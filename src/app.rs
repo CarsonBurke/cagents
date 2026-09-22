@@ -1255,6 +1255,22 @@ static STARTING_DIRECTORY_CAPTION: LazyLock<String> = LazyLock::new(|| {
     format!("Starting directory: {}", display_path(&directory))
 });
 
+/// A terminal that has never run, under a new identity, waiting to launch `launch`.
+fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
+    let id = TerminalId::new();
+    TerminalSession {
+        recovery_origin: None,
+        id,
+        launch: launch.clone(),
+        transcript_path: terminal_transcript_path(id),
+        resume_hint: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+    }
+}
+
 fn terminal_transcript_path(id: TerminalId) -> Option<PathBuf> {
     instance::project_dirs().map(|dirs| {
         dirs.data_dir()
@@ -3863,19 +3879,7 @@ impl Cagents {
         }
         let working_directory = launch.working_directory.clone();
         let card_id = CardId::new();
-        let terminal_id = TerminalId::new();
-        let transcript_path = terminal_transcript_path(terminal_id);
-        let session = TerminalSession {
-            recovery_origin: None,
-            id: terminal_id,
-            launch: launch.clone(),
-            transcript_path,
-            resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable {
-                recipe: launch,
-                last_exit: None,
-            },
-        };
+        let session = fresh_terminal_session(launch);
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -4754,13 +4758,31 @@ impl Cagents {
         card: CardId,
         session: TerminalSession,
     ) -> Task<Message> {
-        let Some(state) = self
-            .card_state(card)
-            .filter(|state| state.existence.is_open())
-            .cloned()
-        else {
+        let Some(visible) = self.convert_card_to_terminal(card, &session) else {
             return Task::none();
         };
+        self.pending_terminal_handoffs
+            .insert(session.id, session.clone());
+        let commit = self.commit_terminal_handoffs();
+        let attach = self.start_terminal(card, session, visible, false);
+        Task::batch([commit, attach])
+    }
+
+    /// Turns an open card into the terminal `session`, ready for its start.
+    ///
+    /// The conversion is checkpointed on the writer lane before anything can
+    /// start, so a crash never finds the card naming a conversation it gave
+    /// up. Answers whether the new surface starts visible, or `None` when the
+    /// card is no longer open.
+    fn convert_card_to_terminal(
+        &mut self,
+        card: CardId,
+        session: &TerminalSession,
+    ) -> Option<bool> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())
+            .cloned()?;
         let residency = Residency::Hydrating {
             epoch: unix_millis().max(1) as u64,
         };
@@ -4776,16 +4798,7 @@ impl Cagents {
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(Arc::clone(&self.durable));
         }
-        self.pending_terminal_handoffs
-            .insert(session.id, session.clone());
-        let commit = self.commit_terminal_handoffs();
-        let attach = self.start_terminal(
-            card,
-            session,
-            state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
-            false,
-        );
-        Task::batch([commit, attach])
+        Some(state.exposure == Exposure::Visible && self.workspace_surfaces_visible())
     }
 
     /// The flush is ordered after conversion snapshots. Never release daemon
@@ -10216,6 +10229,9 @@ impl Application for Cagents {
                 {
                     return self.begin_card_close(id);
                 }
+                // Read before anything persists the scope, which prunes the
+                // closed card from its channel's membership.
+                let emptied = self.channels_emptied_by(&[id]);
                 self.retire_lsp_card(id);
                 self.sidebar_state.clear_agent_activity(id);
                 self.sidebar_state.acknowledge_agent_update(id);
@@ -10255,7 +10271,7 @@ impl Application for Cagents {
                         Task::none()
                     }
                 };
-                Task::batch([closed, self.close_emptied_channels(&[id])])
+                Task::batch([closed, self.delete_channels(emptied)])
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree

@@ -87,18 +87,24 @@ impl Cagents {
 
     pub(super) fn request_card_removal(&mut self, card: CardId) -> Task<Message> {
         match self.workspace.request_close(card) {
-            Ok(handoff) => workspace_widget::focus_handoff_then(
-                handoff,
-                widget::Id::new(TOOLBAR_FOCUS_ID),
-                |next| self.card_keyboard_focus(next),
-                Message::CommitClose(card),
-            )
-            .map(cosmic::Action::App),
+            Ok(handoff) => self.card_removal(handoff),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
             }
         }
+    }
+
+    /// Moves focus off a card whose removal the workspace has reserved, then
+    /// commits that removal.
+    pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
+        workspace_widget::focus_handoff_then(
+            handoff,
+            widget::Id::new(TOOLBAR_FOCUS_ID),
+            |next| self.card_keyboard_focus(next),
+            Message::CommitClose(handoff.unmounting),
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn cancel_terminal_close(&mut self) -> Task<Message> {

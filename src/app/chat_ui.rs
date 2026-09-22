@@ -90,9 +90,13 @@ pub enum Action {
     ChooseFreshProvider(CardId, Provider),
     Switch(CardId),
     Ready(Target, Ready),
-    /// The result of closing a conversation that started for a card which
-    /// could no longer hold it, so a stranded writer is not left behind.
-    Discarded(Result<(), String>),
+    /// The result of giving up a conversation's daemon actor after its card
+    /// stopped holding it: a closed card, an abandoned start, or a start that
+    /// finished for a card which could no longer hold it.
+    Retired(Target, Result<(), String>),
+    /// The daemon actor of a conversation with no exact terminal to return
+    /// to has been given up, so its card can become the terminal it carries.
+    ReturnedLocally(Target, Result<(), String>),
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
@@ -162,7 +166,9 @@ impl Action {
                 | Self::CommandFinished(..)
                 | Self::Attached(..)
                 | Self::HandoffFinished(..)
+                | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
+                | Self::Retired(..)
         )
     }
 
@@ -197,6 +203,13 @@ struct Attempt {
     session: chat::Session,
 }
 
+struct LocalReturn {
+    terminal: TerminalSession,
+    /// Whether the terminal resumes the conversation, and so must not start
+    /// beside an actor that may still hold it.
+    resumes: bool,
+}
+
 pub(super) struct State {
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
@@ -204,7 +217,26 @@ pub(super) struct State {
     attempts: HashMap<CardId, Attempt>,
     handoffs: HashSet<Target>,
     closing: HashSet<Target>,
+    /// Cards whose close has been accepted: their removal is reserved in the
+    /// workspace and nothing may act on their conversation any more.
     closed: HashSet<CardId>,
+    /// Cards closed while their conversation was returning to its terminal.
+    ///
+    /// That transition is a daemon request whose result has to land on the
+    /// card, so the close runs as soon as it does rather than being dropped.
+    close_after_handoff: HashSet<CardId>,
+    /// Starts and restart closes still in flight for a card that has since
+    /// been closed, with the conversation each one concerns.
+    ///
+    /// The card is gone as soon as the user asks, but whatever the request
+    /// leaves in the daemon is only known when it answers, so the answer is
+    /// what retires it.
+    abandoned: HashMap<Target, chat::Session>,
+    /// Conversations being given up in the background after their card left.
+    retiring: HashSet<Target>,
+    /// The terminal each card without an exact conversation to hand back
+    /// becomes once its chat actor is given up, keyed like `handoffs`.
+    local_returns: HashMap<Target, LocalReturn>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -238,6 +270,10 @@ impl Default for State {
             handoffs: HashSet::new(),
             closing: HashSet::new(),
             closed: HashSet::new(),
+            close_after_handoff: HashSet::new(),
+            abandoned: HashMap::new(),
+            retiring: HashSet::new(),
+            local_returns: HashMap::new(),
             drafts: HashMap::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -249,7 +285,20 @@ impl Default for State {
 
 impl State {
     pub(super) fn transition_pending(&self) -> bool {
-        !self.attempts.is_empty() || !self.handoffs.is_empty() || !self.closing.is_empty()
+        !self.attempts.is_empty()
+            || !self.handoffs.is_empty()
+            || !self.closing.is_empty()
+            || !self.abandoned.is_empty()
+            || !self.retiring.is_empty()
+    }
+
+    /// A target no runtime or attempt holds, for a request of its own.
+    fn next_target(&mut self, card: CardId) -> Target {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        Target {
+            card,
+            generation: self.generation,
+        }
     }
 }
 
@@ -1306,6 +1355,10 @@ impl Runtime {
             && self.snapshot.exited
             && self.snapshot.session_id != self.session.launch.session_id
     }
+    /// Whether this runtime still has a daemon connection to its own actor.
+    fn connected(&self) -> bool {
+        !self.disconnected && !self.provider_closed
+    }
     /// Why this chat cannot be swapped for its terminal view right now.
     ///
     /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
@@ -1475,6 +1528,43 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
         last_exit: None,
     };
     Ok(terminal)
+}
+
+/// Gives up a conversation's daemon actor, whatever state its card last saw.
+///
+/// A live handle is asked first, because a connected client closes its own
+/// actor, and the source terminal it was converted from, in one request.
+/// Whatever that leaves in doubt - no handle, a disconnected one, a close that
+/// failed - is settled against the daemon's inventory: a conversation the
+/// daemon no longer lists is closed, and one it does list is attached and
+/// closed by identity. `paired` extends that to the source terminal.
+fn retire_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+    paired: bool,
+) -> Result<(), String> {
+    let refused = match handle.map(|handle| handle.close()) {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(error)) => Some(error),
+        None => None,
+    };
+    let Some(session) = session else {
+        return refused.map_or(Ok(()), Err);
+    };
+    super::channel_ui::close_sessions(vec![CardKind::Chat(session)], paired).map_err(|error| {
+        match refused {
+            Some(refused) => format!("{refused}; {error}"),
+            None => error,
+        }
+    })
+}
+
+/// The terminal a chat card becomes when it has no exact conversation to
+/// return to: a shell in the directory the conversation was working in.
+fn shell_terminal(working_directory: PathBuf) -> Result<TerminalSession, String> {
+    LaunchRecipe::shell(working_directory)
+        .map(fresh_terminal_session)
+        .map_err(|error| format!("Could not open a terminal here: {error}"))
 }
 
 fn fresh_chat_session(
@@ -1751,6 +1841,9 @@ impl Cagents {
         }
         self.chat_ui.attempts.remove(&card);
         self.chat_ui.handoffs.retain(|target| target.card != card);
+        self.chat_ui
+            .local_returns
+            .retain(|target, _| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
         self.chat_ui.restarting.remove(&card);
         self.observe_agent_activity_for_card(card, None);
@@ -1767,6 +1860,8 @@ impl Cagents {
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
         self.chat_ui.fresh_threads.remove(&card);
+        self.chat_ui.closed.remove(&card);
+        self.chat_ui.close_after_handoff.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -1806,13 +1901,47 @@ impl Cagents {
         }
     }
     pub(super) fn chat_switch_label(&self, card: CardId) -> &'static str {
-        if matches!(
-            self.card_state(card).map(|state| &state.kind),
-            Some(CardKind::Chat(_))
-        ) {
-            "Return to terminal"
-        } else {
-            "Switch to native chat"
+        match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Chat(session)) => {
+                let named = match self.cards.get(&card) {
+                    Some(CardRuntime::Chat(runtime)) => {
+                        runtime.session.launch.session_id.is_some()
+                            || runtime.snapshot.session_id.is_some()
+                    }
+                    _ => session.launch.session_id.is_some(),
+                };
+                // A conversation the provider never named has no terminal to
+                // go back to, only a place to open one.
+                if named {
+                    "Return to terminal"
+                } else {
+                    "Open a terminal here"
+                }
+            }
+            _ => "Switch to native chat",
+        }
+    }
+    /// Whether the card's switch control can act now rather than only be seen.
+    ///
+    /// A start, a return, or a close in flight owns the card until it answers,
+    /// and a switch pressed meanwhile used to vanish without a word.
+    pub(super) fn chat_switch_ready(&self, card: CardId) -> bool {
+        !self.chat_start_pending(card) && !self.chat_ui.closed.contains(&card)
+    }
+    /// The conversation a chat card would return from, as current as the card
+    /// knows it: the runtime's session carries the identity the provider has
+    /// confirmed since the card was saved.
+    fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+            let mut session = runtime.session.clone();
+            if let Some(id) = runtime.handle.snapshot().session_id.clone() {
+                session.launch.session_id = Some(id);
+            }
+            return Some(session);
+        }
+        match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Chat(session)) => Some(session.clone()),
+            _ => None,
         }
     }
     pub(super) fn chat_close_approved(&self, card: CardId) -> bool {
@@ -1827,35 +1956,178 @@ impl Cagents {
             .values()
             .find_map(|runtime| runtime.restart_blocker())
     }
+    /// Closes a chat card, in whatever state its conversation is.
+    ///
+    /// The card leaves at once. What the conversation holds in the daemon is
+    /// given up in the background: through the live connection when there is
+    /// one, otherwise by identity against the daemon's inventory, and for a
+    /// start or restart still in flight, when that request answers. Nothing a
+    /// conversation can be doing - never started, connecting, failed,
+    /// disconnected, or live - keeps its card on screen.
+    ///
+    /// Two cases wait for a daemon answer instead: a return to the terminal
+    /// already under way closes the card as soon as it lands, and a chat parked
+    /// behind its source terminal closes before that terminal's own close, so
+    /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
-        if self.chat_start_pending(card) {
+        if self.chat_ui.closed.contains(&card) {
             return Task::none();
         }
-        let Some(runtime) = (match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => Some(runtime),
-            _ => self.chat_ui.parked.get(&card),
-        }) else {
+        if self
+            .chat_ui
+            .handoffs
+            .iter()
+            .any(|target| target.card == card)
+        {
+            self.chat_ui.close_after_handoff.insert(card);
+            return Task::none();
+        }
+        if let Some(runtime) = self.chat_ui.parked.get(&card) {
+            let target = runtime.target;
+            if !self.chat_ui.closing.insert(target) {
+                return Task::none();
+            }
+            let handle = runtime.handle.clone();
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || handle.close())
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                Message::ChatUi(Action::CloseFinished(target, result))
+            });
+        }
+        if !self
+            .card_state(card)
+            .is_some_and(|state| state.existence.is_open())
+        {
+            return Task::none();
+        }
+        let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
-        if runtime.attachment_chooser_pending {
-            self.status = Some(TransientNotice::error(
-                "Finish or cancel the file chooser before closing the chat.",
-            ));
-            return Task::none();
+        // The removal is reserved before anything is given up, so a close the
+        // workspace cannot accept changes nothing.
+        let handoff = match self.workspace.pending_close() {
+            Some(handoff) if handoff.unmounting == card => Ok(handoff),
+            _ => self.workspace.request_close(card),
+        };
+        let handoff = match handoff {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                return Task::none();
+            }
+        };
+        let start = self.chat_ui.attempts.remove(&card);
+        let start_in_flight = start.is_some();
+        if let Some(attempt) = start {
+            self.chat_ui
+                .abandoned
+                .insert(attempt.target, attempt.session);
         }
-        let target = runtime.target;
-        if runtime.provider_closed {
-            self.chat_ui.closing.insert(target);
-            return cosmic::task::message(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        // A restart is closing the previous conversation right now; that close
+        // is the retirement, and the replacement it was clearing room for is
+        // never started.
+        let restarting = self
+            .chat_ui
+            .closing
+            .iter()
+            .copied()
+            .filter(|target| target.card == card)
+            .collect::<Vec<_>>();
+        self.chat_ui.restarting.remove(&card);
+        for target in &restarting {
+            self.chat_ui.closing.remove(target);
+            self.chat_ui.abandoned.insert(*target, session.clone());
         }
-        let handle = runtime.handle.clone();
-        self.chat_ui.closing.insert(target);
+        // A request still in flight retires the conversation when it answers,
+        // and only then is there anything certain to retire.
+        let retire = if !start_in_flight && restarting.is_empty() {
+            let handle = match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) if runtime.connected() => {
+                    Some(runtime.handle.clone())
+                }
+                _ => None,
+            };
+            self.retire_chat(card, handle, Some(session), true)
+        } else {
+            Task::none()
+        };
+        self.chat_ui.closed.insert(card);
+        self.observe_agent_activity_for_card(card, None);
+        Task::batch([retire, self.card_removal(handoff)])
+    }
+
+    /// Gives up a conversation in the background; see [`retire_conversation`].
+    fn retire_chat(
+        &mut self,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: Option<chat::Session>,
+        paired: bool,
+    ) -> Task<Message> {
+        let target = self.chat_ui.next_target(card);
+        self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || handle.close())
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            Message::ChatUi(Action::CloseFinished(target, result))
+            let result =
+                tokio::task::spawn_blocking(move || retire_conversation(handle, session, paired))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+            Message::ChatUi(Action::Retired(target, result))
+        })
+    }
+
+    /// Replaces a chat card that has no exact conversation to hand back with
+    /// the terminal it can still offer.
+    ///
+    /// A conversation whose identity is known resumes in its provider's CLI;
+    /// one that never got that far - never prompted, never started, or failed
+    /// before the provider named it - becomes a shell in its directory, which
+    /// is the terminal the card stood in for. Either way the native actor is
+    /// given up first, so the terminal never shares the conversation with it.
+    fn return_chat_locally(&mut self, card: CardId) -> Task<Message> {
+        let Some(session) = self.chat_return_session(card) else {
+            return Task::none();
+        };
+        let resumes = session.launch.session_id.is_some();
+        let terminal = if resumes {
+            return_terminal(&session)
+        } else {
+            shell_terminal(session.launch.recipe.working_directory.clone())
+        };
+        let terminal = match terminal {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error));
+                return Task::none();
+            }
+        };
+        // A Codex conversation shares its thread with the CLI it came from, and
+        // closing the actor would take that very terminal down with it: the
+        // card returns to the CLI and leaves the thread to it.
+        let retire = terminal.continuity.live_proof().is_none();
+        let handle = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) if retire && runtime.connected() => {
+                Some(runtime.handle.clone())
+            }
+            _ => None,
+        };
+        let session = retire.then_some(session);
+        let target = self.chat_ui.next_target(card);
+        self.chat_ui.handoffs.insert(target);
+        self.chat_ui
+            .local_returns
+            .insert(target, LocalReturn { terminal, resumes });
+        cosmic::task::future(async move {
+            // The card is about to show this terminal, so a source terminal
+            // the chat kept is left alone rather than closed with the actor.
+            let result =
+                tokio::task::spawn_blocking(move || retire_conversation(handle, session, false))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+            Message::ChatUi(Action::ReturnedLocally(target, result))
         })
     }
     /// A panic while connecting is a failed start, not an unwind of the UI thread.
@@ -1892,12 +2164,8 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
-        self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
         let selection = None;
-        let target = Target {
-            card,
-            generation: self.chat_ui.generation,
-        };
+        let target = self.chat_ui.next_target(card);
         self.chat_ui.attempts.insert(
             card,
             Attempt {
@@ -2178,8 +2446,27 @@ impl Cagents {
                         );
                     }
                     Some(CardKind::Chat(_)) => {
-                        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+                        if self.chat_ui.closed.contains(&card) {
                             return Task::none();
+                        }
+                        // Only a connected conversation with a confirmed
+                        // identity can ask the daemon for its exact terminal;
+                        // every other card still has a terminal to become.
+                        let runtime = match self.cards.get(&card) {
+                            Some(CardRuntime::Chat(runtime))
+                                if runtime.connected()
+                                    && runtime.handle.snapshot().session_id.is_some() =>
+                            {
+                                runtime
+                            }
+                            Some(CardRuntime::Chat(runtime))
+                                if runtime.transition_blocker().is_some() =>
+                            {
+                                self.status =
+                                    runtime.transition_blocker().map(TransientNotice::error);
+                                return Task::none();
+                            }
+                            _ => return self.return_chat_locally(card),
                         };
                         if runtime.session.launch.provider != Provider::Codex
                             && let Some(reason) = runtime.transition_blocker()
@@ -2217,6 +2504,13 @@ impl Cagents {
                 let Some(result) = result else {
                     return Task::none();
                 };
+                if let Some(session) = self.chat_ui.abandoned.remove(&target) {
+                    // The card was closed while this start was in flight.
+                    // Whatever the start produced is given up now; a failed
+                    // start is still checked against the inventory, because a
+                    // lost reply is not proof the daemon started nothing.
+                    return self.retire_chat(target.card, result.ok(), Some(session), true);
+                }
                 if !self
                     .chat_ui
                     .attempts
@@ -2243,14 +2537,7 @@ impl Cagents {
                     // provider process running with nothing on screen able to
                     // reach them, so the start is undone here.
                     if let Ok(handle) = result {
-                        return cosmic::task::future(async move {
-                            let closed = tokio::task::spawn_blocking(move || handle.close()).await;
-                            Message::ChatUi(Action::Discarded(
-                                closed
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|result| result),
-                            ))
-                        });
+                        return self.retire_chat(target.card, Some(handle), None, false);
                     }
                     return Task::none();
                 }
@@ -2358,14 +2645,58 @@ impl Cagents {
                     }
                 }
             }
-            Action::Discarded(result) => {
+            Action::Retired(target, result) => {
                 // Nothing is on screen for this conversation, so only a
                 // failure to end it is worth saying anything about.
-                if let Err(error) = result {
+                if self.chat_ui.retiring.remove(&target)
+                    && let Err(error) = result
+                {
                     self.status = Some(TransientNotice::error(format!(
-                        "A conversation that no longer has a card could not be closed: {error}"
+                        "A closed conversation could not be confirmed stopped: {error}"
                     )));
                 }
+            }
+            Action::ReturnedLocally(target, result) => {
+                let Some(LocalReturn { terminal, resumes }) =
+                    self.chat_ui.local_returns.remove(&target)
+                else {
+                    return Task::none();
+                };
+                if !self.chat_ui.handoffs.remove(&target) {
+                    return Task::none();
+                }
+                let close = self.chat_ui.close_after_handoff.remove(&target.card);
+                if let Err(error) = result {
+                    // A resume beside an actor that may still be running would
+                    // be a second writer on one conversation; a new shell
+                    // shares nothing with it, so it only reports the doubt.
+                    if resumes {
+                        self.status = Some(TransientNotice::error(error));
+                        return if close {
+                            self.begin_chat_close(target.card)
+                        } else {
+                            Task::none()
+                        };
+                    }
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The chat could not be confirmed stopped: {error}"
+                    )));
+                }
+                self.chat_forget(target.card);
+                self.chat_ui.fresh_offers.remove(&target.card);
+                self.chat_ui.fresh_threads.remove(&target.card);
+                let Some(visible) = self.convert_card_to_terminal(target.card, &terminal) else {
+                    return Task::none();
+                };
+                let start = self.start_terminal(target.card, terminal, visible, false);
+                return if close {
+                    Task::batch([
+                        start,
+                        cosmic::task::message(Message::CloseCard(target.card)),
+                    ])
+                } else {
+                    start
+                };
             }
             Action::UpdatesAcknowledged(target, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
@@ -2950,11 +3281,19 @@ impl Cagents {
                 if !self.chat_ui.handoffs.remove(&target) {
                     return Task::none();
                 }
+                // A close asked for during the return runs on whatever the
+                // card turned out to be: the terminal it returned to, or the
+                // chat that is still there when the return failed.
+                let close = self.chat_ui.close_after_handoff.remove(&target.card);
                 let terminal = match result {
                     Ok(terminal) => terminal,
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error));
-                        return Task::none();
+                        return if close {
+                            self.begin_chat_close(target.card)
+                        } else {
+                            Task::none()
+                        };
                     }
                 };
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -2962,6 +3301,7 @@ impl Cagents {
                 };
                 if runtime.session.launch.provider != Provider::Codex
                     && let Some(reason) = runtime.transition_blocker()
+                    && !close
                 {
                     self.status = Some(TransientNotice::error(reason));
                     return Task::none();
@@ -2984,14 +3324,40 @@ impl Cagents {
                 // the transition receipt independently of this UI attachment.
                 let task = self.finish_chat_terminal_handoff(target.card, terminal);
                 self.chat_forget(target.card);
-                return task;
+                return if close {
+                    Task::batch([task, cosmic::task::message(Message::CloseCard(target.card))])
+                } else {
+                    task
+                };
             }
             Action::CloseFinished(target, result) => {
+                if let Some(session) = self.chat_ui.abandoned.remove(&target) {
+                    // A restart's close whose card has since been closed. It
+                    // was already the retirement; only a failure leaves
+                    // something for the inventory to settle.
+                    return match result {
+                        Ok(()) => Task::none(),
+                        Err(_) => self.retire_chat(target.card, None, Some(session), true),
+                    };
+                }
                 if self.chat_runtime_mut(target).is_none() {
                     return Task::none();
                 }
                 if !self.chat_ui.closing.remove(&target) {
                     return Task::none();
+                }
+                if !self.chat_ui.restarting.contains_key(&target.card) {
+                    // A chat parked behind its source terminal: the actor is
+                    // closed or unreachable either way, and the card is that
+                    // terminal now, so its own close takes over from here.
+                    self.chat_ui.parked.remove(&target.card);
+                    self.observe_agent_activity_for_card(target.card, None);
+                    if let Err(error) = result {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "The chat could not be confirmed stopped: {error}"
+                        )));
+                    }
+                    return self.begin_card_close(target.card);
                 }
                 if let Err(error) = result {
                     self.chat_ui.restarting.remove(&target.card);
@@ -3026,9 +3392,6 @@ impl Cagents {
                     self.commit_chat_session(target.card, session.clone());
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
-                self.chat_ui.closed.insert(target.card);
-                self.observe_agent_activity_for_card(target.card, None);
-                return cosmic::task::message(Message::CommitClose(target.card));
             }
             Action::Scrolled(target, scroll) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -3261,6 +3624,412 @@ mod tests {
             opened.is_empty(),
             "a group the store no longer produces is forgotten rather than held for the session"
         );
+    }
+
+    const FIXTURE_DIRECTORY: &str = "/workspace/chat-fixture";
+    /// Providers name conversations by UUID; resume refuses anything else.
+    const KNOWN_THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    /// A new conversation whose start is still in flight. Tasks are dropped
+    /// throughout: nothing here starts a provider or reaches a daemon.
+    fn starting_chat(app: &mut Cagents) -> (CardId, Target) {
+        let _ = app.new_native_chat(Provider::Codex, Some(PathBuf::from(FIXTURE_DIRECTORY)));
+        let card = app.workspace.focused().unwrap();
+        let target = app.chat_ui.attempts.get(&card).unwrap().target;
+        (card, target)
+    }
+
+    fn answer_start(
+        app: &mut Cagents,
+        target: Target,
+        result: Result<Arc<ClientHandle>, chat::StartFailure>,
+    ) {
+        let _ = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(result)))),
+        )));
+    }
+
+    fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
+        let session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        Arc::new(ClientHandle::fixture(
+            session,
+            Snapshot {
+                session_id: session_id.map(str::to_owned),
+                ..Snapshot::default()
+            },
+        ))
+    }
+
+    /// A conversation that started, optionally with a provider-confirmed id.
+    fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
+        let (card, target) = starting_chat(app);
+        let handle = fixture_handle(app, card, session_id);
+        answer_start(app, target, Ok(handle));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+        card
+    }
+
+    /// A new conversation whose start the provider refused.
+    fn failed_chat(app: &mut Cagents) -> CardId {
+        let (card, target) = starting_chat(app);
+        answer_start(
+            app,
+            target,
+            Err(chat::StartFailure::retry("fixture: executable unavailable")),
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+        app.notices.entries.clear();
+        card
+    }
+
+    /// Closes `card` the way its close button does, and checks that it is gone
+    /// for good: off the strip, tombstoned, and held by nothing.
+    fn close_chat(app: &mut Cagents, card: CardId) {
+        let _ = app.update(Message::CloseCard(card));
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|handoff| handoff.unmounting),
+            Some(card),
+            "a chat's close is accepted at once, whatever its conversation is doing"
+        );
+        let _ = app.update(Message::CommitClose(card));
+        assert!(
+            !app.workspace.order().any(|id| id == card),
+            "the card leaves the strip"
+        );
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.cards.contains_key(&card));
+        assert!(
+            errors(app).is_empty(),
+            "a close is not an error: {:?}",
+            errors(app)
+        );
+        assert!(
+            !app.chat_ui.closed.contains(&card),
+            "nothing outlives the card"
+        );
+        assert!(!app.chat_start_pending(card));
+    }
+
+    /// The errors the shell has recorded. `status` is drained into the notice
+    /// log at the end of every update, so this is where a test reads it.
+    fn errors(app: &Cagents) -> Vec<String> {
+        app.notices
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.notice.severity, crate::app::NoticeSeverity::Error))
+            .map(|entry| entry.notice.message.clone())
+            .collect()
+    }
+
+    fn retired(app: &mut Cagents, card: CardId) -> Target {
+        let targets = app
+            .chat_ui
+            .retiring
+            .iter()
+            .copied()
+            .filter(|target| target.card == card)
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 1, "one retirement per conversation");
+        targets[0]
+    }
+
+    /// Closing the card was a silent no-op while the conversation connected,
+    /// so a slow or hung start held the card hostage.
+    #[test]
+    fn a_chat_still_connecting_closes_at_once_and_retires_what_its_start_produced() {
+        for started in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = starting_chat(&mut app);
+            let handle = fixture_handle(&app, card, None);
+            close_chat(&mut app, card);
+            assert!(
+                app.chat_ui.abandoned.contains_key(&target),
+                "the start is still answered for"
+            );
+            assert!(app.chat_ui.retiring.is_empty(), "nothing is certain yet");
+            assert!(app.chat_ui.transition_pending());
+
+            let result = if started {
+                Ok(handle)
+            } else {
+                Err(chat::StartFailure::retry("fixture: executable unavailable"))
+            };
+            answer_start(&mut app, target, result);
+            assert!(app.chat_ui.abandoned.is_empty());
+            assert!(
+                !app.cards.contains_key(&card),
+                "a late answer never brings the card back"
+            );
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            assert!(!app.chat_ui.transition_pending());
+            assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        }
+    }
+
+    /// The failed card's own Close button did nothing.
+    #[test]
+    fn a_chat_whose_start_failed_closes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        close_chat(&mut app, card);
+        // With no connection, the daemon's inventory is what settles it.
+        let retirement = retired(&mut app, card);
+        let _ = app.update(Message::ChatUi(Action::Retired(
+            retirement,
+            Err("fixture: daemon unreachable".into()),
+        )));
+        assert!(
+            !errors(&app).is_empty(),
+            "a conversation that may still run is reported"
+        );
+        assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// A successful close committed a removal the workspace had never been
+    /// asked for, which failed with "no card removal is pending" and left a
+    /// tombstoned card on the strip, spinning, with no way to close it.
+    #[test]
+    fn a_live_chat_closes_without_leaving_its_card_behind() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        close_chat(&mut app, card);
+        retired(&mut app, card);
+    }
+
+    /// A disconnected conversation's close request failed before it was sent,
+    /// and the failure only set a status: the card stayed forever.
+    #[test]
+    fn a_disconnected_chat_closes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        let _ = app.update(Message::ChatUi(Action::Wake(
+            target,
+            Wake::Disconnected("fixture: daemon went away".into()),
+        )));
+        app.notices.entries.clear();
+        close_chat(&mut app, card);
+        retired(&mut app, card);
+    }
+
+    #[test]
+    fn closing_a_chat_twice_is_one_close() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let _ = app.update(Message::CloseCard(card));
+        let _ = app.update(Message::CloseCard(card));
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.workspace.order().any(|id| id == card));
+        retired(&mut app, card);
+    }
+
+    /// A restart gives up the previous conversation before it starts the new
+    /// one; a close meanwhile keeps the first half and cancels the second.
+    #[test]
+    fn a_chat_closed_mid_restart_never_starts_its_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let target = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        let _ = app.update(Message::ChatUi(Action::ChooseProvider(
+            target,
+            Provider::Claude,
+        )));
+        assert!(app.chat_ui.closing.contains(&target));
+        close_chat(&mut app, card);
+        assert!(
+            app.chat_ui.retiring.is_empty(),
+            "the restart's close is the retirement"
+        );
+        let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        assert!(
+            app.chat_ui.attempts.is_empty(),
+            "the replacement never starts"
+        );
+        assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// "Return to terminal" refused a conversation the provider had not named
+    /// yet, and silently did nothing for one that never started, so a chat
+    /// that could not go back had no terminal to offer at all.
+    #[test]
+    fn a_chat_with_no_conversation_to_return_to_becomes_a_shell_in_its_directory() {
+        for failed in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = if failed {
+                failed_chat(&mut app)
+            } else {
+                live_chat(&mut app, None)
+            };
+            assert_eq!(app.chat_switch_label(card), "Open a terminal here");
+            assert!(app.chat_switch_ready(card));
+            let _ = app.update(Message::ChatUi(Action::Switch(card)));
+            assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+            let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
+            assert!(!plan.resumes);
+            assert_eq!(
+                plan.terminal.launch,
+                LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap()
+            );
+            assert!(!app.chat_switch_ready(card), "one return at a time");
+
+            // The shell shares nothing with the actor, so doubt about the
+            // actor is reported rather than keeping the card a chat.
+            let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
+                target,
+                Err("fixture: daemon unreachable".into()),
+            )));
+            let Some(CardKind::Terminal(session)) = app.card_state(card).map(|state| &state.kind)
+            else {
+                panic!("the card is a terminal now");
+            };
+            assert_eq!(
+                session.launch.working_directory,
+                PathBuf::from(FIXTURE_DIRECTORY)
+            );
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(!app.chat_start_pending(card));
+            assert!(!app.chat_ui.transition_pending());
+        }
+    }
+
+    /// A failed card whose conversation the provider did name goes back to
+    /// that conversation in its CLI, but never beside an actor that might
+    /// still be holding it.
+    #[test]
+    fn a_failed_chat_with_a_known_conversation_resumes_it_in_its_cli() {
+        for retired in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = failed_chat(&mut app);
+            let state = Arc::make_mut(&mut app.durable)
+                .cards
+                .iter_mut()
+                .find(|state| state.id == card)
+                .unwrap();
+            let CardKind::Chat(session) = &mut state.kind else {
+                unreachable!()
+            };
+            session.launch.session_id = Some(KNOWN_THREAD.into());
+            assert_eq!(app.chat_switch_label(card), "Return to terminal");
+            let _ = app.update(Message::ChatUi(Action::Switch(card)));
+            assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+            let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
+            assert!(plan.resumes);
+            assert!(
+                plan.terminal
+                    .launch
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == KNOWN_THREAD),
+                "{:?}",
+                plan.terminal.launch
+            );
+            let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
+                target,
+                if retired {
+                    Ok(())
+                } else {
+                    Err("fixture: daemon unreachable".into())
+                },
+            )));
+            let kind = &app.card_state(card).unwrap().kind;
+            if retired {
+                assert!(matches!(kind, CardKind::Terminal(_)));
+            } else {
+                assert!(matches!(kind, CardKind::Chat(_)), "no second writer");
+                assert!(!errors(&app).is_empty());
+            }
+            assert!(!app.chat_start_pending(card));
+        }
+    }
+
+    /// A close pressed while the card is on its way back to a terminal waits
+    /// for that return to land, then closes what the card became.
+    #[test]
+    fn a_chat_closed_during_its_return_closes_once_the_return_lands() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.local_returns.keys().next().unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(app.chat_ui.close_after_handoff.contains(&card));
+        assert_eq!(app.workspace.pending_close(), None);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
+        assert!(app.chat_ui.close_after_handoff.is_empty());
+        assert!(matches!(
+            app.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(_))
+        ));
+    }
+
+    /// Issue #237: a channel whose panes are all closed closes itself, in
+    /// either order, including when its chat never got as far as starting.
+    #[test]
+    fn a_channel_closes_when_its_last_pane_does() {
+        for (chat_first, chat_state) in [(true, 0), (true, 1), (true, 2), (false, 0), (false, 2)] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let terminal = app.workspace.focused().unwrap();
+            // A shell that already ended: its close needs no daemon.
+            app.cards
+                .insert(terminal, CardRuntime::Failed("fixture".into()));
+            let channel = crate::model::ChannelId::new();
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: String::new(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![terminal],
+                focused: Some(terminal),
+            });
+            durable.active_channel = Some(channel);
+            // Already in the chat's directory, so starting it changes no scope.
+            app.active_workspace = Some(PathBuf::from(FIXTURE_DIRECTORY));
+            let chat = match chat_state {
+                0 => starting_chat(&mut app).0,
+                1 => failed_chat(&mut app),
+                _ => live_chat(&mut app, Some("thread")),
+            };
+            let channel_exists = |app: &Cagents| {
+                app.durable
+                    .channels
+                    .iter()
+                    .any(|candidate| candidate.id == channel)
+            };
+            let (first, second) = if chat_first {
+                (chat, terminal)
+            } else {
+                (terminal, chat)
+            };
+            for (index, card) in [first, second].into_iter().enumerate() {
+                if card == chat {
+                    close_chat(&mut app, card);
+                } else {
+                    let _ = app.update(Message::CloseCard(card));
+                    let _ = app.update(Message::CommitClose(card));
+                    assert!(!app.workspace.order().any(|id| id == card));
+                }
+                assert_eq!(
+                    channel_exists(&app),
+                    index == 0,
+                    "chat first: {chat_first}, chat state: {chat_state}"
+                );
+            }
+            assert!(app.channel_ui.was_deleted(channel));
+        }
     }
 
     #[test]
