@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -110,6 +110,8 @@ pub enum PersistedCardKind {
     Browser,
     PullRequests,
     Repository,
+    Settings,
+    Accounts,
 }
 
 impl PersistedCardKind {
@@ -120,6 +122,8 @@ impl PersistedCardKind {
             Self::Browser => "browser",
             Self::PullRequests => "pull_requests",
             Self::Repository => "repository",
+            Self::Settings => "settings",
+            Self::Accounts => "accounts",
         }
     }
 
@@ -130,6 +134,8 @@ impl PersistedCardKind {
             "browser" => Ok(Self::Browser),
             "pull_requests" => Ok(Self::PullRequests),
             "repository" => Ok(Self::Repository),
+            "settings" => Ok(Self::Settings),
+            "accounts" => Ok(Self::Accounts),
             other => Err(StoreError::InvalidState(format!(
                 "unknown persisted card kind `{other}`"
             ))),
@@ -1622,6 +1628,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             transaction
                 .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")?;
         }
+        if current < 6 {
+            migrate_to_v6(&transaction)?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -1783,6 +1792,37 @@ fn migrate_to_v4(transaction: &Transaction<'_>) -> Result<()> {
          INSERT INTO cards_v4 SELECT * FROM cards;
          DROP TABLE cards;
          ALTER TABLE cards_v4 RENAME TO cards;
+         CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
+    )?;
+    Ok(())
+}
+
+/// Admits the payload-free utility panes: `settings` and `accounts`. Both are
+/// admitted by one rebuild so the accounts pane needs no second migration, and
+/// a build that knows the kind can always read a database that holds one.
+fn migrate_to_v6(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE cards_v6 (
+            card_id TEXT PRIMARY KEY NOT NULL,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            title TEXT NOT NULL,
+            width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),
+            existence_json TEXT NOT NULL,
+            kind_tag TEXT NOT NULL CHECK (
+                kind_tag IN (
+                    'terminal', 'chat', 'browser', 'pull_requests', 'repository',
+                    'settings', 'accounts'
+                )
+            ),
+            content_json TEXT,
+            updated_at_unix_ms INTEGER NOT NULL,
+            content_hash INTEGER
+         ) STRICT;
+         INSERT INTO cards_v6 SELECT * FROM cards;
+         DROP TABLE cards;
+         ALTER TABLE cards_v6 RENAME TO cards;
          CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
     )?;
     Ok(())
@@ -2412,7 +2452,8 @@ enum CardPayloadWrite<'card> {
         fidelity: &'static str,
     },
     /// Chat, pull-request and repository cards keep their whole payload in the
-    /// `cards.content_json` column, so there is no side table to write.
+    /// `cards.content_json` column, and the utility panes have none, so there
+    /// is no side table to write.
     Inline,
 }
 
@@ -2430,7 +2471,10 @@ impl<'card> CardWrite<'card> {
             CardKind::Chat(session) => Some(to_json(session)?),
             CardKind::PullRequests(view) => Some(to_json(view)?),
             CardKind::Repository(view) => Some(to_json(view)?),
-            CardKind::Terminal(_) | CardKind::Browser(_) => None,
+            CardKind::Terminal(_)
+            | CardKind::Browser(_)
+            | CardKind::Settings
+            | CardKind::Accounts => None,
         };
         let payload = match &card.kind {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
@@ -2462,9 +2506,11 @@ impl<'card> CardWrite<'card> {
                     },
                 }
             }
-            CardKind::Chat(_) | CardKind::PullRequests(_) | CardKind::Repository(_) => {
-                CardPayloadWrite::Inline
-            }
+            CardKind::Chat(_)
+            | CardKind::PullRequests(_)
+            | CardKind::Repository(_)
+            | CardKind::Settings
+            | CardKind::Accounts => CardPayloadWrite::Inline,
         };
 
         let mut hasher = ContentHasher::new();
@@ -3139,6 +3185,8 @@ fn load_card_connection(
                 StoreError::InvalidState(format!("repository card {id} has no payload"))
             })?,
         )?),
+        PersistedCardKind::Settings => CardKind::Settings,
+        PersistedCardKind::Accounts => CardKind::Accounts,
     };
 
     Ok(Some(CardState {
@@ -3352,6 +3400,8 @@ fn card_kind(kind: &CardKind) -> PersistedCardKind {
         CardKind::Browser(_) => PersistedCardKind::Browser,
         CardKind::PullRequests(_) => PersistedCardKind::PullRequests,
         CardKind::Repository(_) => PersistedCardKind::Repository,
+        CardKind::Settings => PersistedCardKind::Settings,
+        CardKind::Accounts => PersistedCardKind::Accounts,
     }
 }
 
@@ -3946,6 +3996,132 @@ mod tests {
                 .kind,
             CardKind::Chat(chat)
         );
+    }
+
+    #[test]
+    fn v6_migration_preserves_cards_and_admits_utility_panes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("v5.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        let transaction = connection.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        migrate_to_v2(&transaction).unwrap();
+        migrate_to_v3(&transaction).unwrap();
+        migrate_to_v4(&transaction).unwrap();
+        transaction
+            .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")
+            .unwrap();
+        let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
+        let mut browser = workspace.cards[0].clone();
+        browser.id = CardId::new();
+        let url = Url::parse("https://example.com/kept").unwrap();
+        browser.kind = CardKind::Browser(BrowserSession {
+            id: BrowserId::new(),
+            current_url: url.clone(),
+            history: vec![url],
+            history_index: 0,
+            scroll_x: 0.0,
+            scroll_y: 40.0,
+            fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+        });
+        workspace.cards.push(browser.clone());
+        let commit = save_workspace_transaction(
+            &transaction,
+            &workspace,
+            SnapshotBase {
+                workspace: 0,
+                cards: &BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        // The v5 table must refuse the new kinds, or this test proves nothing.
+        assert!(
+            transaction
+                .execute(
+                    "UPDATE cards SET kind_tag = 'settings' WHERE card_id = ?1",
+                    [browser.id.to_string()],
+                )
+                .is_err()
+        );
+        transaction.pragma_update(None, "user_version", 5).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let store = StateStore::open(&path, boot("v6-boot")).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>(),
+            workspace
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(restored.cards[1].kind, browser.kind);
+        assert_eq!(
+            store
+                .load_transcript_metadata(chat.id)
+                .unwrap()
+                .unwrap()
+                .1
+                .path,
+            chat.terminal
+                .as_ref()
+                .unwrap()
+                .transcript_path
+                .clone()
+                .unwrap()
+        );
+
+        let mut lane = SaveLane {
+            workspace: commit.generation,
+            cards: commit.card_generations,
+        };
+        for kind in [CardKind::Settings, CardKind::Accounts] {
+            let mut card = workspace.cards[1].clone();
+            card.id = CardId::new();
+            card.title = "Utility".into();
+            card.kind = kind;
+            workspace.cards.push(card);
+        }
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .cards
+                .iter()
+                .map(|card| card.kind.clone())
+                .skip(2)
+                .collect::<Vec<_>>(),
+            vec![CardKind::Settings, CardKind::Accounts]
+        );
+        let inner = store.lock_inner().unwrap();
+        assert!(
+            inner
+                .connection
+                .execute(
+                    "UPDATE cards SET kind_tag = 'unknown' WHERE card_id = ?1",
+                    [browser.id.to_string()],
+                )
+                .is_err(),
+            "the rebuilt table still checks its kinds"
+        );
+        let index_count: i64 = inner
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'cards_workspace_order_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
     }
 
     fn stored_card_row(store: &StateStore, card_id: CardId) -> (i64, i64, Option<i64>) {

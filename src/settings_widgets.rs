@@ -99,6 +99,21 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
     }
 }
 
+/// A labelled switch that spans its setting row: the label reads from the
+/// left edge and the switch sits at the right, clear of any label length.
+pub fn toggle<'a, Message: 'static>(
+    label: &str,
+    value: bool,
+    on_toggle: impl Fn(bool) -> Message + 'a,
+) -> Element<'a, Message> {
+    widget::toggler(value)
+        .label(label.to_owned())
+        .spacing(3.0 * design::GRID_UNIT)
+        .width(Length::Fill)
+        .on_toggle(on_toggle)
+        .into()
+}
+
 pub fn editor_options<'a, Message: Clone + 'static>(
     auto_save: bool,
     wrap: bool,
@@ -111,18 +126,12 @@ pub fn editor_options<'a, Message: Clone + 'static>(
         field(
             "Auto-save",
             "Save files after a pause. Conflicting disk changes still require a decision.",
-            widget::toggler(auto_save)
-                .label("Save files automatically".to_owned())
-                .on_toggle(on_save)
-                .into(),
+            toggle("Save files automatically", auto_save, on_save),
         ),
         field(
             "Word wrap",
             "Wrap long editor lines to the available width.",
-            widget::toggler(wrap)
-                .label("Wrap long lines".to_owned())
-                .on_toggle(on_wrap)
-                .into(),
+            toggle("Wrap long lines", wrap, on_wrap),
         ),
         field(
             "Syntax theme",
@@ -144,13 +153,6 @@ pub fn editor_options<'a, Message: Clone + 'static>(
 
 pub fn search_id() -> widget::Id {
     widget::Id::new("settings.search")
-}
-
-pub fn dialog_size(available: iced::Size) -> iced::Size {
-    iced::Size::new(
-        900.0_f32.min((available.width - 32.0).max(0.0)),
-        available.height * 0.87,
-    )
 }
 
 #[cfg(test)]
@@ -189,14 +191,5 @@ mod tests {
                 .view("Editor", "editor terminal")
                 .is_none()
         );
-    }
-    #[test]
-    fn dialog_uses_available_vertical_space_at_every_window_size() {
-        for height in [480.0, 900.0, 1600.0] {
-            assert_eq!(
-                dialog_size(iced::Size::new(1280.0, height)).height,
-                height * 0.87
-            );
-        }
     }
 }

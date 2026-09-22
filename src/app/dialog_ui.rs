@@ -16,22 +16,6 @@ pub(crate) fn surface<'a, M: 'a>(
     .into()
 }
 
-/// Variant for settings layouts whose dividers must meet the dialog frame.
-/// Section padding belongs to the header, body, and footer instead of sitting
-/// between the frame and their rules.
-pub(crate) fn connected_surface<'a, M: 'a>(
-    content: impl Into<Element<'a, M>>,
-    max_width: f32,
-) -> Element<'a, M> {
-    crate::interaction::opaque(
-        widget::container(content)
-            .class(cosmic::theme::Container::Dialog(false))
-            .width(Length::Fill)
-            .max_width(max_width),
-    )
-    .into()
-}
-
 pub(super) fn overlay<'a>(
     surface: Element<'a, Message>,
     dismiss: Option<Message>,
