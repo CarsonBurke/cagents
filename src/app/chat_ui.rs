@@ -3459,7 +3459,14 @@ impl Cagents {
                 return if close {
                     // Called rather than sent: a message could be dropped by a
                     // modal opened meanwhile, losing the close the user asked for.
-                    Task::batch([task, self.begin_card_close(target.card)])
+                    // A chat parked behind its CLI closes first, exactly as a
+                    // close of that card does, and the CLI's close follows it.
+                    let close = if self.chat_has_parked_runtime(target.card) {
+                        self.begin_chat_close(target.card)
+                    } else {
+                        self.begin_card_close(target.card)
+                    };
+                    Task::batch([task, close])
                 } else {
                     task
                 };
@@ -4352,6 +4359,63 @@ mod tests {
             }
             assert!(app.channel_ui.was_deleted(channel));
         }
+    }
+
+    /// A close pressed while a live Codex chat returns to its CLI lands on a
+    /// card that is the CLI with the chat parked behind it. The chat must be
+    /// closed before the CLI, as a close of that card always does; closing the
+    /// CLI first reserved the card's removal twice and left it stuck.
+    #[test]
+    fn a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.handoffs.iter().next().unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(app.chat_ui.close_after_handoff.contains(&card));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        let mut session = runtime.session.clone();
+        session.launch.session_id = Some(KNOWN_THREAD.into());
+        let proof = runtime.handle.proof().unwrap();
+        let mut cli = return_terminal(&session).unwrap();
+        cli.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let _ = app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(cli))));
+        // Drive every daemon request to success until nothing is left to do.
+        for _ in 0..8 {
+            if let Some(intent) = app.terminal_close.clone() {
+                assert!(intent.detail.is_none(), "{:?}", intent.detail);
+                let _ = app.update(Message::TerminalCloseFinished {
+                    card: intent.card,
+                    terminal: intent.terminal,
+                    proof: intent.proof,
+                    generation: intent.generation,
+                    outcome: crate::app::terminal_close::CloseOutcome::Closed,
+                });
+            } else if app
+                .workspace
+                .pending_close()
+                .is_some_and(|handoff| handoff.unmounting == card)
+            {
+                let _ = app.update(Message::CommitClose(card));
+            } else if let Some(&closing) = app.chat_ui.closing.iter().next() {
+                let _ = app.update(Message::ChatUi(Action::CloseFinished(closing, Ok(()))));
+            } else {
+                break;
+            }
+        }
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.workspace.pending_close(), None);
+        assert!(app.terminal_close.is_none());
+        assert!(!app.chat_has_parked_runtime(card));
+        assert!(!app.chat_ui.transition_pending());
     }
 
     /// A chat that switches to a shell leaves its channel only for the shell
