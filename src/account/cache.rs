@@ -119,15 +119,14 @@ impl Cache {
         Ok(())
     }
 
-    /// Takes the per-provider probe lock without waiting, so two windows
-    /// never probe the same provider at once. `None` means another window
-    /// holds it and its answer will reach this one through the cache.
-    pub fn try_probe_lock(&self, provider: &str) -> io::Result<Option<File>> {
+    /// Takes an account's probe lock, named by [`super::Account::lock_name`],
+    /// without waiting, so two windows never probe the same account at once.
+    /// `None` means another window holds it and its answer will reach this
+    /// one through the cache.
+    pub fn try_probe_lock(&self, name: &str) -> io::Result<Option<File>> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         match crate::instance::owned_lock(
-            &self
-                .directory
-                .join(format!("account-probe.{provider}.lock")),
+            &self.directory.join(format!("account-probe.{name}.lock")),
             libc::LOCK_EX | libc::LOCK_NB,
         ) {
             Ok(lock) => Ok(Some(lock)),

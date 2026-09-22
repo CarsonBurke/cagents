@@ -1729,16 +1729,18 @@ pub enum SettingsCategory {
     Editor,
     Links,
     Keyboard,
+    Accounts,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::General,
         Self::Appearance,
         Self::Editor,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
+        Self::Accounts,
     ];
 
     const fn label(self) -> &'static str {
@@ -1749,6 +1751,7 @@ impl SettingsCategory {
             Self::Editor => "Editor",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
+            Self::Accounts => "Accounts",
         }
     }
 }
@@ -6404,6 +6407,7 @@ impl Cagents {
                 &self.settings_draft,
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
+                self.default_account_choices(),
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Completed) => {

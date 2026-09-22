@@ -550,11 +550,16 @@ impl Cagents {
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
                 let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
+                let accounts = self.chat_accounts(
+                    runtime.session.launch.provider,
+                    &runtime.session.launch.recipe,
+                );
                 runtime.view(
                     self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
                     self.settings.chat_enter_sends,
                     place,
                     !self.workspace_inputs_blocked(),
+                    accounts,
                 )
             }
             _ => widget::text::body("Connecting to native chat…").into(),
@@ -575,6 +580,7 @@ impl Runtime {
         enter_sends: bool,
         place: Place,
         accepting_drops: bool,
+        accounts: Option<ChatAccounts>,
     ) -> Element<'_, Message> {
         let target = self.target;
         let available =
@@ -1151,7 +1157,7 @@ impl Runtime {
                 .into(),
             );
         }
-        status.extend(self.session_controls(transitioning));
+        status.extend(self.session_controls(transitioning, accounts));
         // What the conversation has spent is pinned to the pane's right edge
         // instead of joining that run. The budget and the money are the two
         // figures a reader consults deliberately, and mixing them into the
@@ -1348,10 +1354,17 @@ impl Runtime {
     /// they were about to send. While a session is switching they are drawn as
     /// plain text: the values still matter, and a row of disabled controls
     /// says nothing a reader can act on.
-    fn session_controls(&self, transitioning: bool) -> Vec<Element<'_, Message>> {
+    fn session_controls(
+        &self,
+        transitioning: bool,
+        accounts: Option<ChatAccounts>,
+    ) -> Vec<Element<'_, Message>> {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut controls: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(accounts) = accounts {
+            controls.push(self.account_picker(accounts, transitioning));
+        }
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty())
             || self.can_choose_provider()
         {
@@ -1450,6 +1463,122 @@ impl Runtime {
             }
         }
         controls
+    }
+
+    /// The account a new conversation runs on, chosen before its first
+    /// message and fixed after it: the conversation belongs to the account
+    /// that started it, and resuming it anywhere else would find nothing.
+    fn account_picker<'a>(
+        &'a self,
+        accounts: ChatAccounts,
+        transitioning: bool,
+    ) -> Element<'a, Message> {
+        let target = self.target;
+        let open = self.account_picker && !transitioning;
+        let label = design::caption(accounts.current.clone())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ));
+        let icon = widget::icon(crate::ui_controls::provider_icon(
+            self.session.launch.provider,
+        ))
+        .size(design::COMPACT_ICON_SIZE);
+        if transitioning || !self.can_choose_provider() {
+            // Fixed: stated, not offered.
+            return crate::interaction::tooltip(
+                widget::row::with_children(vec![icon.into(), label.into()])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                format!(
+                    "This conversation runs on {}. Start a new one to use another account.",
+                    accounts.current
+                ),
+            );
+        }
+        let anchor = widget::button::custom(
+            widget::row::with_children(vec![
+                icon.into(),
+                label.into(),
+                widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center),
+        )
+        .name("Choose an account")
+        .class(crate::ui_controls::control_style(open, None))
+        .padding(CONTROL_PADDING)
+        .on_press(action(Action::AccountPicker(target, !open)));
+        let choices = open.then(|| {
+            widget::column::with_children(
+                accounts
+                    .choices
+                    .into_iter()
+                    .map(|choice| {
+                        let mut row: Vec<Element<'a, Message>> = Vec::new();
+                        match choice.used {
+                            Some(used) => row.push(crate::ui_controls::budget_radial(
+                                used,
+                                design::budget_tone(used),
+                            )),
+                            None => row.push(
+                                iced::widget::Space::new()
+                                    .width(design::RADIAL_GAUGE_SIZE)
+                                    .into(),
+                            ),
+                        }
+                        let mut text: Vec<Element<'a, Message>> = vec![
+                            design::body(choice.label.clone())
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .ellipsize(iced::widget::text::Ellipsize::End(
+                                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .into(),
+                        ];
+                        if !choice.detail.is_empty() {
+                            text.push(design::caption(choice.detail).into());
+                        }
+                        row.push(
+                            widget::column::with_children(text)
+                                .spacing(1)
+                                .width(Length::Fill)
+                                .into(),
+                        );
+                        widget::button::custom(
+                            widget::row::with_children(row)
+                                .spacing(step::GAP_S)
+                                .align_y(Alignment::Center),
+                        )
+                        .name(choice.label)
+                        .selected(choice.selected)
+                        .class(crate::ui_controls::control_style(choice.selected, None))
+                        .padding([step::GAP_XS, step::GAP_S])
+                        .width(Length::Fill)
+                        .on_press(action(Action::ChooseAccount(target, choice.id)))
+                        .into()
+                    })
+                    .chain(std::iter::once(
+                        widget::button::custom(design::caption("Manage accounts…"))
+                            .class(crate::ui_controls::control_style(false, None))
+                            .padding([step::GAP_XS, step::GAP_S])
+                            .width(Length::Fill)
+                            .on_press(Message::AccountUi(crate::app::account_ui::Action::OpenPane))
+                            .into(),
+                    ))
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(2)
+            .width(design::MODEL_POPUP_WIDTH)
+            .into()
+        });
+        crate::ui_controls::popover(
+            anchor,
+            choices,
+            widget::popover::Position::Top,
+            action(Action::AccountPicker(target, false)),
+        )
     }
 
     /// Choosing a model by naming it rather than by finding it in a list.

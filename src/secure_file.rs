@@ -30,7 +30,7 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
+pub(crate) fn reject_symlink_components(path: &Path) -> io::Result<()> {
     let mut ancestors = path
         .ancestors()
         .filter(|path| !path.as_os_str().is_empty())
@@ -49,7 +49,7 @@ fn reject_symlink_components(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_owned_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_owned_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(storage_error(path, "expected a real directory"));

@@ -148,7 +148,7 @@ fn prepare(account: &Account, cache: Option<&Cache>, force: bool, now: u64) -> P
             lock: None,
         };
     };
-    let lock = match cache.try_probe_lock(account.provider.executable()) {
+    let lock = match cache.try_probe_lock(&account.lock_name()) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => return Prepared::Done(Outcome::Busy),
         // Without a lock directory the probe still runs; it only loses the
@@ -170,7 +170,7 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
     Outcome::Answered { identity, snapshot }
 }
 
-fn cli_name(provider: Provider) -> &'static str {
+pub fn cli_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude Code",
         Provider::Codex => "Codex",
@@ -396,6 +396,51 @@ async fn run_json(command: Command) -> Result<Value, String> {
     group.finish().await;
     read.map_err(|_| "The CLI's output could not be read".to_owned())?;
     serde_json::from_slice(&output).map_err(|_| "The CLI printed something unexpected".to_owned())
+}
+
+/// Signs `account` out through its own CLI - `claude auth logout`, `codex
+/// logout` - before its home is deleted, so a login kept outside the home,
+/// in a system keyring, goes with it.
+///
+/// A CLI that is missing, fails, or says there was nothing to sign out of is
+/// not an error: the home is going regardless, and only the CLI knows where
+/// else its login lived. Only a managed account is ever signed out here; the
+/// system account's login is the reader's own.
+pub async fn logout(account: Account) -> Result<(), String> {
+    if account.is_system() {
+        return Err("The system account is not signed out by cagents".into());
+    }
+    let arguments: &[&str] = match account.provider {
+        Provider::Claude => &["auth", "logout"],
+        Provider::Codex => &["logout"],
+        Provider::Omp => return Ok(()),
+    };
+    let executable = account.provider.executable();
+    let Some(program) = tokio::task::spawn_blocking(move || find_executable(executable))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let mut command = command(&account, &program);
+    command.args(arguments);
+    let mut group = Group::spawn(command)?;
+    let finished = tokio::time::timeout(TIMEOUT, async {
+        let mut discard = Vec::new();
+        let _ = group.stdout()?.read_to_end(&mut discard).await;
+        Ok::<(), String>(())
+    })
+    .await;
+    group.finish().await;
+    match finished {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "{} did not sign out within {} seconds",
+            cli_name(account.provider),
+            TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Claude Code: `claude auth status --json` for the identity, and the
@@ -753,6 +798,37 @@ cat >/dev/null
                 .await
                 .is_err()
         );
+    }
+
+    /// Signing a managed account out runs its CLI's own logout in its home,
+    /// and never touches the system account.
+    #[tokio::test]
+    async fn logout_runs_the_cli_in_the_managed_home_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let record = directory.path().join("record");
+        let script = bin.join("codex");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$CODEX_HOME $*\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        let home = directory.path().join("home");
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home.clone());
+        let mut command = command(&account, &script);
+        command.arg("logout");
+        let mut group = Group::spawn(command).unwrap();
+        group.finish().await;
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap().trim(),
+            format!("{} logout", home.display())
+        );
+        assert!(logout(Account::system(Provider::Codex)).await.is_err());
     }
 
     fn make_executable(path: &Path) {

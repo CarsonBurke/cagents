@@ -26,7 +26,11 @@ pub mod cache;
 pub mod claude;
 pub mod codex;
 #[cfg(feature = "ui")]
+pub mod home;
+#[cfg(feature = "ui")]
 pub mod probe;
+#[cfg(feature = "ui")]
+pub mod registry;
 pub mod schedule;
 
 /// A used fraction past which an account is reported as approaching its
@@ -53,10 +57,15 @@ fn fraction(value: f64) -> f32 {
 /// moved or rewritten. A managed home is a directory cagents created for a
 /// further login of the same provider; the CLI is pointed at it through the
 /// same variable, so two accounts never share a credential store.
+///
+/// A managed home is named by the key cagents gave it, and its path is kept
+/// beside the key only so nothing has to recompute it: the key alone decides
+/// the account's identity, so the same account keeps its name however the
+/// data directory is spelled.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AccountHome {
     System,
-    Managed(PathBuf),
+    Managed { key: uuid::Uuid, path: PathBuf },
 }
 
 /// One provider login, identified by the home its CLI keeps it in.
@@ -104,31 +113,65 @@ impl Account {
         }
     }
 
-    /// Every account the usage surfaces report on.
-    ///
-    /// Only the system defaults today; managed homes join this list once
-    /// cagents can create them. Omp brokers its own accounts and reports no
-    /// limits through its CLI, so it has none here.
-    pub fn known() -> Vec<Self> {
-        vec![
+    /// A further login cagents keeps in a home of its own.
+    pub fn managed(provider: Provider, key: uuid::Uuid, path: PathBuf) -> Self {
+        Self {
+            provider,
+            home: AccountHome::Managed { key, path },
+        }
+    }
+
+    /// The system accounts, which every installation reports on whether or
+    /// not it added any account of its own. Omp brokers its own accounts and
+    /// reports no limits through its CLI, so it has none here.
+    pub fn system_accounts() -> [Self; 2] {
+        [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
         ]
     }
 
+    /// The providers cagents can add accounts for, in the order they are
+    /// listed.
+    pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
+
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
         AccountId(match &self.home {
             AccountHome::System => format!("{provider}/system"),
-            AccountHome::Managed(path) => format!("{provider}/{}", path.display()),
+            AccountHome::Managed { key, .. } => format!("{provider}/{key}"),
         })
+    }
+
+    /// The key of a managed account, `None` for the system account.
+    pub fn managed_key(&self) -> Option<uuid::Uuid> {
+        match &self.home {
+            AccountHome::System => None,
+            AccountHome::Managed { key, .. } => Some(*key),
+        }
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.home == AccountHome::System
+    }
+
+    /// The name of this account's probe lock, which keeps two windows from
+    /// probing the same account at once while leaving different accounts of
+    /// one provider free to be probed side by side.
+    pub fn lock_name(&self) -> String {
+        match &self.home {
+            AccountHome::System => self.provider.executable().to_owned(),
+            AccountHome::Managed { key, .. } => {
+                format!("{}-{}", self.provider.executable(), key.simple())
+            }
+        }
     }
 
     /// The directory the CLI keeps this account's login in, resolved against
     /// `environment` the way the CLI itself resolves it.
     pub fn home_directory(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         match &self.home {
-            AccountHome::Managed(path) => Some(path.clone()),
+            AccountHome::Managed { path, .. } => Some(path.clone()),
             AccountHome::System => {
                 let variable = home_variable(self.provider)?;
                 if let Some(explicit) = environment(variable).filter(|value| !value.is_empty()) {
@@ -157,7 +200,9 @@ impl Account {
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
             AccountHome::System => None,
-            AccountHome::Managed(path) => Some((home_variable(self.provider)?, path.clone())),
+            AccountHome::Managed { path, .. } => {
+                Some((home_variable(self.provider)?, path.clone()))
+            }
         }
     }
 
@@ -184,6 +229,56 @@ pub struct Identity {
     /// The provider's plan identifier (`max`, `prolite`), not a display name;
     /// see [`plan_label`].
     pub plan: Option<String>,
+}
+
+impl Identity {
+    /// Whether `self` and `other` are the same provider login seen through
+    /// two homes, which is what makes a second home for it redundant.
+    ///
+    /// Only an email both sides reported can say so: two logins with no
+    /// email are not known to be anyone in particular. Organizations are
+    /// compared where both sides name one, because one person can belong to
+    /// a personal and a team organization under the same address, and those
+    /// are separate allowances.
+    pub fn same_login(&self, other: &Identity) -> bool {
+        let (Some(mine), Some(theirs)) = (self.email.as_deref(), other.email.as_deref()) else {
+            return false;
+        };
+        if !mine.trim().eq_ignore_ascii_case(theirs.trim()) {
+            return false;
+        }
+        match (self.organization.as_deref(), other.organization.as_deref()) {
+            (Some(mine), Some(theirs)) => mine.trim() == theirs.trim(),
+            _ => true,
+        }
+    }
+}
+
+/// The longest name a reader can give an account.
+pub const LABEL_LIMIT: usize = 64;
+
+/// A name the reader typed for an account, as it is stored: trimmed, without
+/// control characters, and at most [`LABEL_LIMIT`] characters. `None` for a
+/// name with nothing left, which clears the name back to the account's email.
+pub fn clean_label(label: &str) -> Option<String> {
+    let cleaned: String = label
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(LABEL_LIMIT)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// What a usage window limits, which decides how it is labelled and grouped.
@@ -761,16 +856,52 @@ mod tests {
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
         assert_eq!(claude.probe_environment(), None);
-        let managed = Account {
-            provider: Provider::Codex,
-            home: AccountHome::Managed("/data/accounts/codex/1".into()),
-        };
+        let key = uuid::Uuid::from_u128(1);
+        let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());
         assert_eq!(
             managed.probe_environment(),
             Some(("CODEX_HOME", PathBuf::from("/data/accounts/codex/1")))
         );
         assert_ne!(managed.id(), codex.id());
         assert_eq!(codex.id().as_str(), "codex/system");
+        assert_eq!(
+            managed.id().as_str(),
+            "codex/00000000-0000-0000-0000-000000000001"
+        );
+        // The same key under a differently spelled data directory is still
+        // the same account.
+        assert_eq!(
+            Account::managed(Provider::Codex, key, "/elsewhere".into()).id(),
+            managed.id()
+        );
+        assert_ne!(managed.lock_name(), codex.lock_name());
+        assert!(!managed.is_system() && codex.is_system());
+    }
+
+    #[test]
+    fn a_login_is_the_same_only_when_both_sides_name_one_address() {
+        let identity = |email: Option<&str>, organization: Option<&str>| Identity {
+            email: email.map(str::to_owned),
+            organization: organization.map(str::to_owned),
+            plan: None,
+        };
+        let work = identity(Some("Me@Example.com"), Some("Acme"));
+        assert!(work.same_login(&identity(Some("me@example.com "), Some("Acme"))));
+        assert!(work.same_login(&identity(Some("me@example.com"), None)));
+        assert!(!work.same_login(&identity(Some("me@example.com"), Some("Personal"))));
+        assert!(!work.same_login(&identity(Some("you@example.com"), Some("Acme"))));
+        assert!(!identity(None, None).same_login(&identity(None, None)));
+    }
+
+    #[test]
+    fn a_typed_label_is_trimmed_bounded_and_single_line() {
+        assert_eq!(clean_label("  Work  "), Some("Work".into()));
+        assert_eq!(clean_label("a\nb\tc"), Some("a b c".into()));
+        assert_eq!(clean_label(" \n "), None);
+        assert_eq!(
+            clean_label(&"x".repeat(200)).map(|label| label.chars().count()),
+            Some(LABEL_LIMIT)
+        );
     }
 
     #[test]

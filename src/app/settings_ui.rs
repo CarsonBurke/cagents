@@ -113,11 +113,86 @@ fn settings_choice<'a>(
     )
 }
 
+/// One provider's default-account choice: the accounts it has, each marked
+/// when it is the one new conversations start on.
+fn default_account_choice<'a>(
+    provider: crate::agent::Provider,
+    choices: &[account_ui::DefaultChoice],
+) -> Setting<'a, Message> {
+    let (label, detail) = match provider {
+        crate::agent::Provider::Claude => (
+            "Claude",
+            "The account new Claude conversations start on. A conversation keeps the account it started on.",
+        ),
+        _ => (
+            "ChatGPT (Codex)",
+            "The account new ChatGPT conversations start on. A conversation keeps the account it started on.",
+        ),
+    };
+    let buttons: Vec<Element<'a, Message>> = choices
+        .iter()
+        .map(|choice| {
+            let marker: Element<'a, Message> = if choice.selected {
+                settings_icon("object-select-symbolic").into()
+            } else {
+                iced::widget::Space::new().width(16).height(16).into()
+            };
+            crate::interaction::hover(
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        marker,
+                        widget::text::body(choice.label.clone()).into(),
+                    ])
+                    .spacing(2.0 * design::GRID_UNIT)
+                    .align_y(Alignment::Center),
+                )
+                .name(choice.label.clone())
+                .class(crate::sidebar::sidebar_button_style(choice.selected))
+                .selected(choice.selected)
+                .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+                .height(design::ROW_HEIGHT)
+                .width(Length::Fill)
+                .on_press(Message::AccountUi(account_ui::Action::SetDefault(
+                    choice.id.clone(),
+                ))),
+            )
+        })
+        .collect();
+    setting_field(
+        label,
+        detail,
+        widget::column::with_children(buttons)
+            .spacing(design::GRID_UNIT)
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
 fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
+    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
 ) -> Vec<Group<'a, Message>> {
     match category {
+        SettingsCategory::Accounts => {
+            let mut settings: Vec<Setting<'a, Message>> = accounts
+                .iter()
+                .filter(|(_, choices)| !choices.is_empty())
+                .map(|(provider, choices)| default_account_choice(*provider, choices))
+                .collect();
+            settings.push(setting_field(
+                "Manage accounts",
+                "Add, rename, sign in to or remove accounts, and compare what each has left.",
+                widget::button::standard("Open Accounts")
+                    .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                    .into(),
+            ));
+            vec![settings_group(
+                "Default accounts",
+                "Each provider's CLI keeps every login in a home of its own. cagents never reads credentials.",
+                settings,
+            )]
+        }
         SettingsCategory::General => vec![settings_group(
             "Runtime",
             "Control how many live columns cagents keeps active and when background work is suspended.",
@@ -545,6 +620,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Links => "web-browser-symbolic",
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
         SettingsCategory::Editor => "accessories-text-editor-symbolic",
+        SettingsCategory::Accounts => "system-users-symbolic",
     }
 }
 
@@ -595,9 +671,10 @@ pub(super) fn settings_pane<'a>(
     draft: &'a SettingsDraft,
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
+    accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
 ) -> Element<'a, Message> {
     iced::widget::responsive(move |size| {
-        settings_layout(category, draft, query, feedback, size.width)
+        settings_layout(category, draft, query, feedback, &accounts, size.width)
     })
     .into()
 }
@@ -607,6 +684,7 @@ fn settings_layout<'a>(
     draft: &'a SettingsDraft,
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
+    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
     width: f32,
 ) -> Element<'a, Message> {
     let narrow = width < RAIL_BREAKPOINT;
@@ -713,7 +791,7 @@ fn settings_layout<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft)
+            settings_category_controls(category, draft, accounts)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );
