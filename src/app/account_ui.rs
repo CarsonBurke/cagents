@@ -1110,8 +1110,9 @@ impl Cagents {
                 };
                 match self.sign_in_card(login.provider, &login.home) {
                     // Closing the terminal ends the login; the next check
-                    // finds it ended and deletes the home.
-                    Some(card) => cosmic::task::message(Message::CloseCard(card)),
+                    // finds it ended and deletes the home. Cancelling is
+                    // itself the answer to whether to stop it.
+                    Some(card) => self.close_card_unasked(card),
                     None => self.check_logins(),
                 }
             }

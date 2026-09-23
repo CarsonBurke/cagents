@@ -4871,6 +4871,16 @@ impl Cagents {
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
         self.lifecycle.remove(card);
         if let Some(state) = self.card_state_mut(card) {
+            // A tab still carrying the default title names the provider it was
+            // opened with; a provider switch on a fresh chat renames it so the
+            // tab does not keep naming an agent it no longer talks to.
+            if let CardKind::Chat(current) = &state.kind {
+                let old = crate::app::chat_ui::chat_card_title(current.launch.provider);
+                if current.launch.provider != session.launch.provider && state.title == old {
+                    state.title =
+                        crate::app::chat_ui::chat_card_title(session.launch.provider).into();
+                }
+            }
             state.kind = CardKind::Chat(session);
             state.residency = Residency::Hot;
         }

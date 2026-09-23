@@ -167,7 +167,15 @@ impl Column {
 struct Layout {
     columns: Vec<Column>,
     usage: f32,
+    /// Too narrow for a row of columns: each account's figures go on a
+    /// line of their own under its name, each titled.
+    stacked: bool,
+    /// Too narrow for the pane's description beside its controls.
+    compact_toolbar: bool,
 }
+
+/// Below this the toolbar's description goes above its controls.
+const TOOLBAR_MIN_WIDTH: f32 = 600.0;
 
 fn layout(width: f32) -> Layout {
     let available = width.min(MAX_WIDTH) - 2.0 * GUTTER;
@@ -180,22 +188,32 @@ fn layout(width: f32) -> Layout {
                 .sum::<f32>()
             + COLUMN_SPACING
     };
+    let compact_toolbar = available < TOOLBAR_MIN_WIDTH;
     let mut columns = Column::ORDER.to_vec();
     for drop in Column::DROP_ORDER {
         if needed(&columns, USAGE_WIDTH) <= available {
             return Layout {
                 columns,
                 usage: USAGE_WIDTH,
+                stacked: false,
+                compact_toolbar,
             };
         }
         columns.retain(|column| *column != drop);
     }
-    let usage = if needed(&columns, USAGE_WIDTH) <= available {
-        USAGE_WIDTH
+    let (usage, stacked) = if needed(&columns, USAGE_WIDTH) <= available {
+        (USAGE_WIDTH, false)
+    } else if needed(&columns, NARROW_USAGE_WIDTH) <= available {
+        (NARROW_USAGE_WIDTH, false)
     } else {
-        NARROW_USAGE_WIDTH
+        (NARROW_USAGE_WIDTH, true)
     };
-    Layout { columns, usage }
+    Layout {
+        columns,
+        usage,
+        stacked,
+        compact_toolbar,
+    }
 }
 
 /// The tightest of an account's windows of `kind`.
@@ -262,7 +280,7 @@ pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
 fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
-    let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state)];
+    let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
     for provider in Account::PROVIDERS {
         sections.push(group(app, provider, &layout));
     }
@@ -282,7 +300,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     .into()
 }
 
-fn toolbar(state: &State) -> Element<'_, Message> {
+fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
     let action = |action| Message::AccountUi(action);
     let sort = crate::ui_controls::segmented_controls(
         Sort::ALL
@@ -305,21 +323,34 @@ fn toolbar(state: &State) -> Element<'_, Message> {
             })
             .collect(),
     );
-    let add_button = widget::button::custom(
-        widget::row::with_children(vec![
-            widget::icon(crate::ui_controls::symbolic_icon("list-add-symbolic"))
-                .size(design::COMPACT_ICON_SIZE)
+    let mut add_content: Vec<Element<'a, Message>> = vec![
+        widget::icon(crate::ui_controls::symbolic_icon("list-add-symbolic"))
+            .size(design::COMPACT_ICON_SIZE)
+            .into(),
+    ];
+    // A card too narrow for columns has no room for the words either.
+    if !layout.stacked {
+        add_content.push(
+            design::body("Add account")
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .into(),
-            design::body("Add account").into(),
-        ])
-        .spacing(design::GRID_UNIT * 1.5)
-        .align_y(Alignment::Center),
+        );
+    }
+    let add_button = widget::button::custom(
+        widget::row::with_children(add_content)
+            .spacing(design::GRID_UNIT * 1.5)
+            .align_y(Alignment::Center),
     )
     .name("Add account")
     .selected(state.table.add_menu)
     .class(cosmic::theme::Button::Suggested)
     .padding([design::GRID_UNIT, design::GRID_UNIT * 3.0])
     .on_press(action(Action::AddMenu(!state.table.add_menu)));
+    let add_button: Element<'a, Message> = if layout.stacked {
+        crate::interaction::tooltip(add_button, "Add account")
+    } else {
+        add_button.into()
+    };
     let add = crate::ui_controls::popover(
         add_button,
         state.table.add_menu.then(|| {
@@ -364,24 +395,35 @@ fn toolbar(state: &State) -> Element<'_, Message> {
         widget::popover::Position::Bottom,
         action(Action::AddMenu(false)),
     );
-    widget::row::with_children(vec![
-        widget::column::with_children(vec![
-            design::heading("Accounts").into(),
-            design::caption(
-                "Usage limits as each provider's own CLI reports them. Every login stays with its CLI; cagents never reads credentials.",
-            )
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+    let description = widget::column::with_children(vec![
+        design::heading("Accounts").into(),
+        design::caption(
+            "Usage limits as each provider's own CLI reports them. Every login stays with its CLI; cagents never reads credentials.",
+        )
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+        .into(),
+    ])
+    .spacing(design::GRID_UNIT)
+    .width(Length::Fill);
+    if layout.compact_toolbar {
+        return widget::column::with_children(vec![
+            description.into(),
+            widget::row::with_children(vec![
+                sort,
+                iced::widget::Space::new().width(Length::Fill).into(),
+                add,
+            ])
+            .spacing(design::GRID_UNIT * 3.0)
+            .align_y(Alignment::Center)
             .into(),
         ])
-        .spacing(design::GRID_UNIT)
-        .width(Length::Fill)
-        .into(),
-        sort,
-        add,
-    ])
-    .spacing(design::GRID_UNIT * 3.0)
-    .align_y(Alignment::Center)
-    .into()
+        .spacing(design::GRID_UNIT * 3.0)
+        .into();
+    }
+    widget::row::with_children(vec![description.into(), sort, add])
+        .spacing(design::GRID_UNIT * 3.0)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'a, Message> {
@@ -418,7 +460,7 @@ fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'
     .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
-    if count > 0 || !logins.is_empty() {
+    if (count > 0 || !logins.is_empty()) && !layout.stacked {
         lines.push(column_titles(layout));
     }
     for account in &rows {
@@ -581,13 +623,49 @@ fn row<'a>(app: &'a Cagents, account: &'a AccountState, layout: &Layout) -> Elem
             };
             (column.width(layout.usage), cell)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if layout.stacked {
+        return stacked_row(
+            account_cell(state, account),
+            layout.columns.iter().copied().zip(cells).collect(),
+            actions(state, account, now),
+        );
+    }
     line(
         account_cell(state, account),
         cells,
         actions(state, account, now),
         ROW_HEIGHT,
     )
+}
+
+/// A row for a card too narrow for columns: the account and its actions,
+/// then its figures side by side beneath, each under its column's title.
+fn stacked_row<'a>(
+    account: Element<'a, Message>,
+    cells: Vec<(Column, (f32, Element<'a, Message>))>,
+    actions: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let figures = cells.into_iter().map(|(column, (_, cell))| {
+        widget::column::with_children(vec![design::caption(column.title()).into(), cell])
+            .spacing(design::GRID_UNIT)
+            .width(Length::Fill)
+            .into()
+    });
+    widget::column::with_children(vec![
+        line(account, Vec::new(), actions, ROW_HEIGHT),
+        widget::container(
+            widget::row::with_children(figures.collect::<Vec<_>>()).spacing(COLUMN_SPACING),
+        )
+        .padding(Padding {
+            top: 0.0,
+            right: design::GRID_UNIT * 3.0,
+            bottom: design::GRID_UNIT * 3.0,
+            left: design::GRID_UNIT * 3.0,
+        })
+        .into(),
+    ])
+    .into()
 }
 
 fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message> {
@@ -604,11 +682,14 @@ fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, 
             .on_submit(|_| Message::AccountUi(Action::RenameCommit))
             .width(Length::Fill)
             .into(),
+        // Filling the cell is what lets a long name give way to the badge
+        // after it instead of running under the row's actions.
         None => design::body(state.display_name(account))
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ))
+            .width(Length::Fill)
             .into(),
     };
     let mut title: Vec<Element<'a, Message>> = vec![name];
@@ -916,9 +997,16 @@ mod tests {
             }
         }
         assert_eq!(dropped, Column::DROP_ORDER.to_vec());
-        let narrow = layout(360.0);
+        assert!(!wide.stacked && !wide.compact_toolbar);
+        let narrow = layout(520.0);
         assert_eq!(narrow.columns, [Column::Session, Column::Weekly]);
         assert_eq!(narrow.usage, NARROW_USAGE_WIDTH);
+        assert!(!narrow.stacked && narrow.compact_toolbar);
+        // Never a row with no room for the account's name: its figures
+        // move under it instead.
+        let stacked = layout(360.0);
+        assert_eq!(stacked.columns, [Column::Session, Column::Weekly]);
+        assert!(stacked.stacked);
     }
 
     fn account_with(provider: Provider, key: u128, left: Option<(f32, i64)>) -> AccountState {

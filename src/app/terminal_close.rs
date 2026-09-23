@@ -37,6 +37,17 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 
 impl Cagents {
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
+        self.close_card_as(card, !self.settings.confirm_terminal_close)
+    }
+
+    /// Closes `card` without asking whether to stop what its terminal is
+    /// running, for a close the reader already asked for in so many words -
+    /// cancelling a sign-in, say. The daemon's identity checks still apply.
+    pub(super) fn close_card_unasked(&mut self, card: CardId) -> Task<Message> {
+        self.close_card_as(card, true)
+    }
+
+    fn close_card_as(&mut self, card: CardId, allow_active: bool) -> Task<Message> {
         if self.terminal_close.is_some() {
             return Task::none();
         }
@@ -74,7 +85,7 @@ impl Cagents {
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
                 return close_focus(0);
             }
-            return self.start_terminal_close(!self.settings.confirm_terminal_close);
+            return self.start_terminal_close(allow_active);
         }
         self.request_card_removal(card)
     }
