@@ -2708,6 +2708,13 @@ pub enum Message {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     },
+    /// `None` when the terminal is no longer hosted and would have to be
+    /// launched again, which waits until its card is opened.
+    RestoredAgentAttached {
+        card: CardId,
+        terminal: TerminalId,
+        result: Result<Option<StartedTerminal>, String>,
+    },
     TerminalHandoffsCommitted {
         terminals: Vec<TerminalSession>,
         result: Result<(), String>,
@@ -3343,6 +3350,9 @@ pub struct Cagents {
     terminal_starts: std::sync::atomic::AtomicUsize,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
+    /// Restored agent terminals that are not on screen, attached one at a
+    /// time after startup so their rows show what the agent is doing.
+    restored_agent_attaches: VecDeque<CardId>,
     relaunched_terminals: HashSet<TerminalId>,
     /// The shared sidebar model as this window last saw it.
     workspace_model: crate::workspace_model::WorkspaceModel,
@@ -3826,7 +3836,12 @@ impl Cagents {
                     } else {
                         // Restored terminals remain detached until lifecycle
                         // reconciliation admits them under the terminal startup
-                        // budget.
+                        // budget. An agent's row still has to report what the
+                        // agent is doing, which takes an attached connection
+                        // but no visible surface.
+                        if agent_ui::observes_terminal_agent(&session) {
+                            self.restored_agent_attaches.push_back(card.id);
+                        }
                         self.cards.insert(card.id, CardRuntime::Loading);
                     }
                 }
@@ -3894,6 +3909,7 @@ impl Cagents {
         // renders an explicit external-open path instead.
         Task::batch([
             self.reconcile_lifecycle(&initially_visible, &initially_prefetch),
+            self.attach_next_restored_agent(),
             Task::batch(repository_tasks),
         ])
     }
@@ -3908,57 +3924,13 @@ impl Cagents {
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
         self.begin_terminal_start();
-        let max_scrollback = self.settings.terminal_scrollback_lines;
-        let theme = self.settings.terminal_theme;
+        let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let config = TerminalConfig {
-                    initially_visible: visible,
-                    max_scrollback,
-                    theme,
-                    ..TerminalConfig::default()
-                };
-                let recovered = daemon_recovery::reconcile(session, explicit_retry)?;
-                let recovery_lease = recovered.recovery_lease;
-                let session = recovered.session;
-                let mode = terminal_start_mode(&session)?;
-                let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
-                let wake = move |wake: crate::terminal::TerminalWake| {
-                    // Each terminal source coalesces visual and semantic edges
-                    // until the app acknowledges them. The unbounded app queue
-                    // is therefore O(live cards), not O(terminal event volume),
-                    // and cannot strand a source edge because a fixed queue filled.
-                    let _ = sender.try_send(TerminalWakeup {
-                        card,
-                        generation: wake.generation,
-                    });
-                };
-                let handle = match mode {
-                    TerminalStartMode::Attach(proof) => {
-                        HostedTerminalHandle::connect(session.id, Some(proof), wake)
-                    }
-                    TerminalStartMode::Spawn(recipe) => {
-                        let mut session = session.clone();
-                        session.launch = recipe;
-                        HostedTerminalHandle::attach_or_spawn(
-                            session,
-                            config,
-                            recovered.expected_host,
-                            wake,
-                        )
-                    }
-                }
-                .map_err(|error| error.to_string())?;
-                handle.wait_until_attached(Duration::from_secs(10))?;
-                drop(recovery_lease);
-                let surface = TerminalSurface::from(handle);
-                Ok(StartedTerminal {
-                    handle: surface,
-                    session,
-                    spawned,
-                })
+                let (recovered, mode) = recover_terminal(session, explicit_retry)?;
+                open_terminal(card, recovered, mode, config, sender)
             })
             .await
             .map_err(|error| format!("terminal worker join failed: {error}"))
@@ -3969,6 +3941,202 @@ impl Cagents {
                 result,
             }
         })
+    }
+
+    /// Attaches a restored agent terminal that is not on screen, so its row
+    /// reports what the agent is doing before anyone opens the card. Only a
+    /// terminal the daemon still hosts is attached: launching one again is the
+    /// user's decision, made by opening the card.
+    fn attach_restored_agent(&self, card: CardId, session: TerminalSession) -> Task<Message> {
+        self.begin_terminal_start();
+        let config = self.terminal_config(false);
+        let sender = self.terminal_wake_tx.clone();
+        let terminal = session.id;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let (recovered, mode) = recover_terminal(session, false)?;
+                if matches!(mode, TerminalStartMode::Spawn(_)) {
+                    return Ok(None);
+                }
+                open_terminal(card, recovered, mode, config, sender).map(Some)
+            })
+            .await
+            .map_err(|error| format!("terminal worker join failed: {error}"))
+            .and_then(|result| result);
+            Message::RestoredAgentAttached {
+                card,
+                terminal,
+                result,
+            }
+        })
+    }
+
+    /// Starts the next queued restored agent attach that still applies, once
+    /// no other terminal start is outstanding. Each attach holds the daemon's
+    /// recovery lease, so they run one at a time and never ahead of a card
+    /// being opened, which needs that lease too.
+    pub(super) fn attach_next_restored_agent(&mut self) -> Task<Message> {
+        if self.terminal_starts_in_flight() > 0 {
+            return Task::none();
+        }
+        while let Some(card) = self.restored_agent_attaches.pop_front() {
+            if !matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))) {
+                continue;
+            }
+            if let Some(session) = deferred_terminal_session(
+                self.card_state(card),
+                matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
+            ) {
+                return self.attach_restored_agent(card, session);
+            }
+        }
+        Task::none()
+    }
+
+    fn terminal_started(
+        &mut self,
+        card: CardId,
+        terminal: TerminalId,
+        result: Result<StartedTerminal, String>,
+    ) -> Task<Message> {
+        let accept = can_accept_terminal_start(
+            self.durable.cards.iter().find(|state| state.id == card),
+            self.lifecycle.state(card).is_some(),
+            matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
+        ) && self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal),
+        );
+        if !accept {
+            if let Ok(started) = result
+                && started.spawned
+            {
+                self.begin_terminal_teardown(started.handle);
+            }
+            // Nothing will claim this identity, so a held observation
+            // is free to decide about it.
+            return self.finish_terminal_start();
+        }
+        // A card still hibernated when its start lands is a restored agent
+        // attached only for its row.
+        let hibernated = matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated)));
+
+        let mut tasks = Vec::new();
+        match result {
+            Ok(started) => {
+                if let Some(proof) = started.session.continuity.live_proof() {
+                    // A replacement daemon cannot own the previous
+                    // daemon's in-memory receipts.
+                    self.pending_terminal_handoffs.retain(|_, pending| {
+                        pending
+                            .continuity
+                            .live_proof()
+                            .is_none_or(|stored| stored == proof)
+                    });
+                    self.pending_terminal_handoffs
+                        .insert(started.session.id, started.session.clone());
+                }
+                self.terminal_recovery_attempts.remove(&terminal);
+                self.terminal_recovery_attempts.remove(&started.session.id);
+                if started.session.id != terminal
+                    && let Some(writer) = &self.session
+                {
+                    writer.replace_terminal_identity(card, terminal, started.session.clone());
+                }
+                if let Some(state) = self.card_state_mut(card) {
+                    state.kind = CardKind::Terminal(started.session);
+                }
+                let handle = started.handle;
+                // A worker can publish its first event before this start
+                // result reaches the UI. Adopt and drain it before sending
+                // commands, which could otherwise mask a permanent failure
+                // as a closed visibility channel.
+                self.cards.insert(card, CardRuntime::Terminal(handle));
+                tasks.push(self.drain_terminal(card, 0));
+                if ended_terminal(self.card_state(card)).is_some() {
+                    // The daemon can report a session that already
+                    // ended without a queued event to drain, and a card
+                    // registered as hydrating has nothing else left to
+                    // resolve it.
+                    self.lifecycle.remove(card);
+                    if let Some(state) = self.card_state_mut(card) {
+                        state.residency = Residency::Hibernated;
+                    }
+                    self.persist();
+                    tasks.push(self.commit_terminal_handoffs());
+                    tasks.push(self.finish_terminal_start());
+                    return Task::batch(tasks);
+                }
+                let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+                    tasks.push(cosmic::task::message(Message::LifecycleSweep));
+                    self.persist();
+                    tasks.push(self.commit_terminal_handoffs());
+                    tasks.push(self.finish_terminal_start());
+                    return Task::batch(tasks);
+                };
+                if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not apply terminal theme: {error}"
+                    )));
+                }
+                let visible = terminal_start_visibility(
+                    self.durable.cards.iter().find(|state| state.id == card),
+                )
+                .expect("accepted terminal start has an open terminal card")
+                    && self.workspace_surfaces_visible();
+                // A restored agent attached while its card stays
+                // hibernated keeps only the connection its row needs.
+                let visibility = if hibernated {
+                    handle.hibernate()
+                } else if visible {
+                    handle.reveal()
+                } else {
+                    handle.hide()
+                };
+                match visibility {
+                    Ok(()) => {
+                        if self.finish_initial_hydration(card, Ok(())) {
+                            let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
+                            tasks.push(self.request_lifecycle_sweep(delay));
+                        }
+                    }
+                    Err(error) => {
+                        let error =
+                            format!("could not apply restored terminal visibility: {error}");
+                        self.fail_runtime(card, error.clone());
+                        self.status = Some(TransientNotice::error(error));
+                        tasks.push(cosmic::task::message(Message::LifecycleSweep));
+                    }
+                }
+            }
+            Err(error) => {
+                self.fail_runtime(card, error.clone());
+                self.status = Some(TransientNotice::error(error));
+                tasks.push(cosmic::task::message(Message::LifecycleSweep));
+            }
+        }
+        // A hibernated card holds no hot slot for the sweep to reclaim.
+        if !hibernated
+            && self
+                .card_state(card)
+                .is_some_and(|state| state.exposure == Exposure::Offscreen)
+        {
+            tasks.push(self.reconcile_scoped_lifecycle());
+        }
+        self.persist();
+        tasks.push(self.commit_terminal_handoffs());
+        // Released last: until the card holds the identity this start
+        // settled on, adoption would see an unclaimed live terminal.
+        tasks.push(self.finish_terminal_start());
+        Task::batch(tasks)
+    }
+
+    fn terminal_config(&self, visible: bool) -> TerminalConfig {
+        TerminalConfig {
+            initially_visible: visible,
+            max_scrollback: self.settings.terminal_scrollback_lines,
+            theme: self.settings.terminal_theme,
+            ..TerminalConfig::default()
+        }
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
@@ -5067,9 +5235,21 @@ impl Cagents {
         {
             self.observe_agent_update_for_card(card);
         }
-        if let Some((key, activity)) =
-            activity.and_then(|activity| self.agent_worktree(card).map(|key| (key, activity)))
-        {
+        // A turn that ends has often pushed a branch or opened a pull request;
+        // one that stops to ask for permission has not finished anything.
+        let finished = previous == Some(crate::agent::ActivityState::Working)
+            && !matches!(
+                next,
+                Some(crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting)
+            );
+        // Every terminal wake lands here, so a plain shell resolves nothing.
+        let worktree = (finished || activity.is_some())
+            .then(|| self.agent_worktree(card))
+            .flatten();
+        if finished && let Some(key) = &worktree {
+            self.refresh_ui.mark_stale(key.project_id);
+        }
+        if let Some((key, activity)) = worktree.zip(activity) {
             self.sidebar_state
                 .set_agent_activity(card, key.project_id, key.worktree_id, activity);
         } else if let Some(activity) = activity {
@@ -6031,8 +6211,15 @@ impl Cagents {
                         let session = session.clone();
                         let visible = state.exposure == Exposure::Visible
                             && self.workspace_surfaces_visible();
+                        // Failing the runtime below forgets that it was
+                        // hibernated, which decides how it recovers.
+                        let hibernated = self
+                            .lifecycle
+                            .state(card)
+                            .filter(|(_, residency)| **residency == Residency::Hibernated)
+                            .map(|(exposure, _)| *exposure);
                         if self.terminal_recovery_attempts.insert(session.id) {
-                            recovery = Some((session, visible));
+                            recovery = Some((session, visible, hibernated));
                         }
                     }
                     self.fail_runtime(card, message.clone());
@@ -6052,7 +6239,22 @@ impl Cagents {
         if durable_changed {
             self.persist();
         }
-        if let Some((session, visible)) = recovery {
+        if let Some((session, visible, hibernated)) = recovery {
+            // A hibernated agent kept attached for its row goes back to
+            // waiting for its card: it may be attached again, but launching it
+            // again is the user's decision, made by opening the card.
+            if let Some(exposure) =
+                hibernated.filter(|_| !visible && agent_ui::observes_terminal_agent(&session))
+            {
+                self.lifecycle
+                    .register(card, exposure, Residency::Hibernated, Instant::now());
+                if let Some(state) = self.card_state_mut(card) {
+                    state.residency = Residency::Hibernated;
+                }
+                self.cards.insert(card, CardRuntime::Loading);
+                self.restored_agent_attaches.push_back(card);
+                return self.attach_next_restored_agent();
+            }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
             };
@@ -8961,6 +9163,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
@@ -9265,132 +9468,23 @@ impl Application for Cagents {
                 card,
                 terminal,
                 result,
+            } => self.terminal_started(card, terminal, result),
+            Message::RestoredAgentAttached {
+                card,
+                terminal,
+                result,
             } => {
-                let accept = can_accept_terminal_start(
-                    self.durable.cards.iter().find(|state| state.id == card),
-                    self.lifecycle.state(card).is_some(),
-                    matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
-                ) && self.card_state(card).is_some_and(|state|
-                    matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal));
-                if !accept {
-                    if let Ok(started) = result
-                        && started.spawned
-                    {
-                        self.begin_terminal_teardown(started.handle);
-                    }
-                    // Nothing will claim this identity, so a held observation
-                    // is free to decide about it.
-                    return self.finish_terminal_start();
-                }
-
-                let mut tasks = Vec::new();
                 match result {
-                    Ok(started) => {
-                        if let Some(proof) = started.session.continuity.live_proof() {
-                            // A replacement daemon cannot own the previous
-                            // daemon's in-memory receipts.
-                            self.pending_terminal_handoffs.retain(|_, pending| {
-                                pending
-                                    .continuity
-                                    .live_proof()
-                                    .is_none_or(|stored| stored == proof)
-                            });
-                            self.pending_terminal_handoffs
-                                .insert(started.session.id, started.session.clone());
-                        }
-                        self.terminal_recovery_attempts.remove(&terminal);
-                        self.terminal_recovery_attempts.remove(&started.session.id);
-                        if started.session.id != terminal
-                            && let Some(writer) = &self.session
-                        {
-                            writer.replace_terminal_identity(
-                                card,
-                                terminal,
-                                started.session.clone(),
-                            );
-                        }
-                        if let Some(state) = self.card_state_mut(card) {
-                            state.kind = CardKind::Terminal(started.session);
-                        }
-                        let handle = started.handle;
-                        // A worker can publish its first event before this start
-                        // result reaches the UI. Adopt and drain it before sending
-                        // commands, which could otherwise mask a permanent failure
-                        // as a closed visibility channel.
-                        self.cards.insert(card, CardRuntime::Terminal(handle));
-                        tasks.push(self.drain_terminal(card, 0));
-                        if ended_terminal(self.card_state(card)).is_some() {
-                            // The daemon can report a session that already
-                            // ended without a queued event to drain, and a card
-                            // registered as hydrating has nothing else left to
-                            // resolve it.
-                            self.lifecycle.remove(card);
-                            if let Some(state) = self.card_state_mut(card) {
-                                state.residency = Residency::Hibernated;
-                            }
-                            self.persist();
-                            tasks.push(self.commit_terminal_handoffs());
-                            tasks.push(self.finish_terminal_start());
-                            return Task::batch(tasks);
-                        }
-                        let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                            tasks.push(cosmic::task::message(Message::LifecycleSweep));
-                            self.persist();
-                            tasks.push(self.commit_terminal_handoffs());
-                            tasks.push(self.finish_terminal_start());
-                            return Task::batch(tasks);
-                        };
-                        if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
-                            self.status = Some(TransientNotice::error(format!(
-                                "Could not apply terminal theme: {error}"
-                            )));
-                        }
-                        let visible = terminal_start_visibility(
-                            self.durable.cards.iter().find(|state| state.id == card),
-                        )
-                        .expect("accepted terminal start has an open terminal card")
-                            && self.workspace_surfaces_visible();
-                        let visibility = if visible {
-                            handle.reveal()
-                        } else {
-                            handle.hide()
-                        };
-                        match visibility {
-                            Ok(()) => {
-                                if self.finish_initial_hydration(card, Ok(())) {
-                                    let delay =
-                                        Duration::from_millis(self.settings.hibernation_delay_ms);
-                                    tasks.push(self.request_lifecycle_sweep(delay));
-                                }
-                            }
-                            Err(error) => {
-                                let error = format!(
-                                    "could not apply restored terminal visibility: {error}"
-                                );
-                                self.fail_runtime(card, error.clone());
-                                self.status = Some(TransientNotice::error(error));
-                                tasks.push(cosmic::task::message(Message::LifecycleSweep));
-                            }
-                        }
-                    }
+                    Ok(Some(started)) => self.terminal_started(card, terminal, Ok(started)),
+                    Ok(None) => self.finish_terminal_start(),
+                    // Nobody is looking at this card, so its failure is not
+                    // reported here. Opening it starts the terminal again and
+                    // reports whatever still stands in the way.
                     Err(error) => {
-                        self.fail_runtime(card, error.clone());
-                        self.status = Some(TransientNotice::error(error));
-                        tasks.push(cosmic::task::message(Message::LifecycleSweep));
+                        tracing::debug!(?card, %error, "restored agent terminal stays detached");
+                        self.finish_terminal_start()
                     }
                 }
-                if self
-                    .card_state(card)
-                    .is_some_and(|state| state.exposure == Exposure::Offscreen)
-                {
-                    tasks.push(self.reconcile_scoped_lifecycle());
-                }
-                self.persist();
-                tasks.push(self.commit_terminal_handoffs());
-                // Released last: until the card holds the identity this start
-                // settled on, adoption would see an unclaimed live terminal.
-                tasks.push(self.finish_terminal_start());
-                Task::batch(tasks)
             }
             Message::TerminalWake { card, generation } => {
                 let started =
@@ -12615,6 +12709,57 @@ fn load_repository(
     })
 }
 
+/// Finds the terminal a start should attach to, or the launch it should make.
+fn recover_terminal(
+    session: TerminalSession,
+    explicit_retry: bool,
+) -> Result<(daemon_recovery::RecoveredTerminal, TerminalStartMode), String> {
+    let recovered = daemon_recovery::reconcile(session, explicit_retry)?;
+    let mode = terminal_start_mode(&recovered.session)?;
+    Ok((recovered, mode))
+}
+
+fn open_terminal(
+    card: CardId,
+    recovered: daemon_recovery::RecoveredTerminal,
+    mode: TerminalStartMode,
+    config: TerminalConfig,
+    sender: async_channel::Sender<TerminalWakeup>,
+) -> Result<StartedTerminal, String> {
+    let recovery_lease = recovered.recovery_lease;
+    let session = recovered.session;
+    let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
+    let wake = move |wake: crate::terminal::TerminalWake| {
+        // Each terminal source coalesces visual and semantic edges until the
+        // app acknowledges them. The unbounded app queue is therefore O(live
+        // cards), not O(terminal event volume), and cannot strand a source
+        // edge because a fixed queue filled.
+        let _ = sender.try_send(TerminalWakeup {
+            card,
+            generation: wake.generation,
+        });
+    };
+    let handle = match mode {
+        TerminalStartMode::Attach(proof) => {
+            HostedTerminalHandle::connect(session.id, Some(proof), wake)
+        }
+        TerminalStartMode::Spawn(recipe) => {
+            let mut session = session.clone();
+            session.launch = recipe;
+            HostedTerminalHandle::attach_or_spawn(session, config, recovered.expected_host, wake)
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    handle.wait_until_attached(Duration::from_secs(10))?;
+    drop(recovery_lease);
+    let surface = TerminalSurface::from(handle);
+    Ok(StartedTerminal {
+        handle: surface,
+        session,
+        spawned,
+    })
+}
+
 fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, String> {
     match &session.continuity {
         TerminalContinuity::Live { .. } | TerminalContinuity::DetachedSameBoot { .. } => {
@@ -15608,6 +15753,113 @@ mod tests {
         );
     }
 
+    fn restored_live_terminal(program: &str, exposure: Exposure) -> CardState {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let mut card = terminal_card_state();
+        card.exposure = exposure;
+        card.residency = Residency::Hibernated;
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!("terminal fixture");
+        };
+        session.launch.program = program.into();
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        card
+    }
+
+    /// An agent's row reports what it is doing only through an attached
+    /// terminal, so a restored agent off screen is attached without waiting
+    /// for its card to be opened, while a plain shell stays detached.
+    #[test]
+    fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
+        let mut app = context_inspector_test_app(false);
+        let visible = restored_live_terminal("/bin/sh", Exposure::Visible);
+        let agents = [
+            restored_live_terminal("/usr/bin/claude", Exposure::Offscreen),
+            restored_live_terminal("/usr/bin/codex", Exposure::Offscreen),
+        ];
+        let shell = restored_live_terminal("/bin/sh", Exposure::Offscreen);
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(visible.id),
+            cards: [visible.clone(), shell.clone()]
+                .into_iter()
+                .chain(agents.clone())
+                .collect(),
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let terminal = |card: &CardState| match &card.kind {
+            CardKind::Terminal(session) => session.id,
+            _ => unreachable!("terminal fixture"),
+        };
+        drop(app.initialize_runtimes());
+        // The card on screen starts first; agents wait for its recovery lease.
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert_eq!(app.restored_agent_attaches, [agents[0].id, agents[1].id]);
+        let _ = app.update(Message::TerminalStarted {
+            card: visible.id,
+            terminal: terminal(&visible),
+            result: Err("fixture".into()),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert_eq!(app.restored_agent_attaches, [agents[1].id]);
+        let notices = app.notices.entries.len();
+
+        // A terminal that would have to be launched again stays detached, and
+        // so does one that cannot be attached; neither is a failure anyone
+        // has to see.
+        let _ = app.update(Message::RestoredAgentAttached {
+            card: agents[0].id,
+            terminal: terminal(&agents[0]),
+            result: Ok(None),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert!(app.restored_agent_attaches.is_empty());
+        let _ = app.update(Message::RestoredAgentAttached {
+            card: agents[1].id,
+            terminal: terminal(&agents[1]),
+            result: Err("the daemon is unavailable".into()),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        for card in agents.iter().chain([&shell]) {
+            assert!(matches!(
+                app.cards.get(&card.id),
+                Some(CardRuntime::Loading)
+            ));
+            assert_eq!(
+                app.lifecycle.state(card.id).map(|(_, residency)| residency),
+                Some(&Residency::Hibernated)
+            );
+        }
+        assert_eq!(app.notices.entries.len(), notices);
+    }
+
+    #[test]
+    fn a_queued_agent_attach_yields_to_the_cards_own_start() {
+        let mut app = context_inspector_test_app(false);
+        let agent = restored_live_terminal("/usr/bin/claude", Exposure::Offscreen);
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![agent.clone()],
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.cards.insert(agent.id, CardRuntime::Loading);
+        app.lifecycle.register(
+            agent.id,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+            Instant::now(),
+        );
+        app.restored_agent_attaches.push_back(agent.id);
+        drop(app.attach_next_restored_agent());
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+    }
+
     #[test]
     fn restored_successful_terminal_is_completed_without_automatic_relaunch() {
         let mut app = context_inspector_test_app(true);
@@ -16808,6 +17060,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
@@ -16960,6 +17213,41 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert!(app.sidebar_state.has_card_update(third_id));
     }
+    #[test]
+    fn an_agent_finishing_its_turn_marks_its_project_for_a_read() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        use crate::model::WorktreeId;
+        use crate::sidebar::{SidebarProject, SidebarWorktree};
+
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/tmp".into(),
+            vec![SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                "/tmp".into(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Claude,
+                state,
+            })
+        };
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Waiting));
+        assert!(!app.refresh_ui.is_stale(project));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
+        assert!(app.refresh_ui.is_stale(project));
+    }
+
     #[test]
     fn restored_duplicate_projects_preserve_worktrees_and_writer_generations() {
         let directory = tempfile::tempdir().unwrap();

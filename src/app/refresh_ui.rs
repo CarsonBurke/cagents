@@ -1,11 +1,21 @@
 use super::*;
 
+/// How long the selected project's rows may go unread while the window is
+/// focused.
+const SELECTED_PROJECT_INTERVAL: Duration = Duration::from_secs(60);
+/// Every other project's rows draw the same pull request and check state, so
+/// they are read as well, less often and one at a time.
+const BACKGROUND_PROJECT_INTERVAL: Duration = Duration::from_secs(120);
+/// A project something has made stale is still read at most this often, so an
+/// agent finishing turn after turn cannot keep its project's reads going.
+const STALE_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
+
 pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
-    last_projects: Instant,
+    schedule: ProjectSchedule,
     last_pull_request: Instant,
 }
 
@@ -16,9 +26,90 @@ impl Default for State {
             source_generation: 0,
             source_cancel: None,
             projects: HashMap::new(),
-            last_projects: Instant::now(),
+            schedule: ProjectSchedule::default(),
             last_pull_request: Instant::now(),
         }
+    }
+}
+
+/// When each project was last read, and which ones something has made worth
+/// reading before their interval is up.
+#[derive(Debug, Default)]
+struct ProjectSchedule {
+    read: HashMap<ProjectId, Instant>,
+    stale: HashSet<ProjectId>,
+}
+
+impl ProjectSchedule {
+    fn started(&mut self, project: ProjectId, now: Instant) {
+        self.read.insert(project, now);
+        self.stale.remove(&project);
+    }
+
+    fn retain(&mut self, open: impl Fn(ProjectId) -> bool) {
+        self.read.retain(|&project, _| open(project));
+        self.stale.retain(|&project| open(project));
+    }
+
+    fn mark_stale(&mut self, project: ProjectId) {
+        self.stale.insert(project);
+    }
+
+    fn due(&self, project: ProjectId, interval: Duration, now: Instant) -> bool {
+        let interval = if self.stale.contains(&project) {
+            interval.min(STALE_PROJECT_INTERVAL)
+        } else {
+            interval
+        };
+        self.read
+            .get(&project)
+            .is_none_or(|&read| now.duration_since(read) >= interval)
+    }
+
+    /// The one project a refresh tick reads, if any. The selected project
+    /// keeps its own cadence; the rest wait until no read is in flight, so a
+    /// long project list costs one `git` and `gh` round at a time rather than
+    /// a burst, and the one read longest ago goes first.
+    fn next(
+        &self,
+        selected: Option<ProjectId>,
+        others: impl IntoIterator<Item = ProjectId>,
+        in_flight: &HashMap<ProjectId, CancellationToken>,
+        regained_focus: bool,
+        now: Instant,
+    ) -> Option<ProjectId> {
+        if let Some(selected) = selected.filter(|project| !in_flight.contains_key(project))
+            && (regained_focus || self.due(selected, SELECTED_PROJECT_INTERVAL, now))
+        {
+            return Some(selected);
+        }
+        if !in_flight.is_empty() {
+            return None;
+        }
+        others
+            .into_iter()
+            .filter(|&project| {
+                Some(project) != selected && self.due(project, BACKGROUND_PROJECT_INTERVAL, now)
+            })
+            .min_by_key(|project| {
+                (
+                    !self.stale.contains(project),
+                    self.read.get(project).copied(),
+                )
+            })
+    }
+}
+
+impl State {
+    /// Something that usually changes a project's pull requests happened, such
+    /// as an agent finishing a turn, so its rows are read sooner.
+    pub(super) fn mark_stale(&mut self, project: ProjectId) {
+        self.schedule.mark_stale(project);
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_stale(&self, project: ProjectId) -> bool {
+        self.schedule.stale.contains(&project)
     }
 }
 
@@ -93,17 +184,30 @@ impl Cagents {
             self.refresh_ui.last_pull_request = now;
             tasks.push(self.maybe_refresh_pull_request());
         }
-        if regained_focus
-            || now.duration_since(self.refresh_ui.last_projects) >= Duration::from_secs(60)
-        {
-            self.refresh_ui.last_projects = now;
-            if let Some((id, path)) =
+        let projects = &self.sidebar_model.projects;
+        self.refresh_ui
+            .schedule
+            .retain(|id| projects.iter().any(|project| project.id == id));
+        // A project whose checkout could not be read keeps its explicit retry
+        // rather than failing again in the background, unless it is selected.
+        if let Some((id, path)) = self
+            .refresh_ui
+            .schedule
+            .next(
                 sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
-                    .map(|project| (project.id, project.repository.clone()))
-                    .filter(|(id, _)| !self.refresh_ui.projects.contains_key(id))
-            {
-                tasks.push(self.repository_load_task(path, Some(id), false));
-            }
+                    .map(|project| project.id),
+                projects
+                    .iter()
+                    .filter(|project| project.unreachable.is_none())
+                    .map(|project| project.id),
+                &self.refresh_ui.projects,
+                regained_focus,
+                now,
+            )
+            .and_then(|id| self.sidebar_model.project(id))
+            .map(|project| (project.id, project.repository.clone()))
+        {
+            tasks.push(self.repository_load_task(path, Some(id), false));
         }
         Task::batch(tasks)
     }
@@ -122,6 +226,7 @@ impl Cagents {
         generation: u64,
         open_cards: bool,
     ) -> Task<Message> {
+        self.refresh_ui.schedule.started(project_id, Instant::now());
         let cancellation = CancellationToken::default();
         if let Some(previous) = self
             .refresh_ui
@@ -145,5 +250,146 @@ impl Cagents {
                 result,
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projects<const N: usize>() -> [ProjectId; N] {
+        std::array::from_fn(|_| ProjectId::new())
+    }
+
+    #[test]
+    fn the_selected_project_keeps_its_own_cadence() {
+        let [selected, other] = projects();
+        let start = Instant::now();
+        let mut schedule = ProjectSchedule::default();
+        schedule.started(selected, start);
+        schedule.started(other, start);
+        let in_flight = HashMap::new();
+        let next = |schedule: &ProjectSchedule, regained_focus, elapsed| {
+            schedule.next(
+                Some(selected),
+                [selected, other],
+                &in_flight,
+                regained_focus,
+                start + elapsed,
+            )
+        };
+        assert_eq!(next(&schedule, false, Duration::from_secs(30)), None);
+        assert_eq!(
+            next(&schedule, true, Duration::from_secs(30)),
+            Some(selected)
+        );
+        assert_eq!(
+            next(&schedule, false, SELECTED_PROJECT_INTERVAL),
+            Some(selected)
+        );
+        schedule.started(selected, start + SELECTED_PROJECT_INTERVAL);
+        assert_eq!(next(&schedule, false, SELECTED_PROJECT_INTERVAL), None);
+        // Every other project is read too, once its longer interval is up.
+        schedule.started(selected, start + BACKGROUND_PROJECT_INTERVAL);
+        assert_eq!(
+            next(&schedule, false, BACKGROUND_PROJECT_INTERVAL),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn other_projects_are_read_one_at_a_time_oldest_first() {
+        let [selected, older, newer, unread] = projects();
+        let start = Instant::now();
+        let mut schedule = ProjectSchedule::default();
+        schedule.started(selected, start + BACKGROUND_PROJECT_INTERVAL);
+        schedule.started(older, start);
+        schedule.started(newer, start + Duration::from_secs(10));
+        let now = start + BACKGROUND_PROJECT_INTERVAL + Duration::from_secs(10);
+        let others = [selected, newer, older];
+        assert_eq!(
+            schedule.next(Some(selected), others, &HashMap::new(), false, now),
+            Some(older)
+        );
+        // A project never read goes before any that was.
+        assert_eq!(
+            schedule.next(
+                Some(selected),
+                [selected, newer, older, unread],
+                &HashMap::new(),
+                false,
+                now
+            ),
+            Some(unread)
+        );
+        // Nothing else starts while a read is in flight.
+        let in_flight = HashMap::from([(older, CancellationToken::default())]);
+        assert_eq!(
+            schedule.next(Some(selected), others, &in_flight, false, now),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stale_project_is_read_before_its_interval_is_up() {
+        let [selected, other, stale] = projects();
+        let start = Instant::now();
+        let mut schedule = ProjectSchedule::default();
+        for project in [selected, other, stale] {
+            schedule.started(project, start);
+        }
+        schedule.mark_stale(stale);
+        // Stale shortens the wait rather than skipping it.
+        assert_eq!(
+            schedule.next(
+                Some(selected),
+                [selected, other, stale],
+                &HashMap::new(),
+                false,
+                start + Duration::from_secs(10)
+            ),
+            None
+        );
+        let now = start + STALE_PROJECT_INTERVAL;
+        assert_eq!(
+            schedule.next(
+                Some(selected),
+                [selected, other, stale],
+                &HashMap::new(),
+                false,
+                now
+            ),
+            Some(stale)
+        );
+        schedule.started(stale, now);
+        assert_eq!(
+            schedule.next(
+                Some(selected),
+                [selected, other, stale],
+                &HashMap::new(),
+                false,
+                now
+            ),
+            None
+        );
+        // The selected project is read first when it is the stale one.
+        schedule.mark_stale(selected);
+        let in_flight = HashMap::from([(other, CancellationToken::default())]);
+        assert_eq!(
+            schedule.next(Some(selected), [selected], &in_flight, false, now),
+            Some(selected)
+        );
+    }
+
+    #[test]
+    fn closed_projects_leave_the_schedule() {
+        let [open, closed] = projects();
+        let mut schedule = ProjectSchedule::default();
+        schedule.started(open, Instant::now());
+        schedule.started(closed, Instant::now());
+        schedule.mark_stale(closed);
+        schedule.retain(|project| project == open);
+        assert_eq!(schedule.read.keys().collect::<Vec<_>>(), [&open]);
+        assert!(schedule.stale.is_empty());
     }
 }
