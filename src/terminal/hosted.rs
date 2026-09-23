@@ -20,13 +20,13 @@ use thiserror::Error;
 use crate::model::{HostSessionProof, TerminalId, TerminalSession};
 
 use super::{
-    KeyInput, MouseInput, RenderSnapshot, TerminalEvent, TerminalSendError, TerminalSize,
-    TerminalWake,
+    KeyInput, MouseInput, PasteOrigin, RenderSnapshot, TerminalEvent, TerminalSendError,
+    TerminalSize, TerminalWake,
     ipc::{
-        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-        ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope, ServerMessage,
-        ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
-        WireTerminalSize, daemon_socket_path, read_frame, write_frame,
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
+        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope,
+        ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions,
+        TerminalVisibility, WireTerminalSize, daemon_socket_path, read_frame, write_frame,
     },
 };
 
@@ -586,7 +586,7 @@ impl HostedPublishedState {
 #[derive(Debug)]
 enum ClientCommand {
     Input(Vec<u8>),
-    Paste(String),
+    Paste(String, PasteOrigin),
     Key(KeyInput),
     Mouse(MouseInput),
     Focus(bool),
@@ -606,7 +606,7 @@ impl ClientCommand {
     fn operation(&self) -> &'static str {
         match self {
             Self::Input(_) => "write terminal input",
-            Self::Paste(_) => "paste into terminal",
+            Self::Paste(..) => "paste into terminal",
             Self::Key(_) => "send terminal key",
             Self::Mouse(_) => "send terminal mouse input",
             Self::Focus(_) => "set terminal focus",
@@ -626,7 +626,11 @@ impl ClientCommand {
     fn into_request(self, terminal_id: TerminalId) -> ClientRequest {
         match self {
             Self::Input(bytes) => ClientRequest::Input { terminal_id, bytes },
-            Self::Paste(text) => ClientRequest::Paste { terminal_id, text },
+            Self::Paste(text, origin) => ClientRequest::Paste {
+                terminal_id,
+                text,
+                origin,
+            },
             Self::Key(input) => ClientRequest::Key { terminal_id, input },
             Self::Mouse(input) => ClientRequest::Mouse { terminal_id, input },
             Self::Focus(focused) => ClientRequest::Focus {
@@ -899,8 +903,16 @@ impl HostedTerminalHandle {
         self.try_command(ClientCommand::Input(bytes.into()))
     }
 
-    pub fn paste(&self, text: impl Into<String>) -> Result<(), TerminalSendError> {
-        self.try_command(ClientCommand::Paste(text.into()))
+    pub fn paste(
+        &self,
+        text: impl Into<String>,
+        origin: PasteOrigin,
+    ) -> Result<(), TerminalSendError> {
+        let text = text.into();
+        if text.len() > MAX_INPUT_BYTES {
+            return Err(TerminalSendError::PasteTooLarge(text.len()));
+        }
+        self.try_command(ClientCommand::Paste(text, origin))
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {

@@ -1245,7 +1245,7 @@ impl Runtime {
         // wherever it was aimed.
         crate::file_drop::target(
             pane,
-            target.card,
+            ("chat", target.card),
             accepting_drops && !transitioning,
             move |payload| action(Action::Dropped(target, payload)),
         )

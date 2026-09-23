@@ -1874,6 +1874,14 @@ pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
             "the terminal worker has closed",
             true,
         ),
+        TerminalSendError::PasteTooLarge(bytes) => ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            format!(
+                "terminal paste of {bytes} bytes exceeds the {}-byte limit",
+                crate::terminal_ipc::MAX_INPUT_BYTES
+            ),
+            false,
+        ),
     }
 }
 

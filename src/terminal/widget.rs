@@ -28,8 +28,8 @@ use cosmic::{
 
 use super::{
     CellSnapshot, CursorShape, KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton,
-    MouseInput, RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalKey, TerminalSendError,
-    TerminalSize, TerminalSurface, Underline,
+    MouseInput, PasteOrigin, RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalKey,
+    TerminalSendError, TerminalSize, TerminalSurface, Underline,
 };
 
 use crate::{
@@ -1474,7 +1474,7 @@ impl<Message> TerminalWidget<Message> {
         if self.read_only || text.is_empty() {
             return;
         }
-        if let Err(error) = self.handle.paste(text) {
+        if let Err(error) = self.handle.paste(text, PasteOrigin::Clipboard) {
             self.publish_error(error, shell);
         }
     }

@@ -6,8 +6,12 @@
 //! VTE and kitty do: each file's path, escaped so that a shell reads it back
 //! as one word, followed by a space, sent as a paste so that a child which
 //! asked for bracketed paste - Claude Code, for one, which is how it turns a
-//! dropped image into an attachment - sees one. Nothing ends the insertion
-//! with a newline, so a drop never runs anything by itself.
+//! dropped image into an attachment - sees one. Nothing ends a file drop with
+//! a newline, and the terminal types a drop into a child that did not ask for
+//! bracketed paste with every line break and control key blanked out (see
+//! [`crate::terminal::PasteOrigin::Drop`]), so a drop never runs anything by
+//! itself. A chat composer is not a shell, and takes the same names as they
+//! are.
 
 use std::{
     borrow::Cow,
@@ -137,12 +141,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content.as_widget_mut().operate(
-            &mut tree.children[0],
-            layout.with_virtual_offset(layout.virtual_offset()),
-            renderer,
-            operation,
-        );
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     fn update(
@@ -159,7 +160,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
-            layout.with_virtual_offset(layout.virtual_offset()),
+            layout,
             cursor,
             renderer,
             clipboard,
@@ -178,7 +179,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
     ) -> mouse::Interaction {
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
-            layout.with_virtual_offset(layout.virtual_offset()),
+            layout,
             cursor,
             viewport,
             renderer,
@@ -200,7 +201,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
             renderer,
             theme,
             style,
-            layout.with_virtual_offset(layout.virtual_offset()),
+            layout,
             cursor,
             viewport,
         );
@@ -216,7 +217,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
-            layout.with_virtual_offset(layout.virtual_offset()),
+            layout,
             renderer,
             viewport,
             translation,
@@ -229,11 +230,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content.as_widget().a11y_nodes(
-            layout.with_virtual_offset(layout.virtual_offset()),
-            &tree.children[0],
-            cursor,
-        )
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
     }
 
     fn drag_destinations(
@@ -244,12 +243,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Surface<'_, Message> {
         destinations: &mut DndDestinationRectangles,
     ) {
         let mut inner = DndDestinationRectangles::new();
-        self.content.as_widget().drag_destinations(
-            &tree.children[0],
-            layout.with_virtual_offset(layout.virtual_offset()),
-            renderer,
-            &mut inner,
-        );
+        self.content
+            .as_widget()
+            .drag_destinations(&tree.children[0], layout, renderer, &mut inner);
         let mut rectangles = inner.into_rectangles();
         for destination in &mut rectangles {
             let rectangle = &mut destination.rectangle;
@@ -287,7 +283,7 @@ impl Payload {
 
     pub fn decode(&self) -> Dropped {
         if self.mime == URI_LIST {
-            Dropped::Items(uri_list(&self.data))
+            Dropped::Items(uri_list(&self.data, host_name().as_deref()))
         } else {
             // A source that NUL-terminates its string, as some X11 clients
             // still do, means nothing by the terminator.
@@ -344,16 +340,26 @@ impl Insertion {
     }
 }
 
+/// How the entries of a dropped list are written into the text they join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// Escaped so that a shell - or an agent CLI that reads its input the way
+    /// a shell would - reads each entry back as one word.
+    Shell,
+    /// As they are, for prose such as a chat message.
+    Plain,
+}
+
 impl Dropped {
     /// The text to insert for this drop.
     ///
-    /// Each entry becomes one shell word followed by a space, so that the next
-    /// drop or the next argument does not run into it. A name the child could
-    /// only receive as control bytes is left out rather than altered: a
-    /// newline in it would be an Enter to any child not in bracketed paste
-    /// mode, and inserting some other name than the one dropped would be
-    /// worse than inserting none.
-    pub fn insertion(&self) -> Insertion {
+    /// Each entry becomes one word, spelled as `spelling` says, followed by a
+    /// space so that the next drop or the next argument does not run into it.
+    /// A name that could only be inserted as control characters is left out
+    /// rather than altered: a newline in it would be an Enter to any child not
+    /// in bracketed paste mode, and inserting some other name than the one
+    /// dropped would be worse than inserting none.
+    pub fn insertion(&self, spelling: Spelling) -> Insertion {
         match self {
             Self::Text(text) => Insertion {
                 text: text.clone(),
@@ -369,7 +375,10 @@ impl Dropped {
                     };
                     match word.filter(|word| !word.chars().any(char::is_control)) {
                         Some(word) => {
-                            insertion.text.push_str(&shell_escape(word));
+                            match spelling {
+                                Spelling::Shell => insertion.text.push_str(&shell_escape(word)),
+                                Spelling::Plain => insertion.text.push_str(word),
+                            }
                             insertion.text.push(' ');
                         }
                         None => insertion.refused += 1,
@@ -384,7 +393,10 @@ impl Dropped {
 /// Parses a `text/uri-list` (RFC 2483): one URI per line, `#` lines are
 /// comments. Lines end in CRLF by the letter of the format and in a bare LF
 /// from more than one real source, so both are accepted.
-fn uri_list(data: &[u8]) -> Vec<Item> {
+///
+/// A file URI names this machine by an empty host or `localhost`, and some
+/// sources - KDE's among them - by `local_host`, the machine's own name.
+fn uri_list(data: &[u8], local_host: Option<&str>) -> Vec<Item> {
     data.split(|byte| *byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
@@ -399,13 +411,38 @@ fn uri_list(data: &[u8]) -> Vec<Item> {
                 // The path is percent-decoded to the file name's own bytes,
                 // which need not be UTF-8. A host other than this one names
                 // a file this machine cannot open, so it stays a URI.
-                if let Ok(path) = uri.to_file_path() {
+                let path = match (uri.host_str(), local_host) {
+                    (Some(host), Some(local)) if host.eq_ignore_ascii_case(local) => {
+                        // The path is already percent-encoded, so the same
+                        // URI without its host decodes exactly as it would.
+                        url::Url::parse(&format!("file://{}", uri.path()))
+                            .ok()
+                            .and_then(|uri| uri.to_file_path().ok())
+                    }
+                    _ => uri.to_file_path().ok(),
+                };
+                if let Some(path) = path {
                     return Item::File(path);
                 }
             }
             Item::Uri(uri.into())
         })
         .collect()
+}
+
+/// This machine's name, which a file URI can use as its host.
+fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the pointer and length describe `buffer`, which outlives the
+    // call; gethostname writes at most that many bytes into it.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    // POSIX leaves a truncated name unterminated, and a truncated name is
+    // not this machine's, so it matches nothing rather than a prefix.
+    let name = std::ffi::CStr::from_bytes_until_nul(&buffer).ok()?;
+    name.to_str().ok().map(str::to_owned)
 }
 
 /// Escapes `word` so that a POSIX shell, zsh or fish reads it back as one
@@ -451,7 +488,7 @@ mod tests {
     }
 
     fn inserted(mime: &str, data: &[u8]) -> Insertion {
-        dropped(mime, data).insertion()
+        dropped(mime, data).insertion(Spelling::Shell)
     }
 
     #[test]
@@ -601,6 +638,41 @@ mod tests {
         let insertion = inserted(URI_LIST, b"not a uri\r\n\xff\xfe\r\nfile:///ok\r\n");
         assert_eq!(insertion.text, "/ok ");
         assert_eq!(insertion.refused, 2);
+    }
+
+    #[test]
+    fn a_file_uri_naming_this_machine_is_a_local_file() {
+        assert_eq!(
+            uri_list(
+                b"file://Workstation/tmp/a%20b\r\nfile://elsewhere/tmp/c\r\n",
+                Some("workstation")
+            ),
+            vec![
+                Item::File("/tmp/a b".into()),
+                Item::Uri("file://elsewhere/tmp/c".into()),
+            ]
+        );
+        // Without a name for this machine only the spellings every source
+        // agrees on are local.
+        assert_eq!(
+            uri_list(b"file://workstation/tmp/a", None),
+            vec![Item::Uri("file://workstation/tmp/a".into())]
+        );
+    }
+
+    #[test]
+    fn prose_takes_the_names_as_they_are() {
+        let insertion = dropped(
+            URI_LIST,
+            b"file:///tmp/a%20b.png\r\nhttps://example.com/a?b=c&d#e\r\nfile:///tmp/x%0Ay\r\n",
+        )
+        .insertion(Spelling::Plain);
+        assert_eq!(
+            insertion.text,
+            "/tmp/a b.png https://example.com/a?b=c&d#e "
+        );
+        // A control character is no more insertable into a draft.
+        assert_eq!(insertion.refused, 1);
     }
 
     #[test]

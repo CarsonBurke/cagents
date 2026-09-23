@@ -6372,7 +6372,7 @@ impl Cagents {
                         card: id,
                         message: error.to_string(),
                     }),
-                id,
+                ("terminal", id),
                 // A dialog over the workspace owns the pointer as well as the
                 // keyboard, so a drop aimed through it is refused rather than
                 // typed into a shell the reader cannot see.
@@ -9369,9 +9369,12 @@ impl Application for Cagents {
                 if ended_terminal(self.card_state(card)).is_some() {
                     return Task::none();
                 }
-                let insertion = payload.decode().insertion();
+                let insertion = payload
+                    .decode()
+                    .insertion(crate::file_drop::Spelling::Shell);
                 if !insertion.text.is_empty()
-                    && let Err(error) = handle.paste(insertion.text.as_str())
+                    && let Err(error) =
+                        handle.paste(insertion.text.as_str(), crate::terminal::PasteOrigin::Drop)
                 {
                     self.status = Some(TransientNotice::error(error.to_string()));
                 } else if let Some(refusal) = insertion.refusal() {

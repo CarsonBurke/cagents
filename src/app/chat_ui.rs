@@ -3249,17 +3249,33 @@ impl Cagents {
                     return Task::none();
                 };
                 // Dropped files become attachments where the provider takes
-                // them, as they would from the chooser; anything else is
-                // written into the draft as a terminal would type it.
+                // them, as they would from the chooser. A file it would refuse
+                // at send - a document for Codex, a ninth file for Claude, a
+                // folder for any - is written into the draft as its path
+                // instead, with web addresses and dropped text, as they are.
                 let dropped = match payload.decode() {
                     file_drop::Dropped::Items(items)
                         if runtime.snapshot.capabilities.attachments =>
                     {
+                        let rules =
+                            chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                        let mut room = rules.max_count.map_or(usize::MAX, |limit| {
+                            limit.saturating_sub(runtime.attachments.len())
+                        });
                         let mut files = Vec::new();
                         let mut rest = Vec::new();
                         for item in items {
                             match item {
-                                file_drop::Item::File(path) => files.push(path),
+                                file_drop::Item::File(path)
+                                    if files.contains(&path)
+                                        || runtime
+                                            .attachments
+                                            .iter()
+                                            .any(|attachment| attachment.path == path) => {}
+                                file_drop::Item::File(path) if room > 0 && rules.accepts(&path) => {
+                                    room -= 1;
+                                    files.push(path);
+                                }
                                 other => rest.push(other),
                             }
                         }
@@ -3268,7 +3284,7 @@ impl Cagents {
                     }
                     dropped => dropped,
                 };
-                let insertion = dropped.insertion();
+                let insertion = dropped.insertion(file_drop::Spelling::Plain);
                 if !insertion.text.is_empty() {
                     runtime.revision = runtime.revision.wrapping_add(1);
                     runtime.history_cursor = None;

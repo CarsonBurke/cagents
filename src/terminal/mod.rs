@@ -20,8 +20,9 @@ pub use snapshot::{
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
 pub use types::{
-    KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
-    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalWake,
+    KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
+    TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,
+    TerminalStartError, TerminalWake,
 };
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};

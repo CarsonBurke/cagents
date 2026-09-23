@@ -175,6 +175,91 @@ pub struct Attachment {
     pub path: std::path::PathBuf,
 }
 
+/// The file extensions every provider's image input recognises.
+pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+const MIB: u64 = 1024 * 1024;
+
+/// What a provider's native transport takes as an attachment.
+///
+/// The provider drivers enforce these when a prompt is sent. The composer
+/// checks a dropped file against them before attaching it, so a file the
+/// provider would refuse becomes its path in the draft rather than an error
+/// waiting at send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentRules {
+    /// Whether the provider takes images and nothing else.
+    pub images_only: bool,
+    /// The most attachments one prompt may carry, if there is a limit.
+    pub max_count: Option<usize>,
+    /// The largest image the provider takes.
+    pub max_image_bytes: u64,
+    /// The largest file of any other kind the provider takes, if it limits
+    /// them.
+    pub max_file_bytes: Option<u64>,
+}
+
+impl AttachmentRules {
+    pub const fn for_provider(provider: Provider) -> Self {
+        match provider {
+            Provider::Claude => Self {
+                images_only: false,
+                max_count: Some(8),
+                max_image_bytes: 5 * MIB,
+                max_file_bytes: Some(20 * MIB),
+            },
+            // Codex is given the image's path and reads it itself.
+            Provider::Codex => Self {
+                images_only: true,
+                max_count: None,
+                max_image_bytes: u64::MAX,
+                max_file_bytes: None,
+            },
+            // OMP sends images inline and names any other file in the prompt.
+            Provider::Omp => Self {
+                images_only: false,
+                max_count: None,
+                max_image_bytes: 16 * MIB,
+                max_file_bytes: None,
+            },
+        }
+    }
+
+    /// Whether the provider would take the file at `path` as an attachment,
+    /// as far as its name and metadata tell.
+    pub fn accepts(&self, path: &std::path::Path) -> bool {
+        // Every driver passes or prints the path as text somewhere.
+        if path.to_str().is_none() {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        if is_image_path(path) {
+            metadata.len() <= self.max_image_bytes
+        } else {
+            !self.images_only
+                && self
+                    .max_file_bytes
+                    .is_none_or(|limit| metadata.len() <= limit)
+        }
+    }
+}
+
+/// Whether `path` names an image by its extension.
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|image| extension.eq_ignore_ascii_case(image))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,
@@ -674,6 +759,45 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_is_offered_only_the_attachments_it_takes() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: u64| {
+            let path = directory.path().join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+            path
+        };
+        let image = file("shot.PNG", 1024);
+        let large_image = file("large.webp", 6 * MIB);
+        let document = file("notes.pdf", 1024);
+        let large_document = file("dump.bin", 21 * MIB);
+
+        let codex = AttachmentRules::for_provider(Provider::Codex);
+        assert!(codex.accepts(&image));
+        assert!(codex.accepts(&large_image));
+        assert!(!codex.accepts(&document));
+
+        let claude = AttachmentRules::for_provider(Provider::Claude);
+        assert!(claude.accepts(&image));
+        assert!(!claude.accepts(&large_image));
+        assert!(claude.accepts(&document));
+        assert!(!claude.accepts(&large_document));
+        assert_eq!(claude.max_count, Some(8));
+
+        let omp = AttachmentRules::for_provider(Provider::Omp);
+        assert!(omp.accepts(&large_image));
+        assert!(omp.accepts(&large_document));
+
+        // A folder, or a path that is not there, is no provider's attachment.
+        for rules in [codex, claude, omp] {
+            assert!(!rules.accepts(directory.path()));
+            assert!(!rules.accepts(&directory.path().join("missing.png")));
+        }
+    }
 
     /// The daemon refuses to checkpoint a conversation whose launch cannot be
     /// rebuilt into an exact resume, and a refused checkpoint is what leaves a

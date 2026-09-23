@@ -15,8 +15,8 @@ use crate::{
     },
     terminal::{
         CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, KeyInput, MouseInput,
-        RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalConfig, TerminalEvent,
-        TerminalSize, TerminalTheme, Underline,
+        PasteOrigin, RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalConfig,
+        TerminalEvent, TerminalSize, TerminalTheme, Underline,
     },
 };
 
@@ -70,9 +70,10 @@ use crate::{
 /// Version 15 adds terminal palettes and durable recovery-origin identity.
 /// Version 16 carries the name of the signal that ended a terminal.
 /// Version 17 adds `ClientRequest::Paste`, which the PTY owner encodes against
-/// the child's own bracketed-paste mode. It is appended, but unlike the
-/// observation requests above a current client issues it on every paste, so a
-/// daemon that predates it would be sent a variant index it cannot decode.
+/// the child's own bracketed-paste mode and the paste's origin. It is
+/// appended, but unlike the observation requests above a current client issues
+/// it on every paste, so a daemon that predates it would be sent a variant
+/// index it cannot decode.
 pub const PROTOCOL_VERSION: u16 = 17;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -299,13 +300,15 @@ pub enum ClientRequest {
         edit: crate::workspace_model::ModelEdit,
     },
     BuildInfo,
-    /// Text to paste, which the PTY owner frames as a bracketed paste when the
-    /// child asked for one and strips of the control bytes a paste must never
-    /// deliver. Only the owner can decide this: the mode is the child's, and
-    /// a snapshot of it would be stale by the time the paste arrived.
+    /// Text to paste, which the PTY owner encodes for the paste mode the child
+    /// is in: framed as a bracketed paste when it asked for one, and otherwise
+    /// typed, with what `origin` allows to act as keys. Only the owner can
+    /// decide this: the mode is the child's, and a snapshot of it would be
+    /// stale by the time the paste arrived.
     Paste {
         terminal_id: TerminalId,
         text: String,
+        origin: PasteOrigin,
     },
 }
 
