@@ -123,6 +123,8 @@ pub struct KeyInput {
     pub action: KeyAction,
     pub key: TerminalKey,
     pub modifiers: KeyModifiers,
+    /// What the key types without Ctrl: `c` for Ctrl+C, never the ETX Ctrl
+    /// makes of it, which the encoder derives from the key and modifiers.
     pub text: Option<String>,
     pub unshifted_codepoint: Option<char>,
 }
