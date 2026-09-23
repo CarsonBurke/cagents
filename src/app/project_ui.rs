@@ -980,11 +980,13 @@ fn delete_worktree(target: &Target) -> Result<(), String> {
         .and_then(|output| output.require_success(&command.program));
     if let Err(error) = result {
         // A timeout may happen after removal. Reconcile before saying it failed.
+        // Git's own account is what the row and the notice report: a bare
+        // exit status gives the user nothing to act on before a retry.
         let records = service
             .list_worktrees(&target.repository, &cancellation)
-            .map_err(|_| error.to_string())?;
+            .map_err(|_| error.reported_detail())?;
         if records.iter().any(|record| record.id == id) {
-            return Err(error.to_string());
+            return Err(error.reported_detail());
         }
     }
     Ok(())
