@@ -147,18 +147,20 @@ pub(super) fn sigils(snapshot: &Snapshot) -> Vec<char> {
 
 /// The rows offered for `token`, best first.
 ///
-/// A name the query opens is ranked above one that merely contains it, since
-/// that is the name a reader typing from memory is spelling; within a rank the
-/// provider's own order is kept. Matching ignores case, because a reader
+/// A name the query spells out is ranked first, then one the query opens, then
+/// one that merely contains it, since that is the order a reader typing from
+/// memory means them in; within a rank the provider's own order is kept. Matching ignores case, because a reader
 /// completing is not thinking about how the author capitalized a name.
 pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candidate<'a>> {
     let query = token.query.to_lowercase();
     let rank = |name: &str| {
         let name = name.to_lowercase();
-        if name.starts_with(&query) {
+        if name == query {
             Some(0)
-        } else if name.contains(&query) {
+        } else if name.starts_with(&query) {
             Some(1)
+        } else if name.contains(&query) {
+            Some(2)
         } else {
             None
         }
@@ -337,10 +339,21 @@ impl State {
     /// what it does in the editor: sending, or starting a new line.
     ///
     /// A name already spelled out is left to send, so a reader typing
-    /// `/clear` from memory needs one Enter, not two. So is a bare sigil
-    /// mid-sentence the reader has not looked into, as "cd /" ends.
+    /// `/clear` from memory needs one Enter, not two. Mid-sentence, until the
+    /// reader looks into the list, Enter chooses only a name the word opens:
+    /// a sentence ending "cd /" or "see /docs" is sent as written rather than
+    /// completed to some name that merely contains it.
     pub fn enter_chooses(&self, token: &Token, highlighted: &str) -> bool {
-        !token.spells(highlighted) && (self.browsed || token.leading || !token.query.is_empty())
+        let mut name = highlighted.chars();
+        name.next();
+        !token.spells(highlighted)
+            && (self.browsed
+                || token.leading
+                || (!token.query.is_empty()
+                    && name
+                        .as_str()
+                        .to_lowercase()
+                        .starts_with(&token.query.to_lowercase())))
     }
 
     /// Moves the highlight one row among `count`, wrapping at either end, and
@@ -511,6 +524,18 @@ mod tests {
         assert_eq!(insertions(&snapshot, "then /|"), ["/commits", "/pr-review"]);
         // A name the query opens ranks above one that merely contains it.
         assert_eq!(insertions(&snapshot, "/REV|"), ["/review", "/pr-review"]);
+        // A name spelled out ranks above longer ones it opens, so Enter on it
+        // sends rather than completing to one of them.
+        let mut snapshot = snapshot;
+        snapshot.skills[0].name = "review-fast".into();
+        snapshot.skills[0].invocation = "/review-fast".into();
+        snapshot.commands[1].name = "review-all".into();
+        snapshot.skills[1].name = "review".into();
+        snapshot.skills[1].invocation = "/review".into();
+        assert_eq!(
+            insertions(&snapshot, "/review|"),
+            ["/review", "/review-all", "/review-fast"]
+        );
     }
 
     #[test]
@@ -624,8 +649,12 @@ mod tests {
         // would never be sent, but not mid-sentence until the reader browses.
         assert!(state.enter_chooses(&at("/|"), "/clear"));
         assert!(!state.enter_chooses(&at("cd /|"), "/commits"));
+        // Nor does a word only contained in a name, until the reader browses.
+        assert!(state.enter_chooses(&at("see /Com|"), "/commits"));
+        assert!(!state.enter_chooses(&at("see /its|"), "/commits"));
         state.step(true, 2, 28.0, 56.0);
         assert!(state.enter_chooses(&at("cd /|"), "/commits"));
+        assert!(state.enter_chooses(&at("see /its|"), "/commits"));
     }
 
     /// What is sent names every skill the way the provider invokes it, at

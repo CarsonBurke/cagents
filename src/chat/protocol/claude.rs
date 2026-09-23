@@ -287,9 +287,12 @@ struct Claude {
     /// first turn is all that tells a command from a skill; `None` when its
     /// list marks none, as a version without the mark sends it.
     builtin: Option<HashSet<String>>,
-    /// The skills the session reported when it began its first turn, `None`
+    /// The skills the session reported when it began its latest turn, `None`
     /// until it has.
     skills: Option<HashSet<String>>,
+    /// Every command listed when `skills` was reported, which it rules on;
+    /// one listed since is told apart by the mark alone.
+    reported: HashSet<String>,
     usage: Usage,
     history: Option<History>,
 }
@@ -613,6 +616,7 @@ impl Claude {
                     .map(|name| name.trim_start_matches('/').to_owned())
                     .collect(),
             );
+            self.reported = self.commands.iter().map(|c| c.name.clone()).collect();
         }
         let terminal = data["terminal_slash_commands"].as_array();
         self.commands.retain(|c| {
@@ -656,21 +660,21 @@ impl Claude {
     /// tool, rather than a command it only runs as the whole of one.
     ///
     /// Claude Code lists skills among its slash commands, and names them
-    /// apart only when a turn begins. Everything it does not mark as its own
-    /// - the user's, the project's, and plugins' - is taken for a skill as
-    /// soon as it is listed, including one added mid-session. Its own are
-    /// commands, as are an MCP server's prompts, unless a turn has named them
-    /// skills. A list without the mark tells nothing, so until a turn does
-    /// everything stays a command, which is only ever offered where Claude
-    /// Code acts on it.
+    /// apart only when a turn begins; what the latest turn said of a command
+    /// it listed is final. Anything else is judged by Claude Code's mark:
+    /// what it does not mark as its own - the user's, the project's, and
+    /// plugins' - is taken for a skill, including one added mid-session, and
+    /// its own are commands, as are an MCP server's prompts. A list without
+    /// the mark tells nothing, so such a command stays a command, which is
+    /// only ever offered where Claude Code acts on it.
     fn is_skill(&self, name: &str) -> bool {
-        self.skills
-            .as_ref()
-            .is_some_and(|skills| skills.contains(name))
-            || self
+        match &self.skills {
+            Some(skills) if self.reported.contains(name) => skills.contains(name),
+            _ => self
                 .builtin
                 .as_ref()
-                .is_some_and(|builtin| !builtin.contains(name) && !name.starts_with("mcp__"))
+                .is_some_and(|builtin| !builtin.contains(name) && !name.starts_with("mcp__")),
+        }
     }
     fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let carrier = required(frame, "uuid")?;
@@ -3666,11 +3670,6 @@ mod tests {
         );
     }
 
-    /// Claude Code lists its skills among its slash commands. The composer
-    /// offers a skill anywhere in a message and a command only as the whole
-    /// of one, so the two are told apart: by Claude Code's own mark before
-    /// the first turn, then by the skills the turn reports, keeping each
-    /// description when the turn's list names the commands bare.
     /// A list that does not mark Claude Code's own commands cannot tell
     /// `/clear` from a skill, so nothing is taken for one until a turn says.
     #[test]
@@ -3704,6 +3703,11 @@ mod tests {
         )));
     }
 
+    /// Claude Code lists its skills among its slash commands. The composer
+    /// offers a skill anywhere in a message and a command only as the whole
+    /// of one, so the two are told apart: by Claude Code's own mark before
+    /// the first turn, then by the skills the turn reports, keeping each
+    /// description when the turn's list names the commands bare.
     #[test]
     fn skills_are_told_apart_from_the_commands_they_are_listed_with() {
         fn listed(step: &Step) -> (Vec<String>, Vec<(String, String, String)>) {
@@ -3759,13 +3763,17 @@ mod tests {
         );
         let began = adapter
             .receive(json!({"type":"system","subtype":"init","uuid":"i",
-                "slash_commands":["alpha","simplify","compact","mcp__docs__search"],
+                "slash_commands":["alpha","simplify","compact","local","mcp__docs__search"],
                 "skills":["alpha","simplify"]}))
             .unwrap();
         assert_eq!(
             listed(&began),
             (
-                vec!["compact".to_owned(), "mcp__docs__search".to_owned()],
+                vec![
+                    "compact".to_owned(),
+                    "local".to_owned(),
+                    "mcp__docs__search".to_owned()
+                ],
                 vec![
                     ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
                     ("simplify".into(), "Tidy".into(), "/simplify".into()),
@@ -3773,13 +3781,14 @@ mod tests {
             )
         );
         // A skill added mid-session is one as soon as it is listed, before
-        // any turn names it.
+        // any turn names it; what the turn said of the rest still holds.
         let changed = adapter
             .receive(
                 json!({"type":"system","subtype":"commands_changed","uuid":"c",
                 "commands":[
                     {"name":"alpha","description":"Alpha (user)","argumentHint":""},
                     {"name":"gamma","description":"Gamma (project)","argumentHint":""},
+                    {"name":"local","description":"Local","argumentHint":""},
                     {"name":"simplify","description":"Tidy","argumentHint":"","builtin":true},
                     {"name":"compact","description":"Compact","argumentHint":"","builtin":true},
                 ]}),
@@ -3788,7 +3797,7 @@ mod tests {
         assert_eq!(
             listed(&changed),
             (
-                vec!["compact".to_owned()],
+                vec!["local".to_owned(), "compact".to_owned()],
                 vec![
                     ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
                     ("gamma".into(), "Gamma (project)".into(), "/gamma".into()),

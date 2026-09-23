@@ -2888,8 +2888,7 @@ impl Cagents {
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
                                 && !draft.is_empty()
                             {
-                                runtime.composer = text_editor::Content::with_text(&draft);
-                                runtime.revision = runtime.revision.wrapping_add(1);
+                                runtime.replace_draft(text_editor::Content::with_text(&draft));
                             }
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
