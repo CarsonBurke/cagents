@@ -227,6 +227,55 @@ enum CompletionKey {
     Dismiss,
 }
 
+/// What the composer says of the skills a draft names that `reach` leaves
+/// unloaded, or `None` when it loads them all.
+fn unloaded_hint(unloaded: &[&str], reach: chat::SkillReach) -> Option<String> {
+    let rule = match reach {
+        _ if unloaded.is_empty() => return None,
+        chat::SkillReach::Leading => "only a skill that starts the message is loaded with it",
+        chat::SkillReach::First => "only the first skill a message names is loaded with it",
+        chat::SkillReach::Anywhere => return None,
+    };
+    let verb = if unloaded.len() == 1 { "goes" } else { "go" };
+    Some(format!(
+        "{} {verb} as plain text: {rule}",
+        unloaded.join(", ")
+    ))
+}
+
+/// The completion list as the keyboard sees it: the highlighted row's text,
+/// and whether Enter chooses it.
+#[derive(Debug, Clone)]
+struct OpenList {
+    insertion: String,
+    enter_chooses: bool,
+}
+
+/// What `press` does while the completion list is open, or `None` when it
+/// goes on to sending, history and the editor. `send` is what the same press
+/// would send the message with; Enter does that, or breaks the line, if the
+/// row it chose is gone by the time it lands.
+fn completion_action(
+    target: Target,
+    press: &text_editor::KeyPress,
+    open: &OpenList,
+    send: Option<PromptMode>,
+) -> Option<Action> {
+    Some(match completion_key(press)? {
+        CompletionKey::Move(down) => Action::CompletionMove(target, down),
+        CompletionKey::Choose => Action::Complete(target, open.insertion.clone(), None),
+        CompletionKey::Confirm if open.enter_chooses => {
+            let otherwise = send.map_or(
+                Action::Composer(target, text_editor::Action::Edit(text_editor::Edit::Enter)),
+                |mode| Action::Submit(target, mode),
+            );
+            Action::Complete(target, open.insertion.clone(), Some(Box::new(otherwise)))
+        }
+        CompletionKey::Confirm => return None,
+        CompletionKey::Dismiss => Action::CompletionDismiss(target),
+    })
+}
+
 /// The completion key a press is, or `None` for one the editor keeps.
 ///
 /// Only the bare keys: a chord is the reader reaching past the list, and
@@ -879,22 +928,25 @@ impl Runtime {
             );
         }
         // What Tab chooses while the completion list is open, and whether
-        // Enter does too.
-        let mut chosen = None;
+        // Enter does too. A list whose rows cannot be chosen, while the chat
+        // is changing hands, leaves the keys to the editor.
+        let mut open = None;
         if let Some((token, rows)) = self.completion() {
             let highlighted = self.completion.highlighted.min(rows.len() - 1);
-            let insertion = &rows[highlighted].insertion;
-            chosen = Some((
-                insertion.clone(),
-                self.completion.enter_chooses(&token, insertion),
-            ));
+            let row = &rows[highlighted];
+            open = (!transitioning).then(|| OpenList {
+                insertion: row.insertion.to_string(),
+                enter_chooses: self
+                    .completion
+                    .enter_chooses(&token, row, &self.snapshot.skills),
+            });
             let (_, viewport) = completion_extent(rows.len());
             let rows = rows
                 .into_iter()
                 .enumerate()
                 .map(|(index, row)| {
                     let message = (!transitioning)
-                        .then(|| action(Action::Complete(target, row.insertion.clone())));
+                        .then(|| action(Action::Complete(target, row.insertion.to_string(), None)));
                     completion_row(row, index == highlighted, message)
                 })
                 .collect::<Vec<_>>();
@@ -923,6 +975,19 @@ impl Runtime {
                     true,
                 ))
                 .into(),
+            );
+        }
+        // A skill the provider will not load reaches the agent as words; the
+        // draft says so rather than let the name pass for one that runs.
+        let reach = snapshot.capabilities.skill_reach;
+        if let Some(hint) = unloaded_hint(
+            &completion::unloaded(&draft, &snapshot.skills, reach),
+            reach,
+        ) {
+            content.push(
+                design::caption(hint)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
             );
         }
         for (index, attachment) in self.attachments.iter().enumerate() {
@@ -1049,17 +1114,15 @@ impl Runtime {
                     }
                     // An open completion list has the keys a reader uses to
                     // pick from it ahead of sending and history.
-                    if let Some((chosen, enter_chooses)) = &chosen
-                        && let Some(key) = completion_key(&press)
-                            .filter(|key| *key != CompletionKey::Confirm || *enter_chooses)
+                    if let Some(open) = &open
+                        && let Some(choice) = completion_action(
+                            target,
+                            &press,
+                            open,
+                            submit_chord(&press, submit.0, submit.1, enter_sends),
+                        )
                     {
-                        return Some(text_editor::Binding::Custom(action(match key {
-                            CompletionKey::Move(down) => Action::CompletionMove(target, down),
-                            CompletionKey::Choose | CompletionKey::Confirm => {
-                                Action::Complete(target, chosen.clone())
-                            }
-                            CompletionKey::Dismiss => Action::CompletionDismiss(target),
-                        })));
+                        return Some(text_editor::Binding::Custom(action(choice)));
                     }
                     if let Some(mode) = submit_chord(&press, submit.0, submit.1, enter_sends) {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
@@ -2385,6 +2448,113 @@ mod tests {
                 text_editor::Status::Active
             },
         }
+    }
+
+    /// A press of `named`, which is what routing reads; the physical key
+    /// is not.
+    fn key(named: keyboard::key::Named, modifiers: keyboard::Modifiers) -> text_editor::KeyPress {
+        let key = keyboard::Key::Named(named);
+        text_editor::KeyPress {
+            modified_key: key.clone(),
+            key,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// With the list open the keys a reader picks with go to it, and Enter
+    /// goes to it only when choosing still changes something; otherwise it
+    /// sends, or edits, exactly as it would with no list.
+    #[test]
+    fn an_open_list_takes_only_the_keys_it_answers_to() {
+        use keyboard::key::Named;
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let list = |enter_chooses| OpenList {
+            insertion: "$commits".into(),
+            enter_chooses,
+        };
+        let none = keyboard::Modifiers::empty();
+        let send = Some(PromptMode::Send);
+        let route = |named, modifiers, open: &OpenList| {
+            let press = key(named, modifiers);
+            let send = submit_chord(&press, send, None, true);
+            completion_action(target, &press, open, send)
+        };
+
+        assert!(matches!(
+            route(Named::ArrowDown, none, &list(false)),
+            Some(Action::CompletionMove(_, true))
+        ));
+        assert!(matches!(
+            route(Named::ArrowUp, none, &list(false)),
+            Some(Action::CompletionMove(_, false))
+        ));
+        assert!(matches!(
+            route(Named::Escape, none, &list(false)),
+            Some(Action::CompletionDismiss(_))
+        ));
+        // Tab always chooses, and does nothing else if the row is gone when
+        // it lands.
+        assert!(matches!(
+            route(Named::Tab, none, &list(false)),
+            Some(Action::Complete(_, insertion, None)) if insertion == "$commits"
+        ));
+        // Enter chooses only when the list says it would change the word, and
+        // sends as it would have if the word moved on before it landed.
+        assert!(matches!(
+            route(Named::Enter, none, &list(true)),
+            Some(Action::Complete(_, insertion, Some(otherwise)))
+                if insertion == "$commits"
+                    && matches!(*otherwise, Action::Submit(_, PromptMode::Send))
+        ));
+        assert!(route(Named::Enter, none, &list(false)).is_none());
+        // Where Enter breaks the line, that is what it falls back to.
+        let press = key(Named::Enter, none);
+        assert!(matches!(
+            completion_action(target, &press, &list(true), None),
+            Some(Action::Complete(_, _, Some(otherwise)))
+                if matches!(
+                    *otherwise,
+                    Action::Composer(_, text_editor::Action::Edit(text_editor::Edit::Enter))
+                )
+        ));
+        // Chords reach past the list, to sending and to the editor.
+        for (named, modifiers) in [
+            (Named::Enter, keyboard::Modifiers::COMMAND),
+            (Named::Enter, keyboard::Modifiers::SHIFT),
+            (Named::Tab, keyboard::Modifiers::SHIFT),
+            (Named::ArrowDown, keyboard::Modifiers::ALT),
+        ] {
+            assert!(
+                route(named, modifiers, &list(true)).is_none(),
+                "{named:?} with {modifiers:?}"
+            );
+        }
+        // Keys the list does not answer to stay with the editor.
+        assert!(route(Named::ArrowLeft, none, &list(true)).is_none());
+    }
+
+    /// The hint says which named skills reach the agent as words, and why.
+    #[test]
+    fn the_unloaded_hint_names_the_skills_and_the_rule() {
+        assert_eq!(
+            unloaded_hint(&["/beta"], chat::SkillReach::Leading).as_deref(),
+            Some(
+                "/beta goes as plain text: only a skill that starts the message is loaded with it"
+            )
+        );
+        assert_eq!(
+            unloaded_hint(&["/skill:b", "/skill:c"], chat::SkillReach::First).as_deref(),
+            Some(
+                "/skill:b, /skill:c go as plain text: only the first skill a message names is loaded with it"
+            )
+        );
+        assert_eq!(unloaded_hint(&[], chat::SkillReach::Leading), None);
     }
 
     /// The composer is the product's primary input: the chords must reach the

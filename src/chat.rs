@@ -747,6 +747,26 @@ pub struct Capabilities {
     pub model_selection: bool,
     pub reasoning_selection: bool,
     pub permission_modes: Vec<String>,
+    pub skill_reach: SkillReach,
+}
+/// Which of the skills a message names the provider loads with it.
+///
+/// Every provider reads a skill named in a message, but not every one reads
+/// all of them: a skill it does not load reaches the agent as plain words,
+/// which the agent may or may not act on. The composer says so rather than
+/// dressing such a name up as a skill that will run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkillReach {
+    /// Every skill named anywhere in the message, as Codex reads `$name`.
+    #[default]
+    Anywhere,
+    /// Only a skill the message opens with, as Claude Code expands a leading
+    /// `/name`; one named later is left for the agent to take up.
+    Leading,
+    /// Only the first skill named, wherever it is, as oh-my-pi reads
+    /// `/skill:name`: set apart by whitespace, and in a message that does not
+    /// open with another command or a shell escape.
+    First,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {

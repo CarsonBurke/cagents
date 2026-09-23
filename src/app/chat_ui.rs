@@ -152,8 +152,11 @@ pub enum Action {
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
-    /// Puts a completion row's text over the word being completed.
-    Complete(Target, String),
+    /// Puts a completion row's text over the word being completed. When the
+    /// row is no longer offered, because the word changed under the key that
+    /// chose it, the key does what it does without the list: the action
+    /// given, if any.
+    Complete(Target, String, Option<Box<Action>>),
     /// Moves the completion highlight down, or up when `false`.
     CompletionMove(Target, bool),
     /// Sends the completion list away until the reader types again.
@@ -230,7 +233,7 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
-            | Self::Complete(target, _)
+            | Self::Complete(target, _, _)
             | Self::Scrolled(target, _)
             | Self::ModelPicker(target, _)
             | Self::ModelQuery(target, _) => Some(*target),
@@ -1189,7 +1192,11 @@ fn submission(
         // reader typed: the slash form is the composer's, the invocation is
         // the provider's.
         _ => Ok(Command::Prompt {
-            text: completion::invocations(text, &snapshot.skills).into_owned(),
+            text: completion::invocations(
+                completion::from_leading_skill(text, &snapshot.skills),
+                &snapshot.skills,
+            )
+            .into_owned(),
             attachments: attachments.to_vec(),
             mode,
         }),
@@ -1229,10 +1236,20 @@ impl Runtime {
 
     /// Puts `insertion` over the word being completed when it is one of the
     /// rows offered for that word, leaving the rest of the draft as it was.
-    fn complete(&mut self, insertion: &str) -> bool {
+    ///
+    /// Enter chose the row by what the list showed when it was drawn, and
+    /// keys typed since may have spelled the word out: it only completes
+    /// while it still would choose that row.
+    fn complete(&mut self, insertion: &str, by_enter: bool) -> bool {
         let Some(token) = self.completion().and_then(|(token, rows)| {
             rows.iter()
-                .any(|row| row.insertion == insertion)
+                .any(|row| {
+                    row.insertion == insertion
+                        && (!by_enter
+                            || self
+                                .completion
+                                .enter_chooses(&token, row, &self.snapshot.skills))
+                })
                 .then_some(token)
         }) else {
             return false;
@@ -3646,12 +3663,17 @@ impl Cagents {
                     false,
                 );
             }
-            Action::Complete(target, insertion) => {
+            Action::Complete(target, insertion, otherwise) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime.complete(&insertion) {
-                    return Task::none();
+                if !runtime.complete(&insertion, otherwise.is_some()) {
+                    // Enter pressed while the list still showed a row the
+                    // word has since moved past sends or breaks the line, as
+                    // it would have without the list, rather than doing
+                    // nothing at all.
+                    return otherwise
+                        .map_or_else(Task::none, |otherwise| self.handle_chat_action(*otherwise));
                 }
                 // A row chosen with the pointer took the keyboard from the
                 // draft, and the reader is mid-sentence.
@@ -5382,6 +5404,17 @@ mod tests {
         assert_eq!(
             prompt(submission("/alpha", &claude, &[], PromptMode::Send).unwrap()),
             "/alpha"
+        );
+        // Claude Code expands a skill only from the message's first
+        // character, so blank lines ahead of one are not sent; a message
+        // that opens with anything else keeps its indentation.
+        assert_eq!(
+            prompt(submission("\n  /alpha this", &claude, &[], PromptMode::Send).unwrap()),
+            "/alpha this"
+        );
+        assert_eq!(
+            prompt(submission("    let x = 1;\n/beta", &claude, &[], PromptMode::Send).unwrap()),
+            "    let x = 1;\n/beta"
         );
         assert!(matches!(
             submission("/clear", &claude, &[], PromptMode::Send),

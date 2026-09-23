@@ -672,6 +672,7 @@ impl Adapter for Omp {
                             model_selection: true,
                             reasoning_selection: true,
                             permission_modes: Vec::new(),
+                            skill_reach: chat::SkillReach::First,
                         }));
                         step.events.push(Event::Models {
                             models: Vec::new(),
@@ -711,7 +712,7 @@ impl Adapter for Omp {
                             reasoning: None,
                         });
                     }
-                    "get_available_commands" => step.events.push(Event::Commands(commands(data))),
+                    "get_available_commands" => step.events.extend(commands(data)),
                     "get_messages_page" => {
                         for message in data["messages"].as_array().into_iter().flatten() {
                             step.events
@@ -864,7 +865,7 @@ impl Adapter for Omp {
                 });
             }
             "extension_ui_request" => return self.extension(&frame),
-            "available_commands_update" => step.events.push(Event::Commands(commands(&frame))),
+            "available_commands_update" => step.events.extend(commands(&frame)),
             "prompt_result" if frame["agentInvoked"].as_bool() == Some(false) => {
                 step = self.refresh()
             }
@@ -1023,16 +1024,33 @@ fn phase(block: &Value) -> Phase {
     }
     Phase::Commentary
 }
-fn commands(value: &Value) -> Vec<chat::SlashCommand> {
-    value["commands"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|command| chat::SlashCommand {
-            name: text(command, "name").into(),
-            description: text(command, "description").into(),
-        })
-        .collect()
+/// The commands oh-my-pi lists, and the skills it lists among them.
+///
+/// A skill is listed as the command `skill:name` from the source `skill`.
+/// It is one, in that oh-my-pi runs it from anywhere in a message rather than
+/// only as the whole of one, so it is offered as a skill wherever the reader
+/// is writing.
+fn commands(value: &Value) -> [Event; 2] {
+    let mut commands = Vec::new();
+    let mut skills = Vec::new();
+    for command in value["commands"].as_array().into_iter().flatten() {
+        let name = text(command, "name");
+        let description = text(command, "description").into();
+        match name.strip_prefix("skill:") {
+            Some(skill) if command["source"] == "skill" && !skill.is_empty() => {
+                skills.push(chat::Skill {
+                    name: skill.into(),
+                    description,
+                    invocation: format!("/{name}"),
+                });
+            }
+            _ => commands.push(chat::SlashCommand {
+                name: name.into(),
+                description,
+            }),
+        }
+    }
+    [Event::Commands(commands), Event::Skills(skills)]
 }
 fn answer_value(answers: &[Answer]) -> String {
     answers
@@ -1046,6 +1064,21 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// oh-my-pi lists a skill as the command `skill:name`, which it runs from
+    /// anywhere in a message, and loads only the first a message names.
+    #[test]
+    fn skills_are_listed_apart_from_commands_and_load_first_only() {
+        let events = commands(&json!({"commands":[
+            {"name":"compact","description":"Compact","source":"builtin"},
+            {"name":"skill:review","description":"Review","source":"skill"},
+            {"name":"skill:odd","description":"Not a skill","source":"prompt"},
+        ]}));
+        assert!(matches!(&events[0], Event::Commands(commands)
+            if commands.iter().map(|c| c.name.as_str()).eq(["compact", "skill:odd"])));
+        assert!(matches!(&events[1], Event::Skills(skills)
+            if skills.len() == 1 && skills[0].name == "review" && skills[0].invocation == "/skill:review"));
+    }
 
     #[test]
     fn usage_refresh_keeps_context_and_cumulative_totals_together() {

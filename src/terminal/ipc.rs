@@ -77,7 +77,8 @@ use crate::{
 /// Version 18 adds `ServerMessage::ChatAccountUsage`. It is appended, but it
 /// reaches every chat subscriber unasked, so a client that predates it would
 /// be sent a variant index it cannot decode.
-pub const PROTOCOL_VERSION: u16 = 18;
+/// Version 19 adds the reach of a provider's skills to its chat capabilities.
+pub const PROTOCOL_VERSION: u16 = 19;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
