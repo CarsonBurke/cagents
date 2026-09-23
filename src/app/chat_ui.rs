@@ -3722,12 +3722,18 @@ impl Cagents {
                     // Only the conversation is being given up here; the card
                     // stays and immediately starts its replacement, so it is
                     // never left showing a conversation that no longer exists.
-                    let changing_provider = self.chat_runtime_mut(target).is_some_and(|runtime| {
-                        if runtime.session.launch.provider == session.launch.provider {
+                    // A move to another provider or account starts a
+                    // different conversation (another account renews the
+                    // terminal id); a restart of the same one does not.
+                    let moving = self.chat_runtime_mut(target).is_some_and(|runtime| {
+                        if runtime.session.launch.provider == session.launch.provider
+                            && runtime.session.id == session.id
+                        {
                             return false;
                         }
                         // Keep the draft, attachments, and composer selection in
-                        // this card while its empty connection changes accounts.
+                        // this card while its empty connection changes provider
+                        // or account.
                         runtime.session = session.clone();
                         runtime.disconnected = true;
                         runtime.provider_closed = true;
@@ -3739,7 +3745,7 @@ impl Cagents {
                         runtime.permission_mode = None;
                         true
                     });
-                    if !changing_provider {
+                    if !moving {
                         self.chat_forget(target.card);
                         self.cards.insert(target.card, CardRuntime::Loading);
                     }
@@ -4205,8 +4211,14 @@ mod tests {
             .to_string();
 
         let card = live_chat(&mut app, None);
-        let target = match app.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.target,
+        let dropped = Attachment {
+            path: PathBuf::from("/tmp/dropped.png"),
+        };
+        let target = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.attachments.push(dropped.clone());
+                runtime.target
+            }
             _ => unreachable!(),
         };
         let _ = app.update(Message::ChatUi(Action::ChooseAccount(
@@ -4217,12 +4229,23 @@ mod tests {
             .chat_ui
             .restarting
             .get(&card)
-            .expect("an empty conversation restarts on the chosen account");
+            .expect("an empty conversation restarts on the chosen account")
+            .clone();
         assert_eq!(
             restart.launch.recipe.environment.get("CODEX_HOME"),
             Some(&home)
         );
         assert_eq!(restart.launch.recipe.arguments, ["--remote", "unix://"]);
+        // The composer outlives the move: what the reader attached is still
+        // there on the new account.
+        let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                assert_eq!(runtime.session.id, restart.id);
+                assert_eq!(runtime.attachments, [dropped]);
+            }
+            _ => panic!("the card lost its composer while changing account"),
+        }
 
         let _ = app.update(Message::AccountUi(
             crate::app::account_ui::Action::SetDefault(managed),
