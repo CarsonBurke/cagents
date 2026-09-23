@@ -266,12 +266,15 @@ struct Claude {
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
     message_offsets: HashMap<String, usize>,
+    message_order: VecDeque<String>,
     carrier_items: HashMap<String, Vec<String>>,
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
+    retracted_order: VecDeque<String>,
     tools: HashMap<String, Item>,
     tool_order: VecDeque<String>,
-    tasks: std::collections::HashSet<String>,
+    /// Running background tasks, oldest first.
+    tasks: VecDeque<String>,
     models: Vec<Model>,
     selected: Option<String>,
     cache_read_tokens: u64,
@@ -639,13 +642,23 @@ impl Claude {
                 .map(|v| v as usize)
                 .or_else(|| self.carrier_offsets.get(carrier).copied())
                 .unwrap_or_else(|| self.message_offsets.get(id).copied().unwrap_or(0));
+            // Carrier offsets age out with `carrier_order`. A message's carriers
+            // arrive together, so evicting the message first seen longest ago
+            // leaves any message still arriving with its offset.
             if !self.carrier_offsets.contains_key(carrier) {
-                if self.carrier_offsets.len() >= 2048 {
-                    self.carrier_offsets.clear();
-                    self.message_offsets.clear();
-                }
                 self.carrier_offsets.insert(carrier.into(), base);
-                self.message_offsets.insert(id.into(), base + content.len());
+                if self
+                    .message_offsets
+                    .insert(id.into(), base + content.len())
+                    .is_none()
+                {
+                    self.message_order.push_back(id.into());
+                }
+                while self.message_order.len() > 2048 {
+                    if let Some(old) = self.message_order.pop_front() {
+                        self.message_offsets.remove(&old);
+                    }
+                }
             }
             for (index, block) in content.iter().enumerate() {
                 let index = self
@@ -857,16 +870,11 @@ impl Claude {
                     message: "Claude retracted a message outside the retained correlation window; its original text stays displayed until the session is reloaded".into(),
                     fatal: false,
                 });
-                if self.retracted.len() < 2048 {
-                    self.retracted.insert(carrier.into());
-                }
+                self.remember_retracted(carrier);
                 continue;
             };
             ids.extend(items.iter().cloned());
-            if self.retracted.len() >= 2048 {
-                return Err("Claude retraction ledger exceeds its bounded limit".into());
-            }
-            self.retracted.insert(carrier.into());
+            self.remember_retracted(carrier);
         }
         for id in &ids {
             self.tools.remove(id);
@@ -876,6 +884,18 @@ impl Claude {
             step.events.push(Event::ItemsRemoved { ids });
         }
         Ok(())
+    }
+    /// Keep a replay of a retracted carrier hidden. The oldest are forgotten
+    /// first; one replayed that late reappears instead of ending the session.
+    fn remember_retracted(&mut self, carrier: &str) {
+        if self.retracted.insert(carrier.into()) {
+            self.retracted_order.push_back(carrier.into());
+        }
+        while self.retracted_order.len() > 2048 {
+            if let Some(old) = self.retracted_order.pop_front() {
+                self.retracted.remove(&old);
+            }
+        }
     }
 }
 
@@ -1038,6 +1058,7 @@ impl Adapter for Claude {
                 self.blocks.clear();
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
+                self.message_order.clear();
                 self.tools.clear();
                 self.tool_order.clear();
                 self.tasks.clear();
@@ -1045,6 +1066,7 @@ impl Adapter for Claude {
                 self.carrier_items.clear();
                 self.carrier_order.clear();
                 self.retracted.clear();
+                self.retracted_order.clear();
                 self.usage = Usage::default();
                 self.cache_read_tokens = 0;
                 self.cache_write_tokens = 0;
@@ -1835,15 +1857,19 @@ impl Claude {
                 if string(frame, "subtype") == "task_started"
                     && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
                 {
-                    if self.tasks.len() >= MAX_TOOLS {
-                        return Err("Claude background task count exceeds its limit".into());
+                    if !self.tasks.iter().any(|running| running == task) {
+                        self.tasks.push_back(task.into());
                     }
-                    self.tasks.insert(task.into());
+                    // A task whose completion never arrived must not end the
+                    // conversation; the oldest is the likeliest to be one.
+                    if self.tasks.len() > MAX_TOOLS {
+                        self.tasks.pop_front();
+                    }
                 }
                 if string(frame, "subtype") == "task_notification"
                     || matches!(string(patch, "status"), "completed" | "failed" | "stopped")
                 {
-                    self.tasks.remove(task);
+                    self.tasks.retain(|running| running != task);
                 }
                 if let ItemContent::Tool {
                     input,
@@ -3424,6 +3450,75 @@ mod tests {
         let replacement = adapter.receive(json!({"type":"assistant","uuid":"new-carrier","supersedes":["old-carrier"],"message":{"id":"new-message","content":[{"type":"text","text":"Canonical"}]}})).unwrap();
         assert!(replacement.events.iter().any(|event| matches!(event,Event::ItemsRemoved {ids} if ids == &vec!["old-message:0".to_owned()])));
         assert!(adapter.receive(old).unwrap().events.is_empty());
+    }
+
+    /// Other messages' carriers filling the correlation window must not
+    /// renumber a message whose later blocks are still arriving.
+    #[test]
+    fn an_in_flight_message_keeps_its_block_ids_past_the_carrier_window() {
+        let mut adapter = Claude::default();
+        let block = |carrier: &str, message: &str, text: &str| json!({"type":"assistant","uuid":carrier,"message":{"id":message,"content":[{"type":"text","text":text}]}});
+        adapter.receive(block("slow-0", "slow", "First")).unwrap();
+        for message in 0..1024 {
+            for part in 0..2 {
+                adapter
+                    .receive(block(
+                        &format!("c{message}-{part}"),
+                        &format!("m{message}"),
+                        "Parallel",
+                    ))
+                    .unwrap();
+            }
+        }
+        let second = adapter.receive(block("slow-1", "slow", "Second")).unwrap();
+        assert!(
+            second
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Item(i) if i.id == "slow:1"))
+        );
+        assert!(adapter.message_offsets.len() <= 2048 && adapter.carrier_offsets.len() <= 2048);
+    }
+
+    /// Retractions are rare but unbounded over a session; the ledger
+    /// forgets the oldest rather than ending the conversation.
+    #[test]
+    fn a_long_session_of_retractions_stays_bounded_and_alive() {
+        let mut adapter = Claude::default();
+        for turn in 0..2100 {
+            let old = json!({"type":"assistant","uuid":format!("old-{turn}"),"message":{"id":format!("old-{turn}"),"content":[{"type":"text","text":"Refused"}]}});
+            adapter.receive(old).unwrap();
+            let replacement = adapter.receive(json!({"type":"assistant","uuid":format!("new-{turn}"),"supersedes":[format!("old-{turn}")],"message":{"id":format!("new-{turn}"),"content":[{"type":"text","text":"Fallback"}]}})).unwrap();
+            assert!(replacement.events.iter().any(|event| matches!(event, Event::ItemsRemoved { ids } if *ids == [format!("old-{turn}:0")])));
+        }
+        assert_eq!(adapter.retracted.len(), 2048);
+        let replay = json!({"type":"assistant","uuid":"old-2099","message":{"id":"old-2099","content":[{"type":"text","text":"Refused"}]}});
+        assert!(adapter.receive(replay).unwrap().events.is_empty());
+    }
+
+    /// A background task whose completion never arrives is forgotten once
+    /// the bound is reached, rather than ending the conversation.
+    #[test]
+    fn background_tasks_past_the_bound_evict_the_oldest() {
+        let mut adapter = Claude::default();
+        let task = |subtype: &str, id: usize| json!({"type":"system","subtype":subtype,"task_id":format!("agent-{id}"),"task_type":"local_agent","description":"Review"});
+        for id in 0..=MAX_TOOLS {
+            adapter.receive(task("task_started", id)).unwrap();
+        }
+        assert_eq!(adapter.tasks.len(), MAX_TOOLS);
+        assert_eq!(adapter.tasks.front().map(String::as_str), Some("agent-1"));
+        for id in 1..=MAX_TOOLS {
+            adapter.receive(task("task_notification", id)).unwrap();
+        }
+        let settled = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(
+            settled
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { busy: false, .. }))
+        );
     }
 
     #[test]
