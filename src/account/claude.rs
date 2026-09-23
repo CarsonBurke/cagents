@@ -10,6 +10,7 @@
 //!
 //! Both are normalized to a used fraction and Unix seconds here.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -330,7 +331,7 @@ fn money(value: &Value) -> Option<Money> {
 
 /// A live `rate_limit_event`'s `rate_limit_info`, as the windows it moved and
 /// the status it reported.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveUpdate {
     pub windows: Vec<UsageWindow>,
     /// The status the event states, which is Claude's own reading of the

@@ -1,6 +1,7 @@
 //! Native chat connection to the same authenticated daemon as hosted terminals.
 use super::{Command, Intent, Session, Snapshot, StartFailure};
 use crate::{
+    account::LiveReport,
     agent::ActivityState,
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
@@ -9,7 +10,7 @@ use crate::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io,
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -27,6 +28,8 @@ pub enum Wake {
     Observed,
     /// Consume the newest state with `take_activity`; never fetches a transcript.
     Activity,
+    /// Consume the reports with `take_account_usage`.
+    AccountUsage,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -54,6 +57,7 @@ struct Inner {
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
+    account_usage: Arc<Mutex<AccountUsage>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -89,6 +93,30 @@ impl OutputObservation {
 
     fn take(&mut self) -> bool {
         std::mem::take(&mut self.pending)
+    }
+}
+
+/// Account reports not yet taken by the surface, oldest first.
+///
+/// They are kept rather than coalesced to the newest, because a Codex update
+/// names only the bucket that moved and the next may name another. The bound
+/// only matters to a surface that stopped taking them, and drops the oldest.
+#[derive(Default)]
+struct AccountUsage {
+    reports: VecDeque<(LiveReport, u64)>,
+}
+
+impl AccountUsage {
+    const LIMIT: usize = 32;
+
+    /// Queues a report, and says whether the surface has to be woken for it:
+    /// only the first since the surface last took them.
+    fn push(&mut self, report: LiveReport, observed_at: u64) -> bool {
+        if self.reports.len() == Self::LIMIT {
+            self.reports.pop_front();
+        }
+        self.reports.push_back((report, observed_at));
+        self.reports.len() == 1
     }
 }
 
@@ -288,6 +316,7 @@ impl ClientHandle {
                     pending: false,
                 })),
                 observed: Arc::new(Mutex::new(OutputObservation::default())),
+                account_usage: Arc::default(),
                 next: Arc::new(AtomicU64::new(1)),
                 alive: Arc::new(AtomicBool::new(true)),
                 visible: Arc::new(AtomicBool::new(true)),
@@ -298,6 +327,17 @@ impl ClientHandle {
                 visibility_worker: Mutex::new(None),
             }),
         }
+    }
+
+    /// Queues a report as the reader thread would on its arrival, and says
+    /// whether it would have woken the surface.
+    #[cfg(test)]
+    pub(crate) fn push_account_usage_for_test(&self, report: LiveReport, observed_at: u64) -> bool {
+        self.inner
+            .account_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(report, observed_at)
     }
 
     #[cfg(test)]
@@ -533,6 +573,7 @@ impl ClientHandle {
         // edge older than the handshake snapshot.
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
+        let mut early_usage = AccountUsage::default();
         let (session, initial) = loop {
             let envelope: ServerEnvelope = codec
                 .read(&mut stream)
@@ -553,6 +594,13 @@ impl ClientHandle {
                     if chat_id == id && envelope.request_id.is_none() =>
                 {
                     early_observed.observe(epoch);
+                }
+                ServerMessage::ChatAccountUsage {
+                    chat_id,
+                    report,
+                    observed_at,
+                } if chat_id == id && envelope.request_id.is_none() => {
+                    early_usage.push(report, observed_at);
                 }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
@@ -582,6 +630,7 @@ impl ClientHandle {
         }
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
+        let account_usage = Arc::new(Mutex::new(early_usage));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
@@ -597,6 +646,7 @@ impl ClientHandle {
             snapshot: snapshot.clone(),
             activity: activity.clone(),
             observed: observed.clone(),
+            account_usage: account_usage.clone(),
             next: next.clone(),
             alive: alive.clone(),
             wake: wake.clone(),
@@ -712,6 +762,11 @@ impl ClientHandle {
                             .observe(generation, state);
                         if changed { wake(Wake::Activity); }
                     },
+                    ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
+                        let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
+                            .push(report, observed_at);
+                        if first { wake(Wake::AccountUsage); }
+                    },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
                         if let Some(update) = update {
@@ -782,6 +837,17 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
+    }
+    /// Drains what the provider reported about the account this chat runs
+    /// on, oldest first.
+    pub fn take_account_usage(&self) -> Vec<(LiveReport, u64)> {
+        self.inner
+            .account_usage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reports
+            .drain(..)
+            .collect()
     }
     pub fn take_observed(&self) -> bool {
         self.inner

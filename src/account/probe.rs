@@ -14,7 +14,9 @@
 //! group is killed on the way out, so a probe leaves nothing running.
 
 use std::{
+    ffi::{OsStr, OsString},
     io,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -36,6 +38,8 @@ use crate::agent::Provider;
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a CLI's stdout a probe reads before giving up on it.
 pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
+/// How long the reader's shell is given to say what `PATH` it sets up.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a CLI is given to exit after its input closes.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// How often `finish` looks for the CLI to have exited on its own.
@@ -49,6 +53,27 @@ const SCRUBBED_ENVIRONMENT: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
+];
+
+/// What the reader's shell is asked to run: print its `PATH`, and nothing
+/// else of its environment, between a newline that sets it apart from a
+/// greeting a startup file printed without one and a NUL that ends it.
+///
+/// The printing is left to `/bin/sh`, whose `printf` is the same whatever
+/// the reader's shell; theirs only has to run it, and every shell reads
+/// single quotes as literal.
+const SHELL_PATH_COMMAND: &str = r#"exec /bin/sh -c 'printf "\n%s\0" "$PATH"'"#;
+
+/// Variables the shell asked for its `PATH` goes without as well, so that a
+/// startup file that wants a password or a key's passphrase cannot put a
+/// prompt in front of the reader.
+const SHELL_SCRUBBED_ENVIRONMENT: &[&str] = &[
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "SUDO_ASKPASS",
+    "GIT_ASKPASS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
 ];
 
 /// What a probe learned.
@@ -72,10 +97,14 @@ pub enum Outcome {
 /// [`STALE_AFTER`] is returned instead of probing again.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
     let now = now_ms();
+    let search_path = search_path().await;
     let setup = {
         let account = account.clone();
         let cache = cache.clone();
-        tokio::task::spawn_blocking(move || prepare(&account, cache.as_ref(), force, now)).await
+        tokio::task::spawn_blocking(move || {
+            prepare(&account, cache.as_ref(), force, now, search_path.as_deref())
+        })
+        .await
     };
     let (program, key, lock) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
@@ -121,7 +150,13 @@ enum Prepared {
     },
 }
 
-fn prepare(account: &Account, cache: Option<&Cache>, force: bool, now: u64) -> Prepared {
+fn prepare(
+    account: &Account,
+    cache: Option<&Cache>,
+    force: bool,
+    now: u64,
+    search_path: Option<&OsStr>,
+) -> Prepared {
     let unavailable = |detail: String| {
         Prepared::Done(answered(
             None,
@@ -137,7 +172,7 @@ fn prepare(account: &Account, cache: Option<&Cache>, force: bool, now: u64) -> P
             cli_name(account.provider)
         ));
     }
-    let Some(program) = find_executable(account.provider.executable()) else {
+    let Some(program) = find_executable(account.provider.executable(), search_path) else {
         return unavailable(format!("{} is not installed", cli_name(account.provider)));
     };
     let key = account.cache_key();
@@ -193,13 +228,118 @@ async fn probe_cli(
     }
 }
 
-/// The first executable named `name` on this process's `PATH`.
+/// The `PATH` the reader's shell sets up, once asked: `Some(None)` when it
+/// could not say.
+static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
+
+/// The directories a provider's CLI is looked for in: the ones a terminal
+/// would search.
+///
+/// A terminal runs the reader's shell interactively, and its startup files
+/// are where installers put `~/.local/bin` or a Node version manager's `bin`.
+/// The interface may have been started from a desktop launcher with a much
+/// shorter `PATH`, and a CLI the reader runs in every terminal would then
+/// read as not installed. So the shell is asked, once per process; where it
+/// cannot say, this process's own `PATH` stands in.
+pub async fn search_path() -> Option<OsString> {
+    SHELL_PATH
+        .get_or_init(|| async {
+            let shell = crate::model::login_shell().ok()?;
+            shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+        })
+        .await;
+    current_search_path()
+}
+
+/// What [`search_path`] would answer now, without waiting for the shell:
+/// this process's own `PATH` until the shell has been asked.
+pub fn current_search_path() -> Option<OsString> {
+    shell_search_path()
+        .map(OsStr::to_owned)
+        .or_else(|| std::env::var_os("PATH"))
+}
+
+/// Whether the shell has been asked for its `PATH`, so that
+/// [`current_search_path`] is [`search_path`]'s final answer.
+pub fn shell_asked() -> bool {
+    SHELL_PATH.initialized()
+}
+
+/// The shell's `PATH`, if [`search_path`] has already read one. A CLI found on
+/// it runs with it, as it would in a terminal: a Node CLI's
+/// `#!/usr/bin/env node` looks for Node there.
+pub fn shell_search_path() -> Option<&'static OsStr> {
+    SHELL_PATH.get()?.as_deref()
+}
+
+/// The `PATH` `shell` sets up when started interactively, as a terminal
+/// starts it, or `None` if it does not say within `timeout`.
+///
+/// It runs with no terminal and its output discarded but for the `PATH` it
+/// prints, in its own process group, which goes with it. Nothing it starts
+/// can ask the reader for anything: no terminal, no display, no askpass.
+async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
+    let mut command = Command::new(shell);
+    command.args(["-i", "-c", SHELL_PATH_COMMAND]);
+    for variable in SCRUBBED_ENVIRONMENT
+        .iter()
+        .chain(SHELL_SCRUBBED_ENVIRONMENT)
+    {
+        command.env_remove(variable);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        command.current_dir(home);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .process_group(0);
+    let mut group = Group::spawn(command).await.ok()?;
+    let mut stdout = group.stdout().ok()?;
+    let mut output = Vec::new();
+    // The value ends at its NUL. A job a startup file left running may hold
+    // the pipe open long after, so the read stops there rather than at the
+    // end of the output.
+    let read = tokio::time::timeout(timeout, async {
+        let mut chunk = [0; 4096];
+        loop {
+            match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) if chunk[..read].contains(&0) => {
+                    output.extend_from_slice(&chunk[..read]);
+                    break;
+                }
+                Ok(read) => output.extend_from_slice(&chunk[..read]),
+            }
+        }
+    })
+    .await;
+    drop(stdout);
+    // A shell that has not answered in time is not given a grace to exit.
+    if read.is_err() {
+        group.kill();
+    }
+    group.finish().await;
+    read.ok()?;
+    path_from_output(&output)
+}
+
+/// The `PATH` in what the shell printed: the text between the last newline
+/// and the NUL that ends it, after whatever a startup file printed first.
+fn path_from_output(output: &[u8]) -> Option<OsString> {
+    let end = output.iter().position(|byte| *byte == 0)?;
+    let value = output[..end].rsplit(|byte| *byte == b'\n').next()?;
+    (!value.is_empty()).then(|| OsString::from_vec(value.to_vec()))
+}
+
+/// The first executable named `name` on `search_path`.
 ///
 /// Only absolute entries are searched: a relative entry would resolve
 /// against whatever directory the interface happens to run in.
-pub fn find_executable(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+pub fn find_executable(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(search_path?)
         .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join(name))
         .find(|candidate| is_executable(candidate))
@@ -218,6 +358,9 @@ fn command(account: &Account, program: &Path) -> Command {
     }
     if let Some((variable, home)) = account.probe_environment() {
         command.env(variable, home);
+    }
+    if let Some(path) = shell_search_path() {
+        command.env("PATH", path);
     }
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
@@ -433,10 +576,12 @@ pub async fn logout(account: Account) -> Result<(), String> {
         Provider::Omp => return Ok(()),
     };
     let executable = account.provider.executable();
-    let Some(program) = tokio::task::spawn_blocking(move || find_executable(executable))
-        .await
-        .ok()
-        .flatten()
+    let search_path = search_path().await;
+    let Some(program) =
+        tokio::task::spawn_blocking(move || find_executable(executable, search_path.as_deref()))
+            .await
+            .ok()
+            .flatten()
     else {
         return Ok(());
     };
@@ -846,6 +991,73 @@ cat >/dev/null
             format!("{} logout", home.display())
         );
         assert!(logout(Account::system(Provider::Codex)).await.is_err());
+    }
+
+    /// A shell's startup files decide where a terminal finds the CLI, and
+    /// may greet the reader first or leave a job running that holds the
+    /// output open; a shell that never answers leaves the search to this
+    /// process's own `PATH`, without holding anything up.
+    #[tokio::test]
+    async fn the_cli_is_looked_for_where_the_readers_shell_would_look() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("shell bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cli = bin.join("codex");
+        std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+        make_executable(&cli);
+        let shell = directory.path().join("shell");
+        let asked = directory.path().join("asked");
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1 $2\" = '-i -c' ] || exit 9\n\
+                 [ -z \"${{DISPLAY-}}${{WAYLAND_DISPLAY-}}${{SSH_ASKPASS-}}\" ] || exit 8\n\
+                 printf '%s' \"$3\" > '{}'\n\
+                 printf 'Welcome back'\n\
+                 sleep 30 &\n\
+                 PATH='relative:{}' eval \"$3\"\n",
+                asked.display(),
+                bin.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&shell);
+        let path = shell_path(&shell, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), SHELL_PATH_COMMAND);
+        assert_eq!(path, OsString::from(format!("relative:{}", bin.display())));
+        assert_eq!(find_executable("codex", Some(&path)), Some(cli));
+        assert_eq!(find_executable("claude", Some(&path)), None);
+
+        let silent = directory.path().join("silent");
+        std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        make_executable(&silent);
+        let timeout = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        assert_eq!(shell_path(&silent, timeout).await, None);
+        assert!(
+            started.elapsed() < timeout + EXIT_GRACE,
+            "a shell out of time is not given a grace to exit"
+        );
+    }
+
+    #[test]
+    fn the_path_is_read_past_a_greeting() {
+        assert_eq!(
+            path_from_output(b"Hello\nthere\n/a:/b\0"),
+            Some(OsString::from("/a:/b"))
+        );
+        assert_eq!(
+            path_from_output(b"\n/c\0late output"),
+            Some(OsString::from("/c"))
+        );
+        assert_eq!(path_from_output(b"\n\0"), None);
+        assert_eq!(
+            path_from_output(b"\n/d"),
+            None,
+            "a value cut off is not taken"
+        );
+        assert_eq!(path_from_output(b""), None);
     }
 
     fn make_executable(path: &Path) {

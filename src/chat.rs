@@ -20,14 +20,50 @@ pub mod runtime;
 /// daemon that writes a stamp runs on the same machine as the surface that
 /// reads it.
 pub fn clock_label(unix_ms: u64) -> String {
-    let seconds = (unix_ms / 1000) as libc::time_t;
+    let seconds = i64::try_from(unix_ms / 1000).unwrap_or(i64::MAX);
+    local_time(seconds).map_or_else(String::new, |time| time.clock())
+}
+
+/// The reader's local calendar position of a unix time.
+pub struct LocalTime {
+    pub day_of_year: i32,
+    /// Years since 1900, as `struct tm` counts them.
+    pub year: i32,
+    /// Days since Sunday.
+    pub weekday: usize,
+    /// Months since January.
+    pub month: usize,
+    pub day: i32,
+    pub hour: i32,
+    pub minute: i32,
+}
+
+impl LocalTime {
+    /// The time of day, as `14:32`.
+    pub fn clock(&self) -> String {
+        format!("{:02}:{:02}", self.hour, self.minute)
+    }
+}
+
+/// Where `unix_seconds` falls on the reader's local calendar, or `None` for a
+/// time the platform cannot represent.
+pub fn local_time(unix_seconds: i64) -> Option<LocalTime> {
+    let seconds = unix_seconds as libc::time_t;
     let mut parts: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: `localtime_r` writes into the caller's `tm` and reads only the
     // time it is given, so it is sound for any `time_t` value.
     if unsafe { libc::localtime_r(&seconds, &mut parts) }.is_null() {
-        return String::new();
+        return None;
     }
-    format!("{:02}:{:02}", parts.tm_hour, parts.tm_min)
+    Some(LocalTime {
+        day_of_year: parts.tm_yday,
+        year: parts.tm_year,
+        weekday: parts.tm_wday.clamp(0, 6) as usize,
+        month: parts.tm_mon.clamp(0, 11) as usize,
+        day: parts.tm_mday,
+        hour: parts.tm_hour,
+        minute: parts.tm_min,
+    })
 }
 
 /// Unix milliseconds now, or `None` from a clock set before the epoch.
@@ -741,7 +777,7 @@ pub enum PlanState {
     Active,
     Done,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     /// A provider-confirmed conversation reset. The next Session event supplies
     /// its authoritative identity; never infer an ID from a reset hint.
@@ -808,6 +844,10 @@ pub enum Event {
     Plan {
         steps: Vec<PlanStep>,
     },
+    /// What the provider's CLI reported about the account this conversation
+    /// runs on. It is about the account, not the conversation: the runtime
+    /// forwards it to every surface and keeps it out of the transcript.
+    AccountUsage(crate::account::LiveReport),
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 //! window reported as a whole-number percentage used, a length in minutes and
 //! a reset in Unix seconds.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -100,17 +101,44 @@ pub fn parse_rate_limits(result: &Value, observed_at: u64) -> UsageSnapshot {
     }
 }
 
-/// Folds an `account/rateLimits/updated` notification into a snapshot.
+/// What an `account/rateLimits/updated` notification states.
 ///
 /// The notification is sparse: a window or credit block it leaves null is
-/// unchanged, not cleared, so only what it states replaces what was known.
-pub fn merge_update(snapshot: &mut UsageSnapshot, params: &Value, observed_at: u64) {
+/// unchanged, not cleared, so it is kept as what it names and folded into a
+/// snapshot by [`merge_update`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitsUpdate {
+    pub windows: Vec<UsageWindow>,
+    pub credits: Option<Credits>,
+    pub plan: Option<String>,
+    /// The default bucket reported its limit as reached.
+    pub limited: bool,
+}
+
+/// The limits an `account/rateLimits/updated` notification's params state,
+/// or `None` when it states nothing a snapshot could take.
+pub fn parse_update(params: &Value) -> Option<LimitsUpdate> {
     let bucket = &params["rateLimits"];
     if !bucket.is_object() {
-        return;
+        return None;
     }
     let id = bucket["limitId"].as_str().unwrap_or(DEFAULT_LIMIT_ID);
-    for window in bucket_windows(id, bucket) {
+    let update = LimitsUpdate {
+        windows: bucket_windows(id, bucket),
+        credits: bucket_credits(&bucket["credits"]),
+        plan: bucket["planType"]
+            .as_str()
+            .filter(|plan| *plan != "unknown")
+            .map(str::to_owned),
+        limited: bucket["rateLimitReachedType"].is_string() && id == DEFAULT_LIMIT_ID,
+    };
+    (!update.windows.is_empty() || update.credits.is_some() || update.limited).then_some(update)
+}
+
+/// Folds a rate-limit update into a snapshot: only what it names replaces
+/// what was known.
+pub fn merge_update(snapshot: &mut UsageSnapshot, update: LimitsUpdate, observed_at: u64) {
+    for window in update.windows {
         match snapshot
             .windows
             .iter_mut()
@@ -120,21 +148,65 @@ pub fn merge_update(snapshot: &mut UsageSnapshot, params: &Value, observed_at: u
             None => snapshot.windows.push(window),
         }
     }
-    if let Some(credits) = bucket_credits(&bucket["credits"]) {
+    if let Some(credits) = update.credits {
         snapshot.credits = Some(credits);
     }
-    if let Some(plan) = bucket["planType"]
-        .as_str()
-        .filter(|plan| *plan != "unknown")
-    {
-        snapshot.plan = Some(plan.to_owned());
+    if let Some(plan) = update.plan {
+        snapshot.plan = Some(plan);
     }
-    let limited = bucket["rateLimitReachedType"].is_string() && id == DEFAULT_LIMIT_ID;
     snapshot.observed_at = snapshot.observed_at.max(observed_at);
     snapshot.source = UsageSource::Live;
     snapshot.detail = None;
     snapshot.status = UsageStatus::Ok;
-    snapshot.refresh_status(limited, false);
+    snapshot.refresh_status(update.limited, false);
+}
+
+/// The login an `account/updated` notification reports.
+///
+/// Codex sends it when the login in its home changes. It is not a reading of
+/// the account to show - the notification cannot tell a sign-out from a
+/// provider that needs no OpenAI login - only a reason to ask again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginUpdate {
+    /// Signed in to ChatGPT, the only login Codex reports limits for.
+    pub chatgpt: bool,
+    pub plan: Option<String>,
+}
+
+impl LoginUpdate {
+    /// Whether this is the login the account was last seen with: signed in
+    /// to ChatGPT with figures to show, on the same plan where both name one,
+    /// or not signed in to ChatGPT with none. Nothing known is not
+    /// contradicted.
+    pub fn describes(&self, snapshot: Option<&UsageSnapshot>, identity: Option<&Identity>) -> bool {
+        let Some(snapshot) = snapshot else {
+            return true;
+        };
+        let signed_in = !matches!(
+            snapshot.status,
+            UsageStatus::NeedsLogin | UsageStatus::Unavailable
+        );
+        let plan = snapshot
+            .plan
+            .as_deref()
+            .or_else(|| identity?.plan.as_deref());
+        signed_in == self.chatgpt
+            && (!self.chatgpt || plan.zip(self.plan.as_deref()).is_none_or(|(a, b)| a == b))
+    }
+}
+
+/// The login an `account/updated` notification's params report.
+pub fn parse_login_update(params: &Value) -> LoginUpdate {
+    LoginUpdate {
+        chatgpt: matches!(
+            params["authMode"].as_str(),
+            Some("chatgpt" | "chatgptAuthTokens")
+        ),
+        plan: params["planType"]
+            .as_str()
+            .filter(|plan| *plan != "unknown")
+            .map(str::to_owned),
+    }
 }
 
 /// How a JSON-RPC error from the app server should be shown.
@@ -343,19 +415,49 @@ mod tests {
     #[test]
     fn a_sparse_update_replaces_only_what_it_names() {
         let mut usage = parse_rate_limits(&fixture("codex-rate-limits-read.json")["result"], 3);
-        merge_update(
-            &mut usage,
-            &fixture("codex-rate-limits-updated.json")["params"],
-            9,
-        );
+        let update = parse_update(&fixture("codex-rate-limits-updated.json")["params"]).unwrap();
+        merge_update(&mut usage, update, 9);
         assert_eq!(usage.windows.len(), 3);
         assert!((usage.windows[0].used - 0.57).abs() < 1e-6);
         assert!((usage.windows[1].used - 0.81).abs() < 1e-6, "weekly kept");
         assert!(usage.credits.is_some(), "credits kept");
         assert_eq!(usage.source, UsageSource::Live);
         assert_eq!(usage.observed_at, 9);
-        merge_update(&mut usage, &json!({"rateLimits": null}), 12);
-        assert_eq!(usage.observed_at, 9, "an empty update changes nothing");
+        assert_eq!(parse_update(&json!({"rateLimits": null})), None);
+        assert_eq!(
+            parse_update(&json!({"rateLimits": {"primary": null, "secondary": null}})),
+            None,
+            "an update naming nothing states nothing"
+        );
+    }
+
+    /// A login report is a reason to ask again only when it contradicts
+    /// what the account was last seen as.
+    #[test]
+    fn a_login_report_is_checked_against_what_was_seen() {
+        let figures = parse_rate_limits(&fixture("codex-rate-limits-read.json")["result"], 3);
+        let signed_out = UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", 3);
+        let same = parse_login_update(&fixture("codex-account-updated.json")["params"]);
+        assert_eq!(
+            same,
+            LoginUpdate {
+                chatgpt: true,
+                plan: Some("prolite".into()),
+            }
+        );
+        assert!(same.describes(Some(&figures), None));
+        assert!(
+            same.describes(None, None),
+            "nothing known is not contradicted"
+        );
+        assert!(!same.describes(Some(&signed_out), None));
+        let upgraded = parse_login_update(&json!({"authMode": "chatgpt", "planType": "pro"}));
+        assert!(!upgraded.describes(Some(&figures), None));
+        let logged_out = parse_login_update(&json!({"authMode": null, "planType": null}));
+        assert!(!logged_out.describes(Some(&figures), None));
+        assert!(logged_out.describes(Some(&signed_out), None));
+        let api_key = parse_login_update(&json!({"authMode": "apikey", "planType": null}));
+        assert!(!api_key.chatgpt);
     }
 
     /// The recorded failure from a stale login on this workstation.

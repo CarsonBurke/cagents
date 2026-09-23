@@ -74,7 +74,10 @@ use crate::{
 /// appended, but unlike the observation requests above a current client issues
 /// it on every paste, so a daemon that predates it would be sent a variant
 /// index it cannot decode.
-pub const PROTOCOL_VERSION: u16 = 17;
+/// Version 18 adds `ServerMessage::ChatAccountUsage`. It is appended, but it
+/// reaches every chat subscriber unasked, so a client that predates it would
+/// be sent a variant index it cannot decode.
+pub const PROTOCOL_VERSION: u16 = 18;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -501,6 +504,15 @@ pub enum ServerMessage {
     WorkspaceModelEdited {
         sequence: u64,
         edit: crate::workspace_model::ModelEdit,
+    },
+    /// What a native chat's provider reported about the account the chat runs
+    /// on, delivered to every subscriber whatever its visibility. It names no
+    /// account: the subscriber maps the chat's launch environment to one.
+    ChatAccountUsage {
+        chat_id: TerminalId,
+        report: crate::account::LiveReport,
+        /// Unix milliseconds at which the daemon read the report.
+        observed_at: u64,
     },
 }
 

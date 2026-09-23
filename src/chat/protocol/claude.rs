@@ -3,6 +3,7 @@
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
 use super::{Adapter, ProcessSpec, Step};
+use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat::{
     Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction, Event,
@@ -1348,7 +1349,12 @@ impl Adapter for Claude {
                 )));
             }
             "rate_limit_event" => {
-                let detail = rate_limit_detail(&frame["rate_limit_info"]);
+                let info = &frame["rate_limit_info"];
+                if let Some(update) = account::claude::parse_rate_limit_event(info) {
+                    step.events
+                        .push(Event::AccountUsage(LiveReport::Claude(update)));
+                }
+                let detail = rate_limit_detail(info);
                 if !detail.is_empty() {
                     step.events.push(Event::Status {
                         busy: self.busy,
@@ -2583,6 +2589,37 @@ mod tests {
         );
     }
 
+    /// The account windows a running conversation already streams are
+    /// forwarded as they were reported, beside the status sentence; a frame
+    /// without windows - an API-key session - forwards nothing.
+    #[test]
+    fn a_rate_limit_event_forwards_the_account_windows() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/accounts/claude-rate-limit-event.json");
+        let frame: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let expected = account::claude::parse_rate_limit_event(&frame["rate_limit_info"]).unwrap();
+        let step = Claude::default().receive(frame).unwrap();
+        assert_eq!(
+            step.events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::AccountUsage(report) => Some(report),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [&LiveReport::Claude(expected)]
+        );
+        assert!(
+            step.events
+                .iter()
+                .any(|event| matches!(event, Event::Status { .. }))
+        );
+        let windowless = Claude::default()
+            .receive(json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}))
+            .unwrap();
+        assert!(windowless.events.is_empty());
+    }
+
     #[test]
     fn align_resume_identity_rewrites_space_and_inline_forms() {
         let mut arguments = vec![
@@ -3570,6 +3607,10 @@ mod tests {
         assert_eq!(adapter.retracted.len(), 2048);
         let replay = json!({"type":"assistant","uuid":"old-2099","message":{"id":"old-2099","content":[{"type":"text","text":"Refused"}]}});
         assert!(adapter.receive(replay).unwrap().events.is_empty());
+        // The bound is real: the oldest retraction was evicted, so replaying
+        // its carrier shows it again rather than being remembered forever.
+        let evicted = json!({"type":"assistant","uuid":"old-0","message":{"id":"old-0","content":[{"type":"text","text":"Refused"}]}});
+        assert!(!adapter.receive(evicted).unwrap().events.is_empty());
     }
 
     /// A background task whose completion never arrives is forgotten once

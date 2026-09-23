@@ -320,14 +320,14 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
         return;
     };
     for (&client, &visible) in &record.subscribers {
-        let message = match update {
-            Update::Activity { state, generation } => ServerMessage::ChatActivity {
+        let message = match &update {
+            &Update::Activity { state, generation } => ServerMessage::ChatActivity {
                 chat_id: id,
                 state,
                 generation,
             },
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
-            Update::Observed { generation } if !visible => {
+            &Update::Observed { generation } if !visible => {
                 let observation = record.observations.entry(client).or_default();
                 if !observation.accepts(generation) {
                     continue;
@@ -337,6 +337,16 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
                     epoch: observation.epoch,
                 }
             }
+            // Every surface keeps the account's figures, whether or not it
+            // is showing this conversation.
+            Update::AccountUsage {
+                report,
+                observed_at,
+            } => ServerMessage::ChatAccountUsage {
+                chat_id: id,
+                report: report.clone(),
+                observed_at: *observed_at,
+            },
             _ => continue,
         };
         if let Some(delivery) = clients.get(&client) {
@@ -2768,8 +2778,9 @@ for line in sys.stdin:
                         let _ = released.recv_timeout(Duration::from_secs(5));
                     }
                 }
+                let observed = matches!(update, Update::Observed { .. });
                 changed(&weak, chat_id, update);
-                if matches!(update, Update::Observed { .. }) {
+                if observed {
                     let _ = delivered.try_send(());
                 }
             },

@@ -10,16 +10,17 @@
 //! clients chose to report.
 //!
 //! The model is shared by every lane. The parsers are pure functions over the
-//! JSON a CLI printed, so they are fixture-tested here; the live-event parsers
-//! wait for a running native chat to forward the frames it already receives
-//! (#256). Probing a CLI is
-//! the interface's job and lives in [`probe`].
+//! JSON a CLI printed, so they are fixture-tested here. A running native chat
+//! forwards the account frames its CLI already streams as a [`LiveReport`],
+//! which spares a probe while the conversation is busy. Probing a CLI is the
+//! interface's job and lives in [`probe`].
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::agent::Provider;
+use crate::chat::local_time;
 
 #[cfg(feature = "ui")]
 pub mod cache;
@@ -471,6 +472,54 @@ impl UsageSnapshot {
     }
 }
 
+/// What a running conversation's CLI reported about the account it runs on,
+/// from the frames it streams anyway: Claude's `rate_limit_event`, Codex's
+/// `account/rateLimits/updated` and `account/updated`.
+///
+/// It names no account. The conversation's environment decides that, and
+/// only the interface knows which account an environment belongs to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LiveReport {
+    Claude(claude::LiveUpdate),
+    CodexLimits(codex::LimitsUpdate),
+    CodexLogin(codex::LoginUpdate),
+}
+
+impl LiveReport {
+    pub fn provider(&self) -> Provider {
+        match self {
+            Self::Claude(_) => Provider::Claude,
+            Self::CodexLimits(_) | Self::CodexLogin(_) => Provider::Codex,
+        }
+    }
+
+    /// Folds the figures this report carries into `current`, the reading the
+    /// account already has from a probe or the cache, observed at
+    /// `observed_at`, and says whether it took them.
+    ///
+    /// A report only refines a reading: it carries the windows the CLI
+    /// happened to stream, not the plan, the credits or every model's window,
+    /// so an account without one waits for its probe. A report older than
+    /// `current` is dropped rather than rewinding a newer reading, unless
+    /// `current` is stamped further ahead of `now` than a clock can drift - a
+    /// stamp from before the clock was set back. A login report carries no
+    /// figures and is never taken.
+    pub fn apply(self, current: &mut UsageSnapshot, observed_at: u64, now: u64) -> bool {
+        if current.observed_at > observed_at
+            && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+        {
+            return false;
+        }
+        match self {
+            Self::Claude(update) => claude::merge_live(current, update, observed_at),
+            Self::CodexLimits(update) => codex::merge_update(current, update, observed_at),
+            Self::CodexLogin(_) => return false,
+        }
+        current.observed_at = observed_at;
+        true
+    }
+}
+
 /// The fullest of `windows`, and of equally full windows the one that resets
 /// soonest.
 pub fn tightest<'a>(windows: impl IntoIterator<Item = &'a UsageWindow>) -> Option<&'a UsageWindow> {
@@ -669,36 +718,6 @@ pub fn format_ago(seconds: i64) -> String {
     }
 }
 
-/// The reader's local calendar position of a unix time.
-struct LocalTime {
-    day_of_year: i32,
-    year: i32,
-    weekday: usize,
-    month: usize,
-    day: i32,
-    hour: i32,
-    minute: i32,
-}
-
-fn local_time(unix_seconds: i64) -> Option<LocalTime> {
-    let seconds = unix_seconds as libc::time_t;
-    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `localtime_r` writes into the caller's `tm` and reads only the
-    // time it is given, so it is sound for any `time_t` value.
-    if unsafe { libc::localtime_r(&seconds, &mut parts) }.is_null() {
-        return None;
-    }
-    Some(LocalTime {
-        day_of_year: parts.tm_yday,
-        year: parts.tm_year,
-        weekday: parts.tm_wday.clamp(0, 6) as usize,
-        month: parts.tm_mon.clamp(0, 11) as usize,
-        day: parts.tm_mday,
-        hour: parts.tm_hour,
-        minute: parts.tm_min,
-    })
-}
-
 /// A moment as the reader would name it from `now`: `18:00` today,
 /// `Wed 18:00` within the week, `Sep 30` beyond it.
 pub fn format_local_moment(unix_seconds: i64, now_seconds: i64) -> String {
@@ -709,7 +728,7 @@ pub fn format_local_moment(unix_seconds: i64, now_seconds: i64) -> String {
     let (Some(moment), Some(now)) = (local_time(unix_seconds), local_time(now_seconds)) else {
         return String::new();
     };
-    let clock = format!("{:02}:{:02}", moment.hour, moment.minute);
+    let clock = moment.clock();
     if moment.year == now.year && moment.day_of_year == now.day_of_year {
         clock
     } else if (unix_seconds - now_seconds).abs() < 6 * 86_400 {
@@ -970,6 +989,57 @@ mod tests {
         );
         let next_month = format_local_moment(now + 30 * 86_400, now);
         assert!(next_month.starts_with("Oct"), "{next_month:?}");
+    }
+
+    /// A report older than the reading is dropped, however slightly - unless
+    /// the reading is stamped past any drift of the present, which only a
+    /// clock set back leaves behind.
+    #[test]
+    fn a_live_report_never_rewinds_a_newer_reading() {
+        const NOW: u64 = 1_790_000_000_000;
+        let report = || {
+            LiveReport::Claude(claude::LiveUpdate {
+                windows: vec![window("five_hour", WindowKind::Session, 0.4, None)],
+                status: None,
+            })
+        };
+        let reading = |observed_at| UsageSnapshot {
+            windows: vec![window("five_hour", WindowKind::Session, 0.1, None)],
+            credits: None,
+            status: UsageStatus::Ok,
+            observed_at,
+            source: UsageSource::Probe,
+            plan: Some("max".into()),
+            detail: None,
+        };
+
+        let mut newer = reading(NOW);
+        assert!(!report().apply(&mut newer, NOW - 1, NOW));
+        assert_eq!(newer, reading(NOW));
+        // However much older: the drift allowed is the reading's from the
+        // present, not the report's from the reading.
+        assert!(!report().apply(&mut newer, NOW - 10 * schedule::CLOCK_SLACK, NOW));
+        assert_eq!(newer, reading(NOW));
+
+        let mut older = reading(NOW - 1);
+        assert!(report().apply(&mut older, NOW, NOW));
+        assert_eq!(older.observed_at, NOW);
+        assert_eq!(older.source, UsageSource::Live);
+        assert_eq!(older.plan.as_deref(), Some("max"));
+        assert!((older.windows[0].used - 0.4).abs() < 1e-6);
+
+        // Stamped an hour ahead of a present that has not reached it.
+        let mut ahead = reading(NOW + 3_600_000);
+        assert!(report().apply(&mut ahead, NOW, NOW));
+        assert_eq!(ahead.observed_at, NOW);
+
+        let login = LiveReport::CodexLogin(codex::LoginUpdate {
+            chatgpt: true,
+            plan: None,
+        });
+        let mut untouched = reading(NOW - 1);
+        assert!(!login.apply(&mut untouched, NOW, NOW));
+        assert_eq!(untouched, reading(NOW - 1));
     }
 }
 

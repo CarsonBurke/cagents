@@ -3,6 +3,7 @@ use super::{
     Command, Event, Item, ItemContent, Phase, Snapshot,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
+use crate::account::LiveReport;
 use crate::agent::ActivityState;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -35,7 +36,7 @@ const FRAMES_PER_POLL: usize = 256;
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 type CommandRequest = (Command, crossbeam_channel::Sender<Result<(), String>>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
     Presentation,
     Observed {
@@ -44,6 +45,14 @@ pub(crate) enum Update {
     Activity {
         state: ActivityState,
         generation: u64,
+    },
+    /// The provider reported on the account the conversation runs on. It
+    /// concerns every surface showing the account, whatever this
+    /// conversation's visibility, and changes nothing in the snapshot.
+    AccountUsage {
+        report: LiveReport,
+        /// Unix milliseconds at which the runtime read the report.
+        observed_at: u64,
     },
 }
 
@@ -940,7 +949,12 @@ impl Actor {
         }
     }
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
-        let observed = !step.events.is_empty();
+        // An account report is not output of this conversation, so it does
+        // not mark an offscreen pane as having something new to read.
+        let observed = step
+            .events
+            .iter()
+            .any(|event| !matches!(event, Event::AccountUsage(_)));
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -978,6 +992,13 @@ impl Actor {
             }
         }
         for event in step.events {
+            if let Event::AccountUsage(report) = event {
+                (self.notify)(Update::AccountUsage {
+                    report,
+                    observed_at: observed_at().unwrap_or_default(),
+                });
+                continue;
+            }
             let fatal = match &event {
                 Event::Error {
                     message,
@@ -1141,6 +1162,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.title = title;
         }
         Event::Plan { steps } => state.plan = steps,
+        // About the account rather than the conversation: `step` forwards it
+        // to the surfaces before the store, so it never reaches a snapshot.
+        Event::AccountUsage(_) => {}
         Event::Capabilities(value) => state.capabilities = value,
         Event::Models {
             models,
@@ -1595,6 +1619,72 @@ mod tests {
         assert!(!socket.parent().unwrap().exists());
     }
     #[test]
+    fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
+        struct Reporter;
+        impl Adapter for Reporter {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![json!({})],
+                    events: Vec::new(),
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture takes no commands".into())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![Event::AccountUsage(report())],
+                })
+            }
+        }
+        fn report() -> LiveReport {
+            LiveReport::Claude(crate::account::claude::LiveUpdate {
+                windows: Vec::new(),
+                status: None,
+            })
+        }
+        let spec = ProcessSpec {
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Reporter);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let generation = |handle: &Handle| {
+            handle
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .generation
+        };
+        let (notify, notified) = crossbeam_channel::bounded(8);
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = notify.try_send(update);
+        })
+        .unwrap();
+        let before = generation(&handle);
+        let Update::AccountUsage {
+            report: reported,
+            observed_at,
+        } = notified.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("the report was not forwarded");
+        };
+        assert_eq!(reported, report());
+        assert!(observed_at > 0);
+        // Neither the pane nor its snapshot learns of it: a report is not
+        // output an offscreen conversation would have to be read for.
+        assert!(notified.recv_timeout(Duration::from_millis(200)).is_err());
+        assert_eq!(generation(&handle), before);
+        assert!(handle.snapshot(None).unwrap().items.is_empty());
+        handle.close().unwrap();
+    }
+    #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
             transport: TransportSpec::JsonLines,
@@ -1822,7 +1912,7 @@ mod tests {
             .filter_map(|update| match update {
                 Update::Activity { state, .. } => Some(state),
                 Update::Presentation => panic!("hidden close must not request presentation"),
-                Update::Observed { .. } => None,
+                Update::Observed { .. } | Update::AccountUsage { .. } => None,
             })
             .collect();
         assert_eq!(
