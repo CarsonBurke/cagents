@@ -1,0 +1,212 @@
+# Daemon and upgrades
+
+- [How the daemon runs](#how-the-daemon-runs)
+- [Control CLI](#control-cli)
+- [Compatible upgrades](#compatible-upgrades)
+- [Full daemon upgrades](#full-daemon-upgrades)
+- [Recovering after a daemon change](#recovering-after-a-daemon-change)
+- [Debian packages](#debian-packages)
+- [Development instance](#development-instance)
+
+## How the daemon runs
+
+Terminals and native agent chats are owned by `cagentsd`, a per-user daemon
+that runs independently of the UI so sessions survive window and UI-process
+restarts. There is no system daemon or service unit. The standard production
+installation starts the daemon immediately and registers it for
+graphical-login autostart. While the daemon runs, cagents shows a system-tray
+item that opens the UI and can stop the daemon.
+
+Full and browserless production builds share one daemon socket
+(`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
+deliberately keep that socket namespace, so a newer daemon cannot start as a
+second owner while an incompatible older daemon is still running. The
+handshake rejects incompatible clients without terminating their PTYs.
+Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
+together.
+
+Each window holds an exclusive slot lease and its own session database, and a
+shared compatibility fence excludes older single-window UIs. Startup rejects an
+older running UI or Debian peer package that predates the lease marker; upgrade
+that peer before switching variants.
+
+Where the daemon keeps its state is listed in
+[Configuration](configuration.md#files-and-directories).
+
+## Control CLI
+
+The `cagents` CLI prints human-readable output by default and stable JSON
+envelopes with `--json`. Run `cagents --help`, or `--help` on any subcommand,
+for the complete reference.
+
+```sh
+cagents daemon status
+cagents terminal list
+cagents terminal spawn -- bash -lc 'printf "hello from cagents\\n"'
+cagents --json terminal list
+cagents daemon stop --require-empty
+cagents daemon stop --confirm
+```
+
+| Command | Purpose |
+| --- | --- |
+| `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
+| `daemon start` | Start the daemon if it is not already running |
+| `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
+| `daemon stop` | Request daemon termination (see below) |
+| `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
+| `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
+| `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
+| `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
+| `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
+| `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
+| `channel spawn`, `list`, `close` | Manage the channels every window shares |
+
+- `daemon status` reads `daemon_version` from the running daemon; it is null
+  when no daemon can report its build.
+- `daemon stop --require-empty` atomically rejects both established terminals
+  and in-flight spawn reservations. `--expected-generation N` additionally
+  rejects an inventory that changed since a preflight check.
+- `daemon stop --confirm` terminates the counted hosted sessions. Bare, it
+  shows the exact count and asks you to type `yes`, so it needs an interactive
+  terminal. A script or service passes the capability printed by
+  `cagents daemon preflight` instead: `--confirm "$(cagents daemon preflight)"`.
+  Either way the confirmation is bound to that daemon and inventory and is
+  valid for 60 seconds; inventory changes require a new one.
+- A successful stop means **termination requested**, not that every PTY has
+  exited. Plain `daemon stop` without these flags is a force stop.
+- `terminal spawn` without a command starts the default shell described in
+  [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
+- `project close` asks for `--yes` before deleting the channels a project
+  still holds, since closing a project removes them in every window.
+
+## Compatible upgrades
+
+By default, `install.sh` verifies the staged CLI against the running daemon
+before switching the `current` symlink. Compatible upgrades keep the daemon PID,
+session proof, and PTYs. An incompatible default upgrade can stop only an
+atomically empty daemon; otherwise it leaves the current installation intact.
+Finish the terminals, or explicitly confirm their termination with the installed
+CLI, then retry. Older CLIs without the atomic shutdown operation fail closed;
+there is no force-stop fallback. If publishing launchers fails, the installer
+restores the previous version without stopping compatible sessions. Existing
+version directories are retained.
+
+## Full daemon upgrades
+
+A full upgrade replaces the daemon and resumes supported sessions in new
+processes. The in-app **Update** action coordinates saving and closing windows
+automatically. From the command line, close the application windows and run the
+verified installer with `--restart-daemon` (see
+[Updating](installation.md#updating)).
+
+Before switching any executable, the installer checks that the old installed
+CLI advertises `daemon prepare-upgrade`, calls it with
+`--json daemon prepare-upgrade --yes`, and waits for the old daemon to report
+that it has stopped. Preparation is daemon-owned: it validates recovery
+authority, freezes mutations, durably checkpoints supported sessions, and only
+then requests shutdown. Unsupported sessions, in-flight reservations, or stale
+authorization reject preparation rather than terminating sessions. The
+installer never builds a checkpoint from `terminal list` and never falls back to
+an ordinary `daemon stop`.
+
+`cagents daemon prepare-upgrade --yes` can also be run directly; without
+`--yes` it refuses before contacting the daemon. Its JSON success command is
+`daemon.prepare_upgrade`, with `terminals` and `chats` checkpoint counts.
+Success means the checkpoint was persisted and shutdown requested, so callers
+must still wait for `daemon status` to report stopped. Prefer the installer's
+`--restart-daemon` flow when replacing an installed release.
+
+If identified agents have no exact resume identity, the upgrade is refused and
+every blocker is listed. `daemon prepare-upgrade --yes --relaunch-agents`
+explicitly accepts fresh conversations for those agents; the checkpoint records
+the choice and their panes say **Relaunched after upgrade**. Unrelated shell
+jobs still block the upgrade. The installer accepts
+`--restart-daemon --relaunch-agents` only when the installed CLI can record this
+acceptance.
+
+### What is restored
+
+The replacement daemon restores supported shell launches and the same
+provider-backed agent conversations, including native chats, only after proving
+that the previous writers are gone. These are **new processes and PTYs**: shell
+memory, foreground jobs, and arbitrary commands are not preserved. Unknown
+conversation identity, unsupported command recipes, and surviving or ambiguous
+owners block recovery; the durable checkpoint stays available instead of
+inventing a fresh conversation or replaying commands. Keep the matching
+provider session storage.
+
+Process arguments or environment can be empty during `exec`, so recovery
+requires inspectable evidence before restarting sessions. An intentionally empty
+environment is accepted only when Linux exposes its initialized zero-length
+address range; missing or redacted ranges cannot authorize a duplicate writer.
+
+Daemon startup waiting scales with the checkpoint inventory, including a
+provider-confirmation allowance for each native chat. A missing listening socket
+does not mean shutdown is complete while the daemon still holds its inventory
+lease.
+
+### Failure and rollback
+
+If publication fails after checkpointing, the installer restores the previous
+version and starts its daemon against the durable handoff. A replacement startup
+failure rolls back only when its status proves it stopped; if startup state is
+ambiguous, the installer keeps the new installation and recovery state rather
+than risk a second writer. Inspect `cagents daemon status` before retrying.
+
+An interrupted checkpoint is never blindly replayed. After confirming that every
+previous provider writer has stopped, `cagents daemon abandon-upgrade --yes`
+archives the retained checkpoint without resuming any process. It requires a
+stopped daemon and refuses to overwrite an earlier archive. Reopen the exact
+conversations manually from their provider session storage; do not delete
+checkpoint evidence just to get past an ownership error.
+
+### Legacy installations
+
+Installations whose CLI lacks `daemon prepare-upgrade` cannot perform this
+handoff, and `--restart-daemon` refuses without changing the active
+installation or stopping sessions. For the one-time bootstrap, finish those
+sessions or explicitly terminate only disposable ones with the installed CLI,
+wait for its daemon to exit, then install the new release normally. This
+bootstrap does **not** preserve legacy PTYs or manufacture conversation
+recovery.
+
+Closed windows keep their recovery lineage across successive full upgrades;
+they do not need to be opened for every release.
+
+## Recovering after a daemon change
+
+When the daemon incarnation changes, cagents authenticates the replacement and
+checks for surviving owners before recovering safe shell or exact agent
+launches. Unknown or orphaned processes block recovery rather than risk
+duplicate writers. **Retry** explicitly authorizes saved launch recipes that
+cannot be replayed automatically. Transcripts remain available; recovery starts
+or adopts a proven replacement, not the old terminal process. Activity evidence
+never authorizes conversation recovery.
+
+## Debian packages
+
+Debian upgrades never send signals to daemons. The package records its protocol
+and keeps root-private executable-digest evidence under
+`/var/lib/cagents-package-protocols/`, allowing an older compatible executable
+to keep running across repeated upgrades. A running incompatible or unknown
+executable makes `preinst` fail visibly; the administrator must arrange an
+explicit user-owned shutdown before retrying. Removal similarly refuses while
+that package owns a running daemon, even an empty one. Package scripts do not
+connect to user IPC as root or inspect terminal contents.
+
+An already-installed legacy package's outgoing maintainer scripts cannot be
+changed by the incoming package; stop its daemon explicitly before the first
+transition to this policy.
+
+The upgrade policies are covered by repeatable checks described in
+[Development](development.md#installer-and-package-checks).
+
+## Development instance
+
+Cargo debug builds, and builds with the explicit `development` feature, use a
+separate daemon, session store, application lease, and runtime namespace
+(`cagents-development` in place of `cagents`). They do not register a tray item
+or autostart entry, so a source-tree build can run beside the installed
+production application. Release builds without that feature are production
+builds.

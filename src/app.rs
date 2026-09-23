@@ -8250,7 +8250,7 @@ impl Cagents {
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
         if self.settings_write_blocked {
             return Err(
-                "settings were not loaded successfully; use Reset to defaults to replace them"
+                "settings were not loaded successfully; use Reset all settings to replace them"
                     .to_owned(),
             );
         }

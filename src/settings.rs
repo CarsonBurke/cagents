@@ -495,6 +495,9 @@ pub enum EditorSyntaxTheme {
     Mocha,
     Ocean,
     Eighties,
+    // snake_case would split the acronym into `inspired_git_hub`; keep the file
+    // spelling identical to `key()` and still read files written that way.
+    #[serde(rename = "inspired_github", alias = "inspired_git_hub")]
     InspiredGitHub,
 }
 
@@ -1552,6 +1555,32 @@ mod tests {
             assert_eq!(restored, settings);
             assert_eq!(AppTheme::from_key(app_theme.key()), Some(app_theme));
         }
+    }
+
+    #[test]
+    fn editor_syntax_themes_are_written_with_their_key_and_read_either_spelling() {
+        for &theme in EditorSyntaxTheme::ALL {
+            let settings = AppSettings {
+                editor_syntax_theme: theme,
+                ..AppSettings::default()
+            };
+            let written = toml::to_string(&settings).unwrap();
+            assert!(
+                written.contains(&format!("editor_syntax_theme = \"{}\"", theme.key())),
+                "{written}"
+            );
+            let restored: AppSettings = toml::from_str(&written).unwrap();
+            assert_eq!(restored.editor_syntax_theme, theme);
+        }
+        let earlier = toml::to_string(&AppSettings::default()).unwrap().replace(
+            "editor_syntax_theme = \"auto\"",
+            "editor_syntax_theme = \"inspired_git_hub\"",
+        );
+        let restored: AppSettings = toml::from_str(&earlier).unwrap();
+        assert_eq!(
+            restored.editor_syntax_theme,
+            EditorSyntaxTheme::InspiredGitHub
+        );
     }
 
     #[test]
