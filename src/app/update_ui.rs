@@ -48,6 +48,8 @@ impl Cagents {
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
         if self.modal_is_open()
             || self.has_active_worktree_operations()
+            || self.project_ui.deletion_running()
+            || self.channel_ui.deletion_running()
             || self
                 .sidebar_model
                 .source_control

@@ -630,12 +630,12 @@ impl StateStore {
         let worktree_id = worktree.id.to_string();
         let actual = select_generation(&transaction, SELECT_WORKTREE_GENERATION, &worktree_id)?;
         check_generation("worktree", worktree.id, worktree.generation, actual)?;
-        reject_tombstone_resurrection(
-            "worktree",
-            worktree.id,
-            select_existence(&transaction, SELECT_WORKTREE_EXISTENCE, &worktree_id)?,
-            &worktree.existence,
-        )?;
+        // Unlike a card or project, a tombstoned worktree may reopen. Its id is
+        // derived from its path and Git is the authority on what exists there,
+        // so a worktree created where a deleted one lived is that identity
+        // again, not a stale write resurrecting it. Refusing it would fail
+        // every retry, and once retries ran out the writer would stop
+        // scheduling later changes.
         let next = next_generation(worktree.generation, "worktree", worktree.id)?;
         transaction
             .prepare_cached(
@@ -1041,6 +1041,26 @@ impl StateStore {
         if changed == 0 {
             return Err(StoreError::InvalidState(format!(
                 "operation {id} is missing or already resolved"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Forgets an applied worktree creation, freeing its identity for a new
+    /// one. Only an applied creation can be forgotten: anything unresolved
+    /// still has effects to reconcile, and a rolled-back one holds nothing.
+    pub fn release_worktree_creation(&self, id: OperationId) -> Result<()> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let changed = inner.connection.execute(
+            "DELETE FROM pending_operations
+             WHERE operation_id = ?1 AND entity_kind = 'worktree_creation'
+             AND status = 'applied'",
+            params![id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidState(format!(
+                "operation {id} is not an applied worktree creation"
             )));
         }
         Ok(())
@@ -1941,8 +1961,6 @@ const SELECT_WORKSPACE_EXISTENCE: &str =
 const SELECT_PROJECT_GENERATION: &str = "SELECT generation FROM projects WHERE project_id = ?1";
 const SELECT_PROJECT_EXISTENCE: &str = "SELECT existence_json FROM projects WHERE project_id = ?1";
 const SELECT_WORKTREE_GENERATION: &str = "SELECT generation FROM worktrees WHERE worktree_id = ?1";
-const SELECT_WORKTREE_EXISTENCE: &str =
-    "SELECT existence_json FROM worktrees WHERE worktree_id = ?1";
 const SELECT_TRANSCRIPT_GENERATION: &str =
     "SELECT generation FROM transcript_metadata WHERE terminal_id = ?1";
 const SELECT_CARD_WORKSPACE: &str = "SELECT workspace_id FROM cards WHERE card_id = ?1";
@@ -4541,6 +4559,41 @@ mod tests {
             recovered.operations_requiring_reconciliation().unwrap()[0].status,
             PendingOperationStatus::NeedsReconciliation
         );
+    }
+
+    /// Only an applied creation gives up its identity; one still unresolved
+    /// keeps it, as the lease that stops a second creation racing its effects.
+    #[test]
+    fn only_an_applied_worktree_creation_is_released() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("boot-a")).unwrap();
+        let creation = |entity_id: &str| PendingOperation {
+            id: OperationId::new(),
+            entity_kind: "worktree_creation".into(),
+            entity_id: entity_id.into(),
+            action: "create".into(),
+            base_generation: 1,
+            payload: serde_json::json!({}),
+            status: PendingOperationStatus::Pending,
+            created_at_unix_ms: now_unix_ms(),
+            updated_at_unix_ms: now_unix_ms(),
+        };
+        let applied = creation("created");
+        store.begin_operation(&applied).unwrap();
+        store
+            .resolve_operation(applied.id, PendingOperationStatus::Applied)
+            .unwrap();
+        let running = creation("running");
+        store.begin_operation(&running).unwrap();
+
+        assert!(store.release_worktree_creation(running.id).is_err());
+        assert!(store.begin_operation(&creation("running")).is_err());
+
+        assert!(store.begin_operation(&creation("created")).is_err());
+        store.release_worktree_creation(applied.id).unwrap();
+        assert!(store.release_worktree_creation(applied.id).is_err());
+        store.begin_operation(&creation("created")).unwrap();
     }
 
     #[test]

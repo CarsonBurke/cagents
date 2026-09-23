@@ -363,6 +363,20 @@ impl Cagents {
         }
         Task::none()
     }
+    /// Forgets the finished creation of a worktree the user has since deleted.
+    /// Its row waits for the checkout to list the worktree, which it never
+    /// will again.
+    pub(super) fn forget_worktree_creation(&mut self, path: &Path) {
+        self.worktree_operations.retain(|_, operation| {
+            !(operation.finished
+                && operation
+                    .created_worktree
+                    .as_ref()
+                    .is_some_and(|(created, _)| created == path))
+        });
+        self.sync_worktree_operation_rows();
+    }
+
     pub(super) fn cancel_worktree_operation(&mut self, id: OperationId) -> Task<Message> {
         let Some(operation) = self.worktree_operations.get_mut(&id) else {
             return Task::none();
@@ -565,6 +579,7 @@ impl Cagents {
                     .map(|(path, time)| (path, *time))
             }),
         );
+        self.sync_worktree_deletion_rows();
     }
 }
 
@@ -634,5 +649,60 @@ mod tests {
             );
             assert!(app.worktree_operations[&id].token.is_none());
         }
+    }
+
+    /// A deleted worktree is never listed again, so the creation that made it
+    /// must not be left waiting for it (#245).
+    #[test]
+    fn deleting_a_created_worktree_forgets_its_creation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "repo".into(),
+                "/repo".into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        let created = |path: &str| ActiveWorktreeOperation {
+            project,
+            created_worktree: Some((PathBuf::from(path), 1)),
+            generation: 1,
+            request: None,
+            token: None,
+            receiver: None,
+            stage: Some(WorktreeProgressStage::Finished),
+            started: Instant::now(),
+            termination_requested: false,
+            finished: true,
+            detail: "created".into(),
+            completed_elapsed: None,
+            restored: false,
+            label: path.into(),
+            state: Some(WorktreeOperationState::Created),
+        };
+        let deleted = OperationId::new();
+        let other = OperationId::new();
+        app.worktree_operations
+            .insert(deleted, created("/repo/worktrees/deleted"));
+        app.worktree_operations
+            .insert(other, created("/repo/worktrees/other"));
+        app.sync_worktree_operation_rows();
+        assert_eq!(app.sidebar_model.projects[0].operations.len(), 2);
+
+        app.forget_worktree_creation(Path::new("/repo/worktrees/deleted"));
+        assert!(!app.worktree_operations.contains_key(&deleted));
+        assert!(app.worktree_operations.contains_key(&other));
+        assert_eq!(
+            app.sidebar_model.projects[0]
+                .operations
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![other]
+        );
     }
 }

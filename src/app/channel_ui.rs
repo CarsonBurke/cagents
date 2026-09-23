@@ -128,6 +128,8 @@ pub enum Action {
     Dismiss,
     SessionsClosed(ChannelId, Result<(), String>),
     RetryDelete(ChannelId),
+    /// Runs a deletion that failed again, from the channel's row.
+    RetryFailed(ChannelId),
 }
 
 impl Action {
@@ -148,7 +150,11 @@ impl Action {
 #[derive(Debug, Default)]
 pub struct State {
     dialog: Option<Deletion>,
+    /// Deletions under way. Each runs behind its channel's row rather than a
+    /// dialog, so the rest of the window stays usable meanwhile.
     deleting: HashSet<ChannelId>,
+    /// Deletions that failed, with why, until retried or declined.
+    failed: HashMap<ChannelId, String>,
     /// Channels this window has deleted.
     ///
     /// A window is not sent the echo of its own edits, so its cached copy of
@@ -165,15 +171,32 @@ struct Deletion {
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
     chats: usize,
+    /// Why the last deletion of this channel failed, when the dialog is
+    /// opened again after it. Confirming retries it.
+    failure: Option<String>,
 }
 
 impl State {
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || !self.deleting.is_empty()
+        self.dialog.is_some()
+    }
+
+    fn row_deletion(&self, id: ChannelId) -> Option<crate::sidebar::RowDeletion> {
+        if self.deleting.contains(&id) {
+            return Some(crate::sidebar::RowDeletion::Deleting);
+        }
+        self.failed
+            .get(&id)
+            .map(|reason| crate::sidebar::RowDeletion::Failed(reason.as_str().into()))
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
         self.deleting.contains(&id)
+    }
+
+    /// Whether any channel deletion is under way.
+    pub(super) fn deletion_running(&self) -> bool {
+        !self.deleting.is_empty()
     }
 
     pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
@@ -230,20 +253,35 @@ impl Cagents {
             return match result {
                 Ok(()) => self.finish_delete_channel(id),
                 Err(error) => {
-                    self.status = Some(TransientNotice::error(error));
+                    let title = self
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id)
+                        .map_or("the channel", channel_display_title);
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not delete {title}: {error}"
+                    )));
+                    self.channel_ui.failed.insert(id, error);
+                    self.refresh_sidebar_channels();
                     Task::none()
                 }
             };
         }
         if self.update_prepared
             || self.focused_repository_is_saving()
-            || self.project_ui.deleting()
             || (self.modal_is_open() && !action.answers_own_dialog())
         {
             return Task::none();
         }
         match action {
             Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::RetryFailed(id) => {
+                if !self.channel_ui.failed.contains_key(&id) {
+                    return Task::none();
+                }
+                self.delete_channel(id)
+            }
             Action::Create(project_id) => {
                 if !self
                     .sidebar_model
@@ -283,8 +321,14 @@ impl Cagents {
                 self.persist();
                 Task::batch([scope, chat])
             }
+            // A channel being deleted is not somewhere to go; its row offers
+            // nothing, and this refuses anything that raced it.
+            Action::Open(id) if self.channel_ui.is_deleting(id) => Task::none(),
             Action::Open(id) => self.select_channel(id),
             Action::Delete(id) => {
+                if self.channel_ui.is_deleting(id) {
+                    return Task::none();
+                }
                 let Some(channel) = self
                     .durable
                     .channels
@@ -312,6 +356,7 @@ impl Cagents {
                     channel: id,
                     title,
                     chats,
+                    failure: self.channel_ui.failed.get(&id).cloned(),
                 });
                 iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
             }
@@ -322,7 +367,13 @@ impl Cagents {
                 self.delete_channel(deletion.channel)
             }
             Action::Dismiss => {
-                self.channel_ui.dialog = None;
+                // Declining to delete a channel whose deletion failed is the
+                // answer to that failure, so its row stops asking.
+                if let Some(dismissed) = self.channel_ui.dialog.take()
+                    && self.channel_ui.failed.remove(&dismissed.channel).is_some()
+                {
+                    self.refresh_sidebar_channels();
+                }
                 let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
                     self.workspace
                         .focused()
@@ -411,32 +462,51 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(channel) = self
+        let Some(cards) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
+            .map(|channel| channel.cards.clone())
         else {
             return Task::none();
         };
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
-        if channel
-            .cards
+        self.channel_ui.failed.remove(&id);
+        self.refresh_sidebar_channels();
+        // Settling spawns and closing sessions take a round trip each, and the
+        // row reports them meanwhile. The workspace leaves the channel now, so
+        // nothing the user does in the meantime lands in a channel whose
+        // sessions are being closed.
+        let leave = if self.durable.active_channel == Some(id)
+            && let Some(index) = self
+                .durable
+                .channels
+                .iter()
+                .position(|channel| channel.id == id)
+        {
+            let (project_id, successor) = self.channel_successor(index);
+            self.land_after_channel(project_id, successor)
+        } else {
+            Task::none()
+        };
+        if cards
             .iter()
             .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
         {
-            return cosmic::task::future(async move {
+            let retry = cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 Message::ChannelUi(Action::RetryDelete(id))
             });
+            return Task::batch([leave, retry]);
         }
         let sessions: Vec<_> = self
             .durable
             .cards
             .iter()
-            .filter(|card| channel.cards.contains(&card.id) && card.existence.is_open())
+            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
             .map(|card| card.kind.clone())
             .collect();
         if !sessions
@@ -444,15 +514,16 @@ impl Cagents {
             .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
         {
             self.channel_ui.deleting.remove(&id);
-            return self.finish_delete_channel(id);
+            return Task::batch([leave, self.finish_delete_channel(id)]);
         }
-        cosmic::task::future(async move {
+        let close = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
             Message::ChannelUi(Action::SessionsClosed(id, result))
-        })
+        });
+        Task::batch([leave, close])
     }
 
     fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
@@ -464,29 +535,8 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let project_id = self.durable.channels[index].project_id;
-        let ordinal = self.durable.channels[index].ordinal;
         let was_active = self.durable.active_channel == Some(id);
-        // The channel below the deleted one in the sidebar, or the one above it
-        // when the project's oldest channel is the one going away. Below means
-        // the next lower rank, because the sidebar renders newest first.
-        let mut below = None::<&ProjectChannel>;
-        let mut above = None::<&ProjectChannel>;
-        for channel in self
-            .durable
-            .channels
-            .iter()
-            .filter(|channel| channel.id != id && channel.project_id == project_id)
-        {
-            if channel.ordinal <= ordinal {
-                if below.is_none_or(|best| channel.ordinal > best.ordinal) {
-                    below = Some(channel);
-                }
-            } else if above.is_none_or(|best| channel.ordinal < best.ordinal) {
-                above = Some(channel);
-            }
-        }
-        let successor = below.or(above).map(|channel| channel.id);
+        let (project_id, successor) = self.channel_successor(index);
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
         // Every window loses the channel, not only this one. A deletion that
         // arrived from the registry publishes it right back, which the registry
@@ -515,18 +565,7 @@ impl Cagents {
             }
         }
         let select = if was_active {
-            // A scope that no longer exists cannot stay selected, and the
-            // workspace has to land on something the user can still reach.
-            match successor {
-                Some(next) => self.select_channel(next),
-                None => match self.project_primary_worktree(project_id) {
-                    Some(path) => self.select_worktree(path, false),
-                    None => {
-                        Arc::make_mut(&mut self.durable).active_channel = None;
-                        Task::none()
-                    }
-                },
-            }
+            self.land_after_channel(project_id, successor)
         } else if freed_utility
             && self.durable.active_channel.is_none()
             && let Some(path) = self.active_workspace.clone()
@@ -545,6 +584,52 @@ impl Cagents {
         Task::batch([select, self.lifecycle_sweep(), self.sync_chrome()])
     }
 
+    /// The project of the channel at `index`, and the channel the workspace
+    /// moves to once it is gone: the one below it in the sidebar, or the one
+    /// above it when the project's oldest channel is the one going away. Below
+    /// means the next lower rank, because the sidebar renders newest first.
+    fn channel_successor(&self, index: usize) -> (ProjectId, Option<ChannelId>) {
+        let leaving = &self.durable.channels[index];
+        let mut below = None::<&ProjectChannel>;
+        let mut above = None::<&ProjectChannel>;
+        for channel in self.durable.channels.iter().filter(|channel| {
+            channel.id != leaving.id
+                && channel.project_id == leaving.project_id
+                && !self.channel_ui.is_deleting(channel.id)
+        }) {
+            if channel.ordinal <= leaving.ordinal {
+                if below.is_none_or(|best| channel.ordinal > best.ordinal) {
+                    below = Some(channel);
+                }
+            } else if above.is_none_or(|best| channel.ordinal < best.ordinal) {
+                above = Some(channel);
+            }
+        }
+        (
+            leaving.project_id,
+            below.or(above).map(|channel| channel.id),
+        )
+    }
+
+    /// A scope that is going away cannot stay selected, and the workspace has
+    /// to land on something the user can still reach.
+    fn land_after_channel(
+        &mut self,
+        project_id: ProjectId,
+        successor: Option<ChannelId>,
+    ) -> Task<Message> {
+        match successor {
+            Some(next) => self.select_channel(next),
+            None => match self.project_primary_worktree(project_id) {
+                Some(path) => self.select_worktree(path, false),
+                None => {
+                    Arc::make_mut(&mut self.durable).active_channel = None;
+                    Task::none()
+                }
+            },
+        }
+    }
+
     /// Where a project's workspace falls back to when no channel is selected.
     fn project_primary_worktree(&self, project_id: ProjectId) -> Option<PathBuf> {
         let project = self.sidebar_model.project(project_id)?;
@@ -561,18 +646,8 @@ impl Cagents {
     }
 
     pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
-        if !self.channel_ui.deleting.is_empty() {
-            return Some(super::dialog_ui::surface(
-                widget::column::with_children(vec![
-                    widget::text::title3("Closing channel…").into(),
-                    super::notice_body("Closing its sessions before removing the channel."),
-                ])
-                .spacing(3.0 * design::GRID_UNIT),
-                480.0,
-            ));
-        }
         let dialog = self.channel_ui.dialog.as_ref()?;
-        let rows: Vec<Element<'_, Message>> = vec![
+        let mut rows: Vec<Element<'_, Message>> = vec![
             widget::text::title3("Delete channel?").into(),
             super::notice_body(dialog.title.clone()),
             super::notice_body(match dialog.chats {
@@ -584,20 +659,31 @@ impl Cagents {
                 "The channel and the conversations it holds are removed from this workspace. \
                  Nothing outside the channel is touched.",
             ),
+        ];
+        if let Some(failure) = &dialog.failure {
+            rows.push(super::notice_body(format!(
+                "The last attempt failed: {failure}"
+            )));
+        }
+        rows.push(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("dialog.channel.close"))
                     .on_press(Message::ChannelUi(Action::Dismiss))
                     .into(),
-                widget::button::destructive("Delete channel")
-                    .id(State::focus_target())
-                    .on_press(Message::ChannelUi(Action::ConfirmDelete))
-                    .into(),
+                widget::button::destructive(if dialog.failure.is_some() {
+                    "Retry delete"
+                } else {
+                    "Delete channel"
+                })
+                .id(State::focus_target())
+                .on_press(Message::ChannelUi(Action::ConfirmDelete))
+                .into(),
             ])
             .spacing(cosmic::theme::spacing().space_xxs)
             .into(),
-        ];
+        );
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
             480.0,
@@ -636,6 +722,12 @@ impl Cagents {
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
         let durable = &self.durable;
+        // A failure outlives nothing: a channel that has gone since, however
+        // it went, has nothing left to retry.
+        self.channel_ui
+            .failed
+            .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
+        let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
             let mut index = 0;
@@ -650,6 +742,7 @@ impl Cagents {
             {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
+                let deletion = channel_ui.row_deletion(channel.id);
                 let mut activity = None;
                 let mut unread = false;
                 let mut chats = 0;
@@ -689,9 +782,10 @@ impl Cagents {
                         && row.chats == chats
                         && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
+                        && row.deletion == deletion
                 });
                 if !unchanged {
-                    let row = SidebarChannel::new(
+                    let mut row = SidebarChannel::new(
                         channel.id,
                         title.to_owned(),
                         selected,
@@ -701,6 +795,7 @@ impl Cagents {
                         has_panes,
                         channel.ordinal,
                     );
+                    row.deletion = deletion;
                     if index < project.channels.len() {
                         project.channels[index] = row;
                     } else {
@@ -735,6 +830,7 @@ fn channel_display_title(channel: &ProjectChannel) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::RowDeletion;
 
     #[test]
     fn deleting_a_channel_closes_paired_sources_once_and_skips_exited_terminals() {
@@ -1056,11 +1152,10 @@ mod tests {
         assert!(app.durable.channels.iter().any(|channel| channel.id == id));
     }
 
-    /// A channel's conversations are reachable nowhere else, so deleting one
-    /// has to take them with it, say so first, and leave the workspace on a
-    /// scope that still exists.
-    #[test]
-    fn deleting_the_active_channel_retires_its_chats_and_lands_on_a_survivor() {
+    /// A window whose active channel, "Investigation", holds a live
+    /// conversation, beside an empty "Migration": (window, doomed, survivor,
+    /// conversation).
+    fn channel_with_a_conversation() -> (Cagents, ChannelId, ChannelId, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let project = ProjectId::new();
         let doomed = ChannelId::new();
@@ -1104,6 +1199,15 @@ mod tests {
             Vec::new(),
         ));
         app.refresh_sidebar_channels();
+        (app, doomed, survivor, conversation)
+    }
+
+    /// A channel's conversations are reachable nowhere else, so deleting one
+    /// has to take them with it, say so first, and leave the workspace on a
+    /// scope that still exists.
+    #[test]
+    fn deleting_the_active_channel_retires_its_chats_and_lands_on_a_survivor() {
+        let (mut app, doomed, survivor, conversation) = channel_with_a_conversation();
         assert_eq!(app.sidebar_model.projects[0].channels.len(), 2);
 
         // Asking is not doing: a channel holding a live conversation says what
@@ -1143,6 +1247,75 @@ mod tests {
             app.durable.active_worktree, app.active_workspace,
             "the deletion persisted the workspace it left behind"
         );
+    }
+
+    /// Confirming a deletion lets the window go on while the channel's
+    /// sessions close (#264): the confirmation is gone, the workspace has
+    /// already left the channel, and its row says what is happening. A
+    /// failure stays on the row, which runs the deletion again.
+    #[test]
+    fn a_channel_deletion_runs_behind_its_row_and_a_failure_is_retried_from_there() {
+        let (mut app, doomed, survivor, _) = channel_with_a_conversation();
+        let deletion = |app: &Cagents| {
+            app.sidebar_model.projects[0]
+                .channels
+                .iter()
+                .find(|row| row.id == doomed)
+                .unwrap()
+                .deletion
+                .clone()
+        };
+
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        let _ = app.handle_channel_ui(Action::ConfirmDelete);
+        assert!(!app.modal_is_open() && app.dialog().is_none());
+        assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        assert_eq!(app.durable.active_channel, Some(survivor));
+
+        // Nothing reopens or deletes it twice while its sessions close.
+        let _ = app.handle_channel_ui(Action::Open(doomed));
+        assert_eq!(app.durable.active_channel, Some(survivor));
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        assert!(app.dialog().is_none());
+        let _ = app.handle_channel_ui(Action::RetryFailed(doomed));
+        assert!(app.channel_ui.is_deleting(doomed));
+
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            Err("the daemon is unreachable".into()),
+        ));
+        assert!(!app.channel_ui.is_deleting(doomed));
+        assert_eq!(
+            deletion(&app),
+            Some(RowDeletion::Failed("the daemon is unreachable".into()))
+        );
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("Could not delete Investigation: the daemon is unreachable")
+        );
+        assert!(app.durable.channels.iter().any(|row| row.id == doomed));
+
+        let _ = app.handle_channel_ui(Action::RetryFailed(doomed));
+        assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            Err("the daemon is still unreachable".into()),
+        ));
+
+        // Asked to delete it again, the dialog says why the last attempt
+        // failed, and confirming there retries it.
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        assert_eq!(
+            app.channel_ui
+                .dialog
+                .as_ref()
+                .and_then(|dialog| dialog.failure.as_deref()),
+            Some("the daemon is still unreachable")
+        );
+        let _ = app.handle_channel_ui(Action::ConfirmDelete);
+        assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())));
+        assert!(!app.durable.channels.iter().any(|row| row.id == doomed));
     }
 
     #[test]
