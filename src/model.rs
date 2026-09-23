@@ -253,7 +253,9 @@ impl LaunchRecipe {
     }
 }
 
-fn login_shell() -> Result<String, LoginShellError> {
+/// The shell a new terminal runs: the passwd entry's, else `SHELL`, else
+/// `/bin/sh`.
+pub(crate) fn login_shell() -> Result<String, LoginShellError> {
     choose_login_shell(
         passwd_shell(),
         std::env::var_os("SHELL").and_then(|shell| shell.into_string().ok()),

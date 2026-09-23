@@ -2517,6 +2517,19 @@ impl Cagents {
             Message::ChatUi(Action::UpdatesAcknowledged(target, result))
         })
     }
+    /// Hands what a conversation's provider reported about the account it
+    /// runs on to the accounts, which find the account by its launch.
+    fn take_chat_account_usage(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let reports = runtime.handle.take_account_usage();
+        if reports.is_empty() {
+            return Task::none();
+        }
+        let launch = runtime.session.launch.clone();
+        self.account_reported(launch.provider, &launch.recipe, reports)
+    }
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
             Some(CardRuntime::Chat(runtime)) if runtime.target == target => Some(runtime),
@@ -2912,15 +2925,17 @@ impl Cagents {
                             self.name_channel_from_prompt(target.card, &name);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        // Reports that raced the attachment woke nothing.
+                        let usage = self.take_chat_account_usage(target);
                         let control = match self.cards.get(&target.card) {
                             Some(CardRuntime::Chat(runtime)) => runtime.focus_control(),
                             _ => "chat-composer",
                         };
-                        return iced::widget::operation::focus(card_control_id(
-                            target.card,
-                            control,
-                        ))
-                        .map(cosmic::Action::App);
+                        return Task::batch([
+                            usage,
+                            iced::widget::operation::focus(card_control_id(target.card, control))
+                                .map(cosmic::Action::App),
+                        ]);
                     }
                     Err(failure) => {
                         // A card that cannot resume has to say what refused it
@@ -3048,6 +3063,9 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                if matches!(wake, Wake::AccountUsage) {
+                    return self.take_chat_account_usage(target);
+                }
                 let needs_name = self.channel_needs_name(target.card);
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
@@ -3106,6 +3124,7 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         return Task::none();
                     }
+                    Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
@@ -4199,6 +4218,42 @@ mod tests {
         let card = live_chat(&mut app, Some("thread"));
         close_chat(&mut app, card);
         retired(&mut app, card);
+    }
+
+    /// What a conversation's provider reports about its account reaches the
+    /// account it runs on, whether it raced the attachment or woke the
+    /// surface after it.
+    #[test]
+    fn a_conversations_account_report_reaches_its_account() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, Some("thread"));
+        let account = crate::account::Account::system(Provider::Codex).id();
+        let report = |used: u32| {
+            crate::account::LiveReport::CodexLimits(
+                crate::account::codex::parse_update(&serde_json::json!({"rateLimits": {
+                    "primary": {"usedPercent": used, "windowDurationMins": 300},
+                }}))
+                .unwrap(),
+            )
+        };
+        let used = |app: &Cagents| {
+            app.account_ui
+                .snapshot_for_test(&account)
+                .map(|snapshot| snapshot.windows[0].used)
+        };
+        let now = crate::chat::now_ms().unwrap();
+        assert!(handle.push_account_usage_for_test(report(20), now));
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert_eq!(used(&app), Some(0.2));
+        assert!(
+            handle.push_account_usage_for_test(report(60), now + 1),
+            "the queue was drained, so the next report wakes the surface"
+        );
+        assert!(!handle.push_account_usage_for_test(report(70), now + 2));
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::AccountUsage)));
+        assert_eq!(used(&app), Some(0.7));
+        assert!(handle.take_account_usage().is_empty());
     }
 
     /// A disconnected conversation's close request failed before it was sent,

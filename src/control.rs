@@ -1086,6 +1086,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
+        | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -1105,6 +1106,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
+        ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
     }
 }
 

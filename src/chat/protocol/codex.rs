@@ -4,6 +4,7 @@
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
 use super::{Adapter, ProcessSpec, Step, TransportSpec};
+use crate::account::{self, LiveReport};
 use crate::chat::{
     Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
     FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode, Request,
@@ -1273,6 +1274,18 @@ impl Adapter for Codex {
             // The catalog is a cache the server watches for itself, so a
             // change notification is an invalidation and nothing more.
             "skills/changed" => self.skills(&mut step)?,
+            // The account this server runs on, which the surface keeps apart
+            // from the transcript. A rate-limit update is sparse and is
+            // forwarded as what it names, for the surface to merge.
+            "account/rateLimits/updated" => {
+                if let Some(update) = account::codex::parse_update(params) {
+                    step.events
+                        .push(Event::AccountUsage(LiveReport::CodexLimits(update)));
+                }
+            }
+            "account/updated" => step.events.push(Event::AccountUsage(LiveReport::CodexLogin(
+                account::codex::parse_login_update(params),
+            ))),
             "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
             // Auxiliary app-server notifications are not transcript data.
             // Unknown item types are shown as tool disclosures and unknown
@@ -1991,6 +2004,42 @@ mod tests {
             skills_stale: false,
             materialized: true,
         }
+    }
+
+    fn account_fixture(name: &str) -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/accounts")
+            .join(name);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// Account notifications name no thread and are forwarded as account
+    /// reports rather than dropped with the other auxiliary notifications. A
+    /// sparse rate-limit update is forwarded as what it names.
+    #[test]
+    fn account_notifications_are_forwarded_as_reports() {
+        let mut adapter = adapter();
+        let limits = account_fixture("codex-rate-limits-updated.json");
+        let expected = account::codex::parse_update(&limits["params"]).unwrap();
+        assert_eq!(expected.windows.len(), 1, "the null window is not cleared");
+        assert_eq!(
+            adapter.receive(limits).unwrap().events,
+            [Event::AccountUsage(LiveReport::CodexLimits(expected))]
+        );
+        assert_eq!(
+            adapter
+                .receive(account_fixture("codex-account-updated.json"))
+                .unwrap()
+                .events,
+            [Event::AccountUsage(LiveReport::CodexLogin(
+                account::codex::LoginUpdate {
+                    chatgpt: true,
+                    plan: Some("prolite".into()),
+                }
+            ))]
+        );
+        let empty = json!({"method": "account/rateLimits/updated", "params": {"rateLimits": null}});
+        assert!(adapter.receive(empty).unwrap().events.is_empty());
     }
 
     #[test]

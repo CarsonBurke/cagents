@@ -14,7 +14,7 @@
 //! private to the user like every other file in the data directories.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
@@ -31,6 +31,9 @@ const VERSION: u32 = 1;
 /// A cache larger than this is not one cagents wrote, and is ignored rather
 /// than read into memory.
 const MAX_BYTES: u64 = 1024 * 1024;
+/// How long an entry no configured account refers to is kept, in unix
+/// milliseconds.
+pub const ORPHAN_AFTER: u64 = 7 * 24 * 3_600_000;
 
 /// What is remembered about one account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,14 +111,49 @@ impl Cache {
                 document.entries.insert(key.to_owned(), entry);
             }
         }
-        let bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
+        self.write(&document)
+    }
+
+    /// Forgets the entries no account in `keep` refers to that are older
+    /// than [`ORPHAN_AFTER`]: the figures of an account since removed, or of
+    /// a home that moved. A younger one stays, because another window may
+    /// have an account this one has not read from the registry yet.
+    pub fn prune(&self, keep: &BTreeSet<String>, now: u64) -> io::Result<()> {
+        let path = self.path();
+        // Most starts have nothing to forget, and read without the lock.
+        let orphaned = |document: &Document| {
+            document
+                .entries
+                .iter()
+                .any(|(key, entry)| !keep.contains(key) && !current(entry, now))
+        };
+        if !read_document(&path).is_some_and(|document| orphaned(&document)) {
+            return Ok(());
+        }
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let Some(mut document) = read_document(&path).filter(orphaned) else {
+            return Ok(());
+        };
+        document
+            .entries
+            .retain(|key, entry| keep.contains(key) || current(entry, now));
+        self.write(&document)
+    }
+
+    /// Replaces the file with `document`, whole: written to a private
+    /// temporary sibling and renamed over the original. The caller holds the
+    /// lock.
+    fn write(&self, document: &Document) -> io::Result<()> {
+        let bytes = serde_json::to_vec(document).map_err(io::Error::other)?;
         let mut temporary = tempfile::Builder::new()
             .prefix(".account-usage.")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .tempfile_in(&self.directory)?;
         temporary.write_all(&bytes)?;
         temporary.as_file().sync_all()?;
-        temporary.persist(&path).map_err(|error| error.error)?;
+        temporary
+            .persist(self.path())
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -138,6 +176,14 @@ impl Cache {
     fn lock(&self, operation: i32) -> io::Result<File> {
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), operation)
     }
+}
+
+/// Whether `entry` is recent enough at `now` to keep with nothing referring
+/// to it. A stamp further ahead than a clock drifts is from a clock since
+/// set back, and says nothing about its age.
+fn current(entry: &Entry, now: u64) -> bool {
+    let observed = entry.snapshot.observed_at;
+    observed <= now.saturating_add(CLOCK_SLACK) && now.saturating_sub(observed) < ORPHAN_AFTER
 }
 
 fn read_document(path: &Path) -> Option<Document> {
@@ -253,6 +299,42 @@ mod tests {
         assert_eq!(cache.load(u64::MAX).len(), 1);
         fs::remove_file(directory.path().join(FILE_NAME)).unwrap();
         assert!(cache.load(u64::MAX).is_empty());
+    }
+
+    /// Entries no account refers to go once they are old; recent ones and
+    /// the ones still referred to stay, and a cache with nothing to forget
+    /// is left untouched.
+    #[test]
+    fn old_entries_no_account_refers_to_are_forgotten() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = 100 * ORPHAN_AFTER;
+        cache.store("kept", entry(1, "referred to")).unwrap();
+        cache.store("recent", entry(now - 1_000, "recent")).unwrap();
+        cache
+            .store("removed", entry(now - ORPHAN_AFTER, "old"))
+            .unwrap();
+        cache
+            .store("ahead", entry(now + 10 * CLOCK_SLACK, "clock set back"))
+            .unwrap();
+        let keep = BTreeSet::from(["kept".to_owned()]);
+        cache.prune(&keep, now).unwrap();
+        let file = directory.path().join(FILE_NAME);
+        let remaining = read_document(&file).unwrap().entries;
+        assert_eq!(
+            remaining.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["kept", "recent"]
+        );
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cache.prune(&keep, now).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+        // A cache that was never written stays unwritten.
+        let empty = tempfile::tempdir().unwrap();
+        Cache::at(empty.path().join("nested"))
+            .prune(&keep, now)
+            .unwrap();
+        assert!(!empty.path().join("nested").exists());
     }
 
     #[test]

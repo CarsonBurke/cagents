@@ -15,9 +15,9 @@
 //! - and never twice at once for the same account.
 //!
 //! Figures that arrive another way - another window's probe read back from
-//! the cache, and once they are forwarded (#256) a running conversation's
-//! live events - count exactly as a probe would, which is what keeps several
-//! windows, and eventually a busy conversation, from probing at all.
+//! the cache, or a running conversation's live events - count exactly as a
+//! probe would, which is what keeps several windows, and a busy conversation,
+//! from probing at all.
 //!
 //! Every method takes the current time rather than reading a clock, so the
 //! policy is tested by stating times instead of waiting for them.
@@ -108,6 +108,13 @@ impl Schedule {
         self.should_probe(Trigger::Manual, now, true)
     }
 
+    /// When the debounce on the last manual refresh lifts, so a control shown
+    /// disabled can be re-enabled at that moment rather than on a later tick.
+    pub fn manual_ready_at(&self) -> Option<Millis> {
+        self.last_manual
+            .map(|last| last.saturating_add(MANUAL_DEBOUNCE))
+    }
+
     /// Whether a probe is running. One that has not reported back within
     /// [`IN_FLIGHT_LIMIT`] never will - its task was lost - and no longer
     /// holds the account's next probe back.
@@ -161,6 +168,15 @@ impl Schedule {
             self.observed_at
                 .map_or(observed_at, |seen| seen.max(observed_at)),
         );
+    }
+
+    /// The login changed under the figures, so they no longer describe it:
+    /// the next tick or focus checks again whatever their age, and backoff
+    /// earned by the previous login no longer applies.
+    pub fn invalidate(&mut self) {
+        self.observed_at = None;
+        self.failures = 0;
+        self.retry_at = None;
     }
 
     pub fn failures(&self) -> u32 {
@@ -279,6 +295,33 @@ mod tests {
         schedule.start(Trigger::Manual, T0 + 120_000);
         schedule.abandon();
         assert!(schedule.manual_ready(T0 + 121_000));
+    }
+
+    /// The moment a debounced refresh control comes back is known in
+    /// advance, so the interface can wake for it instead of waiting a tick.
+    #[test]
+    fn the_end_of_the_manual_debounce_is_known_in_advance() {
+        let mut schedule = Schedule::default();
+        assert_eq!(schedule.manual_ready_at(), None);
+        schedule.start(Trigger::Manual, T0);
+        schedule.succeed(T0 + 1_000);
+        let ready = schedule.manual_ready_at().unwrap();
+        assert!(!schedule.manual_ready(ready - 1));
+        assert!(schedule.manual_ready(ready));
+    }
+
+    /// A login that changed under fresh figures is checked at the next
+    /// chance, without waiting out their age or the old login's backoff.
+    #[test]
+    fn a_changed_login_is_checked_at_the_next_chance() {
+        let mut schedule = Schedule::default();
+        schedule.start(Trigger::Tick, T0);
+        schedule.fail(T0);
+        schedule.observe(T0);
+        assert!(!schedule.should_probe(Trigger::Tick, T0 + 1, true));
+        schedule.invalidate();
+        assert!(schedule.should_probe(Trigger::Tick, T0 + 1, true));
+        assert!(!schedule.should_probe(Trigger::Tick, T0 + 1, false));
     }
 
     #[test]
