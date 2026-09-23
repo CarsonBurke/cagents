@@ -2728,6 +2728,77 @@ for line in sys.stdin:
         }
     }
 
+    /// Closing a live chat reports its teardown - the provider's exit is an
+    /// activity change - to every attached client, the closer included, before
+    /// the close is answered. The control client attaches only to close, and
+    /// must still see the close succeed and its connection stay usable.
+    #[test]
+    fn a_control_client_closes_a_live_chat_it_attached_to() {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("control-close"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let weak = Arc::downgrade(&host);
+        let handle = Handle::start(
+            spec,
+            Box::new(Echo(false)),
+            initial,
+            store,
+            None,
+            move |update| changed(&weak, chat_id, update),
+        )
+        .unwrap();
+        let session = Session {
+            id: chat_id,
+            launch: chat::Launch {
+                provider: Provider::Codex,
+                recipe,
+                session_id: None,
+            },
+            proof: Some(proof),
+            terminal: None,
+        };
+        host.lock().unwrap().chats.insert(
+            chat_id,
+            Record {
+                session: session.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("cagentsd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server_host = Arc::clone(&host);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            super::super::client::serve(stream, 1, server_host);
+        });
+
+        let mut client = crate::control::ControlClient::connect(&socket).unwrap();
+        client.close_chat(session).unwrap();
+        assert!(handle.is_completed());
+        assert!(client.list_chats().unwrap().is_empty());
+        drop(client);
+        server.join().unwrap();
+    }
+
     #[test]
     fn delayed_producer_callback_after_rearm_is_fenced_without_reads() {
         acknowledgement_race(false);

@@ -10,11 +10,11 @@ use std::{
 use crate::{
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, FrameCodec, MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
-        ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
-        ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot, TerminalVisibility,
-        WireTerminalEvent, read_frame_with_limit, validate_proof,
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_CLIENT_FRAME_BYTES,
+        MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
+        ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
+        TerminalVisibility, WireTerminalEvent, read_frame_with_limit, validate_proof,
     },
 };
 
@@ -40,7 +40,7 @@ impl Read for HandshakeReader<'_> {
 fn read_handshake_frame(
     stream: &mut UnixStream,
     deadline: Instant,
-) -> Result<Option<ClientEnvelope>, crate::terminal_ipc::FrameError> {
+) -> Result<Option<ClientEnvelope>, FrameError> {
     read_frame_with_limit(
         &mut HandshakeReader { stream, deadline },
         MAX_CLIENT_FRAME_BYTES,
@@ -1042,15 +1042,37 @@ fn push_error(
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
-        if codec.write(&mut stream, &message.wire()).is_err() {
-            // A five-second send timeout or a dead socket. Queued frames cannot
-            // be delivered, so there is nothing to drain and the peer only sees
-            // the EOF below; `abort` records why.
-            delivery.abort("the client socket could not be written within its send timeout");
+        if let Err(error) = codec.write(&mut stream, &message.wire()) {
+            // Queued frames cannot be delivered, so there is nothing to drain
+            // and the peer only sees the EOF below; `abort` records why.
+            delivery.abort(write_failure(&error));
             break;
         }
     }
     let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// Why a frame never reached the client, in the words the daemon log uses.
+fn write_failure(error: &FrameError) -> String {
+    match error {
+        FrameError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            "the client socket could not be written within its send timeout".to_owned()
+        }
+        FrameError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            "the client closed its connection".to_owned()
+        }
+        error => format!("a frame could not be written to the client: {error}"),
+    }
 }
 
 #[cfg(test)]

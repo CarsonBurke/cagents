@@ -324,7 +324,7 @@ impl DeliveryQueue {
 
     /// Severs the connection without draining. `reason` is logged, because an
     /// abort discards queued frames and the peer only observes an EOF.
-    pub(crate) fn abort(&self, reason: &'static str) {
+    pub(crate) fn abort(&self, reason: impl std::fmt::Display) {
         let mut state = self
             .state
             .lock()
@@ -333,7 +333,7 @@ impl DeliveryQueue {
             tracing::warn!(
                 client = self.client_id,
                 queued = state.messages.len(),
-                reason,
+                %reason,
                 "aborting a cagents daemon client delivery queue"
             );
         }

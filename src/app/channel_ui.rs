@@ -41,7 +41,10 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
         {
             if let Err(error) = client.close_chat(live.clone()) {
                 // Another window or a natural exit can win this race.
-                // Only a fresh inventory may turn a close error into success.
+                // Only a fresh inventory may turn a close error into success,
+                // read on a fresh connection: a failed request can leave this
+                // one out of step with the daemon.
+                client = reconnect(&socket)?;
                 if client
                     .list_chats()
                     .map_err(|error| error.to_string())?
@@ -65,6 +68,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
+            client = reconnect(&socket)?;
             let still_running = client
                 .list()
                 .map_err(|error| error.to_string())?
@@ -79,6 +83,11 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn reconnect(socket: &std::path::Path) -> Result<crate::control::ControlClient, String> {
+    crate::control::ControlClient::connect(socket)
+        .map_err(|error| format!("Cannot reach the daemon to close sessions: {error}"))
 }
 
 fn channel_terminal_ids(
