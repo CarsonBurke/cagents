@@ -1279,7 +1279,16 @@ fn prepare_upgrade_with_policy(
                     source.id
                 )));
             }
-            super::chat::validate_upgrade_environment(&source, &launch, &record.handle)
+            // The successor restarts this conversation from its terminal only
+            // if that terminal is checkpointed, which a completed one is not,
+            // and is restored first, which it is not for a conversation that
+            // owns its Codex listener.
+            let hosted_source = !super::chat::owns_codex_listener(&source)
+                && state
+                    .terminals
+                    .get(&source.id)
+                    .is_some_and(|terminal| !terminal.handle.is_completed());
+            super::chat::validate_upgrade_environment(&launch, hosted_source, &record.handle)
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
