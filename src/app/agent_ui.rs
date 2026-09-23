@@ -17,39 +17,69 @@ pub(super) fn observes_terminal_agent(session: &TerminalSession) -> bool {
     matches!(provider, Some(Provider::Claude | Provider::Codex))
 }
 
+/// How often the daemon is asked what the agent in a live pane is doing.
+const AGENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// An agent not opened this session drives only its sidebar row, which can
+/// trail the agent by a few seconds more than an open pane's can.
+const HIBERNATED_AGENT_POLL_INTERVAL: Duration = Duration::from_secs(6);
+
 impl Cagents {
-    fn polls_terminal_agent(&self, card: CardId) -> bool {
-        let Some(state) = self.card_state(card) else {
-            return false;
-        };
+    /// Whether `card` runs an observed agent, and whether it is hibernated,
+    /// which decides how often it is polled.
+    fn polled_terminal_agent(&self, card: CardId) -> Option<bool> {
+        let state = self.card_state(card)?;
         if !state.existence.is_open() {
-            return false;
+            return None;
         }
         let CardKind::Terminal(session) = &state.kind else {
-            return false;
+            return None;
         };
         observes_terminal_agent(session)
+            .then(|| matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))))
     }
 
+    /// Polling stops while the window is unfocused, and regaining focus polls
+    /// every agent at once, so rows are current whenever they can be read.
     pub(super) fn terminal_agent_activity_subscription(&self) -> Subscription<Message> {
-        if self.cards.iter().any(|(card, runtime)| {
-            matches!(runtime, CardRuntime::Terminal(_)) && self.polls_terminal_agent(*card)
-        }) {
-            iced::time::every(std::time::Duration::from_secs(2))
-                .map(|_| Message::PollTerminalAgentActivity)
-        } else {
-            Subscription::none()
+        if !self.refresh_ui.focused {
+            return Subscription::none();
         }
+        let (mut live, mut hibernated) = (false, false);
+        for (card, runtime) in &self.cards {
+            if let CardRuntime::Terminal(_) = runtime {
+                match self.polled_terminal_agent(*card) {
+                    Some(true) => hibernated = true,
+                    Some(false) => live = true,
+                    None => {}
+                }
+            }
+        }
+        Subscription::batch([
+            if live {
+                iced::time::every(AGENT_POLL_INTERVAL)
+                    .map(|_| Message::PollTerminalAgentActivity { hibernated: false })
+            } else {
+                Subscription::none()
+            },
+            if hibernated {
+                iced::time::every(HIBERNATED_AGENT_POLL_INTERVAL)
+                    .map(|_| Message::PollTerminalAgentActivity { hibernated: true })
+            } else {
+                Subscription::none()
+            },
+        ])
     }
 
-    pub(super) fn poll_terminal_agent_activity(&mut self) -> Task<Message> {
+    /// Asks the daemon about every agent polled at the cadence `hibernated`
+    /// names; `None` polls them all.
+    pub(super) fn poll_terminal_agent_activity(&self, hibernated: Option<bool>) {
         for (card, runtime) in &self.cards {
-            if self.polls_terminal_agent(*card)
-                && let CardRuntime::Terminal(surface) = runtime
+            if let CardRuntime::Terminal(surface) = runtime
+                && let Some(polled) = self.polled_terminal_agent(*card)
+                && hibernated.is_none_or(|hibernated| hibernated == polled)
             {
                 let _ = surface.refresh_agent_activity();
             }
         }
-        Task::none()
     }
 }

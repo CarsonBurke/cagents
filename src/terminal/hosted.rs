@@ -970,6 +970,11 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn visibility(&self) -> TerminalVisibility {
+        self.inner.published.desired_visibility()
+    }
+
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
         self.inner.published.hibernate();

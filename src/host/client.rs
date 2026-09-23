@@ -2,7 +2,11 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -286,13 +290,29 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 }
 
 /// At most one query is admitted per connection, with no pending backlog.
-/// A finished worker is reaped before its replacement is created; idle clients
-/// have no polling worker. Overflow is an explicit retryable protocol response.
+/// A connection's first query starts its one worker, which then waits for the
+/// next rather than exiting, so an agent polled every few seconds costs no
+/// thread per poll. Idle clients have no worker. Overflow is an explicit
+/// retryable protocol response.
 #[derive(Default)]
 struct AgentActivityJob {
-    worker: Option<thread::JoinHandle<()>>,
+    worker: Option<ActivityWorker>,
     // Serializes cancellation with apply/publication, not with provider I/O.
     cancelled: Arc<Mutex<bool>>,
+}
+
+struct ActivityWorker {
+    queries: mpsc::SyncSender<ActivityQuery>,
+    busy: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
+
+struct ActivityQuery {
+    request_id: u64,
+    terminal_id: TerminalId,
+    handle: crate::terminal::TerminalHandle,
+    observer: Arc<crate::agent::observe::Observer>,
+    proof: HostSessionProof,
 }
 
 impl AgentActivityJob {
@@ -304,7 +324,7 @@ impl AgentActivityJob {
         request_id: u64,
         terminal_id: TerminalId,
     ) -> Result<(), ProtocolError> {
-        let (handle, observer, proof) = {
+        let query = {
             let state = host.lock().unwrap_or_else(|error| error.into_inner());
             let handle = state.surface_handle(client_id, terminal_id)?;
             if state.shutting_down
@@ -319,116 +339,43 @@ impl AgentActivityJob {
                     true,
                 ));
             }
-            (
+            ActivityQuery {
+                request_id,
+                terminal_id,
                 handle,
-                Arc::clone(&state.agent_observer),
-                state.proof().clone(),
-            )
+                observer: Arc::clone(&state.agent_observer),
+                proof: state.proof().clone(),
+            }
         };
-        if self
-            .worker
-            .as_ref()
-            .is_some_and(|worker| !worker.is_finished())
-        {
+        // A worker that panicked is reaped and replaced rather than leaving
+        // this connection without activity for the rest of its life.
+        if let Some(worker) = self.worker.take_if(|worker| worker.thread.is_finished()) {
+            let _ = worker.thread.join();
+        }
+        let worker = match &mut self.worker {
+            Some(worker) => worker,
+            None => self.worker.insert(ActivityWorker::spawn(
+                host,
+                client_id,
+                delivery,
+                &self.cancelled,
+            )?),
+        };
+        if worker.busy.swap(true, Ordering::AcqRel) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::QueueFull,
                 "an agent activity query is already running on this connection",
                 true,
             ));
         }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        let host = Arc::clone(host);
-        let delivery = Arc::clone(delivery);
-        let cancelled = Arc::clone(&self.cancelled);
-        self.worker = Some(
-            thread::Builder::new()
-                .name(format!("cagentsd-activity-{client_id}"))
-                .spawn(move || {
-                    let gate = control_gate(&host);
-                    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
-                    // Scheduling and worker admission are separate: an upgrade
-                    // may commit before this thread starts. Once admitted, keep
-                    // observation and its eventual apply inside the same barrier.
-                    if ensure_control_open(&host).is_err() {
-                        delivery.abort("the daemon committed an upgrade or shutdown");
-                        return;
-                    }
-                    let process = {
-                        let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
-                        if *cancelled {
-                            return;
-                        }
-                        handle.observe_agent_process()
-                    };
-                    let observation = process
-                        .as_ref()
-                        .and_then(|process| {
-                            (process.provider != crate::agent::Provider::Omp)
-                                .then(|| observer.observe(process))
-                        })
-                        .unwrap_or_default();
-                    let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
-                    if *cancelled {
-                        return;
-                    }
-                    // The connection may have detached, shut down, or been replaced
-                    // while the provider was queried. Never publish to its successor.
-                    let attached = {
-                        let state = host.lock().unwrap_or_else(|error| error.into_inner());
-                        if state.shutting_down
-                            || state.proof() != &proof
-                            || !state
-                                .clients
-                                .get(&client_id)
-                                .is_some_and(|current| Arc::ptr_eq(current, &delivery))
-                        {
-                            delivery.abort("the client connection was replaced");
-                            return;
-                        }
-                        state.surface_handle(client_id, terminal_id)
-                    };
-                    let message = match attached {
-                        Ok(_) => {
-                            // Fresh raw process identity and deadline are checked by
-                            // the PTY owner. Neither observation nor apply holds HostState.
-                            let activity = process.and_then(|process| {
-                                if process.provider == crate::agent::Provider::Omp {
-                                    handle.agent_activity()
-                                } else {
-                                    handle.apply_agent_activity(
-                                        process,
-                                        observation.activity,
-                                        observation.title,
-                                    )
-                                }
-                            });
-                            ServerMessage::Response {
-                                response: ServerResponse::AgentActivity {
-                                    terminal_id,
-                                    activity,
-                                },
-                            }
-                        }
-                        Err(error) => ServerMessage::Error(error),
-                    };
-                    let _ = delivery.push(ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(request_id),
-                        proof,
-                        message,
-                    });
-                })
-                .map_err(|error| {
-                    ProtocolError::new(
-                        ProtocolErrorCode::Internal,
-                        format!("could not start agent activity query: {error}"),
-                        true,
-                    )
-                })?,
-        );
-        Ok(())
+        worker.queries.send(query).map_err(|_| {
+            worker.busy.store(false, Ordering::Release);
+            ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "the agent activity worker stopped",
+                true,
+            )
+        })
     }
 
     fn cancel(&self) {
@@ -439,11 +386,137 @@ impl AgentActivityJob {
     }
 }
 
+impl ActivityWorker {
+    fn spawn(
+        host: &SharedHost,
+        client_id: ClientId,
+        delivery: &Arc<DeliveryQueue>,
+        cancelled: &Arc<Mutex<bool>>,
+    ) -> Result<Self, ProtocolError> {
+        // `busy` admits one query at a time, so the channel never holds more.
+        let (queries, received) = mpsc::sync_channel(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let host = Arc::clone(host);
+        let delivery = Arc::clone(delivery);
+        let cancelled = Arc::clone(cancelled);
+        let idle = Arc::clone(&busy);
+        let thread = thread::Builder::new()
+            .name(format!("cagentsd-activity-{client_id}"))
+            .spawn(move || {
+                for query in received {
+                    observe_agent_activity(&host, client_id, &delivery, &cancelled, query);
+                    idle.store(false, Ordering::Release);
+                }
+            })
+            .map_err(|error| {
+                ProtocolError::new(
+                    ProtocolErrorCode::Internal,
+                    format!("could not start agent activity query: {error}"),
+                    true,
+                )
+            })?;
+        Ok(Self {
+            queries,
+            busy,
+            thread,
+        })
+    }
+}
+
+fn observe_agent_activity(
+    host: &SharedHost,
+    client_id: ClientId,
+    delivery: &Arc<DeliveryQueue>,
+    cancelled: &Mutex<bool>,
+    query: ActivityQuery,
+) {
+    let ActivityQuery {
+        request_id,
+        terminal_id,
+        handle,
+        observer,
+        proof,
+    } = query;
+    let gate = control_gate(host);
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    // Scheduling and worker admission are separate: an upgrade may commit
+    // before this query is taken up. Once admitted, keep observation and its
+    // eventual apply inside the same barrier. The idle worker holds none.
+    if ensure_control_open(host).is_err() {
+        delivery.abort("the daemon committed an upgrade or shutdown");
+        return;
+    }
+    let process = {
+        let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
+        if *cancelled {
+            return;
+        }
+        handle.observe_agent_process()
+    };
+    let observation = process
+        .as_ref()
+        .and_then(|process| {
+            (process.provider != crate::agent::Provider::Omp).then(|| observer.observe(process))
+        })
+        .unwrap_or_default();
+    let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
+    if *cancelled {
+        return;
+    }
+    // The connection may have detached, shut down, or been replaced while the
+    // provider was queried. Never publish to its successor.
+    let attached = {
+        let state = host.lock().unwrap_or_else(|error| error.into_inner());
+        if state.shutting_down
+            || state.proof() != &proof
+            || !state
+                .clients
+                .get(&client_id)
+                .is_some_and(|current| Arc::ptr_eq(current, delivery))
+        {
+            delivery.abort("the client connection was replaced");
+            return;
+        }
+        state.surface_handle(client_id, terminal_id)
+    };
+    let message = match attached {
+        Ok(_) => {
+            // Fresh raw process identity and deadline are checked by the PTY
+            // owner. Neither observation nor apply holds HostState.
+            let activity = process.and_then(|process| {
+                if process.provider == crate::agent::Provider::Omp {
+                    handle.agent_activity()
+                } else {
+                    handle.apply_agent_activity(process, observation.activity, observation.title)
+                }
+            });
+            ServerMessage::Response {
+                response: ServerResponse::AgentActivity {
+                    terminal_id,
+                    activity,
+                },
+            }
+        }
+        Err(error) => ServerMessage::Error(error),
+    };
+    let _ = delivery.push(ServerEnvelope {
+        version: PROTOCOL_VERSION,
+        request_id: Some(request_id),
+        proof,
+        message,
+    });
+}
+
 impl Drop for AgentActivityJob {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(ActivityWorker {
+            queries, thread, ..
+        }) = self.worker.take()
+        {
+            // Closing the channel ends the worker once its current query does.
+            drop(queries);
+            let _ = thread.join();
         }
     }
 }
@@ -1497,6 +1570,19 @@ mod tests {
             -1,
             "timed-out probe must be reaped"
         );
+        // The connection's worker takes the next query once it has answered,
+        // and the observer's cached failure answers it without a new probe.
+        send(
+            &mut stream,
+            &proof,
+            16,
+            ClientRequest::RefreshAgentActivity { terminal_id },
+        );
+        let envelope = response(&mut stream, &proof);
+        assert_eq!(envelope.request_id, Some(16));
+        assert!(matches!(envelope.message, ServerMessage::Response {
+            response: ServerResponse::AgentActivity { terminal_id: id, activity: None },
+        } if id == terminal_id));
         // Reap the first connection before exercising in-flight cancellation on
         // a fresh one, rather than racing its post-response thread epilogue.
         let handle = cleanup.handle.take();

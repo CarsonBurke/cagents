@@ -4,11 +4,19 @@ use super::*;
 /// focused.
 const SELECTED_PROJECT_INTERVAL: Duration = Duration::from_secs(60);
 /// Every other project's rows draw the same pull request and check state, so
-/// they are read as well, less often and one at a time.
-const BACKGROUND_PROJECT_INTERVAL: Duration = Duration::from_secs(120);
-/// A project something has made stale is still read at most this often, so an
-/// agent finishing turn after turn cannot keep its project's reads going.
-const STALE_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
+/// they are read as well, one at a time. A project with a pull request still
+/// open can see its checks or review state change at any moment.
+const ACTIVE_PROJECT_INTERVAL: Duration = Duration::from_secs(120);
+/// A project with no pull request open changes when someone opens one, which
+/// an agent finishing its turn there already brings forward by marking it
+/// stale.
+const IDLE_PROJECT_INTERVAL: Duration = Duration::from_secs(600);
+/// No project is read more often than this, however often an agent finishes
+/// a turn in it or the window regains focus.
+const MIN_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
+/// Reads that keep failing, a GitHub rate limit included, wait twice as long
+/// after each failure, up to this.
+const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 pub(super) struct State {
     pub(super) focused: bool,
@@ -32,12 +40,13 @@ impl Default for State {
     }
 }
 
-/// When each project was last read, and which ones something has made worth
-/// reading before their interval is up.
+/// When each project was last read, which ones something has made worth
+/// reading before their interval is up, and how many reads in a row failed.
 #[derive(Debug, Default)]
 struct ProjectSchedule {
     read: HashMap<ProjectId, Instant>,
     stale: HashSet<ProjectId>,
+    failures: HashMap<ProjectId, u32>,
 }
 
 impl ProjectSchedule {
@@ -46,40 +55,58 @@ impl ProjectSchedule {
         self.stale.remove(&project);
     }
 
+    fn finished(&mut self, project: ProjectId, succeeded: bool) {
+        if succeeded {
+            self.failures.remove(&project);
+        } else {
+            *self.failures.entry(project).or_default() += 1;
+        }
+    }
+
     fn retain(&mut self, open: impl Fn(ProjectId) -> bool) {
         self.read.retain(|&project, _| open(project));
         self.stale.retain(|&project| open(project));
+        self.failures.retain(|&project, _| open(project));
     }
 
     fn mark_stale(&mut self, project: ProjectId) {
         self.stale.insert(project);
     }
 
-    fn due(&self, project: ProjectId, interval: Duration, now: Instant) -> bool {
-        let interval = if self.stale.contains(&project) {
-            interval.min(STALE_PROJECT_INTERVAL)
-        } else {
-            interval
-        };
+    /// How long `project` waits after its last read. Stale and regained
+    /// focus shorten the wait to the floor; neither shortens a backoff.
+    fn wait(&self, project: ProjectId, interval: Duration, eager: bool) -> Duration {
+        match self.failures.get(&project) {
+            Some(&failures) => interval
+                .saturating_mul(1 << failures.min(8))
+                .min(MAX_PROJECT_BACKOFF),
+            None if eager || self.stale.contains(&project) => interval.min(MIN_PROJECT_INTERVAL),
+            None => interval,
+        }
+    }
+
+    fn due(&self, project: ProjectId, interval: Duration, eager: bool, now: Instant) -> bool {
         self.read
             .get(&project)
-            .is_none_or(|&read| now.duration_since(read) >= interval)
+            .is_none_or(|&read| now.duration_since(read) >= self.wait(project, interval, eager))
     }
 
     /// The one project a refresh tick reads, if any. The selected project
-    /// keeps its own cadence; the rest wait until no read is in flight, so a
-    /// long project list costs one `git` and `gh` round at a time rather than
-    /// a burst, and the one read longest ago goes first.
+    /// keeps its own cadence; the rest, each with its own interval, wait
+    /// until no read is in flight, so a long project list costs one `git`
+    /// and `gh` round at a time rather than a burst. The one read longest ago
+    /// goes first, and a stale one only breaks a tie, so a project that keeps
+    /// going stale cannot hold the others back.
     fn next(
         &self,
         selected: Option<ProjectId>,
-        others: impl IntoIterator<Item = ProjectId>,
+        others: impl IntoIterator<Item = (ProjectId, Duration)>,
         in_flight: &HashMap<ProjectId, CancellationToken>,
         regained_focus: bool,
         now: Instant,
     ) -> Option<ProjectId> {
         if let Some(selected) = selected.filter(|project| !in_flight.contains_key(project))
-            && (regained_focus || self.due(selected, SELECTED_PROJECT_INTERVAL, now))
+            && self.due(selected, SELECTED_PROJECT_INTERVAL, regained_focus, now)
         {
             return Some(selected);
         }
@@ -88,15 +115,11 @@ impl ProjectSchedule {
         }
         others
             .into_iter()
-            .filter(|&project| {
-                Some(project) != selected && self.due(project, BACKGROUND_PROJECT_INTERVAL, now)
+            .filter(|&(project, interval)| {
+                Some(project) != selected && self.due(project, interval, false, now)
             })
-            .min_by_key(|project| {
-                (
-                    !self.stale.contains(project),
-                    self.read.get(project).copied(),
-                )
-            })
+            .map(|(project, _)| project)
+            .min_by_key(|project| (self.read.get(project), !self.stale.contains(project)))
     }
 }
 
@@ -105,6 +128,12 @@ impl State {
     /// as an agent finishing a turn, so its rows are read sooner.
     pub(super) fn mark_stale(&mut self, project: ProjectId) {
         self.schedule.mark_stale(project);
+    }
+
+    /// A read finished. One that failed, or reached GitHub only to be
+    /// refused, makes the project wait longer before the next.
+    pub(super) fn finished(&mut self, project: ProjectId, succeeded: bool) {
+        self.schedule.finished(project, succeeded);
     }
 
     #[cfg(test)]
@@ -149,6 +178,7 @@ impl Cagents {
                 if !regained {
                     return Task::none();
                 }
+                self.poll_terminal_agent_activity(None);
                 true
             }
             Action::Tick => false,
@@ -188,8 +218,8 @@ impl Cagents {
         self.refresh_ui
             .schedule
             .retain(|id| projects.iter().any(|project| project.id == id));
-        // A project whose checkout could not be read keeps its explicit retry
-        // rather than failing again in the background, unless it is selected.
+        // A project whose checkout could not be read is retried from its row
+        // rather than in the background, unless it is selected.
         if let Some((id, path)) = self
             .refresh_ui
             .schedule
@@ -199,7 +229,14 @@ impl Cagents {
                 projects
                     .iter()
                     .filter(|project| project.unreachable.is_none())
-                    .map(|project| project.id),
+                    .map(|project| {
+                        let interval = if project.has_open_pull_request() {
+                            ACTIVE_PROJECT_INTERVAL
+                        } else {
+                            IDLE_PROJECT_INTERVAL
+                        };
+                        (project.id, interval)
+                    }),
                 &self.refresh_ui.projects,
                 regained_focus,
                 now,
@@ -261,6 +298,10 @@ mod tests {
         std::array::from_fn(|_| ProjectId::new())
     }
 
+    fn active<const N: usize>(projects: [ProjectId; N]) -> [(ProjectId, Duration); N] {
+        projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
+    }
+
     #[test]
     fn the_selected_project_keeps_its_own_cadence() {
         let [selected, other] = projects();
@@ -272,17 +313,16 @@ mod tests {
         let next = |schedule: &ProjectSchedule, regained_focus, elapsed| {
             schedule.next(
                 Some(selected),
-                [selected, other],
+                active([selected, other]),
                 &in_flight,
                 regained_focus,
                 start + elapsed,
             )
         };
-        assert_eq!(next(&schedule, false, Duration::from_secs(30)), None);
-        assert_eq!(
-            next(&schedule, true, Duration::from_secs(30)),
-            Some(selected)
-        );
+        assert_eq!(next(&schedule, false, MIN_PROJECT_INTERVAL), None);
+        // Regaining focus reads it early, but never twice within the floor.
+        assert_eq!(next(&schedule, true, Duration::from_secs(10)), None);
+        assert_eq!(next(&schedule, true, MIN_PROJECT_INTERVAL), Some(selected));
         assert_eq!(
             next(&schedule, false, SELECTED_PROJECT_INTERVAL),
             Some(selected)
@@ -290,11 +330,8 @@ mod tests {
         schedule.started(selected, start + SELECTED_PROJECT_INTERVAL);
         assert_eq!(next(&schedule, false, SELECTED_PROJECT_INTERVAL), None);
         // Every other project is read too, once its longer interval is up.
-        schedule.started(selected, start + BACKGROUND_PROJECT_INTERVAL);
-        assert_eq!(
-            next(&schedule, false, BACKGROUND_PROJECT_INTERVAL),
-            Some(other)
-        );
+        schedule.started(selected, start + ACTIVE_PROJECT_INTERVAL);
+        assert_eq!(next(&schedule, false, ACTIVE_PROJECT_INTERVAL), Some(other));
     }
 
     #[test]
@@ -302,11 +339,11 @@ mod tests {
         let [selected, older, newer, unread] = projects();
         let start = Instant::now();
         let mut schedule = ProjectSchedule::default();
-        schedule.started(selected, start + BACKGROUND_PROJECT_INTERVAL);
+        schedule.started(selected, start + ACTIVE_PROJECT_INTERVAL);
         schedule.started(older, start);
         schedule.started(newer, start + Duration::from_secs(10));
-        let now = start + BACKGROUND_PROJECT_INTERVAL + Duration::from_secs(10);
-        let others = [selected, newer, older];
+        let now = start + ACTIVE_PROJECT_INTERVAL + Duration::from_secs(10);
+        let others = active([selected, newer, older]);
         assert_eq!(
             schedule.next(Some(selected), others, &HashMap::new(), false, now),
             Some(older)
@@ -315,7 +352,7 @@ mod tests {
         assert_eq!(
             schedule.next(
                 Some(selected),
-                [selected, newer, older, unread],
+                active([selected, newer, older, unread]),
                 &HashMap::new(),
                 false,
                 now
@@ -331,7 +368,27 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_project_is_read_before_its_interval_is_up() {
+    fn a_project_without_an_open_pull_request_is_read_least_often() {
+        let [idle, open] = projects();
+        let start = Instant::now();
+        let mut schedule = ProjectSchedule::default();
+        schedule.started(idle, start);
+        schedule.started(open, start);
+        let others = [
+            (idle, IDLE_PROJECT_INTERVAL),
+            (open, ACTIVE_PROJECT_INTERVAL),
+        ];
+        let next = |schedule: &ProjectSchedule, elapsed| {
+            schedule.next(None, others, &HashMap::new(), false, start + elapsed)
+        };
+        assert_eq!(next(&schedule, ACTIVE_PROJECT_INTERVAL), Some(open));
+        schedule.started(open, start + ACTIVE_PROJECT_INTERVAL);
+        assert_eq!(next(&schedule, ACTIVE_PROJECT_INTERVAL), None);
+        assert_eq!(next(&schedule, IDLE_PROJECT_INTERVAL), Some(idle));
+    }
+
+    #[test]
+    fn a_stale_project_is_read_early_but_not_ahead_of_older_reads() {
         let [selected, other, stale] = projects();
         let start = Instant::now();
         let mut schedule = ProjectSchedule::default();
@@ -339,45 +396,100 @@ mod tests {
             schedule.started(project, start);
         }
         schedule.mark_stale(stale);
-        // Stale shortens the wait rather than skipping it.
-        assert_eq!(
+        let next = |schedule: &ProjectSchedule, others: &[ProjectId], in_flight, now| {
             schedule.next(
                 Some(selected),
-                [selected, other, stale],
-                &HashMap::new(),
+                others
+                    .iter()
+                    .map(|&project| (project, ACTIVE_PROJECT_INTERVAL)),
+                in_flight,
                 false,
+                now,
+            )
+        };
+        let idle = HashMap::new();
+        // Stale shortens the wait to the floor rather than skipping it.
+        assert_eq!(
+            next(
+                &schedule,
+                &[selected, other, stale],
+                &idle,
                 start + Duration::from_secs(10)
             ),
             None
         );
-        let now = start + STALE_PROJECT_INTERVAL;
+        let now = start + MIN_PROJECT_INTERVAL;
         assert_eq!(
-            schedule.next(
-                Some(selected),
-                [selected, other, stale],
-                &HashMap::new(),
-                false,
-                now
-            ),
+            next(&schedule, &[selected, other, stale], &idle, now),
             Some(stale)
         );
         schedule.started(stale, now);
+        assert_eq!(next(&schedule, &[selected, other, stale], &idle, now), None);
+        // Going stale again cannot put it ahead of a project read longer ago.
+        schedule.mark_stale(stale);
+        let later = start + ACTIVE_PROJECT_INTERVAL;
+        schedule.started(selected, later);
         assert_eq!(
-            schedule.next(
-                Some(selected),
-                [selected, other, stale],
-                &HashMap::new(),
-                false,
-                now
-            ),
-            None
+            next(&schedule, &[selected, other, stale], &idle, later),
+            Some(other)
+        );
+        // Among reads started together, the stale one goes first.
+        schedule.started(other, now);
+        assert_eq!(
+            next(&schedule, &[selected, other, stale], &idle, later),
+            Some(stale)
         );
         // The selected project is read first when it is the stale one.
         schedule.mark_stale(selected);
         let in_flight = HashMap::from([(other, CancellationToken::default())]);
         assert_eq!(
-            schedule.next(Some(selected), [selected], &in_flight, false, now),
+            next(
+                &schedule,
+                &[selected],
+                &in_flight,
+                later + MIN_PROJECT_INTERVAL
+            ),
             Some(selected)
+        );
+    }
+
+    #[test]
+    fn failed_reads_back_off_until_one_succeeds() {
+        let [project] = projects();
+        let start = Instant::now();
+        let mut schedule = ProjectSchedule::default();
+        let next = |schedule: &ProjectSchedule, regained_focus, elapsed| {
+            schedule.next(
+                Some(project),
+                [],
+                &HashMap::new(),
+                regained_focus,
+                start + elapsed,
+            )
+        };
+        schedule.started(project, start);
+        schedule.finished(project, false);
+        schedule.mark_stale(project);
+        // Neither stale nor focus shortens a backoff.
+        assert_eq!(next(&schedule, true, SELECTED_PROJECT_INTERVAL), None);
+        assert_eq!(
+            next(&schedule, false, SELECTED_PROJECT_INTERVAL * 2),
+            Some(project)
+        );
+        schedule.finished(project, false);
+        assert_eq!(next(&schedule, false, SELECTED_PROJECT_INTERVAL * 2), None);
+        assert_eq!(
+            next(&schedule, false, SELECTED_PROJECT_INTERVAL * 4),
+            Some(project)
+        );
+        for _ in 0..40 {
+            schedule.finished(project, false);
+        }
+        assert_eq!(next(&schedule, false, MAX_PROJECT_BACKOFF), Some(project));
+        schedule.finished(project, true);
+        assert_eq!(
+            next(&schedule, false, SELECTED_PROJECT_INTERVAL),
+            Some(project)
         );
     }
 
@@ -388,8 +500,10 @@ mod tests {
         schedule.started(open, Instant::now());
         schedule.started(closed, Instant::now());
         schedule.mark_stale(closed);
+        schedule.finished(closed, false);
         schedule.retain(|project| project == open);
         assert_eq!(schedule.read.keys().collect::<Vec<_>>(), [&open]);
         assert!(schedule.stale.is_empty());
+        assert!(schedule.failures.is_empty());
     }
 }
