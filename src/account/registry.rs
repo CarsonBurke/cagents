@@ -478,6 +478,7 @@ mod tests {
                 registry.register(work.clone(), &[]).unwrap();
                 registry.set_default(&Account::system(Provider::Codex));
                 registry.set_label(&Account::system(Provider::Claude), Some("Personal".into()));
+                registry.begin(Provider::Claude, Uuid::from_u128(9), 2);
             })
             .unwrap();
         let text = fs::read_to_string(directory.path().join(FILE_NAME)).unwrap();
@@ -493,6 +494,8 @@ mod tests {
             "email",
             "organization",
             "added_at",
+            "pending",
+            "started_at",
             // Provider names, as keys of the two maps.
             "claude",
             "codex",
@@ -528,6 +531,30 @@ mod tests {
             }
         }
         assert!(!text.contains('/'), "no path is ever written: {text}");
+    }
+
+    #[test]
+    fn a_sign_in_stays_pending_until_it_is_registered_or_abandoned() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let work = managed(Provider::Claude, "work@example.com");
+        let (first, second) = (work.key, Uuid::from_u128(77));
+        let (registry, ()) = store
+            .update(|registry| {
+                registry.begin(Provider::Claude, first, 10);
+                registry.begin(Provider::Codex, second, 20);
+                registry.begin(Provider::Codex, second, 30);
+            })
+            .unwrap();
+        assert_eq!(registry.pending().len(), 2, "a sign-in is recorded once");
+        assert_eq!(store.load().unwrap().pending(), registry.pending());
+        let (registry, registered) = store
+            .update(|registry| registry.register(work.clone(), &[]))
+            .unwrap();
+        assert_eq!(registered, Ok(()));
+        assert_eq!(registry.pending().len(), 1, "registering ends its sign-in");
+        let (registry, ()) = store.update(|registry| registry.abandon(second)).unwrap();
+        assert!(registry.pending().is_empty());
     }
 
     #[test]
