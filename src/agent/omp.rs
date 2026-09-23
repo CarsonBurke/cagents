@@ -63,6 +63,12 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 };
 
 fn session_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
+    data_root(launch, home)
+}
+
+/// Where Omp keeps its data - its sessions and its agent database - for
+/// `launch`.
+pub(super) fn data_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_DATA_HOME")
 }
 

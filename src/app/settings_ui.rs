@@ -320,7 +320,7 @@ fn settings_category_controls<'a>(
                     ),
                     setting_field(
                         "Status bar",
-                        "A thin bar along the bottom of the window showing how much of each signed-in Claude Code and Codex account's usage limits is left.",
+                        "A thin bar along the bottom of the window showing how much of each signed-in Claude Code, Codex and Omp account's usage limits is left.",
                         crate::settings_widgets::toggle(
                             "Show the status bar",
                             draft.show_status_bar,

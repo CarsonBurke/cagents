@@ -6,7 +6,9 @@
 //! own CLI from an async task and does its file work on the blocking pool;
 //! nothing here touches a process or a file on the UI thread. This module
 //! only decides when to ask, through [`crate::account::schedule`], and draws
-//! whatever came back.
+//! whatever came back. Omp's accounts, which Omp picks between itself, are
+//! read from the usage record it keeps ([`crate::account::omp`]) on the same
+//! pool.
 //!
 //! # Adding an account
 //!
@@ -27,6 +29,7 @@ use crate::account::{
     UsageWindow,
     cache::{Cache, Entry},
     home::Homes,
+    omp::{self, History},
     probe::{self, Outcome},
     registry::{self, Registry, Store},
     schedule::{self, Millis, Schedule, Trigger},
@@ -52,6 +55,10 @@ const LIVE_SAVE_DELAY: Duration = Duration::from_secs(5);
 /// Each question lists every hosted terminal, so it is asked less often
 /// than a card on screen is looked at.
 const HOST_CHECK: Millis = 3_000;
+/// How long after Omp's usage record was read a tick reads it again. Less
+/// than a tick, so a focused window reads it on every one: a local read
+/// costs nobody's patience, and Omp records figures as it works.
+const OMP_REREAD: Millis = 20_000;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
@@ -84,6 +91,38 @@ pub(super) struct State {
     live_unsaved: BTreeSet<AccountId>,
     /// Whether a write of [`State::live_unsaved`] is already due.
     saving_live: bool,
+    omp: OmpRecord,
+}
+
+/// Omp's usage record, which lists the accounts Omp keeps and is read
+/// rather than probed.
+#[derive(Debug, Default)]
+struct OmpRecord {
+    /// Where the record is, `None` where there is nowhere to look.
+    database: Option<PathBuf>,
+    /// The accounts it last listed, the one Omp recorded most recently
+    /// first, which is the one the status bar leads with.
+    accounts: Vec<Account>,
+    reading: bool,
+    /// When the record was last read.
+    read_at: Option<Millis>,
+    /// Why the last read found nothing it could use, while it could not.
+    problem: Option<String>,
+}
+
+impl OmpRecord {
+    /// Whether `trigger` at `now` should read the record again. The reader
+    /// asking always does; otherwise only a focused window reads, and not
+    /// again straight after a read.
+    fn due(&self, trigger: Trigger, now: Millis, focused: bool) -> bool {
+        self.database.is_some()
+            && !self.reading
+            && (trigger == Trigger::Manual
+                || (focused
+                    && self
+                        .read_at
+                        .is_none_or(|read_at| now.saturating_sub(read_at) >= OMP_REREAD)))
+    }
 }
 
 impl State {
@@ -91,11 +130,13 @@ impl State {
     /// of this installation through the cache in its state directory, and
     /// accounts through the registry in its configuration directory.
     pub(super) fn installation() -> Self {
-        Self::new(
+        let mut state = Self::new(
             Cache::installation(),
             Store::installation(),
             Homes::installation(),
-        )
+        );
+        state.omp.database = omp::database(&|name| std::env::var(name).ok());
+        state
     }
 
     fn new(cache: Option<Cache>, store: Option<Store>, homes: Option<Homes>) -> Self {
@@ -115,6 +156,7 @@ impl State {
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
             saving_live: false,
+            omp: OmpRecord::default(),
         };
         state.sync_accounts();
         state
@@ -128,11 +170,12 @@ impl State {
         self.accounts.iter_mut().find(|account| &account.id == id)
     }
 
-    /// Makes the account list match the registry: accounts it no longer
-    /// names go, new ones join, and every account that stays keeps what is
-    /// known about it.
+    /// Makes the account list match the registry and Omp's record: accounts
+    /// they no longer name go, new ones join, and every account that stays
+    /// keeps what is known about it.
     fn sync_accounts(&mut self) {
-        let wanted = self.registry.accounts(self.homes.as_ref());
+        let mut wanted = self.registry.accounts(self.homes.as_ref());
+        wanted.extend(self.omp.accounts.iter().cloned());
         let mut previous: BTreeMap<AccountId, AccountState> = std::mem::take(&mut self.accounts)
             .into_iter()
             .map(|state| (state.id.clone(), state))
@@ -168,8 +211,17 @@ impl State {
     }
 
     /// What the reader calls `account`: the name they gave it, else the
-    /// address it is signed in as, else what kind of account it is.
+    /// address it is signed in as, else what kind of account it is. One of
+    /// Omp's accounts is named with the service it signs in to, since one
+    /// address can have a login with several.
     fn display_name(&self, account: &AccountState) -> String {
+        if let Some(service) = account.account.brokered_service() {
+            let service = omp::service_label(service);
+            return match account.email(&self.registry) {
+                Some(email) => format!("{service} · {email}"),
+                None => format!("{service} account"),
+            };
+        }
         if let Some(label) = self.registry.label(&account.account) {
             return label.to_owned();
         }
@@ -221,6 +273,48 @@ impl State {
                 self.popover = None;
             }
         }
+    }
+
+    /// Takes what a read of Omp's usage record found at `now`. A record
+    /// that is gone takes its accounts with it; one that could not be read
+    /// leaves them as they were, saying why they are not newer.
+    fn take_history(&mut self, history: History, now: Millis) {
+        self.omp.reading = false;
+        self.omp.read_at = Some(now);
+        self.omp.problem = None;
+        let brokered = match history {
+            History::Missing => Vec::new(),
+            History::Unreadable(message) => {
+                self.omp.problem = Some(message.clone());
+                for state in &mut self.accounts {
+                    if state.account.is_brokered() {
+                        state.schedule.fail(now);
+                        state.failure = Some(message.clone());
+                    }
+                }
+                return;
+            }
+            History::Read(brokered) => brokered,
+        };
+        self.omp.accounts = brokered
+            .iter()
+            .map(|brokered| brokered.account.clone())
+            .collect();
+        self.sync_accounts();
+        for brokered in brokered {
+            let Some(state) = self.account_mut(&brokered.account.id()) else {
+                continue;
+            };
+            state.schedule.succeed(brokered.snapshot.observed_at);
+            state.identity = Some(brokered.identity);
+            state.snapshot = Some(brokered.snapshot);
+            state.failure = None;
+        }
+    }
+
+    /// Why Omp's usage record could not be read, when it could not.
+    pub(super) fn omp_problem(&self) -> Option<&str> {
+        self.omp.problem.as_deref()
     }
 
     /// What the accounts running conversations reported on since the last
@@ -418,6 +512,8 @@ pub enum Action {
         id: AccountId,
         outcome: Outcome,
     },
+    /// Omp's usage record was read.
+    OmpRead(History),
     Refresh(AccountId),
     /// The debounce on a manual refresh lifted, so its control can offer
     /// another.
@@ -915,11 +1011,14 @@ impl Cagents {
     /// for the CLIs: a slow startup file would hold back every figure the
     /// cache already has. Until the shell answers, the interface's own
     /// `PATH` stands in, and [`Self::locate_accounts`] looks again after.
-    pub(super) fn load_accounts(&self) -> Task<Message> {
+    ///
+    /// Omp's usage record is read beside it, on its own: a read that waits
+    /// on Omp writing holds back no other account.
+    pub(super) fn load_accounts(&mut self) -> Task<Message> {
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
-        cosmic::task::future(async move {
+        let load = cosmic::task::future(async move {
             let provisional = !probe::shell_asked();
             let search_path = probe::current_search_path();
             let loaded = tokio::task::spawn_blocking(move || {
@@ -958,7 +1057,11 @@ impl Cagents {
                 provisional,
             });
             Message::AccountUi(Action::Loaded(loaded))
-        })
+        });
+        match self.start_omp_read() {
+            Some(read) => Task::batch([load, read]),
+            None => load,
+        }
     }
 
     /// Judges again, on the shell's `PATH`, which accounts have a CLI to ask,
@@ -968,6 +1071,8 @@ impl Cagents {
             .account_ui
             .accounts
             .iter()
+            // Omp's accounts have no home or CLI of their own to find.
+            .filter(|state| !state.account.is_brokered())
             .map(|state| state.account.clone())
             .collect();
         let cache = self.account_ui.cache.clone();
@@ -1080,11 +1185,14 @@ impl Cagents {
             .account_ui
             .accounts
             .iter()
+            .filter(|account| !account.account.is_brokered())
             .map(|account| account.id.clone())
             .collect();
+        let omp = self.read_omp(trigger, now);
         Task::batch(
             ids.iter()
-                .filter_map(|id| self.probe_account(id, trigger, now)),
+                .filter_map(|id| self.probe_account(id, trigger, now))
+                .chain(omp),
         )
     }
 
@@ -1096,7 +1204,12 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
-        let provider = self.account_ui.account(id)?.account.provider;
+        let account = &self.account_ui.account(id)?.account;
+        // Omp's accounts are asked about together, by reading its record.
+        if account.is_brokered() {
+            return self.read_omp(trigger, now);
+        }
+        let provider = account.provider;
         let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
         // Figures from before a reset are wrong however recent they are, so
@@ -1151,6 +1264,68 @@ impl Cagents {
                 Message::AccountUi(Action::ManualReady)
             }),
         ]))
+    }
+
+    /// Reads Omp's usage record on the blocking pool, if `trigger` makes it
+    /// due. A manual refresh of one of its accounts is a refresh of all of
+    /// them, since they are one read: each shows it under way, and each is
+    /// debounced. The reads a tick makes are too quick and too frequent to
+    /// show.
+    fn read_omp(&mut self, trigger: Trigger, now: Millis) -> Option<Task<Message>> {
+        let focused = self.refresh_ui.focused;
+        let omp = &mut self.account_ui.omp;
+        if !omp.due(trigger, now, focused) {
+            return None;
+        }
+        let brokered = || {
+            self.account_ui
+                .accounts
+                .iter()
+                .filter(|state| state.account.is_brokered())
+        };
+        if trigger == Trigger::Manual && !brokered().all(|state| state.schedule.manual_ready(now)) {
+            return None;
+        }
+        let read = self.start_omp_read()?;
+        let mut ready_at = None;
+        if trigger == Trigger::Manual {
+            for state in &mut self.account_ui.accounts {
+                if state.account.is_brokered() {
+                    state.schedule.start(trigger, now);
+                    ready_at = ready_at.or(state.schedule.manual_ready_at());
+                }
+            }
+        }
+        let Some(ready_at) = ready_at else {
+            return Some(read);
+        };
+        let wait = Duration::from_millis(ready_at.saturating_sub(now));
+        Some(Task::batch([
+            read,
+            cosmic::task::future(async move {
+                tokio::time::sleep(wait).await;
+                Message::AccountUi(Action::ManualReady)
+            }),
+        ]))
+    }
+
+    /// Reads Omp's usage record on the blocking pool, unless there is none
+    /// or a read is already under way.
+    fn start_omp_read(&mut self) -> Option<Task<Message>> {
+        let omp = &mut self.account_ui.omp;
+        if omp.reading {
+            return None;
+        }
+        let database = omp.database.clone()?;
+        omp.reading = true;
+        Some(cosmic::task::future(async move {
+            let history = tokio::task::spawn_blocking(move || omp::read(&database, now_ms()))
+                .await
+                .unwrap_or_else(|_| {
+                    History::Unreadable("Omp's usage record could not be read".into())
+                });
+            Message::AccountUi(Action::OmpRead(history))
+        }))
     }
 
     /// What a running conversation's CLI reported about the account the
@@ -1278,6 +1453,12 @@ impl Cagents {
                 Task::none()
             }
             Action::Probed { id, outcome } => self.account_probed(id, outcome),
+            Action::OmpRead(history) => {
+                let now = now_ms();
+                self.account_ui.now_ms = now;
+                self.account_ui.take_history(history, now);
+                Task::none()
+            }
             Action::Refresh(id) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -1434,7 +1615,12 @@ impl Cagents {
             }
             Action::Rename(id) => {
                 self.account_ui.table.menu = None;
-                let Some(state) = self.account_ui.account(&id) else {
+                let Some(state) = self
+                    .account_ui
+                    .account(&id)
+                    // Omp names its own accounts.
+                    .filter(|state| !state.account.is_brokered())
+                else {
                     return Task::none();
                 };
                 let current = self
@@ -1473,7 +1659,7 @@ impl Cagents {
                 if self
                     .account_ui
                     .account(&id)
-                    .is_some_and(|state| !state.account.is_system())
+                    .is_some_and(|state| state.account.managed_key().is_some())
                 {
                     self.account_ui.table.confirm_in_use = self.cards_on_account(&id);
                     self.account_ui.table.menu = Some(id.clone());
@@ -2363,7 +2549,7 @@ impl Cagents {
         }
         let now = self.account_ui.now_ms;
         let compact = self.window_width < COMPACT_WIDTH;
-        let chips: Vec<Element<'_, Message>> = Account::PROVIDERS
+        let chips: Vec<Element<'_, Message>> = Account::REPORTED
             .into_iter()
             .filter_map(|provider| self.provider_chip(provider, now, compact))
             .collect();
@@ -2660,6 +2846,7 @@ impl Cagents {
                 UsageSource::Probe => "",
                 UsageSource::Cache => " · saved",
                 UsageSource::Live => " · from a running conversation",
+                UsageSource::Recorded => " · as Omp recorded it",
             };
             let updated = format!("Updated {ago}{source}");
             footer.push(design::caption(updated).into());
@@ -4076,6 +4263,186 @@ mod app_tests {
                 .iter()
                 .any(|entry| entry.notice.message.contains("already added")),
             "the reader is told which account it duplicates"
+        );
+    }
+
+    /// What Omp would have recorded for one login's five-hour window.
+    fn recorded(service: &str, email: &str, used: f64, recorded_at: Millis) -> omp::Row {
+        omp::Row {
+            recorded_at: recorded_at as i64,
+            service: service.into(),
+            account_key: format!("oauth|email:{email}"),
+            email: Some(email.into()),
+            limit_id: "primary".into(),
+            label: Some("5 Hour".into()),
+            window_label: Some("5 Hours".into()),
+            used_fraction: Some(used),
+            status: Some("ok".into()),
+            resets_at: None,
+        }
+    }
+
+    fn brokered(app: &Cagents) -> Vec<&AccountState> {
+        app.account_ui
+            .accounts
+            .iter()
+            .filter(|state| state.account.is_brokered())
+            .collect()
+    }
+
+    #[test]
+    fn omps_accounts_come_and_go_with_its_record_and_are_only_read() {
+        let mut app = context_inspector_test_app(false);
+        let now = now_ms();
+        let both = omp::accounts(
+            [
+                recorded("openai-codex", "b@example.com", 0.5, now - 2_000),
+                recorded("anthropic", "a@example.com", 0.25, now - 1_000),
+            ],
+            now,
+        );
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Read(
+            both.clone(),
+        ))));
+        let listed = brokered(&app);
+        assert_eq!(listed.len(), 2);
+        let (anthropic, codex) = (listed[0].id.clone(), listed[1].id.clone());
+        // The login Omp used last leads, as the status bar's chip.
+        assert_eq!(
+            app.account_ui.display_name(listed[0]),
+            "Anthropic · a@example.com"
+        );
+        assert!(listed.iter().all(|state| state.present));
+        let snapshot = listed[0].snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.source, UsageSource::Recorded);
+        assert_eq!(snapshot.windows[0].used, 0.25);
+        assert!(app.status_bar().is_some());
+        assert!(app.provider_chip(Provider::Omp, now, false).is_some());
+        // Omp names and forgets its own accounts.
+        let _ = app.update(Message::AccountUi(Action::Remove(anthropic.clone())));
+        assert_eq!(app.account_ui.table.confirm_remove, None);
+        let _ = app.update(Message::AccountUi(Action::Rename(anthropic.clone())));
+        assert_eq!(app.account_ui.table.rename, None);
+        // A record that cannot be read keeps what was read before it.
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Unreadable(
+            "Omp's usage record is damaged".into(),
+        ))));
+        let state = app.account_ui.account(&anthropic).unwrap();
+        assert!(state.snapshot.is_some());
+        assert_eq!(
+            state.failure.as_deref(),
+            Some("Omp's usage record is damaged")
+        );
+        // A login the record no longer lists goes, and a read clears the
+        // failure of those that stay.
+        let _ = app.update(Message::AccountUi(Action::Popover(Some(codex.clone()))));
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Read(
+            both.into_iter()
+                .filter(|brokered| brokered.account.id() == anthropic)
+                .collect(),
+        ))));
+        assert!(app.account_ui.account(&codex).is_none());
+        assert_eq!(app.account_ui.popover, None);
+        assert_eq!(app.account_ui.account(&anthropic).unwrap().failure, None);
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Missing)));
+        assert!(brokered(&app).is_empty());
+        assert!(app.account_ui.omp.accounts.is_empty());
+    }
+
+    #[test]
+    fn omps_record_is_read_while_someone_looks_but_not_straight_after_a_read() {
+        let now = 1_000_000;
+        let mut record = OmpRecord::default();
+        assert!(!record.due(Trigger::Manual, now, true), "nowhere to read");
+        record.database = Some(PathBuf::from("/nonexistent/agent.db"));
+        assert!(record.due(Trigger::Tick, now, true));
+        assert!(!record.due(Trigger::Tick, now, false));
+        assert!(record.due(Trigger::Manual, now, false));
+        record.read_at = Some(now);
+        assert!(!record.due(Trigger::Focus, now + OMP_REREAD - 1, true));
+        assert!(record.due(Trigger::Tick, now + OMP_REREAD, true));
+        assert!(record.due(Trigger::Manual, now + 1, true));
+        record.reading = true;
+        assert!(!record.due(Trigger::Manual, now + OMP_REREAD, true));
+    }
+
+    #[test]
+    fn refreshing_one_of_omps_accounts_reads_the_record_for_all_of_them() {
+        let mut app = context_inspector_test_app(false);
+        let now = now_ms();
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Read(
+            omp::accounts(
+                [
+                    recorded("anthropic", "a@example.com", 0.25, now - 1_000),
+                    recorded("xai-oauth", "c@example.com", 0.1, now - 3_000),
+                ],
+                now,
+            ),
+        ))));
+        let id = brokered(&app)[0].id.clone();
+        // A record that is no longer there is found out by the read.
+        app.account_ui.omp.database = Some(PathBuf::from("/nonexistent/agent.db"));
+        let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));
+        assert!(app.account_ui.omp.reading);
+        let later = now_ms();
+        assert!(
+            brokered(&app)
+                .iter()
+                .all(|state| state.schedule.in_flight(later) && !state.schedule.manual_ready(later))
+        );
+        // A second request while the first is being read is the same read.
+        let _ = app.update(Message::AccountUi(Action::Refresh(id)));
+        assert!(app.account_ui.omp.reading);
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Missing)));
+        assert!(!app.account_ui.omp.reading);
+        assert!(brokered(&app).is_empty());
+    }
+
+    #[test]
+    fn a_record_omp_keeps_in_an_unknown_form_is_reported_before_any_account_is_read() {
+        let mut app = context_inspector_test_app(false);
+        let problem = "Omp's usage record is in a form cagents does not know";
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Unreadable(
+            problem.into(),
+        ))));
+        assert!(brokered(&app).is_empty());
+        assert_eq!(app.account_ui.omp_problem(), Some(problem));
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Missing)));
+        assert_eq!(app.account_ui.omp_problem(), None);
+    }
+
+    /// A tick reads the record every few seconds, and a check that lands in
+    /// milliseconds is not worth showing that often.
+    #[test]
+    fn a_tick_reads_omps_record_without_showing_a_check_under_way() {
+        let mut app = context_inspector_test_app(false);
+        let now = now_ms();
+        let _ = app.update(Message::AccountUi(Action::OmpRead(History::Read(
+            omp::accounts(
+                [recorded("anthropic", "a@example.com", 0.25, now - 1_000)],
+                now,
+            ),
+        ))));
+        app.refresh_ui.focused = true;
+        app.account_ui.omp.database = Some(PathBuf::from("/nonexistent/agent.db"));
+        app.account_ui.omp.read_at = None;
+        assert!(app.read_omp(Trigger::Tick, now).is_some());
+        assert!(app.account_ui.omp.reading);
+        let state = brokered(&app)[0];
+        assert!(!state.schedule.in_flight(now) && state.schedule.manual_ready(now));
+    }
+
+    #[test]
+    fn omps_record_is_read_at_start_apart_from_the_accounts_and_before_focus() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = false;
+        app.account_ui.omp.database = Some(PathBuf::from("/nonexistent/agent.db"));
+        let _ = app.load_accounts();
+        assert!(app.account_ui.omp.reading);
+        let _ = app.load_accounts();
+        assert!(
+            app.read_omp(Trigger::Manual, now_ms()).is_none(),
+            "a read under way is not started again"
         );
     }
 }
