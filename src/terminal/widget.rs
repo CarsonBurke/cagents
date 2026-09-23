@@ -1635,6 +1635,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modified_key,
+                physical_key,
                 modifiers,
                 text,
                 repeat,
@@ -1644,7 +1645,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // Copy, paste and dropping a selection are this widget's
                 // chords, never the child's, and each is captured even when it
                 // does nothing so that no half of one reaches the child.
-                if let Some(chord) = clipboard_chord(key, *modifiers) {
+                if let Some(chord) = clipboard_chord(key, *physical_key, *modifiers) {
                     match chord {
                         ClipboardChord::Copy => {
                             if let Some(text) = self.selected_text(state) {
@@ -1684,15 +1685,25 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let input = key_press(key, modified_key, *modifiers, text.as_deref(), *repeat);
+                let input = key_press(
+                    key,
+                    modified_key,
+                    *physical_key,
+                    *modifiers,
+                    text.as_deref(),
+                    *repeat,
+                );
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
                     Err(error) => self.publish_error(error, shell),
                 }
             }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, modifiers, .. })
-                if self.model_focused =>
-            {
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if self.model_focused => {
                 state.modifiers = map_iced_modifiers(*modifiers);
                 if self.read_only {
                     shell.capture_event();
@@ -1705,7 +1716,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                if clipboard_chord(key, *modifiers).is_some() {
+                if clipboard_chord(key, *physical_key, *modifiers).is_some() {
                     shell.capture_event();
                     return;
                 }
@@ -1715,13 +1726,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let input = KeyInput {
-                    action: KeyAction::Release,
-                    key: map_iced_key(key),
-                    modifiers: map_iced_modifiers(*modifiers),
-                    text: None,
-                    unshifted_codepoint: character_from_key(key),
-                };
+                let input = key_release(key, *physical_key, *modifiers);
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
                     Err(error) => self.publish_error(error, shell),
@@ -2636,6 +2641,7 @@ fn map_iced_modifiers(modifiers: keyboard::Modifiers) -> KeyModifiers {
 fn key_press(
     key: &keyboard::Key,
     modified_key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     text: Option<&str>,
     repeat: bool,
@@ -2646,9 +2652,24 @@ fn key_press(
         } else {
             KeyAction::Press
         },
-        key: map_iced_key(key),
+        key: map_iced_key(key, physical_key),
         modifiers: map_iced_modifiers(modifiers),
         text: key_text(text, modified_key),
+        unshifted_codepoint: character_from_key(key),
+    }
+}
+
+/// The release iced reported, naming the key its press named.
+fn key_release(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> KeyInput {
+    KeyInput {
+        action: KeyAction::Release,
+        key: map_iced_key(key, physical_key),
+        modifiers: map_iced_modifiers(modifiers),
+        text: None,
         unshifted_codepoint: character_from_key(key),
     }
 }
@@ -2690,11 +2711,21 @@ fn character_from_key(key: &keyboard::Key) -> Option<char> {
     characters.next().is_none().then_some(character)
 }
 
-fn map_iced_key(key: &keyboard::Key) -> TerminalKey {
+/// The key a press names to the encoder: when the active layout types a
+/// non-Latin character, the key a US layout has in the same place.
+///
+/// Ghostty's encoder turns Ctrl and a key into a control character by the
+/// key's US name, so on a Russian layout Ctrl+С is Ctrl+C - SIGINT - and Ctrl+Ъ
+/// is Ctrl+] - GS - as they are in Ghostty's own front ends. The press still
+/// carries the layout's own text and unshifted character, so a child reading
+/// the kitty protocol sees `с`, and `c` as its base-layout key when it asks for
+/// alternates.
+fn map_iced_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> TerminalKey {
     match key.as_ref() {
-        keyboard::Key::Character(text) => text
-            .chars()
-            .next()
+        keyboard::Key::Character(text) => key
+            .to_latin(physical_key)
+            .or_else(|| us_punctuation(physical_key))
+            .or_else(|| text.chars().next())
             .map_or(TerminalKey::Unidentified, TerminalKey::Character),
         keyboard::Key::Named(named) => match named {
             keyboard::key::Named::Backspace => TerminalKey::Backspace,
@@ -2740,6 +2771,30 @@ fn map_iced_key(key: &keyboard::Key) -> TerminalKey {
         },
         keyboard::Key::Unidentified => TerminalKey::Unidentified,
     }
+}
+
+/// What a US layout's punctuation key types unshifted, the part of the
+/// writing-system keys iced's `Key::to_latin` leaves out.
+fn us_punctuation(physical_key: keyboard::key::Physical) -> Option<char> {
+    use keyboard::key::Code;
+
+    let keyboard::key::Physical::Code(code) = physical_key else {
+        return None;
+    };
+    Some(match code {
+        Code::Backquote => '`',
+        Code::Minus => '-',
+        Code::Equal => '=',
+        Code::BracketLeft => '[',
+        Code::BracketRight => ']',
+        Code::Backslash => '\\',
+        Code::Semicolon => ';',
+        Code::Quote => '\'',
+        Code::Comma => ',',
+        Code::Period => '.',
+        Code::Slash => '/',
+        _ => return None,
+    })
 }
 
 fn map_iced_button(button: IcedMouseButton) -> MouseButton {
@@ -2843,20 +2898,22 @@ enum ClipboardChord {
     Paste,
 }
 
-fn clipboard_chord(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<ClipboardChord> {
+/// Ctrl+Shift+C and Ctrl+Shift+V, by the Latin key in their place so the
+/// chords survive a switch to a non-Latin layout.
+fn clipboard_chord(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> Option<ClipboardChord> {
     if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
         return None;
     }
-    let keyboard::Key::Character(text) = key.as_ref() else {
-        return None;
-    };
-    // Shift is held, so the layout may well report the capital.
-    if text.eq_ignore_ascii_case("c") {
-        Some(ClipboardChord::Copy)
-    } else if text.eq_ignore_ascii_case("v") {
-        Some(ClipboardChord::Paste)
-    } else {
-        None
+    // iced reports the key without modifiers, but a capital costs nothing to
+    // fold.
+    match key.to_latin(physical_key)?.to_ascii_lowercase() {
+        'c' => Some(ClipboardChord::Copy),
+        'v' => Some(ClipboardChord::Paste),
+        _ => None,
     }
 }
 
@@ -2977,6 +3034,7 @@ mod tests {
     fn a_key_hands_over_what_it_types_without_ctrl() {
         let key = |text: &str| keyboard::Key::Character(text.into());
         let named = |named| keyboard::Key::Named(named);
+        let physical_c = keyboard::key::Physical::Code(keyboard::key::Code::KeyC);
 
         // Ctrl+C, Ctrl+C under Caps Lock, and Ctrl+[ as winit reports them.
         assert_eq!(key_text(Some("\u{3}"), &key("c")).as_deref(), Some("c"));
@@ -3000,6 +3058,7 @@ mod tests {
         let press = key_press(
             &key("c"),
             &key("c"),
+            physical_c,
             keyboard::Modifiers::CTRL,
             Some("\u{3}"),
             false,
@@ -3008,6 +3067,83 @@ mod tests {
         assert!(press.modifiers.control);
         assert_eq!(press.text.as_deref(), Some("c"));
         assert_eq!(press.unshifted_codepoint, Some('c'));
+    }
+
+    #[test]
+    fn a_non_latin_layout_names_the_latin_key_in_its_place() {
+        let key = |text: &str| keyboard::Key::Character(text.into());
+        let physical = keyboard::key::Physical::Code;
+
+        // Ctrl+С on a Russian layout names C, which the encoder makes ETX of,
+        // and keeps the layout's text and character for the kitty protocol.
+        let press = key_press(
+            &key("с"),
+            &key("с"),
+            physical(keyboard::key::Code::KeyC),
+            keyboard::Modifiers::CTRL,
+            Some("с"),
+            false,
+        );
+        assert_eq!(press.key, TerminalKey::Character('c'));
+        assert_eq!(press.text.as_deref(), Some("с"));
+        assert_eq!(press.unshifted_codepoint, Some('с'));
+        // Its release names the same key, or a child reading releases would
+        // see one key go down and another come up.
+        let release = key_release(
+            &key("с"),
+            physical(keyboard::key::Code::KeyC),
+            keyboard::Modifiers::CTRL,
+        );
+        assert_eq!(release.action, KeyAction::Release);
+        assert_eq!(release.key, press.key);
+        assert_eq!(release.unshifted_codepoint, Some('с'));
+        assert_eq!(release.text, None);
+        // Punctuation positions too: Ctrl+Ъ is Ctrl+] and Ctrl+Ж is Ctrl+;.
+        assert_eq!(
+            map_iced_key(&key("ъ"), physical(keyboard::key::Code::BracketRight)),
+            TerminalKey::Character(']')
+        );
+        assert_eq!(
+            map_iced_key(&key("ж"), physical(keyboard::key::Code::Semicolon)),
+            TerminalKey::Character(';')
+        );
+        // A Latin layout's key is its own, wherever it sits.
+        assert_eq!(
+            map_iced_key(&key("q"), physical(keyboard::key::Code::KeyA)),
+            TerminalKey::Character('q')
+        );
+        assert_eq!(
+            map_iced_key(&key("ü"), physical(keyboard::key::Code::BracketLeft)),
+            TerminalKey::Character('ü')
+        );
+        // A non-Latin key with no US key in its place stays itself.
+        assert_eq!(
+            map_iced_key(&key("ё"), physical(keyboard::key::Code::IntlBackslash)),
+            TerminalKey::Character('ё')
+        );
+
+        // Copy and paste follow the same key.
+        let chord = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            clipboard_chord(&key("С"), physical(keyboard::key::Code::KeyC), chord),
+            Some(ClipboardChord::Copy)
+        );
+        assert_eq!(
+            clipboard_chord(&key("М"), physical(keyboard::key::Code::KeyV), chord),
+            Some(ClipboardChord::Paste)
+        );
+        assert_eq!(
+            clipboard_chord(&key("C"), physical(keyboard::key::Code::KeyC), chord),
+            Some(ClipboardChord::Copy)
+        );
+        assert_eq!(
+            clipboard_chord(
+                &key("с"),
+                physical(keyboard::key::Code::KeyC),
+                keyboard::Modifiers::CTRL
+            ),
+            None
+        );
     }
 
     #[test]

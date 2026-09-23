@@ -3217,6 +3217,41 @@ mod tests {
     }
 
     #[test]
+    fn control_c_interrupts_on_a_non_latin_layout() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let mut encoder = KeyEncoder::new().unwrap();
+        // Ctrl+С on a Russian layout: the widget names the Latin key in its
+        // place and hands over the layout's own text.
+        let mut control = |terminal: &Terminal<'_, '_>, key, typed: &str| {
+            let mut input = key_input(
+                KeyAction::Press,
+                TerminalKey::Character(key),
+                Some(typed),
+                typed.chars().next(),
+            );
+            input.modifiers.control = true;
+            encode_key_input(terminal, &mut encoder, input).unwrap()
+        };
+        assert_eq!(control(&terminal, 'c', "с"), b"\x03");
+        // The punctuation keys follow the US key in their place, into whatever
+        // Ghostty makes of that key: Ctrl+Ъ is Ctrl+], and Ctrl+Х is Ctrl+[,
+        // which Ghostty keeps as CSI u after fixterms rather than a bare ESC.
+        assert_eq!(control(&terminal, ']', "ъ"), b"\x1d");
+        assert_eq!(control(&terminal, '[', "х"), "\x1b[1093;5u".as_bytes());
+        // A kitty child reads the layout's key, and its base-layout key when
+        // it asks for alternates.
+        terminal.vt_write(b"\x1b[>1u");
+        assert_eq!(control(&terminal, 'c', "с"), "\x1b[1089;5u".as_bytes());
+        terminal.vt_write(b"\x1b[=5u");
+        assert_eq!(control(&terminal, 'c', "с"), "\x1b[1089::99;5u".as_bytes());
+    }
+
+    #[test]
     fn control_backspace_kills_words_only_in_legacy_encoding() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 80,
