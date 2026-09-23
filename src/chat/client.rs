@@ -1010,21 +1010,22 @@ fn acknowledge_terminal_handoff_on(
                 request_id: 1,
                 proof: None,
                 request: ClientRequest::Connect {
-                    expected_host: expected.clone(),
+                    expected_host: None,
                     resume: Vec::new(),
                 },
             },
         )
         .map_err(|error| error.to_string())?;
-    let proof = match receive(&mut wire.stream, &mut wire.codec, 1, expected.as_ref())? {
-        ServerResponse::Connected { proof, .. }
-            if proof.is_complete()
-                && expected.as_ref().is_none_or(|expected| expected == &proof) =>
-        {
-            proof
-        }
+    let proof = match receive(&mut wire.stream, &mut wire.codec, 1, None)? {
+        ServerResponse::Connected { proof, .. } if proof.is_complete() => proof,
         _ => return Err("Daemon did not prove terminal handoff ownership".into()),
     };
+    // A daemon keeps its handoff receipts in memory, so one answering under
+    // another identity than the terminal's never held this one: the daemon
+    // that did is gone, and there is nothing left to acknowledge.
+    if expected.as_ref().is_some_and(|expected| expected != &proof) {
+        return Ok(());
+    }
     let wire = Mutex::new(wire);
     transmit(
         &wire,
@@ -1125,8 +1126,17 @@ mod tests {
             transcript_path: None,
         };
         // A persisted descriptor with no live proof still commits on the
-        // discovered host. An incarnation change after discovery must fail.
-        for changed in [false, true] {
+        // discovered host, as one naming that host does. An incarnation change
+        // after discovery must fail.
+        for (live, changed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut terminal = terminal.clone();
+            if live {
+                terminal.continuity = TerminalContinuity::DetachedSameBoot {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: proof.host_incarnation.clone(),
+                };
+            }
             let (client, mut server) = UnixStream::pair().unwrap();
             let proof = proof.clone();
             let worker = thread::spawn(move || {
@@ -1155,6 +1165,10 @@ mod tests {
                     )
                     .unwrap();
                 let commit: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(matches!(
+                    commit.request,
+                    ClientRequest::ChatCommitTerminal { .. }
+                ));
                 let response_proof = if changed {
                     HostSessionProof {
                         host_incarnation: HostIncarnation::new("replacement"),
@@ -1181,6 +1195,78 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(result.is_err(), changed);
         }
+    }
+
+    #[test]
+    fn a_replacement_daemon_retires_the_previous_daemons_handoff() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity,
+            TerminalSession,
+        };
+        let previous = HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("previous"),
+        };
+        let replacement = HostSessionProof {
+            host_incarnation: HostIncarnation::new("replacement"),
+            ..previous.clone()
+        };
+        // A closed card saved before its daemon was replaced still carries the
+        // previous daemon's identity; its receipt went away with that daemon.
+        let terminal = TerminalSession {
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: LaunchRecipe {
+                program: "unused".into(),
+                arguments: Vec::new(),
+                working_directory: "/".into(),
+                environment: BTreeMap::new(),
+            },
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: previous.host_session_id.clone(),
+                boot_id: previous.boot_id.clone(),
+                host_incarnation: previous.host_incarnation.clone(),
+            },
+            resume_hint: None,
+            transcript_path: None,
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            // Pinning the previous identity would only draw a refusal.
+            assert!(matches!(
+                connect.request,
+                ClientRequest::Connect {
+                    expected_host: None,
+                    ..
+                }
+            ));
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(connect.request_id),
+                        proof: replacement.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: replacement,
+                                resumed: Vec::new(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            // Nothing more is asked of a daemon that never held the receipt.
+            codec.read::<ClientEnvelope>(&mut server).unwrap()
+        });
+        assert_eq!(acknowledge_terminal_handoff_on(client, &terminal), Ok(()));
+        assert!(worker.join().unwrap().is_none());
     }
 
     #[test]
