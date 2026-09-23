@@ -162,7 +162,7 @@ Browserless builds keep terminals, repositories, worktrees, GitHub
 pull-request flows, and persistence. New links open through the desktop portal,
 falling back to `xdg-open` when no portal is available; Debian packages install
 `xdg-utils`, and portable or source users must provide it for that fallback. A
-restored browser card keeps its saved URL, history, scroll position, and
+restored browser pane keeps its saved URL, history, scroll position, and
 fidelity, shows that the integrated browser is unavailable, and offers **Open
 in system browser**.
 
@@ -176,6 +176,8 @@ executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`, and
 `cagentsd` must stay together.
 
 ```sh
+REPOSITORY='CarsonBurke/cagents'
+VERSION='0.1.2'
 gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
   --pattern "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" --pattern SHA256SUMS
 sha256sum --ignore-missing --strict --check SHA256SUMS
@@ -225,7 +227,7 @@ runs the installer's full-upgrade handoff, and reopens the same named windows
 from the newly installed executable. Failure status and the private installer
 log stay under the installation's `.update/` directory. After you resolve a
 veto or failure, the warning offers **Retry update** while the selected release
-is still available.
+is still available; the diagnostic files are kept.
 
 ### From the command line
 

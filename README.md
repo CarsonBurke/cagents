@@ -6,11 +6,11 @@
 
 <p align="center">A native Linux workspace for running coding agents across repositories and Git worktrees.</p>
 
-cagents keeps every agent session, terminal, and worktree in one fast Wayland
-application. Run Claude Code, Codex, and OMP in real terminals or native chat
-views, review their changes and pull requests next to them, and close the
-window without losing anything: a per-user daemon keeps terminals and
-conversations running in the background.
+cagents keeps every agent session, terminal, and worktree in one native
+Wayland application. Run Claude Code, Codex, and OMP in real terminals or
+native chat views, and review their changes and pull requests next to them. A
+per-user daemon owns the terminals and conversations, so they keep running when
+you close the window or restart the UI.
 
 > [!IMPORTANT]
 > The repository is private (`CarsonBurke/cagents`). Downloading a release
@@ -35,8 +35,8 @@ conversations running in the background.
   as `ceditor`.
 - **Embedded browser.** An optional Servo browser pane. The browserless build
   opens links in your system browser instead.
-- **Scriptable CLI.** `cagents` controls the daemon and terminals with
-  human-readable or JSON output.
+- **Scriptable CLI.** `cagents` controls the daemon, terminals, projects, and
+  channels with human-readable or JSON output.
 
 ## Install
 
@@ -44,25 +44,10 @@ Requirements: Linux x86_64 with glibc 2.35 or newer, a Wayland session, Git
 2.36 or newer, and an authenticated [GitHub CLI](https://cli.github.com/)
 (`gh auth login`).
 
-Install the latest release for your user (no root needed):
-
-```sh
-(
-  gh auth status --hostname github.com || exit 1
-  tag="$(gh release view --repo github.com/CarsonBurke/cagents --json tagName --jq .tagName)" || exit 1
-  case "$tag" in v*) ;; *) exit 1 ;; esac
-  download_dir="$(mktemp -d)" || exit 1
-  trap 'rm -rf "$download_dir"' 0
-  trap 'exit 1' HUP INT TERM
-  gh release download "$tag" --repo github.com/CarsonBurke/cagents \
-    --pattern install.sh --dir "$download_dir" &&
-    sh "$download_dir/install.sh" --version "${tag#v}"
-)
-```
-
-This runs the installer without checking it first. For a checksum-verified
-install, Debian packages (full and browserless), the portable archive,
-updates, and uninstalling, see [docs/installation.md](docs/installation.md).
+[docs/installation.md](docs/installation.md) has the recommended
+checksum-verified installer, a shorter convenience installer, the full and
+browserless Debian packages, the portable archive, and how to update and
+uninstall. The installer runs as your user and never needs root.
 
 ## Getting started
 
@@ -74,50 +59,22 @@ cagents ui
 
 Add a repository from the **Projects** pane, select a worktree, and press
 `Ctrl+T` for a terminal. Start your agent there, or use **New tab → New
-thread** for a native chat.
+thread** for a native chat. Move between panes with `Alt+Q` and `Alt+W`, and
+resize the focused pane with `Alt+R`. The
+[user guide](docs/user-guide.md#navigation) lists every shortcut.
 
-| Action | Default shortcut |
-| --- | --- |
-| New terminal | `Ctrl+T` |
-| New channel (project-wide chat) | `Alt+G` |
-| Clone focused pane | `Alt+E` |
-| Close focused column | `Ctrl+W` |
-| Search projects | `Ctrl+F` |
-| Previous / next column | `Alt+Q` / `Alt+W` (or `Alt+Left` / `Alt+Right`) |
-| Cycle pane width | `Alt+R` |
-| Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
-| Review: mark viewed, next, previous file | `Alt+V`, `Alt+Down`, `Alt+Up` |
-
-Shortcuts are configurable in Settings or in
-[`settings.toml`](docs/configuration.md#keyboard-shortcuts).
-
-The daemon is also scriptable:
+The daemon is scriptable too:
 
 ```sh
 cagents daemon status
-cagents terminal list
 cagents --json terminal list
 cagents --help
 ```
 
 ## Run from source
 
-You need Rust 1.93, Zig 0.15.2, and the native build dependencies. On Ubuntu
-22.04:
-
-```sh
-sudo apt-get update
-sudo apt-get install --yes --no-install-recommends \
-  build-essential clang cmake git libclang-dev libdbus-1-dev \
-  libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
-  libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
-  libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
-rustup toolchain install 1.93.0 --profile minimal
-rustup default 1.93.0
-```
-
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) (or run
-`mise install`) and put `zig` on `PATH`.
+You need Rust 1.93, Zig 0.15.2, and the native build packages listed in
+[docs/development.md](docs/development.md#prerequisites).
 
 Run the app with the development runner. It builds the matched `cagents`,
 `cagents-ui`, and `cagentsd` executables with separate feature sets and uses an
@@ -139,18 +96,8 @@ scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
 scripts/run-development --browserless --fresh-daemon
 ```
 
-Check the boundary you changed instead of building everything:
-
-```sh
-cargo check --locked --no-default-features --bin cagents                          # CLI
-cargo check --locked --no-default-features --features host --bin cagentsd         # daemon
-cargo check --locked --no-default-features --features ui --bin cagents-ui        # browserless UI
-cargo check --locked --features integrated-browser --bin cagents-ui               # integrated UI
-```
-
-Builds use two compilation jobs by default; set `CARGO_BUILD_JOBS=1` on a
-memory-constrained machine. [docs/development.md](docs/development.md) covers
-the feature boundaries, every runner option, test lanes, resource usage, and
+[docs/development.md](docs/development.md) covers the per-boundary
+`cargo check` commands, every runner option, test lanes, build memory use, and
 troubleshooting.
 
 ## Documentation

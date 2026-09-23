@@ -9,10 +9,10 @@
 - [Troubleshooting](#troubleshooting)
 - [Standalone editor](#standalone-editor)
 
-The short version lives in the README under
-[Run from source](../README.md#run-from-source). This page is the full
-reference. Repository tooling is POSIX shell and Rust; Python is only a native
-build prerequisite of the full Servo dependency graph.
+The README's [Run from source](../README.md#run-from-source) section is the
+quick start; this page is the full reference. Repository tooling is shell
+(POSIX `sh`, plus Bash for the release and benchmark scripts) and Rust; Python
+is only a native build prerequisite of the full Servo dependency graph.
 
 ## Prerequisites
 
@@ -211,7 +211,7 @@ data. It does not signal the host daemon or install anything on the host.
 | --- | --- |
 | `required command not found: zig` | Install Zig 0.15.2 and put it on `PATH` (`mise install` reads `mise.toml`). |
 | The UI talks to an old daemon after you changed daemon, host, or IPC code | Relaunch with `--fresh-daemon`. |
-| `development daemon did not stop within 5 seconds` | Check `$XDG_RUNTIME_DIR/cagents-development/` and retry `--fresh-daemon`. |
+| `development daemon did not stop within 5 seconds` | Look for a lingering development daemon with `pgrep -a cagentsd`, let it exit (or stop that process), then retry `--fresh-daemon`. The socket is `$XDG_RUNTIME_DIR/cagents-development/cagentsd.sock`. |
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and avoid concurrent cold builds; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |

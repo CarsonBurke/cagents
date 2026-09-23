@@ -17,12 +17,13 @@ installation starts the daemon immediately and registers it for
 graphical-login autostart. While the daemon runs, cagents shows a system-tray
 item that opens the UI and can stop the daemon.
 
-Full and browserless production builds share the same daemon socket and
-session store under `$XDG_RUNTIME_DIR/cagents/`. IPC protocol changes
-deliberately keep that namespace, so an incompatible older daemon cannot be
-joined by a second owner; the handshake rejects incompatible clients without
-terminating their PTYs. Upgrade the three companion executables (`cagents`,
-`cagents-ui`, `cagentsd`) together.
+Full and browserless production builds share one daemon socket
+(`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
+deliberately keep that socket namespace, so a newer daemon cannot start as a
+second owner while an incompatible older daemon is still running. The
+handshake rejects incompatible clients without terminating their PTYs.
+Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
+together.
 
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
@@ -35,7 +36,8 @@ Where the daemon keeps its state is listed in
 ## Control CLI
 
 The `cagents` CLI prints human-readable output by default and stable JSON
-envelopes with `--json`:
+envelopes with `--json`. Run `cagents --help`, or `--help` on any subcommand,
+for the complete reference.
 
 ```sh
 cagents daemon status
@@ -46,20 +48,37 @@ cagents daemon stop --require-empty
 cagents daemon stop --confirm
 ```
 
-Run `cagents --help` or `cagents terminal --help` for the complete command set.
+| Command | Purpose |
+| --- | --- |
+| `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
+| `daemon start` | Start the daemon if it is not already running |
+| `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
+| `daemon stop` | Request daemon termination (see below) |
+| `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
+| `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
+| `daemon abandon-upgrade --yes` | Archive an interrupted upgrade checkpoint without resuming it |
+| `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
+| `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
+| `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
+| `channel spawn`, `list`, `close` | Manage the channels every window shares |
 
-- `daemon status` reports `cli_version` and `daemon_version`. The latter is read
-  from the running daemon and is null when no daemon can report its build.
+- `daemon status` reads `daemon_version` from the running daemon; it is null
+  when no daemon can report its build.
 - `daemon stop --require-empty` atomically rejects both established terminals
   and in-flight spawn reservations. `--expected-generation N` additionally
   rejects an inventory that changed since a preflight check.
-- `daemon stop --confirm` requires an interactive terminal, shows the exact
-  session count, and commits a daemon-bound confirmation valid for 60 seconds;
-  inventory changes require a new confirmation.
+- `daemon stop --confirm` terminates the counted hosted sessions. Bare, it
+  shows the exact count and asks you to type `yes`, so it needs an interactive
+  terminal. A script or service passes the capability printed by
+  `cagents daemon preflight` instead: `--confirm "$(cagents daemon preflight)"`.
+  Either way the confirmation is bound to that daemon and inventory and is
+  valid for 60 seconds; inventory changes require a new one.
 - A successful stop means **termination requested**, not that every PTY has
   exited. Plain `daemon stop` without these flags is a force stop.
-- `cagents terminal spawn` without a command starts the default shell described
-  in [Configuration](configuration.md#default-shell).
+- `terminal spawn` without a command starts the default shell described in
+  [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
+- `project close` asks for `--yes` before deleting the channels a project
+  still holds, since closing a project removes them in every window.
 
 ## Compatible upgrades
 
@@ -101,7 +120,7 @@ must still wait for `daemon status` to report stopped. Prefer the installer's
 If identified agents have no exact resume identity, the upgrade is refused and
 every blocker is listed. `daemon prepare-upgrade --yes --relaunch-agents`
 explicitly accepts fresh conversations for those agents; the checkpoint records
-the choice and their cards say **Relaunched after upgrade**. Unrelated shell
+the choice and their panes say **Relaunched after upgrade**. Unrelated shell
 jobs still block the upgrade. The installer accepts
 `--restart-daemon --relaunch-agents` only when the installed CLI can record this
 acceptance.

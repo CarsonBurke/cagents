@@ -22,9 +22,11 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   selecting it again does not create another terminal.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
-  selected worktree or channel.
+  selected worktree or channel. Some settings and shortcut labels call a pane
+  in the strip a **column**, and a few messages call it a **card**; all three
+  mean the same thing.
 - **New terminal** (`Ctrl+T`) starts in the selected worktree and opens directly
-  to the right of the focused column. The **New tab** menu offers **New
+  to the right of the focused pane. The **New tab** menu offers **New
   thread**, **Terminal**, and **Browser** with keyboard navigation; New thread
   opens the model selector.
 - **Clone focused pane** (`Alt+E`) opens another pane of the same kind:
@@ -45,7 +47,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   readable branch basename; tooltips and search keep the full branch name.
   Rows show matching pull requests and their CI status. Unread updates stay
   emphasized until acknowledged, and viewing a waiting agent clears its
-  attention badge. The All, Attention, and Pull requests views keep separate
+  attention badge without changing its activity. The All, Attention, and Pull requests views keep separate
   scroll positions.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
   after one second.
@@ -80,9 +82,9 @@ Every shortcut is configurable; see
 - **Activate panes on hover** is on by default and changes focus without
   scrolling; turn it off in Settings to require a click.
 - Switching worktrees remembers each strip's scroll position and focused
-  column. Hidden terminals release their presentation while their PTYs keep
+  pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree
-  selection, and column focus survive restarts independently in each window.
+  selection, and pane focus survive restarts independently in each window.
 - Closing the application checks unsaved editors in every worktree, not only
   the visible one. Deleted worktrees disappear from the sidebar without moving
   their panes to another worktree.
@@ -102,7 +104,7 @@ request**, and **Details**; the sidebar toggle hides or reveals it.
   their file counts.
 - **Pull request** inspects the worktree's matching PR, grouping description,
   checks, and discussion in collapsible sections.
-- **Details** follows the focused card.
+- **Details** follows the focused pane.
 
 File lists support **Tree** and **Flat** modes, and filters open from their
 search icons. Change rows color their status and line counts and swap them for
@@ -117,8 +119,9 @@ description, branches, and draft setting. If the remote outcome is uncertain,
 the form stays editable but another attempt is blocked until you check GitHub
 and confirm that no pull request was created. A GitHub refresh immediately
 revokes mutation authority: missing CLI, unauthenticated, unassociated, loading,
-failed, and ready-empty are distinct states, and only a matching refresh
-re-enables creation.
+failed, and ready-empty are distinct states. Pull request rows kept from an
+earlier refresh are stale display data, never a target for changes, and only a
+matching refresh re-enables creation.
 
 ## Pull request review
 
@@ -185,7 +188,7 @@ every key are documented in [Configuration](configuration.md).
   overwrites external changes. Turn off **Save files automatically** in Settings
   to save manually.
 - **Wrap long lines** is off by default. Editor and terminal text default to 14
-  logical pixels.
+  logical pixels; a terminal font size you already saved is kept.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
 - Working-tree diffs edit the real file buffer with the same selection, IME,
@@ -193,7 +196,8 @@ every key are documented in [Configuration](configuration.md).
   Staged and historical content are read-only. Syntax highlighting is kept in
   file and diff views.
 - Comparisons load on demand and cancelled jobs stop. Switching files or modes
-  keeps bounded in-memory viewport positions without duplicating buffers.
+  keeps bounded in-memory viewport positions without duplicating buffers or
+  writing every scroll to disk.
 
 ## Native agent chat
 
@@ -201,22 +205,27 @@ Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**,
 and the New tab menu starts a native conversation without a terminal.
 
 The switch uses the provider's exact conversation identity, never terminal-text
-scraping, a most-recent-session lookup, or a fork. A confirmed fresh OMP
-session can switch before it has saved a conversation: cagents waits for the
-replacement's resumable identity before stopping the source. Missing or
-ambiguous identities leave the terminal intact; resume the exact conversation in
-the provider CLI and retry. Managed Codex threads keep their identity across
-native and CLI views automatically.
+scraping, a most-recent-session lookup, or a fork, and there is no
+conversation chooser or ID to copy. A confirmed fresh OMP session can switch
+before it has saved a conversation: cagents waits for the replacement's
+resumable identity before stopping the source. Missing or ambiguous identities
+leave the terminal intact; resume the exact conversation in the provider CLI
+and retry. An unrelated, unmanaged terminal without a proven identity is never
+touched. Managed Codex threads keep their identity across native and CLI views
+automatically.
 
 - **OMP and Claude** use a stop-and-resume handoff: active work is interrupted,
   the CLI stops, and native chat resumes the same conversation. Returning to
   the terminal stops the native writer before resuming the CLI. Unsent drafts,
   attachments, and pending commands block the return so they are not lost.
-  Available history depends on the provider.
+  This is a handoff, not a simultaneous live view: only one side runs at a
+  time, and available history depends on the provider. The original launch
+  recipe and terminal descriptor are kept for the return.
 - **Codex** threads use a cagents-owned local server, so native and CLI views
-  attach to the same thread, even mid-response, and switching keeps drafts and
-  attachments. Existing sessions on a shared Unix socket can also be attached;
-  remote WebSocket endpoints are not supported.
+  attach to the same thread, even mid-response, and switching keeps drafts,
+  attachments, and pending native commands. Existing sessions on a shared Unix
+  socket can also be attached; remote WebSocket endpoints are not supported.
+  cagents never picks a thread by directory or recency.
 
 The handoff keeps the source process's provider account, environment, and trust
 store paths. If credentials or provider settings cannot be transferred safely,
@@ -237,11 +246,13 @@ queued follow-ups, attachments, compaction, and model and thinking selection;
 Claude supports attachments, advertised models and slash commands, compaction
 when advertised, and permission modes; Codex controls depend on the session's
 advertised capabilities, and image attachments need an image-capable model.
+Unsupported controls are not offered, and are never imitated with terminal
+keystrokes.
 Usage and cost come from provider reports.
 
 Chat work keeps running in the background when you switch worktrees or close
 the window. **Stop and close chat** interrupts active work and waits for the
-daemon before removing the card. Disconnects keep the draft and offer
+daemon before removing the pane. Disconnects keep the draft and offer
 **Reconnect to this session**. Transcripts use a private disk-backed cache and
 pageable display windows; use **Load earlier history** and **Jump to latest**
 to navigate. The cache is not a permanent archive or a fixed disk quota:
@@ -253,16 +264,25 @@ the source for resumed history.
 - Ctrl-click an HTTP or HTTPS address in a terminal to open it using the
   configured link behavior.
 - Closing an idle shell needs no confirmation. A running agent, foreground
-  child, background job, or uncertain process state asks first (Close is
-  focused; Cancel or Escape keeps the card). The decision uses the process
-  tree, not prompt instrumentation. **Don't ask me again** turns this off.
+  child, background job, or uncertain process state asks first, with Close
+  focused; Cancel or Escape keeps the pane. The close button and `Ctrl+W`
+  follow the same rule. The decision uses the process tree, not prompt
+  instrumentation, so a shell builtin with no child process closes without
+  asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
+  closing active processes** turns it back on.
+- Every close, confirmed or not, first rechecks the terminal's identity with
+  the daemon. If the daemon is unreachable, the pane is kept.
 - Worktree rows distinguish unread updates from **working** and **waiting**
-  agents, tracked per pane. OMP status comes from its terminal-title lifecycle,
-  Codex from its local shared-daemon API, Claude from `agents --json` for the
-  detected CLI and account, and native chats from provider protocol events.
-  Output volume alone never counts as working.
-- Status queries are bounded, cached, and run outside the terminal input loop;
-  hidden terminals keep running without rendering.
+  agents. Attention is tracked per pane: activating a pane acknowledges only
+  that pane, not every session in the worktree.
+- OMP status comes from its terminal-title lifecycle, Codex from its local
+  shared-daemon API, Claude from `agents --json` for the detected CLI and
+  account, and native chats from provider protocol events. When evidence is
+  unsupported or unavailable, status stays unknown; output volume alone never
+  counts as working.
+- Status queries are bounded, cached, run outside the terminal input loop, and
+  never request snapshots of hidden terminals. Hidden terminals keep running
+  without rendering.
 
 ## Standalone editor (ceditor)
 
@@ -279,8 +299,8 @@ scripts/run-ceditor-development /path/to/project   # isolated development identi
 - Open tabs, their order, and the active tab restore on launch; explicit paths
   are also opened, and a new session with no paths browses the current
   directory.
-- **Ctrl+T** or the plus control creates an untitled note in a scratch folder;
-  **Ctrl+S** then chooses where it lives.
+- **Ctrl+T** or the plus control creates an untitled note in a scratch folder
+  next to the editor settings; **Ctrl+S** then chooses where it lives.
 - Its settings, including file-list mode, are stored separately from cagents.
 - Right-click a file to rename, duplicate, or copy its absolute or relative
   path. Rename and duplicate never overwrite an existing file. Unsaved changes

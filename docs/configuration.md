@@ -2,9 +2,13 @@
 
 - [Files and directories](#files-and-directories)
 - [Settings file](#settings-file)
+- [Settings keys](#settings-keys)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Terminal themes](#terminal-themes)
 - [Language servers](#language-servers)
+- [Upgrading older settings files](#upgrading-older-settings-files)
+- [Migrating from settings.json](#migrating-from-settingsjson)
+- [File safety](#file-safety)
 - [Default shell](#default-shell)
 
 Most preferences are edited from **Settings** (the gear in the lower-left
@@ -46,10 +50,11 @@ app starts. That session then runs on defaults and does not write the file, so
 your file is not overwritten. To replace a broken file from the app, use
 **Reset all settings**.
 
-The file is read at startup. A save writes only the fields that window changed
-since its last save. As a result, several windows can share the file, and
-edits you make by hand while the app runs are kept, but they take effect only
-after a restart.
+Each window reads the file when it opens. A save re-reads the file and writes
+only the fields that window changed since its last save, so several windows can
+share the file and edits you make by hand while the app runs are kept. Running
+windows do not pick up hand edits; windows opened afterwards do. If a hand edit
+leaves the file invalid, saves from running windows fail until it is fixed.
 
 ### Example
 
@@ -108,7 +113,7 @@ TOML does not allow a top-level key after a table header. Put every plain
 `key = value` line, including `language_servers = []`, before
 `[keyboard_shortcuts]` or any other `[table]` or `[[array]]` header.
 
-### Keys
+## Settings keys
 
 Floating-point ranges include both ends. NaN and infinity are rejected.
 
@@ -146,7 +151,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 
-### Keyboard shortcuts
+## Keyboard shortcuts
 
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
@@ -155,7 +160,7 @@ modifiers, joined by `+`. Names are case-insensitive.
   Each chord needs `Ctrl`, `Alt`, or `Super`. `Shift` is optional.
 - Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, or `Tab`.
 - No chord can appear twice, even under different actions.
-- A chord you bind here is not passed to the program running in a card.
+- A chord you bind here is not passed to the program running in a pane.
   For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
   cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
   be bound.
@@ -165,7 +170,7 @@ modifiers, joined by `+`. Names are case-insensitive.
   and the three `review_*` actions) can be empty lists (`[]`), which leaves
   them unbound.
 
-### Terminal themes
+## Terminal themes
 
 There are 25 dark and light terminal presets. The values are `"dark"`,
 `"light"`, `"solarized_dark"`, `"solarized_light"`, `"dracula"`,
@@ -209,7 +214,7 @@ ansi = [
 ]
 ```
 
-### Language servers
+## Language servers
 
 `language_servers` lists external Language Server Protocol (LSP) servers for
 the native editor. If the key is missing, cagents uses this built-in list. If
@@ -260,7 +265,7 @@ extensions = ["rs"]
 `[keyboard_shortcuts]`. The inline `language_servers = []` must come before
 every table header.
 
-### Upgrading older files
+## Upgrading older settings files
 
 cagents upgrades version 1 and version 2 files when it loads them. It writes
 them back as version 3 the next time it saves.
@@ -293,7 +298,7 @@ and disk-write failures stay on screen as errors. Your existing preferences,
 such as an `"application"` cursor, are kept and are not replaced by newer
 defaults.
 
-### Migrating from settings.json
+## Migrating from settings.json
 
 cagents migrates a `settings.json` in the same directory only when
 `settings.toml` does not exist. The JSON file must use schema version 1. Every
@@ -303,7 +308,7 @@ deletion fails, the JSON file stays and is ignored. An existing TOML file
 always takes precedence. If the TOML file is malformed, cagents reports the
 error and does not fall back to the JSON file.
 
-### File safety
+## File safety
 
 - cagents sets the configuration directory to mode `0700` and the settings file
   to mode `0600`.
@@ -313,9 +318,9 @@ error and does not fall back to the JSON file.
 - A `settings.toml.lock` file keeps separate windows from saving at the same
   time.
 
-### Default shell
+## Default shell
 
-New terminal cards use a default shell. So does `cagents terminal spawn` when
+New terminal panes use a default shell. So does `cagents terminal spawn` when
 you give it no command. cagents tries these in order and uses the first one
 that is an absolute path to an executable file:
 

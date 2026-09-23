@@ -498,7 +498,7 @@ fn settings_category_controls<'a>(
                 ),
                 setting_input(
                     "Cycle pane width",
-                    "Cycles the active pane through 1/3, 2/3, 1/2, and full viewport width; may repeat while held.",
+                    "Cycles the active pane through 1/3, 1/2, 2/3, and full viewport width; may repeat while held.",
                     &draft.keyboard_shortcuts.cycle_pane_width,
                     SettingsField::ShortcutCyclePaneWidth,
                 ),
