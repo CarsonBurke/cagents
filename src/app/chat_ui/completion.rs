@@ -65,11 +65,17 @@ impl Token {
             return None;
         }
         // The word runs on past the caret as far as the name does, so a comma
-        // or a closing parenthesis after it stays where it is.
+        // or a closing parenthesis after it stays where it is. A sigil typed
+        // just ahead of a word names something of its own, and the word it
+        // was typed against stays.
         let after = &line[caret.column..];
-        let rest = after
-            .find(|character: char| !is_name_character(character))
-            .unwrap_or(after.len());
+        let rest = if query.is_empty() {
+            0
+        } else {
+            after
+                .find(|character: char| !is_name_character(character))
+                .unwrap_or(after.len())
+        };
         if after[rest..].starts_with(sigils) {
             return None;
         }
@@ -222,9 +228,10 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
 /// Puts `insertion` over `token` as one edit and leaves the caret after it,
 /// ready for the rest of the sentence.
 ///
-/// At the end of a line a space follows the name, so the reader can go on
-/// writing. Mid-sentence the caret steps over the space already there rather
-/// than doubling it, and punctuation right after the word stays against it.
+/// A space follows the name, so the reader can go on writing and a word the
+/// sigil was typed against is not run into it. Mid-sentence the caret steps
+/// over the space already there rather than doubling it, and punctuation
+/// right after the word stays against it.
 pub(super) fn apply(
     composer: &mut text_editor::Content<cosmic::Renderer>,
     token: &Token,
@@ -234,8 +241,8 @@ pub(super) fn apply(
         .line(token.line)
         .and_then(|line| line.text.get(token.end..)?.chars().next());
     let text = match next {
-        None => format!("{insertion} "),
-        Some(_) => insertion.to_owned(),
+        Some(next) if !is_name_character(next) => insertion.to_owned(),
+        _ => format!("{insertion} "),
     };
     composer.move_to(token.selection());
     composer.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
@@ -594,6 +601,11 @@ mod tests {
         assert_eq!(
             apply_at("try /comm|its, then", "/commits"),
             ("try /commits, then".into(), caret(0, 12))
+        );
+        // A slash typed against a word leaves the word to follow the name.
+        assert_eq!(
+            apply_at("/|please look", "/review"),
+            ("/review please look".into(), caret(0, 8))
         );
 
         // A second skill after the first leaves the first where it was.
