@@ -6,13 +6,13 @@ use super::{Adapter, ProcessSpec, Step};
 use crate::agent::Provider;
 use crate::chat::{
     Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction, Event,
-    Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SlashCommand,
+    Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, Skill, SlashCommand,
     ToolStatus, Usage, clock_label,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -283,6 +283,16 @@ struct Claude {
     cache_write_tokens: u64,
     reasoning: Option<String>,
     commands: Vec<SlashCommand>,
+    /// The commands Claude Code marks as its own, which before the session's
+    /// first turn is all that tells a command from a skill; `None` when its
+    /// list marks none, as a version without the mark sends it.
+    builtin: Option<HashSet<String>>,
+    /// The skills the session reported when it began its latest turn, `None`
+    /// until it has.
+    skills: Option<HashSet<String>>,
+    /// Every command listed when `skills` was reported, which it rules on;
+    /// one listed since is told apart by the mark alone.
+    reported: HashSet<String>,
     usage: Usage,
     history: Option<History>,
 }
@@ -562,25 +572,51 @@ impl Claude {
                 .collect();
         }
         if let Some(commands) = data["commands"].as_array() {
+            let mut builtin = HashSet::new();
+            let mut marked = false;
             self.commands = commands
                 .iter()
                 .filter_map(|c| {
+                    let name: String = c["name"].as_str()?.trim_start_matches('/').into();
+                    marked |= c.get("builtin").is_some();
+                    if c["builtin"].as_bool() == Some(true) {
+                        builtin.insert(name.clone());
+                    }
                     Some(SlashCommand {
-                        name: c["name"].as_str()?.trim_start_matches('/').into(),
+                        name,
                         description: string(c, "description").into(),
                     })
                 })
                 .collect();
+            self.builtin = marked.then_some(builtin);
         } else if let Some(commands) = data["slash_commands"].as_array() {
+            // The turn's own list names the commands without describing
+            // them, so a description the session already gave is kept.
+            let described = std::mem::take(&mut self.commands);
             self.commands = commands
                 .iter()
                 .filter_map(|c| {
-                    c.as_str().map(|s| SlashCommand {
-                        name: s.trim_start_matches('/').into(),
-                        description: String::new(),
+                    let name = c.as_str()?.trim_start_matches('/');
+                    Some(SlashCommand {
+                        name: name.into(),
+                        description: described
+                            .iter()
+                            .find(|known| known.name == name)
+                            .map(|known| known.description.clone())
+                            .unwrap_or_default(),
                     })
                 })
                 .collect();
+        }
+        if let Some(skills) = data["skills"].as_array() {
+            self.skills = Some(
+                skills
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|name| name.trim_start_matches('/').to_owned())
+                    .collect(),
+            );
+            self.reported = self.commands.iter().map(|c| c.name.clone()).collect();
         }
         let terminal = data["terminal_slash_commands"].as_array();
         self.commands.retain(|c| {
@@ -598,9 +634,47 @@ impl Claude {
                 selected: self.selected.clone(),
                 reasoning: self.reasoning.clone(),
             },
-            Event::Commands(self.commands.clone()),
+            Event::Commands(
+                self.commands
+                    .iter()
+                    .filter(|c| !self.is_skill(&c.name))
+                    .cloned()
+                    .collect(),
+            ),
+            Event::Skills(
+                self.commands
+                    .iter()
+                    .filter(|c| self.is_skill(&c.name))
+                    .map(|c| Skill {
+                        name: c.name.clone(),
+                        description: c.description.clone(),
+                        invocation: format!("/{}", c.name),
+                    })
+                    .collect(),
+            ),
             Event::Capabilities(self.capabilities()),
         ]);
+    }
+    /// Whether a listed command is a skill: a prompt the model can be pointed
+    /// at from anywhere in a message, which Claude Code runs through its Skill
+    /// tool, rather than a command it only runs as the whole of one.
+    ///
+    /// Claude Code lists skills among its slash commands, and names them
+    /// apart only when a turn begins; what the latest turn said of a command
+    /// it listed is final. Anything else is judged by Claude Code's mark:
+    /// what it does not mark as its own - the user's, the project's, and
+    /// plugins' - is taken for a skill, including one added mid-session, and
+    /// its own are commands, as are an MCP server's prompts. A list without
+    /// the mark tells nothing, so such a command stays a command, which is
+    /// only ever offered where Claude Code acts on it.
+    fn is_skill(&self, name: &str) -> bool {
+        match &self.skills {
+            Some(skills) if self.reported.contains(name) => skills.contains(name),
+            _ => self
+                .builtin
+                .as_ref()
+                .is_some_and(|builtin| !builtin.contains(name) && !name.starts_with("mcp__")),
+        }
     }
     fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let carrier = required(frame, "uuid")?;
@@ -3593,6 +3667,151 @@ mod tests {
         assert!(
             quiet.events.is_empty() && quiet.writes.is_empty(),
             "an auxiliary frame is not transcript data: {quiet:?}"
+        );
+    }
+
+    /// A list that does not mark Claude Code's own commands cannot tell
+    /// `/clear` from a skill, so nothing is taken for one until a turn says.
+    #[test]
+    fn an_unmarked_command_list_offers_no_skills_until_a_turn_names_them() {
+        let mut adapter = Claude::default();
+        let initialize = adapter.initialize().unwrap();
+        let id = initialize.writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let connected = adapter
+            .receive(reply(
+                &id,
+                json!({"commands":[
+                    {"name":"alpha","description":"Alpha","argumentHint":""},
+                    {"name":"clear","description":"Clear","argumentHint":""},
+                ]}),
+            ))
+            .unwrap();
+        assert!(connected.events.iter().any(|event| matches!(
+            event,
+            Event::Skills(skills) if skills.is_empty()
+        )));
+        let began = adapter
+            .receive(json!({"type":"system","subtype":"init","uuid":"i",
+                "slash_commands":["alpha","clear"],"skills":["alpha"]}))
+            .unwrap();
+        assert!(began.events.iter().any(|event| matches!(
+            event,
+            Event::Skills(skills) if skills.len() == 1 && skills[0].name == "alpha"
+        )));
+    }
+
+    /// Claude Code lists its skills among its slash commands. The composer
+    /// offers a skill anywhere in a message and a command only as the whole
+    /// of one, so the two are told apart: by Claude Code's own mark before
+    /// the first turn, then by the skills the turn reports, keeping each
+    /// description when the turn's list names the commands bare.
+    #[test]
+    fn skills_are_told_apart_from_the_commands_they_are_listed_with() {
+        fn listed(step: &Step) -> (Vec<String>, Vec<(String, String, String)>) {
+            let mut commands = None;
+            let mut skills = None;
+            for event in &step.events {
+                match event {
+                    Event::Commands(listed) => {
+                        commands = Some(listed.iter().map(|c| c.name.clone()).collect())
+                    }
+                    Event::Skills(listed) => {
+                        skills = Some(
+                            listed
+                                .iter()
+                                .map(|s| {
+                                    (s.name.clone(), s.description.clone(), s.invocation.clone())
+                                })
+                                .collect(),
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            (commands.expect("commands"), skills.expect("skills"))
+        }
+        let mut adapter = Claude::default();
+        let initialize = adapter.initialize().unwrap();
+        let id = initialize.writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let connected = adapter
+            .receive(reply(
+                &id,
+                json!({"commands":[
+                    {"name":"alpha","description":"Alpha (user)","argumentHint":""},
+                    {"name":"simplify","description":"Tidy","argumentHint":"","builtin":true},
+                    {"name":"compact","description":"Compact","argumentHint":"","builtin":true},
+                    {"name":"mcp__docs__search","description":"Search","argumentHint":""},
+                ]}),
+            ))
+            .unwrap();
+        assert_eq!(
+            listed(&connected),
+            (
+                vec![
+                    "simplify".to_owned(),
+                    "compact".to_owned(),
+                    "mcp__docs__search".to_owned()
+                ],
+                vec![("alpha".into(), "Alpha (user)".into(), "/alpha".into())]
+            )
+        );
+        let began = adapter
+            .receive(json!({"type":"system","subtype":"init","uuid":"i",
+                "slash_commands":["alpha","simplify","compact","local","mcp__docs__search"],
+                "skills":["alpha","simplify"]}))
+            .unwrap();
+        assert_eq!(
+            listed(&began),
+            (
+                vec![
+                    "compact".to_owned(),
+                    "local".to_owned(),
+                    "mcp__docs__search".to_owned()
+                ],
+                vec![
+                    ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
+                    ("simplify".into(), "Tidy".into(), "/simplify".into()),
+                ]
+            )
+        );
+        // A skill added mid-session is one as soon as it is listed, before
+        // any turn names it; what the turn said of the rest still holds.
+        let changed = adapter
+            .receive(
+                json!({"type":"system","subtype":"commands_changed","uuid":"c",
+                "commands":[
+                    {"name":"alpha","description":"Alpha (user)","argumentHint":""},
+                    {"name":"gamma","description":"Gamma (project)","argumentHint":""},
+                    {"name":"local","description":"Local","argumentHint":""},
+                    {"name":"simplify","description":"Tidy","argumentHint":"","builtin":true},
+                    {"name":"compact","description":"Compact","argumentHint":"","builtin":true},
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(
+            listed(&changed),
+            (
+                vec!["local".to_owned(), "compact".to_owned()],
+                vec![
+                    ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
+                    ("gamma".into(), "Gamma (project)".into(), "/gamma".into()),
+                    ("simplify".into(), "Tidy".into(), "/simplify".into()),
+                ]
+            )
+        );
+        // A skill at the head of a message still dispatches as one.
+        assert!(
+            adapter
+                .command(Command::Slash {
+                    command: "/alpha now".into()
+                })
+                .is_ok()
         );
     }
 }

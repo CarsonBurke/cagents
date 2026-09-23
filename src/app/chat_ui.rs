@@ -12,6 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod completion;
 mod scroll;
 mod step;
 mod tool_text;
@@ -151,10 +152,14 @@ pub enum Action {
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
-    Slash(Target, String),
-    /// Names a provider skill in the draft rather than dispatching a command,
-    /// because that is how a skill is invoked.
-    Mention(Target, String),
+    /// Puts a completion row's text over the word being completed.
+    Complete(Target, String),
+    /// Moves the completion highlight down, or up when `false`.
+    CompletionMove(Target, bool),
+    /// Sends the completion list away until the reader types again.
+    CompletionDismiss(Target),
+    /// Where the completion list has been scrolled to.
+    CompletionScrolled(Target, f32),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
@@ -225,8 +230,7 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
-            | Self::Slash(target, _)
-            | Self::Mention(target, _)
+            | Self::Complete(target, _)
             | Self::Scrolled(target, _)
             | Self::ModelPicker(target, _)
             | Self::ModelQuery(target, _) => Some(*target),
@@ -1120,55 +1124,42 @@ pub(super) struct Runtime {
     later_asked: Option<f32>,
     /// The model search's query while its popup is open, `None` when closed.
     model_picker: Option<String>,
+    /// The composer's completion list.
+    completion: completion::State,
 }
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
 pub(super) const COMPACT_COMMAND: &str = "compact";
 
-/// What a draft beginning with `/` asks for.
+/// What a draft beginning with `/` asks for, when it is not a message.
 enum SlashInvocation {
     /// One of the provider's own commands, sent through its dispatcher.
     Command(String),
     /// Compaction, offered as a command wherever the provider can do it.
     Compact,
-    /// A skill, as the message the provider invokes it with: `/review src`
-    /// becomes `$review src` for Codex and stays as it is for a provider whose
-    /// skills are slash commands.
-    Skill(String),
 }
 
-/// Resolves a draft's leading `/name` against what the provider offers.
+/// Resolves a draft's leading `/name` against the provider's commands.
 ///
-/// Names match without regard to case and to the `/` or `$` the provider
-/// prefixes its own form with, because a reader completing from the picker
-/// and a reader typing from memory should reach the same skill.
+/// Names match without regard to case and to the `/` the provider prefixes
+/// its own form with, because a reader completing from the picker and a
+/// reader typing from memory should reach the same command. A skill is not a
+/// command: it is named inside a message, so a draft opening with one is sent
+/// as a message, with the skills in it spelled by [`completion::invocations`].
 fn slash_invocation(draft: &str, snapshot: &Snapshot) -> Option<SlashInvocation> {
     let draft = draft.trim();
-    let rest = draft.strip_prefix('/')?;
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let (name, arguments) = (&rest[..end], rest[end..].trim_start());
+    let rest = draft.strip_prefix(completion::COMMAND_SIGIL)?;
+    let name = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
     if name.is_empty() {
         return None;
     }
-    fn bare(candidate: &str) -> &str {
-        candidate.trim_start_matches(['/', '$'])
-    }
-    if snapshot
-        .commands
-        .iter()
-        .any(|command| bare(&command.name).eq_ignore_ascii_case(name))
-    {
-        return Some(SlashInvocation::Command(draft.to_owned()));
-    }
-    if let Some(skill) = snapshot.skills.iter().find(|skill| {
-        skill.name.eq_ignore_ascii_case(name) || bare(&skill.invocation).eq_ignore_ascii_case(name)
+    if snapshot.commands.iter().any(|command| {
+        command
+            .name
+            .trim_start_matches(completion::COMMAND_SIGIL)
+            .eq_ignore_ascii_case(name)
     }) {
-        let mut text = skill.invocation.clone();
-        if !arguments.is_empty() {
-            text.push(' ');
-            text.push_str(arguments);
-        }
-        return Some(SlashInvocation::Skill(text));
+        return Some(SlashInvocation::Command(draft.to_owned()));
     }
     if name.eq_ignore_ascii_case(COMPACT_COMMAND) && snapshot.capabilities.compact {
         return Some(SlashInvocation::Compact);
@@ -1176,7 +1167,83 @@ fn slash_invocation(draft: &str, snapshot: &Snapshot) -> Option<SlashInvocation>
     None
 }
 
+/// What the composer sends for `text`, or why it will not.
+fn submission(
+    text: &str,
+    snapshot: &Snapshot,
+    attachments: &[Attachment],
+    mode: PromptMode,
+) -> Result<Command, &'static str> {
+    match (mode, slash_invocation(text, snapshot)) {
+        (PromptMode::Send, Some(SlashInvocation::Command(_))) if !attachments.is_empty() => {
+            Err("Send attachments with a message, not a slash command.")
+        }
+        (PromptMode::Send, Some(SlashInvocation::Command(command))) => {
+            Ok(Command::Slash { command })
+        }
+        (PromptMode::Send, Some(SlashInvocation::Compact)) if !attachments.is_empty() => {
+            Err("Send attachments with a message, not a compaction.")
+        }
+        (PromptMode::Send, Some(SlashInvocation::Compact)) => Ok(Command::Compact),
+        // A skill is asked for the way the provider asks for it, whatever the
+        // reader typed: the slash form is the composer's, the invocation is
+        // the provider's.
+        _ => Ok(Command::Prompt {
+            text: completion::invocations(text, &snapshot.skills).into_owned(),
+            attachments: attachments.to_vec(),
+            mode,
+        }),
+    }
+}
+
 impl Runtime {
+    /// The word the caret is naming something with and the rows offered for
+    /// it, or `None` while there is nothing to offer.
+    fn completion(&self) -> Option<(completion::Token, Vec<completion::Candidate<'_>>)> {
+        let caret = self.composer.cursor();
+        // A selection is text the reader is about to act on, not a word they
+        // are still spelling.
+        if caret.selection.is_some() {
+            return None;
+        }
+        let line = self.composer.line(caret.position.line)?;
+        let mut token = completion::Token::at(
+            &line.text,
+            caret.position,
+            &completion::sigils(&self.snapshot),
+            || {
+                (0..caret.position.line).all(|earlier| {
+                    self.composer
+                        .line(earlier)
+                        .is_some_and(|line| line.text.trim().is_empty())
+                })
+            },
+        )?;
+        if self.completion.dismissed == Some((token.line, token.start)) {
+            return None;
+        }
+        let rows = completion::candidates(&self.snapshot, &token);
+        token.fit(&rows);
+        (!rows.is_empty()).then_some((token, rows))
+    }
+
+    /// Puts `insertion` over the word being completed when it is one of the
+    /// rows offered for that word, leaving the rest of the draft as it was.
+    fn complete(&mut self, insertion: &str) -> bool {
+        let Some(token) = self.completion().and_then(|(token, rows)| {
+            rows.iter()
+                .any(|row| row.insertion == insertion)
+                .then_some(token)
+        }) else {
+            return false;
+        };
+        completion::apply(&mut self.composer, &token, insertion);
+        self.completion = completion::State::default();
+        self.revision = self.revision.wrapping_add(1);
+        self.history_cursor = None;
+        true
+    }
+
     /// Adds files to the next message, each at most once.
     fn attach(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         let before = self.attachments.len();
@@ -1228,7 +1295,14 @@ impl Runtime {
             None => std::mem::take(&mut self.history_stash),
         };
         self.history_cursor = next;
-        self.composer = text_editor::Content::with_text(text.trim_end_matches('\n'));
+        self.replace_draft(text_editor::Content::with_text(text.trim_end_matches('\n')));
+    }
+
+    /// Puts a whole new draft in the composer. Whatever the completion list
+    /// was doing belonged to the old one.
+    fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+        self.composer = composer;
+        self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -1273,6 +1347,7 @@ impl Runtime {
             earlier_asked: None,
             later_asked: None,
             model_picker: None,
+            completion: completion::State::default(),
         };
         runtime.refresh();
         runtime
@@ -1347,8 +1422,7 @@ impl Runtime {
             && self.composer.text().trim().is_empty()
             && let Some(text) = &snapshot.composer
         {
-            self.composer = text_editor::Content::with_text(text);
-            self.revision = self.revision.wrapping_add(1);
+            self.replace_draft(text_editor::Content::with_text(text));
         }
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
@@ -1494,23 +1568,6 @@ pub(super) fn chat_card_title(provider: Provider) -> &'static str {
         Provider::Claude => "Claude chat",
         Provider::Codex => "Codex chat",
     }
-}
-
-/// The draft with the word being typed replaced by `invocation`.
-///
-/// A skill is named inside a message rather than instead of one, so the text
-/// already written stays and a trailing space follows the name, ready for the
-/// rest of the sentence.
-fn mention_replaced(draft: &str, invocation: &str) -> String {
-    // The split has to land on a character boundary: a no-break space pasted
-    // in with a quotation is whitespace more than one byte wide, and a byte
-    // offset taken from it would slice inside the character.
-    let kept = draft
-        .char_indices()
-        .rev()
-        .find(|(_, character)| character.is_whitespace())
-        .map_or(0, |(index, character)| index + character.len_utf8());
-    format!("{}{invocation} ", &draft[..kept])
 }
 
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
@@ -2832,8 +2889,7 @@ impl Cagents {
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
                                 && !draft.is_empty()
                             {
-                                runtime.composer = text_editor::Content::with_text(&draft);
-                                runtime.revision = runtime.revision.wrapping_add(1);
+                                runtime.replace_draft(text_editor::Content::with_text(&draft));
                             }
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
@@ -3123,7 +3179,14 @@ impl Cagents {
                         // so the next Up starts again from the newest.
                         runtime.history_cursor = None;
                     }
+                    // The completion rows follow the word at the caret, so
+                    // anything that can change that word starts them afresh.
+                    let rescroll = !matches!(action, text_editor::Action::Scroll { .. })
+                        && runtime.completion.restart(action.is_edit());
                     runtime.composer.perform(action);
+                    if rescroll {
+                        return view::completion_scroll(target, 0.0);
+                    }
                 }
             }
             Action::AppendProviderDraft(target) => {
@@ -3134,8 +3197,7 @@ impl Cagents {
                             text.push('\n');
                         }
                         text.push_str(provided);
-                        runtime.composer = text_editor::Content::with_text(&text);
-                        runtime.revision = runtime.revision.wrapping_add(1);
+                        runtime.replace_draft(text_editor::Content::with_text(&text));
                     }
                 }
             }
@@ -3153,37 +3215,13 @@ impl Cagents {
                     return Task::none();
                 }
                 let text = runtime.composer.text();
-                let command = match (mode, slash_invocation(&text, &runtime.snapshot)) {
-                    (PromptMode::Send, Some(SlashInvocation::Command(command))) => {
-                        if !runtime.attachments.is_empty() {
-                            runtime.error = Some(
-                                "Send attachments with a message, not a slash command.".into(),
-                            );
-                            return Task::none();
-                        }
-                        Command::Slash { command }
+                let command = match submission(&text, &runtime.snapshot, &runtime.attachments, mode)
+                {
+                    Ok(command) => command,
+                    Err(refusal) => {
+                        runtime.error = Some(refusal.into());
+                        return Task::none();
                     }
-                    (PromptMode::Send, Some(SlashInvocation::Compact)) => {
-                        if !runtime.attachments.is_empty() {
-                            runtime.error =
-                                Some("Send attachments with a message, not a compaction.".into());
-                            return Task::none();
-                        }
-                        Command::Compact
-                    }
-                    // A skill is asked for the way the provider asks for it,
-                    // whatever the reader typed: the slash form is the
-                    // composer's, the invocation is the provider's.
-                    (_, Some(SlashInvocation::Skill(text))) => Command::Prompt {
-                        text,
-                        attachments: runtime.attachments.clone(),
-                        mode,
-                    },
-                    _ => Command::Prompt {
-                        text,
-                        attachments: runtime.attachments.clone(),
-                        mode,
-                    },
                 };
                 return self.chat_send(target, command, true);
             }
@@ -3216,9 +3254,8 @@ impl Cagents {
                             runtime.permission_mode = Some(mode);
                         }
                         if pending.draft_revision == Some(runtime.revision) {
-                            runtime.composer = text_editor::Content::new();
+                            runtime.replace_draft(text_editor::Content::new());
                             runtime.attachments.clear();
-                            runtime.revision = runtime.revision.wrapping_add(1);
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -3561,45 +3598,44 @@ impl Cagents {
                     false,
                 );
             }
-            Action::Slash(target, name) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if runtime
-                        .snapshot
-                        .commands
-                        .iter()
-                        .any(|command| command.name == name)
-                        || (name.trim_start_matches('/') == COMPACT_COMMAND
-                            && runtime.snapshot.capabilities.compact)
-                    {
-                        runtime.composer = text_editor::Content::with_text(&format!(
-                            "/{} ",
-                            name.trim_start_matches('/')
-                        ));
-                        runtime.revision = runtime.revision.wrapping_add(1);
-                    }
-                }
-            }
-            Action::Mention(target, invocation) => {
+            Action::Complete(target, insertion) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                // The picker names a skill in the composer's slash form, and
-                // the provider's own invocation is accepted as well, because
-                // a reader who knows it can type it.
-                if !runtime.snapshot.skills.iter().any(|skill| {
-                    skill.invocation == invocation
-                        || invocation
-                            .strip_prefix('/')
-                            .is_some_and(|name| skill.name.eq_ignore_ascii_case(name))
-                }) {
+                if !runtime.complete(&insertion) {
                     return Task::none();
                 }
-                // A skill is named inside a message rather than instead of
-                // one, so only the word the reader was typing is replaced and
-                // whatever they had already written stays.
-                let draft = mention_replaced(&runtime.composer.text(), &invocation);
-                runtime.composer = text_editor::Content::with_text(&draft);
-                runtime.revision = runtime.revision.wrapping_add(1);
+                // A row chosen with the pointer took the keyboard from the
+                // draft, and the reader is mid-sentence.
+                return iced::widget::operation::focus(card_control_id(
+                    target.card,
+                    "chat-composer",
+                ))
+                .map(cosmic::Action::App);
+            }
+            Action::CompletionMove(target, down) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(count) = runtime.completion().map(|(_, rows)| rows.len()) else {
+                    return Task::none();
+                };
+                let (row, viewport) = view::completion_extent(count);
+                if let Some(offset) = runtime.completion.step(down, count, row, viewport) {
+                    return view::completion_scroll(target, offset);
+                }
+            }
+            Action::CompletionDismiss(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.completion.dismissed = runtime
+                        .completion()
+                        .map(|(token, _)| (token.line, token.start));
+                }
+            }
+            Action::CompletionScrolled(target, offset) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.completion.offset = offset;
+                }
             }
             Action::HandoffFinished(target, result) => {
                 if self.chat_runtime_mut(target).is_none() {
@@ -5112,6 +5148,85 @@ mod tests {
         );
     }
 
+    /// A message naming several skills goes out as one message, each skill
+    /// in the provider's own spelling; only a draft that is a command as a
+    /// whole is dispatched as one.
+    #[test]
+    fn a_message_naming_several_skills_is_sent_as_one_message() {
+        let skill = |name: &str, sigil: char| chat::Skill {
+            name: name.into(),
+            description: String::new(),
+            invocation: format!("{sigil}{name}"),
+        };
+        let prompt = |command: Command| match command {
+            Command::Prompt { text, .. } => text,
+            other => panic!("sent as {other:?}, not a message"),
+        };
+        let codex = Snapshot {
+            skills: vec![skill("commits", '$'), skill("pr-review", '$')],
+            capabilities: chat::Capabilities {
+                compact: true,
+                ..chat::Capabilities::default()
+            },
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            prompt(
+                submission(
+                    "/commits the fix, then /pr-review it",
+                    &codex,
+                    &[],
+                    PromptMode::Send
+                )
+                .unwrap()
+            ),
+            "$commits the fix, then $pr-review it"
+        );
+        assert!(matches!(
+            submission("/compact", &codex, &[], PromptMode::Send),
+            Ok(Command::Compact)
+        ));
+
+        let claude = Snapshot {
+            commands: vec![chat::SlashCommand {
+                name: "clear".into(),
+                description: String::new(),
+            }],
+            skills: vec![skill("alpha", '/'), skill("beta", '/')],
+            ..Snapshot::default()
+        };
+        let attachment = [Attachment {
+            path: "shot.png".into(),
+        }];
+        assert_eq!(
+            prompt(
+                submission(
+                    "/alpha this, and /beta that",
+                    &claude,
+                    &attachment,
+                    PromptMode::Send
+                )
+                .unwrap()
+            ),
+            "/alpha this, and /beta that"
+        );
+        // A skill alone is a message Claude Code expands, not a command.
+        assert_eq!(
+            prompt(submission("/alpha", &claude, &[], PromptMode::Send).unwrap()),
+            "/alpha"
+        );
+        assert!(matches!(
+            submission("/clear", &claude, &[], PromptMode::Send),
+            Ok(Command::Slash { command }) if command == "/clear"
+        ));
+        assert!(submission("/clear", &claude, &attachment, PromptMode::Send).is_err());
+        // Steering carries words to a running turn, never a command.
+        assert_eq!(
+            prompt(submission("/clear", &claude, &[], PromptMode::Steer).unwrap()),
+            "/clear"
+        );
+    }
+
     #[test]
     fn switching_a_terminal_never_opens_a_conversation_chooser() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -5135,27 +5250,6 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::Switch(id)));
     }
 
-    /// Picking a skill replaces the word being typed and nothing else, for any
-    /// text a reader can put in the composer. A byte offset taken from the last
-    /// whitespace character would slice inside a no-break space and panic the
-    /// whole window.
-    #[test]
-    fn choosing_a_skill_replaces_only_the_word_being_typed() {
-        assert_eq!(mention_replaced("", "$commits"), "$commits ");
-        assert_eq!(mention_replaced("/comm", "$commits"), "$commits ");
-        assert_eq!(
-            mention_replaced("please run /comm", "$commits"),
-            "please run $commits "
-        );
-        assert_eq!(
-            mention_replaced("quoted\u{a0}/comm", "$commits"),
-            "quoted\u{a0}$commits "
-        );
-        assert_eq!(
-            mention_replaced("first line\n/comm", "$commits"),
-            "first line\n$commits "
-        );
-    }
     /// A message that arrives byte by byte must present exactly as one that
     /// arrived whole. The incremental fence scan is the only difference, and a
     /// mistake in it would show the wrong code behind a copy control rather
