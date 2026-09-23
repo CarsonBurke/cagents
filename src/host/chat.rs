@@ -771,23 +771,23 @@ fn start(
         // never the durable session. Explicit selected configuration takes
         // precedence over daemon defaults, and the recipe's own environment
         // takes precedence over both.
-        let mut environment =
-            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false);
-        for (name, value) in execution_environment.0 {
-            if !crate::model::agent_recovery::fresh_environment_key(
+        if execution_environment.0.iter().any(|(name, value)| {
+            !crate::model::agent_recovery::fresh_environment_key(
                 session.launch.provider,
-                &name,
-                &value,
+                name,
+                value,
                 false,
-            ) {
-                return Err(error(
-                    "Native execution environment contains an unrelated or private variable",
-                ));
-            }
-            environment.insert(name, value);
+            )
+        }) {
+            return Err(error(
+                "Native execution environment contains an unrelated or private variable",
+            ));
         }
-        environment.extend(std::mem::take(&mut spec.environment));
-        spec.environment = environment;
+        spec.environment = sourceless_environment(
+            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false),
+            execution_environment.0,
+            std::mem::take(&mut spec.environment),
+        );
     }
     if let Some(environment) = &source_execution {
         spec.environment = environment.clone();
@@ -1691,18 +1691,49 @@ fn restore_selection(
     }
 }
 
-pub(super) fn validate_upgrade_environment(
-    session: &Session,
+/// The environment a conversation started without a proven source runs with:
+/// the daemon's native configuration, then configuration the user selected,
+/// then the recipe's own environment, each taking precedence over the last.
+fn sourceless_environment(
+    daemon: BTreeMap<String, String>,
+    selected: BTreeMap<String, String>,
+    recipe: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut environment = daemon;
+    environment.extend(selected);
+    environment.extend(recipe);
+    environment
+}
+
+/// The environment `restore_upgrade` will start `launch` with in the next
+/// daemon. A conversation whose terminal the successor restores before it
+/// restarts from that terminal; any other, including one that merely names a
+/// stopped terminal, starts as `start` starts every conversation without a
+/// source. Selections the UI made for it are not saved, so they are not
+/// restored.
+fn upgrade_environment(
     launch: &chat::Launch,
+    hosted_source: bool,
+    daemon: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let (spec, _) = chat::protocol::create(launch)?;
+    Ok(if hosted_source {
+        spec.environment
+    } else {
+        sourceless_environment(daemon, BTreeMap::new(), spec.environment)
+    })
+}
+
+pub(super) fn validate_upgrade_environment(
+    launch: &chat::Launch,
+    hosted_source: bool,
     handle: &Handle,
 ) -> Result<(), String> {
-    let (spec, _) = chat::protocol::create(launch)?;
-    let mut restored = if session.terminal.is_none() {
-        crate::model::agent_recovery::fresh_native_environment(launch.provider, false)
-    } else {
-        BTreeMap::new()
-    };
-    restored.extend(spec.environment);
+    let restored = upgrade_environment(
+        launch,
+        hosted_source,
+        crate::model::agent_recovery::fresh_native_environment(launch.provider, false),
+    )?;
     if !handle.execution_environment_matches(&restored) {
         return Err(
             "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
@@ -1878,6 +1909,47 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    /// A conversation opened on a stopped agent terminal starts with the
+    /// daemon's own provider configuration, so an upgrade restores it the same
+    /// way rather than refusing it for a variable only the daemon supplies.
+    #[test]
+    fn an_upgrade_restores_the_environment_a_chat_actually_started_with() {
+        let launch = chat::Launch {
+            provider: Provider::Omp,
+            recipe: LaunchRecipe {
+                program: "omp".into(),
+                arguments: vec!["--model".into(), "model".into()],
+                working_directory: "/project".into(),
+                environment: BTreeMap::from([
+                    ("HOME".into(), "/home/user".into()),
+                    ("PATH".into(), "/recipe/bin".into()),
+                ]),
+            },
+            session_id: Some("01a0ab66-21d6-7065-9fe5-95f302b669e1".into()),
+        };
+        let daemon = BTreeMap::from([
+            ("BUN_INSTALL_GLOBAL_STORE".into(), "/store".into()),
+            ("PATH".into(), "/daemon/bin".into()),
+        ]);
+        let started = sourceless_environment(
+            daemon.clone(),
+            BTreeMap::new(),
+            chat::protocol::create(&launch).unwrap().0.environment,
+        );
+        assert_eq!(started["BUN_INSTALL_GLOBAL_STORE"], "/store");
+        assert_eq!(started["PATH"], "/recipe/bin");
+        assert_eq!(
+            upgrade_environment(&launch, false, daemon.clone()).unwrap(),
+            started
+        );
+        // A conversation whose terminal is still hosted restarts from that
+        // terminal, not from the daemon.
+        assert_eq!(
+            upgrade_environment(&launch, true, daemon).unwrap(),
+            launch.recipe.environment
+        );
+    }
 
     #[test]
     fn paired_codex_upgrade_preserves_confirmed_fresh_or_switched_thread() {
