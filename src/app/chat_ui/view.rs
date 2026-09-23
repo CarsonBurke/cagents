@@ -55,11 +55,21 @@ const PLAN_CEILING: f32 = 120.0;
 /// it made a caption-height row twice the height of its own text.
 const CONTROL_PADDING: [f32; 2] = [2.0, 6.0];
 
+/// The height of one completion row.
+const COMPLETION_ROW: f32 = design::DENSE_ROW_HEIGHT;
+
 /// How tall the completion list is allowed to grow.
 ///
 /// The list sits between the transcript and the composer, so it is bounded:
-/// an agent with forty commands must not push the conversation off screen.
-const COMPLETION_CEILING: f32 = 180.0;
+/// an agent with forty skills must not push the conversation off screen. A
+/// whole number of rows, so the last visible one is never cut in half.
+const COMPLETION_CEILING: f32 = 7.0 * COMPLETION_ROW;
+
+/// The completion list's inset from its own edge.
+const COMPLETION_INSET: f32 = design::GRID_UNIT;
+
+/// The completion list's scrollable, named so the keyboard can scroll it.
+const COMPLETION_LIST: &str = "chat-completion";
 
 /// How tall the conversation chooser is allowed to grow.
 ///
@@ -204,6 +214,41 @@ fn notice_entry<'a>(message: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+/// What a key press does to an open completion list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionKey {
+    /// Moves the highlight down, or up when `false`.
+    Move(bool),
+    /// Chooses the highlighted row.
+    Choose,
+    Dismiss,
+}
+
+/// The completion key a press is, or `None` for one the editor keeps.
+///
+/// Only the bare keys: a chord is the reader reaching past the list, and
+/// Ctrl+Enter in particular still sends the message.
+fn completion_key(press: &text_editor::KeyPress) -> Option<CompletionKey> {
+    if !matches!(press.status, text_editor::Status::Focused { .. })
+        || press.modifiers.shift()
+        || press.modifiers.control()
+        || press.modifiers.alt()
+        || press.modifiers.logo()
+    {
+        return None;
+    }
+    let keyboard::Key::Named(key) = press.key else {
+        return None;
+    };
+    match key {
+        keyboard::key::Named::ArrowDown => Some(CompletionKey::Move(true)),
+        keyboard::key::Named::ArrowUp => Some(CompletionKey::Move(false)),
+        keyboard::key::Named::Enter | keyboard::key::Named::Tab => Some(CompletionKey::Choose),
+        keyboard::key::Named::Escape => Some(CompletionKey::Dismiss),
+        _ => None,
+    }
+}
+
 fn submit_chord(
     press: &text_editor::KeyPress,
     primary: Option<PromptMode>,
@@ -265,44 +310,68 @@ fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Mes
     ]))
 }
 
-/// The completion query the draft ends on: the text after a `/` that opens the
-/// draft's last word, or `None` when the reader is not naming something.
-///
-/// The trigger follows the end of the draft rather than the start of it,
-/// because that is where typing happens, and a reader who wants a command
-/// after a sentence of context should still get the list.
-fn mention_query(draft: &str) -> Option<&str> {
-    draft
-        .rsplit(|character: char| character.is_whitespace())
-        .next()
-        .and_then(|word| word.strip_prefix('/'))
-}
 /// One row of the composer's completion list.
 ///
-/// A completion row names the thing and says what it does, because a list of
-/// bare slugs makes a reader guess.
+/// A row shows exactly what choosing it puts in the draft, says what that
+/// does, and says whether it is a command or a skill: a command is the whole
+/// message and a skill is part of one, and a reader deciding where to type
+/// next needs to know which they just added.
 fn completion_row<'a>(
-    label: String,
-    description: &'a str,
+    row: completion::Candidate<'a>,
+    highlighted: bool,
     message: Option<Message>,
 ) -> Element<'a, Message> {
     widget::button::custom(
         widget::row::with_children(vec![
-            design::body(label).into(),
-            design::caption(description)
+            design::body(row.insertion)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            design::caption(row.description)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ))
                 .into(),
+            design::caption(match row.kind {
+                completion::Kind::Command => "Command",
+                completion::Kind::Skill => "Skill",
+            })
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into(),
         ])
         .spacing(step::GAP_S)
         .align_y(Alignment::Center),
     )
-    .class(cosmic::theme::Button::MenuItem)
-    .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
+    .class(crate::ui_controls::control_style(highlighted, None))
+    .padding(iced::Padding::from([0.0, step::GAP_S]))
+    .height(Length::Fixed(COMPLETION_ROW))
     .width(Length::Fill)
     .on_press_maybe(message)
     .into()
+}
+
+/// The height of one completion row and of the list showing `count` of them.
+///
+/// Rows are a fixed height so the keyboard highlight can be scrolled into view
+/// by arithmetic rather than by measuring the laid-out list.
+pub(super) fn completion_extent(count: usize) -> (f32, f32) {
+    (
+        COMPLETION_ROW,
+        (count as f32 * COMPLETION_ROW).min(COMPLETION_CEILING),
+    )
+}
+
+/// Scrolls the completion list to `offset`.
+pub(super) fn completion_scroll(target: Target, offset: f32) -> Task<Message> {
+    iced::widget::scrollable::scroll_to(
+        card_control_id(target.card, COMPLETION_LIST),
+        iced::widget::scrollable::AbsoluteOffset {
+            x: None,
+            y: Some(offset),
+        },
+    )
 }
 /// Which end of the loaded window a history request is extending.
 ///
@@ -805,66 +874,47 @@ impl Runtime {
                     .into(),
             );
         }
-        if let Some(query) = mention_query(&draft) {
-            let matches = |candidate: &str| {
-                // Matching case-insensitively, because a reader typing a
-                // completion query is not thinking about how the skill's
-                // author capitalized it.
-                candidate.to_lowercase().starts_with(&query.to_lowercase())
-            };
-            let mut rows: Vec<Element<'_, Message>> = snapshot
-                .commands
-                .iter()
-                .filter(|command| matches(command.name.trim_start_matches('/')))
-                .map(|command| {
-                    completion_row(
-                        format!("/{}", command.name.trim_start_matches('/')),
-                        command.description.as_str(),
-                        (!transitioning)
-                            .then_some(action(Action::Slash(target, command.name.clone()))),
-                    )
+        // What Enter and Tab choose while the completion list is open.
+        let mut chosen = None;
+        if let Some((_, rows)) = self.completion() {
+            let highlighted = self.completion.highlighted.min(rows.len() - 1);
+            chosen = Some(rows[highlighted].insertion.clone());
+            let (_, viewport) = completion_extent(rows.len());
+            let rows = rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let message = (!transitioning)
+                        .then(|| action(Action::Complete(target, row.insertion.clone())));
+                    completion_row(row, index == highlighted, message)
                 })
-                .collect();
-            // Skills sit in the same list as the commands, because a reader
-            // opening it is asking what this agent can be told to do, not
-            // which of those things happens to be a built-in command. The
-            // row shows the invocation the provider actually answers to.
-            rows.extend(
-                snapshot
-                    .skills
-                    .iter()
-                    .filter(|skill| matches(&skill.name))
-                    .map(|skill| {
-                        completion_row(
-                            skill.invocation.clone(),
-                            skill.description.as_str(),
-                            (!transitioning).then_some(action(Action::Mention(
-                                target,
-                                skill.invocation.clone(),
-                            ))),
-                        )
-                    }),
-            );
-            if !rows.is_empty() {
-                content.push(
-                    widget::container(
-                        widget::scrollable(
-                            widget::column::with_children(rows)
-                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                        )
-                        .direction(
-                            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
-                        ),
+                .collect::<Vec<_>>();
+            content.push(
+                widget::container(
+                    widget::scrollable(
+                        widget::column::with_children(rows)
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
                     )
-                    .max_height(COMPLETION_CEILING)
-                    .class(design::surface(
-                        Some(design::raised),
-                        [design::RADIUS_M; 4],
-                        true,
+                    .id(card_control_id(target.card, COMPLETION_LIST))
+                    .on_scroll(move |viewport| {
+                        action(Action::CompletionScrolled(
+                            target,
+                            viewport.absolute_offset().y,
+                        ))
+                    })
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
                     ))
-                    .into(),
-                );
-            }
+                    .height(Length::Fixed(viewport)),
+                )
+                .padding(COMPLETION_INSET)
+                .class(design::surface(
+                    Some(design::raised),
+                    [design::RADIUS_M; 4],
+                    true,
+                ))
+                .into(),
+            );
         }
         for (index, attachment) in self.attachments.iter().enumerate() {
             content.push(
@@ -987,6 +1037,17 @@ impl Runtime {
                         )
                     {
                         return None;
+                    }
+                    // An open completion list has the keys a reader uses to
+                    // pick from it ahead of sending and history.
+                    if let Some(chosen) = &chosen
+                        && let Some(key) = completion_key(&press)
+                    {
+                        return Some(text_editor::Binding::Custom(action(match key {
+                            CompletionKey::Move(down) => Action::CompletionMove(target, down),
+                            CompletionKey::Choose => Action::Complete(target, chosen.clone()),
+                            CompletionKey::Dismiss => Action::CompletionDismiss(target),
+                        })));
                     }
                     if let Some(mode) = submit_chord(&press, submit.0, submit.1, enter_sends) {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
