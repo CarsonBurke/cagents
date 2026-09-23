@@ -43,6 +43,10 @@ const TICK: Duration = Duration::from_secs(30);
 /// ended. The check reads only this window's own state; the CLI is asked
 /// who it signed in as once, when the terminal ends.
 const LOGIN_TICK: Duration = Duration::from_secs(1);
+/// How often the daemon is asked about sign-ins no card on screen watches.
+/// Each question lists every hosted terminal, so it is asked less often
+/// than a card on screen is looked at.
+const HOST_CHECK: Millis = 3_000;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
@@ -65,6 +69,8 @@ pub(super) struct State {
     logins: Vec<Login>,
     /// Whether the daemon is being asked which sign-ins have ended.
     asking_host: bool,
+    /// Not before this is the daemon asked again.
+    next_host_check: Millis,
     table: table::Table,
     /// Accounts being signed out and deleted.
     removing: BTreeSet<AccountId>,
@@ -94,6 +100,7 @@ impl State {
             cache,
             logins: Vec::new(),
             asking_host: false,
+            next_host_check: 0,
             table: table::Table::default(),
             removing: BTreeSet::new(),
         };
@@ -383,10 +390,13 @@ pub enum Action {
     LoginTick,
     /// The daemon's answer for sign-ins whose terminals this window is not
     /// watching: the ones whose terminals have ended.
-    LoginsEnded(Result<Vec<uuid::Uuid>, String>),
-    /// A sign-in off the strip on screen was stopped through the daemon, or
-    /// could not be.
-    LoginStopped(Result<(), String>),
+    LoginsEnded(Result<Vec<(uuid::Uuid, TerminalId)>, String>),
+    /// A sign-in card off the strip on screen had its terminal closed
+    /// through the daemon, or could not.
+    OffstripClosed {
+        card: CardId,
+        result: Result<(), String>,
+    },
     LoginVerified {
         key: uuid::Uuid,
         outcome: Outcome,
@@ -1114,17 +1124,23 @@ impl Cagents {
                 self.account_ui.asking_host = false;
                 match result {
                     Ok(mut ended) => {
-                        // A sign-in settled, or already being asked, while
-                        // the daemon was answering has moved on.
-                        ended.retain(|key| {
+                        // A sign-in settled, being asked, or restarted in
+                        // another terminal while the daemon was answering has
+                        // moved on from the terminal the answer is about.
+                        ended.retain(|(key, terminal)| {
                             self.account_ui.logins.iter().any(|login| {
-                                login.key == *key && login.phase == LoginPhase::Waiting
+                                login.key == *key
+                                    && login.phase == LoginPhase::Waiting
+                                    && self
+                                        .sign_in_card(login.provider, &login.home)
+                                        .and_then(|card| sign_in_terminal(self.card_state(card)))
+                                        .is_none_or(|current| current == *terminal)
                             })
                         });
                         Task::batch(
                             ended
                                 .into_iter()
-                                .map(|key| self.verify_login(key))
+                                .map(|(key, _)| self.verify_login(key))
                                 .collect::<Vec<_>>(),
                         )
                     }
@@ -1135,8 +1151,9 @@ impl Cagents {
                     }
                 }
             }
-            Action::LoginStopped(result) => match result {
-                Ok(()) => self.check_logins(),
+            Action::OffstripClosed { card, result } => match result {
+                // With its card gone, the sign-in counts as ended.
+                Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
                 Err(error) => {
                     self.status = Some(TransientNotice::error(format!(
                         "The sign-in could not be stopped: {error}"
@@ -1159,9 +1176,9 @@ impl Cagents {
                         self.close_card_unasked(card)
                     }
                     // Its strip is not on screen, so there is no card close
-                    // to run: the daemon stops the login, and settling it
-                    // retires the card.
-                    Some(card) => self.stop_offstrip_login(card),
+                    // to run: the daemon stops the login and the card is
+                    // retired, which the next check takes as the end.
+                    Some(card) => self.close_offstrip_sign_in(card),
                     None => self.check_logins(),
                 }
             }
@@ -1606,34 +1623,42 @@ impl Cagents {
                 ended.push(login.key);
                 continue;
             };
+            let on_screen = self.workspace.order().any(|id| id == card);
             match self.cards.get(&card) {
                 Some(CardRuntime::Failed(_)) => ended.push(login.key),
-                // A card this window is running follows its terminal.
-                Some(CardRuntime::Terminal(_) | CardRuntime::Completed) => {
+                // A card on the strip on screen follows its terminal.
+                Some(CardRuntime::Terminal(_) | CardRuntime::Completed) if on_screen => {
                     if ended_terminal(self.card_state(card)).is_some() {
                         ended.push(login.key);
                     }
                 }
-                // A card off the strip on screen, or not hydrated yet, keeps
-                // whatever it last saw, so the daemon is asked instead - once
-                // the daemon has taken the terminal on, since until then it
-                // has nothing to say about it.
+                // A card off the strip hibernates, and one not hydrated yet
+                // has not started watching: either keeps whatever it last saw.
+                // What it saw end has ended; otherwise the daemon is asked -
+                // once it has taken the terminal on, since until then it has
+                // nothing to say about it.
                 _ => {
-                    if let Some(CardState {
+                    if ended_terminal(self.card_state(card)).is_some() {
+                        ended.push(login.key);
+                    } else if let Some(CardState {
                         kind: CardKind::Terminal(session),
                         ..
                     }) = self.card_state(card)
-                        && session.continuity.live_proof().is_some()
+                        && let Some(proof) = session.continuity.live_proof()
                     {
-                        unwatched.push((login.key, session.id));
+                        unwatched.push((login.key, session.id, proof));
                     }
                 }
             }
         }
-        let ask = if unwatched.is_empty() || self.account_ui.asking_host {
+        let ask = if unwatched.is_empty()
+            || self.account_ui.asking_host
+            || self.account_ui.next_host_check > now
+        {
             Task::none()
         } else {
             self.account_ui.asking_host = true;
+            self.account_ui.next_host_check = now + HOST_CHECK;
             cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || ended_on_host(&unwatched))
                     .await
@@ -1649,39 +1674,45 @@ impl Cagents {
         Task::batch(verify.into_iter().chain([ask]))
     }
 
-    /// Stops a sign-in whose card is not on the strip on screen, through the
-    /// daemon hosting its terminal.
-    fn stop_offstrip_login(&mut self, card: CardId) -> Task<Message> {
-        let Some(CardState {
-            kind: CardKind::Terminal(session),
-            ..
-        }) = self.card_state(card)
-        else {
-            return Task::none();
+    /// Closes a sign-in card that is not on the strip on screen, which has
+    /// no card close to run: the daemon closes its terminal - a no-op for
+    /// one that has ended - and the card is then retired.
+    fn close_offstrip_sign_in(&mut self, card: CardId) -> Task<Message> {
+        let hosted = match self.card_state(card) {
+            Some(CardState {
+                kind: CardKind::Terminal(session),
+                ..
+            }) => session
+                .continuity
+                .live_proof()
+                .map(|proof| (session.id, proof)),
+            _ => None,
         };
-        let Some(proof) = session.continuity.live_proof() else {
+        let Some((terminal, proof)) = hosted else {
             // Ended already, or never taken on by the daemon: nothing runs.
-            return self.check_logins();
+            return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
         };
-        let terminal = session.id;
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                match super::terminal_close::close_hosted_terminal(terminal, &proof, true) {
-                    // Gone, or no longer the terminal the card started:
-                    // either way nothing of this sign-in is left running.
-                    super::terminal_close::CloseOutcome::Closed
-                    | super::terminal_close::CloseOutcome::Stale => Ok(()),
-                    super::terminal_close::CloseOutcome::Active => {
-                        Err("the terminal is still running".to_owned())
-                    }
-                    super::terminal_close::CloseOutcome::Unreachable(error) => Err(error),
-                }
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            Message::AccountUi(Action::LoginStopped(result))
+            let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::AccountUi(Action::OffstripClosed { card, result })
         })
+    }
+
+    /// Closes the card of a sign-in that has settled: its terminal has said
+    /// all it had to.
+    fn close_settled_sign_in(&mut self, provider: Provider, home: &Path) -> Task<Message> {
+        match self.sign_in_card(provider, home) {
+            Some(card) if !self.workspace.order().any(|id| id == card) => {
+                self.close_offstrip_sign_in(card)
+            }
+            Some(card) if ended_terminal(self.card_state(card)).is_some() => {
+                cosmic::task::message(Message::CloseCard(card))
+            }
+            _ => Task::none(),
+        }
     }
 
     fn verify_login(&mut self, key: uuid::Uuid) -> Task<Message> {
@@ -1829,17 +1860,6 @@ impl Cagents {
             return Task::none();
         };
         let login = self.account_ui.logins.remove(index);
-        // The login terminal has said all it had to. One off the strip on
-        // screen was only settled once the daemon said it had ended.
-        let close = match self.sign_in_card(login.provider, &login.home) {
-            Some(card) if !self.workspace.order().any(|id| id == card) => {
-                self.retire_offstrip_card(card)
-            }
-            Some(card) if ended_terminal(self.card_state(card)).is_some() => {
-                cosmic::task::message(Message::CloseCard(card))
-            }
-            _ => Task::none(),
-        };
         match result {
             Ok(Settled::Registered {
                 registry,
@@ -1863,7 +1883,7 @@ impl Cagents {
                     state.identity = identity;
                 }
                 self.status = Some(TransientNotice::success(format!("{name} was added.")));
-                close
+                self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Duplicate { existing, registry }) => {
                 if let Some(registry) = registry {
@@ -1877,13 +1897,13 @@ impl Cagents {
                 self.status = Some(TransientNotice::warning(format!(
                     "That login is already added as {name}."
                 )));
-                close
+                self.close_settled_sign_in(login.provider, &login.home)
             }
             Ok(Settled::Abandoned(registry)) => {
                 if let Some(registry) = registry {
                     self.account_ui.set_registry(registry);
                 }
-                close
+                self.close_settled_sign_in(login.provider, &login.home)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -2485,24 +2505,77 @@ impl Cagents {
     }
 }
 
-/// Which of the sign-ins `watched`, each named with its terminal, have
-/// ended by the daemon's account. A terminal the daemon no longer hosts has
-/// ended too: every one asked about was hosted when the question was put.
-fn ended_on_host(watched: &[(uuid::Uuid, TerminalId)]) -> Result<Vec<uuid::Uuid>, String> {
+/// The terminal a sign-in card runs.
+fn sign_in_terminal(state: Option<&CardState>) -> Option<TerminalId> {
+    match &state?.kind {
+        CardKind::Terminal(session) => Some(session.id),
+        _ => None,
+    }
+}
+
+/// Which of the sign-ins `watched`, each named with its terminal and the
+/// daemon session that terminal was hosted in, have ended by the daemon's
+/// account. A terminal the daemon hosts says so itself. One it does not
+/// has ended only if the daemon is still that session: a daemon started
+/// since may not have restored it yet.
+fn ended_on_host(
+    watched: &[(uuid::Uuid, TerminalId, HostSessionProof)],
+) -> Result<Vec<(uuid::Uuid, TerminalId)>, String> {
     let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client =
         crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
+    let session = client.proof().clone();
     Ok(watched
         .iter()
-        .filter(|(_, terminal)| {
-            hosted
+        .filter(|(_, terminal, proof)| {
+            match hosted
                 .iter()
                 .find(|descriptor| descriptor.session.id == *terminal)
-                .is_none_or(|descriptor| terminal_ended(&descriptor.session))
+            {
+                Some(descriptor) => terminal_ended(&descriptor.session),
+                None => session == *proof,
+            }
         })
-        .map(|(key, _)| *key)
+        .map(|(key, terminal, _)| (*key, *terminal))
         .collect())
+}
+
+/// Closes the hosted `terminal` for good. A daemon that restored it under
+/// a session of its own is asked again with that session, so a close is
+/// only reported done once the terminal has ended or is gone.
+fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), String> {
+    use super::terminal_close::{CloseOutcome, close_hosted_terminal};
+    let outcome = match close_hosted_terminal(terminal, proof, true) {
+        CloseOutcome::Stale => {
+            let path =
+                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+            let mut client =
+                crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            let hosted = client.list().map_err(|error| error.to_string())?;
+            match hosted
+                .iter()
+                .find(|descriptor| descriptor.session.id == terminal)
+            {
+                None => return Ok(()),
+                Some(descriptor) if terminal_ended(&descriptor.session) => return Ok(()),
+                Some(descriptor) => match descriptor.session.continuity.live_proof() {
+                    Some(current) if current != *proof => {
+                        close_hosted_terminal(terminal, &current, true)
+                    }
+                    _ => CloseOutcome::Stale,
+                },
+            }
+        }
+        outcome => outcome,
+    };
+    match outcome {
+        CloseOutcome::Closed => Ok(()),
+        CloseOutcome::Active | CloseOutcome::Stale => {
+            Err("its terminal is still running and could not be closed".to_owned())
+        }
+        CloseOutcome::Unreachable(error) => Err(error),
+    }
 }
 
 /// Forgets the pending sign-in `key`, returning the registry as it now
@@ -2989,11 +3062,22 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginTick));
         assert!(app.account_ui.asking_host);
         assert_eq!(phase(&app), Some(LoginPhase::Waiting));
-        let _ = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![key]))));
+        // An answer about a terminal the sign-in no longer runs is not one
+        // about this sign-in.
+        let _ = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![(
+            key,
+            TerminalId::new(),
+        )]))));
         assert!(!app.account_ui.asking_host);
+        assert_eq!(phase(&app), Some(LoginPhase::Waiting));
+        let _ = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![(
+            key, terminal,
+        )]))));
         assert_eq!(phase(&app), Some(LoginPhase::Verifying));
 
-        // Settling retires the card, which no strip on screen can close.
+        // Settling closes the terminal through the daemon, which no strip
+        // on screen can do, and only a close the daemon confirmed retires
+        // the card.
         let _ = app.update(Message::AccountUi(Action::LoginSettled {
             key,
             result: Ok(Settled::Abandoned(None)),
@@ -3001,8 +3085,73 @@ mod app_tests {
         assert!(app.account_ui.logins.is_empty());
         assert!(
             app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        let _ = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            result: Err("unreachable".into()),
+        }));
+        assert!(
+            app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        let _ = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            result: Ok(()),
+        }));
+        assert!(
+            app.card_state(card)
                 .is_none_or(|state| !state.existence.is_open()),
             "the settled sign-in's card was left open"
+        );
+        assert!(!app.durable.card_scopes.contains_key(&card));
+    }
+
+    #[test]
+    fn cancelling_a_sign_in_off_the_strip_that_never_started_retires_it() {
+        let mut app = app_in_repo();
+        let key = uuid::Uuid::from_u128(22);
+        let home = PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string());
+        let launch = login_launch(
+            &Account::managed(Provider::Claude, key, home.clone()),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .expect("Claude has a login command");
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(
+                |card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal),
+            )
+            .map(|card| card.id)
+            .expect("the login opens a card");
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        let _ = app.select_worktree("/elsewhere".into(), false);
+        assert!(!app.workspace.order().any(|id| id == card));
+
+        // No daemon ever hosted it, so nothing needs stopping: the card is
+        // retired at once and the sign-in, left without one, is settled.
+        let _ = app.update(Message::AccountUi(Action::CancelLogin(key)));
+        assert!(
+            app.card_state(card)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        assert_eq!(
+            app.account_ui.logins.first().map(|login| login.phase),
+            Some(LoginPhase::Verifying)
         );
     }
 

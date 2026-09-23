@@ -10632,6 +10632,8 @@ impl Application for Cagents {
                     }
                 }
                 self.lifecycle.remove(id);
+                // A closed card is never reopened, so its filing is spent.
+                Arc::make_mut(&mut self.durable).card_scopes.remove(&id);
                 if let Some(card) = self.card_state_mut(id) {
                     card.existence = Existence::Closed {
                         tombstone: crate::model::Tombstone {

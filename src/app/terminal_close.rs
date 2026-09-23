@@ -67,6 +67,7 @@ impl Cagents {
         self.sidebar_state.acknowledge_agent_update(card);
         self.cards.remove(&card);
         self.lifecycle.remove(card);
+        Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
         if let Some(state) = self.card_state_mut(card) {
             state.existence = Existence::Closed {
                 tombstone: crate::model::Tombstone {
