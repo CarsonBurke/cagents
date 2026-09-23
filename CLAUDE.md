@@ -52,4 +52,4 @@ You are a senior app developer tasked with creating a great Agent Development En
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
 - Use `cargo fmt --check` after Rust edits.
 
-The human-facing setup, dependency prerequisites, runner options, and troubleshooting examples are in `README.md` under **Run from source**. Repository development tooling is shell and Rust; Python is only an upstream native prerequisite of the full Servo build graph.
+The human-facing setup and dependency prerequisites are in `README.md` under **Run from source**; the full runner option reference, test lanes, resource guidance, and troubleshooting are in `docs/development.md`. Repository development tooling is shell and Rust; Python is only an upstream native prerequisite of the full Servo build graph.
