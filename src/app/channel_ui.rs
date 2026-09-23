@@ -15,21 +15,8 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
         return Ok(());
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = match crate::control::ControlClient::connect(&socket) {
-        Ok(client) => client,
-        Err(crate::control::ControlError::Connect(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(format!(
-                "Cannot reach the daemon to close sessions: {error}"
-            ));
-        }
+    let Some(mut client) = connect(&socket)? else {
+        return Ok(());
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
@@ -44,7 +31,10 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                client = reconnect(&socket)?;
+                let Some(fresh) = connect(&socket)? else {
+                    return Ok(());
+                };
+                client = fresh;
                 if client
                     .list_chats()
                     .map_err(|error| error.to_string())?
@@ -68,7 +58,10 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            client = reconnect(&socket)?;
+            let Some(fresh) = connect(&socket)? else {
+                return Ok(());
+            };
+            client = fresh;
             let still_running = client
                 .list()
                 .map_err(|error| error.to_string())?
@@ -85,9 +78,23 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     Ok(())
 }
 
-fn reconnect(socket: &std::path::Path) -> Result<crate::control::ControlClient, String> {
-    crate::control::ControlClient::connect(socket)
-        .map_err(|error| format!("Cannot reach the daemon to close sessions: {error}"))
+/// A connection to the daemon, or `None` when no daemon is running: then none
+/// of the sessions it hosted survives to be closed.
+fn connect(socket: &std::path::Path) -> Result<Option<crate::control::ControlClient>, String> {
+    match crate::control::ControlClient::connect(socket) {
+        Ok(client) => Ok(Some(client)),
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!(
+            "Cannot reach the daemon to close sessions: {error}"
+        )),
+    }
 }
 
 fn channel_terminal_ids(

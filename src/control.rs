@@ -487,17 +487,25 @@ impl ControlClient {
     /// as activity - so they are expected between the requests' responses.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
         let chat_id = session.id;
-        match self.request_strict(ClientRequest::ChatAttach { session })? {
-            ServerResponse::ChatAttached { .. } => {}
-            response => return Err(unexpected_response("a native chat attachment", &response)),
-        }
+        // The daemon subscribes this connection before it answers the
+        // attachment, so the chat's notifications can arrive ahead of that
+        // answer.
         self.attached_chats.insert(chat_id);
-        let closed = self
-            .request_strict(ClientRequest::ChatClose { chat_id })
-            .and_then(|response| match response {
-                ServerResponse::ChatClosed { .. } => Ok(()),
-                response => Err(unexpected_response("a native chat close", &response)),
-            });
+        let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
+            Ok(ServerResponse::ChatAttached { .. }) => self
+                .request_strict(ClientRequest::ChatClose { chat_id })
+                .and_then(|response| match response {
+                    ServerResponse::ChatClosed { .. } => Ok(()),
+                    response => Err(unexpected_response("a native chat close", &response)),
+                }),
+            Ok(response) => Err(unexpected_response("a native chat attachment", &response)),
+            // The daemon refuses an attachment before it subscribes anyone.
+            Err(error @ ControlError::Remote { .. }) => {
+                self.attached_chats.remove(&chat_id);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let detached = match &closed {
             // The daemon removed the chat, and every notification about it,
             // before answering.
@@ -965,6 +973,11 @@ impl ControlClient {
                     Ok(()) => {}
                     Err(message)
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
+                    // The daemon's notice that it is dropping this connection,
+                    // such as an overflowing delivery queue, says why.
+                    Err(message @ ServerMessage::Error(_)) => {
+                        return response_from_message(message);
+                    }
                     Err(message) => {
                         return Err(ControlError::UnexpectedMessage {
                             expected: "a correlated response",
@@ -3411,6 +3424,13 @@ mod tests {
                 panic!("expected an attachment, got {:?}", attach.request);
             };
             assert_eq!(session.id, closed);
+            // Subscribed before the answer is queued, a working chat can
+            // report ahead of it.
+            send(
+                &mut server_stream,
+                None,
+                activity(closed, ActivityState::Working),
+            );
             respond(
                 &mut server_stream,
                 attach.request_id,
@@ -3492,6 +3512,18 @@ mod tests {
                 ServerResponse::Detached,
             );
 
+            // A refused attachment subscribes nothing, so nothing is detached.
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            send(
+                &mut server_stream,
+                Some(attach.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "Exact native chat not found; no replacement process was spawned",
+                    false,
+                )),
+            );
+
             // The connection stays in step for the next request, and a chat it
             // never attached cannot answer for it.
             let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
@@ -3527,12 +3559,62 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            client.close_chat(session(elsewhere)),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                ..
+            })
+        ));
         assert!(client.attached_chats.is_empty());
         assert!(client.list_chats().unwrap().is_empty());
         assert!(matches!(
             client.list_chats(),
             Err(ControlError::UnexpectedMessage {
                 actual: "chat_activity",
+                ..
+            })
+        ));
+        server.join().unwrap();
+    }
+
+    /// The daemon says why it is dropping a connection in an untagged error;
+    /// the request that error interrupts reports it rather than a stray frame.
+    #[test]
+    fn an_untagged_daemon_error_fails_the_pending_request_with_its_reason() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let peer_proof = pinned.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: peer_proof,
+                    message: ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::QueueFull,
+                        "client delivery queue overflowed",
+                        true,
+                    )),
+                },
+            )
+            .unwrap();
+        });
+
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(matches!(
+            client.list_chats(),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::QueueFull,
+                retryable: true,
                 ..
             })
         ));
