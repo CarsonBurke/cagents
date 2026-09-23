@@ -140,16 +140,21 @@ impl Cagents {
     }
 
     /// Releases one in-flight terminal start and decides the observations it
-    /// held back.
+    /// held back, then lets the next restored agent attach.
     pub(super) fn finish_terminal_start(&mut self) -> Task<Message> {
         let remaining = self.terminal_starts_in_flight().saturating_sub(1);
         self.terminal_starts
             .store(remaining, std::sync::atomic::Ordering::Relaxed);
-        if remaining > 0 || self.pending_adoptions.is_empty() {
+        if remaining > 0 {
             return Task::none();
         }
-        let pending = std::mem::take(&mut self.pending_adoptions);
-        self.observe_hosted_terminals(pending)
+        let adopted = if self.pending_adoptions.is_empty() {
+            Task::none()
+        } else {
+            let pending = std::mem::take(&mut self.pending_adoptions);
+            self.observe_hosted_terminals(pending)
+        };
+        Task::batch([adopted, self.attach_next_restored_agent()])
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {
