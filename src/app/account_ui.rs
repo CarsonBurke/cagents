@@ -198,8 +198,31 @@ impl State {
             .any(|account| &account.id != except && account.schedule.in_flight(now))
     }
 
-    /// The identities of the system accounts, as last reported, for telling
-    /// a new login apart from them.
+    /// Takes what a load found for each account: whether it has a CLI to ask,
+    /// and what the cache had for it.
+    fn restore(&mut self, restored: Vec<Restored>) {
+        for restored in restored {
+            let Some(state) = self.account_mut(&restored.id) else {
+                continue;
+            };
+            // A probe that answered first knows better than the load.
+            if state.snapshot.is_some() {
+                continue;
+            }
+            state.present = restored.present;
+            if let Some(entry) = restored.entry.filter(|_| restored.present) {
+                let mut snapshot = entry.snapshot;
+                snapshot.source = UsageSource::Cache;
+                state.schedule.observe(snapshot.observed_at);
+                state.identity = entry.identity;
+                state.snapshot = Some(snapshot);
+            }
+            if !restored.present && self.popover.as_ref() == Some(&restored.id) {
+                self.popover = None;
+            }
+        }
+    }
+
     /// What the accounts running conversations reported on since the last
     /// write leave for the cache.
     fn take_live_entries(&mut self) -> Vec<(Account, Entry)> {
@@ -218,6 +241,8 @@ impl State {
             .collect()
     }
 
+    /// The identities of the system accounts, as last reported, for telling
+    /// a new login apart from them.
     fn system_identities(&self) -> Vec<(Provider, Identity)> {
         self.accounts
             .iter()
@@ -370,6 +395,9 @@ pub enum Settled {
 pub struct Loaded {
     registry: Result<Registry, String>,
     restored: Vec<Restored>,
+    /// Whether presence was judged on the interface's own `PATH` because the
+    /// shell had not yet said what a terminal would search.
+    provisional: bool,
 }
 
 /// What the startup load found for one account.
@@ -384,6 +412,8 @@ pub struct Restored {
 pub enum Action {
     Tick,
     Loaded(Loaded),
+    /// Presence judged again on the shell's `PATH`, once it is known.
+    Located(Vec<Restored>),
     Probed {
         id: AccountId,
         outcome: Outcome,
@@ -880,12 +910,18 @@ impl Cagents {
     /// Reads the registry - finishing, under its lock, any removal an earlier
     /// run was interrupted in - what earlier probes, from this window or
     /// another, left in the cache, and which accounts have a CLI to ask.
+    ///
+    /// It does not wait on the reader's shell for where a terminal would look
+    /// for the CLIs: a slow startup file would hold back every figure the
+    /// cache already has. Until the shell answers, the interface's own
+    /// `PATH` stands in, and [`Self::locate_accounts`] looks again after.
     pub(super) fn load_accounts(&self) -> Task<Message> {
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
         cosmic::task::future(async move {
-            let search_path = probe::search_path().await;
+            let provisional = !probe::shell_asked();
+            let search_path = probe::current_search_path();
             let loaded = tokio::task::spawn_blocking(move || {
                 let registry = match (&store, &homes) {
                     (Some(store), Some(homes)) => store
@@ -900,22 +936,49 @@ impl Cagents {
                     .unwrap_or_else(|_| Account::system_accounts().into());
                 let now = now_ms();
                 let restored = restore(&accounts, cache.as_ref(), now, search_path.as_deref());
-                // Not while the registry cannot be read, which would take
-                // every added account for one since removed.
-                if let (Some(cache), Ok(_)) = (&cache, &registry) {
+                // Not while the registry cannot be read, or its accounts' homes
+                // cannot be found, which would take every added account for
+                // one since removed.
+                if let (Some(cache), Ok(_), Some(_)) = (&cache, &registry, &homes) {
                     let keep = accounts.iter().filter_map(Account::cache_key).collect();
                     if let Err(error) = cache.prune(&keep, now) {
                         tracing::debug!(%error, "the account usage cache could not be pruned");
                     }
                 }
-                Loaded { restored, registry }
+                Loaded {
+                    registry,
+                    restored,
+                    provisional,
+                }
             })
             .await
             .unwrap_or_else(|_| Loaded {
                 registry: Err("The accounts could not be read".into()),
                 restored: Vec::new(),
+                provisional,
             });
             Message::AccountUi(Action::Loaded(loaded))
+        })
+    }
+
+    /// Judges again, on the shell's `PATH`, which accounts have a CLI to ask,
+    /// restoring what the cache has for any found only there.
+    fn locate_accounts(&self) -> Task<Message> {
+        let accounts: Vec<Account> = self
+            .account_ui
+            .accounts
+            .iter()
+            .map(|state| state.account.clone())
+            .collect();
+        let cache = self.account_ui.cache.clone();
+        cosmic::task::future(async move {
+            let search_path = probe::search_path().await;
+            let restored = tokio::task::spawn_blocking(move || {
+                restore(&accounts, cache.as_ref(), now_ms(), search_path.as_deref())
+            })
+            .await
+            .unwrap_or_default();
+            Message::AccountUi(Action::Located(restored))
         })
     }
 
@@ -1094,10 +1157,13 @@ impl Cagents {
     /// conversation runs on, which its launch names by the home it points
     /// the CLI at.
     ///
-    /// Figures count as a probe's would, so a busy conversation keeps its
-    /// account from being probed at all, and they reach other windows
-    /// through the cache. A changed login is not a reading of the account;
-    /// it makes the account due for a probe.
+    /// Figures refine the reading the account already has and count as a
+    /// probe's would, so a busy conversation keeps its account from being
+    /// probed at all, and they reach other windows through the cache. An
+    /// account with no reading yet - never probed, as while no surface shows
+    /// accounts - waits for its probe, and its figures go unrecorded. A
+    /// changed login is not a reading of the account; it makes the account
+    /// due for a probe.
     pub(super) fn account_reported(
         &mut self,
         provider: Provider,
@@ -1120,7 +1186,9 @@ impl Cagents {
             }
             if let LiveReport::CodexLogin(login) = &report {
                 login_changed |= !login.describes(state.snapshot.as_ref(), state.identity.as_ref());
-            } else if report.apply(&mut state.snapshot, observed_at) {
+            } else if let Some(snapshot) = state.snapshot.as_mut()
+                && report.apply(snapshot, observed_at, now)
+            {
                 state.schedule.observe(observed_at);
                 observed = true;
             }
@@ -1197,24 +1265,17 @@ impl Cagents {
                         )));
                     }
                 }
-                for restored in loaded.restored {
-                    let Some(state) = self.account_ui.account_mut(&restored.id) else {
-                        continue;
-                    };
-                    // A probe that answered first knows better than the load.
-                    if state.snapshot.is_some() {
-                        continue;
-                    }
-                    state.present = restored.present;
-                    if let Some(entry) = restored.entry.filter(|_| restored.present) {
-                        let mut snapshot = entry.snapshot;
-                        snapshot.source = UsageSource::Cache;
-                        state.schedule.observe(snapshot.observed_at);
-                        state.identity = entry.identity;
-                        state.snapshot = Some(snapshot);
-                    }
-                }
-                self.probe_accounts(Trigger::Focus)
+                self.account_ui.restore(loaded.restored);
+                let locate = if loaded.provisional {
+                    self.locate_accounts()
+                } else {
+                    Task::none()
+                };
+                Task::batch([self.probe_accounts(Trigger::Focus), locate])
+            }
+            Action::Located(restored) => {
+                self.account_ui.restore(restored);
+                Task::none()
             }
             Action::Probed { id, outcome } => self.account_probed(id, outcome),
             Action::Refresh(id) => {
@@ -3098,6 +3159,7 @@ mod tests {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+    use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
 
     fn signed_out(app: &mut Cagents) -> AccountId {
@@ -3490,12 +3552,12 @@ mod app_tests {
         recipe
     }
 
-    /// Figures a running conversation reports land on the account its
-    /// launch points at, count as a probe - a focused window's tick asks
-    /// every other account that is due, but not that one - and reach other
-    /// windows through the cache.
+    /// Figures a running conversation reports refine the reading of the
+    /// account its launch points at, count as a probe - a focused window's
+    /// tick asks every other account that is due, but not that one - and
+    /// reach other windows through the cache.
     #[test]
-    fn a_conversations_live_figures_stand_in_for_a_probe_and_reach_the_cache() {
+    fn a_conversations_live_figures_refresh_its_account_and_reach_the_cache() {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
         let mut app = context_inspector_test_app(false);
@@ -3505,12 +3567,37 @@ mod app_tests {
         let system = Account::system(Provider::Claude).id();
         let recipe = recipe_on(&app, &managed);
         let now = now_ms();
+
+        // Streamed windows alone are not a reading: the account without one
+        // waits for its probe, and nothing is queued for the cache.
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.2), now)]);
+        let state = app.account_ui.account(&managed).unwrap();
+        assert!(state.snapshot.is_none());
+        assert!(app.account_ui.live_unsaved.is_empty());
+
+        // A probe long enough ago that the account is due again.
+        let mut probed =
+            UsageSnapshot::state(UsageStatus::Ok, "", now - 2 * schedule::REFRESH_INTERVAL);
+        probed.detail = None;
+        probed.plan = Some("max".into());
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            id: managed.clone(),
+            outcome: Outcome::Answered {
+                identity: None,
+                snapshot: probed,
+            },
+        }));
         let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.43), now)]);
         let state = app.account_ui.account(&managed).unwrap();
         let snapshot = state.snapshot.clone().unwrap();
         assert_eq!(snapshot.source, UsageSource::Live);
         assert_eq!(snapshot.observed_at, now);
         assert!((snapshot.windows[0].used - 0.43).abs() < 1e-6);
+        assert_eq!(
+            snapshot.plan.as_deref(),
+            Some("max"),
+            "the probe's plan is kept"
+        );
         assert!(app.account_ui.account(&system).unwrap().snapshot.is_none());
         let _ = app.update(Message::AccountUi(Action::Tick));
         let in_flight = |app: &Cagents, id: &AccountId| {
@@ -3555,6 +3642,107 @@ mod app_tests {
         assert_eq!(cached.snapshot.observed_at, now + 1);
     }
 
+    /// The startup load does not wait on the shell: an account whose CLI only
+    /// the shell's `PATH` finds is taken as absent at first, and gets its
+    /// cached figures once the shell answers - unless a probe answered in
+    /// between, which knows better.
+    #[test]
+    fn an_account_found_on_the_shells_path_gets_its_cached_figures_late() {
+        let mut app = context_inspector_test_app(false);
+        let claude = Account::system(Provider::Claude).id();
+        let codex = Account::system(Provider::Codex).id();
+        let now = now_ms();
+        let cached = |used| Entry {
+            identity: None,
+            snapshot: UsageSnapshot {
+                windows: vec![UsageWindow {
+                    key: "five_hour".into(),
+                    kind: WindowKind::Session,
+                    label: "Session".into(),
+                    used,
+                    resets_at: None,
+                    span_secs: None,
+                    binding: false,
+                }],
+                credits: None,
+                status: UsageStatus::Ok,
+                observed_at: now,
+                source: UsageSource::Probe,
+                plan: None,
+                detail: None,
+            },
+        };
+        let judged = |present| {
+            vec![
+                Restored {
+                    id: claude.clone(),
+                    present,
+                    entry: Some(cached(0.3)),
+                },
+                Restored {
+                    id: codex.clone(),
+                    present,
+                    entry: Some(cached(0.3)),
+                },
+            ]
+        };
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(Registry::default()),
+            restored: judged(false),
+            provisional: true,
+        })));
+        for id in [&claude, &codex] {
+            let state = app.account_ui.account(id).unwrap();
+            assert!(!state.present);
+            assert!(state.snapshot.is_none());
+        }
+
+        let mut probed = cached(0.8).snapshot;
+        probed.observed_at = now + 1;
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            id: codex.clone(),
+            outcome: Outcome::Answered {
+                identity: None,
+                snapshot: probed.clone(),
+            },
+        }));
+        let _ = app.update(Message::AccountUi(Action::Located(judged(true))));
+        let state = app.account_ui.account(&claude).unwrap();
+        assert!(state.present);
+        let restored = state.snapshot.as_ref().unwrap();
+        assert_eq!(restored.source, UsageSource::Cache);
+        assert!((restored.windows[0].used - 0.3).abs() < 1e-6);
+        assert_eq!(
+            app.account_ui.account(&codex).unwrap().snapshot.as_ref(),
+            Some(&probed)
+        );
+    }
+
+    /// A CLI the interface's own `PATH` found but the shell's does not is
+    /// not there to ask after all, and a popover open on it closes.
+    #[test]
+    fn an_account_the_shells_path_rules_out_loses_its_popover() {
+        let mut app = context_inspector_test_app(false);
+        let claude = Account::system(Provider::Claude).id();
+        let judged = |present| {
+            vec![Restored {
+                id: claude.clone(),
+                present,
+                entry: None,
+            }]
+        };
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(Registry::default()),
+            restored: judged(true),
+            provisional: true,
+        })));
+        let _ = app.update(Message::AccountUi(Action::Popover(Some(claude.clone()))));
+        assert_eq!(app.account_ui.popover.as_ref(), Some(&claude));
+        let _ = app.update(Message::AccountUi(Action::Located(judged(false))));
+        assert!(!app.account_ui.account(&claude).unwrap().present);
+        assert_eq!(app.account_ui.popover, None);
+    }
+
     /// A conversation says its account's login changed: the figures shown
     /// no longer describe it, so the account is asked again at once.
     #[test]
@@ -3590,10 +3778,11 @@ mod app_tests {
         );
     }
 
-    /// The refresh control is re-enabled when its debounce lifts, by a
-    /// wake scheduled for that moment rather than the next tick.
+    /// A manual refresh knows the moment its debounce lifts, and the wake
+    /// scheduled for that moment re-reads the clock, which is what re-enables
+    /// the refresh control without waiting for the next tick.
     #[test]
-    fn a_manual_refresh_wakes_when_its_debounce_lifts() {
+    fn a_manual_refreshs_debounce_ends_in_a_wake_that_rereads_the_clock() {
         let mut app = context_inspector_test_app(false);
         let id = app.account_ui.accounts[0].id.clone();
         let _ = app.update(Message::AccountUi(Action::Refresh(id.clone())));

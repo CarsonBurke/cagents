@@ -493,38 +493,29 @@ impl LiveReport {
         }
     }
 
-    /// Folds the figures this report carries into `snapshot`, observed at
+    /// Folds the figures this report carries into `current`, the reading the
+    /// account already has from a probe or the cache, observed at
     /// `observed_at`, and says whether it took them.
     ///
-    /// A report older than the snapshot is dropped rather than rewinding a
-    /// newer probe, unless the snapshot's stamp is further ahead than a clock
-    /// can drift - a stamp from before the clock was set back. A login report
-    /// carries no figures and is never taken.
-    pub fn apply(self, snapshot: &mut Option<UsageSnapshot>, observed_at: u64) -> bool {
-        if matches!(self, Self::CodexLogin(_)) {
-            return false;
-        }
-        if let Some(current) = snapshot
-            && current.observed_at > observed_at
-            && current.observed_at <= observed_at.saturating_add(schedule::CLOCK_SLACK)
+    /// A report only refines a reading: it carries the windows the CLI
+    /// happened to stream, not the plan, the credits or every model's window,
+    /// so an account without one waits for its probe. A report older than
+    /// `current` is dropped rather than rewinding a newer reading, unless
+    /// `current` is stamped further ahead of `now` than a clock can drift - a
+    /// stamp from before the clock was set back. A login report carries no
+    /// figures and is never taken.
+    pub fn apply(self, current: &mut UsageSnapshot, observed_at: u64, now: u64) -> bool {
+        if current.observed_at > observed_at
+            && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
         {
             return false;
         }
-        let snapshot = snapshot.get_or_insert_with(|| UsageSnapshot {
-            windows: Vec::new(),
-            credits: None,
-            status: UsageStatus::Ok,
-            observed_at,
-            source: UsageSource::Live,
-            plan: None,
-            detail: None,
-        });
         match self {
-            Self::Claude(update) => claude::merge_live(snapshot, update, observed_at),
-            Self::CodexLimits(update) => codex::merge_update(snapshot, update, observed_at),
-            Self::CodexLogin(_) => {}
+            Self::Claude(update) => claude::merge_live(current, update, observed_at),
+            Self::CodexLimits(update) => codex::merge_update(current, update, observed_at),
+            Self::CodexLogin(_) => return false,
         }
-        snapshot.observed_at = observed_at;
+        current.observed_at = observed_at;
         true
     }
 }
@@ -998,6 +989,57 @@ mod tests {
         );
         let next_month = format_local_moment(now + 30 * 86_400, now);
         assert!(next_month.starts_with("Oct"), "{next_month:?}");
+    }
+
+    /// A report older than the reading is dropped, however slightly - unless
+    /// the reading is stamped past any drift of the present, which only a
+    /// clock set back leaves behind.
+    #[test]
+    fn a_live_report_never_rewinds_a_newer_reading() {
+        const NOW: u64 = 1_790_000_000_000;
+        let report = || {
+            LiveReport::Claude(claude::LiveUpdate {
+                windows: vec![window("five_hour", WindowKind::Session, 0.4, None)],
+                status: None,
+            })
+        };
+        let reading = |observed_at| UsageSnapshot {
+            windows: vec![window("five_hour", WindowKind::Session, 0.1, None)],
+            credits: None,
+            status: UsageStatus::Ok,
+            observed_at,
+            source: UsageSource::Probe,
+            plan: Some("max".into()),
+            detail: None,
+        };
+
+        let mut newer = reading(NOW);
+        assert!(!report().apply(&mut newer, NOW - 1, NOW));
+        assert_eq!(newer, reading(NOW));
+        // However much older: the drift allowed is the reading's from the
+        // present, not the report's from the reading.
+        assert!(!report().apply(&mut newer, NOW - 10 * schedule::CLOCK_SLACK, NOW));
+        assert_eq!(newer, reading(NOW));
+
+        let mut older = reading(NOW - 1);
+        assert!(report().apply(&mut older, NOW, NOW));
+        assert_eq!(older.observed_at, NOW);
+        assert_eq!(older.source, UsageSource::Live);
+        assert_eq!(older.plan.as_deref(), Some("max"));
+        assert!((older.windows[0].used - 0.4).abs() < 1e-6);
+
+        // Stamped an hour ahead of a present that has not reached it.
+        let mut ahead = reading(NOW + 3_600_000);
+        assert!(report().apply(&mut ahead, NOW, NOW));
+        assert_eq!(ahead.observed_at, NOW);
+
+        let login = LiveReport::CodexLogin(codex::LoginUpdate {
+            chatgpt: true,
+            plan: None,
+        });
+        let mut untouched = reading(NOW - 1);
+        assert!(!login.apply(&mut untouched, NOW, NOW));
+        assert_eq!(untouched, reading(NOW - 1));
     }
 }
 

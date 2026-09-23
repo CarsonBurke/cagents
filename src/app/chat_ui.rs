@@ -3063,6 +3063,8 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                // Before the runtime is borrowed, as the account it reports
+                // on belongs to the whole window.
                 if matches!(wake, Wake::AccountUsage) {
                     return self.take_chat_account_usage(target);
                 }
@@ -3124,6 +3126,7 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         return Task::none();
                     }
+                    // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
                         runtime.disconnected = true;
@@ -4243,6 +4246,18 @@ mod tests {
                 .map(|snapshot| snapshot.windows[0].used)
         };
         let now = crate::chat::now_ms().unwrap();
+        // Live figures refine a reading the account already has.
+        let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+            id: account.clone(),
+            outcome: crate::account::probe::Outcome::Answered {
+                identity: None,
+                snapshot: crate::account::UsageSnapshot::state(
+                    crate::account::UsageStatus::Ok,
+                    "",
+                    now - 1,
+                ),
+            },
+        }));
         assert!(handle.push_account_usage_for_test(report(20), now));
         answer_start(&mut app, target, Ok(handle.clone()));
         assert_eq!(used(&app), Some(0.2));

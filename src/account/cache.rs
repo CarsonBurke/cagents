@@ -33,7 +33,7 @@ const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 1024 * 1024;
 /// How long an entry no configured account refers to is kept, in unix
 /// milliseconds.
-pub const ORPHAN_AFTER: u64 = 7 * 24 * 3_600_000;
+const ORPHAN_AFTER: u64 = 7 * 24 * 3_600_000;
 
 /// What is remembered about one account.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
