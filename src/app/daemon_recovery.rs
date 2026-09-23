@@ -2,7 +2,7 @@ use std::{path::Path, time::Duration};
 
 use crate::{
     control::ControlClient,
-    model::{HostSessionProof, LaunchRecipe, TerminalSession},
+    model::{HostSessionProof, TerminalSession},
     terminal::ensure_daemon_ready,
     upgrade::{ensure_no_surviving_process, exact_conversation},
 };
@@ -27,7 +27,10 @@ pub(super) fn reconcile(
         });
     }
     let socket = ensure_daemon_ready().map_err(|error| error.to_string())?;
-    reconcile_at(session, explicit_retry, &socket, Path::new("/proc"))
+    let id = session.id;
+    reconcile_at(session, explicit_retry, &socket, Path::new("/proc")).inspect_err(|error| {
+        tracing::warn!(terminal = %id, explicit_retry, %error, "terminal recovery refused");
+    })
 }
 
 fn reconcile_at(
@@ -110,9 +113,11 @@ fn reconcile_at(
     }
     let owner = crate::daemon::replacement_owner(socket, &proof)
         .map_err(|error| format!("cannot establish replacement daemon ownership: {error}"))?;
-    let planned_recipe = session
-        .agent_resume_recipe()
-        .unwrap_or_else(|| session.launch.clone());
+    // Explicit replay changes only the recipe policy, never the ownership evidence.
+    let plan = crate::upgrade::recovery_plan(&session);
+    let planned_recipe = plan
+        .as_ref()
+        .map_or_else(|_| session.launch.clone(), |(recipe, _)| recipe.clone());
     // A lost Spawn reply is not evidence that Spawn failed. Use one stable
     // candidate per source/daemon and discover it before authorizing a replay.
     let mut replacement_id = recovery_terminal_id(session.id, &proof);
@@ -170,8 +175,19 @@ fn reconcile_at(
     {
         return Err("daemon ownership changed during recovery".into());
     }
-    // Explicit replay changes only the recipe policy, never the ownership evidence.
-    let recipe = recovery_recipe(&session, explicit_retry)?;
+    let (recipe, kind) = match plan {
+        Ok((recipe, kind)) => (recipe, kind.label()),
+        Err(_) if explicit_retry => (session.launch.clone(), "explicit replay"),
+        Err(error) => return Err(error),
+    };
+    tracing::info!(
+        terminal = %session.id,
+        replacement = %replacement_id,
+        program = %recipe.program,
+        cwd = %recipe.working_directory.display(),
+        recovery = kind,
+        "relaunching a terminal whose daemon is gone"
+    );
     let mut replacement = super::fresh_terminal_relaunch(&session);
     replacement.id = replacement_id;
     replacement.recovery_origin = Some(session.recovery_origin.unwrap_or(session.id));
@@ -199,24 +215,11 @@ fn recovery_terminal_id(
     crate::model::TerminalId::from_uuid(uuid::Uuid::from_bytes(bytes))
 }
 
-fn recovery_recipe(
-    session: &TerminalSession,
-    explicit_retry: bool,
-) -> Result<LaunchRecipe, String> {
-    crate::upgrade::recovery_recipe(session).or_else(|error| {
-        if explicit_retry {
-            Ok(session.launch.clone())
-        } else {
-            Err(error)
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        model::{HostIncarnation, HostSessionId, TerminalContinuity, TerminalId},
+        model::{HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity, TerminalId},
         terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, TerminalDescriptor, read_frame, write_frame,
@@ -443,6 +446,41 @@ mod tests {
     }
 
     #[test]
+    fn agent_without_exact_identity_reopens_its_resume_picker_not_its_shell() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("replacement");
+        let mut original = session(directory.path(), &proof("old"));
+        // The shell's argv names nothing; the observation saw Claude inside it
+        // without establishing which conversation it held.
+        let agent = LaunchRecipe {
+            program: "claude".into(),
+            arguments: vec![
+                "--model".into(),
+                "sonnet".into(),
+                "--resume".into(),
+                "12345678-1234-4234-8234-123456789abc".into(),
+            ],
+            working_directory: directory.path().to_owned(),
+            environment: Default::default(),
+        };
+        original.resume_hint =
+            Some(serde_json::json!({ "version": 2, "recipe": agent }).to_string());
+        assert!(original.agent_resume_recipe().is_none());
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner.clone(), Vec::new(), 2);
+        let recovered = reconcile_at(original.clone(), false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(recovered.session.launch.program, "claude");
+        assert_eq!(
+            recovered.session.launch.arguments,
+            ["--model", "sonnet", "--resume"]
+        );
+        assert_eq!(recovered.session.resume_hint, None);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
     fn authenticated_exit_allows_only_explicit_relaunch() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
@@ -492,7 +530,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut original = session(directory.path(), &proof("old"));
         original.launch.arguments = vec!["-c".into(), "touch important-file".into()];
-        assert!(recovery_recipe(&original, false).is_err());
+        assert!(crate::upgrade::recovery_plan(&original).is_err());
     }
 
     #[test]

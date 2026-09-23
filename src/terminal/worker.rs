@@ -1614,13 +1614,15 @@ impl Worker {
     /// Timer-driven observation. The descent is only worth its cost while the
     /// foreground group is moving, so an unchanged group backs the interval
     /// off and skips the walk outright once it has found no agent to track.
-    /// A terminal nobody is watching is never observed here at all: it can
-    /// only change what a snapshot nobody reads would have shown.
+    ///
+    /// A hidden terminal is still observed, at the longest interval: its saved
+    /// resume hint is what recovery relies on when the daemon goes away, and
+    /// an agent can `/resume` or `/clear` into another conversation without
+    /// ever leaving the foreground or drawing a title anyone sees.
     fn observe_foreground(&mut self) {
-        if self.visibility != Visibility::Visible || self.agent_exited {
-            // Nothing here can change anything anyone reads, so let the timer
-            // settle to its longest interval rather than waking every 2s for
-            // the rest of this terminal's life.
+        if self.agent_exited {
+            // Nothing here can change again, so let the timer settle to its
+            // longest interval rather than waking for the rest of its life.
             self.foreground_poll = FOREGROUND_POLL_MAX;
             return;
         }
@@ -1631,6 +1633,9 @@ impl Worker {
             }
         }
         self.refresh_resume_hint(true);
+        if self.visibility != Visibility::Visible {
+            self.foreground_poll = FOREGROUND_POLL_MAX;
+        }
     }
 
     fn refresh_resume_hint(&mut self, force: bool) {
@@ -2848,7 +2853,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_observation_backs_off_and_skips_unwatched_terminals() {
+    fn foreground_observation_backs_off_and_slows_for_unwatched_terminals() {
         // A long-lived child keeps the foreground group stable for the whole
         // test, so every tick below takes its "nothing changed" path.
         let (mut worker, _) = capture_worker_for(LaunchRecipe {
@@ -2868,9 +2873,12 @@ mod tests {
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN * 4);
         assert_eq!(worker.resume_foreground, worker.foreground_group());
 
-        // A terminal nobody is watching is never observed on the timer.
+        // A terminal nobody is watching is still observed, at the slowest
+        // interval, so its saved identity stays current for recovery.
         worker.set_hidden();
+        worker.resume_foreground = None;
         worker.observe_foreground();
+        assert_eq!(worker.resume_foreground, worker.foreground_group());
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MAX);
 
         // Revealing it makes the next observation prompt again.

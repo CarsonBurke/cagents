@@ -133,7 +133,7 @@ pub enum DaemonCommand {
         /// Authorize interruption and resumption of all supported hosted sessions.
         #[arg(long)]
         yes: bool,
-        /// Start fresh conversations for identified agents without an exact resume ID.
+        /// Relaunch identified agents without an exact resume ID into their resume picker.
         /// Without this or --no-relaunch-agents, Settings decides; it defaults to on.
         #[arg(long, conflicts_with = "no_relaunch_agents")]
         relaunch_agents: bool,

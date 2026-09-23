@@ -246,7 +246,7 @@ in the currently installed CLI and daemon.
 | --- | --- |
 | `--restart-daemon` | Checkpoint supported sessions and replace the running daemon |
 | `--require-empty-daemon` | With `--restart-daemon`, refuse rather than interrupt live sessions |
-| `--relaunch-agents` | With `--restart-daemon`, accept fresh conversations for agents that have no exact resume identity (requires an installed CLI that can record this) |
+| `--relaunch-agents` | With `--restart-daemon`, relaunch agents that have no exact resume identity into their resume picker (requires an installed CLI that can record this) |
 | `--no-relaunch-agents` | With `--restart-daemon`, refuse the upgrade while any agent has no exact resume identity |
 
 Without either relaunch option, the installed CLI decides: it follows the

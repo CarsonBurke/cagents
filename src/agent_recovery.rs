@@ -60,6 +60,55 @@ pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
     Some(recipe)
 }
 
+/// Reopen the provider's own conversation picker with the same supported
+/// configuration. This recovers a recognised agent whose exact conversation
+/// was never established: nothing is guessed, resumed or replayed, and the
+/// user chooses the conversation - or a new one - themselves.
+///
+/// Every selector the launch carried is dropped, whether an exact ID, a picker
+/// search term or a latest-session shortcut, since the picker supersedes it.
+pub fn picker_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
+    let provider = Provider::from_program(&launch.program)?;
+    let mut arguments = Vec::with_capacity(launch.arguments.len());
+    let mut args = launch.arguments.iter().peekable();
+    while let Some(argument) = args.next() {
+        let flag = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(flag, _)| flag);
+        let latest = match provider {
+            Provider::Codex => flag == "--last",
+            _ => matches!(flag, "--continue" | "-c"),
+        };
+        if latest {
+            continue;
+        }
+        if provider.is_identity_option(flag) {
+            // Claude's and OMP's selectors take an optional value; Codex's
+            // subcommand an optional positional ID.
+            if flag == argument.as_str() && args.peek().is_some_and(|value| !value.starts_with('-'))
+            {
+                args.next();
+            }
+            continue;
+        }
+        arguments.push(argument.clone());
+    }
+    let mut recipe = interactive_recipe(
+        &LaunchRecipe {
+            arguments,
+            ..launch.clone()
+        },
+        false,
+    )?;
+    provider.append_resume_picker(&mut recipe.arguments);
+    Some(recipe)
+}
+
+/// Whether `recipe` is exactly the picker `picker_recipe` builds for it.
+pub fn is_picker_recipe(recipe: &LaunchRecipe) -> bool {
+    picker_recipe(recipe).as_ref() == Some(recipe)
+}
+
 fn interactive_recipe(launch: &LaunchRecipe, resume: bool) -> Option<LaunchRecipe> {
     let provider = Provider::from_program(&launch.program)?;
     if launch.arguments.len() > 128
@@ -194,6 +243,14 @@ pub fn observed_hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
     })
     .ok()?;
     (hint.len() <= MAX_HINT_BYTES).then_some(hint)
+}
+
+/// Whether `hint` records an agent observed running without an exact
+/// conversation. That observation is newer than the terminal's launch argv,
+/// which may name a conversation the agent has since left.
+pub fn hint_lacks_identity(hint: &str) -> bool {
+    hint.len() <= MAX_HINT_BYTES
+        && serde_json::from_str::<AgentResumeHint>(hint).is_ok_and(|hint| hint.version == 2)
 }
 
 pub fn observed_launch_from_hint(hint: &str) -> Option<LaunchRecipe> {
@@ -1978,6 +2035,73 @@ mod tests {
             environment: BTreeMap::new(),
         }
     }
+    #[test]
+    fn picker_recipe_drops_every_selector_and_opens_the_provider_picker() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let claude = picker_recipe(&launch(
+            "claude",
+            &["--resume", id, "--model", "sonnet", "--bare"],
+        ))
+        .unwrap();
+        assert_eq!(
+            claude.arguments,
+            ["--model", "sonnet", "--bare", "--resume"]
+        );
+        assert!(is_picker_recipe(&claude));
+        // A picker search term, a latest-session shortcut and an assigned ID
+        // are all selectors the picker supersedes.
+        for arguments in [
+            &["-r", "search term"][..],
+            &["--continue"],
+            &["-c"],
+            &["--session-id", id],
+            &[&format!("--resume={id}")],
+            &["--resume"],
+        ] {
+            assert_eq!(
+                picker_recipe(&launch("claude", arguments))
+                    .unwrap()
+                    .arguments,
+                ["--resume"],
+                "{arguments:?}"
+            );
+        }
+        let codex = picker_recipe(&launch("codex", &["resume", id, "-c", "model=o3"])).unwrap();
+        assert_eq!(codex.arguments, ["resume", "-c", "model=o3"]);
+        assert!(is_picker_recipe(&codex));
+        assert_eq!(
+            picker_recipe(&launch("codex", &["resume", "--last", "-m", "o3"]))
+                .unwrap()
+                .arguments,
+            ["resume", "-m", "o3"]
+        );
+        let omp = picker_recipe(&launch(
+            "omp",
+            &["--session-dir", "/sessions", "--resume", id],
+        ))
+        .unwrap();
+        assert_eq!(omp.arguments, ["--session-dir", "/sessions", "--resume"]);
+        assert!(is_picker_recipe(&omp));
+        // Prompts and unknown options stay refused: nothing is ever replayed.
+        assert!(picker_recipe(&launch("claude", &["--model", "sonnet", "do it again"])).is_none());
+        assert!(picker_recipe(&launch("claude", &["--unknown-permission-mode"])).is_none());
+        assert!(picker_recipe(&launch("/bin/sh", &[])).is_none());
+        // Neither a fresh nor an exact recipe passes for a picker.
+        assert!(!is_picker_recipe(&launch("claude", &["--model", "sonnet"])));
+        assert!(!is_picker_recipe(&launch("claude", &["--resume", id])));
+    }
+
+    #[test]
+    fn a_hint_without_identity_is_recognised_as_such() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let exact = hint_from_launch(&launch("claude", &["--resume", id])).unwrap();
+        let observed =
+            observed_hint_from_launch(&launch("claude", &["--model", "sonnet"])).unwrap();
+        assert!(!hint_lacks_identity(&exact));
+        assert!(hint_lacks_identity(&observed));
+        assert!(!hint_lacks_identity("not a hint"));
+    }
+
     #[test]
     fn npm_launchers_resolve_exact_sessions_without_selecting_server_processes() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";
