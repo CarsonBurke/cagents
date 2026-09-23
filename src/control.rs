@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
@@ -309,6 +309,12 @@ pub struct ControlClient {
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
+    /// Native chats this connection is attached to, whose change and activity
+    /// notifications the daemon interleaves with responses.
+    ///
+    /// Attaching is only how this client earns the right to close a chat; it
+    /// reads nothing from the chat's notifications, so they are dropped.
+    attached_chats: BTreeSet<TerminalId>,
 }
 
 impl ControlClient {
@@ -336,6 +342,7 @@ impl ControlClient {
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
+            attached_chats: BTreeSet::new(),
         })
     }
 
@@ -474,16 +481,47 @@ impl ControlClient {
     /// attaches first with the session as the inventory reported it. Closing
     /// interrupts the provider's work and frees the conversation; it is what
     /// worktree deletion does to the chats still running inside the directory.
+    ///
+    /// Attached, this connection is sent the chat's notifications until the
+    /// close removes it - the interrupt the close delivers is itself reported
+    /// as activity - so they are expected between the requests' responses.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
         let chat_id = session.id;
-        match self.request_strict(ClientRequest::ChatAttach { session })? {
-            ServerResponse::ChatAttached { .. } => {}
-            response => return Err(unexpected_response("a native chat attachment", &response)),
+        // The daemon subscribes this connection before it answers the
+        // attachment, so the chat's notifications can arrive ahead of that
+        // answer.
+        self.attached_chats.insert(chat_id);
+        let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
+            Ok(ServerResponse::ChatAttached { .. }) => self
+                .request_strict(ClientRequest::ChatClose { chat_id })
+                .and_then(|response| match response {
+                    ServerResponse::ChatClosed { .. } => Ok(()),
+                    response => Err(unexpected_response("a native chat close", &response)),
+                }),
+            Ok(response) => Err(unexpected_response("a native chat attachment", &response)),
+            // The daemon refuses an attachment before it subscribes anyone.
+            Err(error @ ControlError::Remote { .. }) => {
+                self.attached_chats.remove(&chat_id);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let detached = match &closed {
+            // The daemon removed the chat, and every notification about it,
+            // before answering.
+            Ok(()) => true,
+            // The daemon answered, so the connection is still in step and can
+            // stop the notifications of a chat it did not close.
+            Err(ControlError::Remote { .. } | ControlError::UnexpectedResponse { .. }) => matches!(
+                self.request_strict(ClientRequest::ChatDetach { chat_id }),
+                Ok(ServerResponse::Detached)
+            ),
+            Err(_) => false,
+        };
+        if detached {
+            self.attached_chats.remove(&chat_id);
         }
-        match self.request_strict(ClientRequest::ChatClose { chat_id })? {
-            ServerResponse::ChatClosed { .. } => Ok(()),
-            response => Err(unexpected_response("a native chat close", &response)),
-        }
+        closed
     }
 
     pub fn resolve_upgrade_chat(
@@ -815,21 +853,19 @@ impl ControlClient {
                     terminal_id: actual,
                     ..
                 } if actual == terminal_id => {}
-                // A subscribed connection can be told about another client's
-                // terminal at any point, including mid-replay.
-                ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
-                ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                    self.observed_model.push_back((sequence, edit));
-                }
                 ServerMessage::Synchronized {
                     terminal_id: actual,
                     ..
                 } if actual == terminal_id => return Ok(()),
+                // A subscribed connection can be told about another client's
+                // terminal at any point, including mid-replay.
                 message => {
-                    return Err(ControlError::UnexpectedMessage {
-                        expected: "the terminal attachment replay",
-                        actual: message_name(&message),
-                    });
+                    if let Err(message) = self.absorb(message) {
+                        return Err(ControlError::UnexpectedMessage {
+                            expected: "the terminal attachment replay",
+                            actual: message_name(&message),
+                        });
+                    }
                 }
             }
         }
@@ -933,26 +969,45 @@ impl ControlClient {
                     });
                 }
                 Some(_) => return response_from_message(envelope.message),
-                // Only a connection that subscribed receives this, and it must
-                // survive the request it interrupted.
-                None => match envelope.message {
-                    ServerMessage::TerminalCreated { terminal } => {
-                        self.observed.push_back(terminal);
-                    }
-                    ServerMessage::WorkspaceModelEdited { sequence, edit } => {
-                        self.observed_model.push_back((sequence, edit));
-                    }
-                    message
+                None => match self.absorb(envelope.message) {
+                    Ok(()) => {}
+                    Err(message)
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
-                    _ => {
-                        return Err(ControlError::RequestIdMismatch {
-                            expected: request_id,
-                            actual: None,
+                    // The daemon's notice that it is dropping this connection,
+                    // such as an overflowing delivery queue, says why.
+                    Err(message @ ServerMessage::Error(_)) => {
+                        return response_from_message(message);
+                    }
+                    Err(message) => {
+                        return Err(ControlError::UnexpectedMessage {
+                            expected: "a correlated response",
+                            actual: message_name(&message),
                         });
                     }
                 },
             }
         }
+    }
+
+    /// Takes an unsolicited message this connection asked for, or hands it
+    /// back.
+    ///
+    /// Only a connection that subscribed or attached receives these, at any
+    /// point between a request and its response, and it must survive the
+    /// request they interrupt.
+    fn absorb(&mut self, message: ServerMessage) -> Result<(), ServerMessage> {
+        match message {
+            ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
+            ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                self.observed_model.push_back((sequence, edit));
+            }
+            ServerMessage::ChatChanged { chat_id }
+            | ServerMessage::ChatObserved { chat_id, .. }
+            | ServerMessage::ChatActivity { chat_id, .. }
+                if self.attached_chats.contains(&chat_id) => {}
+            message => return Err(message),
+        }
+        Ok(())
     }
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
@@ -3191,7 +3246,13 @@ mod tests {
             assert!(matches!(
                 (malformed, error),
                 (0, ControlError::ProofMismatch)
-                    | (1, ControlError::RequestIdMismatch { actual: None, .. })
+                    | (
+                        1,
+                        ControlError::UnexpectedMessage {
+                            actual: "redraw",
+                            ..
+                        }
+                    )
             ));
             server.join().unwrap();
         }
@@ -3295,6 +3356,271 @@ mod tests {
         );
         server.join().unwrap();
     }
+    /// Closing a chat attaches this connection to it, and the interrupt the
+    /// close delivers is reported to every attached client before the answer.
+    /// Neither the close nor the requests after it may mistake that report for
+    /// a stray response; a chat this connection never attached still may not
+    /// interleave.
+    #[test]
+    fn closing_a_chat_survives_its_own_notifications_but_no_one_elses() {
+        use crate::agent::ActivityState;
+
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+        };
+        let session = |id| crate::chat::Session {
+            id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: recipe.clone(),
+                session_id: None,
+            },
+            proof: Some(pinned.clone()),
+            terminal: None,
+        };
+        let [closed, refused, elsewhere] =
+            [TerminalId::new(), TerminalId::new(), TerminalId::new()];
+        let peer_proof = pinned.clone();
+        let server = thread::spawn(move || {
+            let send = |stream: &mut UnixStream, request_id, message| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: peer_proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let respond = |stream: &mut UnixStream, request_id, response| {
+                send(
+                    stream,
+                    Some(request_id),
+                    ServerMessage::Response { response },
+                );
+            };
+            let activity = |chat_id, state: ActivityState| ServerMessage::ChatActivity {
+                chat_id,
+                state,
+                generation: 1,
+            };
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+
+            // A close the daemon carries out.
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            let ClientRequest::ChatAttach { session } = attach.request else {
+                panic!("expected an attachment, got {:?}", attach.request);
+            };
+            assert_eq!(session.id, closed);
+            // Subscribed before the answer is queued, a working chat can
+            // report ahead of it.
+            send(
+                &mut server_stream,
+                None,
+                activity(closed, ActivityState::Working),
+            );
+            respond(
+                &mut server_stream,
+                attach.request_id,
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: crate::chat::Snapshot::default(),
+                },
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatObserved {
+                    chat_id: closed,
+                    epoch: 1,
+                },
+            );
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(close.request, ClientRequest::ChatClose { chat_id: closed });
+            send(
+                &mut server_stream,
+                None,
+                activity(closed, ActivityState::Idle),
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatChanged { chat_id: closed },
+            );
+            respond(
+                &mut server_stream,
+                close.request_id,
+                ServerResponse::ChatClosed {
+                    chat_id: closed,
+                    snapshot: crate::chat::Snapshot::default(),
+                },
+            );
+
+            // A close the daemon refuses: the connection detaches instead.
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            let ClientRequest::ChatAttach { session } = attach.request else {
+                panic!("expected an attachment, got {:?}", attach.request);
+            };
+            respond(
+                &mut server_stream,
+                attach.request_id,
+                ServerResponse::ChatAttached {
+                    session,
+                    snapshot: crate::chat::Snapshot::default(),
+                },
+            );
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            send(
+                &mut server_stream,
+                None,
+                activity(refused, ActivityState::Working),
+            );
+            send(
+                &mut server_stream,
+                Some(close.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "The thread changed while its previous actor was closing.",
+                    false,
+                )),
+            );
+            let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                detach.request,
+                ClientRequest::ChatDetach { chat_id: refused }
+            );
+            send(
+                &mut server_stream,
+                None,
+                activity(refused, ActivityState::Idle),
+            );
+            respond(
+                &mut server_stream,
+                detach.request_id,
+                ServerResponse::Detached,
+            );
+
+            // A refused attachment subscribes nothing, so nothing is detached.
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            send(
+                &mut server_stream,
+                Some(attach.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "Exact native chat not found; no replacement process was spawned",
+                    false,
+                )),
+            );
+
+            // The connection stays in step for the next request, and a chat it
+            // never attached cannot answer for it.
+            let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(list.request, ClientRequest::ChatList);
+            respond(
+                &mut server_stream,
+                list.request_id,
+                ServerResponse::ChatListed {
+                    sessions: Vec::new(),
+                },
+            );
+            let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            send(
+                &mut server_stream,
+                None,
+                activity(elsewhere, ActivityState::Idle),
+            );
+            respond(
+                &mut server_stream,
+                list.request_id,
+                ServerResponse::ChatListed {
+                    sessions: Vec::new(),
+                },
+            );
+        });
+
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client.close_chat(session(closed)).unwrap();
+        assert!(matches!(
+            client.close_chat(session(refused)),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.close_chat(session(elsewhere)),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                ..
+            })
+        ));
+        assert!(client.attached_chats.is_empty());
+        assert!(client.list_chats().unwrap().is_empty());
+        assert!(matches!(
+            client.list_chats(),
+            Err(ControlError::UnexpectedMessage {
+                actual: "chat_activity",
+                ..
+            })
+        ));
+        server.join().unwrap();
+    }
+
+    /// The daemon says why it is dropping a connection in an untagged error;
+    /// the request that error interrupts reports it rather than a stray frame.
+    #[test]
+    fn an_untagged_daemon_error_fails_the_pending_request_with_its_reason() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let peer_proof = pinned.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: peer_proof,
+                    message: ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::QueueFull,
+                        "client delivery queue overflowed",
+                        true,
+                    )),
+                },
+            )
+            .unwrap();
+        });
+
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(matches!(
+            client.list_chats(),
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::QueueFull,
+                retryable: true,
+                ..
+            })
+        ));
+        server.join().unwrap();
+    }
+
     #[test]
     fn ui_launch_handshake_surfaces_child_startup_errors() {
         parse_ui_launch_handshake(UI_LAUNCH_READY.as_bytes()).unwrap();
