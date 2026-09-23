@@ -25,8 +25,7 @@ use crate::{
         normalize_project_channels,
     },
     secure_file::{
-        migrate_existing_private_file, open_existing_private_file, prepare_private_directory,
-        validate_and_privatize_open_file,
+        migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
     },
 };
 
@@ -355,7 +354,7 @@ impl StateStore {
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
-        drop(open_existing_private_file(source)?);
+        enforce_private_database(source)?;
         let parent = destination
             .parent()
             .ok_or_else(|| StoreError::InvalidState("window database has no parent".into()))?;
@@ -428,7 +427,7 @@ impl StateStore {
         enforce_sqlite_sidecars(path)?;
         migrate(&mut connection)?;
         let recovery = reconcile_startup(&mut connection, &boot_id)?;
-        drop(open_existing_private_file(path)?);
+        enforce_private_database(path)?;
         enforce_sqlite_sidecars(path)?;
 
         Ok(Self {
@@ -1613,12 +1612,30 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+// SQLite locks a database and its wal-index with POSIX advisory locks, and
+// closing any descriptor of a file drops every such lock the process holds
+// on it. A store's files are therefore checked by path, never opened: a
+// descriptor opened and closed beside a live connection would leave that
+// connection unlocked, free for another to checkpoint and delete its WAL.
+
+/// Checks, without opening it, that the database at `path` is a private
+/// regular file of this user.
+fn enforce_private_database(path: &Path) -> io::Result<()> {
+    if migrate_existing_private_file(path)? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} does not exist", path.display()),
+        ))
+    }
+}
+
+/// Checks, without opening them, whichever of the database's `-wal` and
+/// `-shm` files exist.
 fn enforce_sqlite_sidecars(path: &Path) -> io::Result<()> {
     for suffix in ["-wal", "-shm"] {
-        let sidecar = sqlite_sidecar_path(path, suffix);
-        if migrate_existing_private_file(&sidecar)? {
-            drop(open_existing_private_file(&sidecar)?);
-        }
+        migrate_existing_private_file(&sqlite_sidecar_path(path, suffix))?;
     }
     Ok(())
 }
@@ -1630,9 +1647,7 @@ fn prepare_private_database(path: &Path) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     prepare_private_directory(parent)?;
     enforce_sqlite_sidecars(path)?;
-    if migrate_existing_private_file(path)? {
-        drop(open_existing_private_file(path)?);
-    } else {
+    if !migrate_existing_private_file(path)? {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -3833,6 +3848,69 @@ mod tests {
 
     fn boot(value: &str) -> BootId {
         BootId::new(value)
+    }
+
+    const VISITOR_TEST: &str = "persistence::tests::another_process_visits_the_store";
+    const VISITOR_ENV: &str = "CAGENTS_STORE_VISITOR_DATABASE";
+
+    /// Run only as the child of `an_open_store_keeps_its_wal_from_other_processes`:
+    /// another process - a second window, `sqlite3`, a backup - that opens the
+    /// store read-write and closes it again.
+    #[test]
+    fn another_process_visits_the_store() {
+        let Some(path) = std::env::var_os(VISITOR_ENV) else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let connection = Connection::open(&path).unwrap();
+        let _: i64 = connection
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        connection.close().unwrap();
+        fs::write(sqlite_sidecar_path(&path, "-visited"), "visited").unwrap();
+    }
+
+    /// SQLite holds a store's POSIX locks for as long as the store is open,
+    /// which is how a closing connection elsewhere knows it is not the last
+    /// one and leaves the WAL alone. Opening the store must keep them: closing
+    /// any descriptor of a file drops every POSIX lock the process holds on it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_open_store_keeps_its_wal_from_other_processes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("visited.sqlite3");
+        let store = StateStore::open(&path, boot("visited")).unwrap();
+        store.save_window_view("before").unwrap();
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        assert!(wal.exists());
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", VISITOR_TEST, "--test-threads=1"])
+            .env(VISITOR_ENV, &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        // `--exact` matching nothing also exits zero.
+        assert!(sqlite_sidecar_path(&path, "-visited").exists());
+
+        // Taking itself for the last connection, the visitor would have
+        // checkpointed the WAL and deleted it, and the store would go on
+        // committing into a file nothing reads.
+        assert!(wal.exists(), "the visitor deleted the open store's WAL");
+        store.save_window_view("after").unwrap();
+        let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let view: String = reader
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'window_view_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(view, "after");
     }
 
     fn recipe() -> LaunchRecipe {
