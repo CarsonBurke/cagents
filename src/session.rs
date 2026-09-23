@@ -2179,6 +2179,65 @@ mod tests {
         reopened.shutdown();
     }
 
+    /// Worktree ids are derived from their path, so creating a worktree where a
+    /// deleted one lived reuses the tombstoned id. That save used to be refused
+    /// forever, exhausting the lane and stranding every catalog write after it
+    /// (#245).
+    #[test]
+    fn worktree_recreated_at_a_deleted_path_reopens_its_catalog_row() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot = BootId::new("boot-recreate");
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "cagents".into(),
+            repository: PathBuf::from("/repo/cagents"),
+            existence: Existence::Open,
+        };
+        let worktree = WorktreeState {
+            id: WorktreeId::new(),
+            project_id: project.id,
+            generation: 0,
+            path: PathBuf::from("/repo/cagents/worktrees/feature"),
+            branch: Some("feature".into()),
+            existence: Existence::Open,
+        };
+        let deleted = WorktreeState {
+            existence: Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: 1,
+                    reason: Some("worktree deleted by user".into()),
+                },
+            },
+            ..worktree.clone()
+        };
+        let timeout = Duration::from_secs(5);
+        runtime.save_project(project);
+        runtime.save_worktrees([worktree.clone()]);
+        runtime.flush(timeout).unwrap();
+        runtime.save_worktrees([deleted]);
+        runtime.flush(timeout).unwrap();
+
+        runtime.save_worktrees([worktree.clone()]);
+        runtime.flush(timeout).unwrap();
+        runtime.shutdown();
+        assert_eq!(runtime.last_error(), None);
+
+        let (mut reopened, _) = SessionRuntime::open(&path, boot).unwrap();
+        let (_, worktrees) = reopened.take_catalog();
+        assert_eq!(
+            worktrees,
+            vec![WorktreeState {
+                generation: 3,
+                ..worktree
+            }]
+        );
+        reopened.shutdown();
+    }
+
     #[test]
     fn transient_write_failure_retries_without_losing_snapshot() {
         let directory = tempdir().unwrap();

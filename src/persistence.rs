@@ -630,12 +630,12 @@ impl StateStore {
         let worktree_id = worktree.id.to_string();
         let actual = select_generation(&transaction, SELECT_WORKTREE_GENERATION, &worktree_id)?;
         check_generation("worktree", worktree.id, worktree.generation, actual)?;
-        reject_tombstone_resurrection(
-            "worktree",
-            worktree.id,
-            select_existence(&transaction, SELECT_WORKTREE_EXISTENCE, &worktree_id)?,
-            &worktree.existence,
-        )?;
+        // Unlike a card or project, a tombstoned worktree may reopen. Its id is
+        // derived from its path and Git is the authority on what exists there,
+        // so a worktree created where a deleted one lived is that identity
+        // again, not a stale write resurrecting it. Refusing it would fail
+        // every retry, and once retries ran out the writer would stop
+        // scheduling later changes.
         let next = next_generation(worktree.generation, "worktree", worktree.id)?;
         transaction
             .prepare_cached(
@@ -1941,8 +1941,6 @@ const SELECT_WORKSPACE_EXISTENCE: &str =
 const SELECT_PROJECT_GENERATION: &str = "SELECT generation FROM projects WHERE project_id = ?1";
 const SELECT_PROJECT_EXISTENCE: &str = "SELECT existence_json FROM projects WHERE project_id = ?1";
 const SELECT_WORKTREE_GENERATION: &str = "SELECT generation FROM worktrees WHERE worktree_id = ?1";
-const SELECT_WORKTREE_EXISTENCE: &str =
-    "SELECT existence_json FROM worktrees WHERE worktree_id = ?1";
 const SELECT_TRANSCRIPT_GENERATION: &str =
     "SELECT generation FROM transcript_metadata WHERE terminal_id = ?1";
 const SELECT_CARD_WORKSPACE: &str = "SELECT workspace_id FROM cards WHERE card_id = ?1";

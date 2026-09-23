@@ -75,7 +75,7 @@ pub enum Action {
     AwaitSessions(Target),
     Deleted {
         target: Target,
-        result: Result<Option<String>, String>,
+        result: Result<(), String>,
     },
     AvatarLoaded {
         owner: OwnerKey,
@@ -325,12 +325,6 @@ impl Cagents {
                     dialog.failure = None;
                     return Task::none();
                 }
-                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
-                    let dialog = self.project_ui.dialog.as_mut().unwrap();
-                    dialog.failure =
-                        Some("The session store is unavailable, so the deletion was not recorded. Reopen the window and try again.".to_owned());
-                    return Task::none();
-                };
                 let dialog = self.project_ui.dialog.as_mut().unwrap();
                 dialog.pending = true;
                 dialog.blocker = None;
@@ -348,11 +342,10 @@ impl Cagents {
                 }
                 return cosmic::task::future(async move {
                     let request = target.clone();
-                    let result =
-                        tokio::task::spawn_blocking(move || delete_worktree(&request, &store))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
+                    let result = tokio::task::spawn_blocking(move || delete_worktree(&request))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
                     Message::ProjectUi(Action::Deleted { target, result })
                 });
             }
@@ -367,7 +360,7 @@ impl Cagents {
                         dialog.failure = Some(failure);
                     }
                 }
-                Ok(warning) => {
+                Ok(()) => {
                     self.project_ui.dialog = None;
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
@@ -395,16 +388,31 @@ impl Cagents {
                     let emptied = self.close_emptied_channels(&ids);
                     self.worktree_offsets.remove(&target.path);
                     self.worktree_focus.remove(&target.path);
-                    if let Some(project) = self
+                    let removed = self
                         .sidebar_model
                         .projects
                         .iter_mut()
                         .find(|project| project.id == target.project)
-                    {
-                        project
-                            .worktrees
-                            .retain(|worktree| Some(worktree.id) != target.worktree);
+                        .and_then(|project| {
+                            let index = project
+                                .worktrees
+                                .iter()
+                                .position(|worktree| Some(worktree.id) == target.worktree)?;
+                            Some(project.worktrees.remove(index))
+                        });
+                    // Queued behind any save of the open worktree, so the
+                    // tombstone is the catalog's last word on it.
+                    if let (Some(id), Some(session)) = (target.worktree, &self.session) {
+                        session.save_worktrees([WorktreeState {
+                            id,
+                            project_id: target.project,
+                            generation: 0,
+                            path: target.path.clone(),
+                            branch: removed.and_then(|worktree| worktree.branch),
+                            existence: removed_existence("worktree deleted by user"),
+                        }]);
                     }
+                    self.forget_worktree_creation(&target.path);
                     let scope = if self.active_workspace.as_ref() == Some(&target.path) {
                         target.repository.clone()
                     } else {
@@ -414,10 +422,9 @@ impl Cagents {
                     };
                     let select = self.select_worktree(scope, false);
                     self.persist();
-                    self.status = Some(match warning {
-                        Some(warning) => TransientNotice::error(warning),
-                        None => TransientNotice::success("Worktree deleted; branch retained."),
-                    });
+                    self.status = Some(TransientNotice::success(
+                        "Worktree deleted; branch retained.",
+                    ));
                     let refresh =
                         self.repository_load_task(target.repository, Some(target.project), false);
                     return Task::batch([
@@ -716,23 +723,17 @@ fn close_worktree_sessions(target: &Target) -> Result<(), String> {
     Ok(())
 }
 
-fn delete_worktree(
-    target: &Target,
-    store: &crate::persistence::StateStore,
-) -> Result<Option<String>, String> {
+/// Removes the worktree through Git once Git confirms it is the one the user
+/// chose and is safe to remove.
+///
+/// Git's listing is the authority here, not the window's catalog: the catalog
+/// is written behind the UI and may not have caught up with a worktree created
+/// moments ago. The deletion is recorded in the catalog afterwards, on the same
+/// ordered lane as every other catalog write.
+fn delete_worktree(target: &Target) -> Result<(), String> {
     let id = target
         .worktree
         .ok_or("The primary repository cannot be deleted.")?;
-    let durable = store
-        .load_worktree(id)
-        .map_err(|error| format!("Cannot verify durable worktree: {error}"))?
-        .ok_or("Wait for the worktree catalog to finish saving, then try again.")?;
-    if !durable.existence.is_open()
-        || durable.project_id != target.project
-        || durable.path != target.path
-    {
-        return Err("Durable worktree identity changed; refresh before deleting.".into());
-    }
     let service = RepositoryService::system("git");
     let cancellation = CancellationToken::default();
     let records = service
@@ -777,18 +778,185 @@ fn delete_worktree(
             return Err(error.to_string());
         }
     }
-    let saved = (|| -> Result<(), String> {
-        let mut worktree = store
-            .load_worktree(id)
-            .map_err(|error| error.to_string())?
-            .ok_or("Removed worktree was not present in durable catalog.")?;
-        worktree.existence = removed_existence("worktree deleted by user");
-        store
-            .save_worktree(&worktree)
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    })();
-    Ok(saved
-        .err()
-        .map(|error| format!("Worktree removed, but catalog persistence failed: {error}")))
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A worktree deleted before the catalog ever stored it is still recorded
+    /// as deleted, and the tombstone lands after a save of it as open that was
+    /// still queued (#245).
+    #[test]
+    fn deletion_records_its_tombstone_without_waiting_for_the_catalog() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("test"),
+        )
+        .unwrap();
+        app.session = Some(session);
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let id = linked.id;
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![
+                SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    repository.clone(),
+                    Some("main".into()),
+                ),
+                linked.clone(),
+            ],
+            Vec::new(),
+        ));
+        let session = app.session.as_ref().unwrap();
+        session.save_project(ProjectState {
+            id: project,
+            generation: 0,
+            name: "repo".into(),
+            repository: repository.clone(),
+            existence: Existence::Open,
+        });
+
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        // A repository refresh that listed the worktree before Git removed it.
+        app.session
+            .as_ref()
+            .unwrap()
+            .save_worktrees([WorktreeState {
+                id,
+                project_id: project,
+                generation: 0,
+                path: linked.path.clone(),
+                branch: Some("feature".into()),
+                existence: Existence::Open,
+            }]);
+        let _ = app.handle_project_action(Action::Deleted {
+            target,
+            result: Ok(()),
+        });
+        assert!(app.project_ui.dialog.is_none());
+        assert!(
+            !app.sidebar_model.projects[0]
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.id == id)
+        );
+
+        let session = app.session.as_ref().unwrap();
+        let store = session.operation_store();
+        session.flush(Duration::from_secs(5)).unwrap();
+        let deleted = store.load_worktree(id).unwrap().unwrap();
+        assert!(!deleted.existence.is_open());
+        assert_eq!(deleted.project_id, project);
+        assert_eq!(deleted.path, linked.path);
+        assert_eq!(deleted.branch.as_deref(), Some("feature"));
+    }
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// With the catalog no longer consulted, Git's listing is the only guard
+    /// before the directory is removed. Each refusal leaves it in place. The
+    /// removal itself is not exercised: it first closes sessions through the
+    /// daemon, which a test must not reach.
+    #[test]
+    fn deletion_refuses_whatever_git_does_not_confirm_as_removable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        let linked = root.join("linked");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let records = RepositoryService::system("git")
+            .list_worktrees(&repository, &CancellationToken::default())
+            .unwrap();
+        let id_of = |path: &Path| {
+            records
+                .iter()
+                .find(|record| record.path == path)
+                .unwrap()
+                .id
+        };
+        let target = |worktree: Option<WorktreeId>, path: &Path| Target {
+            project: ProjectId::new(),
+            worktree,
+            repository: repository.clone(),
+            path: path.to_path_buf(),
+            label: "linked".into(),
+        };
+        let linked_id = id_of(&linked);
+        let refusal = |target: Target| delete_worktree(&target).unwrap_err();
+
+        assert_eq!(
+            refusal(target(None, &repository)),
+            "The primary repository cannot be deleted."
+        );
+        assert_eq!(
+            refusal(target(Some(id_of(&repository)), &repository)),
+            "The primary worktree cannot be deleted."
+        );
+        assert_eq!(
+            refusal(target(Some(WorktreeId::new()), &linked)),
+            "Worktree changed or disappeared; refresh before deleting."
+        );
+        assert_eq!(
+            refusal(target(Some(linked_id), &root.join("elsewhere"))),
+            "Worktree changed or disappeared; refresh before deleting."
+        );
+
+        std::fs::write(linked.join("scratch"), "work").unwrap();
+        assert_eq!(
+            refusal(target(Some(linked_id), &linked)),
+            "The worktree has changes; commit, stash, or discard them first."
+        );
+        std::fs::remove_file(linked.join("scratch")).unwrap();
+
+        git(&repository, &["worktree", "lock", linked.to_str().unwrap()]);
+        assert_eq!(
+            refusal(target(Some(linked_id), &linked)),
+            "The worktree is locked; unlock it explicitly in Git first."
+        );
+        assert!(linked.is_dir());
+    }
 }
