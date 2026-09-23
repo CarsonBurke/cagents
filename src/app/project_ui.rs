@@ -485,6 +485,21 @@ impl Cagents {
                             card.existence = removed_existence("worktree deleted by user");
                         }
                     }
+                    // A card filed under the worktree without running in it -
+                    // an adopted terminal or a provider sign-in, whose
+                    // directories no worktree owns - outlives the deletion,
+                    // so it moves to the repository rather than stay filed
+                    // under a row that no longer exists, where no strip would
+                    // show it again.
+                    let durable = Arc::make_mut(&mut self.durable);
+                    for id in &ids {
+                        durable.card_scopes.remove(id);
+                    }
+                    for scope in durable.card_scopes.values_mut() {
+                        if scope.starts_with(&target.path) {
+                            *scope = target.repository.clone();
+                        }
+                    }
                     let emptied = self.close_emptied_channels(&ids);
                     self.worktree_offsets.remove(&target.path);
                     self.worktree_focus.remove(&target.path);
@@ -1138,6 +1153,53 @@ mod tests {
         assert_eq!(deleted.project_id, project);
         assert_eq!(deleted.path, linked.path);
         assert_eq!(deleted.branch.as_deref(), Some("feature"));
+    }
+
+    /// A card filed under the worktree without running in it, such as a
+    /// provider sign-in started from its strip, outlives the deletion and
+    /// moves to the repository instead of under a row that is gone.
+    #[test]
+    fn a_card_filed_under_a_deleted_worktree_moves_to_its_repository() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let open = |app: &mut Cagents, directory: &str| {
+            let _ = app.add_terminal(PathBuf::from(directory));
+            let card = app.durable.cards.last().unwrap().id;
+            Arc::make_mut(&mut app.durable)
+                .card_scopes
+                .insert(card, linked.path.clone());
+            card
+        };
+        let sign_in = open(&mut app, "/home/reader");
+        let inside = open(&mut app, "/repo/worktrees/feature/src");
+
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::Deleted {
+            target,
+            result: Ok(()),
+        });
+
+        assert!(app.card_state(sign_in).unwrap().existence.is_open());
+        assert_eq!(app.durable.card_scopes.get(&sign_in), Some(&repository));
+        assert!(!app.card_state(inside).unwrap().existence.is_open());
+        assert!(!app.durable.card_scopes.contains_key(&inside));
     }
 
     /// The confirmation goes the moment it is answered, and the worktree's
