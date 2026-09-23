@@ -47,6 +47,43 @@ impl Cagents {
         self.close_card_as(card, true)
     }
 
+    /// Closes `card` from outside the strip on screen, which has no widget
+    /// for it to hand focus from. It only retires the card: whatever the
+    /// card ran must already have ended or been closed through the daemon,
+    /// as a worktree's deletion retires the cards it held.
+    pub(super) fn retire_offstrip_card(&mut self, card: CardId) -> Task<Message> {
+        if self.workspace.order().any(|id| id == card)
+            || self
+                .card_state(card)
+                .is_none_or(|state| !state.existence.is_open())
+        {
+            return Task::none();
+        }
+        // Read before anything persists the scope, which prunes the closed
+        // card from its channel's membership.
+        let emptied = self.channels_emptied_by(&[card]);
+        self.retire_lsp_card(card);
+        self.sidebar_state.clear_agent_activity(card);
+        self.sidebar_state.acknowledge_agent_update(card);
+        self.cards.remove(&card);
+        self.lifecycle.remove(card);
+        if let Some(state) = self.card_state_mut(card) {
+            state.existence = Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: unix_millis(),
+                    reason: Some("closed by user".into()),
+                },
+            };
+        }
+        let emptied = emptied
+            .into_iter()
+            .filter(|&channel| !self.channel_has_open_card(channel))
+            .collect();
+        self.persist();
+        Task::batch([self.delete_channels(emptied), self.sync_chrome()])
+    }
+
     fn close_card_as(&mut self, card: CardId, allow_active: bool) -> Task<Message> {
         if self.terminal_close.is_some() {
             return Task::none();
@@ -386,16 +423,28 @@ fn close_focus(index: usize) -> Task<Message> {
 }
 
 fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
+    close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
+}
+
+/// Asks the daemon to close `terminal`, provided the daemon is still the one
+/// `proof` names and still hosts it as that session. A terminal that has
+/// already ended counts as closed; one that is gone, or hosted under another
+/// proof, is `Stale` and left alone.
+pub(super) fn close_hosted_terminal(
+    terminal: TerminalId,
+    proof: &HostSessionProof,
+    allow_active: bool,
+) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
         let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
-        if client.proof() != &intent.proof || !intent.proof.is_complete() {
+        if client.proof() != proof || !proof.is_complete() {
             return Ok(CloseOutcome::Stale);
         }
         let terminals = client.list().map_err(|error| error.to_string())?;
         let Some(descriptor) = terminals
             .iter()
-            .find(|descriptor| descriptor.session.id == intent.terminal)
+            .find(|descriptor| descriptor.session.id == terminal)
         else {
             return Ok(CloseOutcome::Stale);
         };
@@ -404,12 +453,12 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
             | TerminalContinuity::RelaunchAvailable {
                 last_exit: Some(_), ..
             } => return Ok(CloseOutcome::Closed),
-            continuity if continuity.live_proof().as_ref() == Some(&intent.proof) => {}
+            continuity if continuity.live_proof().as_ref() == Some(proof) => {}
             _ => return Ok(CloseOutcome::Stale),
         }
         Ok(
             match client
-                .close_terminal_checked(intent.terminal, allow_active)
+                .close_terminal_checked(terminal, allow_active)
                 .map_err(|error| error.to_string())?
             {
                 TerminalCloseResult::Closed => CloseOutcome::Closed,
