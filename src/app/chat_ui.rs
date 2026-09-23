@@ -3797,9 +3797,8 @@ impl Cagents {
                     if let Some(runtime) = self.chat_runtime_mut(target) {
                         runtime.disconnected = true;
                         runtime.provider_closed = true;
-                        runtime.error = Some(
-                            "The restart was cancelled: its worktree is being deleted.".into(),
-                        );
+                        runtime.error =
+                            Some("Restart cancelled: the worktree was being deleted.".into());
                     }
                     self.observe_agent_activity_for_card(target.card, None);
                     return Task::none();
@@ -4629,6 +4628,13 @@ mod tests {
         assert!(app.chat_ui.closing.contains(&target));
         app.project_ui
             .begin_deleting(PathBuf::from(FIXTURE_DIRECTORY));
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: Provider::Codex,
+                state: crate::agent::ActivityState::Working,
+            },
+        );
 
         let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
         assert!(
@@ -4640,7 +4646,15 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
             panic!("the card lost its conversation");
         };
-        assert!(runtime.provider_closed && runtime.error.is_some());
+        assert!(runtime.provider_closed);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Restart cancelled: the worktree was being deleted.")
+        );
+        assert!(
+            app.sidebar_state.card_activity(card).is_none(),
+            "the closed conversation still shows as active"
+        );
         assert_eq!(
             app.notices
                 .entries
