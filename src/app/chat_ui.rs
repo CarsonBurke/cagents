@@ -1826,7 +1826,7 @@ impl Cagents {
         runtime.account_picker = false;
         if runtime.provider_closed {
             runtime.session = session.clone();
-            self.commit_chat_session(target.card, session.clone());
+            self.replace_chat_conversation(target.card, session.clone());
             return self.start_chat(target.card, session, chat::Intent::Start, None, false);
         }
         self.chat_ui.closing.insert(target);
@@ -2603,7 +2603,7 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                self.commit_chat_session(card, session.clone());
+                self.replace_chat_conversation(card, session.clone());
                 self.cards.insert(card, CardRuntime::Loading);
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
@@ -3075,7 +3075,12 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                if self.chat_start_pending(card) || self.chat_ui.closed.contains(&card) {
+                // Dropping the saved conversation is what this does, and storage
+                // takes it as given, so it acts only while the card still
+                // offers it: a late or repeated press after the conversation
+                // recovered must not discard it.
+                if !self.chat_offers_fresh_conversation(card) || self.chat_ui.closed.contains(&card)
+                {
                     return Task::none();
                 }
                 // The new conversation runs the saved launch verbatim - same
@@ -3104,6 +3109,7 @@ impl Cagents {
                         Message::ChatUi(Action::CloseFinished(target, result))
                     });
                 }
+                self.replace_chat_conversation(card, session.clone());
                 self.cards.insert(card, CardRuntime::Loading);
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
@@ -3735,7 +3741,7 @@ impl Cagents {
                         self.chat_forget(target.card);
                         self.cards.insert(target.card, CardRuntime::Loading);
                     }
-                    self.commit_chat_session(target.card, session.clone());
+                    self.replace_chat_conversation(target.card, session.clone());
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
             }
@@ -3999,7 +4005,10 @@ mod tests {
     }
 
     fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
-        let session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        let mut session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        // The daemon starts a new Codex thread on a listener of its own and
+        // hands the thread back naming it.
+        session.claim_owned_codex_listener();
         Arc::new(ClientHandle::fixture(
             session,
             Snapshot {
@@ -4224,6 +4233,122 @@ mod tests {
             Some(&home),
             "a new conversation starts on the default account"
         );
+    }
+
+    /// A thread that has not begun and moves to another provider, then to
+    /// another account, is saved as the conversation it now holds. Storage
+    /// used to refuse both moves, which failed every later save of the window
+    /// and brought the old conversation back on the next launch, where the
+    /// daemon no longer had it.
+    #[test]
+    fn a_new_chat_moved_to_another_provider_or_account_is_saved_as_its_new_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 24);
+        let home = app
+            .known_account(&managed)
+            .and_then(|account| account.resolved_home())
+            .unwrap()
+            .display()
+            .to_string();
+        // A Codex thread is named by the daemon as soon as it starts, so the
+        // saved card already carries a conversation before any message.
+        let card = live_chat(&mut app, Some("thread"));
+        let flushed = |app: &Cagents| {
+            let writer = app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(writer.last_error(), None);
+            match writer.operation_store().load_card(card, None).unwrap() {
+                Some(CardState {
+                    kind: CardKind::Chat(stored),
+                    ..
+                }) => stored,
+                other => panic!("the card is stored as a chat: {other:?}"),
+            }
+        };
+        let target = |app: &Cagents| match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        let restart = |app: &mut Cagents, action: &dyn Fn(Target) -> Action| {
+            let target = target(app);
+            let _ = app.update(Message::ChatUi(action(target)));
+            assert!(app.chat_ui.restarting.contains_key(&card));
+            let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+            let attempt = app.chat_ui.attempts.get(&card).unwrap();
+            let (target, session) = (attempt.target, attempt.session.clone());
+            // A provider takes seconds to start, long after the replacement
+            // it starts for has been saved.
+            let writer = app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(writer.last_error(), None);
+            let handle = fixture_handle(app, card, Some("replacement"));
+            answer_start(app, target, Ok(handle));
+            session
+        };
+        // The started conversation adds its provider's name for it and the
+        // daemon's proof; what a card may not change on its own is the rest.
+        let identity = |session: &chat::Session| {
+            (
+                session.id,
+                session.launch.provider,
+                session.launch.recipe.clone(),
+            )
+        };
+        assert_eq!(flushed(&app).launch.provider, Provider::Codex);
+
+        let claude = restart(&mut app, &|target| {
+            Action::ChooseProvider(target, Provider::Claude)
+        });
+        assert_eq!(identity(&flushed(&app)), identity(&claude));
+
+        let moved = restart(&mut app, &|target| {
+            Action::ChooseAccount(target, managed.clone())
+        });
+        assert_ne!(moved.id, claude.id, "another account is another identity");
+        let stored = flushed(&app);
+        assert_eq!(identity(&stored), identity(&moved));
+        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(
+            stored.launch.recipe.environment.get("CLAUDE_CONFIG_DIR"),
+            Some(&home)
+        );
+
+        // A resume the provider refused is offered a fresh start, which
+        // drops the saved conversation on purpose.
+        app.cards.remove(&card);
+        app.chat_ui.fresh_offers.insert(card);
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = app.chat_ui.attempts.get(&card).unwrap();
+        let (target, fresh) = (attempt.target, attempt.session.clone());
+        assert_eq!(fresh.launch.session_id, None);
+        let handle = fixture_handle(&app, card, Some("fresh"));
+        answer_start(&mut app, target, Ok(handle));
+        let stored = flushed(&app);
+        assert_eq!(identity(&stored), identity(&fresh));
+        assert_eq!(stored.launch.session_id.as_deref(), Some("fresh"));
+        // A late or repeated press, once nothing offers it, keeps it.
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        assert!(!app.chat_ui.attempts.contains_key(&card));
+        assert_eq!(flushed(&app), stored);
+
+        // Back to Codex, whose daemon starts the thread on a listener of its
+        // own: the started thread saves over the one that asked for it.
+        let codex = restart(&mut app, &|target| {
+            Action::ChooseProvider(target, Provider::Codex)
+        });
+        let stored = flushed(&app);
+        assert_eq!(stored.launch.provider, Provider::Codex);
+        assert_eq!(stored.id, codex.id);
+        assert!(stored.owns_codex_listener());
+        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(app.card_state(card).unwrap().title, "Codex chat");
     }
 
     /// A conversation that has begun keeps its account.

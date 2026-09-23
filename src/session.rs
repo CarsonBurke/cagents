@@ -191,26 +191,63 @@ pub enum SessionError {
     Worker(std::io::Error),
 }
 
+/// An explicit change of the identity a card's payload is bound to, which
+/// ordinary snapshots are not allowed to make.
 #[derive(Debug, Clone)]
-struct TerminalIdentityReplacement {
+struct IdentityReplacement {
     card_id: CardId,
     expected_terminal_id: TerminalId,
-    replacement: TerminalSession,
+    replacement: Replacement,
+}
+
+#[derive(Debug, Clone)]
+enum Replacement {
+    /// A terminal relaunched under a fresh identity.
+    Terminal(TerminalSession),
+    /// A new conversation started in a chat card in place of its own.
+    Chat(crate::chat::Session),
+}
+
+impl Replacement {
+    fn id(&self) -> TerminalId {
+        match self {
+            Self::Terminal(session) => session.id,
+            Self::Chat(session) => session.id,
+        }
+    }
+
+    fn same_kind(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+impl IdentityReplacement {
+    fn apply(&self, store: &impl SessionStore) -> Result<(), StoreError> {
+        match &self.replacement {
+            Replacement::Terminal(session) => {
+                store.replace_terminal_identity(self.card_id, self.expected_terminal_id, session)
+            }
+            Replacement::Chat(session) => {
+                store.replace_chat_identity(self.card_id, self.expected_terminal_id, session)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 enum ConversionCheckpoint {
     Snapshot(Arc<WorkspaceState>),
-    TerminalReplacement(TerminalIdentityReplacement),
+    IdentityReplacement(IdentityReplacement),
 }
 
-fn merge_terminal_replacement(
-    replacements: &mut HashMap<CardId, TerminalIdentityReplacement>,
-    incoming: TerminalIdentityReplacement,
+fn merge_identity_replacement(
+    replacements: &mut HashMap<CardId, IdentityReplacement>,
+    incoming: IdentityReplacement,
 ) {
     match replacements.entry(incoming.card_id) {
         std::collections::hash_map::Entry::Occupied(mut entry)
-            if entry.get().replacement.id == incoming.expected_terminal_id =>
+            if entry.get().replacement.id() == incoming.expected_terminal_id
+                && entry.get().replacement.same_kind(&incoming.replacement) =>
         {
             entry.get_mut().replacement = incoming.replacement;
         }
@@ -234,7 +271,7 @@ struct QueueState {
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
-    terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
+    identity_replacements: HashMap<CardId, IdentityReplacement>,
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
@@ -394,10 +431,10 @@ impl SessionRuntime {
             && !queue.shutdown
         {
             queue.ordered_identities = true;
-            for replacement in std::mem::take(&mut queue.terminal_replacements).into_values() {
+            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
                 queue
                     .conversions
-                    .push_back(ConversionCheckpoint::TerminalReplacement(replacement));
+                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
             }
             if let Some(previous) = queue.latest.take() {
                 queue
@@ -439,15 +476,53 @@ impl SessionRuntime {
         expected_terminal_id: TerminalId,
         replacement: TerminalSession,
     ) {
+        self.replace_identity(
+            IdentityReplacement {
+                card_id,
+                expected_terminal_id,
+                replacement: Replacement::Terminal(replacement),
+            },
+            None,
+        );
+    }
+
+    /// Records that chat card `card_id` now holds a new conversation in place
+    /// of the one with identity `expected_id`: another provider or account for
+    /// a thread that had not begun, or a fresh start where a resume failed.
+    /// Snapshots refuse such a change on their own, since a card silently
+    /// re-pointed at another conversation would lose the one it had.
+    ///
+    /// `state` is the workspace that already shows the replacement. It is
+    /// queued under the same lock, so the writer can never pair the
+    /// replacement with an older snapshot that still holds the previous
+    /// conversation and would be refused.
+    pub fn replace_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: crate::chat::Session,
+        state: Arc<WorkspaceState>,
+    ) {
+        self.replace_identity(
+            IdentityReplacement {
+                card_id,
+                expected_terminal_id: expected_id,
+                replacement: Replacement::Chat(replacement),
+            },
+            Some(state),
+        );
+    }
+
+    /// Queues `replacement`, then `state` as the newest snapshot when given.
+    fn replace_identity(
+        &self,
+        replacement: IdentityReplacement,
+        state: Option<Arc<WorkspaceState>>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            let replacement = TerminalIdentityReplacement {
-                card_id,
-                expected_terminal_id,
-                replacement,
-            };
             if queue.ordered_identities {
                 if let Some(previous) = queue.latest.take() {
                     queue
@@ -456,9 +531,12 @@ impl SessionRuntime {
                 }
                 queue
                     .conversions
-                    .push_back(ConversionCheckpoint::TerminalReplacement(replacement));
+                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
             } else {
-                merge_terminal_replacement(&mut queue.terminal_replacements, replacement);
+                merge_identity_replacement(&mut queue.identity_replacements, replacement);
+            }
+            if let Some(state) = state {
+                queue.latest = Some(state);
             }
             changed.notify_one();
         }
@@ -630,7 +708,7 @@ struct PendingWrites {
     conversions: VecDeque<ConversionCheckpoint>,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
-    terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
+    identity_replacements: HashMap<CardId, IdentityReplacement>,
     workspace_generation: u64,
     card_generations: BTreeMap<CardId, u64>,
     project_generations: HashMap<ProjectId, u64>,
@@ -643,6 +721,12 @@ trait SessionStore {
         card_id: CardId,
         expected_terminal_id: TerminalId,
         replacement: &TerminalSession,
+    ) -> Result<(), StoreError>;
+    fn replace_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: &crate::chat::Session,
     ) -> Result<(), StoreError>;
     fn save_workspace(
         &self,
@@ -671,6 +755,15 @@ impl SessionStore for StateStore {
         replacement: &TerminalSession,
     ) -> Result<(), StoreError> {
         Self::replace_terminal_identity(self, card_id, expected_terminal_id, replacement)
+    }
+
+    fn replace_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Self::replace_chat_identity(self, card_id, expected_id, replacement)
     }
 
     fn save_workspace(
@@ -718,6 +811,14 @@ impl SessionStore for Arc<StateStore> {
         replacement: &TerminalSession,
     ) -> Result<(), StoreError> {
         StateStore::replace_terminal_identity(self, card_id, expected_terminal_id, replacement)
+    }
+    fn replace_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::replace_chat_identity(self, card_id, expected_id, replacement)
     }
     fn save_workspace(
         &self,
@@ -771,7 +872,7 @@ impl PendingWrites {
             conversions: VecDeque::new(),
             projects: HashMap::new(),
             worktrees: HashMap::new(),
-            terminal_replacements: HashMap::new(),
+            identity_replacements: HashMap::new(),
             workspace_generation,
             card_generations,
             project_generations,
@@ -784,7 +885,7 @@ impl PendingWrites {
             && self.conversions.is_empty()
             && self.projects.is_empty()
             && self.worktrees.is_empty()
-            && self.terminal_replacements.is_empty()
+            && self.identity_replacements.is_empty()
     }
 
     /// The workspace every pending snapshot in this batch belongs to.
@@ -797,7 +898,7 @@ impl PendingWrites {
             .iter()
             .find_map(|checkpoint| match checkpoint {
                 ConversionCheckpoint::Snapshot(snapshot) => Some(snapshot.id),
-                ConversionCheckpoint::TerminalReplacement(_) => None,
+                ConversionCheckpoint::IdentityReplacement(_) => None,
             })
             .or_else(|| self.workspace.as_ref().map(|snapshot| snapshot.id))
     }
@@ -877,19 +978,15 @@ impl PendingWrites {
     fn flush(&mut self, store: &impl SessionStore) -> Vec<StoreError> {
         let mut errors = Vec::new();
         let replacement_cards = self
-            .terminal_replacements
+            .identity_replacements
             .keys()
             .copied()
             .collect::<Vec<_>>();
         for card_id in replacement_cards {
-            let replacement = &self.terminal_replacements[&card_id];
-            match store.replace_terminal_identity(
-                replacement.card_id,
-                replacement.expected_terminal_id,
-                &replacement.replacement,
-            ) {
+            let replacement = &self.identity_replacements[&card_id];
+            match replacement.apply(store) {
                 Ok(()) => {
-                    self.terminal_replacements.remove(&card_id);
+                    self.identity_replacements.remove(&card_id);
                 }
                 Err(error) => errors.push(error),
             }
@@ -897,16 +994,12 @@ impl PendingWrites {
 
         // Conversion checkpoints precede later autosaves, and failed writes
         // stay at the front so neither a retry nor shutdown can reorder them.
-        if self.terminal_replacements.is_empty() {
+        if self.identity_replacements.is_empty() {
             loop {
                 let snapshot = match self.conversions.front() {
                     Some(ConversionCheckpoint::Snapshot(snapshot)) => snapshot,
-                    Some(ConversionCheckpoint::TerminalReplacement(replacement)) => {
-                        match store.replace_terminal_identity(
-                            replacement.card_id,
-                            replacement.expected_terminal_id,
-                            &replacement.replacement,
-                        ) {
+                    Some(ConversionCheckpoint::IdentityReplacement(replacement)) => {
+                        match replacement.apply(store) {
                             Ok(()) => {
                                 self.conversions.pop_front();
                             }
@@ -1139,7 +1232,7 @@ fn persistence_loop(
             && state.conversions.is_empty()
             && state.projects.is_empty()
             && state.worktrees.is_empty()
-            && state.terminal_replacements.is_empty()
+            && state.identity_replacements.is_empty()
             && !state.retry_requested
             && state.checkpoints.is_empty()
             && !state.shutdown
@@ -1168,7 +1261,7 @@ fn persistence_loop(
             || !state.conversions.is_empty()
             || !state.projects.is_empty()
             || !state.worktrees.is_empty()
-            || !state.terminal_replacements.is_empty();
+            || !state.identity_replacements.is_empty();
         if !state.conversions.is_empty() {
             if let Some(previous) = writes.workspace.take() {
                 writes
@@ -1184,8 +1277,8 @@ fn persistence_loop(
         writes
             .worktrees
             .extend(std::mem::take(&mut state.worktrees));
-        for replacement in std::mem::take(&mut state.terminal_replacements).into_values() {
-            merge_terminal_replacement(&mut writes.terminal_replacements, replacement);
+        for replacement in std::mem::take(&mut state.identity_replacements).into_values() {
+            merge_identity_replacement(&mut writes.identity_replacements, replacement);
         }
         let retry_requested = std::mem::take(&mut state.retry_requested);
         if retry_requested && !writes.is_empty() {
@@ -1250,6 +1343,15 @@ fn persistence_loop(
                         category = failure.map(SaveFailureCategory::label),
                         "a cagents workspace write could not be stored"
                     );
+                    // Which card a refusal of saved state names is what
+                    // explains it. Those messages are this crate's own and
+                    // carry no connection string, unlike the other errors,
+                    // which stay behind their category.
+                    for error in &errors {
+                        if let StoreError::InvalidState(reason) = error {
+                            tracing::debug!(reason, "workspace write refused");
+                        }
+                    }
                 }
                 health.failed(&errors, retry_exhausted);
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
@@ -1522,6 +1624,15 @@ mod tests {
             _card_id: CardId,
             _expected_terminal_id: TerminalId,
             _replacement: &TerminalSession,
+        ) -> Result<(), StoreError> {
+            self.write()
+        }
+
+        fn replace_chat_identity(
+            &self,
+            _card_id: CardId,
+            _expected_id: TerminalId,
+            _replacement: &crate::chat::Session,
         ) -> Result<(), StoreError> {
             self.write()
         }
@@ -1911,26 +2022,26 @@ mod tests {
         };
         let mut replacements = HashMap::new();
 
-        merge_terminal_replacement(
+        merge_identity_replacement(
             &mut replacements,
-            TerminalIdentityReplacement {
+            IdentityReplacement {
                 card_id,
                 expected_terminal_id: original_id,
-                replacement: terminal(middle_id),
+                replacement: Replacement::Terminal(terminal(middle_id)),
             },
         );
-        merge_terminal_replacement(
+        merge_identity_replacement(
             &mut replacements,
-            TerminalIdentityReplacement {
+            IdentityReplacement {
                 card_id,
                 expected_terminal_id: middle_id,
-                replacement: terminal(final_id),
+                replacement: Replacement::Terminal(terminal(final_id)),
             },
         );
 
         let replacement = &replacements[&card_id];
         assert_eq!(replacement.expected_terminal_id, original_id);
-        assert_eq!(replacement.replacement.id, final_id);
+        assert_eq!(replacement.replacement.id(), final_id);
     }
 
     #[test]
@@ -2027,6 +2138,67 @@ mod tests {
         );
         first.shutdown();
         second.shutdown();
+    }
+
+    /// A chat card moved to another provider or account before its thread
+    /// began saves as its new conversation, whether or not the lane is keeping
+    /// conversions in order, and the next launch restores that conversation.
+    #[test]
+    fn a_replaced_chat_conversation_saves_with_its_snapshot_and_restores() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("chat-replacement.sqlite3");
+            let boot = BootId::new("chat-replacement");
+            let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+            let mut state = workspace();
+            let card = state.cards[0].id;
+            let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let chat = |provider: crate::agent::Provider, id: TerminalId| crate::chat::Session {
+                id,
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe: LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: Vec::new(),
+                        ..terminal.launch.clone()
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            };
+            let codex = chat(crate::agent::Provider::Codex, TerminalId::new());
+            state.cards[0].kind = CardKind::Chat(codex.clone());
+            state.cards[0].title = "Codex chat".into();
+            runtime.snapshot(Arc::new(state.clone()));
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            if ordered {
+                runtime.snapshot_conversion(Arc::new(state.clone()));
+            }
+            // An autosave still queued from before the switch.
+            state.focused = Some(card);
+            runtime.snapshot(Arc::new(state.clone()));
+
+            let claude = chat(crate::agent::Provider::Claude, TerminalId::new());
+            state.cards[0].kind = CardKind::Chat(claude.clone());
+            state.cards[0].title = "Claude chat".into();
+            runtime.replace_chat_identity(card, codex.id, claude.clone(), Arc::new(state.clone()));
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            runtime.shutdown();
+            assert_eq!(runtime.last_error(), None, "ordered: {ordered}");
+
+            let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+            let restored = restored.unwrap();
+            assert_eq!(
+                restored.cards[0].kind,
+                CardKind::Chat(claude),
+                "ordered: {ordered}"
+            );
+            assert_eq!(restored.cards[0].title, "Claude chat");
+            reopened.shutdown();
+        }
     }
 
     #[test]

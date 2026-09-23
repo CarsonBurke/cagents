@@ -4860,11 +4860,30 @@ impl Cagents {
         }
     }
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
+        match self.install_chat_session(card, session) {
+            Some(true) => {
+                if let Some(writer) = &self.session {
+                    writer.snapshot_conversion(Arc::clone(&self.durable));
+                }
+            }
+            Some(false) => self.persist(),
+            None => {}
+        }
+    }
+
+    /// Puts `session` in card `card`'s durable state without saving it.
+    /// `None` when the card already holds exactly that session; otherwise
+    /// whether the card was converted from another kind.
+    fn install_chat_session(
+        &mut self,
+        card: CardId,
+        session: crate::chat::Session,
+    ) -> Option<bool> {
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
         if unchanged {
-            return;
+            return None;
         }
         let conversion = self
             .card_state(card)
@@ -4885,12 +4904,29 @@ impl Cagents {
             state.residency = Residency::Hot;
         }
         self.card_chrome.remove(&card);
-        if conversion {
-            if let Some(writer) = &self.session {
-                writer.snapshot_conversion(Arc::clone(&self.durable));
-            }
-        } else {
-            self.persist();
+        Some(conversion)
+    }
+
+    /// Puts a new conversation in chat card `card` in place of the one it
+    /// holds: another provider or account for a thread that has not begun, or
+    /// a fresh start after a failed resume. Callers pass only a conversation
+    /// that has not begun, which is all storage accepts this way.
+    ///
+    /// Storage refuses a snapshot that re-points a chat card at another
+    /// conversation, so the replacement is recorded explicitly, together with
+    /// the snapshot that shows it, the way a terminal relaunch records its new
+    /// identity.
+    fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
+        let expected = match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Chat(current)) if current != &session => current.id,
+            _ => return self.commit_chat_session(card, session),
+        };
+        if self.install_chat_session(card, session.clone()).is_none() {
+            return;
+        }
+        self.snapshot_workspace_scope();
+        if let Some(writer) = &self.session {
+            writer.replace_chat_identity(card, expected, session, Arc::clone(&self.durable));
         }
     }
 

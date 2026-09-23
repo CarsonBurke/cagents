@@ -519,6 +519,28 @@ impl StateStore {
         Ok(())
     }
 
+    /// Atomically puts a new conversation in an existing chat card.
+    ///
+    /// This is the explicit restart path - another provider or account for a
+    /// thread that has not begun, or a fresh start after a failed resume.
+    /// Normal workspace snapshots still reject a chat card whose conversation
+    /// identity changed through `validate_chat_identity`.
+    pub fn replace_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        replacement: &crate::chat::Session,
+    ) -> Result<()> {
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        replace_chat_identity_transaction(&transaction, card_id, expected_id, replacement)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_project(&self, project: &ProjectState) -> Result<u64> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -2412,24 +2434,39 @@ fn validate_chat_identity(
             |row| row.get(0),
         )?;
         let stored: crate::chat::Session = from_json("chat card", &content)?;
-        if stored.id != session.id
-            || stored.launch.provider != session.launch.provider
-            || stored.launch.recipe != session.launch.recipe
-            || (stored.terminal != session.terminal
-                && !(stored.terminal.is_none()
-                    && session
-                        .terminal
-                        .as_ref()
-                        .is_some_and(|view| codex_cli_view(session, view))))
-            || (stored
-                .launch
-                .session_id
-                .as_ref()
-                .is_some_and(|id| Some(id) != session.launch.session_id.as_ref())
-                && (stored.proof.is_none() || stored.proof != session.proof))
+        let changed = if stored.id != session.id {
+            Some("identity")
+        } else if stored.launch.provider != session.launch.provider {
+            Some("provider")
+        } else if stored.launch.recipe != session.launch.recipe
+            // The daemon gives a new Codex thread its own listener as it
+            // starts it, so the started thread comes back naming that
+            // endpoint where it had asked for one.
+            && !stored.resolved_to_owned_codex_listener(session)
         {
+            Some("launch recipe")
+        } else if stored.terminal != session.terminal
+            && !(stored.terminal.is_none()
+                && session
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|view| codex_cli_view(session, view)))
+        {
+            Some("source terminal")
+        } else if stored
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| Some(id) != session.launch.session_id.as_ref())
+            && (stored.proof.is_none() || stored.proof != session.proof)
+        {
+            Some("provider conversation")
+        } else {
+            None
+        };
+        if let Some(changed) = changed {
             return Err(StoreError::InvalidState(format!(
-                "chat card {card} changed conversation identity"
+                "chat card {card} changed conversation identity ({changed})"
             )));
         }
     }
@@ -2721,6 +2758,71 @@ fn save_card_payload(
         }
         CardPayloadWrite::Inline => {}
     }
+    Ok(())
+}
+
+fn replace_chat_identity_transaction(
+    transaction: &Transaction<'_>,
+    card_id: CardId,
+    expected_id: TerminalId,
+    replacement: &crate::chat::Session,
+) -> Result<()> {
+    let Some((kind, content)) = transaction
+        .query_row(
+            "SELECT kind_tag, content_json FROM cards WHERE card_id = ?1",
+            [card_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    else {
+        // The card has not reached storage yet; the snapshot following this
+        // operation stores it with the replacement as its first conversation.
+        return Ok(());
+    };
+    if kind != PersistedCardKind::Chat.as_str() {
+        return Err(StoreError::InvalidState(format!(
+            "card {card_id} is not a chat card"
+        )));
+    }
+    let content = content
+        .ok_or_else(|| StoreError::InvalidState(format!("chat card {card_id} has no payload")))?;
+    let stored: crate::chat::Session = from_json("chat card", &content)?;
+    if &stored == replacement {
+        return Ok(());
+    }
+    if stored.id != expected_id {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card_id} expected conversation {expected_id}, found {}",
+            stored.id
+        )));
+    }
+    // Only a conversation that has not begun replaces another this way. One
+    // that names a native session, or a daemon that proved it, has to reach
+    // storage through a snapshot, which checks that proof.
+    if replacement.launch.session_id.is_some() || replacement.proof.is_some() {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card_id} can only be replaced by a conversation that has not begun"
+        )));
+    }
+    // It may keep the CLI the card already pairs with, launched the same way
+    // under the same identity, but never gain one.
+    if replacement.terminal.is_some()
+        && (replacement.terminal != stored.terminal
+            || replacement.id != stored.id
+            || replacement.launch.provider != stored.launch.provider
+            || replacement.launch.recipe != stored.launch.recipe)
+    {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card_id} cannot take a source terminal with a new conversation"
+        )));
+    }
+    transaction.execute(
+        "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
+        params![to_json(replacement)?, now_unix_ms(), card_id.to_string()],
+    )?;
+    // As with a terminal relaunch, the payload changed behind the snapshot
+    // lane's back, so the next snapshot must take the full write path.
+    transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
     Ok(())
 }
 
@@ -3815,6 +3917,198 @@ mod tests {
         assert_eq!(restored_metadata.byte_len, 128);
         assert_eq!(restored_metadata.durable_offset, 96);
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
+    }
+
+    /// A chat card takes a new conversation - another provider, another
+    /// account's home, a fresh identity - only through the explicit
+    /// replacement, never through a snapshot on its own. Before the
+    /// replacement existed, switching a new thread's provider or account left
+    /// every later save failing with "saved state is invalid", and the next
+    /// launch restored the conversation the card no longer had.
+    #[test]
+    fn a_chat_card_takes_a_new_conversation_only_through_its_replacement() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Codex);
+        let source = begun.terminal.clone().unwrap();
+        let proof = source.continuity.live_proof();
+        let fresh = |provider: crate::agent::Provider, id: TerminalId, home: Option<&str>| {
+            let mut recipe = begun.launch.recipe.clone();
+            recipe.program = provider.executable().into();
+            recipe.arguments.clear();
+            if let Some(home) = home {
+                recipe
+                    .environment
+                    .insert("CLAUDE_CONFIG_DIR".into(), home.into());
+            }
+            crate::chat::Session {
+                id,
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe,
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            }
+        };
+        // A thread the daemon started already names its conversation, which
+        // is why the store cannot tell on its own that it is empty.
+        let started = |session: &crate::chat::Session| crate::chat::Session {
+            launch: crate::chat::Launch {
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..session.launch.clone()
+            },
+            proof: proof.clone(),
+            ..session.clone()
+        };
+        let codex = started(&fresh(
+            crate::agent::Provider::Codex,
+            TerminalId::new(),
+            None,
+        ));
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(codex.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        // Another provider under the same identity.
+        let claude = fresh(crate::agent::Provider::Claude, codex.id, None);
+        workspace.cards[0].kind = CardKind::Chat(claude.clone());
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::InvalidState(_))
+        ));
+        store
+            .replace_chat_identity(card, codex.id, &claude)
+            .unwrap();
+        // A retried replacement that already landed is not an error.
+        store
+            .replace_chat_identity(card, codex.id, &claude)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        // The new thread then names its conversation through the proof check.
+        let claude = started(&claude);
+        workspace.cards[0].kind = CardKind::Chat(claude.clone());
+        lane.save(&store, &workspace).unwrap();
+
+        // Another account, which also renews the identity.
+        let managed = fresh(
+            crate::agent::Provider::Claude,
+            TerminalId::new(),
+            Some("/accounts/claude/a"),
+        );
+        assert!(matches!(
+            store.replace_chat_identity(card, TerminalId::new(), &managed),
+            Err(StoreError::InvalidState(_))
+        ));
+        // Only a conversation that has not begun takes a card's place: a
+        // replacement cannot smuggle in a native session the proof check
+        // would have refused.
+        assert!(matches!(
+            store.replace_chat_identity(card, claude.id, &started(&managed)),
+            Err(StoreError::InvalidState(_))
+        ));
+        store
+            .replace_chat_identity(card, claude.id, &managed)
+            .unwrap();
+        workspace.cards[0].kind = CardKind::Chat(managed.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(managed.clone())
+        );
+        // What the next launch restores is the new conversation.
+        drop(store);
+        let reopened =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(managed.clone())
+        );
+
+        // A replacement never gives a card a source it did not have.
+        let mut paired = fresh(crate::agent::Provider::Claude, managed.id, None);
+        paired.terminal = Some(source);
+        assert!(matches!(
+            reopened.replace_chat_identity(card, managed.id, &paired),
+            Err(StoreError::InvalidState(_))
+        ));
+    }
+
+    /// A new Codex thread asks for a listener of its own with a bare
+    /// `unix://` remote, and the daemon starts it on that thread's socket.
+    /// The card is saved before the start completes, so the started thread
+    /// must save over it; that used to be refused as a changed launch, which
+    /// failed every later save and left the card with no conversation to
+    /// restore.
+    #[test]
+    fn a_new_codex_thread_saves_as_the_daemon_started_it() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Codex);
+        let proof = begun.terminal.as_ref().unwrap().continuity.live_proof();
+        let mut asked = begun.clone();
+        asked.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        asked.launch.session_id = None;
+        asked.proof = None;
+        asked.terminal = None;
+        asked.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(asked.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let started = |remote: String| {
+            let mut session = asked.clone();
+            session.launch.recipe.arguments[1] = remote;
+            session.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            session.proof = proof.clone();
+            session
+        };
+        let mut save = |session: &crate::chat::Session| {
+            let mut workspace = workspace.clone();
+            workspace.cards[0].kind = CardKind::Chat(session.clone());
+            lane.save(&store, &workspace)
+        };
+
+        // Any other endpoint is a different launch.
+        let elsewhere = crate::chat::Session {
+            id: TerminalId::new(),
+            ..asked.clone()
+        };
+        for remote in [
+            "unix:///tmp/elsewhere/control.sock".to_owned(),
+            elsewhere.owned_codex_remote(),
+        ] {
+            assert!(matches!(
+                save(&started(remote)),
+                Err(StoreError::InvalidState(message)) if message.contains("launch recipe")
+            ));
+        }
+        let mut other_option = started(asked.owned_codex_remote());
+        other_option.launch.recipe.arguments.push("--search".into());
+        assert!(matches!(
+            save(&other_option),
+            Err(StoreError::InvalidState(_))
+        ));
+
+        let own = started(asked.owned_codex_remote());
+        assert!(own.owns_codex_listener());
+        save(&own).unwrap();
+        let reopened =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        match reopened.load_card(workspace.cards[0].id, None).unwrap() {
+            Some(CardState {
+                kind: CardKind::Chat(stored),
+                ..
+            }) => assert_eq!(stored, own),
+            other => panic!("the card is stored as the started thread: {other:?}"),
+        }
+        // Once begun, the thread keeps that endpoint.
+        let mut rewound = own.clone();
+        rewound.launch.recipe.arguments[1] = "unix://".into();
+        assert!(matches!(save(&rewound), Err(StoreError::InvalidState(_))));
     }
 
     #[test]
