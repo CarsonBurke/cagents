@@ -3402,7 +3402,12 @@ pub struct Cagents {
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
+    /// The generation of the latest load of each project. Every generation is
+    /// drawn from `repository_load_sequence`, so generations of different
+    /// projects are ordered too: a load that reaches another project's
+    /// repository can tell whether that project has been loaded since it began.
     repository_generations: HashMap<ProjectId, u64>,
+    repository_load_sequence: u64,
     worktree_dialog: Option<WorktreeDialog>,
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
@@ -3660,9 +3665,9 @@ impl Cagents {
         open_cards: bool,
     ) -> Task<Message> {
         let project_id = project_id.unwrap_or_default();
-        let generation = self.repository_generations.entry(project_id).or_default();
-        *generation = generation.wrapping_add(1);
-        let generation = *generation;
+        self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
+        let generation = self.repository_load_sequence;
+        self.repository_generations.insert(project_id, generation);
         // Liveness is not authority. A poll starting says nothing about whether
         // the user is still authorized against the same repository, so the last
         // confirmed identity rides along and the sidebar keeps its pull-request
@@ -3963,7 +3968,7 @@ impl Cagents {
     }
 
     fn add_terminal_recipe(&mut self, launch: LaunchRecipe) -> Task<Message> {
-        if self.project_ui.deleting() {
+        if self.refuse_in_deleting_worktree(&launch.working_directory) {
             return Task::none();
         }
         let scope = if self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
@@ -3985,7 +3990,7 @@ impl Cagents {
         session: TerminalSession,
         slot: Option<(usize, usize)>,
     ) -> Task<Message> {
-        if self.project_ui.deleting() {
+        if self.refuse_in_deleting_worktree(&session.launch.working_directory) {
             return Task::none();
         }
         let working_directory = session.launch.working_directory.clone();
@@ -4042,15 +4047,15 @@ impl Cagents {
     }
 
     fn clone_focused_pane(&mut self) -> Task<Message> {
-        if self.workspace_inputs_blocked()
-            || self.focused_repository_is_saving()
-            || self.project_ui.deleting()
-        {
+        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
             return Task::none();
         }
         let Some(source) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
             return Task::none();
         };
+        if self.project_ui.deleting_card(source) {
+            return Task::none();
+        }
         // A window holds one of each utility pane; a copy would show the
         // same application state twice.
         if !source.existence.is_open() || source.kind.is_utility() {
@@ -5265,7 +5270,7 @@ impl Cagents {
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
         // A card whose close is already accepted never starts anything again.
-        if self.chat_close_approved(card) {
+        if self.chat_close_approved(card) || self.refuse_for_deleting_card(card) {
             return Task::none();
         }
         if self.completed_terminal_has_native_owner(card) {
@@ -5664,12 +5669,18 @@ impl Cagents {
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
-        if self.project_ui.deleting() {
-            return Task::none();
-        }
         let mut visible = HashSet::new();
         let mut prefetch = HashSet::new();
         for (id, visibility) in self.workspace.mounted_visibility() {
+            // A card in a worktree being deleted is not brought up: its
+            // session is being closed, and one started now would outlive the
+            // directory it runs in.
+            if self
+                .card_state(id)
+                .is_some_and(|card| self.project_ui.deleting_card(card))
+            {
+                continue;
+            }
             if visibility == VisibilityClass::Visible {
                 visible.insert(id);
             } else if visibility == VisibilityClass::Overscan {
@@ -8936,6 +8947,7 @@ impl Application for Cagents {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
+            repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,
@@ -9412,12 +9424,26 @@ impl Application for Cagents {
                                         }))
                             })
                         {
-                            // This read reached the same repository, so
-                            // whatever an earlier failure recorded about the
-                            // row it landed on no longer holds.
-                            existing.unreachable = None;
-                            existing.reloading = false;
-                            for (record, status) in &loaded.worktrees {
+                            // A load of that project which began after this
+                            // one lists the repository more recently, and it
+                            // is also how a deletion is followed up. Adding a
+                            // worktree from this older listing would bring a
+                            // deleted one back, open.
+                            let superseded = self
+                                .repository_generations
+                                .get(&existing.id)
+                                .is_some_and(|&latest| latest > generation);
+                            let listed = if superseded {
+                                &[][..]
+                            } else {
+                                // This read reached the same repository, so
+                                // whatever an earlier failure recorded about
+                                // the row it landed on no longer holds.
+                                existing.unreachable = None;
+                                existing.reloading = false;
+                                &loaded.worktrees[..]
+                            };
+                            for (record, status) in listed {
                                 if existing.worktrees.iter().any(|known| known.id == record.id) {
                                     continue;
                                 }
@@ -9737,6 +9763,12 @@ impl Application for Cagents {
                     }
                     SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
                     SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
+                    SidebarAction::RetryWorktreeDeletion { worktree_id, .. } => {
+                        self.handle_project_action(project_ui::Action::RetryDelete(worktree_id))
+                    }
+                    SidebarAction::RetryChannelDeletion { channel_id } => {
+                        self.handle_channel_ui(channel_ui::Action::RetryFailed(channel_id))
+                    }
                     SidebarAction::OpenRepositoryPicker => {
                         cosmic::task::message(Message::OpenRepository)
                     }
@@ -9751,9 +9783,15 @@ impl Application for Cagents {
                             .find(|project| project.id == project_id)
                             .and_then(|project| project.worktrees.first())
                             .map_or(repository, |worktree| worktree.path.clone());
+                        if self.refuse_in_deleting_worktree(&path) {
+                            return Task::none();
+                        }
                         self.select_worktree(path, true)
                     }
                     SidebarAction::OpenWorktree { path, .. } => {
+                        if self.refuse_in_deleting_worktree(&path) {
+                            return Task::none();
+                        }
                         self.select_worktree(path, true)
                     }
                     SidebarAction::OpenPullRequest {
@@ -16703,6 +16741,7 @@ mod tests {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
+            repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,
@@ -17859,15 +17898,20 @@ mod tests {
 
         let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
         assert!(
-            app.project_ui.deleting(),
+            app.project_ui
+                .deleting_directory(Path::new("/repo/feature")),
             "confirming hands the worktree to the deletion path"
         );
         assert!(
-            dialog_labels(&app, &renderer)
-                .iter()
-                .any(|label| label == "Deleting…"),
-            "and the dialog stays up to report it"
+            !app.modal_is_open() && app.dialog().is_none(),
+            "and the dialog goes once it is confirmed: the row reports the rest (#264)"
         );
+        let row = app.sidebar_model.projects[0]
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == worktree_id)
+            .unwrap();
+        assert_eq!(row.deletion, Some(sidebar::RowDeletion::Deleting));
     }
 
     /// Both rails speak for one worktree. The context rail's Changes and Pull

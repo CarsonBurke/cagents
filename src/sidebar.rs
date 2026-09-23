@@ -328,6 +328,17 @@ pub struct WorktreeOperationRow {
     pub cancellable: bool,
 }
 
+/// A deletion the user has confirmed, as the row being deleted shows it.
+///
+/// Deleting closes every session inside and waits on Git, so it runs behind
+/// the row rather than behind a dialog: the row goes quiet with a spinner
+/// until it disappears, or says why it could not and offers to try again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowDeletion {
+    Deleting,
+    Failed(Box<str>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeOperationPhase {
     /// Still running, or created and waiting for the checkout to list it.
@@ -389,6 +400,7 @@ pub struct SidebarChannel {
     /// because the row is what gets ordered, and the registry's rank is the
     /// only order two windows can agree on.
     pub ordinal: u32,
+    pub deletion: Option<RowDeletion>,
     folded_title: Box<str>,
     open_id: Id,
     accessible_name: Box<str>,
@@ -419,6 +431,7 @@ impl SidebarChannel {
             chats,
             has_panes,
             ordinal,
+            deletion: None,
             folded_title: fold(&title),
             open_id: entity_id("channel.open", id),
             accessible_name: format!(
@@ -571,6 +584,9 @@ pub struct SidebarWorktree {
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
     pub pull_request_state: Option<WorktreePullRequestState>,
+    /// Held by the application rather than read from the checkout, and
+    /// reapplied whenever a read replaces the row.
+    pub deletion: Option<RowDeletion>,
     chrome: WorktreeChrome,
 }
 
@@ -625,6 +641,7 @@ impl SidebarWorktree {
             behind,
             created_at_unix_ms: None,
             pull_request_state: None,
+            deletion: None,
             chrome,
         }
     }
@@ -2829,6 +2846,8 @@ impl SidebarState {
             SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::DismissWorktreeOperation(_)
+            | SidebarAction::RetryWorktreeDeletion { .. }
+            | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
@@ -2891,6 +2910,15 @@ pub enum SidebarAction {
     CancelWorktreeOperation(crate::model::OperationId),
     /// Removes the row of a creation that ended without a worktree.
     DismissWorktreeOperation(crate::model::OperationId),
+    /// Runs a confirmed worktree deletion again after it failed.
+    RetryWorktreeDeletion {
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+    },
+    /// Runs a confirmed channel deletion again after it failed.
+    RetryChannelDeletion {
+        channel_id: ChannelId,
+    },
     SearchChanged(String),
     SetFilter(SidebarFilter),
     ToggleControls,
@@ -4430,11 +4458,16 @@ impl GlyphTone {
 }
 
 fn channel_ink(channel: &SidebarChannel) -> RowInk {
-    RowInk::of(channel.has_panes, channel.unread)
+    deletion_ink(
+        RowInk::of(channel.has_panes, channel.unread),
+        channel.deletion.as_ref(),
+    )
 }
 
 fn channel_glyph_tone(channel: &SidebarChannel) -> GlyphTone {
-    if channel.unread {
+    if channel.deletion == Some(RowDeletion::Deleting) {
+        GlyphTone::Ink(RowInk::Muted)
+    } else if channel.unread {
         GlyphTone::Danger
     } else if channel.activity == Some(crate::agent::ActivityState::Working) {
         GlyphTone::Warning
@@ -4486,12 +4519,83 @@ fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarActi
     (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into())
 }
 
+/// A deletion under way takes the reserved slot: it is the one live thing
+/// about the row, and outranks whatever the row was doing before.
+fn deleting_indicator<'a>() -> Element<'a, SidebarAction> {
+    crate::interaction::tooltip(
+        crate::ui_controls::activity_spinner_tone(
+            f32::from(ROW_ICON_SIZE),
+            design::muted_icon_color,
+        ),
+        "Deleting…",
+    )
+}
+
+/// A failed deletion is a fact about the row until it is retried, so it is a
+/// badge after the reserved slot and leaves live activity where it was. The
+/// rail has room for nothing after the slot, so there it takes the slot.
+fn deletion_failed_badge(reason: &str) -> Element<'_, SidebarAction> {
+    status_icon("dialog-warning-symbolic", reason, BadgeTone::Warning)
+}
+
+/// A row being deleted reads as muted as a creation's row does, glyph and
+/// label alike; the name stays so the user can tell which row it is.
+fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
+    if deletion == Some(&RowDeletion::Deleting) {
+        RowInk::Muted
+    } else {
+        ink
+    }
+}
+
+/// Mounts a row with the trailing retry a failed deletion offers.
+fn with_deletion_retry<'a>(
+    row: Element<'a, SidebarAction>,
+    deletion: Option<&RowDeletion>,
+    compact: bool,
+    label: &str,
+    retry: Option<SidebarAction>,
+    id: Id,
+) -> Element<'a, SidebarAction> {
+    if compact || !matches!(deletion, Some(RowDeletion::Failed(_))) {
+        return row;
+    }
+    widget::row::with_capacity(2)
+        .align_y(Alignment::Center)
+        .push(row)
+        .push(icon_action(
+            "view-refresh-symbolic",
+            format!("Retry deleting {label}"),
+            retry,
+            id,
+        ))
+        .into()
+}
+
+/// A row's accessible name with the deletion it is part of.
+fn with_deletion_name<'a>(
+    name: Cow<'a, str>,
+    kind: &str,
+    label: &str,
+    deletion: Option<&RowDeletion>,
+) -> Cow<'a, str> {
+    match deletion {
+        None => name,
+        Some(RowDeletion::Deleting) => Cow::Owned(format!("Deleting {kind} {label}")),
+        Some(RowDeletion::Failed(reason)) => {
+            Cow::Owned(format!("{name}, could not be deleted: {reason}"))
+        }
+    }
+}
+
 fn channel_view(
     channel: &SidebarChannel,
     modal_open: bool,
     compact: bool,
 ) -> Element<'_, SidebarAction> {
     let grid = RowGrid::child(compact);
+    let deletion = channel.deletion.as_ref();
+    let deleting = deletion == Some(&RowDeletion::Deleting);
     let tone = channel_glyph_tone(channel);
     let glyph = widget::container(
         widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic")).size(ROW_ICON_SIZE),
@@ -4512,23 +4616,55 @@ fn channel_view(
             .width(Length::Fill)
             .into()
     });
+    let indicator = match deletion {
+        Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+        Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
+        _ => channel_indicator(channel),
+    };
+    let mut content = grid.content(glyph, label, indicator);
+    if !compact {
+        match deletion {
+            Some(RowDeletion::Deleting) => content = content.push(design::caption("Deleting…")),
+            Some(RowDeletion::Failed(reason)) => {
+                content = content.push(deletion_failed_badge(reason))
+            }
+            None => {}
+        }
+    }
+    // A channel on its way out is not somewhere to go, nor something to
+    // delete twice.
+    let inert = modal_open || deleting;
     let action = grid
-        .control(
-            grid.content(glyph, label, channel_indicator(channel)),
-            channel.selected,
-        )
+        .control(content, channel.selected)
         .id(channel.open_id.clone())
-        .name(&*channel.accessible_name)
+        .name(with_deletion_name(
+            Cow::Borrowed(&*channel.accessible_name),
+            "channel",
+            &channel.title,
+            deletion,
+        ))
         .on_press_maybe(gated(
             SidebarAction::OpenChannel {
                 channel_id: channel.id,
             },
-            modal_open,
+            inert,
         ));
-    grid.mount(channel_context_controls(
-        crate::interaction::tooltip(action, &*channel.tooltip),
-        channel.id,
-        modal_open,
+    grid.mount(with_deletion_retry(
+        channel_context_controls(
+            crate::interaction::tooltip(action, &*channel.tooltip),
+            channel.id,
+            inert,
+        ),
+        deletion,
+        compact,
+        &channel.title,
+        gated(
+            SidebarAction::RetryChannelDeletion {
+                channel_id: channel.id,
+            },
+            modal_open,
+        ),
+        entity_id("channel.retry-delete", channel.id),
     ))
 }
 
@@ -4673,9 +4809,11 @@ fn worktree_view<'a>(
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
+    let deletion = worktree.deletion.as_ref();
+    let deleting = deletion == Some(&RowDeletion::Deleting);
     let label = (!compact).then(|| {
         design::body(&*chrome.label)
-            .class(RowInk::of(has_panes, agent_update).text_class())
+            .class(deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
@@ -4683,15 +4821,38 @@ fn worktree_view<'a>(
             .width(Length::Fill)
             .into()
     });
-    let mut content = grid.content(
-        worktree_status_icon(worktree, agent_update, has_panes),
-        label,
-        worktree_indicator(worktree, agent_update, activity, compact),
-    );
+    let indicator = match deletion {
+        Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+        Some(RowDeletion::Failed(reason)) if compact => Some(deletion_failed_badge(reason)),
+        _ => worktree_indicator(worktree, agent_update, activity, compact),
+    };
+    let glyph = if deleting {
+        widget::container(widget::icon(worktree_icon()).size(ROW_ICON_SIZE))
+            .class(theme::Container::custom(|theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(design::muted_icon_color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into()
+    } else {
+        worktree_status_icon(worktree, agent_update, has_panes)
+    };
+    let mut content = grid.content(glyph, label, indicator);
+    if !compact {
+        match deletion {
+            Some(RowDeletion::Deleting) => content = content.push(design::caption("Deleting…")),
+            Some(RowDeletion::Failed(reason)) => {
+                content = content.push(deletion_failed_badge(reason))
+            }
+            None => {}
+        }
+    }
     // Durable attributes, after the reserved slot: each is a fact about the
     // worktree rather than live activity, so none of them moves while an agent
-    // starts or stops working. The rail has no room for any of them.
-    if !compact {
+    // starts or stops working. The rail has no room for any of them, and a
+    // worktree on its way out has no use for them.
+    if !compact && !deleting {
         let indicators = worktree_indicators(worktree);
         if let Some(label) = indicators.dirty {
             content = content.push(status_icon(
@@ -4731,14 +4892,17 @@ fn worktree_view<'a>(
             project_id,
             worktree_id: worktree.id,
         });
+    // A worktree on its way out is not somewhere to go: opening it would start
+    // sessions in a directory Git is about to remove.
+    let inert = modal_open || deleting;
     let action = grid
         .control(content, selected)
         .id(chrome.open_id.clone())
-        .name(worktree_accessible_name(
-            worktree,
-            agent_update,
-            activity,
-            has_panes,
+        .name(with_deletion_name(
+            worktree_accessible_name(worktree, agent_update, activity, has_panes),
+            "worktree",
+            &chrome.label,
+            deletion,
         ))
         .on_press_maybe(gated(
             SidebarAction::OpenWorktree {
@@ -4746,20 +4910,33 @@ fn worktree_view<'a>(
                 worktree_id: worktree.id,
                 path: worktree.path.clone(),
             },
-            modal_open,
+            inert,
         ));
     let action: Element<'a, SidebarAction> = if compact {
         action.into()
     } else {
         crate::interaction::hover(action)
     };
-    grid.mount(context_controls(
-        crate::interaction::tooltip(action, &*chrome.tooltip),
-        project_id,
-        Some(worktree.id),
-        modal_open,
-        github_ready,
-        editors,
+    grid.mount(with_deletion_retry(
+        context_controls(
+            crate::interaction::tooltip(action, &*chrome.tooltip),
+            project_id,
+            Some(worktree.id),
+            inert,
+            github_ready,
+            editors,
+        ),
+        deletion,
+        compact,
+        &chrome.label,
+        gated(
+            SidebarAction::RetryWorktreeDeletion {
+                project_id,
+                worktree_id: worktree.id,
+            },
+            modal_open,
+        ),
+        entity_id("worktree.retry-delete", worktree.id),
     ))
 }
 
@@ -7694,7 +7871,8 @@ pub(crate) fn channels_in_display_order<'a>(
 /// Cycling has to agree with the rows on screen, so it reuses the same
 /// ordering those rows are built from rather than the model's storage order.
 /// The active filter is deliberately not applied: a transient search must not
-/// silently shrink what a keyboard shortcut can reach.
+/// silently shrink what a keyboard shortcut can reach. A row being deleted is
+/// passed over: it is on its way out and cannot be opened meanwhile.
 pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<SidebarAction> {
     let mut destinations = Vec::new();
     for project in &model.projects {
@@ -7705,6 +7883,7 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
                 &project.worktrees,
             )
             .into_iter()
+            .filter(|worktree| worktree.deletion != Some(RowDeletion::Deleting))
             .map(|worktree| SidebarAction::OpenWorktree {
                 project_id: project.id,
                 worktree_id: worktree.id,
@@ -7714,6 +7893,7 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
         destinations.extend(
             channels_in_display_order(&project.channels)
                 .into_iter()
+                .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
                 .map(|channel| SidebarAction::OpenChannel {
                     channel_id: channel.id,
                 }),
@@ -10745,6 +10925,92 @@ pub(crate) mod tests {
                 "compact {compact}: a running operation lost its cancel: {actions:?}"
             );
         }
+    }
+
+    /// A deletion runs behind its row (#264): the row being deleted says so
+    /// and offers nothing, and one whose deletion failed says why, stays
+    /// navigable, and offers to run it again.
+    #[test]
+    fn a_row_being_deleted_is_inert_and_a_failed_one_offers_a_retry() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        let project_id = entry.id;
+        let (kept, doomed) = (entry.worktrees[0].id, entry.worktrees[1].id);
+        let channel = ChannelId::new();
+        entry.channels = vec![SidebarChannel::new(
+            channel,
+            "Investigation".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        )];
+        let opens = |actions: &[SidebarAction], id: WorktreeId| {
+            actions.iter().any(|action| {
+                matches!(action, SidebarAction::OpenWorktree { worktree_id, .. } if *worktree_id == id)
+            })
+        };
+
+        entry.worktrees[1].deletion = Some(RowDeletion::Deleting);
+        entry.channels[0].deletion = Some(RowDeletion::Deleting);
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry.clone()]);
+        let state = SidebarState::default();
+        for compact in [false, true] {
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
+            assert!(opens(&actions, kept), "compact {compact}: {actions:?}");
+            assert!(
+                !opens(&actions, doomed),
+                "compact {compact}: a worktree being deleted can still be opened"
+            );
+            assert!(
+                !actions.contains(&SidebarAction::OpenChannel {
+                    channel_id: channel
+                }),
+                "compact {compact}: a channel being deleted can still be opened"
+            );
+            let names = accessible_names(&renderer, body(&model, &state, compact, false));
+            for expected in [
+                // The row is labelled by its pull request.
+                "Deleting worktree Polish sidebar",
+                "Deleting channel Investigation",
+            ] {
+                assert!(
+                    names.iter().any(|name| name == expected),
+                    "compact {compact}: {expected:?} missing from {names:?}"
+                );
+            }
+        }
+
+        entry.worktrees[1].deletion = Some(RowDeletion::Failed("The worktree has changes".into()));
+        entry.channels[0].deletion = Some(RowDeletion::Failed("Daemon unreachable".into()));
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false));
+        assert!(
+            opens(&actions, doomed),
+            "a failed deletion leaves the row usable"
+        );
+        assert!(
+            actions.contains(&SidebarAction::RetryWorktreeDeletion {
+                project_id,
+                worktree_id: doomed,
+            }),
+            "{actions:?}"
+        );
+        assert!(
+            actions.contains(&SidebarAction::RetryChannelDeletion {
+                channel_id: channel
+            }),
+            "{actions:?}"
+        );
+        let names = accessible_names(&renderer, body(&model, &state, false, false));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("could not be deleted: The worktree has changes")),
+            "{names:?}"
+        );
     }
 
     #[test]

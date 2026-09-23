@@ -182,6 +182,17 @@ impl Action {
         )
     }
 
+    /// The card whose provider session this action starts afresh.
+    fn starts_session(&self) -> Option<CardId> {
+        match self {
+            Self::ChooseProvider(target, _) | Self::Reconnect(target) => Some(target.card),
+            Self::ChooseFreshProvider(card, _) | Self::Switch(card) | Self::StartFresh(card) => {
+                Some(*card)
+            }
+            _ => None,
+        }
+    }
+
     fn mutation_target(&self) -> Option<Target> {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
@@ -1813,12 +1824,12 @@ impl Cagents {
         provider: Provider,
         directory: Option<PathBuf>,
     ) -> Task<Message> {
-        if self.project_ui.deleting() {
-            return Task::none();
-        }
         let Some(working_directory) = directory.or_else(|| self.terminal_directory()) else {
             return cosmic::task::message(Message::OpenRepository);
         };
+        if self.refuse_in_deleting_worktree(&working_directory) {
+            return Task::none();
+        }
         let session =
             match fresh_chat_session(provider, TerminalId::new(), working_directory.clone()) {
                 Ok(session) => session,
@@ -2429,6 +2440,11 @@ impl Cagents {
     fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
             && (self.chat_start_pending(target.card) || self.chat_ui.closed.contains(&target.card))
+        {
+            return Task::none();
+        }
+        if let Some(card) = action.starts_session()
+            && self.refuse_for_deleting_card(card)
         {
             return Task::none();
         }

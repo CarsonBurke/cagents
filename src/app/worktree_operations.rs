@@ -376,6 +376,7 @@ impl Cagents {
         });
         self.sync_worktree_operation_rows();
     }
+
     pub(super) fn cancel_worktree_operation(&mut self, id: OperationId) -> Task<Message> {
         let Some(operation) = self.worktree_operations.get_mut(&id) else {
             return Task::none();
@@ -578,6 +579,7 @@ impl Cagents {
                     .map(|(path, time)| (path, *time))
             }),
         );
+        self.sync_worktree_deletion_rows();
     }
 }
 

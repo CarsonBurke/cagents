@@ -1046,6 +1046,26 @@ impl StateStore {
         Ok(())
     }
 
+    /// Forgets an applied worktree creation, freeing its identity for a new
+    /// one. Only an applied creation can be forgotten: anything unresolved
+    /// still has effects to reconcile, and a rolled-back one holds nothing.
+    pub fn release_worktree_creation(&self, id: OperationId) -> Result<()> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let changed = inner.connection.execute(
+            "DELETE FROM pending_operations
+             WHERE operation_id = ?1 AND entity_kind = 'worktree_creation'
+             AND status = 'applied'",
+            params![id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidState(format!(
+                "operation {id} is not an applied worktree creation"
+            )));
+        }
+        Ok(())
+    }
+
     /// Compare-and-swap the durable evidence and its generic journal status.
     /// A stale worker/reconciler must never overwrite newer evidence.
     pub fn update_operation(
@@ -4539,6 +4559,41 @@ mod tests {
             recovered.operations_requiring_reconciliation().unwrap()[0].status,
             PendingOperationStatus::NeedsReconciliation
         );
+    }
+
+    /// Only an applied creation gives up its identity; one still unresolved
+    /// keeps it, as the lease that stops a second creation racing its effects.
+    #[test]
+    fn only_an_applied_worktree_creation_is_released() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot("boot-a")).unwrap();
+        let creation = |entity_id: &str| PendingOperation {
+            id: OperationId::new(),
+            entity_kind: "worktree_creation".into(),
+            entity_id: entity_id.into(),
+            action: "create".into(),
+            base_generation: 1,
+            payload: serde_json::json!({}),
+            status: PendingOperationStatus::Pending,
+            created_at_unix_ms: now_unix_ms(),
+            updated_at_unix_ms: now_unix_ms(),
+        };
+        let applied = creation("created");
+        store.begin_operation(&applied).unwrap();
+        store
+            .resolve_operation(applied.id, PendingOperationStatus::Applied)
+            .unwrap();
+        let running = creation("running");
+        store.begin_operation(&running).unwrap();
+
+        assert!(store.release_worktree_creation(running.id).is_err());
+        assert!(store.begin_operation(&creation("running")).is_err());
+
+        assert!(store.begin_operation(&creation("created")).is_err());
+        store.release_worktree_creation(applied.id).unwrap();
+        assert!(store.release_worktree_creation(applied.id).is_err());
+        store.begin_operation(&creation("created")).unwrap();
     }
 
     #[test]

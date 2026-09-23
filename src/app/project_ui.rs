@@ -11,16 +11,68 @@ pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
+    /// Deletions the user has confirmed, by worktree, until each resolves. A
+    /// failed one stays so its row can say why and offer to run it again.
+    deletions: HashMap<WorktreeId, Deletion>,
     editors: Vec<crate::external_editor::Editor>,
+}
+
+/// A confirmed deletion. It runs behind the worktree's row, not a dialog.
+#[derive(Debug, Clone)]
+struct Deletion {
+    target: Target,
+    /// Why the last attempt failed; `None` while one is running.
+    failure: Option<String>,
 }
 
 impl State {
     pub fn modal_open(&self) -> bool {
         self.dialog.is_some()
     }
-    pub fn deleting(&self) -> bool {
-        self.dialog.as_ref().is_some_and(|dialog| dialog.pending)
+
+    fn running(&self) -> impl Iterator<Item = &Target> {
+        self.deletions
+            .values()
+            .filter(|deletion| deletion.failure.is_none())
+            .map(|deletion| &deletion.target)
     }
+
+    /// Whether `directory` is inside a worktree whose deletion is running.
+    ///
+    /// Nothing may start there: its sessions have been or are being closed,
+    /// and Git is about to remove the directory from under whatever did.
+    pub(super) fn deleting_directory(&self, directory: &Path) -> bool {
+        self.running()
+            .any(|target| directory.starts_with(&target.path))
+    }
+
+    /// Whether `card` works inside a worktree whose deletion is running.
+    pub(super) fn deleting_card(&self, card: &CardState) -> bool {
+        self.running()
+            .any(|target| card_belongs_to(card, &target.path))
+    }
+
+    fn row_deletion(&self, worktree: WorktreeId) -> Option<crate::sidebar::RowDeletion> {
+        self.deletions
+            .get(&worktree)
+            .map(|deletion| match &deletion.failure {
+                None => crate::sidebar::RowDeletion::Deleting,
+                Some(reason) => crate::sidebar::RowDeletion::Failed(reason.as_str().into()),
+            })
+    }
+
+    /// Whether the deletion of `worktree` is under way.
+    fn is_deleting(&self, worktree: WorktreeId) -> bool {
+        self.deletions
+            .get(&worktree)
+            .is_some_and(|deletion| deletion.failure.is_none())
+    }
+
+    /// Whether any worktree deletion is under way.
+    pub(super) fn deletion_running(&self) -> bool {
+        self.running().next().is_some()
+    }
+
     pub(super) fn focus_target(&self) -> widget::Id {
         widget::Id::new(
             if self
@@ -39,12 +91,11 @@ impl State {
 #[derive(Debug, Clone)]
 struct Dialog {
     target: Target,
-    pending: bool,
     /// A pre-flight refusal: deletion cannot proceed, so the confirm button
     /// stays disabled until the user resolves it outside the dialog.
     blocker: Option<String>,
-    /// A failed attempt. `ConfirmDelete` is written to be re-entered, so this
-    /// must be displayed without disabling the retry.
+    /// Why the last confirmed deletion of this worktree failed, when the
+    /// dialog is opened again from its row. Confirming retries it.
     failure: Option<String>,
 }
 
@@ -72,6 +123,8 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
+    /// Runs a failed deletion again. The user confirmed it once already.
+    RetryDelete(WorktreeId),
     AwaitSessions(Target),
     Deleted {
         target: Target,
@@ -189,17 +242,15 @@ impl Cagents {
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::AwaitSessions(target) => {
-                let Some(dialog) = &mut self.project_ui.dialog else {
-                    return Task::none();
-                };
-                if dialog.target.worktree != target.worktree
-                    || dialog.target.path != target.path
-                    || !dialog.pending
-                {
-                    return Task::none();
+                let running = target
+                    .worktree
+                    .and_then(|id| self.project_ui.deletions.get(&id))
+                    .is_some_and(|deletion| {
+                        deletion.failure.is_none() && deletion.target.path == target.path
+                    });
+                if running {
+                    return self.run_worktree_deletion(target);
                 }
-                dialog.pending = false;
-                return self.handle_project_action(Action::ConfirmDelete);
             }
             Action::EditorsLoaded(result) => match result {
                 Ok(editors) => {
@@ -228,25 +279,37 @@ impl Cagents {
                 worktree_id,
                 command,
             } => {
-                if self.project_ui.deleting()
-                    || (self.modal_is_open() && !self.project_ui.modal_open())
-                {
+                if self.modal_is_open() && !self.project_ui.modal_open() {
                     return Task::none();
                 }
                 let Some(target) = self.project_target(project_id, worktree_id) else {
                     return Task::none();
                 };
+                // The row offers nothing while its worktree is being deleted;
+                // a command that raced the deletion is refused the same way,
+                // even once a read has moved the row to another path.
+                if target
+                    .worktree
+                    .is_some_and(|id| self.project_ui.is_deleting(id))
+                    || (target.worktree.is_some()
+                        && self.project_ui.deleting_directory(&target.path))
+                {
+                    return Task::none();
+                }
                 match command {
                     ProjectCommand::OpenEditor(editor_id) => {
                         return self.launch_editor(target.path, &editor_id);
                     }
                     ProjectCommand::Delete => {
                         let blocker = self.worktree_deletion_blocker(&target);
+                        let failure = target
+                            .worktree
+                            .and_then(|id| self.project_ui.deletions.get(&id))
+                            .and_then(|deletion| deletion.failure.clone());
                         self.project_ui.dialog = Some(Dialog {
                             target,
-                            pending: false,
                             blocker,
-                            failure: None,
+                            failure,
                         });
                         return iced::widget::operation::focus(self.project_ui.focus_target())
                             .map(cosmic::Action::App);
@@ -295,29 +358,25 @@ impl Cagents {
                 }
             }
             Action::Dismiss => {
-                if self.project_ui.deleting() {
-                    return Task::none();
+                let dismissed = self.project_ui.dialog.take();
+                // Declining to run a failed deletion again is the answer to
+                // it, so its row stops asking.
+                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
+                    && self
+                        .project_ui
+                        .deletions
+                        .get(&id)
+                        .is_some_and(|deletion| deletion.failure.is_some())
+                {
+                    self.project_ui.deletions.remove(&id);
+                    self.sync_worktree_operation_rows();
                 }
-                self.project_ui.dialog = None;
-                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
-                    self.workspace
-                        .focused()
-                        .map(|card| self.card_keyboard_focus(card))
-                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
-                });
-                return Task::batch([
-                    iced::widget::operation::focus(focus).map(cosmic::Action::App),
-                    self.lifecycle_sweep(),
-                    self.sync_chrome(),
-                ]);
+                return self.project_dialog_closed();
             }
             Action::ConfirmDelete => {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
                 };
-                if dialog.pending {
-                    return Task::none();
-                }
                 let target = dialog.target.clone();
                 if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                     let dialog = self.project_ui.dialog.as_mut().unwrap();
@@ -325,43 +384,63 @@ impl Cagents {
                     dialog.failure = None;
                     return Task::none();
                 }
-                let dialog = self.project_ui.dialog.as_mut().unwrap();
-                dialog.pending = true;
-                dialog.blocker = None;
-                dialog.failure = None;
-                if self.durable.cards.iter().any(|card| {
-                    card.existence.is_open()
-                        && card_belongs_to(card, &target.path)
-                        && (self.pending_terminal_spawn(card.id)
-                            || self.chat_start_pending(card.id))
-                }) {
-                    return cosmic::task::future(async move {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        Message::ProjectUi(Action::AwaitSessions(target))
-                    });
+                // Confirmed is registered: the row reports the deletion from
+                // here, so the dialog has nothing left to say.
+                self.project_ui.dialog = None;
+                let deletion = self.start_worktree_deletion(target);
+                return Task::batch([deletion, self.project_dialog_closed()]);
+            }
+            Action::RetryDelete(id) => {
+                let Some(deletion) = self.project_ui.deletions.get(&id) else {
+                    return Task::none();
+                };
+                if deletion.failure.is_none() {
+                    return Task::none();
                 }
-                return cosmic::task::future(async move {
-                    let request = target.clone();
-                    let result = tokio::task::spawn_blocking(move || delete_worktree(&request))
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result);
-                    Message::ProjectUi(Action::Deleted { target, result })
-                });
+                // The row may have been read again since; retry what it lists
+                // now, and let a row that is gone take its failure with it.
+                let Some(target) = self.project_target(deletion.target.project, Some(id)) else {
+                    self.project_ui.deletions.remove(&id);
+                    self.sync_worktree_operation_rows();
+                    return Task::none();
+                };
+                if let Some(blocker) = self.worktree_deletion_blocker(&target) {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Could not delete {}: {blocker}",
+                        target.label
+                    )));
+                    if let Some(deletion) = self.project_ui.deletions.get_mut(&id) {
+                        deletion.failure = Some(blocker);
+                    }
+                    self.sync_worktree_operation_rows();
+                    return Task::none();
+                }
+                return self.start_worktree_deletion(target);
             }
             Action::Deleted { target, result } => match result {
                 Err(failure) => {
-                    // Re-check first: the failure may have been caused by state
-                    // that has since become a hard blocker.
-                    let blocker = self.worktree_deletion_blocker(&target);
-                    if let Some(dialog) = &mut self.project_ui.dialog {
-                        dialog.pending = false;
-                        dialog.blocker = blocker;
-                        dialog.failure = Some(failure);
+                    // A blocker names what to resolve, so it outranks Git's
+                    // own account of the same refusal.
+                    let reason = self.worktree_deletion_blocker(&target).unwrap_or(failure);
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not delete {}: {reason}",
+                        target.label
+                    )));
+                    if let Some(deletion) = target
+                        .worktree
+                        .and_then(|id| self.project_ui.deletions.get_mut(&id))
+                    {
+                        deletion.failure = Some(reason);
                     }
+                    self.sync_worktree_operation_rows();
+                    // The worktree stays, so the cards the sweep held back
+                    // while it was going can mount again.
+                    return self.lifecycle_sweep();
                 }
                 Ok(()) => {
-                    self.project_ui.dialog = None;
+                    if let Some(id) = target.worktree {
+                        self.project_ui.deletions.remove(&id);
+                    }
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
@@ -413,14 +492,20 @@ impl Cagents {
                         }]);
                     }
                     self.forget_worktree_creation(&target.path);
-                    let scope = if self.active_workspace.as_ref() == Some(&target.path) {
-                        target.repository.clone()
-                    } else {
-                        self.active_workspace
-                            .clone()
-                            .unwrap_or_else(|| target.repository.clone())
+                    // The window may have moved anywhere while Git worked, a
+                    // channel included, so the scope it is on is re-selected
+                    // to drop the retired cards rather than replaced.
+                    let select = match self.durable.active_channel {
+                        Some(channel) => self.select_channel(channel),
+                        None => {
+                            let scope = self
+                                .active_workspace
+                                .clone()
+                                .filter(|active| !active.starts_with(&target.path))
+                                .unwrap_or_else(|| target.repository.clone());
+                            self.select_worktree(scope, false)
+                        }
                     };
-                    let select = self.select_worktree(scope, false);
                     self.persist();
                     self.status = Some(TransientNotice::success(
                         "Worktree deleted; branch retained.",
@@ -443,6 +528,132 @@ impl Cagents {
             }
         }
         Task::none()
+    }
+
+    /// Registers a confirmed deletion on its row and starts it.
+    ///
+    /// The workspace leaves the worktree now rather than once it is gone, so
+    /// nothing the user does in the meantime lands in a directory whose
+    /// sessions are being closed.
+    fn start_worktree_deletion(&mut self, target: Target) -> Task<Message> {
+        let Some(id) = target.worktree else {
+            return Task::none();
+        };
+        self.project_ui.deletions.insert(
+            id,
+            Deletion {
+                target: target.clone(),
+                failure: None,
+            },
+        );
+        self.sync_worktree_operation_rows();
+        let leave = if self
+            .active_workspace
+            .as_deref()
+            .is_some_and(|active| active.starts_with(&target.path))
+        {
+            self.select_worktree(target.repository.clone(), false)
+        } else {
+            Task::none()
+        };
+        Task::batch([leave, self.run_worktree_deletion(target)])
+    }
+
+    /// Runs the deletion once no session in the worktree is still starting:
+    /// one that is would come up after its directory had been emptied.
+    fn run_worktree_deletion(&mut self, target: Target) -> Task<Message> {
+        if self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && card_belongs_to(card, &target.path)
+                && (self.pending_terminal_spawn(card.id) || self.chat_start_pending(card.id))
+        }) {
+            return cosmic::task::future(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Message::ProjectUi(Action::AwaitSessions(target))
+            });
+        }
+        let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        cosmic::task::future(async move {
+            let request = target.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                delete_worktree(&request)?;
+                if let Some(store) = store
+                    && let Err(error) =
+                        crate::repository::release_deleted_worktree_creations(&store, &request.path)
+                {
+                    // The worktree is gone either way; what stays held is
+                    // only the chance to create the same one again.
+                    tracing::warn!(
+                        worktree = %request.path.display(),
+                        %error,
+                        "could not release the deleted worktree's creation"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::ProjectUi(Action::Deleted { target, result })
+        })
+    }
+
+    /// Refuses, and says so, to start anything in `directory` while the
+    /// worktree it is in is being deleted.
+    pub(super) fn refuse_in_deleting_worktree(&mut self, directory: &Path) -> bool {
+        if !self.project_ui.deleting_directory(directory) {
+            return false;
+        }
+        self.status = Some(TransientNotice::warning("That worktree is being deleted."));
+        true
+    }
+
+    /// Refuses, and says so, to start a session for `card` while the
+    /// worktree it works in is being deleted.
+    pub(super) fn refuse_for_deleting_card(&mut self, card: CardId) -> bool {
+        if !self
+            .card_state(card)
+            .is_some_and(|state| self.project_ui.deleting_card(state))
+        {
+            return false;
+        }
+        self.status = Some(TransientNotice::warning("That worktree is being deleted."));
+        true
+    }
+
+    /// Hands focus back to whatever the dialog covered.
+    fn project_dialog_closed(&mut self) -> Task<Message> {
+        let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
+            self.workspace
+                .focused()
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
+        });
+        Task::batch([
+            iced::widget::operation::focus(focus).map(cosmic::Action::App),
+            self.lifecycle_sweep(),
+            self.sync_chrome(),
+        ])
+    }
+
+    /// Shows each deletion on its worktree's row. A read of the checkout
+    /// rebuilds the rows, so this runs after every one; a failure whose
+    /// worktree the read no longer lists has nothing left to retry.
+    pub(super) fn sync_worktree_deletion_rows(&mut self) {
+        let projects = &mut self.sidebar_model.projects;
+        self.project_ui.deletions.retain(|id, deletion| {
+            deletion.failure.is_none()
+                || projects
+                    .iter()
+                    .flat_map(|project| &project.worktrees)
+                    .any(|worktree| worktree.id == *id)
+        });
+        for worktree in projects
+            .iter_mut()
+            .flat_map(|project| &mut project.worktrees)
+        {
+            worktree.deletion = self.project_ui.row_deletion(worktree.id);
+        }
     }
 
     fn worktree_deletion_blocker(&self, target: &Target) -> Option<String> {
@@ -547,23 +758,21 @@ impl Cagents {
         if let Some(message) = dialog.message() {
             rows.push(super::notice_body(message));
         }
-        // A failed attempt leaves the confirm button live: `ConfirmDelete`
-        // re-checks every precondition, so a transient git failure must not
-        // force the user to dismiss and re-open the dialog to retry.
-        let confirm = (!dialog.pending && dialog.blocker.is_none())
+        // Reopened from a row whose deletion failed, the dialog says why and
+        // confirming runs it again; `ConfirmDelete` re-checks every
+        // precondition first either way.
+        let confirm = dialog
+            .blocker
+            .is_none()
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
         rows.push(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("dialog.project.close"))
-                    .on_press_maybe(
-                        (!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss)),
-                    )
+                    .on_press(Message::ProjectUi(Action::Dismiss))
                     .into(),
-                widget::button::destructive(if dialog.pending {
-                    "Deleting…"
-                } else if dialog.failure.is_some() {
+                widget::button::destructive(if dialog.failure.is_some() {
                     "Retry delete"
                 } else {
                     "Delete worktree"
@@ -784,12 +993,15 @@ fn delete_worktree(target: &Target) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar::RowDeletion;
 
-    /// A worktree deleted before the catalog ever stored it is still recorded
-    /// as deleted, and the tombstone lands after a save of it as open that was
-    /// still queued (#245).
-    #[test]
-    fn deletion_records_its_tombstone_without_waiting_for_the_catalog() {
+    /// A window with session storage and one project at `repository` whose
+    /// linked worktree is `linked`, both of them saved.
+    fn deletable_app(
+        repository: &Path,
+        linked: &SidebarWorktree,
+        primary: &SidebarWorktree,
+    ) -> (Cagents, tempfile::TempDir, ProjectId) {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let directory = tempfile::tempdir().unwrap();
         let (session, _) = SessionRuntime::open(
@@ -797,38 +1009,52 @@ mod tests {
             crate::model::BootId::new("test"),
         )
         .unwrap();
-        app.session = Some(session);
         let project = ProjectId::new();
+        session.save_project(ProjectState {
+            id: project,
+            generation: 0,
+            name: "repo".into(),
+            repository: repository.to_path_buf(),
+            existence: Existence::Open,
+        });
+        app.session = Some(session);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.to_path_buf(),
+            vec![primary.clone(), linked.clone()],
+            Vec::new(),
+        ));
+        (app, directory, project)
+    }
+
+    fn row(app: &Cagents, id: WorktreeId) -> Option<&SidebarWorktree> {
+        app.sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| &project.worktrees)
+            .find(|worktree| worktree.id == id)
+    }
+
+    /// A worktree deleted before the catalog ever stored it is still recorded
+    /// as deleted, and the tombstone lands after a save of it as open that was
+    /// still queued (#245).
+    #[test]
+    fn deletion_records_its_tombstone_without_waiting_for_the_catalog() {
         let repository = PathBuf::from("/repo");
         let linked = SidebarWorktree::from_durable(
             WorktreeId::new(),
             repository.join("worktrees/feature"),
             Some("feature".into()),
         );
-        let id = linked.id;
-        app.sidebar_model.projects.push(SidebarProject::new(
-            project,
-            RepositoryId::new(),
-            "repo".into(),
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
             repository.clone(),
-            vec![
-                SidebarWorktree::from_durable(
-                    WorktreeId::new(),
-                    repository.clone(),
-                    Some("main".into()),
-                ),
-                linked.clone(),
-            ],
-            Vec::new(),
-        ));
-        let session = app.session.as_ref().unwrap();
-        session.save_project(ProjectState {
-            id: project,
-            generation: 0,
-            name: "repo".into(),
-            repository: repository.clone(),
-            existence: Existence::Open,
-        });
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
 
         let _ = app.handle_project_action(Action::Command {
             project_id: project,
@@ -836,6 +1062,8 @@ mod tests {
             command: ProjectCommand::Delete,
         });
         let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        assert!(app.project_ui.dialog.is_none());
         // A repository refresh that listed the worktree before Git removed it.
         app.session
             .as_ref()
@@ -852,7 +1080,7 @@ mod tests {
             target,
             result: Ok(()),
         });
-        assert!(app.project_ui.dialog.is_none());
+        assert!(app.project_ui.deletions.is_empty());
         assert!(
             !app.sidebar_model.projects[0]
                 .worktrees
@@ -868,6 +1096,253 @@ mod tests {
         assert_eq!(deleted.project_id, project);
         assert_eq!(deleted.path, linked.path);
         assert_eq!(deleted.branch.as_deref(), Some("feature"));
+    }
+
+    /// The confirmation goes the moment it is answered, and the worktree's
+    /// row carries the deletion from there (#264): nothing starts in the
+    /// worktree meanwhile, a failure stays on the row through a re-read of
+    /// the checkout, the row runs it again, and declining it clears the row.
+    #[test]
+    fn a_deletion_runs_behind_its_row_and_a_failure_is_retried_from_there() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let delete = Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        };
+
+        let _ = app.handle_project_action(delete.clone());
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        assert!(!app.modal_is_open());
+        assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
+
+        let cards = app.durable.cards.len();
+        let _ = app.add_terminal(linked.path.join("src"));
+        assert_eq!(app.durable.cards.len(), cards, "a terminal started in it");
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("That worktree is being deleted.")
+        );
+        assert!(!app.project_ui.deleting_directory(&repository));
+
+        let target = app.project_ui.deletions[&id].target.clone();
+        let _ = app.handle_project_action(Action::Deleted {
+            target: target.clone(),
+            result: Err("fatal: cannot remove".into()),
+        });
+        let failed = Some(RowDeletion::Failed("fatal: cannot remove".into()));
+        assert_eq!(row(&app, id).unwrap().deletion, failed);
+        assert!(!app.project_ui.deleting_directory(&linked.path));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.ends_with("fatal: cannot remove"))
+        );
+
+        // A read of the checkout replaces the rows; the failure is the
+        // application's, so it is put back on the new one.
+        app.sidebar_model.projects[0].worktrees = vec![
+            primary.clone(),
+            SidebarWorktree::from_durable(id, linked.path.clone(), Some("feature".into())),
+        ];
+        app.sync_worktree_operation_rows();
+        assert_eq!(row(&app, id).unwrap().deletion, failed);
+
+        let _ = app.handle_project_action(Action::RetryDelete(id));
+        assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
+        let _ = app.handle_project_action(Action::Deleted {
+            target,
+            result: Err("fatal: cannot remove".into()),
+        });
+
+        // Reopened from the row, the dialog says why; cancelling declines it.
+        let _ = app.handle_project_action(delete);
+        assert_eq!(
+            app.project_ui.dialog.as_ref().unwrap().failure.as_deref(),
+            Some("fatal: cannot remove")
+        );
+        let _ = app.handle_project_action(Action::Dismiss);
+        assert_eq!(row(&app, id).unwrap().deletion, None);
+        assert!(app.project_ui.deletions.is_empty());
+    }
+
+    /// The window moves off a worktree whose deletion it confirms and cannot
+    /// be brought back while Git works, by the row or by cycling workspaces,
+    /// nor restarted underneath it. Wherever the user goes meanwhile, a
+    /// channel included, is where the window stays when the deletion lands.
+    #[test]
+    fn the_window_leaves_a_worktree_being_deleted_and_stays_where_the_user_went() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let _ = app.select_worktree(linked.path.clone(), false);
+        assert_eq!(app.active_workspace.as_ref(), Some(&linked.path));
+
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        assert_eq!(app.active_workspace.as_ref(), Some(&repository));
+        assert!(
+            app.window_update_blocker().is_some(),
+            "an update would restart the window halfway through the deletion"
+        );
+
+        let open = SidebarAction::OpenWorktree {
+            project_id: project,
+            worktree_id: id,
+            path: linked.path.clone(),
+        };
+        assert!(
+            !crate::sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state)
+                .contains(&open),
+            "cycling workspaces lands on the worktree being deleted"
+        );
+        let _ = app.update(Message::Sidebar(open));
+        assert_eq!(app.active_workspace.as_ref(), Some(&repository));
+        assert_eq!(
+            app.status.as_ref().map(|notice| notice.message.as_str()),
+            Some("That worktree is being deleted.")
+        );
+
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Investigation".into(),
+                ordinal: 0,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        let _ = app.select_channel(channel);
+        let target = app.project_ui.deletions[&id].target.clone();
+        let _ = app.handle_project_action(Action::Deleted {
+            target,
+            result: Ok(()),
+        });
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert!(app.window_update_blocker().is_none());
+    }
+
+    /// A load that reached this repository under another project entry, with
+    /// a listing taken before the deletion, lands after it. The deletion
+    /// started a newer load of the project, so the older listing adds nothing
+    /// back.
+    #[test]
+    fn a_listing_older_than_a_deletion_cannot_bring_the_worktree_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        let linked_path = root.join("linked");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                linked_path.to_str().unwrap(),
+            ],
+        );
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("test"),
+        )
+        .unwrap();
+        app.session = Some(session);
+        let load = || {
+            super::super::load_repository(&repository, None, CancellationToken::default()).unwrap()
+        };
+        let loaded = |app: &mut Cagents, project_id, repository| {
+            let generation = app.repository_generations[&project_id];
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: false,
+                project_id,
+                generation,
+                result: Ok(Box::new(repository)),
+            }));
+        };
+
+        let first = load();
+        let project = first.project.id;
+        let _ = app.repository_load_task(repository.clone(), Some(project), false);
+        loaded(&mut app, project, first);
+        let id = app.sidebar_model.projects[0]
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == linked_path)
+            .unwrap()
+            .id;
+
+        // Re-adding the repository starts a load under a new entry, and its
+        // listing is taken while the worktree still exists.
+        let alias = ProjectId::new();
+        let _ = app.repository_load_task(repository.clone(), Some(alias), false);
+        let stale = load();
+
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        git(
+            &repository,
+            &["worktree", "remove", linked_path.to_str().unwrap()],
+        );
+        let target = app.project_ui.deletions[&id].target.clone();
+        let _ = app.handle_project_action(Action::Deleted {
+            target,
+            result: Ok(()),
+        });
+        loaded(&mut app, alias, stale);
+
+        assert!(
+            row(&app, id).is_none(),
+            "the stale listing re-added the row"
+        );
+        let session = app.session.as_ref().unwrap();
+        session.flush(Duration::from_secs(5)).unwrap();
+        assert!(
+            !session
+                .operation_store()
+                .load_worktree(id)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open(),
+            "the stale listing reopened the catalog row"
+        );
     }
 
     fn git(directory: &Path, arguments: &[&str]) {
@@ -958,5 +1433,25 @@ mod tests {
             "The worktree is locked; unlock it explicitly in Git first."
         );
         assert!(linked.is_dir());
+
+        // A bare repository lists itself first, as the primary it is.
+        let bare = root.join("bare.git");
+        git(&root, &["init", "--bare", "bare.git"]);
+        let bare_id = RepositoryService::system("git")
+            .list_worktrees(&bare, &CancellationToken::default())
+            .unwrap()
+            .into_iter()
+            .find(|record| record.bare)
+            .unwrap()
+            .id;
+        assert_eq!(
+            delete_worktree(&Target {
+                repository: bare.clone(),
+                ..target(Some(bare_id), &bare)
+            })
+            .unwrap_err(),
+            "The primary worktree cannot be deleted."
+        );
+        assert!(bare.is_dir());
     }
 }

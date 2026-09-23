@@ -10562,6 +10562,37 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
     .expect("byte slices and strings serialize")
 }
 
+/// Releases the identities held by the applied creations of `worktree`,
+/// which Git has just removed at the user's request.
+///
+/// An applied creation keeps its identity so that a replay of the request
+/// cannot run while what it made exists. Once the user has deleted the
+/// worktree there is nothing left to protect, and holding on would refuse
+/// creating the same worktree again for good (#269). A worktree removed
+/// outside the app keeps its creations' identities: nothing here saw the
+/// user ask for that.
+pub fn release_deleted_worktree_creations(
+    store: &StateStore,
+    worktree: &Path,
+) -> Result<(), StoreError> {
+    for operation in store.journaled_worktree_operations()? {
+        if operation.status != PendingOperationStatus::Applied {
+            continue;
+        }
+        let Ok(journal) = serde_json::from_value::<WorktreeJournal>(operation.payload) else {
+            continue;
+        };
+        let created = match &journal.outcome {
+            Some(WorktreeCreationOutcome::Created { worktree, .. }) => Some(&worktree.path),
+            _ => None,
+        };
+        if journal.request.destination == worktree || created.is_some_and(|path| path == worktree) {
+            store.release_worktree_creation(operation.id)?;
+        }
+    }
+    Ok(())
+}
+
 // Configured roots may intentionally be siblings (../worktrees). Resolve
 // symlinks before each parent step, then hand the journal an absolute path
 // without traversal components. Explicit destinations keep the strict guard.
@@ -11681,6 +11712,39 @@ mod worktree_journal_tests {
         }
     }
 
+    /// Deleting a created worktree in the app frees its identity, so the same
+    /// worktree can be created again on the branch the deletion kept (#269).
+    #[test]
+    fn a_deleted_worktree_can_be_created_again_on_its_kept_branch() {
+        let mut fixture = Fixture::new();
+        fixture.resolve(fixture.input("foo"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let destination = fixture.request.destination.clone();
+        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+
+        release_deleted_worktree_creations(&fixture.store, &destination).unwrap();
+        assert!(
+            fixture
+                .store
+                .journaled_worktree_operations()
+                .unwrap()
+                .iter()
+                .all(|operation| operation.id != report.operation_id),
+            "the applied creation still holds its identity"
+        );
+
+        fixture.resolve(fixture.input("foo"));
+        assert_eq!(
+            fixture.request.base,
+            BaseRevision::LocalBranch(ValidatedBranchName::parse("foo").unwrap()),
+            "the kept branch is checked out as it is"
+        );
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert!(destination.join("tracked.txt").is_file());
+    }
+
     #[test]
     fn creation_from_project_common_directory_keeps_project_identity() {
         let mut fixture = Fixture::new();
@@ -11832,7 +11896,8 @@ mod worktree_journal_tests {
             fixture.run(&CancellationToken::new()).state,
             WorktreeOperationState::LeaseConflict
         );
-        // Removing a created worktree does not release its replay-proof identity.
+        // Removing a created worktree outside the app does not release its
+        // replay-proof identity; only a deletion the user asked the app for does.
         // A distinct destination permits an independent divergence attempt.
         let mut input = fixture.input("topic");
         input.destination = "worktrees/topic-diverged".into();
