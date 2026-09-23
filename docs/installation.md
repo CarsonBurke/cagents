@@ -247,6 +247,11 @@ in the currently installed CLI and daemon.
 | `--restart-daemon` | Checkpoint supported sessions and replace the running daemon |
 | `--require-empty-daemon` | With `--restart-daemon`, refuse rather than interrupt live sessions |
 | `--relaunch-agents` | With `--restart-daemon`, accept fresh conversations for agents that have no exact resume identity (requires an installed CLI that can record this) |
+| `--no-relaunch-agents` | With `--restart-daemon`, refuse the upgrade while any agent has no exact resume identity |
+
+Without either relaunch option, the installed CLI decides: it follows the
+`relaunch_agents_on_upgrade` setting, which is on by default. An installed CLI
+older than that setting never relaunches unless `--relaunch-agents` is given.
 
 `--restart-daemon` cannot be combined with `--uninstall` or `--purge`. The full
 handoff, rollback behavior, and the one-time bootstrap from legacy

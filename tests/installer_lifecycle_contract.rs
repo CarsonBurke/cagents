@@ -142,10 +142,13 @@ case "$*" in
   'daemon prepare-upgrade --help')
     [ "$FIXTURE_RESTART" != relaunch-unsupported ] || exit 0
     printf 'Options:\n  --relaunch-agents  Accept fresh launches\n'
+    [ "$FIXTURE_RESTART" != decline ] || printf '  --no-relaunch-agents  Refuse instead\n'
     ;;
-  '--json daemon prepare-upgrade --yes'|'--json daemon prepare-upgrade --yes --relaunch-agents')
+  '--json daemon prepare-upgrade --yes'|'--json daemon prepare-upgrade --yes --relaunch-agents'|'--json daemon prepare-upgrade --yes --no-relaunch-agents')
     if [ "$FIXTURE_RESTART" = relaunch ]; then
       [ "$#" -eq 5 ] && [ "$5" = --relaunch-agents ] || exit 98
+    elif [ "$FIXTURE_RESTART" = decline ]; then
+      [ "$#" -eq 5 ] && [ "$5" = --no-relaunch-agents ] || exit 98
     else
       [ "$#" -eq 4 ] || exit 98
     fi
@@ -337,6 +340,9 @@ esac
     if matches!(restart, Some("relaunch" | "relaunch-unsupported")) {
         command.arg("--relaunch-agents");
     }
+    if matches!(restart, Some("decline" | "decline-legacy")) {
+        command.arg("--no-relaunch-agents");
+    }
     if download.is_some() {
         command
             .env_remove("CAGENTS_ARCHIVE")
@@ -379,7 +385,9 @@ esac
         .unwrap();
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
-            Some("success" | "relaunch") => publish_failure.is_none(),
+            Some("success" | "relaunch" | "decline" | "decline-legacy") => {
+                publish_failure.is_none()
+            }
             Some("empty") => terminals == 0 && publish_failure.is_none(),
             Some(_) => false,
             None => (compatible || terminals == 0) && publish_failure.is_none(),
@@ -432,7 +440,7 @@ esac
             ("start-failure", _) => {
                 "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\nnew:stopped\nold:start\n"
             }
-            ("success" | "relaunch", None) => {
+            ("success" | "relaunch" | "decline" | "decline-legacy", None) => {
                 "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
             }
             ("success", Some(_)) => "old:help\nold:prepare\nold:draining\nold:stopped\nold:start\n",
@@ -565,6 +573,14 @@ fn installer_passes_relaunch_acceptance_only_to_a_supporting_installed_cli() {
     upgrade_fixture(false, 7, None, Some("relaunch-unsupported"));
 }
 
+/// Declining is passed on where the installed CLI knows the choice, and is
+/// already what an older CLI does when nothing is passed.
+#[test]
+fn installer_passes_a_declined_relaunch_only_to_a_cli_that_would_otherwise_accept() {
+    upgrade_fixture(false, 7, None, Some("decline"));
+    upgrade_fixture(false, 7, None, Some("decline-legacy"));
+}
+
 #[test]
 fn checkpointed_publication_failure_restarts_previous_version_from_handoff() {
     upgrade_fixture(false, 7, Some("error"), Some("success"));
@@ -599,6 +615,7 @@ fn restart_option_rejects_uninstall_and_extra_values_without_creating_installati
         vec!["--restart-daemon=yes"],
         vec!["--restart-daemon", "yes"],
         vec!["--relaunch-agents"],
+        vec!["--no-relaunch-agents"],
     ] {
         let output = Command::new("sh")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))

@@ -475,6 +475,10 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
+const fn default_relaunch_agents_on_upgrade() -> bool {
+    true
+}
+
 /// Main stays first; imported worktrees without creation evidence sort by path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -609,6 +613,12 @@ pub struct AppSettings {
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
+    /// Whether a daemon upgrade starts a fresh conversation for an agent whose
+    /// conversation cannot be resumed exactly, rather than refusing to
+    /// upgrade until it is closed. `cagents daemon prepare-upgrade` reads it
+    /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
+    #[serde(default = "default_relaunch_agents_on_upgrade")]
+    pub relaunch_agents_on_upgrade: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -657,6 +667,7 @@ impl Default for AppSettings {
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
             show_status_bar: default_show_status_bar(),
+            relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
@@ -1227,9 +1238,7 @@ pub enum SettingsError {
 }
 
 pub fn default_path() -> Result<PathBuf, SettingsError> {
-    instance::project_dirs()
-        .map(|dirs| dirs.config_dir().join("settings.toml"))
-        .ok_or(SettingsError::DirectoryUnavailable)
+    instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
 }
 
 fn settings_lock(path: &Path) -> Result<File, SettingsError> {
@@ -1714,6 +1723,7 @@ mod tests {
             worktree_sort: WorktreeSort::Oldest,
             focus_follows_mouse: false,
             confirm_terminal_close: false,
+            relaunch_agents_on_upgrade: false,
             ..AppSettings::default()
         };
 
@@ -1733,9 +1743,11 @@ mod tests {
         let table = old.as_table_mut().unwrap();
         table.remove("confirm_terminal_close");
         table.remove("focus_follows_mouse");
+        table.remove("relaunch_agents_on_upgrade");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
         assert!(decoded.focus_follows_mouse);
+        assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
     }
 

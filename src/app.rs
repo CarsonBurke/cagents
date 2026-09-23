@@ -2333,6 +2333,7 @@ pub enum SettingsField {
     EditorWrapLines,
     ChatEnterSends,
     ShowStatusBar,
+    RelaunchAgentsOnUpgrade,
     EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
@@ -2428,6 +2429,7 @@ struct SettingsDraft {
     confirm_terminal_close: bool,
     chat_enter_sends: bool,
     show_status_bar: bool,
+    relaunch_agents_on_upgrade: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
@@ -2471,6 +2473,7 @@ impl SettingsDraft {
             confirm_terminal_close: settings.confirm_terminal_close,
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
+            relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -2503,6 +2506,9 @@ impl SettingsDraft {
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
+            SettingsField::RelaunchAgentsOnUpgrade => {
+                self.relaunch_agents_on_upgrade = value == "true"
+            }
             SettingsField::EditorSyntaxTheme => {
                 if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
                     self.editor_syntax_theme = theme;
@@ -2597,6 +2603,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_status_bar = enabled)
             .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
+        SettingsField::RelaunchAgentsOnUpgrade => value
+            .parse::<bool>()
+            .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
+            .map_err(|_| "Choose whether upgrades relaunch unresumable agents.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -9104,6 +9114,7 @@ impl Cagents {
                     | SettingsField::TerminalScrollSpeed
                     | SettingsField::TerminalCursorStyle
                     | SettingsField::ConfirmTerminalClose
+                    | SettingsField::RelaunchAgentsOnUpgrade
                     | SettingsField::ChatEnterSends
                     | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
@@ -12047,7 +12058,14 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(dialog_ui::surface(
                 widget::column::with_children(vec![
                     widget::text::title3("Update and reopen cagents?").into(),
-                    notice_body(format!("The terminal service will restart, interrupting {count} live sessions. Agent conversations resume where supported; shells reopen in their working directories. Running shell jobs will stop. Your windows and tabs will reopen automatically.")),
+                    notice_body(format!(
+                        "The terminal service will restart, interrupting {count} live sessions. Agent conversations resume where supported{}; shells reopen in their working directories. Running shell jobs will stop. Your windows and tabs will reopen automatically.",
+                        if self.settings.relaunch_agents_on_upgrade {
+                            ", and agents that cannot resume start a fresh conversation"
+                        } else {
+                            ""
+                        }
+                    )),
                     widget::row::with_children(vec![
                         iced::widget::Space::new().width(Length::Fill).into(),
                         widget::button::standard("Cancel").id(widget::Id::new("update.cancel"))

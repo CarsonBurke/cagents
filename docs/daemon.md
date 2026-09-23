@@ -117,13 +117,16 @@ Success means the checkpoint was persisted and shutdown requested, so callers
 must still wait for `daemon status` to report stopped. Prefer the installer's
 `--restart-daemon` flow when replacing an installed release.
 
-If identified agents have no exact resume identity, the upgrade is refused and
-every blocker is listed. `daemon prepare-upgrade --yes --relaunch-agents`
-explicitly accepts fresh conversations for those agents; the checkpoint records
-the choice and their panes say **Relaunched after upgrade**. Unrelated shell
-jobs still block the upgrade. The installer accepts
-`--restart-daemon --relaunch-agents` only when the installed CLI can record this
-acceptance.
+An identified agent with no exact resume identity is relaunched as a fresh
+conversation by default: the checkpoint records the choice and its pane says
+**Relaunched after upgrade**. Turning off **Relaunch agents on upgrade** in
+Settings (`relaunch_agents_on_upgrade = false` in `settings.toml`) makes the
+upgrade refuse instead and list every blocker. `daemon prepare-upgrade` reads
+that setting unless `--relaunch-agents` or `--no-relaunch-agents` chooses for
+one invocation; a settings file it cannot read is an error rather than the
+default. Unrelated shell jobs always block the upgrade. The installer passes
+`--relaunch-agents` only to an installed CLI that can record the acceptance;
+without either option it leaves the choice to the installed CLI.
 
 ### What is restored
 

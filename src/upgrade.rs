@@ -7,6 +7,32 @@ use crate::model::{LaunchRecipe, TerminalSession};
 use std::{fs, io};
 use std::{os::unix::fs::MetadataExt, path::Path};
 
+/// Whether an upgrade starts fresh conversations for agents it cannot resume
+/// exactly, when the command names neither choice: the Settings preference
+/// `relaunch_agents_on_upgrade` in `settings`, which is on by default.
+///
+/// Only that key is read, so the CLI needs none of the UI's settings model.
+/// A file that exists but cannot be read is an error rather than the default,
+/// because it may be the one saying no.
+pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
+    #[derive(serde::Deserialize)]
+    struct Preference {
+        #[serde(default = "relaunch_by_default")]
+        relaunch_agents_on_upgrade: bool,
+    }
+    fn relaunch_by_default() -> bool {
+        true
+    }
+    let document = match std::fs::read_to_string(settings) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(format!("cannot read {}: {error}", settings.display())),
+    };
+    toml::from_str::<Preference>(&document)
+        .map(|preference| preference.relaunch_agents_on_upgrade)
+        .map_err(|error| format!("cannot read {}: {error}", settings.display()))
+}
+
 /// Automatic recovery never replays arbitrary command recipes.
 #[cfg(any(feature = "host", feature = "ui", test))]
 pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
@@ -777,6 +803,28 @@ mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalId};
     use handoff::{Checkpoint, Phase, Store, Terminal};
+
+    #[test]
+    fn upgrades_relaunch_agents_unless_settings_say_otherwise() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.toml");
+        assert_eq!(relaunch_agents_by_default(&settings), Ok(true));
+        // Other preferences, including tables, are none of the CLI's business.
+        std::fs::write(
+            &settings,
+            "schema_version = 3\nshow_status_bar = false\n\n[keyboard_shortcuts]\nnew_terminal = \"Ctrl+T\"\n",
+        )
+        .unwrap();
+        assert_eq!(relaunch_agents_by_default(&settings), Ok(true));
+        std::fs::write(&settings, "relaunch_agents_on_upgrade = false\n").unwrap();
+        assert_eq!(relaunch_agents_by_default(&settings), Ok(false));
+        // A file that may be saying no is never read as yes.
+        std::fs::write(&settings, "relaunch_agents_on_upgrade = \"no\"\n").unwrap();
+        assert!(relaunch_agents_by_default(&settings).is_err());
+        std::fs::write(&settings, "relaunch_agents_on_upgrade = false\n[").unwrap();
+        assert!(relaunch_agents_by_default(&settings).is_err());
+        assert!(relaunch_agents_by_default(directory.path()).is_err());
+    }
 
     fn checkpoint(directory: &Path) -> Checkpoint {
         let proof = HostSessionProof {

@@ -1304,6 +1304,11 @@ pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "cagents", STORAGE_NAME)
 }
 
+/// This instance's settings file, which the UI owns and the CLI only reads.
+pub fn settings_path() -> Option<PathBuf> {
+    project_dirs().map(|dirs| dirs.config_dir().join("settings.toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
