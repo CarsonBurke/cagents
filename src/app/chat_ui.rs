@@ -3529,6 +3529,24 @@ impl Cagents {
                     self.status = Some(TransientNotice::error(error));
                     return Task::none();
                 }
+                if self.refuse_for_deleting_card(target.card) {
+                    // The worktree was confirmed for deletion while this
+                    // restart was closing the old conversation; its
+                    // replacement would start in a directory being removed.
+                    // The card keeps the closed conversation instead, known
+                    // to have no actor left, so should the deletion fail a
+                    // new choice starts at once rather than closing again.
+                    self.chat_ui.restarting.remove(&target.card);
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.disconnected = true;
+                        runtime.provider_closed = true;
+                        runtime.error = Some(
+                            "The restart was cancelled: its worktree is being deleted.".into(),
+                        );
+                    }
+                    self.observe_agent_activity_for_card(target.card, None);
+                    return Task::none();
+                }
                 if let Some(session) = self.chat_ui.restarting.remove(&target.card) {
                     // Only the conversation is being given up here; the card
                     // stays and immediately starts its replacement, so it is
@@ -4022,6 +4040,54 @@ mod tests {
             "the replacement never starts"
         );
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// A restart already closing the old conversation when its worktree is
+    /// confirmed for deletion must not start the replacement there.
+    #[test]
+    fn a_restart_under_way_never_starts_its_replacement_in_a_worktree_being_deleted() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let target = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        let _ = app.update(Message::ChatUi(Action::ChooseProvider(
+            target,
+            Provider::Claude,
+        )));
+        assert!(app.chat_ui.closing.contains(&target));
+        app.project_ui
+            .begin_deleting(PathBuf::from(FIXTURE_DIRECTORY));
+
+        let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        assert!(
+            app.chat_ui.attempts.is_empty(),
+            "the replacement started in the worktree being deleted"
+        );
+        assert!(!app.chat_ui.restarting.contains_key(&card));
+        assert!(!app.chat_start_pending(card));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("the card lost its conversation");
+        };
+        assert!(runtime.provider_closed && runtime.error.is_some());
+        assert_eq!(
+            app.notices
+                .entries
+                .back()
+                .map(|entry| entry.notice.message.as_str()),
+            Some("That worktree is being deleted.")
+        );
+
+        // Should the deletion fail, a new choice starts without closing the
+        // conversation a second time.
+        app.project_ui = Default::default();
+        let _ = app.update(Message::ChatUi(Action::ChooseProvider(
+            target,
+            Provider::Claude,
+        )));
+        assert!(!app.chat_ui.closing.contains(&target));
+        assert!(app.chat_ui.attempts.contains_key(&card));
     }
 
     /// The terminal cards open in the current scope.

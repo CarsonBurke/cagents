@@ -405,6 +405,31 @@ impl Cagents {
         )
     }
 
+    /// The directory a sidebar open of a project or worktree enters.
+    pub(super) fn sidebar_entered_directory(&self, action: &SidebarAction) -> Option<PathBuf> {
+        match action {
+            SidebarAction::OpenRepository {
+                project_id,
+                repository,
+            } => Some(self.project_entry_directory(*project_id, repository)),
+            SidebarAction::OpenWorktree { path, .. } => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// A project opens in its first worktree, or its repository without one.
+    pub(super) fn project_entry_directory(&self, project: ProjectId, repository: &Path) -> PathBuf {
+        self.sidebar_model
+            .projects
+            .iter()
+            .find(|row| row.id == project)
+            .and_then(|row| row.worktrees.first())
+            .map_or_else(
+                || repository.to_path_buf(),
+                |worktree| worktree.path.clone(),
+            )
+    }
+
     pub(super) fn select_worktree(
         &mut self,
         path: PathBuf,

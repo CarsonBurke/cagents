@@ -3402,12 +3402,20 @@ pub struct Cagents {
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
-    /// The generation of the latest load of each project. Every generation is
-    /// drawn from `repository_load_sequence`, so generations of different
-    /// projects are ordered too: a load that reaches another project's
-    /// repository can tell whether that project has been loaded since it began.
+    /// The generation of the latest load of each project, drawn from
+    /// `repository_load_sequence`.
     repository_generations: HashMap<ProjectId, u64>,
+    /// The generation of the latest load of each project that has landed,
+    /// whether it read the repository or failed to. A load is outstanding
+    /// until its generation is settled here.
+    repository_settled: HashMap<ProjectId, u64>,
+    /// Numbers every repository load, so loads of different projects are
+    /// ordered against each other and against the deletions below.
     repository_load_sequence: u64,
+    /// For each worktree this window deleted, the last load generation drawn
+    /// before Git confirmed the removal. A listing from that load or an
+    /// earlier one can still name the worktree; one begun later cannot.
+    deleted_worktrees: HashMap<crate::model::WorktreeId, u64>,
     worktree_dialog: Option<WorktreeDialog>,
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
@@ -8947,7 +8955,9 @@ impl Application for Cagents {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
+            repository_settled: HashMap::new(),
             repository_load_sequence: 0,
+            deleted_worktrees: HashMap::new(),
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,
@@ -9393,6 +9403,20 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                // A deletion is remembered only while a load that may have
+                // listed the worktree before it went, this one included, is
+                // still outstanding.
+                let outstanding: Vec<u64> = self
+                    .repository_generations
+                    .iter()
+                    .filter(|(project, generation)| {
+                        self.repository_settled.get(project) < Some(generation)
+                    })
+                    .map(|(_, &generation)| generation)
+                    .collect();
+                self.deleted_worktrees
+                    .retain(|_, &mut deleted| outstanding.iter().any(|&load| load <= deleted));
+                self.repository_settled.insert(project_id, generation);
                 self.refresh_ui.projects.remove(&project_id);
                 let mut task = Task::none();
                 match result {
@@ -9425,26 +9449,42 @@ impl Application for Cagents {
                             })
                         {
                             // A load of that project which began after this
-                            // one lists the repository more recently, and it
-                            // is also how a deletion is followed up. Adding a
-                            // worktree from this older listing would bring a
-                            // deleted one back, open.
-                            let superseded = self
-                                .repository_generations
+                            // one and has landed already listed the
+                            // repository more recently, successfully or not;
+                            // this listing speaks for nothing that one did not.
+                            let stale = self
+                                .repository_settled
                                 .get(&existing.id)
-                                .is_some_and(|&latest| latest > generation);
-                            let listed = if superseded {
+                                .is_some_and(|&settled| settled > generation);
+                            let listed = if stale {
                                 &[][..]
                             } else {
                                 // This read reached the same repository, so
                                 // whatever an earlier failure recorded about
-                                // the row it landed on no longer holds.
+                                // the row it landed on no longer holds. A
+                                // newer load of it still under way keeps
+                                // the row reloading.
                                 existing.unreachable = None;
-                                existing.reloading = false;
+                                if self
+                                    .repository_generations
+                                    .get(&existing.id)
+                                    .is_none_or(|&latest| latest <= generation)
+                                {
+                                    existing.reloading = false;
+                                }
                                 &loaded.worktrees[..]
                             };
                             for (record, status) in listed {
-                                if existing.worktrees.iter().any(|known| known.id == record.id) {
+                                // A worktree deleted after this listing began
+                                // is still in it; adding it would bring the
+                                // deleted worktree back, open.
+                                let deleted_since = self
+                                    .deleted_worktrees
+                                    .get(&record.id)
+                                    .is_some_and(|&deleted| generation <= deleted);
+                                if deleted_since
+                                    || existing.worktrees.iter().any(|known| known.id == record.id)
+                                {
                                     continue;
                                 }
                                 // A newly created linked worktree can be added
@@ -9471,10 +9511,12 @@ impl Application for Cagents {
                                 ));
                             }
                             self.repository_generations.remove(&project_id);
+                            self.repository_settled.remove(&project_id);
                             self.github_availability.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
-                            let task = if open_cards {
+                            let task = if open_cards && !self.refuse_in_deleting_worktree(&worktree)
+                            {
                                 self.select_worktree(worktree, true)
                             } else {
                                 Task::none()
@@ -9564,7 +9606,9 @@ impl Application for Cagents {
                             self.prune_pull_request_refs(project_id),
                         ]);
                         if open_cards {
-                            task = self.select_worktree(worktree, true);
+                            if !self.refuse_in_deleting_worktree(&worktree) {
+                                task = self.select_worktree(worktree, true);
+                            }
                         } else if let Some(active) = self.active_workspace.clone() {
                             // Discovery can resolve legacy launch directories
                             // into distinct worktrees after session restoration.
@@ -9748,6 +9792,14 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                // Entering a worktree that is being deleted is refused, and
+                // for the same reason before the selection would claim it.
+                if self
+                    .sidebar_entered_directory(&action)
+                    .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
+                {
+                    return Task::none();
+                }
                 self.sidebar_state.apply(&action);
                 match action {
                     SidebarAction::DragWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Drag)),
@@ -9779,21 +9831,10 @@ impl Application for Cagents {
                         project_id,
                         repository,
                     } => {
-                        let path = self.sidebar_model.projects.iter()
-                            .find(|project| project.id == project_id)
-                            .and_then(|project| project.worktrees.first())
-                            .map_or(repository, |worktree| worktree.path.clone());
-                        if self.refuse_in_deleting_worktree(&path) {
-                            return Task::none();
-                        }
-                        self.select_worktree(path, true)
+                        let directory = self.project_entry_directory(project_id, &repository);
+                        self.select_worktree(directory, true)
                     }
-                    SidebarAction::OpenWorktree { path, .. } => {
-                        if self.refuse_in_deleting_worktree(&path) {
-                            return Task::none();
-                        }
-                        self.select_worktree(path, true)
-                    }
+                    SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
                     SidebarAction::OpenPullRequest {
                         project_id,
                         number,
@@ -16741,7 +16782,9 @@ mod tests {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
+            repository_settled: HashMap::new(),
             repository_load_sequence: 0,
+            deleted_worktrees: HashMap::new(),
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,

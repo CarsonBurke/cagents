@@ -171,6 +171,9 @@ struct Deletion {
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
     chats: usize,
+    /// Why the last deletion of this channel failed, when the dialog is
+    /// opened again after it. Confirming retries it.
+    failure: Option<String>,
 }
 
 impl State {
@@ -353,6 +356,7 @@ impl Cagents {
                     channel: id,
                     title,
                     chats,
+                    failure: self.channel_ui.failed.get(&id).cloned(),
                 });
                 iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
             }
@@ -643,7 +647,7 @@ impl Cagents {
 
     pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
         let dialog = self.channel_ui.dialog.as_ref()?;
-        let rows: Vec<Element<'_, Message>> = vec![
+        let mut rows: Vec<Element<'_, Message>> = vec![
             widget::text::title3("Delete channel?").into(),
             super::notice_body(dialog.title.clone()),
             super::notice_body(match dialog.chats {
@@ -655,20 +659,31 @@ impl Cagents {
                 "The channel and the conversations it holds are removed from this workspace. \
                  Nothing outside the channel is touched.",
             ),
+        ];
+        if let Some(failure) = &dialog.failure {
+            rows.push(super::notice_body(format!(
+                "The last attempt failed: {failure}"
+            )));
+        }
+        rows.push(
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("dialog.channel.close"))
                     .on_press(Message::ChannelUi(Action::Dismiss))
                     .into(),
-                widget::button::destructive("Delete channel")
-                    .id(State::focus_target())
-                    .on_press(Message::ChannelUi(Action::ConfirmDelete))
-                    .into(),
+                widget::button::destructive(if dialog.failure.is_some() {
+                    "Retry delete"
+                } else {
+                    "Delete channel"
+                })
+                .id(State::focus_target())
+                .on_press(Message::ChannelUi(Action::ConfirmDelete))
+                .into(),
             ])
             .spacing(cosmic::theme::spacing().space_xxs)
             .into(),
-        ];
+        );
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
             480.0,
@@ -1281,6 +1296,23 @@ mod tests {
         assert!(app.durable.channels.iter().any(|row| row.id == doomed));
 
         let _ = app.handle_channel_ui(Action::RetryFailed(doomed));
+        assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            Err("the daemon is still unreachable".into()),
+        ));
+
+        // Asked to delete it again, the dialog says why the last attempt
+        // failed, and confirming there retries it.
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        assert_eq!(
+            app.channel_ui
+                .dialog
+                .as_ref()
+                .and_then(|dialog| dialog.failure.as_deref()),
+            Some("the daemon is still unreachable")
+        );
+        let _ = app.handle_channel_ui(Action::ConfirmDelete);
         assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
         let _ = app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())));
         assert!(!app.durable.channels.iter().any(|row| row.id == doomed));

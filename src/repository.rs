@@ -10563,34 +10563,45 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
 }
 
 /// Releases the identities held by the applied creations of `worktree`,
-/// which Git has just removed at the user's request.
+/// which Git has just removed from the repository whose canonical common
+/// directory is `common_dir`, at the user's request.
 ///
 /// An applied creation keeps its identity so that a replay of the request
 /// cannot run while what it made exists. Once the user has deleted the
 /// worktree there is nothing left to protect, and holding on would refuse
-/// creating the same worktree again for good (#269). A worktree removed
-/// outside the app keeps its creations' identities: nothing here saw the
-/// user ask for that.
+/// creating the same worktree again for good (#269). A creation is known by
+/// its repository and the path it made the worktree at, so a worktree moved
+/// or removed outside the app keeps its creation's identity: nothing here
+/// saw the user ask for that.
+///
+/// Every matching creation is attempted; the failures are returned.
 pub fn release_deleted_worktree_creations(
     store: &StateStore,
+    common_dir: &Path,
     worktree: &Path,
-) -> Result<(), StoreError> {
-    for operation in store.journaled_worktree_operations()? {
+) -> Result<(), Vec<StoreError>> {
+    let mut failures = Vec::new();
+    let operations = store
+        .journaled_worktree_operations()
+        .map_err(|error| vec![error])?;
+    for operation in operations {
         if operation.status != PendingOperationStatus::Applied {
             continue;
         }
         let Ok(journal) = serde_json::from_value::<WorktreeJournal>(operation.payload) else {
             continue;
         };
-        let created = match &journal.outcome {
-            Some(WorktreeCreationOutcome::Created { worktree, .. }) => Some(&worktree.path),
-            _ => None,
-        };
-        if journal.request.destination == worktree || created.is_some_and(|path| path == worktree) {
-            store.release_worktree_creation(operation.id)?;
+        if journal.created(common_dir, worktree)
+            && let Err(error) = store.release_worktree_creation(operation.id)
+        {
+            failures.push(error);
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
 }
 
 // Configured roots may intentionally be siblings (../worktrees). Resolve
@@ -10719,6 +10730,17 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 }
 
 impl WorktreeJournal {
+    /// Whether this creation made the worktree at `path` in the repository
+    /// whose canonical common directory is `common_dir`.
+    fn created(&self, common_dir: &Path, path: &Path) -> bool {
+        self.common_dir == common_dir
+            && (self.request.destination == path
+                || matches!(
+                    &self.outcome,
+                    Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.path == path
+                ))
+    }
+
     fn report(&self, created_at_unix_ms: i64) -> WorktreeOperationReport {
         let mut outcome = self.outcome.clone();
         // A worktree this operation created must never be reported without
@@ -10766,6 +10788,26 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// The canonical common directory of `repository`, the one a creation
+    /// journal records and its identity is keyed by.
+    pub fn common_dir(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(
+                repository,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+            cancellation,
+        )?;
+        Ok(
+            fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
+                .map_err(|e| ValidationError::Io(e.to_string()))?,
+        )
+    }
+
     /// The production entrypoint. No caller may create the managed root first.
     /// The retained token and generation belong to the UI; this emits at most
     /// five events, so a per-operation bounded(8) channel cannot drop a stage.
@@ -11138,15 +11180,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if request.track && matches!(request.base, BaseRevision::ObjectId(_)) {
             return Err(ValidationError::TrackingRequiresBranch.into());
         }
-        let output = self.run_checked(
-            &self.git_read(
-                &request.repository,
-                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            ),
-            cancellation,
-        )?;
-        let common_dir = fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
-            .map_err(|e| ValidationError::Io(e.to_string()))?;
+        let common_dir = self.common_dir(&request.repository, cancellation)?;
         let mut request = request.clone();
         request.managed_root = canonical_future_path(&request.managed_root)
             .map_err(|e| ValidationError::Io(e.to_string()))?;
@@ -11624,6 +11658,15 @@ mod worktree_journal_tests {
             }
         }
 
+        /// Whether the creation `id` still holds its identity.
+        fn holds(&self, id: OperationId) -> bool {
+            self.store
+                .journaled_worktree_operations()
+                .unwrap()
+                .iter()
+                .any(|operation| operation.id == id)
+        }
+
         fn git(&self, arguments: &[&str]) -> String {
             let output = Command::new("git")
                 .arg("-C")
@@ -11723,14 +11766,13 @@ mod worktree_journal_tests {
         let destination = fixture.request.destination.clone();
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
-        release_deleted_worktree_creations(&fixture.store, &destination).unwrap();
+        let common_dir = fixture
+            .service
+            .common_dir(&fixture.request.repository, &CancellationToken::new())
+            .unwrap();
+        release_deleted_worktree_creations(&fixture.store, &common_dir, &destination).unwrap();
         assert!(
-            fixture
-                .store
-                .journaled_worktree_operations()
-                .unwrap()
-                .iter()
-                .all(|operation| operation.id != report.operation_id),
+            !fixture.holds(report.operation_id),
             "the applied creation still holds its identity"
         );
 
@@ -11743,6 +11785,55 @@ mod worktree_journal_tests {
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert!(destination.join("tracked.txt").is_file());
+    }
+
+    /// Only the creation that made the deleted worktree is released: not the
+    /// one of a worktree still listed, nor one whose repository differs, nor
+    /// one moved outside the app since.
+    #[test]
+    fn a_deletion_releases_only_the_creation_of_the_worktree_it_removed() {
+        let mut fixture = Fixture::new();
+        fixture.resolve(fixture.input("foo"));
+        let doomed = fixture.run(&CancellationToken::new());
+        assert_eq!(doomed.state, WorktreeOperationState::Created, "{doomed:?}");
+        let destination = fixture.request.destination.clone();
+        fixture.resolve(fixture.input("bar"));
+        let kept = fixture.run(&CancellationToken::new());
+        assert_eq!(kept.state, WorktreeOperationState::Created, "{kept:?}");
+        let moved_from = fixture.request.destination.clone();
+        let common_dir = fixture
+            .service
+            .common_dir(&fixture.request.repository, &CancellationToken::new())
+            .unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        release_deleted_worktree_creations(
+            &fixture.store,
+            &fs::canonicalize(elsewhere.path()).unwrap(),
+            &destination,
+        )
+        .unwrap();
+        assert!(
+            fixture.holds(doomed.operation_id),
+            "another repository's deletion released this creation"
+        );
+
+        let moved = moved_from.with_file_name("moved");
+        fixture.git(&[
+            "worktree",
+            "move",
+            moved_from.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ]);
+        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+        release_deleted_worktree_creations(&fixture.store, &common_dir, &destination).unwrap();
+        fixture.git(&["worktree", "remove", moved.to_str().unwrap()]);
+        release_deleted_worktree_creations(&fixture.store, &common_dir, &moved).unwrap();
+        assert!(!fixture.holds(doomed.operation_id));
+        assert!(
+            fixture.holds(kept.operation_id),
+            "a creation moved outside the app since was released"
+        );
     }
 
     #[test]
