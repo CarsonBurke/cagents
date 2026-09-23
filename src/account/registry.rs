@@ -62,6 +62,19 @@ impl Managed {
     }
 }
 
+/// A home created for a sign-in that has not finished: registered before the
+/// provider's login runs in it, so that no window, and no later run, takes it
+/// for a directory nothing knows about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    pub key: Uuid,
+    #[serde(with = "provider_name")]
+    pub provider: Provider,
+    /// Unix milliseconds.
+    #[serde(default)]
+    pub started_at: u64,
+}
+
 /// The whole registry.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registry {
@@ -78,6 +91,8 @@ pub struct Registry {
     system_labels: BTreeMap<String, String>,
     #[serde(default, rename = "account", skip_serializing_if = "Vec::is_empty")]
     accounts: Vec<Managed>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<Pending>,
 }
 
 const SYSTEM: &str = "system";
@@ -200,6 +215,7 @@ impl Registry {
         }) {
             return Err(Account::managed(existing.provider, existing.key, PathBuf::new()).id());
         }
+        self.abandon(managed.key);
         match self
             .accounts
             .iter_mut()
@@ -209,6 +225,27 @@ impl Registry {
             None => self.accounts.push(managed),
         }
         Ok(())
+    }
+
+    /// Records a home created for a sign-in that is about to start.
+    pub fn begin(&mut self, provider: Provider, key: Uuid, started_at: u64) {
+        if self.find(key).is_none() && !self.pending.iter().any(|pending| pending.key == key) {
+            self.pending.push(Pending {
+                key,
+                provider,
+                started_at,
+            });
+        }
+    }
+
+    /// Sign-ins that have not finished, oldest first.
+    pub fn pending(&self) -> &[Pending] {
+        &self.pending
+    }
+
+    /// Forgets a sign-in whose home is gone.
+    pub fn abandon(&mut self, key: Uuid) {
+        self.pending.retain(|pending| pending.key != key);
     }
 
     /// Updates what the provider last reported about a managed account, so
@@ -242,12 +279,10 @@ impl Registry {
         Some(removed)
     }
 
-    /// Every managed home the registry names, for [`Homes::sweep`].
-    pub fn registered(&self) -> Vec<(Provider, Uuid)> {
-        self.accounts
-            .iter()
-            .map(|managed| (managed.provider, managed.key))
-            .collect()
+    /// Whether a newer cagents wrote this registry, in which case this one
+    /// changes nothing it does not understand.
+    pub fn is_newer(&self) -> bool {
+        self.version > VERSION
     }
 }
 
@@ -307,12 +342,12 @@ impl Store {
         Ok((registry, result))
     }
 
-    /// Loads the registry and, under the same lock so no window registers an
-    /// account meanwhile, sweeps `homes` of what no account names.
+    /// Loads the registry, then finishes any removal an earlier run was
+    /// interrupted in - outside the lock, since deleting a home can take a
+    /// while and a parked home is no account's any more.
     pub fn load_and_sweep(&self, homes: &Homes) -> io::Result<Registry> {
-        let _lock = self.lock()?;
-        let registry = read(&self.path())?;
-        homes.sweep(&registry.registered(), std::time::SystemTime::now());
+        let registry = self.load()?;
+        homes.finish_removals();
         Ok(registry)
     }
 }

@@ -46,7 +46,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use uuid::Uuid;
@@ -57,9 +57,10 @@ use crate::agent::Provider;
 /// interrupted leaves a name nothing else uses, and the next start finishes
 /// it.
 const REMOVING_PREFIX: &str = ".removing-";
-/// How long a home no registry entry names is left alone before it is taken
-/// for the remains of a sign-in that never finished. Long enough that no
-/// sign-in in progress - in this window or another - is mistaken for one.
+/// How long a pending sign-in is left alone before a home that turns out to
+/// be signed in to nothing is taken for the remains of one that never
+/// finished. Long enough that no sign-in in progress - in this window or
+/// another - is mistaken for one.
 pub const ORPHAN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Entries of the system home a new managed home links to. See the module
@@ -149,14 +150,14 @@ impl Homes {
         remove_parked(&parked)
     }
 
-    /// Finishes removals an earlier run was interrupted in, and removes homes
-    /// no account in `registered` names once they are older than
-    /// [`ORPHAN_AGE`]: the remains of sign-ins that were never completed
-    /// because the window running them closed first.
+    /// Finishes removals an earlier run was interrupted in.
     ///
-    /// Only entries named like homes cagents creates are considered, so a
-    /// file the reader put here is left where it is.
-    pub fn sweep(&self, registered: &[(Provider, Uuid)], now: SystemTime) {
+    /// Nothing else here is ever deleted on its own: a home the registry
+    /// does not name may belong to a registry this run cannot read - a newer
+    /// cagents, a reset configuration directory - and holds a login and its
+    /// history. Sign-ins that never finished are the registry's pending
+    /// entries, which the accounts view verifies before removing anything.
+    pub fn finish_removals(&self) {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
             if crate::secure_file::reject_symlink_components(&directory).is_err()
@@ -169,36 +170,16 @@ impl Homes {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if let Some(key) = name
-                    .strip_prefix(REMOVING_PREFIX)
+                let Some(key) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix(REMOVING_PREFIX))
                     .and_then(|key| Uuid::parse_str(key).ok())
-                {
-                    let _ = remove_parked(
-                        &self
-                            .provider_directory(provider)
-                            .join(format!("{REMOVING_PREFIX}{}", key.hyphenated())),
-                    );
-                    continue;
-                }
-                let Ok(key) = Uuid::parse_str(name) else {
+                else {
                     continue;
                 };
-                // Only the canonical spelling is one cagents created.
-                if key.hyphenated().to_string() != name || registered.contains(&(provider, key)) {
-                    continue;
-                }
-                let old = entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_some_and(|age| age >= ORPHAN_AGE);
-                if old {
-                    let _ = self.remove(provider, key);
-                }
+                let _ = remove_parked(
+                    &directory.join(format!("{REMOVING_PREFIX}{}", key.hyphenated())),
+                );
             }
         }
     }
@@ -340,12 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_finishes_removals_and_ages_out_unregistered_homes_only() {
+    fn only_interrupted_removals_are_finished_on_their_own() {
         let directory = tempfile::tempdir().unwrap();
         let homes = Homes::at(directory.path().join("accounts"));
-        let (kept, kept_home) = homes.create(Provider::Claude, None).unwrap();
-        let (_, orphan_home) = homes.create(Provider::Claude, None).unwrap();
-        let (_, fresh_home) = homes.create(Provider::Codex, None).unwrap();
+        let (_, unknown_home) = homes.create(Provider::Claude, None).unwrap();
+        let (_, codex_home) = homes.create(Provider::Codex, None).unwrap();
         let parked = directory.path().join(format!(
             "accounts/codex/{REMOVING_PREFIX}{}",
             Uuid::new_v4()
@@ -354,22 +334,15 @@ mod tests {
         let foreign = directory.path().join("accounts/claude/notes");
         fs::create_dir_all(&foreign).unwrap();
 
-        // Just created, an unregistered home may be a sign-in in progress.
-        homes.sweep(&[(Provider::Claude, kept)], SystemTime::now());
-        assert!(orphan_home.exists() && fresh_home.exists());
+        homes.finish_removals();
+        assert!(!parked.exists(), "an interrupted removal is finished");
         assert!(
-            !parked.exists(),
-            "an interrupted removal is finished at once"
+            unknown_home.exists() && codex_home.exists(),
+            "a home no registry names is never taken for garbage"
         );
-
-        let later = SystemTime::now() + ORPHAN_AGE + Duration::from_secs(60);
-        homes.sweep(&[(Provider::Claude, kept)], later);
-        assert!(kept_home.exists());
-        assert_eq!(fs::metadata(&kept_home).unwrap().uid(), unsafe {
+        assert!(foreign.exists());
+        assert_eq!(fs::metadata(&unknown_home).unwrap().uid(), unsafe {
             libc::geteuid()
         });
-        assert!(!orphan_home.exists());
-        assert!(!fresh_home.exists());
-        assert!(foreign.exists(), "only names cagents creates are swept");
     }
 }

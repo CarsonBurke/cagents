@@ -189,6 +189,7 @@ impl Action {
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
                 | Self::Retired(..)
+                | Self::AccountPicker(_, false)
         )
     }
 
@@ -1761,7 +1762,7 @@ impl Cagents {
         if runtime.session.launch.provider == provider && !runtime.provider_closed {
             return Task::none();
         }
-        self.restart_fresh_chat(target, provider, &account)
+        self.restart_fresh_chat(target, provider, &account, false)
     }
 
     /// Moves a conversation that has not begun to account `id` of its own
@@ -1782,16 +1783,21 @@ impl Cagents {
         {
             return Task::none();
         }
-        self.restart_fresh_chat(target, provider, &account)
+        // A new terminal id, because the provider's owned resources are
+        // keyed by it: a Codex app-server socket that is still listening
+        // under the old id would carry the conversation on the old account.
+        self.restart_fresh_chat(target, provider, &account, true)
     }
 
     /// Replaces a conversation that has not begun with a new one for
-    /// `provider` on `account`, in the same card.
+    /// `provider` on `account`, in the same card. `renew` gives it a new
+    /// terminal id rather than the one it had.
     fn restart_fresh_chat(
         &mut self,
         target: Target,
         provider: Provider,
         account: &Account,
+        renew: bool,
     ) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
@@ -1801,7 +1807,11 @@ impl Cagents {
         }
         let session = match fresh_chat_session(
             provider,
-            runtime.session.id,
+            if renew {
+                TerminalId::new()
+            } else {
+                runtime.session.id
+            },
             runtime.session.launch.recipe.working_directory.clone(),
             account,
         ) {

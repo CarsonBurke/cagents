@@ -50,6 +50,8 @@ pub(in crate::app) struct Table {
     pub(in crate::app) menu: Option<AccountId>,
     /// The row whose menu is asking to confirm a removal.
     pub(in crate::app) confirm_remove: Option<AccountId>,
+    /// How many open cards run on the account being removed.
+    pub(in crate::app) confirm_in_use: usize,
     pub(in crate::app) add_menu: bool,
     /// The row being renamed, and the name typed so far.
     pub(in crate::app) rename: Option<(AccountId, String)>,
@@ -762,6 +764,20 @@ fn actions<'a>(state: &'a State, account: &'a AccountState, now: Millis) -> Elem
         .into()
 }
 
+/// What removing an account does to the cards open on it.
+fn in_use_warning<'a>(cards: usize) -> Element<'a, Message> {
+    match cards {
+        0 => iced::widget::Space::new().into(),
+        count => design::caption(format!(
+            "{count} open {} on this account {} signed out with it.",
+            if count == 1 { "card runs" } else { "cards run" },
+            if count == 1 { "and is" } else { "and are" },
+        ))
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+        .into(),
+    }
+}
+
 fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message> {
     let action = |action| Message::AccountUi(action);
     let id = &account.id;
@@ -774,6 +790,7 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
             ))
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
+            in_use_warning(state.table.confirm_in_use),
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::button::standard("Cancel")

@@ -241,8 +241,25 @@ struct Group {
 }
 
 impl Group {
-    fn spawn(mut command: Command) -> Result<Self, String> {
-        let child = command.spawn().map_err(|error| spawn_failure(&error))?;
+    /// Starts `command`. An executable that is still open for writing -
+    /// just installed or updated, or inherited for an instant by a process
+    /// another thread is forking - is busy rather than missing, so it is
+    /// tried again a few times before the start counts as failed.
+    async fn spawn(mut command: Command) -> Result<Self, String> {
+        let mut delay = Duration::from_millis(10);
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy
+                        && delay <= Duration::from_millis(160) =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => return Err(spawn_failure(&error)),
+            }
+        };
         let id = child.id().and_then(|id| i32::try_from(id).ok());
         Ok(Self { child, id })
     }
@@ -319,9 +336,9 @@ struct Session {
 }
 
 impl Session {
-    fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(mut command: Command) -> Result<Self, String> {
         command.stdin(Stdio::piped());
-        let mut group = Group::spawn(command)?;
+        let mut group = Group::spawn(command).await?;
         let stdin = group.child.stdin.take();
         let stdout = group.stdout()?;
         Ok(Self {
@@ -388,7 +405,7 @@ fn spawn_failure(error: &io::Error) -> String {
 
 /// Runs a CLI that prints one JSON document and exits.
 async fn run_json(command: Command) -> Result<Value, String> {
-    let mut group = Group::spawn(command)?;
+    let mut group = Group::spawn(command).await?;
     let mut output = Vec::new();
     // The output is dropped once read, so a CLI that writes past the limit
     // meets a closed pipe rather than blocking until the timeout.
@@ -425,7 +442,7 @@ pub async fn logout(account: Account) -> Result<(), String> {
     };
     let mut command = command(&account, &program);
     command.args(arguments);
-    let mut group = Group::spawn(command)?;
+    let mut group = Group::spawn(command).await?;
     let finished = tokio::time::timeout(TIMEOUT, async {
         let mut discard = Vec::new();
         let _ = group.stdout()?.read_to_end(&mut discard).await;
@@ -509,7 +526,7 @@ async fn probe_claude(
 /// The `get_usage` control response's inner `response`, or the error message
 /// Claude answered the request with.
 async fn claude_usage(command: Command) -> Result<Result<Value, String>, String> {
-    let mut session = Session::spawn(command)?;
+    let mut session = Session::spawn(command).await?;
     let result = claude_exchange(&mut session).await;
     session.close().await;
     result
@@ -571,7 +588,7 @@ async fn probe_codex(
 ) -> Result<(Option<Identity>, UsageSnapshot), String> {
     let mut command = command(account, program);
     command.arg("app-server");
-    let mut session = Session::spawn(command)?;
+    let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
     session.close().await;
     let (account_read, limits_read) = result?;
@@ -822,7 +839,7 @@ cat >/dev/null
         let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home.clone());
         let mut command = command(&account, &script);
         command.arg("logout");
-        let mut group = Group::spawn(command).unwrap();
+        let mut group = Group::spawn(command).await.unwrap();
         group.finish().await;
         assert_eq!(
             std::fs::read_to_string(&record).unwrap().trim(),
