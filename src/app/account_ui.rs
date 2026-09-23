@@ -1,25 +1,52 @@
-//! Account usage: the status bar's per-provider chips, the popover each one
-//! opens, and the Accounts pane.
+//! Accounts: the status bar's per-provider chips and the popover each one
+//! opens, the Accounts pane's table, adding and removing accounts, and the
+//! account a new conversation starts on.
 //!
 //! Figures come from [`crate::account::probe`], which runs each provider's
 //! own CLI from an async task and does its file work on the blocking pool;
 //! nothing here touches a process or a file on the UI thread. This module
 //! only decides when to ask, through [`crate::account::schedule`], and draws
 //! whatever came back.
+//!
+//! # Adding an account
+//!
+//! An account is added by giving the provider's CLI a home of its own and
+//! letting the CLI sign in there, in a terminal the reader can see - the
+//! provider's own login, its own browser hand-off, its own device code.
+//! cagents never sees what the login produces. When the terminal ends, the
+//! home is asked who it is signed in as; a home that is signed in to an
+//! account cagents already has is signed out and deleted again, one that is
+//! signed in to nothing is deleted, and anything else becomes an account in
+//! the registry ([`crate::account::registry`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use crate::account::{
     self, Account, AccountId, Identity, UsageSnapshot, UsageSource, UsageStatus, UsageWindow,
     cache::{Cache, Entry},
+    home::Homes,
     probe::{self, Outcome},
+    registry::{self, Registry, Store},
     schedule::{self, Millis, Schedule, Trigger},
 };
+use crate::agent::Provider;
+
+mod table;
+
+pub(super) use table::Sort;
 
 /// How often a visible, focused window re-reads the clock and asks the
 /// schedule whether an account is due.
 const TICK: Duration = Duration::from_secs(30);
+/// How often a sign-in in progress is checked for its terminal having
+/// ended. The check reads only this window's own state; the CLI is asked
+/// who it signed in as once, when the terminal ends.
+const LOGIN_TICK: Duration = Duration::from_secs(1);
+/// How often the daemon is asked about sign-ins no card on screen watches.
+/// Each question lists every hosted terminal, so it is asked less often
+/// than a card on screen is looked at.
+const HOST_CHECK: Millis = 3_000;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
 const CHIP_HEIGHT: f32 = 20.0;
 const CHIP_ICON_SIZE: u16 = 12;
@@ -30,31 +57,55 @@ const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 
 pub(super) struct State {
     accounts: Vec<AccountState>,
+    registry: Registry,
+    store: Option<Store>,
+    homes: Option<Homes>,
     /// The clock as of the last event that read it. Views format against
     /// this rather than reading the clock themselves, so a frame is a pure
     /// function of the state and a test can state the time.
     now_ms: Millis,
     popover: Option<AccountId>,
     cache: Option<Cache>,
+    logins: Vec<Login>,
+    /// Whether the daemon is being asked which sign-ins have ended.
+    asking_host: bool,
+    /// Not before this is the daemon asked again.
+    next_host_check: Millis,
+    table: table::Table,
+    /// Accounts being signed out and deleted.
+    removing: BTreeSet<AccountId>,
 }
 
 impl State {
     /// The state of a real window, sharing figures with every other window
-    /// of this installation through the cache in its state directory.
+    /// of this installation through the cache in its state directory, and
+    /// accounts through the registry in its configuration directory.
     pub(super) fn installation() -> Self {
-        Self::new(Cache::installation())
+        Self::new(
+            Cache::installation(),
+            Store::installation(),
+            Homes::installation(),
+        )
     }
 
-    fn new(cache: Option<Cache>) -> Self {
-        Self {
-            accounts: Account::known()
-                .into_iter()
-                .map(AccountState::new)
-                .collect(),
+    fn new(cache: Option<Cache>, store: Option<Store>, homes: Option<Homes>) -> Self {
+        let registry = Registry::default();
+        let mut state = Self {
+            accounts: Vec::new(),
+            registry,
+            store,
+            homes,
             now_ms: now_ms(),
             popover: None,
             cache,
-        }
+            logins: Vec::new(),
+            asking_host: false,
+            next_host_check: 0,
+            table: table::Table::default(),
+            removing: BTreeSet::new(),
+        };
+        state.sync_accounts();
+        state
     }
 
     fn account(&self, id: &AccountId) -> Option<&AccountState> {
@@ -64,13 +115,93 @@ impl State {
     fn account_mut(&mut self, id: &AccountId) -> Option<&mut AccountState> {
         self.accounts.iter_mut().find(|account| &account.id == id)
     }
+
+    /// Makes the account list match the registry: accounts it no longer
+    /// names go, new ones join, and every account that stays keeps what is
+    /// known about it.
+    fn sync_accounts(&mut self) {
+        let wanted = self.registry.accounts(self.homes.as_ref());
+        let mut previous: BTreeMap<AccountId, AccountState> = std::mem::take(&mut self.accounts)
+            .into_iter()
+            .map(|state| (state.id.clone(), state))
+            .collect();
+        self.accounts = wanted
+            .into_iter()
+            .map(|account| {
+                previous.remove(&account.id()).unwrap_or_else(|| {
+                    let mut state = AccountState::new(account);
+                    // A managed home exists by construction; whether its CLI
+                    // is still installed is the probe's to find out.
+                    state.present = !state.account.is_system();
+                    state
+                })
+            })
+            .collect();
+        if self
+            .popover
+            .as_ref()
+            .is_some_and(|id| self.account(id).is_none())
+        {
+            self.popover = None;
+        }
+        self.table
+            .forget_missing(|id| self.accounts.iter().any(|state| &state.id == id));
+    }
+
+    fn set_registry(&mut self, registry: Registry) {
+        if self.registry != registry {
+            self.registry = registry;
+            self.sync_accounts();
+        }
+    }
+
+    /// What the reader calls `account`: the name they gave it, else the
+    /// address it is signed in as, else what kind of account it is.
+    fn display_name(&self, account: &AccountState) -> String {
+        if let Some(label) = self.registry.label(&account.account) {
+            return label.to_owned();
+        }
+        if let Some(email) = account.email(&self.registry) {
+            return email.to_owned();
+        }
+        if account.account.is_system() {
+            "System default".into()
+        } else {
+            format!("{} account", account.name())
+        }
+    }
+
+    /// The accounts of `provider`, in list order.
+    fn of(&self, provider: Provider) -> impl Iterator<Item = &AccountState> {
+        self.accounts
+            .iter()
+            .filter(move |account| account.account.provider == provider)
+    }
+
+    /// Whether any account of `provider` other than `except` has a probe in
+    /// flight, which the next one waits for: several CLIs of one provider
+    /// starting at once would only compete for the same machine.
+    fn provider_busy(&self, provider: Provider, except: &AccountId, now: Millis) -> bool {
+        self.of(provider)
+            .any(|account| &account.id != except && account.schedule.in_flight(now))
+    }
+
+    /// The identities of the system accounts, as last reported, for telling
+    /// a new login apart from them.
+    fn system_identities(&self) -> Vec<(Provider, Identity)> {
+        self.accounts
+            .iter()
+            .filter(|account| account.account.is_system())
+            .filter_map(|account| Some((account.account.provider, account.identity.clone()?)))
+            .collect()
+    }
 }
 
-/// A window with no cache: nothing it learns outlives it or reaches another
-/// window, which is what a test fixture wants.
+/// A window with no cache and no registry: nothing it learns outlives it or
+/// reaches another window, which is what a test fixture wants.
 impl Default for State {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None, None)
     }
 }
 
@@ -78,8 +209,8 @@ struct AccountState {
     account: Account,
     id: AccountId,
     /// Whether the account has anything to report: its CLI is installed and
-    /// its home exists. An absent account gets no chip, because most people
-    /// use one of the two CLIs rather than both.
+    /// its home exists. An absent system account gets no chip, because most
+    /// people use one of the two CLIs rather than both.
     present: bool,
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
@@ -87,6 +218,9 @@ struct AccountState {
     /// Why the latest probe produced nothing, while the figures on screen
     /// are older than that attempt.
     failure: Option<String>,
+    /// A probe that came due while another account of the same provider was
+    /// being probed, and starts once that one answers.
+    queued: Option<Trigger>,
 }
 
 impl AccountState {
@@ -99,6 +233,7 @@ impl AccountState {
             snapshot: None,
             schedule: Schedule::default(),
             failure: None,
+            queued: None,
         }
     }
 
@@ -113,6 +248,98 @@ impl AccountState {
             .or_else(|| self.identity.as_ref()?.plan.as_deref())
             .map(account::plan_label)
     }
+
+    /// The address the account is signed in as: as its CLI last reported, or
+    /// as the registry remembers from when it was added.
+    fn email<'a>(&'a self, registry: &'a Registry) -> Option<&'a str> {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.email.as_deref())
+            .or_else(|| registry.find(self.account.managed_key()?)?.email.as_deref())
+    }
+
+    /// The window a summary of this account leads with, while its figures
+    /// are figures rather than a state.
+    fn headline(&self) -> Option<&UsageWindow> {
+        let snapshot = self.snapshot.as_ref()?;
+        matches!(
+            snapshot.status,
+            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+        )
+        .then(|| headline_window(snapshot))
+        .flatten()
+    }
+}
+
+/// A sign-in running in a terminal, for an account that is not yet in the
+/// registry. Its terminal is found by the home it signs in to, which survives
+/// the terminal being relaunched or restored under another id.
+#[derive(Debug, Clone)]
+struct Login {
+    provider: Provider,
+    key: uuid::Uuid,
+    home: PathBuf,
+    phase: LoginPhase,
+    /// How many times the home has been asked who it is signed in as.
+    attempts: u32,
+    /// Not before this is the home asked again.
+    next_check: Millis,
+    /// When the sign-in began, as the registry's pending entry records it.
+    started_at: Millis,
+    /// Picked up from an earlier run, with no terminal in this window: its
+    /// home is only deleted once it is old enough that no window can still
+    /// be signing in to it.
+    recovered: bool,
+}
+
+/// How many times a sign-in's home is asked who it is signed in as before
+/// the question is left for the next start.
+const LOGIN_ATTEMPTS: u32 = 3;
+/// How long after a failed question the home is asked again, per attempt.
+const LOGIN_RETRY: Millis = 5_000;
+/// How old a pending sign-in with no terminal in this window must be before
+/// this window asks its home who it is signed in as.
+const RECOVER_AFTER: Millis = 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoginPhase {
+    /// The terminal is running the provider's login.
+    Waiting,
+    /// The terminal ended and the home is being asked who it signed in as.
+    Verifying,
+    /// The answer is in, and the home is being registered or deleted.
+    Settling,
+}
+
+impl Login {
+    fn account(&self) -> Account {
+        Account::managed(self.provider, self.key, self.home.clone())
+    }
+}
+
+/// How a sign-in ended.
+#[derive(Debug, Clone)]
+pub enum Settled {
+    /// The account joined the registry, now as given.
+    Registered {
+        registry: Registry,
+        identity: Option<Identity>,
+        snapshot: Option<UsageSnapshot>,
+    },
+    /// The login duplicated the account named, and was signed out again.
+    Duplicate {
+        existing: AccountId,
+        registry: Option<Registry>,
+    },
+    /// Nothing was signed in, and the home is gone.
+    Abandoned(Option<Registry>),
+}
+
+/// What the startup load found.
+#[derive(Debug, Clone)]
+pub struct Loaded {
+    registry: Result<Registry, String>,
+    restored: Vec<Restored>,
 }
 
 /// What the startup load found for one account.
@@ -126,7 +353,7 @@ pub struct Restored {
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
-    Loaded(Vec<Restored>),
+    Loaded(Loaded),
     Probed {
         id: AccountId,
         outcome: Outcome,
@@ -135,6 +362,8 @@ pub enum Action {
     /// Opens the popover for an account, or closes it with `None` or by
     /// naming the account whose popover is already open.
     Popover(Option<AccountId>),
+    /// Shows another account in the popover that is already open.
+    ShowAccount(AccountId),
     OpenPane,
     SignIn(AccountId),
     /// The CLI to sign in with was looked for; `None` when it is missing.
@@ -142,15 +371,84 @@ pub enum Action {
         id: AccountId,
         program: Option<PathBuf>,
     },
+    /// The registry was read again, as another window may have changed it.
+    RegistryLoaded(Result<Registry, String>),
+    /// A change this window made to the registry was written, or was not.
+    Saved(Result<Registry, String>),
+    /// Starts adding an account; `device` asks Codex for a device code
+    /// rather than a browser hand-off.
+    Add {
+        provider: Provider,
+        device: bool,
+    },
+    /// The new account's home and CLI are ready, or could not be.
+    HomeReady {
+        provider: Provider,
+        device: bool,
+        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+    },
+    LoginTick,
+    /// The daemon's answer for sign-ins whose terminals this window is not
+    /// watching: the ones whose terminals have ended.
+    LoginsEnded(Result<Vec<(uuid::Uuid, TerminalId)>, String>),
+    /// A sign-in card off the strip on screen had its terminal closed
+    /// through the daemon, or could not.
+    OffstripClosed {
+        card: CardId,
+        result: Result<(), String>,
+    },
+    LoginVerified {
+        key: uuid::Uuid,
+        outcome: Outcome,
+    },
+    LoginSettled {
+        key: uuid::Uuid,
+        result: Result<Settled, String>,
+    },
+    CancelLogin(uuid::Uuid),
+    SetDefault(AccountId),
+    Rename(AccountId),
+    RenameInput(String),
+    RenameCommit,
+    RenameCancel,
+    /// Asks to remove an account; [`Action::RemoveConfirm`] does it.
+    Remove(AccountId),
+    RemoveConfirm(AccountId),
+    RemoveCancel,
+    /// A removal finished: the registry as it now stands, where it was
+    /// changed, and what went wrong, if anything.
+    Removed {
+        id: AccountId,
+        registry: Option<Registry>,
+        error: Option<String>,
+    },
+    /// Opens a row's menu, or closes it with `None`.
+    Menu(Option<AccountId>),
+    AddMenu(bool),
+    Sort(Sort),
 }
 
 impl Action {
-    /// Whether this is the reader acting on the usage surfaces, which a
-    /// dialog in front of them must stop. Closing the popover never is.
+    /// Whether this is the reader acting on the account surfaces, which a
+    /// dialog in front of them must stop. Closing a popup never is.
     pub(super) fn blocked_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Refresh(_) | Self::Popover(Some(_)) | Self::OpenPane | Self::SignIn(_)
+            Self::Refresh(_)
+                | Self::Popover(Some(_))
+                | Self::ShowAccount(_)
+                | Self::OpenPane
+                | Self::SignIn(_)
+                | Self::Add { .. }
+                | Self::CancelLogin(_)
+                | Self::SetDefault(_)
+                | Self::Rename(_)
+                | Self::RenameCommit
+                | Self::Remove(_)
+                | Self::RemoveConfirm(_)
+                | Self::Menu(Some(_))
+                | Self::AddMenu(true)
+                | Self::Sort(_)
         )
     }
 }
@@ -220,6 +518,17 @@ fn reset_line(window: &UsageWindow, now: Millis) -> Option<String> {
     })
 }
 
+/// How long until a window resets, as a table cell states it.
+fn reset_countdown(window: &UsageWindow, now: Millis) -> Option<String> {
+    let resets_at = window.resets_at?;
+    let now_seconds = unix_seconds(now);
+    Some(if resets_at <= now_seconds {
+        "reset".into()
+    } else {
+        account::format_remaining(resets_at - now_seconds)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChipTone {
     Current,
@@ -261,8 +570,7 @@ fn headline_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
     )
 }
 
-fn chip(account: &AccountState, now: Millis) -> Chip {
-    let name = account.name();
+fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
             Some(failure) => Chip {
@@ -364,18 +672,30 @@ fn chip(account: &AccountState, now: Millis) -> Chip {
     }
 }
 
+/// How a provider's CLI signs in: through the browser by default, or, for
+/// Codex, with a device code a reader can finish on another machine.
+fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'static str]> {
+    Some(match (provider, device) {
+        (Provider::Claude, _) => &["auth", "login", "--claudeai"],
+        (Provider::Codex, false) => &["login"],
+        (Provider::Codex, true) => &["login", "--device-auth"],
+        (Provider::Omp, _) => return None,
+    })
+}
+
 /// The terminal that runs `account`'s login command: the CLI at `program`,
 /// the same executable the probes run, started in the reader's home - not in
 /// a project, whose own CLI settings have no business in a login.
 ///
 /// `auth` and `login` are account management, which the launch recognizer
 /// does not take for an agent conversation.
-fn login_launch(account: &Account, program: &Path, home: PathBuf) -> Option<LaunchRecipe> {
-    let command: &[&str] = match account.provider {
-        crate::agent::Provider::Claude => &["auth", "login"],
-        crate::agent::Provider::Codex => &["login"],
-        crate::agent::Provider::Omp => return None,
-    };
+fn login_launch(
+    account: &Account,
+    program: &Path,
+    home: PathBuf,
+    device: bool,
+) -> Option<LaunchRecipe> {
+    let command = login_arguments(account.provider, device)?;
     let environment: BTreeMap<String, String> = account
         .probe_environment()
         .map(|(variable, home)| (variable.to_owned(), home.display().to_string()))
@@ -402,14 +722,70 @@ pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
     let arguments: Vec<&str> = recipe.arguments.iter().map(String::as_str).collect();
     matches!(
         (program, arguments.as_slice()),
-        ("claude", ["auth", "login"]) | ("codex", ["login"])
+        ("claude", ["auth", "login"])
+            | ("claude", ["auth", "login", "--claudeai"])
+            | ("codex", ["login"])
+            | ("codex", ["login", "--device-auth"])
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Placement {
-    Popover,
-    Pane,
+/// The account a conversation's launch runs on, by the home its recipe
+/// points the provider's CLI at.
+fn account_of_recipe<'a>(
+    accounts: &'a [AccountState],
+    provider: Provider,
+    recipe: &LaunchRecipe,
+) -> Option<&'a AccountState> {
+    let variable = account::home_variable(provider)?;
+    let chosen = recipe
+        .environment
+        .get(variable)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let system = accounts
+        .iter()
+        .find(|state| state.account.provider == provider && state.account.is_system());
+    let Some(chosen) = chosen else {
+        return system;
+    };
+    accounts
+        .iter()
+        .filter(|state| state.account.provider == provider)
+        .find(|state| state.account.resolved_home().as_deref() == Some(chosen.as_path()))
+        .or_else(|| {
+            // A home the recipe inherited from cagents' own environment is
+            // the system account, however the reader spelled it.
+            let system_home = system?.account.resolved_home()?;
+            (system_home == chosen).then_some(system?)
+        })
+}
+
+/// One account a conversation's composer offers.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ChatAccount {
+    pub id: AccountId,
+    pub label: String,
+    /// The plan and what is left, where known: `Max · 62% left`.
+    pub detail: String,
+    pub selected: bool,
+    /// The used fraction of the account's headline window, for its ring.
+    pub used: Option<f32>,
+}
+
+/// One account the settings pane offers as a provider's default.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DefaultChoice {
+    pub id: AccountId,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The account picker a conversation's composer shows.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ChatAccounts {
+    /// What the picker's button says: the chosen account's name.
+    pub current: String,
+    pub choices: Vec<ChatAccount>,
 }
 
 impl Cagents {
@@ -422,30 +798,99 @@ impl Cagents {
     /// Ticks while anything shows account usage. Unfocused, a tick only
     /// moves the clock the figures are read against - "resets in", "updated
     /// ... ago" - since [`Schedule::should_probe`] probes a focused window
-    /// alone.
+    /// alone. A sign-in in progress ticks faster, to notice its terminal
+    /// ending.
     pub(super) fn account_subscription(&self) -> Subscription<Message> {
-        if !self.accounts_surface_visible() {
-            return Subscription::none();
-        }
-        cosmic::iced::time::every(TICK).map(|_| Message::AccountUi(Action::Tick))
+        let usage = if self.accounts_surface_visible() {
+            cosmic::iced::time::every(TICK).map(|_| Message::AccountUi(Action::Tick))
+        } else {
+            Subscription::none()
+        };
+        let logins = if self
+            .account_ui
+            .logins
+            .iter()
+            .any(|login| login.phase == LoginPhase::Waiting)
+        {
+            cosmic::iced::time::every(LOGIN_TICK).map(|_| Message::AccountUi(Action::LoginTick))
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([usage, logins])
     }
 
-    /// Reads what earlier probes, from this window or another, left in the
-    /// cache, and which accounts have a CLI to ask.
+    /// Reads the registry - finishing, under its lock, any removal an earlier
+    /// run was interrupted in - what earlier probes, from this window or
+    /// another, left in the cache, and which accounts have a CLI to ask.
     pub(super) fn load_accounts(&self) -> Task<Message> {
-        let accounts: Vec<Account> = self
-            .account_ui
-            .accounts
-            .iter()
-            .map(|account| account.account.clone())
-            .collect();
+        let store = self.account_ui.store.clone();
+        let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
         cosmic::task::future(async move {
-            let restored =
-                tokio::task::spawn_blocking(move || restore(&accounts, cache.as_ref(), now_ms()))
-                    .await
-                    .unwrap_or_default();
-            Message::AccountUi(Action::Loaded(restored))
+            let loaded = tokio::task::spawn_blocking(move || {
+                let registry = match (&store, &homes) {
+                    (Some(store), Some(homes)) => store
+                        .load_and_sweep(homes)
+                        .map_err(|error| error.to_string()),
+                    (Some(store), None) => store.load().map_err(|error| error.to_string()),
+                    _ => Ok(Registry::default()),
+                };
+                let accounts = registry
+                    .as_ref()
+                    .map(|registry| registry.accounts(homes.as_ref()))
+                    .unwrap_or_else(|_| Account::system_accounts().into());
+                Loaded {
+                    restored: restore(&accounts, cache.as_ref(), now_ms()),
+                    registry,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Loaded {
+                registry: Err("The accounts could not be read".into()),
+                restored: Vec::new(),
+            });
+            Message::AccountUi(Action::Loaded(loaded))
+        })
+    }
+
+    /// Reads the registry again, for what another window changed.
+    fn reload_registry(&self) -> Task<Message> {
+        let Some(store) = self.account_ui.store.clone() else {
+            return Task::none();
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || store.load())
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::AccountUi(Action::RegistryLoaded(result))
+        })
+    }
+
+    /// Applies `change` to the registry on the blocking pool and reports the
+    /// result as [`Action::Saved`].
+    fn save_registry(
+        &mut self,
+        change: impl FnOnce(&mut Registry) + Send + 'static,
+    ) -> Task<Message> {
+        let Some(store) = self.account_ui.store.clone() else {
+            // A window without a configuration directory keeps its choices
+            // for as long as it runs.
+            let mut registry = self.account_ui.registry.clone();
+            change(&mut registry);
+            self.account_ui.set_registry(registry);
+            return Task::none();
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || store.update(change))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| {
+                    result
+                        .map(|(registry, ())| registry)
+                        .map_err(|error| error.to_string())
+                });
+            Message::AccountUi(Action::Saved(result))
         })
     }
 
@@ -468,23 +913,30 @@ impl Cagents {
             // An anchored popup outliving the reader's attention would still
             // be open, over stale figures, when they come back.
             self.account_ui.popover = None;
+            self.account_ui.table.close_popups();
         }
         if !regained {
             return Task::none();
         }
-        self.probe_accounts(Trigger::Focus)
+        Task::batch([self.reload_registry(), self.probe_accounts(Trigger::Focus)])
     }
 
-    /// The popover's share of a key event, like the chrome's popups: a
-    /// dialog opening closes it, and Escape closes it before anything behind.
+    /// The account popups' share of a key event, like the chrome's popups:
+    /// a dialog opening closes them, and Escape closes them before anything
+    /// behind.
     pub(super) fn account_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        self.account_ui.popover.as_ref()?;
+        if self.account_ui.popover.is_none() && !self.account_ui.table.has_popup() {
+            return None;
+        }
         if self.modal_is_open() {
             self.account_ui.popover = None;
+            self.account_ui.table.close_popups();
             return None;
         }
         is_escape_press(event).then(|| {
-            self.account_ui.popover = None;
+            if self.account_ui.popover.take().is_none() {
+                self.account_ui.table.escape();
+            }
             Task::none()
         })
     }
@@ -515,6 +967,8 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
+        let provider = self.account_ui.account(id)?.account.provider;
+        let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
         // Figures from before a reset are wrong however recent they are, so
         // they are refreshed as eagerly as on the reader's return.
@@ -532,6 +986,15 @@ impl Cagents {
         if !state.schedule.should_probe(trigger, now, focused) {
             return None;
         }
+        if busy {
+            state.queued = Some(match (state.queued, trigger) {
+                (Some(Trigger::Manual), _) | (_, Trigger::Manual) => Trigger::Manual,
+                (Some(Trigger::Focus), _) | (_, Trigger::Focus) => Trigger::Focus,
+                _ => Trigger::Tick,
+            });
+            return None;
+        }
+        state.queued = None;
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
         let force = trigger == Trigger::Manual || state.schedule.awaiting_login(now);
@@ -544,11 +1007,39 @@ impl Cagents {
         }))
     }
 
+    /// Starts the probe that was waiting for another account of `provider`.
+    fn probe_queued(&mut self, provider: Provider) -> Task<Message> {
+        let now = now_ms();
+        let Some((id, trigger)) = self
+            .account_ui
+            .of(provider)
+            .find_map(|account| Some((account.id.clone(), account.queued?)))
+        else {
+            return Task::none();
+        };
+        if let Some(state) = self.account_ui.account_mut(&id) {
+            state.queued = None;
+        }
+        self.probe_account(&id, trigger, now)
+            .unwrap_or_else(Task::none)
+    }
+
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Tick => self.probe_accounts(Trigger::Tick),
-            Action::Loaded(restored) => {
-                for restored in restored {
+            Action::Loaded(loaded) => {
+                match loaded.registry {
+                    Ok(registry) => {
+                        self.account_ui.set_registry(registry);
+                        self.recover_logins();
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "Your added accounts could not be read: {error}"
+                        )));
+                    }
+                }
+                for restored in loaded.restored {
                     let Some(state) = self.account_ui.account_mut(&restored.id) else {
                         continue;
                     };
@@ -567,50 +1058,7 @@ impl Cagents {
                 }
                 self.probe_accounts(Trigger::Focus)
             }
-            Action::Probed { id, outcome } => {
-                let now = now_ms();
-                self.account_ui.now_ms = now;
-                let Some(state) = self.account_ui.account_mut(&id) else {
-                    return Task::none();
-                };
-                match outcome {
-                    // Another window's cached answer can be older than what
-                    // this window already shows, and then says nothing new.
-                    Outcome::Answered { snapshot, .. }
-                        if snapshot.source == UsageSource::Cache
-                            && state.snapshot.as_ref().is_some_and(|current| {
-                                snapshot.observed_at < current.observed_at
-                            }) =>
-                    {
-                        state.schedule.abandon();
-                    }
-                    // A probe's own answer is always the newest.
-                    Outcome::Answered { identity, snapshot } => {
-                        state.schedule.succeed(snapshot.observed_at);
-                        if snapshot.status != UsageStatus::NeedsLogin {
-                            state.schedule.login_settled();
-                        }
-                        state.present = snapshot.status != UsageStatus::Unavailable;
-                        // A signed-out answer, or an identity lookup that failed
-                        // this time, names nobody; the account last seen is
-                        // still the one it is, or the one to sign back in to.
-                        if identity.is_some() || snapshot.status == UsageStatus::Unavailable {
-                            state.identity = identity;
-                        }
-                        state.snapshot = Some(snapshot);
-                        state.failure = None;
-                    }
-                    Outcome::Failed(message) => {
-                        state.schedule.fail(now);
-                        state.failure = Some(message);
-                    }
-                    Outcome::Busy => state.schedule.abandon(),
-                }
-                if !state.present && self.account_ui.popover.as_ref() == Some(&id) {
-                    self.account_ui.popover = None;
-                }
-                Task::none()
-            }
+            Action::Probed { id, outcome } => self.account_probed(id, outcome),
             Action::Refresh(id) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -626,14 +1074,285 @@ impl Cagents {
                 id.and_then(|id| self.probe_account(&id, Trigger::Focus, now))
                     .unwrap_or_else(Task::none)
             }
+            Action::ShowAccount(id) => {
+                if self.account_ui.account(&id).is_none() {
+                    return Task::none();
+                }
+                self.account_ui.popover = Some(id.clone());
+                let now = now_ms();
+                self.account_ui.now_ms = now;
+                self.probe_account(&id, Trigger::Focus, now)
+                    .unwrap_or_else(Task::none)
+            }
             Action::OpenPane => {
                 self.account_ui.popover = None;
+                self.dismiss_chat_picker();
                 let open = self.open_utility_card(CardKind::Accounts);
                 Task::batch([open, self.accounts_surface_changed()])
             }
             Action::SignIn(id) => self.sign_in(id),
             Action::LoginReady { id, program } => self.open_login(&id, program),
+            Action::RegistryLoaded(result) => {
+                if let Ok(registry) = result {
+                    let before = self.account_ui.accounts.len();
+                    self.account_ui.set_registry(registry);
+                    if self.account_ui.accounts.len() != before {
+                        return self.probe_accounts(Trigger::Focus);
+                    }
+                }
+                Task::none()
+            }
+            Action::Saved(result) => {
+                match result {
+                    Ok(registry) => self.account_ui.set_registry(registry),
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "The change to your accounts could not be saved: {error}"
+                        )));
+                    }
+                }
+                Task::none()
+            }
+            Action::Add { provider, device } => self.add_account(provider, device),
+            Action::HomeReady {
+                provider,
+                device,
+                result,
+            } => self.open_account_login(provider, device, result),
+            Action::LoginTick => self.check_logins(),
+            Action::LoginsEnded(result) => {
+                self.account_ui.asking_host = false;
+                match result {
+                    Ok(mut ended) => {
+                        // A sign-in settled, being asked, or restarted in
+                        // another terminal while the daemon was answering has
+                        // moved on from the terminal the answer is about.
+                        ended.retain(|(key, terminal)| {
+                            self.account_ui.logins.iter().any(|login| {
+                                login.key == *key
+                                    && login.phase == LoginPhase::Waiting
+                                    && self
+                                        .sign_in_card(login.provider, &login.home)
+                                        .and_then(|card| sign_in_terminal(self.card_state(card)))
+                                        .is_none_or(|current| current == *terminal)
+                            })
+                        });
+                        Task::batch(
+                            ended
+                                .into_iter()
+                                .map(|(key, _)| self.verify_login(key))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    // The next tick asks again.
+                    Err(error) => {
+                        tracing::debug!(%error, "the daemon could not say which sign-ins ended");
+                        Task::none()
+                    }
+                }
+            }
+            Action::OffstripClosed { card, result } => match result {
+                // With its card gone, the sign-in counts as ended.
+                Ok(()) => Task::batch([self.retire_offstrip_card(card), self.check_logins()]),
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(format!(
+                        "The sign-in could not be stopped: {error}"
+                    )));
+                    Task::none()
+                }
+            },
+            Action::LoginVerified { key, outcome } => self.login_verified(key, outcome),
+            Action::LoginSettled { key, result } => self.login_settled(key, result),
+            Action::CancelLogin(key) => {
+                let Some(login) = self.account_ui.logins.iter().find(|login| login.key == key)
+                else {
+                    return Task::none();
+                };
+                match self.sign_in_card(login.provider, &login.home) {
+                    // Closing the terminal ends the login; the next check
+                    // finds it ended and deletes the home. Cancelling is
+                    // itself the answer to whether to stop it.
+                    Some(card) if self.workspace.order().any(|id| id == card) => {
+                        self.close_card_unasked(card)
+                    }
+                    // Its strip is not on screen, so there is no card close
+                    // to run: the daemon stops the login and the card is
+                    // retired, which the next check takes as the end.
+                    Some(card) => self.close_offstrip_sign_in(card),
+                    None => self.check_logins(),
+                }
+            }
+            Action::SetDefault(id) => {
+                self.account_ui.table.close_popups();
+                let Some(account) = self
+                    .account_ui
+                    .account(&id)
+                    .map(|state| state.account.clone())
+                else {
+                    return Task::none();
+                };
+                self.save_registry(move |registry| registry.set_default(&account))
+            }
+            Action::Rename(id) => {
+                self.account_ui.table.menu = None;
+                let Some(state) = self.account_ui.account(&id) else {
+                    return Task::none();
+                };
+                let current = self
+                    .account_ui
+                    .registry
+                    .label(&state.account)
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                self.account_ui.table.rename = Some((id, current));
+                iced::widget::operation::focus(table::rename_id()).map(cosmic::Action::App)
+            }
+            Action::RenameInput(text) => {
+                if let Some((_, draft)) = self.account_ui.table.rename.as_mut() {
+                    *draft = text.chars().take(account::LABEL_LIMIT * 2).collect();
+                }
+                Task::none()
+            }
+            Action::RenameCommit => {
+                let Some((id, draft)) = self.account_ui.table.rename.take() else {
+                    return Task::none();
+                };
+                let Some(account) = self
+                    .account_ui
+                    .account(&id)
+                    .map(|state| state.account.clone())
+                else {
+                    return Task::none();
+                };
+                self.save_registry(move |registry| registry.set_label(&account, Some(draft)))
+            }
+            Action::RenameCancel => {
+                self.account_ui.table.rename = None;
+                Task::none()
+            }
+            Action::Remove(id) => {
+                if self
+                    .account_ui
+                    .account(&id)
+                    .is_some_and(|state| !state.account.is_system())
+                {
+                    self.account_ui.table.confirm_in_use = self.cards_on_account(&id);
+                    self.account_ui.table.menu = Some(id.clone());
+                    self.account_ui.table.confirm_remove = Some(id);
+                }
+                Task::none()
+            }
+            Action::RemoveCancel => {
+                self.account_ui.table.confirm_remove = None;
+                Task::none()
+            }
+            Action::RemoveConfirm(id) => self.remove_account(id),
+            Action::Removed {
+                id,
+                registry,
+                error,
+            } => {
+                self.account_ui.removing.remove(&id);
+                if let Some(registry) = registry {
+                    self.account_ui.set_registry(registry);
+                }
+                if let Some(error) = error {
+                    self.status = Some(TransientNotice::error(format!(
+                        "The account could not be removed completely: {error}"
+                    )));
+                }
+                Task::none()
+            }
+            Action::Menu(id) => {
+                let id = id.filter(|id| self.account_ui.table.menu.as_ref() != Some(id));
+                self.account_ui.table.menu = id;
+                self.account_ui.table.confirm_remove = None;
+                self.account_ui.table.add_menu = false;
+                Task::none()
+            }
+            Action::AddMenu(open) => {
+                self.account_ui.table.add_menu = open;
+                if open {
+                    self.account_ui.table.menu = None;
+                }
+                Task::none()
+            }
+            Action::Sort(sort) => {
+                self.account_ui.table.sort = sort;
+                Task::none()
+            }
         }
+    }
+
+    fn account_probed(&mut self, id: AccountId, outcome: Outcome) -> Task<Message> {
+        let now = now_ms();
+        self.account_ui.now_ms = now;
+        let Some(state) = self.account_ui.account_mut(&id) else {
+            return Task::none();
+        };
+        let provider = state.account.provider;
+        let mut learned = None;
+        match outcome {
+            // Another window's cached answer can be older than what this
+            // window already shows, and then says nothing new.
+            Outcome::Answered { snapshot, .. }
+                if snapshot.source == UsageSource::Cache
+                    && state
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|current| snapshot.observed_at < current.observed_at) =>
+            {
+                state.schedule.abandon();
+            }
+            // A probe's own answer is always the newest.
+            Outcome::Answered { identity, snapshot } => {
+                state.schedule.succeed(snapshot.observed_at);
+                if snapshot.status != UsageStatus::NeedsLogin {
+                    state.schedule.login_settled();
+                }
+                state.present =
+                    snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
+                // A signed-out answer, or an identity lookup that failed this
+                // time, names nobody; the account last seen is still the one
+                // it is, or the one to sign back in to.
+                if identity.is_some() || snapshot.status == UsageStatus::Unavailable {
+                    state.identity = identity;
+                }
+                if let (Some(key), Some(identity)) =
+                    (state.account.managed_key(), state.identity.as_ref())
+                {
+                    learned = Some((key, identity.clone()));
+                }
+                state.snapshot = Some(snapshot);
+                state.failure = None;
+            }
+            Outcome::Failed(message) => {
+                state.schedule.fail(now);
+                state.failure = Some(message);
+            }
+            Outcome::Busy => state.schedule.abandon(),
+        }
+        let present = state.present;
+        if !present && self.account_ui.popover.as_ref() == Some(&id) {
+            self.account_ui.popover = None;
+        }
+        // A managed account's address is remembered, so the next sign-in can
+        // be told apart from it before this window has probed it.
+        let remember = learned
+            .filter(|(key, identity)| {
+                self.account_ui.registry.find(*key).is_some_and(|managed| {
+                    identity.email.is_some() && managed.email != identity.email
+                        || identity.organization.is_some()
+                            && managed.organization != identity.organization
+                })
+            })
+            .map(|(key, identity)| {
+                self.save_registry(move |registry| {
+                    registry.observe_identity(key, &identity);
+                })
+            })
+            .unwrap_or_else(Task::none);
+        Task::batch([remember, self.probe_queued(provider)])
     }
 
     /// Finds the CLI to sign in with off the interface thread, the same way
@@ -647,6 +1366,7 @@ impl Cagents {
             return Task::none();
         };
         self.account_ui.popover = None;
+        self.account_ui.table.close_popups();
         cosmic::task::future(async move {
             let program = tokio::task::spawn_blocking(move || {
                 probe::find_executable(account.provider.executable())
@@ -665,7 +1385,7 @@ impl Cagents {
         let launch = program
             .zip(std::env::var_os("HOME"))
             .and_then(|(program, home)| {
-                login_launch(&state.account, &program, PathBuf::from(home))
+                login_launch(&state.account, &program, PathBuf::from(home), false)
             });
         let Some(launch) = launch else {
             self.status = Some(TransientNotice::error(format!(
@@ -674,13 +1394,726 @@ impl Cagents {
             )));
             return Task::none();
         };
-        // A sign-in keeps no transcript: see `is_sign_in`.
-        let session = fresh_terminal_session(launch);
+        let title = format!("Sign in to {}", state.name());
         let now = now_ms();
         if let Some(state) = self.account_ui.account_mut(id) {
             state.schedule.await_login(now);
         }
-        self.insert_terminal_card(session, None)
+        self.open_login_terminal(launch, title).0
+    }
+
+    /// Opens a terminal running a provider's login, which keeps no
+    /// transcript (see [`is_sign_in`]), and names it for what it is doing.
+    fn open_login_terminal(
+        &mut self,
+        launch: LaunchRecipe,
+        title: String,
+    ) -> (Task<Message>, TerminalId) {
+        // The login runs from the home directory, which no worktree owns, so
+        // the next scope rebuild would file the card under that directory and
+        // take it out of the strip it was opened in. It is filed with the
+        // workspace the reader is looking at instead, as an adopted terminal
+        // would be.
+        let filing = self
+            .worktree_scope_for(&launch.working_directory)
+            .is_none()
+            .then(|| self.active_workspace.clone())
+            .flatten();
+        let session = fresh_terminal_session(launch);
+        let terminal = session.id;
+        let task = self.insert_terminal_card(session, None);
+        let card = self
+            .durable
+            .cards
+            .iter()
+            .find(
+                |card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal),
+            )
+            .map(|card| card.id);
+        if let Some(card) = card {
+            if let Some(state) = self.card_state_mut(card) {
+                state.title = title;
+            }
+            if let Some(scope) = filing {
+                Arc::make_mut(&mut self.durable)
+                    .card_scopes
+                    .insert(card, scope);
+            }
+        }
+        (task, terminal)
+    }
+
+    /// The open card running a sign-in to `home`, if any.
+    fn sign_in_card(&self, provider: Provider, home: &Path) -> Option<CardId> {
+        let variable = account::home_variable(provider)?;
+        self.durable
+            .cards
+            .iter()
+            .find(|card| {
+                card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Terminal(session)
+                        if is_sign_in(&session.launch)
+                            && session
+                                .launch
+                                .environment
+                                .get(variable)
+                                .is_some_and(|value| Path::new(value) == home))
+            })
+            .map(|card| card.id)
+    }
+
+    /// Takes up the sign-ins an earlier run left pending: one whose terminal
+    /// this window restored carries on as if nothing happened, and one old
+    /// enough that no window can still be running it is asked who it signed
+    /// in as, which registers or deletes it.
+    fn recover_logins(&mut self) {
+        let Some(homes) = self.account_ui.homes.clone() else {
+            return;
+        };
+        let now = now_ms();
+        let pending: Vec<registry::Pending> = self.account_ui.registry.pending().to_vec();
+        for pending in pending {
+            if self
+                .account_ui
+                .logins
+                .iter()
+                .any(|login| login.key == pending.key)
+            {
+                continue;
+            }
+            let home = homes.path(pending.provider, pending.key);
+            let restored = self.sign_in_card(pending.provider, &home).is_some();
+            if !restored && now.saturating_sub(pending.started_at) < RECOVER_AFTER {
+                continue;
+            }
+            self.account_ui.logins.push(Login {
+                provider: pending.provider,
+                key: pending.key,
+                home,
+                phase: LoginPhase::Waiting,
+                attempts: 0,
+                next_check: 0,
+                started_at: pending.started_at,
+                recovered: !restored,
+            });
+        }
+    }
+
+    /// Creates the new account's home off the interface thread, with the
+    /// reader's shared entries linked in, and finds its CLI.
+    fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
+        self.account_ui.table.close_popups();
+        self.account_ui.popover = None;
+        if login_arguments(provider, device).is_none() {
+            return Task::none();
+        }
+        let Some(homes) = self.account_ui.homes.clone() else {
+            self.status = Some(TransientNotice::error(
+                "Accounts cannot be added: this system offers no data directory.",
+            ));
+            return Task::none();
+        };
+        let store = self.account_ui.store.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let program = probe::find_executable(provider.executable())
+                    .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
+                let system = Account::system(provider).resolved_home();
+                let (key, home) = homes
+                    .create(provider, system.as_deref())
+                    .map_err(|error| format!("Its home could not be created: {error}"))?;
+                // Recorded before any login can land in it, so the home is
+                // never one nothing knows about.
+                if let Some(store) = &store
+                    && let Err(error) =
+                        store.update(|registry| registry.begin(provider, key, now_ms()))
+                {
+                    let _ = homes.remove(provider, key);
+                    return Err(format!("It could not be recorded: {error}"));
+                }
+                Ok((key, home, program))
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AccountUi(Action::HomeReady {
+                provider,
+                device,
+                result,
+            })
+        })
+    }
+
+    fn open_account_login(
+        &mut self,
+        provider: Provider,
+        device: bool,
+        result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
+    ) -> Task<Message> {
+        let (key, home, program) = match result {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "A {} account could not be added: {error}",
+                    provider.label()
+                )));
+                return Task::none();
+            }
+        };
+        let account = Account::managed(provider, key, home.clone());
+        let launch = std::env::var_os("HOME").and_then(|reader_home| {
+            login_launch(&account, &program, PathBuf::from(reader_home), device)
+        });
+        let Some(launch) = launch else {
+            self.status = Some(TransientNotice::error(format!(
+                "{} could not be started to sign in.",
+                probe::cli_name(provider)
+            )));
+            return self.discard_home(key, provider);
+        };
+        let (task, _) =
+            self.open_login_terminal(launch, format!("Add a {} account", provider.label()));
+        let now = now_ms();
+        self.account_ui.logins.push(Login {
+            provider,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now,
+            recovered: false,
+        });
+        task
+    }
+
+    /// Deletes a home that never became an account, and its pending entry.
+    fn discard_home(&self, key: uuid::Uuid, provider: Provider) -> Task<Message> {
+        let homes = self.account_ui.homes.clone();
+        let store = self.account_ui.store.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<Settled, String> {
+                if let Some(homes) = homes {
+                    homes
+                        .remove(provider, key)
+                        .map_err(|error| error.to_string())?;
+                }
+                abandon(store.as_ref(), key).map(Settled::Abandoned)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AccountUi(Action::LoginSettled { key, result })
+        })
+    }
+
+    /// Asks the home of every sign-in whose terminal has ended - or whose
+    /// card was closed - who it is signed in as.
+    fn check_logins(&mut self) -> Task<Message> {
+        let now = now_ms();
+        let mut ended = Vec::new();
+        let mut unwatched = Vec::new();
+        for login in self
+            .account_ui
+            .logins
+            .iter()
+            .filter(|login| login.phase == LoginPhase::Waiting && login.next_check <= now)
+        {
+            let Some(card) = self.sign_in_card(login.provider, &login.home) else {
+                ended.push(login.key);
+                continue;
+            };
+            let on_screen = self.workspace.order().any(|id| id == card);
+            match self.cards.get(&card) {
+                Some(CardRuntime::Failed(_)) => ended.push(login.key),
+                // A card on the strip on screen follows its terminal.
+                Some(CardRuntime::Terminal(_) | CardRuntime::Completed) if on_screen => {
+                    if ended_terminal(self.card_state(card)).is_some() {
+                        ended.push(login.key);
+                    }
+                }
+                // A card off the strip hibernates, and one not hydrated yet
+                // has not started watching: either keeps whatever it last saw.
+                // What it saw end has ended; otherwise the daemon is asked -
+                // once it has taken the terminal on, since until then it has
+                // nothing to say about it.
+                _ => {
+                    if ended_terminal(self.card_state(card)).is_some() {
+                        ended.push(login.key);
+                    } else if let Some(CardState {
+                        kind: CardKind::Terminal(session),
+                        ..
+                    }) = self.card_state(card)
+                        && let Some(proof) = session.continuity.live_proof()
+                    {
+                        unwatched.push((login.key, session.id, proof));
+                    }
+                }
+            }
+        }
+        let ask = if unwatched.is_empty()
+            || self.account_ui.asking_host
+            || self.account_ui.next_host_check > now
+        {
+            Task::none()
+        } else {
+            self.account_ui.asking_host = true;
+            self.account_ui.next_host_check = now + HOST_CHECK;
+            cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || ended_on_host(&unwatched))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                Message::AccountUi(Action::LoginsEnded(result))
+            })
+        };
+        let verify = ended
+            .into_iter()
+            .map(|key| self.verify_login(key))
+            .collect::<Vec<_>>();
+        Task::batch(verify.into_iter().chain([ask]))
+    }
+
+    /// Closes a sign-in card that is not on the strip on screen, which has
+    /// no card close to run: the daemon closes its terminal - a no-op for
+    /// one that has ended - and the card is then retired.
+    fn close_offstrip_sign_in(&mut self, card: CardId) -> Task<Message> {
+        let hosted = match self.card_state(card) {
+            Some(CardState {
+                kind: CardKind::Terminal(session),
+                ..
+            }) => session
+                .continuity
+                .live_proof()
+                .map(|proof| (session.id, proof)),
+            _ => None,
+        };
+        let Some((terminal, proof)) = hosted else {
+            // Ended already, or never taken on by the daemon: nothing runs.
+            return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::AccountUi(Action::OffstripClosed { card, result })
+        })
+    }
+
+    /// Closes the card of a sign-in that has settled: its terminal has said
+    /// all it had to.
+    fn close_settled_sign_in(&mut self, provider: Provider, home: &Path) -> Task<Message> {
+        match self.sign_in_card(provider, home) {
+            Some(card) if !self.workspace.order().any(|id| id == card) => {
+                self.close_offstrip_sign_in(card)
+            }
+            Some(card) if ended_terminal(self.card_state(card)).is_some() => {
+                cosmic::task::message(Message::CloseCard(card))
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn verify_login(&mut self, key: uuid::Uuid) -> Task<Message> {
+        let Some(login) = self
+            .account_ui
+            .logins
+            .iter_mut()
+            .find(|login| login.key == key)
+        else {
+            return Task::none();
+        };
+        login.phase = LoginPhase::Verifying;
+        login.attempts += 1;
+        let account = login.account();
+        cosmic::task::future(async move {
+            // No cache: the answer is about a home no other window knows.
+            let outcome = probe::run(account, None, true).await;
+            Message::AccountUi(Action::LoginVerified { key, outcome })
+        })
+    }
+
+    fn login_verified(&mut self, key: uuid::Uuid, outcome: Outcome) -> Task<Message> {
+        let now = now_ms();
+        let Some(index) = self
+            .account_ui
+            .logins
+            .iter()
+            .position(|login| login.key == key)
+        else {
+            return Task::none();
+        };
+        let login = &mut self.account_ui.logins[index];
+        let (identity, snapshot) = match outcome {
+            Outcome::Answered { identity, snapshot } => (identity, snapshot),
+            // A CLI that cannot say who it signed in as right now is asked
+            // again a little later. A login that cannot be confirmed at all
+            // is neither added nor thrown away: it stays pending, and the
+            // next start asks again.
+            Outcome::Failed(_) | Outcome::Busy => {
+                if login.attempts < LOGIN_ATTEMPTS {
+                    login.phase = LoginPhase::Waiting;
+                    login.next_check = now + LOGIN_RETRY * Millis::from(login.attempts);
+                    return Task::none();
+                }
+                let login = self.account_ui.logins.remove(index);
+                if !login.recovered {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "{} could not say which account signed in. cagents will check again the next time it starts.",
+                        probe::cli_name(login.provider)
+                    )));
+                }
+                return Task::none();
+            }
+        };
+        let signed_in = identity.is_some()
+            || matches!(
+                snapshot.status,
+                UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+            );
+        let provider = login.provider;
+        let account = login.account();
+        if !signed_in {
+            // A sign-in picked up from an earlier run may still be under way
+            // in another window until it is old enough not to be.
+            if login.recovered
+                && now.saturating_sub(login.started_at)
+                    < crate::account::home::ORPHAN_AGE.as_millis() as Millis
+            {
+                self.account_ui.logins.remove(index);
+                return Task::none();
+            }
+            login.phase = LoginPhase::Settling;
+            return self.discard_home(key, provider);
+        }
+        login.phase = LoginPhase::Settling;
+        let managed = registry::Managed {
+            key,
+            provider,
+            label: None,
+            email: identity
+                .as_ref()
+                .and_then(|identity| identity.email.clone()),
+            organization: identity
+                .as_ref()
+                .and_then(|identity| identity.organization.clone()),
+            added_at: now,
+        };
+        let system = self.account_ui.system_identities();
+        let store = self.account_ui.store.clone();
+        let homes = self.account_ui.homes.clone();
+        let fallback = self.account_ui.registry.clone();
+        cosmic::task::future(async move {
+            let registered = match store.clone() {
+                Some(store) => tokio::task::spawn_blocking(move || {
+                    store.update(|registry| registry.register(managed, &system))
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string())),
+                None => {
+                    let mut registry = fallback;
+                    let result = registry.register(managed, &system);
+                    Ok((registry, result))
+                }
+            };
+            let result = match registered {
+                Ok((registry, Ok(()))) => Ok(Settled::Registered {
+                    registry,
+                    identity,
+                    snapshot: Some(snapshot),
+                }),
+                Ok((_, Err(existing))) => {
+                    // The same login twice would be one allowance counted
+                    // twice. The new home is signed out - its login is its
+                    // own, so the existing one is unaffected - and deleted.
+                    let _ = probe::logout(account).await;
+                    tokio::task::spawn_blocking(move || -> Result<Settled, String> {
+                        if let Some(homes) = homes {
+                            homes
+                                .remove(provider, key)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(Settled::Duplicate {
+                            existing,
+                            registry: abandon(store.as_ref(), key)?,
+                        })
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result)
+                }
+                Err(error) => Err(error),
+            };
+            Message::AccountUi(Action::LoginSettled { key, result })
+        })
+    }
+
+    fn login_settled(&mut self, key: uuid::Uuid, result: Result<Settled, String>) -> Task<Message> {
+        let Some(index) = self
+            .account_ui
+            .logins
+            .iter()
+            .position(|login| login.key == key)
+        else {
+            return Task::none();
+        };
+        let login = self.account_ui.logins.remove(index);
+        match result {
+            Ok(Settled::Registered {
+                registry,
+                identity,
+                snapshot,
+            }) => {
+                self.account_ui.set_registry(registry);
+                let id = login.account().id();
+                let now = now_ms();
+                let name = identity
+                    .as_ref()
+                    .and_then(|identity| identity.email.clone())
+                    .unwrap_or_else(|| format!("A {} account", login.provider.label()));
+                if let Some(state) = self.account_ui.account_mut(&id) {
+                    state.present = true;
+                    if let Some(snapshot) = snapshot {
+                        state.schedule.start(Trigger::Manual, now);
+                        state.schedule.succeed(snapshot.observed_at);
+                        state.snapshot = Some(snapshot);
+                    }
+                    state.identity = identity;
+                }
+                self.status = Some(TransientNotice::success(format!("{name} was added.")));
+                self.close_settled_sign_in(login.provider, &login.home)
+            }
+            Ok(Settled::Duplicate { existing, registry }) => {
+                if let Some(registry) = registry {
+                    self.account_ui.set_registry(registry);
+                }
+                let name = self
+                    .account_ui
+                    .account(&existing)
+                    .map(|state| self.account_ui.display_name(state))
+                    .unwrap_or_else(|| "an account you already have".into());
+                self.status = Some(TransientNotice::warning(format!(
+                    "That login is already added as {name}."
+                )));
+                self.close_settled_sign_in(login.provider, &login.home)
+            }
+            Ok(Settled::Abandoned(registry)) => {
+                if let Some(registry) = registry {
+                    self.account_ui.set_registry(registry);
+                }
+                self.close_settled_sign_in(login.provider, &login.home)
+            }
+            Err(error) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "The new {} account could not be saved: {error}",
+                    login.provider.label()
+                )));
+                Task::none()
+            }
+        }
+    }
+
+    /// Signs a managed account out through its CLI, forgets it, and deletes
+    /// its home, in that order: once it is forgotten nothing uses the home,
+    /// and a home whose deletion fails is swept later rather than left
+    /// registered and broken.
+    fn remove_account(&mut self, id: AccountId) -> Task<Message> {
+        self.account_ui.table.close_popups();
+        let Some(account) = self
+            .account_ui
+            .account(&id)
+            .map(|state| state.account.clone())
+        else {
+            return Task::none();
+        };
+        let Some(key) = account.managed_key() else {
+            return Task::none();
+        };
+        if !self.account_ui.removing.insert(id.clone()) {
+            return Task::none();
+        }
+        let store = self.account_ui.store.clone();
+        let homes = self.account_ui.homes.clone();
+        let fallback = self.account_ui.registry.clone();
+        let provider = account.provider;
+        cosmic::task::future(async move {
+            let _ = probe::logout(account).await;
+            let (registry, error) = tokio::task::spawn_blocking(move || {
+                let registry = match store {
+                    Some(store) => match store.update(|registry| {
+                        registry.unregister(key);
+                    }) {
+                        Ok((registry, ())) => registry,
+                        Err(error) => return (None, Some(error.to_string())),
+                    },
+                    None => {
+                        let mut registry = fallback;
+                        registry.unregister(key);
+                        registry
+                    }
+                };
+                // Once forgotten, the home is no account's: a deletion that
+                // fails here leaves files, never a broken account.
+                let error = homes.and_then(|homes| {
+                    homes
+                        .remove(provider, key)
+                        .err()
+                        .map(|error| format!("its files could not be deleted: {error}"))
+                });
+                (Some(registry), error)
+            })
+            .await
+            .unwrap_or_else(|error| (None, Some(error.to_string())));
+            Message::AccountUi(Action::Removed {
+                id,
+                registry,
+                error,
+            })
+        })
+    }
+
+    /// The account `provider` starts a new conversation on.
+    pub(super) fn default_account(&self, provider: Provider) -> Account {
+        self.account_ui
+            .registry
+            .default_account(provider, self.account_ui.homes.as_ref())
+    }
+
+    /// The account named `id`, if it is still known.
+    pub(super) fn known_account(&self, id: &AccountId) -> Option<Account> {
+        self.account_ui
+            .account(id)
+            .map(|state| state.account.clone())
+    }
+
+    /// The account a conversation launched as `recipe` runs on, if it is
+    /// one cagents knows.
+    pub(super) fn chat_account(
+        &self,
+        provider: Provider,
+        recipe: &LaunchRecipe,
+    ) -> Option<AccountId> {
+        account_of_recipe(&self.account_ui.accounts, provider, recipe).map(|state| state.id.clone())
+    }
+
+    /// The accounts a conversation launched as `recipe` could run on, for
+    /// its composer's picker, or `None` where there is nothing to choose
+    /// between and nothing worth naming: one account, and it is the system
+    /// default.
+    pub(super) fn chat_accounts(
+        &self,
+        provider: Provider,
+        recipe: &LaunchRecipe,
+    ) -> Option<ChatAccounts> {
+        // Only a provider with accounts cagents can tell apart has a choice.
+        if !Account::PROVIDERS.contains(&provider) {
+            return None;
+        }
+        let state = &self.account_ui;
+        let current = account_of_recipe(&state.accounts, provider, recipe);
+        let choices: Vec<ChatAccount> = state
+            .of(provider)
+            .filter(|account| {
+                account.present || Some(account.id.as_str()) == current.map(|c| c.id.as_str())
+            })
+            .map(|account| {
+                let mut detail = Vec::new();
+                if let Some(plan) = account.plan() {
+                    detail.push(plan);
+                }
+                let headline = account.headline();
+                match (&account.snapshot, headline) {
+                    (_, Some(window)) => {
+                        detail.push(format!("{}% left", percent_left(window.used)))
+                    }
+                    (Some(snapshot), None) if snapshot.status == UsageStatus::NeedsLogin => {
+                        detail.push("Signed out".into())
+                    }
+                    _ => {}
+                }
+                if state.registry.is_default(&account.account) {
+                    detail.push("Default".into());
+                }
+                ChatAccount {
+                    id: account.id.clone(),
+                    label: state.display_name(account),
+                    detail: detail.join(" · "),
+                    selected: current.is_some_and(|current| current.id == account.id),
+                    used: headline.map(|window| window.used),
+                }
+            })
+            .collect();
+        let current_label = match current {
+            Some(current) => state.display_name(current),
+            None => "Other home".into(),
+        };
+        if choices.is_empty()
+            || (choices.len() < 2 && current.is_some_and(|current| current.account.is_system()))
+        {
+            return None;
+        }
+        Some(ChatAccounts {
+            current: current_label,
+            choices,
+        })
+    }
+
+    /// How many open conversations and terminals run on account `id`.
+    fn cards_on_account(&self, id: &AccountId) -> usize {
+        let Some(state) = self.account_ui.account(id) else {
+            return 0;
+        };
+        let provider = state.account.provider;
+        self.durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .filter_map(|card| match &card.kind {
+                CardKind::Chat(session) if session.launch.provider == provider => {
+                    Some(&session.launch.recipe)
+                }
+                CardKind::Terminal(session) => Some(&session.launch),
+                _ => None,
+            })
+            .filter(|recipe| {
+                recipe
+                    .environment
+                    .get(account::home_variable(provider).unwrap_or_default())
+                    .is_some()
+                    && account_of_recipe(&self.account_ui.accounts, provider, recipe)
+                        .is_some_and(|account| &account.id == id)
+            })
+            .count()
+    }
+
+    /// The per-provider default choices the settings pane offers.
+    pub(super) fn default_account_choices(&self) -> Vec<(Provider, Vec<DefaultChoice>)> {
+        let state = &self.account_ui;
+        Account::PROVIDERS
+            .into_iter()
+            .map(|provider| {
+                (
+                    provider,
+                    state
+                        .of(provider)
+                        // The default is always listed, so the choice shows
+                        // what new conversations actually start on.
+                        .filter(|account| {
+                            account.present
+                                || !account.account.is_system()
+                                || state.registry.is_default(&account.account)
+                        })
+                        .map(|account| DefaultChoice {
+                            id: account.id.clone(),
+                            label: state.display_name(account),
+                            selected: state.registry.is_default(&account.account),
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn status_bar(&self) -> Option<Element<'_, Message>> {
@@ -689,12 +2122,9 @@ impl Cagents {
         }
         let now = self.account_ui.now_ms;
         let compact = self.window_width < COMPACT_WIDTH;
-        let chips: Vec<Element<'_, Message>> = self
-            .account_ui
-            .accounts
-            .iter()
-            .filter(|account| account.present)
-            .map(|account| self.account_chip(account, now, compact))
+        let chips: Vec<Element<'_, Message>> = Account::PROVIDERS
+            .into_iter()
+            .filter_map(|provider| self.provider_chip(provider, now, compact))
             .collect();
         // A bar with nothing to report is only a line across the window.
         if chips.is_empty() {
@@ -721,16 +2151,47 @@ impl Cagents {
         )
     }
 
-    fn account_chip<'a>(
-        &'a self,
-        account: &'a AccountState,
+    /// A provider's chip: its default account's figures - or, while that
+    /// account has nothing to report, the first account that does - and how
+    /// many more accounts the popover lists.
+    fn provider_chip(
+        &self,
+        provider: Provider,
         now: Millis,
         compact: bool,
-    ) -> Element<'a, Message> {
-        let summary = chip(account, now);
-        let open = self.account_ui.popover.as_ref() == Some(&account.id) && !self.modal_is_open();
-        let mut items: Vec<Element<'a, Message>> = vec![
-            widget::icon(crate::ui_controls::provider_icon(account.account.provider))
+    ) -> Option<Element<'_, Message>> {
+        let state = &self.account_ui;
+        let present: Vec<&AccountState> = state
+            .of(provider)
+            .filter(|account| account.present)
+            .collect();
+        let lead = present
+            .iter()
+            .find(|account| state.registry.is_default(&account.account))
+            .or_else(|| present.first())
+            .copied()?;
+        let others = present.len() - 1;
+        let name = if others > 0 {
+            format!("{} ({})", lead.name(), state.display_name(lead))
+        } else {
+            lead.name().to_owned()
+        };
+        let mut summary = chip(lead, &name, now);
+        if others > 0 {
+            summary.tooltip.push_str(&format!(
+                "\n{others} more {} account{}",
+                lead.name(),
+                if others == 1 { "" } else { "s" }
+            ));
+        }
+        let popover_account = state
+            .popover
+            .as_ref()
+            .and_then(|id| state.account(id))
+            .filter(|account| account.account.provider == provider);
+        let open = popover_account.is_some() && !self.modal_is_open();
+        let mut items: Vec<Element<'_, Message>> = vec![
+            widget::icon(crate::ui_controls::provider_icon(provider))
                 .size(CHIP_ICON_SIZE)
                 .into(),
         ];
@@ -756,6 +2217,13 @@ impl Cagents {
                 .into(),
             );
         }
+        if others > 0 && !compact {
+            items.push(
+                design::caption(format!("+{others}"))
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            );
+        }
         let button = widget::button::custom(
             widget::row::with_children(items)
                 .spacing(design::GRID_UNIT * 1.5)
@@ -767,25 +2235,101 @@ impl Cagents {
         .height(CHIP_HEIGHT)
         .padding(Padding::from([0.0, design::GRID_UNIT * 1.5]))
         .on_press(Message::AccountUi(Action::Popover(Some(
-            account.id.clone(),
+            popover_account.map_or_else(|| lead.id.clone(), |account| account.id.clone()),
         ))));
         let anchor =
             crate::interaction::tooltip(crate::interaction::hover(button), summary.tooltip);
-        crate::ui_controls::popover(
+        Some(crate::ui_controls::popover(
             anchor,
             open.then(|| {
-                widget::container(self.account_details(account, now, Placement::Popover))
-                    .width(POPOVER_WIDTH)
-                    .padding(design::GRID_UNIT)
-                    .into()
+                let shown = popover_account.unwrap_or(lead);
+                let mut sections = vec![self.account_details(shown, now, Placement::Popover)];
+                if others > 0 {
+                    sections.push(design::horizontal_rule());
+                    sections.push(self.account_switcher(provider, &shown.id, now));
+                }
+                widget::container(
+                    widget::column::with_children(sections).spacing(design::GRID_UNIT * 2.0),
+                )
+                .width(POPOVER_WIDTH)
+                .padding(design::GRID_UNIT)
+                .into()
             }),
             widget::popover::Position::Top,
             Message::AccountUi(Action::Popover(None)),
-        )
+        ))
     }
 
-    /// Everything known about one account: the popover's content, and one
-    /// section of the Accounts pane.
+    /// The popover's list of every account of a provider, each with what it
+    /// has left, to look at another without leaving the status bar.
+    fn account_switcher<'a>(
+        &'a self,
+        provider: Provider,
+        shown: &AccountId,
+        now: Millis,
+    ) -> Element<'a, Message> {
+        let state = &self.account_ui;
+        let rows: Vec<Element<'a, Message>> = state
+            .of(provider)
+            .filter(|account| account.present)
+            .map(|account| {
+                let selected = &account.id == shown;
+                let mut items: Vec<Element<'a, Message>> = Vec::new();
+                match account.headline() {
+                    Some(window) => {
+                        let stale = account
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| is_stale(snapshot, now));
+                        let tone = if stale {
+                            design::muted_color
+                        } else {
+                            design::budget_tone(window.used)
+                        };
+                        items.push(crate::ui_controls::budget_radial(window.used, tone));
+                    }
+                    None => items.push(
+                        iced::widget::Space::new()
+                            .width(design::RADIAL_GAUGE_SIZE)
+                            .height(design::RADIAL_GAUGE_SIZE)
+                            .into(),
+                    ),
+                }
+                items.push(
+                    design::body(state.display_name(account))
+                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill)
+                        .into(),
+                );
+                items.push(
+                    design::caption(chip(account, account.name(), now).text)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                        .into(),
+                );
+                widget::button::custom(
+                    widget::row::with_children(items)
+                        .spacing(design::GRID_UNIT * 2.0)
+                        .align_y(Alignment::Center),
+                )
+                .name(state.display_name(account))
+                .selected(selected)
+                .class(crate::ui_controls::control_style(selected, None))
+                .padding([design::GRID_UNIT, design::GRID_UNIT * 2.0])
+                .width(Length::Fill)
+                .on_press(Message::AccountUi(Action::ShowAccount(account.id.clone())))
+                .into()
+            })
+            .collect();
+        widget::column::with_children(rows)
+            .spacing(2)
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Everything known about one account: the popover's content.
     fn account_details<'a>(
         &'a self,
         account: &'a AccountState,
@@ -903,11 +2447,31 @@ impl Cagents {
         now: Millis,
         placement: Placement,
     ) -> Element<'a, Message> {
+        let state = &self.account_ui;
+        let mut title: Vec<Element<'a, Message>> = vec![design::heading(account.name()).into()];
+        let several = state
+            .of(account.account.provider)
+            .filter(|other| other.present)
+            .count()
+            > 1;
+        if several || !account.account.is_system() {
+            title.push(
+                design::caption(state.display_name(account))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .into(),
+            );
+        }
         let mut items: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::provider_icon(account.account.provider))
                 .size(design::ROW_ICON_SIZE)
                 .into(),
-            design::heading(account.name()).into(),
+            widget::column::with_children(title)
+                .spacing(0)
+                .width(Length::Shrink)
+                .into(),
         ];
         if let Some(plan) = account.plan() {
             items.push(design::badge(
@@ -917,23 +2481,7 @@ impl Cagents {
         }
         items.push(iced::widget::Space::new().width(Length::Fill).into());
         if account.present || account.snapshot.is_some() {
-            let refreshing = account.schedule.in_flight(now);
-            let ready = !refreshing && account.schedule.manual_ready(now);
-            let label = if refreshing {
-                "Checking…"
-            } else if ready {
-                "Check now"
-            } else {
-                "Checked moments ago"
-            };
-            items.push(
-                crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
-                    label,
-                    ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))),
-                )
-                .into(),
-            );
+            items.push(refresh_control(account, now).into());
         }
         if placement == Placement::Popover {
             items.push(
@@ -951,61 +2499,123 @@ impl Cagents {
             .into()
     }
 
-    /// The Accounts pane: every account the usage surfaces know about,
-    /// including those with nothing to report and why.
+    /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        let spacing = cosmic::theme::spacing();
-        let now = self.account_ui.now_ms;
-        let mut sections: Vec<Element<'_, Message>> = vec![
-            design::heading("Accounts").into(),
-            design::caption(
-                "Usage limits as each provider's own CLI reports them. cagents asks the CLI and never reads its credentials.",
-            )
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
-        ];
-        for account in &self.account_ui.accounts {
-            let details: Element<'_, Message> = if account.present || account.snapshot.is_some() {
-                self.account_details(account, now, Placement::Pane)
-            } else {
-                widget::column::with_children(vec![
-                    self.account_header(account, now, Placement::Pane),
-                    design::caption(format!(
-                        "{} is not set up on this computer.",
-                        account.name()
-                    ))
-                    .into(),
-                ])
-                .spacing(design::GRID_UNIT * 2.0)
-                .into()
-            };
-            sections.push(
-                widget::container(details)
-                    .padding(design::GRID_UNIT * 3.0)
-                    .width(Length::Fill)
-                    .class(design::surface(
-                        Some(design::raised),
-                        [design::RADIUS_M; 4],
-                        true,
-                    ))
-                    .into(),
-            );
-        }
-        widget::scrollable(
-            widget::container(
-                widget::column::with_children(sections)
-                    .spacing(spacing.space_s)
-                    .max_width(design::READABLE_MEASURE),
-            )
-            .padding(spacing.space_m)
-            .center_x(Length::Fill),
-        )
-        .direction(iced::widget::scrollable::Direction::Vertical(
-            design::scrollbar(),
-        ))
-        .height(Length::Fill)
-        .into()
+        table::view(self)
     }
+}
+
+/// The terminal a sign-in card runs.
+fn sign_in_terminal(state: Option<&CardState>) -> Option<TerminalId> {
+    match &state?.kind {
+        CardKind::Terminal(session) => Some(session.id),
+        _ => None,
+    }
+}
+
+/// Which of the sign-ins `watched`, each named with its terminal and the
+/// daemon session that terminal was hosted in, have ended by the daemon's
+/// account. A terminal the daemon hosts says so itself. One it does not
+/// has ended only if the daemon is still that session: a daemon started
+/// since may not have restored it yet.
+fn ended_on_host(
+    watched: &[(uuid::Uuid, TerminalId, HostSessionProof)],
+) -> Result<Vec<(uuid::Uuid, TerminalId)>, String> {
+    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+    let hosted = client.list().map_err(|error| error.to_string())?;
+    let session = client.proof().clone();
+    Ok(watched
+        .iter()
+        .filter(|(_, terminal, proof)| {
+            match hosted
+                .iter()
+                .find(|descriptor| descriptor.session.id == *terminal)
+            {
+                Some(descriptor) => terminal_ended(&descriptor.session),
+                None => session == *proof,
+            }
+        })
+        .map(|(key, terminal, _)| (*key, *terminal))
+        .collect())
+}
+
+/// Closes the hosted `terminal` for good. A daemon that restored it under
+/// a session of its own is asked again with that session, so a close is
+/// only reported done once the terminal has ended or is gone.
+fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), String> {
+    use super::terminal_close::{CloseOutcome, close_hosted_terminal};
+    let outcome = match close_hosted_terminal(terminal, proof, true) {
+        CloseOutcome::Stale => {
+            let path =
+                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+            let mut client =
+                crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            let hosted = client.list().map_err(|error| error.to_string())?;
+            match hosted
+                .iter()
+                .find(|descriptor| descriptor.session.id == terminal)
+            {
+                None => return Ok(()),
+                Some(descriptor) if terminal_ended(&descriptor.session) => return Ok(()),
+                Some(descriptor) => match descriptor.session.continuity.live_proof() {
+                    Some(current) if current != *proof => {
+                        close_hosted_terminal(terminal, &current, true)
+                    }
+                    _ => CloseOutcome::Stale,
+                },
+            }
+        }
+        outcome => outcome,
+    };
+    match outcome {
+        CloseOutcome::Closed => Ok(()),
+        CloseOutcome::Active | CloseOutcome::Stale => {
+            Err("its terminal is still running and could not be closed".to_owned())
+        }
+        CloseOutcome::Unreachable(error) => Err(error),
+    }
+}
+
+/// Forgets the pending sign-in `key`, returning the registry as it now
+/// stands where there is one on disk.
+fn abandon(store: Option<&Store>, key: uuid::Uuid) -> Result<Option<Registry>, String> {
+    store
+        .map(|store| {
+            store
+                .update(|registry| registry.abandon(key))
+                .map(|(registry, ())| registry)
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Popover,
+}
+
+/// The control that asks an account's CLI again, which says why it cannot
+/// while it cannot.
+fn refresh_control<'a>(
+    account: &AccountState,
+    now: Millis,
+) -> crate::ui_controls::IconControl<'a, Message> {
+    let refreshing = account.schedule.in_flight(now) || account.queued.is_some();
+    let ready = !refreshing && account.schedule.manual_ready(now);
+    let label = if refreshing {
+        "Checking…"
+    } else if ready {
+        "Check now"
+    } else {
+        "Checked moments ago"
+    };
+    crate::ui_controls::compact_icon_control(
+        crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+        label,
+        ready.then(|| Message::AccountUi(Action::Refresh(account.id.clone()))),
+    )
 }
 
 fn identity_line(identity: &Identity) -> Option<String> {
@@ -1045,6 +2655,39 @@ fn usage_window_row<'a>(window: &'a UsageWindow, now: Millis, stale: bool) -> El
 }
 
 #[cfg(test)]
+impl State {
+    /// Registers a managed account under a fixture root, as a finished
+    /// sign-in would, and returns its id.
+    pub(super) fn add_managed_fixture(&mut self, provider: Provider, key: u128) -> AccountId {
+        let homes = self
+            .homes
+            .get_or_insert_with(|| Homes::at("/cagents-fixture/accounts"))
+            .clone();
+        let key = uuid::Uuid::from_u128(key);
+        let mut registry = self.registry.clone();
+        registry
+            .register(
+                registry::Managed {
+                    key,
+                    provider,
+                    label: None,
+                    email: Some(format!("{key}@example.com")),
+                    organization: None,
+                    added_at: 0,
+                },
+                &[],
+            )
+            .expect("a fixture account is new");
+        self.set_registry(registry);
+        let id = Account::managed(provider, key, homes.path(provider, key)).id();
+        if let Some(state) = self.account_mut(&id) {
+            state.present = true;
+        }
+        id
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::WindowKind;
@@ -1052,7 +2695,7 @@ mod tests {
     const NOW: Millis = 1_790_000_000_000;
 
     fn state_with(snapshot: Option<UsageSnapshot>) -> AccountState {
-        let mut state = AccountState::new(Account::system(crate::agent::Provider::Claude));
+        let mut state = AccountState::new(Account::system(Provider::Claude));
         state.present = true;
         state.snapshot = snapshot;
         state
@@ -1093,12 +2736,17 @@ mod tests {
         let reset = unix_seconds(NOW) + 2 * 3_600 + 14 * 60;
         let chip = chip(
             &state_with(Some(snapshot(vec![window(0.38, Some(reset))], NOW))),
+            "Claude",
             NOW,
         );
         assert_eq!(chip.text, "62% left · 2h 14m");
         assert_eq!(chip.gauge, Some(0.38));
         assert_eq!(chip.tone, ChipTone::Current);
         assert!(chip.tooltip.contains("Session: 62% left"));
+        assert_eq!(
+            reset_countdown(&window(0.38, Some(reset)), NOW).as_deref(),
+            Some("2h 14m")
+        );
     }
 
     /// Claude marks one model's exhausted weekly allowance as the binding
@@ -1118,7 +2766,7 @@ mod tests {
             vec![window(0.43, None), weekly, scoped],
             NOW,
         )));
-        let chip = chip(&state, NOW);
+        let chip = chip(&state, "Claude", NOW);
         assert_eq!(chip.text, "5% left");
         assert!(
             chip.tooltip.contains("Weekly · Fable: 0% left"),
@@ -1132,6 +2780,7 @@ mod tests {
         let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
         let old = chip(
             &state_with(Some(snapshot(vec![window(0.5, None)], observed))),
+            "Claude",
             NOW,
         );
         assert_eq!(old.tone, ChipTone::Stale);
@@ -1141,7 +2790,7 @@ mod tests {
         let before_reset = snapshot(vec![window(0.9, Some(reset))], NOW - 5 * 60_000);
         assert!(reset_since(&before_reset, NOW));
         assert_eq!(
-            chip(&state_with(Some(before_reset)), NOW).tone,
+            chip(&state_with(Some(before_reset)), "Claude", NOW).tone,
             ChipTone::Stale
         );
     }
@@ -1149,44 +2798,57 @@ mod tests {
     #[test]
     fn a_signed_out_account_asks_for_a_sign_in_and_an_unanswered_one_says_so() {
         let signed_out = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW);
-        let chip_for_login = chip(&state_with(Some(signed_out)), NOW);
+        let chip_for_login = chip(&state_with(Some(signed_out)), "Claude", NOW);
         assert_eq!(chip_for_login.text, "Sign in");
         assert_eq!(chip_for_login.tone, ChipTone::Attention);
         assert!(chip_for_login.essential);
 
-        assert_eq!(chip(&state_with(None), NOW).text, "Checking…");
+        assert_eq!(chip(&state_with(None), "Claude", NOW).text, "Checking…");
         let mut failed = state_with(None);
         failed.failure = Some("Claude Code did not answer".into());
-        assert_eq!(chip(&failed, NOW).text, "Unavailable");
+        assert_eq!(chip(&failed, "Claude", NOW).text, "Unavailable");
     }
 
     #[test]
     fn a_login_terminal_runs_the_probed_cli_at_home_and_is_not_an_agent() {
         let launch = login_launch(
-            &Account::system(crate::agent::Provider::Claude),
+            &Account::system(Provider::Claude),
             Path::new("/opt/bin/claude"),
             PathBuf::from("/home/reader"),
+            false,
         )
         .expect("Claude has a login command");
         assert_eq!(launch.program, "/opt/bin/claude");
-        assert_eq!(launch.arguments, ["auth", "login"]);
+        assert_eq!(launch.arguments, ["auth", "login", "--claudeai"]);
         assert_eq!(launch.working_directory, Path::new("/home/reader"));
         assert!(launch.environment.is_empty());
-        assert_eq!(crate::agent::Provider::recognize_launch(&launch), None);
-
-        let managed = Account {
-            provider: crate::agent::Provider::Codex,
-            home: account::AccountHome::Managed(PathBuf::from("/accounts/work")),
-        };
-        let launch = login_launch(&managed, Path::new("/usr/bin/codex"), PathBuf::from("/h"))
-            .expect("Codex logs in");
-        assert_eq!(launch.arguments, ["login"]);
-        assert_eq!(crate::agent::Provider::recognize_launch(&launch), None);
-        assert_eq!(
-            launch.environment.get("CODEX_HOME").map(String::as_str),
-            Some("/accounts/work")
-        );
+        assert_eq!(Provider::recognize_launch(&launch), None);
         assert!(is_sign_in(&launch));
+
+        let managed = Account::managed(
+            Provider::Codex,
+            uuid::Uuid::from_u128(1),
+            PathBuf::from("/accounts/work"),
+        );
+        for (device, arguments) in [
+            (false, &["login"][..]),
+            (true, &["login", "--device-auth"][..]),
+        ] {
+            let launch = login_launch(
+                &managed,
+                Path::new("/usr/bin/codex"),
+                PathBuf::from("/h"),
+                device,
+            )
+            .expect("Codex logs in");
+            assert_eq!(launch.arguments, arguments);
+            assert_eq!(Provider::recognize_launch(&launch), None);
+            assert_eq!(
+                launch.environment.get("CODEX_HOME").map(String::as_str),
+                Some("/accounts/work")
+            );
+            assert!(is_sign_in(&launch));
+        }
     }
 
     #[test]
@@ -1201,11 +2863,51 @@ mod tests {
             environment: BTreeMap::new(),
         };
         assert!(is_sign_in(&recipe("/opt/bin/claude", &["auth", "login"])));
+        assert!(is_sign_in(&recipe(
+            "claude",
+            &["auth", "login", "--claudeai"]
+        )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
+        assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));
+        assert!(!is_sign_in(&recipe(
+            "claude",
+            &["auth", "login", "--console"]
+        )));
         assert!(!is_sign_in(&recipe("codex", &["login", "--api-key"])));
         assert!(!is_sign_in(&recipe("/bin/fish", &["login"])));
+    }
+
+    #[test]
+    fn a_conversation_runs_on_the_account_its_recipe_points_at() {
+        let mut state = State::default();
+        let managed = state.add_managed_fixture(Provider::Claude, 5);
+        let home = state
+            .account(&managed)
+            .unwrap()
+            .account
+            .resolved_home()
+            .unwrap();
+        let mut recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        let found = |recipe: &LaunchRecipe| {
+            account_of_recipe(&state.accounts, Provider::Claude, recipe)
+                .map(|state| state.id.clone())
+        };
+        assert_eq!(found(&recipe), Some(Account::system(Provider::Claude).id()));
+        recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), home.display().to_string());
+        assert_eq!(found(&recipe), Some(managed));
+        recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/somewhere/else".into());
+        assert_eq!(found(&recipe), None);
     }
 }
 
@@ -1226,6 +2928,232 @@ mod app_tests {
     }
 
     const NOW: Millis = 1_790_000_000_000;
+
+    fn escape() -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    /// An app with one worktree, `/repo`, on screen.
+    fn app_in_repo() -> Cagents {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            crate::model::ProjectId::new(),
+            crate::repository::RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                "/repo".into(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.known_worktree_roots = [PathBuf::from("/repo")].into_iter().collect();
+        let _ = app.select_worktree("/repo".into(), false);
+        app
+    }
+
+    /// Opens a Claude sign-in terminal and returns its card and terminal.
+    fn open_sign_in(app: &mut Cagents) -> (CardId, TerminalId) {
+        let launch = login_launch(
+            &Account::system(Provider::Claude),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .expect("Claude has a login command");
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(
+                |card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal),
+            )
+            .map(|card| card.id)
+            .expect("the login opens a card");
+        (card, terminal)
+    }
+
+    #[test]
+    fn a_sign_in_stays_in_the_strip_it_was_opened_from() {
+        let mut app = app_in_repo();
+        let (card, _) = open_sign_in(&mut app);
+        assert!(app.workspace.order().any(|id| id == card));
+
+        // Rebuilding the scope re-derives every card's worktree; the login's
+        // home directory belongs to none, so only its filing keeps it here.
+        let _ = app.select_worktree("/repo".into(), false);
+        assert!(
+            app.workspace.order().any(|id| id == card),
+            "the sign-in left the strip it was started from"
+        );
+    }
+
+    #[test]
+    fn a_sign_in_off_the_strip_is_settled_on_the_daemons_word() {
+        let mut app = app_in_repo();
+        let key = uuid::Uuid::from_u128(21);
+        let home = PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string());
+        let launch = login_launch(
+            &Account::managed(Provider::Claude, key, home.clone()),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .expect("Claude has a login command");
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(
+                |card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal),
+            )
+            .map(|card| card.id)
+            .expect("the login opens a card");
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        let phase = |app: &Cagents| app.account_ui.logins.first().map(|login| login.phase);
+
+        // Until the daemon has taken the terminal on it has nothing to say,
+        // and a card that has not started has not ended either.
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        assert_eq!(phase(&app), Some(LoginPhase::Waiting));
+        assert!(!app.account_ui.asking_host);
+
+        if let Some(CardState {
+            kind: CardKind::Terminal(session),
+            ..
+        }) = app.card_state_mut(card)
+        {
+            session.continuity = TerminalContinuity::DetachedSameBoot {
+                host_session_id: crate::model::HostSessionId::new("host"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+            };
+        }
+        let _ = app.select_worktree("/elsewhere".into(), false);
+        assert!(!app.workspace.order().any(|id| id == card));
+
+        // The hidden card goes on showing a running terminal whatever
+        // happens to it, so the daemon is asked instead.
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        assert!(app.account_ui.asking_host);
+        assert_eq!(phase(&app), Some(LoginPhase::Waiting));
+        // An answer about a terminal the sign-in no longer runs is not one
+        // about this sign-in.
+        let _ = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![(
+            key,
+            TerminalId::new(),
+        )]))));
+        assert!(!app.account_ui.asking_host);
+        assert_eq!(phase(&app), Some(LoginPhase::Waiting));
+        let _ = app.update(Message::AccountUi(Action::LoginsEnded(Ok(vec![(
+            key, terminal,
+        )]))));
+        assert_eq!(phase(&app), Some(LoginPhase::Verifying));
+
+        // Settling closes the terminal through the daemon, which no strip
+        // on screen can do, and only a close the daemon confirmed retires
+        // the card.
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Abandoned(None)),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert!(
+            app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        let _ = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            result: Err("unreachable".into()),
+        }));
+        assert!(
+            app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        let _ = app.update(Message::AccountUi(Action::OffstripClosed {
+            card,
+            result: Ok(()),
+        }));
+        assert!(
+            app.card_state(card)
+                .is_none_or(|state| !state.existence.is_open()),
+            "the settled sign-in's card was left open"
+        );
+        assert!(!app.durable.card_scopes.contains_key(&card));
+    }
+
+    #[test]
+    fn cancelling_a_sign_in_off_the_strip_that_never_started_retires_it() {
+        let mut app = app_in_repo();
+        let key = uuid::Uuid::from_u128(22);
+        let home = PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string());
+        let launch = login_launch(
+            &Account::managed(Provider::Claude, key, home.clone()),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/home/reader"),
+            false,
+        )
+        .expect("Claude has a login command");
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(
+                |card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal),
+            )
+            .map(|card| card.id)
+            .expect("the login opens a card");
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home,
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        let _ = app.select_worktree("/elsewhere".into(), false);
+        assert!(!app.workspace.order().any(|id| id == card));
+
+        // No daemon ever hosted it, so nothing needs stopping: the card is
+        // retired at once and the sign-in, left without one, is settled.
+        let _ = app.update(Message::AccountUi(Action::CancelLogin(key)));
+        assert!(
+            app.card_state(card)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        assert_eq!(
+            app.account_ui.logins.first().map(|login| login.phase),
+            Some(LoginPhase::Verifying)
+        );
+    }
 
     #[test]
     fn the_status_bar_follows_its_setting_and_hiding_it_closes_the_popover() {
@@ -1252,22 +3180,24 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Popover(Some(id.clone()))));
         assert_eq!(app.account_ui.popover, None);
         let _ = app.update(Message::AccountUi(Action::Popover(Some(id))));
-        let escape = keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::Escape),
-            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        };
         // Captured by a focused terminal or not, Escape reaches the popover.
         let _ = app.update(Message::KeyEvent {
-            event: escape.clone(),
+            event: escape(),
             captured: true,
         });
         assert_eq!(app.account_ui.popover, None);
-        assert!(app.account_key_event(&escape).is_none());
+        assert!(app.account_key_event(&escape()).is_none());
+    }
+
+    #[test]
+    fn the_popover_shows_another_account_of_the_same_provider() {
+        let mut app = context_inspector_test_app(false);
+        let system = signed_out(&mut app);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 3);
+        let _ = app.update(Message::AccountUi(Action::Popover(Some(system))));
+        let _ = app.update(Message::AccountUi(Action::ShowAccount(managed.clone())));
+        assert_eq!(app.account_ui.popover.as_ref(), Some(&managed));
+        assert!(app.status_bar().is_some());
     }
 
     #[test]
@@ -1291,6 +3221,8 @@ mod app_tests {
                 .count(),
             1
         );
+        // The pane renders at any width without panicking.
+        let _ = app.accounts_pane();
     }
 
     #[test]
@@ -1345,5 +3277,290 @@ mod app_tests {
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         assert_eq!(state.identity, None);
         assert!(!state.schedule.in_flight(NOW));
+    }
+
+    #[test]
+    fn the_default_account_is_chosen_renamed_and_offered_to_new_conversations() {
+        let mut app = context_inspector_test_app(false);
+        let system = Account::system(Provider::Codex);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 8);
+        assert_eq!(app.default_account(Provider::Codex), system);
+        let _ = app.update(Message::AccountUi(Action::SetDefault(managed.clone())));
+        assert_eq!(app.default_account(Provider::Codex).id(), managed);
+        let choices = app.default_account_choices();
+        let codex = &choices
+            .iter()
+            .find(|(p, _)| *p == Provider::Codex)
+            .unwrap()
+            .1;
+        assert!(
+            codex
+                .iter()
+                .any(|choice| choice.id == managed && choice.selected)
+        );
+
+        let _ = app.update(Message::AccountUi(Action::Rename(managed.clone())));
+        let _ = app.update(Message::AccountUi(Action::RenameInput("  Work\n".into())));
+        let _ = app.update(Message::AccountUi(Action::RenameCommit));
+        let state = app.account_ui.account(&managed).unwrap();
+        assert_eq!(app.account_ui.display_name(state), "Work");
+
+        let recipe = LaunchRecipe {
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        let accounts = app
+            .chat_accounts(Provider::Codex, &recipe)
+            .expect("two accounts are a choice");
+        assert_eq!(accounts.choices.len(), 2);
+        assert!(accounts.choices.iter().any(|choice| choice.label == "Work"));
+        assert!(
+            app.chat_accounts(
+                Provider::Claude,
+                &LaunchRecipe {
+                    program: "claude".into(),
+                    ..recipe
+                }
+            )
+            .is_none(),
+            "one system account is nothing to choose"
+        );
+    }
+
+    #[test]
+    fn only_a_managed_account_can_be_removed_and_only_after_confirming() {
+        let mut app = context_inspector_test_app(false);
+        let system = signed_out(&mut app);
+        let _ = app.update(Message::AccountUi(Action::Remove(system)));
+        assert_eq!(app.account_ui.table.confirm_remove, None);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 4);
+        let _ = app.update(Message::AccountUi(Action::Remove(managed.clone())));
+        assert_eq!(app.account_ui.table.confirm_remove.as_ref(), Some(&managed));
+        let _ = app.update(Message::AccountUi(Action::RemoveConfirm(managed.clone())));
+        assert!(app.account_ui.removing.contains(&managed));
+        let mut remaining = app.account_ui.registry.clone();
+        remaining.unregister(uuid::Uuid::from_u128(4));
+        // Its files could not all be deleted, but it is forgotten: the
+        // table follows the registry, and the reader hears about the rest.
+        let _ = app.update(Message::AccountUi(Action::Removed {
+            id: managed.clone(),
+            registry: Some(remaining),
+            error: Some("its files could not be deleted: busy".into()),
+        }));
+        assert!(app.account_ui.account(&managed).is_none());
+        assert!(app.account_ui.removing.is_empty());
+        assert!(app.notices.entries.iter().any(|entry| {
+            entry
+                .notice
+                .message
+                .contains("could not be removed completely")
+        }));
+    }
+
+    #[test]
+    fn removing_an_account_counts_the_cards_open_on_it() {
+        let mut app = context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 5);
+        let home = app
+            .account_ui
+            .account(&managed)
+            .and_then(|state| state.account.resolved_home())
+            .expect("a managed account has a home");
+        let launch = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::from([(
+                account::home_variable(Provider::Claude).unwrap().to_owned(),
+                home.display().to_string(),
+            )]),
+        };
+        let _ = app.insert_terminal_card(fresh_terminal_session(launch), None);
+        let _ = app.update(Message::AccountUi(Action::Remove(managed.clone())));
+        assert_eq!(app.account_ui.table.confirm_in_use, 1);
+    }
+
+    #[test]
+    fn only_a_provider_with_accounts_offers_a_choice_of_them() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.add_managed_fixture(Provider::Claude, 6);
+        let recipe = LaunchRecipe {
+            program: "omp".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/w"),
+            environment: BTreeMap::new(),
+        };
+        assert!(app.chat_accounts(Provider::Omp, &recipe).is_none());
+        assert!(app.chat_accounts(Provider::Claude, &recipe).is_some());
+    }
+
+    fn pending_login(app: &mut Cagents, key: u128) -> uuid::Uuid {
+        let key = uuid::Uuid::from_u128(key);
+        app.account_ui.logins.push(Login {
+            provider: Provider::Claude,
+            key,
+            home: PathBuf::from("/cagents-fixture/accounts/claude").join(key.to_string()),
+            phase: LoginPhase::Waiting,
+            attempts: 0,
+            next_check: 0,
+            started_at: now_ms(),
+            recovered: false,
+        });
+        key
+    }
+
+    #[test]
+    fn a_sign_in_that_cannot_be_confirmed_is_retried_then_left_pending() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 14);
+        for attempt in 1..=LOGIN_ATTEMPTS {
+            app.account_ui.logins[0].next_check = 0;
+            let _ = app.update(Message::AccountUi(Action::LoginTick));
+            assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+            assert_eq!(app.account_ui.logins[0].attempts, attempt);
+            let _ = app.update(Message::AccountUi(Action::LoginVerified {
+                key,
+                outcome: Outcome::Failed("not now".into()),
+            }));
+            if attempt < LOGIN_ATTEMPTS {
+                let login = &app.account_ui.logins[0];
+                assert_eq!(login.phase, LoginPhase::Waiting);
+                assert!(login.next_check > now_ms(), "it waits before asking again");
+            }
+        }
+        // Never discarded: its home may hold a login that simply could not
+        // be confirmed, and the next start asks again.
+        assert!(app.account_ui.logins.is_empty());
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("check again"))
+        );
+    }
+
+    #[test]
+    fn sign_ins_left_pending_are_taken_up_only_when_no_window_can_still_run_them() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let now = now_ms();
+        let (young, old) = (uuid::Uuid::from_u128(21), uuid::Uuid::from_u128(22));
+        let mut registry = app.account_ui.registry.clone();
+        registry.begin(Provider::Codex, young, now - 60_000);
+        registry.begin(Provider::Claude, old, now - 2 * RECOVER_AFTER);
+        app.account_ui.set_registry(registry);
+        app.recover_logins();
+        let keys: Vec<_> = app
+            .account_ui
+            .logins
+            .iter()
+            .map(|login| login.key)
+            .collect();
+        assert_eq!(keys, [old], "a recent sign-in may be another window's");
+        assert!(app.account_ui.logins[0].recovered);
+
+        // Signed out, but younger than a sign-in can last: left alone.
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        let _ = app.update(Message::AccountUi(Action::LoginVerified {
+            key: old,
+            outcome: Outcome::Answered {
+                identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
+            },
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert_eq!(app.account_ui.registry.pending().len(), 2);
+    }
+
+    #[test]
+    fn a_sign_in_whose_terminal_is_gone_is_verified_and_a_failed_one_forgotten() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 11);
+        // No card shows the login's terminal: it was closed.
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Verifying);
+        let _ = app.update(Message::AccountUi(Action::LoginVerified {
+            key,
+            outcome: Outcome::Answered {
+                identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW),
+            },
+        }));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::Settling);
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Abandoned(None)),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert!(app.account_ui.registry.managed().is_empty());
+    }
+
+    #[test]
+    fn a_verified_sign_in_joins_the_accounts_with_its_figures() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 12);
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .register(
+                registry::Managed {
+                    key,
+                    provider: Provider::Claude,
+                    label: None,
+                    email: Some("new@example.com".into()),
+                    organization: None,
+                    added_at: NOW,
+                },
+                &[],
+            )
+            .unwrap();
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let identity = Identity {
+            email: Some("new@example.com".into()),
+            organization: None,
+            plan: Some("max".into()),
+        };
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Registered {
+                registry,
+                identity: Some(identity.clone()),
+                snapshot: Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW)),
+            }),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        let state = app
+            .account_ui
+            .accounts
+            .iter()
+            .find(|state| state.account.managed_key() == Some(key))
+            .expect("the account is listed");
+        assert!(state.present);
+        assert_eq!(state.identity.as_ref(), Some(&identity));
+        assert_eq!(app.account_ui.display_name(state), "new@example.com");
+    }
+
+    #[test]
+    fn a_duplicate_sign_in_is_reported_and_not_listed() {
+        let mut app = context_inspector_test_app(false);
+        let system = signed_out(&mut app);
+        let key = pending_login(&mut app, 13);
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Duplicate {
+                existing: system,
+                registry: None,
+            }),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        assert!(app.account_ui.registry.managed().is_empty());
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("already added")),
+            "the reader is told which account it duplicates"
+        );
     }
 }

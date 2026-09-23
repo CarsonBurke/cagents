@@ -711,27 +711,9 @@ fn start(
         }
     }
     // All adapter validation happens before a source terminal can be changed.
-    let owned_socket = std::env::temp_dir()
-        .join(format!("cagents-codex-{}", session.id))
-        .join("control.sock");
-    let owned_remote = format!("unix://{}", owned_socket.display());
-    let owned = source.is_none()
-        && session.launch.provider == Provider::Codex
-        && session.launch.recipe.arguments.windows(2).any(|pair| {
-            pair[0] == "--remote"
-                && (pair[1] == owned_remote
-                    || (pair[1] == "unix://" && session.launch.session_id.is_none()))
-        });
+    let owned_socket = session.owned_codex_socket();
+    let owned = source.is_none() && session.claim_owned_codex_listener();
     if owned {
-        if let Some(index) = session
-            .launch
-            .recipe
-            .arguments
-            .iter()
-            .position(|argument| argument == "--remote")
-        {
-            session.launch.recipe.arguments[index + 1] = owned_remote.clone();
-        }
         // An unclean daemon exit can leave the owned socket inode behind.
         // Only remove a refused socket inside our private, user-owned directory;
         // a live listener is reused and an arbitrary endpoint is never touched.

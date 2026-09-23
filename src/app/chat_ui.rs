@@ -1,5 +1,7 @@
 use super::*;
+use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
+use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot, clock_label};
 use crate::file_drop;
@@ -98,6 +100,11 @@ pub enum ReturnRefused {
 pub enum Action {
     ToolText(Target, String, CopyPart, text_editor::Action),
     ChooseProvider(Target, Provider),
+    /// Restarts a conversation that has not begun on another account of its
+    /// provider.
+    ChooseAccount(Target, AccountId),
+    /// Opens or closes the account choice.
+    AccountPicker(Target, bool),
     ChooseFreshProvider(CardId, Provider),
     Switch(CardId),
     Ready(Target, Ready),
@@ -182,13 +189,16 @@ impl Action {
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
                 | Self::Retired(..)
+                | Self::AccountPicker(_, false)
         )
     }
 
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::ChooseProvider(target, _) | Self::Reconnect(target) => Some(target.card),
+            Self::ChooseProvider(target, _)
+            | Self::ChooseAccount(target, _)
+            | Self::Reconnect(target) => Some(target.card),
             Self::ChooseFreshProvider(card, _) | Self::Switch(card) | Self::StartFresh(card) => {
                 Some(*card)
             }
@@ -200,6 +210,8 @@ impl Action {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
             Self::ChooseProvider(target, _)
+            | Self::ChooseAccount(target, _)
+            | Self::AccountPicker(target, _)
             | Self::Reconnect(target)
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
@@ -1080,6 +1092,8 @@ pub(super) struct Runtime {
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
+    /// Whether the account choice is open.
+    account_picker: bool,
     permission_mode: Option<String>,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
@@ -1250,6 +1264,7 @@ impl Runtime {
             error: None,
             failures: Vec::new(),
             reasoning_picker: false,
+            account_picker: false,
             permission_mode: None,
             history: Vec::new(),
             history_cursor: None,
@@ -1655,10 +1670,19 @@ fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> 
         .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())
 }
 
+/// A new conversation for `provider` on `account`.
+///
+/// A managed account is chosen by pointing the provider's CLI at its home
+/// through the recipe's environment, which the daemon lays over its own and
+/// which travels with the conversation: resuming or recovering it later
+/// starts the CLI on the same home, never on whatever the default has become
+/// since. The system account sets nothing, so the CLI resolves its home as it
+/// would in the reader's shell.
 fn fresh_chat_session(
     provider: Provider,
     id: TerminalId,
     working_directory: PathBuf,
+    account: &Account,
 ) -> Result<chat::Session, String> {
     let mut recipe = LaunchRecipe {
         program: provider.executable().into(),
@@ -1666,6 +1690,15 @@ fn fresh_chat_session(
         working_directory,
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
+    if account.provider == provider
+        && let Some((variable, home)) = account.probe_environment()
+    {
+        let home = home
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
+        recipe.environment.insert(variable.to_owned(), home);
+    }
     match provider {
         // A shared listener lets CLI and native views use the same thread.
         Provider::Codex => recipe
@@ -1724,18 +1757,65 @@ impl Cagents {
         })
     }
     fn choose_chat_provider(&mut self, target: Target, provider: Provider) -> Task<Message> {
+        let account = self.default_account(provider);
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        if !runtime.can_choose_provider()
-            || (runtime.session.launch.provider == provider && !runtime.provider_closed)
+        if runtime.session.launch.provider == provider && !runtime.provider_closed {
+            return Task::none();
+        }
+        self.restart_fresh_chat(target, provider, &account, false)
+    }
+
+    /// Moves a conversation that has not begun to account `id` of its own
+    /// provider.
+    fn choose_chat_account(&mut self, target: Target, id: AccountId) -> Task<Message> {
+        let Some(account) = self.known_account(&id) else {
+            return Task::none();
+        };
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.account_picker = false;
+        let provider = runtime.session.launch.provider;
+        let closed = runtime.provider_closed;
+        let recipe = runtime.session.launch.recipe.clone();
+        if account.provider != provider
+            || (!closed && self.chat_account(provider, &recipe).as_ref() == Some(&id))
         {
+            return Task::none();
+        }
+        // A new terminal id, because the provider's owned resources are
+        // keyed by it: a Codex app-server socket that is still listening
+        // under the old id would carry the conversation on the old account.
+        self.restart_fresh_chat(target, provider, &account, true)
+    }
+
+    /// Replaces a conversation that has not begun with a new one for
+    /// `provider` on `account`, in the same card. `renew` gives it a new
+    /// terminal id rather than the one it had.
+    fn restart_fresh_chat(
+        &mut self,
+        target: Target,
+        provider: Provider,
+        account: &Account,
+        renew: bool,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.can_choose_provider() {
             return Task::none();
         }
         let session = match fresh_chat_session(
             provider,
-            runtime.session.id,
+            if renew {
+                TerminalId::new()
+            } else {
+                runtime.session.id
+            },
             runtime.session.launch.recipe.working_directory.clone(),
+            account,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -1745,9 +1825,10 @@ impl Cagents {
         };
         let handle = runtime.handle.clone();
         runtime.model_picker = None;
+        runtime.account_picker = false;
         if runtime.provider_closed {
             runtime.session = session.clone();
-            self.commit_chat_session(target.card, session.clone());
+            self.replace_chat_conversation(target.card, session.clone());
             return self.start_chat(target.card, session, chat::Intent::Start, None, false);
         }
         self.chat_ui.closing.insert(target);
@@ -1830,8 +1911,11 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return false;
         };
-        let open = runtime.model_picker.take().is_some() || runtime.reasoning_picker;
+        let open = runtime.model_picker.take().is_some()
+            || runtime.reasoning_picker
+            || runtime.account_picker;
         runtime.reasoning_picker = false;
+        runtime.account_picker = false;
         open
     }
     /// Opens a new native conversation in a new card.
@@ -1851,14 +1935,19 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&working_directory) {
             return Task::none();
         }
-        let session =
-            match fresh_chat_session(provider, TerminalId::new(), working_directory.clone()) {
-                Ok(session) => session,
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(error));
-                    return Task::none();
-                }
-            };
+        let account = self.default_account(provider);
+        let session = match fresh_chat_session(
+            provider,
+            TerminalId::new(),
+            working_directory.clone(),
+            &account,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error));
+                return Task::none();
+            }
+        };
         let card_id = CardId::new();
         self.chat_ui.fresh_threads.insert(card_id);
         let card = CardState {
@@ -2486,6 +2575,16 @@ impl Cagents {
             Action::ChooseProvider(target, provider) => {
                 return self.choose_chat_provider(target, provider);
             }
+            Action::ChooseAccount(target, id) => {
+                return self.choose_chat_account(target, id);
+            }
+            Action::AccountPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.account_picker = open && runtime.can_choose_provider();
+                    runtime.model_picker = None;
+                    runtime.reasoning_picker = false;
+                }
+            }
             Action::ChooseFreshProvider(card, provider) => {
                 if !self.can_choose_failed_chat_provider(card) {
                     return Task::none();
@@ -2498,6 +2597,7 @@ impl Cagents {
                     provider,
                     previous.id,
                     previous.launch.recipe.working_directory.clone(),
+                    &self.default_account(provider),
                 ) {
                     Ok(session) => session,
                     Err(error) => {
@@ -2505,7 +2605,7 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                self.commit_chat_session(card, session.clone());
+                self.replace_chat_conversation(card, session.clone());
                 self.cards.insert(card, CardRuntime::Loading);
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
@@ -2977,7 +3077,12 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                if self.chat_start_pending(card) || self.chat_ui.closed.contains(&card) {
+                // Dropping the saved conversation is what this does, and storage
+                // takes it as given, so it acts only while the card still
+                // offers it: a late or repeated press after the conversation
+                // recovered must not discard it.
+                if !self.chat_offers_fresh_conversation(card) || self.chat_ui.closed.contains(&card)
+                {
                     return Task::none();
                 }
                 // The new conversation runs the saved launch verbatim - same
@@ -3006,6 +3111,7 @@ impl Cagents {
                         Message::ChatUi(Action::CloseFinished(target, result))
                     });
                 }
+                self.replace_chat_conversation(card, session.clone());
                 self.cards.insert(card, CardRuntime::Loading);
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
@@ -3616,12 +3722,18 @@ impl Cagents {
                     // Only the conversation is being given up here; the card
                     // stays and immediately starts its replacement, so it is
                     // never left showing a conversation that no longer exists.
-                    let changing_provider = self.chat_runtime_mut(target).is_some_and(|runtime| {
-                        if runtime.session.launch.provider == session.launch.provider {
+                    // A move to another provider or account starts a
+                    // different conversation (another account renews the
+                    // terminal id); a restart of the same one does not.
+                    let moving = self.chat_runtime_mut(target).is_some_and(|runtime| {
+                        if runtime.session.launch.provider == session.launch.provider
+                            && runtime.session.id == session.id
+                        {
                             return false;
                         }
                         // Keep the draft, attachments, and composer selection in
-                        // this card while its empty connection changes accounts.
+                        // this card while its empty connection changes provider
+                        // or account.
                         runtime.session = session.clone();
                         runtime.disconnected = true;
                         runtime.provider_closed = true;
@@ -3633,11 +3745,11 @@ impl Cagents {
                         runtime.permission_mode = None;
                         true
                     });
-                    if !changing_provider {
+                    if !moving {
                         self.chat_forget(target.card);
                         self.cards.insert(target.card, CardRuntime::Loading);
                     }
-                    self.commit_chat_session(target.card, session.clone());
+                    self.replace_chat_conversation(target.card, session.clone());
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
             }
@@ -3679,6 +3791,7 @@ impl Cagents {
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(String::new);
                 runtime.reasoning_picker = false;
+                runtime.account_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -3700,6 +3813,7 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.reasoning_picker = open;
                     runtime.model_picker = None;
+                    runtime.account_picker = false;
                 }
             }
         }
@@ -3899,7 +4013,10 @@ mod tests {
     }
 
     fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
-        let session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        let mut session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        // The daemon starts a new Codex thread on a listener of its own and
+        // hands the thread back naming it.
+        session.claim_owned_codex_listener();
         Arc::new(ClientHandle::fixture(
             session,
             Snapshot {
@@ -4079,6 +4196,214 @@ mod tests {
         retired(&mut app, card);
     }
 
+    /// A new conversation starts on its provider's default account, and one
+    /// that has not begun moves to another account by restarting on that
+    /// account's home - which its recipe, and so every later resume, keeps.
+    #[test]
+    fn a_new_chat_runs_on_the_chosen_account_through_its_recipe() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 21);
+        let home = app
+            .known_account(&managed)
+            .and_then(|account| account.resolved_home())
+            .unwrap()
+            .display()
+            .to_string();
+
+        let card = live_chat(&mut app, None);
+        let dropped = Attachment {
+            path: PathBuf::from("/tmp/dropped.png"),
+        };
+        let target = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.attachments.push(dropped.clone());
+                runtime.target
+            }
+            _ => unreachable!(),
+        };
+        let _ = app.update(Message::ChatUi(Action::ChooseAccount(
+            target,
+            managed.clone(),
+        )));
+        let restart = app
+            .chat_ui
+            .restarting
+            .get(&card)
+            .expect("an empty conversation restarts on the chosen account")
+            .clone();
+        assert_eq!(
+            restart.launch.recipe.environment.get("CODEX_HOME"),
+            Some(&home)
+        );
+        assert_eq!(restart.launch.recipe.arguments, ["--remote", "unix://"]);
+        // The composer outlives the move: what the reader attached is still
+        // there on the new account.
+        let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                assert_eq!(runtime.session.id, restart.id);
+                assert_eq!(runtime.attachments, [dropped]);
+            }
+            _ => panic!("the card lost its composer while changing account"),
+        }
+
+        let _ = app.update(Message::AccountUi(
+            crate::app::account_ui::Action::SetDefault(managed),
+        ));
+        let _ = app.new_native_chat(Provider::Codex, Some(PathBuf::from(FIXTURE_DIRECTORY)));
+        let fresh = app.workspace.focused().unwrap();
+        let attempt = app.chat_ui.attempts.get(&fresh).unwrap();
+        assert_eq!(
+            attempt.session.launch.recipe.environment.get("CODEX_HOME"),
+            Some(&home),
+            "a new conversation starts on the default account"
+        );
+    }
+
+    /// A thread that has not begun and moves to another provider, then to
+    /// another account, is saved as the conversation it now holds. Storage
+    /// used to refuse both moves, which failed every later save of the window
+    /// and brought the old conversation back on the next launch, where the
+    /// daemon no longer had it.
+    #[test]
+    fn a_new_chat_moved_to_another_provider_or_account_is_saved_as_its_new_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 24);
+        let home = app
+            .known_account(&managed)
+            .and_then(|account| account.resolved_home())
+            .unwrap()
+            .display()
+            .to_string();
+        // A Codex thread is named by the daemon as soon as it starts, so the
+        // saved card already carries a conversation before any message.
+        let card = live_chat(&mut app, Some("thread"));
+        let flushed = |app: &Cagents| {
+            let writer = app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(writer.last_error(), None);
+            match writer.operation_store().load_card(card, None).unwrap() {
+                Some(CardState {
+                    kind: CardKind::Chat(stored),
+                    ..
+                }) => stored,
+                other => panic!("the card is stored as a chat: {other:?}"),
+            }
+        };
+        let target = |app: &Cagents| match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => unreachable!(),
+        };
+        let restart = |app: &mut Cagents, action: &dyn Fn(Target) -> Action| {
+            let target = target(app);
+            let _ = app.update(Message::ChatUi(action(target)));
+            assert!(app.chat_ui.restarting.contains_key(&card));
+            let _ = app.update(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+            let attempt = app.chat_ui.attempts.get(&card).unwrap();
+            let (target, session) = (attempt.target, attempt.session.clone());
+            // A provider takes seconds to start, long after the replacement
+            // it starts for has been saved.
+            let writer = app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(writer.last_error(), None);
+            let handle = fixture_handle(app, card, Some("replacement"));
+            answer_start(app, target, Ok(handle));
+            session
+        };
+        // The started conversation adds its provider's name for it and the
+        // daemon's proof; what a card may not change on its own is the rest.
+        let identity = |session: &chat::Session| {
+            (
+                session.id,
+                session.launch.provider,
+                session.launch.recipe.clone(),
+            )
+        };
+        assert_eq!(flushed(&app).launch.provider, Provider::Codex);
+
+        let claude = restart(&mut app, &|target| {
+            Action::ChooseProvider(target, Provider::Claude)
+        });
+        assert_eq!(identity(&flushed(&app)), identity(&claude));
+
+        let moved = restart(&mut app, &|target| {
+            Action::ChooseAccount(target, managed.clone())
+        });
+        assert_ne!(moved.id, claude.id, "another account is another identity");
+        let stored = flushed(&app);
+        assert_eq!(identity(&stored), identity(&moved));
+        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(
+            stored.launch.recipe.environment.get("CLAUDE_CONFIG_DIR"),
+            Some(&home)
+        );
+
+        // A resume the provider refused is offered a fresh start, which
+        // drops the saved conversation on purpose.
+        app.cards.remove(&card);
+        app.chat_ui.fresh_offers.insert(card);
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        let attempt = app.chat_ui.attempts.get(&card).unwrap();
+        let (target, fresh) = (attempt.target, attempt.session.clone());
+        assert_eq!(fresh.launch.session_id, None);
+        let handle = fixture_handle(&app, card, Some("fresh"));
+        answer_start(&mut app, target, Ok(handle));
+        let stored = flushed(&app);
+        assert_eq!(identity(&stored), identity(&fresh));
+        assert_eq!(stored.launch.session_id.as_deref(), Some("fresh"));
+        // A late or repeated press, once nothing offers it, keeps it.
+        let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+        assert!(!app.chat_ui.attempts.contains_key(&card));
+        assert_eq!(flushed(&app), stored);
+
+        // Back to Codex, whose daemon starts the thread on a listener of its
+        // own: the started thread saves over the one that asked for it.
+        let codex = restart(&mut app, &|target| {
+            Action::ChooseProvider(target, Provider::Codex)
+        });
+        let stored = flushed(&app);
+        assert_eq!(stored.launch.provider, Provider::Codex);
+        assert_eq!(stored.id, codex.id);
+        assert!(stored.owns_codex_listener());
+        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(app.card_state(card).unwrap().title, "Codex chat");
+    }
+
+    /// A conversation that has begun keeps its account.
+    #[test]
+    fn a_begun_chat_cannot_change_account() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 22);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                Arc::make_mut(&mut runtime.snapshot).items.push(chat::Item {
+                    id: "prompt".into(),
+                    role: chat::Role::User,
+                    content: text("hello"),
+                    at: None,
+                });
+                runtime.target
+            }
+            _ => unreachable!(),
+        };
+        let _ = app.update(Message::ChatUi(Action::AccountPicker(target, true)));
+        let _ = app.update(Message::ChatUi(Action::ChooseAccount(target, managed)));
+        assert!(app.chat_ui.restarting.is_empty());
+        assert!(!app.chat_ui.closing.contains(&target));
+        match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => assert!(!runtime.account_picker),
+            _ => unreachable!(),
+        }
+    }
+
     /// A restart gives up the previous conversation before it starts the new
     /// one; a close meanwhile keeps the first half and cancels the second.
     #[test]
@@ -4105,6 +4430,33 @@ mod tests {
             "the replacement never starts"
         );
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// Moving a chat to another account starts its replacement, so it is
+    /// refused in a worktree being deleted before anything is closed.
+    #[test]
+    fn a_chat_in_a_worktree_being_deleted_keeps_its_account() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let (target, provider) = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => (runtime.target, runtime.session.launch.provider),
+            _ => unreachable!(),
+        };
+        let managed = app.account_ui.add_managed_fixture(provider, 22);
+        app.project_ui
+            .begin_deleting(PathBuf::from(FIXTURE_DIRECTORY));
+
+        let _ = app.update(Message::ChatUi(Action::ChooseAccount(target, managed)));
+        assert!(!app.chat_ui.closing.contains(&target));
+        assert!(!app.chat_ui.restarting.contains_key(&card));
+        assert!(app.chat_ui.attempts.is_empty());
+        assert_eq!(
+            app.notices
+                .entries
+                .back()
+                .map(|entry| entry.notice.message.as_str()),
+            Some("That worktree is being deleted.")
+        );
     }
 
     /// A restart already closing the old conversation when its worktree is

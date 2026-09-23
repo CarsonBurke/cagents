@@ -1729,16 +1729,18 @@ pub enum SettingsCategory {
     Editor,
     Links,
     Keyboard,
+    Accounts,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::General,
         Self::Appearance,
         Self::Editor,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
+        Self::Accounts,
     ];
 
     const fn label(self) -> &'static str {
@@ -1749,6 +1751,7 @@ impl SettingsCategory {
             Self::Editor => "Editor",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
+            Self::Accounts => "Accounts",
         }
     }
 }
@@ -4857,27 +4860,73 @@ impl Cagents {
         }
     }
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
+        match self.install_chat_session(card, session) {
+            Some(true) => {
+                if let Some(writer) = &self.session {
+                    writer.snapshot_conversion(Arc::clone(&self.durable));
+                }
+            }
+            Some(false) => self.persist(),
+            None => {}
+        }
+    }
+
+    /// Puts `session` in card `card`'s durable state without saving it.
+    /// `None` when the card already holds exactly that session; otherwise
+    /// whether the card was converted from another kind.
+    fn install_chat_session(
+        &mut self,
+        card: CardId,
+        session: crate::chat::Session,
+    ) -> Option<bool> {
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
         if unchanged {
-            return;
+            return None;
         }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
         self.lifecycle.remove(card);
         if let Some(state) = self.card_state_mut(card) {
+            // A tab still carrying the default title names the provider it was
+            // opened with; a provider switch on a fresh chat renames it so the
+            // tab does not keep naming an agent it no longer talks to.
+            if let CardKind::Chat(current) = &state.kind {
+                let old = crate::app::chat_ui::chat_card_title(current.launch.provider);
+                if current.launch.provider != session.launch.provider && state.title == old {
+                    state.title =
+                        crate::app::chat_ui::chat_card_title(session.launch.provider).into();
+                }
+            }
             state.kind = CardKind::Chat(session);
             state.residency = Residency::Hot;
         }
         self.card_chrome.remove(&card);
-        if conversion {
-            if let Some(writer) = &self.session {
-                writer.snapshot_conversion(Arc::clone(&self.durable));
-            }
-        } else {
-            self.persist();
+        Some(conversion)
+    }
+
+    /// Puts a new conversation in chat card `card` in place of the one it
+    /// holds: another provider or account for a thread that has not begun, or
+    /// a fresh start after a failed resume. Callers pass only a conversation
+    /// that has not begun, which is all storage accepts this way.
+    ///
+    /// Storage refuses a snapshot that re-points a chat card at another
+    /// conversation, so the replacement is recorded explicitly, together with
+    /// the snapshot that shows it, the way a terminal relaunch records its new
+    /// identity.
+    fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
+        let expected = match self.card_state(card).map(|state| &state.kind) {
+            Some(CardKind::Chat(current)) if current != &session => current.id,
+            _ => return self.commit_chat_session(card, session),
+        };
+        if self.install_chat_session(card, session.clone()).is_none() {
+            return;
+        }
+        self.snapshot_workspace_scope();
+        if let Some(writer) = &self.session {
+            writer.replace_chat_identity(card, expected, session, Arc::clone(&self.durable));
         }
     }
 
@@ -6404,6 +6453,7 @@ impl Cagents {
                 &self.settings_draft,
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
+                self.default_account_choices(),
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Completed) => {
@@ -10618,6 +10668,8 @@ impl Application for Cagents {
                     }
                 }
                 self.lifecycle.remove(id);
+                // A closed card is never reopened, so its filing is spent.
+                Arc::make_mut(&mut self.durable).card_scopes.remove(&id);
                 if let Some(card) = self.card_state_mut(id) {
                     card.existence = Existence::Closed {
                         tombstone: crate::model::Tombstone {

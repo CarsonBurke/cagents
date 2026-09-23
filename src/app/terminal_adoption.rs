@@ -245,7 +245,7 @@ impl Cagents {
     }
 
     /// The known worktree that owns `directory`.
-    fn worktree_scope_for(&self, directory: &Path) -> Option<PathBuf> {
+    pub(super) fn worktree_scope_for(&self, directory: &Path) -> Option<PathBuf> {
         worktree_ui::worktree_root(
             directory,
             self.known_worktree_roots

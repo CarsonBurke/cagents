@@ -270,12 +270,26 @@ pub struct Session {
     pub terminal: Option<crate::model::TerminalSession>,
 }
 impl Session {
+    /// The socket of the Codex listener allocated for this exact cagents
+    /// thread, retained in both views.
+    ///
+    /// It lives under the process temporary directory, so the UI and the
+    /// daemon agree on it only while they share `TMPDIR`; the daemon inherits
+    /// the environment of the UI that spawned it.
+    pub fn owned_codex_socket(&self) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("cagents-codex-{}", self.id))
+            .join("control.sock")
+    }
+
+    /// The `--remote` endpoint naming [`Self::owned_codex_socket`].
+    pub fn owned_codex_remote(&self) -> String {
+        format!("unix://{}", self.owned_codex_socket().display())
+    }
+
     /// An endpoint allocated for this exact cagents thread, retained in both views.
     pub fn owns_codex_listener(&self) -> bool {
-        let socket = std::env::temp_dir()
-            .join(format!("cagents-codex-{}", self.id))
-            .join("control.sock");
-        let remote = format!("unix://{}", socket.display());
+        let remote = self.owned_codex_remote();
         self.launch.provider == Provider::Codex
             && self
                 .launch
@@ -283,6 +297,46 @@ impl Session {
                 .arguments
                 .windows(2)
                 .any(|pair| pair[0] == "--remote" && pair[1] == remote)
+    }
+
+    /// Whether `started` is this new Codex thread as the daemon started it.
+    ///
+    /// A new thread asks for a listener of its own with a bare `unix://`
+    /// remote, which the daemon resolves to [`Self::owned_codex_remote`]
+    /// before it launches anything; that resolution is the one change the
+    /// launch undergoes, and the rest of the recipe is exactly as asked.
+    pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
+        if self.launch.session_id.is_some() || self.terminal.is_some() || started.id != self.id {
+            return false;
+        }
+        let mut resolved = self.clone();
+        resolved.claim_owned_codex_listener() && resolved.launch.recipe == started.launch.recipe
+    }
+
+    /// Point this Codex thread's first `--remote` at its own listener.
+    ///
+    /// Only a new thread asking with a bare `unix://`, or a thread already on
+    /// [`Self::owned_codex_remote`], is claimed; any other endpoint is left
+    /// alone and `false` is returned. The daemon applies this to every chat it
+    /// starts without a source terminal.
+    pub fn claim_owned_codex_listener(&mut self) -> bool {
+        if self.launch.provider != Provider::Codex {
+            return false;
+        }
+        let owned = self.owned_codex_remote();
+        let new_thread = self.launch.session_id.is_none();
+        let arguments = &mut self.launch.recipe.arguments;
+        let Some(index) = arguments.iter().position(|argument| argument == "--remote") else {
+            return false;
+        };
+        match arguments.get_mut(index + 1) {
+            Some(remote) if *remote == owned => true,
+            Some(remote) if new_thread && remote == "unix://" => {
+                *remote = owned;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -831,5 +885,51 @@ mod tests {
                 "01a0ab66-21d6-7065-9fe5-95f302b669e1",
             ]
         );
+    }
+
+    /// The daemon and the stored card agree on which endpoint a Codex thread
+    /// listens on, so the claim looks only at the first `--remote`, as the
+    /// launch itself does, and never re-points an endpoint it did not allocate.
+    #[test]
+    fn only_a_new_thread_asking_for_its_own_listener_is_claimed() {
+        let session = |arguments: &[&str], session_id: Option<&str>| Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+                    working_directory: "/home/user".into(),
+                    environment: Default::default(),
+                },
+                session_id: session_id.map(str::to_owned),
+            },
+            proof: None,
+            terminal: None,
+        };
+
+        let mut asked = session(&["--remote", "unix://"], None);
+        assert!(asked.claim_owned_codex_listener());
+        assert!(asked.owns_codex_listener());
+        let claimed = asked.clone();
+        assert!(
+            asked.claim_owned_codex_listener(),
+            "an owned listener stays claimed"
+        );
+        assert_eq!(asked, claimed);
+
+        for (arguments, session_id) in [
+            (
+                &["--remote", "unix:///elsewhere", "--remote", "unix://"][..],
+                None,
+            ),
+            (&["--remote", "unix://"][..], Some("begun")),
+            (&["--search"][..], None),
+        ] {
+            let mut other = session(arguments, session_id);
+            let before = other.clone();
+            assert!(!other.claim_owned_codex_listener(), "{arguments:?}");
+            assert_eq!(other, before);
+        }
     }
 }

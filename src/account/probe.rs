@@ -148,7 +148,7 @@ fn prepare(account: &Account, cache: Option<&Cache>, force: bool, now: u64) -> P
             lock: None,
         };
     };
-    let lock = match cache.try_probe_lock(account.provider.executable()) {
+    let lock = match cache.try_probe_lock(&account.lock_name()) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => return Prepared::Done(Outcome::Busy),
         // Without a lock directory the probe still runs; it only loses the
@@ -170,7 +170,7 @@ fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
     Outcome::Answered { identity, snapshot }
 }
 
-fn cli_name(provider: Provider) -> &'static str {
+pub fn cli_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude Code",
         Provider::Codex => "Codex",
@@ -241,8 +241,25 @@ struct Group {
 }
 
 impl Group {
-    fn spawn(mut command: Command) -> Result<Self, String> {
-        let child = command.spawn().map_err(|error| spawn_failure(&error))?;
+    /// Starts `command`. An executable that is still open for writing -
+    /// just installed or updated, or inherited for an instant by a process
+    /// another thread is forking - is busy rather than missing, so it is
+    /// tried again a few times before the start counts as failed.
+    async fn spawn(mut command: Command) -> Result<Self, String> {
+        let mut delay = Duration::from_millis(10);
+        let child = loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy
+                        && delay <= Duration::from_millis(160) =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(error) => return Err(spawn_failure(&error)),
+            }
+        };
         let id = child.id().and_then(|id| i32::try_from(id).ok());
         Ok(Self { child, id })
     }
@@ -319,9 +336,9 @@ struct Session {
 }
 
 impl Session {
-    fn spawn(mut command: Command) -> Result<Self, String> {
+    async fn spawn(mut command: Command) -> Result<Self, String> {
         command.stdin(Stdio::piped());
-        let mut group = Group::spawn(command)?;
+        let mut group = Group::spawn(command).await?;
         let stdin = group.child.stdin.take();
         let stdout = group.stdout()?;
         Ok(Self {
@@ -388,7 +405,7 @@ fn spawn_failure(error: &io::Error) -> String {
 
 /// Runs a CLI that prints one JSON document and exits.
 async fn run_json(command: Command) -> Result<Value, String> {
-    let mut group = Group::spawn(command)?;
+    let mut group = Group::spawn(command).await?;
     let mut output = Vec::new();
     // The output is dropped once read, so a CLI that writes past the limit
     // meets a closed pipe rather than blocking until the timeout.
@@ -396,6 +413,51 @@ async fn run_json(command: Command) -> Result<Value, String> {
     group.finish().await;
     read.map_err(|_| "The CLI's output could not be read".to_owned())?;
     serde_json::from_slice(&output).map_err(|_| "The CLI printed something unexpected".to_owned())
+}
+
+/// Signs `account` out through its own CLI - `claude auth logout`, `codex
+/// logout` - before its home is deleted, so a login kept outside the home,
+/// in a system keyring, goes with it.
+///
+/// A CLI that is missing, fails, or says there was nothing to sign out of is
+/// not an error: the home is going regardless, and only the CLI knows where
+/// else its login lived. Only a managed account is ever signed out here; the
+/// system account's login is the reader's own.
+pub async fn logout(account: Account) -> Result<(), String> {
+    if account.is_system() {
+        return Err("The system account is not signed out by cagents".into());
+    }
+    let arguments: &[&str] = match account.provider {
+        Provider::Claude => &["auth", "logout"],
+        Provider::Codex => &["logout"],
+        Provider::Omp => return Ok(()),
+    };
+    let executable = account.provider.executable();
+    let Some(program) = tokio::task::spawn_blocking(move || find_executable(executable))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let mut command = command(&account, &program);
+    command.args(arguments);
+    let mut group = Group::spawn(command).await?;
+    let finished = tokio::time::timeout(TIMEOUT, async {
+        let mut discard = Vec::new();
+        let _ = group.stdout()?.read_to_end(&mut discard).await;
+        Ok::<(), String>(())
+    })
+    .await;
+    group.finish().await;
+    match finished {
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "{} did not sign out within {} seconds",
+            cli_name(account.provider),
+            TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// Claude Code: `claude auth status --json` for the identity, and the
@@ -464,7 +526,7 @@ async fn probe_claude(
 /// The `get_usage` control response's inner `response`, or the error message
 /// Claude answered the request with.
 async fn claude_usage(command: Command) -> Result<Result<Value, String>, String> {
-    let mut session = Session::spawn(command)?;
+    let mut session = Session::spawn(command).await?;
     let result = claude_exchange(&mut session).await;
     session.close().await;
     result
@@ -526,7 +588,7 @@ async fn probe_codex(
 ) -> Result<(Option<Identity>, UsageSnapshot), String> {
     let mut command = command(account, program);
     command.arg("app-server");
-    let mut session = Session::spawn(command)?;
+    let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
     session.close().await;
     let (account_read, limits_read) = result?;
@@ -753,6 +815,37 @@ cat >/dev/null
                 .await
                 .is_err()
         );
+    }
+
+    /// Signing a managed account out runs its CLI's own logout in its home,
+    /// and never touches the system account.
+    #[tokio::test]
+    async fn logout_runs_the_cli_in_the_managed_home_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let record = directory.path().join("record");
+        let script = bin.join("codex");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$CODEX_HOME $*\" > '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        let home = directory.path().join("home");
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home.clone());
+        let mut command = command(&account, &script);
+        command.arg("logout");
+        let mut group = Group::spawn(command).await.unwrap();
+        group.finish().await;
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap().trim(),
+            format!("{} logout", home.display())
+        );
+        assert!(logout(Account::system(Provider::Codex)).await.is_err());
     }
 
     fn make_executable(path: &Path) {
