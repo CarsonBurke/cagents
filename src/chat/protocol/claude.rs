@@ -2056,9 +2056,6 @@ impl History {
             .working_directory
             .canonicalize()
             .map_err(|e| format!("Cannot resolve Claude session directory: {e}"))?;
-        let cwd_text = cwd
-            .to_str()
-            .ok_or("Claude history directory is not UTF-8")?;
         let config = launch
             .recipe
             .environment
@@ -2084,49 +2081,7 @@ impl History {
                 PathBuf::from(home).join(".claude")
             }
         };
-        let root = config
-            .join("projects")
-            .canonicalize()
-            .map_err(|e| format!("Claude history project directory is unavailable: {e}"))?;
-        let sanitized: String = cwd_text
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let filename = format!("{id}.jsonl");
-        let project = if sanitized.len() <= 200 {
-            root.join(sanitized)
-        } else {
-            let prefix = format!("{}-", &sanitized[..200]);
-            let mut candidates = std::fs::read_dir(&root)
-                .map_err(|e| e.to_string())?
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-                .map(|entry| entry.path())
-                .filter(|path| path.join(&filename).is_file());
-            let candidate = candidates
-                .next()
-                .ok_or("Exact Claude transcript not found for this long project path")?;
-            if candidates.next().is_some() {
-                return Err(
-                    "Ambiguous Claude project hash; refusing to choose a history directory".into(),
-                );
-            }
-            candidate
-        };
-        let project = project
-            .canonicalize()
-            .map_err(|e| format!("Claude project history is unavailable: {e}"))?;
-        if !project.starts_with(&root) {
-            return Err("Claude project history escapes its configuration directory".into());
-        }
-        let path = project.join(filename);
-        if std::fs::symlink_metadata(&path)
-            .map_err(|e| format!("Exact Claude session history is unavailable: {e}"))?
-            .file_type()
-            .is_symlink()
-        {
-            return Err("Refusing a symlinked Claude session transcript".into());
-        }
+        let path = crate::agent::claude_transcript(&config, &cwd, id)?;
         let mut options = std::fs::OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt as _;
         options

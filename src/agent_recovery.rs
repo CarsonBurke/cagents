@@ -240,7 +240,12 @@ enum SessionIdentity {
 }
 
 #[cfg(feature = "host")]
-fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<SessionIdentity> {
+fn runtime_identity(
+    root: &Path,
+    pid: i32,
+    launch: &LaunchRecipe,
+    start: u64,
+) -> Option<SessionIdentity> {
     let provider = Provider::from_program(&launch.program)?;
     let session_root = provider.session_root(launch)?;
     if provider == Provider::Omp
@@ -248,8 +253,16 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
     {
         return Some(identity);
     }
+    if provider == Provider::Claude
+        && let Some(identity) = claude_process_identity(&session_root, pid, launch, start)
+    {
+        return Some(identity);
+    }
     let mut identity = None;
+    // The kernel reports open files by their resolved path, and a session root
+    // is often a symbolic link, such as a dotfiles checkout linked into HOME.
     let expected = session_root.join(provider.session_directory());
+    let expected = fs::canonicalize(&expected).unwrap_or(expected);
     let entries = match fs::read_dir(root.join("fd")) {
         Ok(entries) => entries,
         Err(_) => return Some(SessionIdentity::Ambiguous),
@@ -288,6 +301,52 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
         }
     }
     identity.map(SessionIdentity::Exact)
+}
+
+/// The conversation Claude Code says process `pid` holds.
+///
+/// Claude does not keep its transcript open between writes, so the open-file
+/// scan cannot find it. It instead publishes each interactive process's live
+/// conversation in `sessions/<pid>.json`, which follows `/resume` and `/clear`
+/// where the process's argv does not. The record counts only for the process
+/// that wrote it, told apart from a later one with the same pid by its start
+/// time. Once it does, it outranks the argv: a conversation with no transcript
+/// yet, or one a parked background job now owns, cannot be resumed here.
+#[cfg(feature = "host")]
+fn claude_process_identity(
+    session_root: &Path,
+    pid: i32,
+    launch: &LaunchRecipe,
+    start: u64,
+) -> Option<SessionIdentity> {
+    // Claude refuses a relative configuration directory, so one never holds
+    // this process's record.
+    if !session_root.is_absolute() {
+        return None;
+    }
+    let record = bounded_read(
+        session_root.join("sessions").join(format!("{pid}.json")),
+        MAX_HINT_BYTES,
+    )?;
+    let record: serde_json::Value = serde_json::from_slice(&record).ok()?;
+    let started = record["procStart"]
+        .as_str()
+        .and_then(|start| start.parse().ok());
+    if record["pid"].as_i64() != Some(i64::from(pid)) || started != Some(start) {
+        return None;
+    }
+    let identity = (|| {
+        if record["kind"] != "interactive" || !record["parkedJobId"].is_null() {
+            return None;
+        }
+        let id = record["sessionId"].as_str().filter(|id| exact_id(id))?;
+        let cwd = fs::canonicalize(&launch.working_directory).ok()?;
+        crate::agent::claude_transcript(session_root, &cwd, id)
+            .ok()
+            .filter(|transcript| transcript.is_file())
+            .map(|_| SessionIdentity::Exact(id.to_owned()))
+    })();
+    Some(identity.unwrap_or(SessionIdentity::Ambiguous))
 }
 
 #[cfg(feature = "host")]
@@ -342,7 +401,12 @@ fn omp_terminal_identity(
                 session_directory = launch.working_directory.join(directory);
             }
         }
-        session.starts_with(&session_directory).then_some(())?;
+        // Whether OMP records the directory as named or resolved is its own
+        // choice, so a linked session root is accepted either way.
+        let resolved = fs::canonicalize(&session_directory).ok();
+        (session.starts_with(&session_directory)
+            || resolved.is_some_and(|resolved| session.starts_with(resolved)))
+        .then_some(())?;
         if session
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
@@ -1273,24 +1337,29 @@ fn walk_foreground(
 #[cfg(feature = "host")]
 fn recovery_observation(
     root: &Path,
-    _pid: i32,
+    pid: i32,
     raw: LaunchRecipe,
     start: u64,
 ) -> Result<Option<String>, ()> {
-    let mut launch = Provider::normalize_launch(raw).ok_or(())?;
-    if let Some(identity) = runtime_identity(root, &launch, start) {
-        let SessionIdentity::Exact(id) = identity else {
-            // Recognition still exposes activation, but never stale resume authority.
-            let hint = serde_json::to_string(&AgentResumeHint {
-                version: 2,
-                recipe: launch,
-            })
-            .map_err(|_| ())?;
-            return Ok((hint.len() <= MAX_HINT_BYTES).then_some(hint));
-        };
-        launch = bind_session(&launch, &id).ok_or(())?;
+    let launch = Provider::normalize_launch(raw).ok_or(())?;
+    let Some(identity) = runtime_identity(root, pid, &launch, start) else {
+        return observed_hint_from_launch(&launch).map(Some).ok_or(());
+    };
+    // An option the resume cannot carry is no reason to forget the agent.
+    let bound = match identity {
+        SessionIdentity::Exact(id) => bind_session(&launch, &id),
+        SessionIdentity::Fresh(_) | SessionIdentity::Ambiguous => None,
+    };
+    if let Some(bound) = bound {
+        return observed_hint_from_launch(&bound).map(Some).ok_or(());
     }
-    observed_hint_from_launch(&launch).map(Some).ok_or(())
+    // Recognition still exposes activation, but never stale resume authority.
+    let hint = serde_json::to_string(&AgentResumeHint {
+        version: 2,
+        recipe: launch,
+    })
+    .map_err(|_| ())?;
+    Ok((hint.len() <= MAX_HINT_BYTES).then_some(hint))
 }
 
 #[cfg(test)]
@@ -1981,13 +2050,13 @@ mod tests {
         assert!(recipe_from_hint(&fresh).is_none());
         assert_eq!(observed_launch_from_hint(&fresh).unwrap().program, "omp");
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Fresh(session.clone()))
         );
         // A deleted established session must not be replaced with an empty chat.
         fs::write(&marker, format!("/tmp\n{}\n", session.display())).unwrap();
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Ambiguous)
         );
         fs::write(&marker, format!("/tmp\n{}\nfresh\n", session.display())).unwrap();
@@ -2003,27 +2072,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Exact(id.into()))
         );
         let hint = inspect_process(proc_root, 100, 100, &recipe, &mut 64)
             .unwrap()
             .unwrap();
         assert_eq!(recipe_from_hint(&hint).unwrap().arguments, ["--resume", id]);
+        // Through a linked home, the marker may name the resolved session.
+        let linked = directory.path().join("linked-home");
+        symlink(directory.path(), &linked).unwrap();
+        let mut through_link = recipe.clone();
+        through_link
+            .environment
+            .insert("HOME".into(), linked.to_str().unwrap().into());
+        fs::write(
+            &marker,
+            format!("/tmp\n{}\n", fs::canonicalize(&session).unwrap().display()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_identity(&root, 100, &through_link, 0),
+            Some(SessionIdentity::Exact(id.into()))
+        );
         fs::File::options()
             .write(true)
             .open(&marker)
             .unwrap()
             .set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
-        assert!(runtime_identity(&root, &recipe, 0).is_none());
+        assert!(runtime_identity(&root, 100, &recipe, 0).is_none());
         fs::write(
             &marker,
             format!("/another-worktree\n{}\n", session.display()),
         )
         .unwrap();
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Ambiguous)
         );
         fs::remove_file(&marker).unwrap();
@@ -2033,7 +2118,7 @@ mod tests {
             format!("/tmp\n{}\n", session.display()),
         )
         .unwrap();
-        assert!(runtime_identity(&root, &recipe, 0).is_none());
+        assert!(runtime_identity(&root, 100, &recipe, 0).is_none());
     }
 
     #[cfg(feature = "host")]
@@ -2058,10 +2143,10 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("fdinfo/3"), "flags:\t0100000\n").unwrap();
-        assert!(runtime_identity(&root, &recipe, 0).is_none());
+        assert!(runtime_identity(&root, 100, &recipe, 0).is_none());
         fs::write(root.join("fdinfo/3"), "flags:\t0100001\n").unwrap();
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Exact(first.into()))
         );
         symlink(
@@ -2073,9 +2158,157 @@ mod tests {
         .unwrap();
         fs::write(root.join("fdinfo/4"), "flags:\t0100001\n").unwrap();
         assert_eq!(
-            runtime_identity(&root, &recipe, 0),
+            runtime_identity(&root, 100, &recipe, 0),
             Some(SessionIdentity::Ambiguous)
         );
+    }
+
+    /// The kernel names an open file by its resolved path, so a session root
+    /// linked into HOME from elsewhere, such as a dotfiles checkout, must be
+    /// compared resolved too.
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_linked_session_root_still_identifies_the_open_conversation() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("proc");
+        fs::create_dir_all(root.join("fd")).unwrap();
+        fs::create_dir_all(root.join("fdinfo")).unwrap();
+        let dotfiles = directory.path().join("dotfiles/codex");
+        fs::create_dir_all(dotfiles.join("sessions/2026/09/23")).unwrap();
+        symlink(&dotfiles, directory.path().join(".codex")).unwrap();
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let mut recipe = launch("codex", &[]);
+        recipe
+            .environment
+            .insert("HOME".into(), directory.path().to_str().unwrap().into());
+        symlink(
+            dotfiles.join(format!("sessions/2026/09/23/rollout-2026-09-23-{id}.jsonl")),
+            root.join("fd/3"),
+        )
+        .unwrap();
+        fs::write(root.join("fdinfo/3"), "flags:\t0100001\n").unwrap();
+        assert_eq!(
+            runtime_identity(&root, 100, &recipe, 0),
+            Some(SessionIdentity::Exact(id.into()))
+        );
+    }
+
+    /// Claude keeps no transcript open, so its conversation is the one its
+    /// process record names: after `/resume`, not the one in its argv.
+    #[cfg(feature = "host")]
+    #[test]
+    fn claude_is_identified_by_its_own_process_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let work = directory.path().join("work");
+        // A configuration directory linked in from elsewhere, as dotfiles are.
+        let config = directory.path().join("dotfiles/claude");
+        fs::create_dir_all(config.join("sessions")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&config, home.join(".claude")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        let launched = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let current = "a1b2c3d4-2222-4111-8111-123456789abc";
+        let mut recipe = launch("claude", &["--resume", launched]);
+        recipe.working_directory = work.clone();
+        recipe
+            .environment
+            .insert("HOME".into(), home.to_str().unwrap().into());
+        let proc_root = directory.path().join("proc");
+        process_fixture(&proc_root, 100, &recipe, &[]);
+        let root = proc_root.join("100");
+        let record = config.join("sessions/100.json");
+        let write_record = |pid: i32, start: &str, extra: serde_json::Value| {
+            let mut fields = serde_json::json!({
+                "pid": pid,
+                "procStart": start,
+                "sessionId": current,
+                "cwd": work,
+                "kind": "interactive",
+            });
+            fields
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            fs::write(&record, fields.to_string()).unwrap()
+        };
+        let hint = |recipe: &LaunchRecipe| {
+            inspect_process(&proc_root, 100, 100, recipe, &mut 64)
+                .unwrap()
+                .unwrap()
+        };
+
+        // A conversation with nothing said yet has no transcript to resume,
+        // and the one the argv names is no longer this process's.
+        write_record(100, "0", serde_json::json!({}));
+        assert_eq!(
+            runtime_identity(&root, 100, &recipe, 0),
+            Some(SessionIdentity::Ambiguous)
+        );
+        assert_eq!(recipe_from_hint(&hint(&recipe)), None);
+        assert_eq!(
+            observed_launch_from_hint(&hint(&recipe)).map(|launch| launch.arguments),
+            Some(recipe.arguments.clone())
+        );
+
+        let project: String = work
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history = config.join("projects").join(project);
+        fs::create_dir_all(&history).unwrap();
+        fs::write(history.join(format!("{current}.jsonl")), "{}\n").unwrap();
+        assert_eq!(
+            runtime_identity(&root, 100, &recipe, 0),
+            Some(SessionIdentity::Exact(current.into()))
+        );
+        let resumed = recipe_from_hint(&hint(&recipe)).unwrap();
+        assert_eq!(resumed.arguments, ["--resume", current]);
+        assert_eq!(resumed.working_directory, work);
+
+        // An option the resume cannot carry still leaves the agent recognised.
+        fs::write(
+            root.join("cmdline"),
+            ["claude", "--unknown-option", "--resume", launched].join("\0"),
+        )
+        .unwrap();
+        assert_eq!(recipe_from_hint(&hint(&recipe)), None);
+        assert_eq!(
+            observed_launch_from_hint(&hint(&recipe)).map(|launch| launch.arguments),
+            Some(vec![
+                "--unknown-option".into(),
+                "--resume".into(),
+                launched.into()
+            ])
+        );
+
+        // A conversation a parked background job owns, or a process that is
+        // not interactive, is not one to resume in this terminal.
+        for extra in [
+            serde_json::json!({"parkedJobId": "job"}),
+            serde_json::json!({"kind": "print"}),
+        ] {
+            write_record(100, "0", extra);
+            assert_eq!(
+                runtime_identity(&root, 100, &recipe, 0),
+                Some(SessionIdentity::Ambiguous)
+            );
+        }
+
+        // A record left by an earlier process with the same pid, or by
+        // another process, names someone else's conversation.
+        write_record(100, "7", serde_json::json!({}));
+        assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
+        write_record(101, "0", serde_json::json!({}));
+        assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
+        // Claude writes its start time as a string; anything else is not its record.
+        write_record(100, "0", serde_json::json!({"procStart": 0}));
+        assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
     }
 
     #[test]
