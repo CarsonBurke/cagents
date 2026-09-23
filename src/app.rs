@@ -12503,7 +12503,13 @@ impl Application for Cagents {
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
-                    self.card_view(context.id, context.focused, !docked_context_inspector)
+                    // A docked inspector's own resize handle is the trailing
+                    // edge of the last card; a second one there would double
+                    // the rule and compete for the same drag. Every other card
+                    // keeps the splitter that separates it from its neighbour.
+                    let beside_inspector = docked_context_inspector
+                        && self.workspace.order().last() == Some(context.id);
+                    self.card_view(context.id, context.focused, !beside_inspector)
                 },
                 // `sync_chrome` keeps an entry for every durable card, so
                 // the fallback is only reachable for a card the workspace holds

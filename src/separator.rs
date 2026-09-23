@@ -110,7 +110,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Separator {
                 snap: false,
                 ..Default::default()
             },
-            iced::Color::from(theme.current_container().divider),
+            crate::design::rule(theme),
         );
     }
 }
