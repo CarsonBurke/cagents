@@ -2873,11 +2873,23 @@ mod tests {
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN * 4);
         assert_eq!(worker.resume_foreground, worker.foreground_group());
 
-        // A terminal nobody is watching is still observed, at the slowest
-        // interval, so its saved identity stays current for recovery.
+        // A terminal nobody is watching still re-walks a tracked agent, at the
+        // slowest interval, so its saved identity stays current for recovery
+        // even though the agent never leaves the foreground.
         worker.set_hidden();
-        worker.resume_foreground = None;
+        let launch = worker.launch.clone();
+        worker.agent_process = Some(crate::model::agent_recovery::AgentProcess {
+            pid: 1,
+            start: 0,
+            provider: crate::agent::Provider::Claude,
+            launch: launch.clone(),
+            recovery: launch,
+        });
         worker.observe_foreground();
+        assert!(
+            worker.agent_process.is_none(),
+            "the tracked agent was re-observed"
+        );
         assert_eq!(worker.resume_foreground, worker.foreground_group());
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MAX);
 

@@ -12061,7 +12061,7 @@ impl Application for Cagents {
                     notice_body(format!(
                         "The terminal service will restart, interrupting {count} live sessions. Agent conversations resume where supported{}; shells reopen in their working directories. Running shell jobs will stop. Your windows and tabs will reopen automatically.",
                         if self.settings.relaunch_agents_on_upgrade {
-                            ", and agents that cannot resume start a fresh conversation"
+                            ", and agents that cannot resume exactly reopen in their resume picker"
                         } else {
                             ""
                         }

@@ -947,24 +947,42 @@ mod tests {
     }
 
     #[test]
-    fn observed_agent_without_identity_outranks_a_stale_launch_id() {
+    fn agent_without_exact_identity_reopens_its_picker_from_the_best_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let mut checkpoint = checkpoint(directory.path());
         let source = &mut checkpoint.terminals[0].source;
-        source.launch.program = "claude".into();
-        source.launch.arguments = vec![
-            "--resume".into(),
-            "12345678-1234-4234-8234-123456789abc".into(),
-        ];
-        source.resume_hint =
-            crate::model::agent_recovery::observed_hint_from_launch(&LaunchRecipe {
-                arguments: vec!["--model".into(), "sonnet".into()],
-                ..source.launch.clone()
-            });
+        let shell = source.launch.clone();
+        let claude = |arguments: &[&str]| LaunchRecipe {
+            program: "claude".into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+            ..shell.clone()
+        };
+        // An agent observed inside the shell reopens as that agent.
+        source.resume_hint = crate::model::agent_recovery::observed_hint_from_launch(&claude(&[
+            "--model", "sonnet",
+        ]));
         let (recipe, kind) = recovery_plan(source).unwrap();
         assert_eq!(kind, RecoveryKind::Picker);
-        assert_eq!(recipe.arguments, ["--model", "sonnet", "--resume"]);
-        assert!(exact_conversation(&recipe).is_none());
+        assert_eq!(recipe, claude(&["--model", "sonnet", "--resume"]));
+        // An observation the picker cannot carry falls back to the terminal's
+        // own agent command, and to its shell when that is all it ran.
+        source.resume_hint =
+            crate::model::agent_recovery::observed_hint_from_launch(&claude(&["--unknown"]));
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (shell.clone(), RecoveryKind::Shell)
+        );
+        source.launch = claude(&["--bare"]);
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (claude(&["--bare", "--resume"]), RecoveryKind::Picker)
+        );
+        // An exact identity always wins over the picker.
+        source.launch = claude(&["--resume", "12345678-1234-4234-8234-123456789abc"]);
+        assert_eq!(recovery_plan(source).unwrap().1, RecoveryKind::Exact);
     }
 
     #[test]

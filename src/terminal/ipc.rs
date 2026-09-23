@@ -707,7 +707,8 @@ pub struct TerminalDescriptor {
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
 }
 
-/// Explicitly accepted fresh launches, bound to the exact former daemon source.
+/// Explicitly accepted resume-picker or fresh agent launches, bound to the
+/// exact former daemon source.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UpgradeRelaunch {
     pub source: TerminalSession,

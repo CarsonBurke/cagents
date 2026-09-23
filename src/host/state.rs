@@ -1120,9 +1120,6 @@ fn upgrade_error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
 
-/// Names a terminal whose running job would be lost by the upgrade: what is
-/// running, where, and which terminal it is, so the user can find it in the
-/// sidebar without opening each one.
 /// How an upgrade restarts an agent it cannot resume exactly. Only an agent
 /// its provider says has no conversation yet starts a fresh one; any other
 /// reopens the provider's resume picker, so a conversation the agent moved to
@@ -1137,6 +1134,9 @@ fn upgrade_relaunch(
     agent_recovery::picker_recipe(&agent.recovery).map(|recipe| (recipe, "resume picker"))
 }
 
+/// Names a terminal whose running job would be lost by the upgrade: what is
+/// running, where, and which terminal it is, so the user can find it in the
+/// sidebar without opening each one.
 fn describe_upgrade_blocker(source: &TerminalSession) -> String {
     let launch = &source.launch;
     let mut command = launch.program.clone();

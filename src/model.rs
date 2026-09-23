@@ -886,17 +886,11 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     /// An exact saved agent identity, never a newest-session guess.
-    ///
-    /// The launch argv counts only until an observation says otherwise: an
-    /// agent seen without an exact conversation may have `/resume`d or
-    /// `/clear`ed away from the one it was started with.
     pub fn agent_resume_recipe(&self) -> Option<LaunchRecipe> {
-        match self.resume_hint.as_deref() {
-            Some(hint) if agent_recovery::hint_lacks_identity(hint) => None,
-            Some(hint) => agent_recovery::recipe_from_hint(hint)
-                .or_else(|| agent_recovery::resume_recipe(&self.launch)),
-            None => agent_recovery::resume_recipe(&self.launch),
-        }
+        self.resume_hint
+            .as_deref()
+            .and_then(agent_recovery::recipe_from_hint)
+            .or_else(|| agent_recovery::resume_recipe(&self.launch))
     }
 }
 

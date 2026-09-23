@@ -38,13 +38,13 @@ fn exact_id(value: &str) -> bool {
 /// Rebuild an interactive resume invocation without replaying an initial prompt,
 /// forking a conversation, or carrying an implicit latest-session selector.
 pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
-    interactive_recipe(launch, true)
+    interactive_recipe(launch, Selector::Exact)
 }
 
 /// Start an independent conversation with the same supported configuration,
 /// never a second writer to the source conversation or a replayed prompt.
 pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
-    let mut recipe = interactive_recipe(launch, false)?;
+    let mut recipe = interactive_recipe(launch, Selector::Fresh)?;
     if Provider::from_program(&recipe.program)? == Provider::Omp
         && !recipe.arguments.iter().any(|arg| arg == "--session-dir")
     {
@@ -68,40 +68,7 @@ pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
 /// Every selector the launch carried is dropped, whether an exact ID, a picker
 /// search term or a latest-session shortcut, since the picker supersedes it.
 pub fn picker_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
-    let provider = Provider::from_program(&launch.program)?;
-    let mut arguments = Vec::with_capacity(launch.arguments.len());
-    let mut args = launch.arguments.iter().peekable();
-    while let Some(argument) = args.next() {
-        let flag = argument
-            .split_once('=')
-            .map_or(argument.as_str(), |(flag, _)| flag);
-        let latest = match provider {
-            Provider::Codex => flag == "--last",
-            _ => matches!(flag, "--continue" | "-c"),
-        };
-        if latest {
-            continue;
-        }
-        if provider.is_identity_option(flag) {
-            // Claude's and OMP's selectors take an optional value; Codex's
-            // subcommand an optional positional ID.
-            if flag == argument.as_str() && args.peek().is_some_and(|value| !value.starts_with('-'))
-            {
-                args.next();
-            }
-            continue;
-        }
-        arguments.push(argument.clone());
-    }
-    let mut recipe = interactive_recipe(
-        &LaunchRecipe {
-            arguments,
-            ..launch.clone()
-        },
-        false,
-    )?;
-    provider.append_resume_picker(&mut recipe.arguments);
-    Some(recipe)
+    interactive_recipe(launch, Selector::Picker)
 }
 
 /// Whether `recipe` is exactly the picker `picker_recipe` builds for it.
@@ -109,7 +76,18 @@ pub fn is_picker_recipe(recipe: &LaunchRecipe) -> bool {
     picker_recipe(recipe).as_ref() == Some(recipe)
 }
 
-fn interactive_recipe(launch: &LaunchRecipe, resume: bool) -> Option<LaunchRecipe> {
+/// Which conversation an interactive recipe rebuilt from a launch selects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selector {
+    /// None: the provider starts a new conversation.
+    Fresh,
+    /// The exact conversation the launch names, which it must name.
+    Exact,
+    /// The provider's picker, superseding any selector the launch carried.
+    Picker,
+}
+
+fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<LaunchRecipe> {
     let provider = Provider::from_program(&launch.program)?;
     if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
@@ -119,13 +97,31 @@ fn interactive_recipe(launch: &LaunchRecipe, resume: bool) -> Option<LaunchRecip
     let mut id = None;
     let mut arguments = Vec::new();
     let mut working_directory = launch.working_directory.clone();
-    let mut args = launch.arguments.iter();
+    let mut args = launch.arguments.iter().peekable();
     while let Some(argument) = args.next() {
         let (flag, inline) = argument
             .split_once('=')
             .map_or((argument.as_str(), None), |(flag, value)| {
                 (flag, Some(value))
             });
+        if selector == Selector::Picker {
+            let latest = match provider {
+                Provider::Codex => flag == "--last",
+                _ => matches!(flag, "--continue" | "-c"),
+            };
+            if latest && inline.is_none() {
+                continue;
+            }
+            if provider.is_identity_option(flag) {
+                // Claude's and OMP's selectors take an optional value, Codex's
+                // subcommand an optional positional ID or name: whichever it
+                // is, the picker supersedes it.
+                if inline.is_none() {
+                    args.next_if(|value| !value.starts_with('-'));
+                }
+                continue;
+            }
+        }
         if provider.is_cwd_option(flag) {
             let value = inline.or_else(|| args.next().map(String::as_str))?;
             if value.is_empty() || value.starts_with('-') || value.contains('\0') {
@@ -160,8 +156,10 @@ fn interactive_recipe(launch: &LaunchRecipe, resume: bool) -> Option<LaunchRecip
             return None;
         }
     }
-    if resume {
-        provider.append_resume(&mut arguments, id?);
+    match selector {
+        Selector::Fresh => {}
+        Selector::Exact => provider.append_resume(&mut arguments, id?),
+        Selector::Picker => provider.append_resume_picker(&mut arguments),
     }
     Some(LaunchRecipe {
         arguments,
@@ -243,14 +241,6 @@ pub fn observed_hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
     })
     .ok()?;
     (hint.len() <= MAX_HINT_BYTES).then_some(hint)
-}
-
-/// Whether `hint` records an agent observed running without an exact
-/// conversation. That observation is newer than the terminal's launch argv,
-/// which may name a conversation the agent has since left.
-pub fn hint_lacks_identity(hint: &str) -> bool {
-    hint.len() <= MAX_HINT_BYTES
-        && serde_json::from_str::<AgentResumeHint>(hint).is_ok_and(|hint| hint.version == 2)
 }
 
 pub fn observed_launch_from_hint(hint: &str) -> Option<LaunchRecipe> {
@@ -2070,6 +2060,19 @@ mod tests {
         assert_eq!(codex.arguments, ["resume", "-c", "model=o3"]);
         assert!(is_picker_recipe(&codex));
         assert_eq!(
+            picker_recipe(&launch("codex", &["-m", "o3", "resume", id]))
+                .unwrap()
+                .arguments,
+            ["resume", "-m", "o3"]
+        );
+        // A value that happens to spell a selector is still that option's value.
+        assert_eq!(
+            picker_recipe(&launch("codex", &["-p", "resume", "resume", id]))
+                .unwrap()
+                .arguments,
+            ["resume", "-p", "resume"]
+        );
+        assert_eq!(
             picker_recipe(&launch("codex", &["resume", "--last", "-m", "o3"]))
                 .unwrap()
                 .arguments,
@@ -2089,17 +2092,6 @@ mod tests {
         // Neither a fresh nor an exact recipe passes for a picker.
         assert!(!is_picker_recipe(&launch("claude", &["--model", "sonnet"])));
         assert!(!is_picker_recipe(&launch("claude", &["--resume", id])));
-    }
-
-    #[test]
-    fn a_hint_without_identity_is_recognised_as_such() {
-        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
-        let exact = hint_from_launch(&launch("claude", &["--resume", id])).unwrap();
-        let observed =
-            observed_hint_from_launch(&launch("claude", &["--model", "sonnet"])).unwrap();
-        assert!(!hint_lacks_identity(&exact));
-        assert!(hint_lacks_identity(&observed));
-        assert!(!hint_lacks_identity("not a hint"));
     }
 
     #[test]
