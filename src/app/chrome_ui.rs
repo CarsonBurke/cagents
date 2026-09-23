@@ -286,24 +286,22 @@ impl Cagents {
             let ids: Vec<&str> = match popup {
                 Popup::NewTab => NEW_TAB_CHOICES.iter().map(|(_, _, _, id)| *id).collect(),
                 Popup::Notices => {
-                    let action =
-                        self.save_health
-                            .as_ref()
-                            .and_then(|health| match &health.health {
-                                SessionSaveHealth::RetryExhausted { .. }
-                                    if !health.retry_requested =>
-                                {
-                                    Some("session-save.retry")
-                                }
-                                SessionSaveHealth::Recovered { .. } => {
-                                    Some("session-save.acknowledge-recovery")
-                                }
-                                _ => None,
-                            });
+                    let health = self.save_health.as_ref();
+                    // In the order the notices draw them: the lane's own notice,
+                    // then the refused writes. Only one of them offers a retry.
+                    let acknowledge = health
+                        .is_some_and(|health| {
+                            matches!(health.health, SessionSaveHealth::Recovered { .. })
+                        })
+                        .then_some("session-save.acknowledge-recovery");
+                    let retry = health
+                        .is_some_and(SaveHealthState::offers_retry)
+                        .then_some("session-save.retry");
                     [
                         Some("chrome.notices.close"),
                         (!self.notices.is_empty()).then_some("chrome.notices.dismiss"),
-                        action,
+                        acknowledge,
+                        retry,
                     ]
                     .into_iter()
                     .flatten()
@@ -445,10 +443,10 @@ impl Cagents {
         // triangle labelled "Application notices", and `NoticeSeverity::icon`
         // already owns the per-severity glyph.
         let health_severity = self.save_health.as_ref().and_then(|health| {
-            matches!(
+            (matches!(
                 health.health,
                 SessionSaveHealth::RetryExhausted { .. } | SessionSaveHealth::WriterUnavailable
-            )
+            ) || !health.quarantined.is_empty())
             .then_some(NoticeSeverity::Error)
         });
         // From the log, not `self.status`: `update` drains that slot into the
@@ -506,8 +504,10 @@ impl Cagents {
                         false,
                     ));
                 }
-                if let Some(health) = self.save_health.as_ref().and_then(save_health_view) {
-                    notices.push(health);
+                if let Some(health) = &self.save_health {
+                    notices.extend(save_health_views(health, |card| {
+                        self.card_state(card).map(|card| card.title.as_str())
+                    }));
                 }
                 let mut heading_children = vec![
                     design::heading("Application notices")

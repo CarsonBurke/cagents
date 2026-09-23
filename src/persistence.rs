@@ -72,12 +72,68 @@ pub enum StoreError {
     },
     #[error("invalid state: {0}")]
     InvalidState(String),
+    /// Storage failed on `card` within a larger write, such as a workspace
+    /// snapshot, so the caller can say which card the failure concerns.
+    #[error("card {card}: {error}")]
+    Card {
+        card: CardId,
+        error: Box<StoreError>,
+    },
     #[error("busy timeout must be greater than zero and no more than {maximum:?}")]
     InvalidBusyTimeout { maximum: Duration },
     #[error("state store mutex was poisoned")]
     MutexPoisoned,
     #[error("state store has already been shut down")]
     Closed,
+}
+
+impl StoreError {
+    /// Whether storage refuses a write because of what the write contains, so
+    /// offering the same content again can only fail the same way.
+    ///
+    /// Everything else is a condition of storage itself - a lock, a full disk,
+    /// a read-only or corrupt file, a base generation that fell behind - which
+    /// a retry can outlast and which every other write would hit too.
+    ///
+    /// A foreign-key violation is a refusal too. The only parent a caller can
+    /// send a write ahead of is a worktree's project, and the session writer
+    /// holds a worktree back until its project has a row; project rows are
+    /// never deleted, since closing one stores a tombstone. A missing parent
+    /// anywhere else is a fault in the write itself.
+    pub fn refuses_content(&self) -> bool {
+        use rusqlite::ErrorCode;
+
+        match self {
+            Self::Card { error, .. } => error.refuses_content(),
+            Self::InvalidState(_) | Self::Serialization(_) | Self::InvalidUuid { .. } => true,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+                error.code,
+                ErrorCode::ConstraintViolation | ErrorCode::TooBig | ErrorCode::TypeMismatch
+            ),
+            // The remaining SQLite errors are deterministic outcomes of a
+            // statement and the rows it read: a missing row, a value that does
+            // not convert. None of them is a condition that clears.
+            Self::Sqlite(_) => true,
+            Self::Io(_)
+            | Self::UnsupportedSchema { .. }
+            | Self::StaleGeneration { .. }
+            | Self::InvalidBusyTimeout { .. }
+            | Self::MutexPoisoned
+            | Self::Closed => false,
+        }
+    }
+
+    /// Attributes this error to `card`. A stale generation stays as it is:
+    /// it concerns the whole snapshot's base, which the caller rebases.
+    fn in_card(self, card: CardId) -> Self {
+        match self {
+            Self::StaleGeneration { .. } | Self::Card { .. } => self,
+            error => Self::Card {
+                card,
+                error: Box::new(error),
+            },
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -420,6 +476,9 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let commit = save_workspace_transaction(&transaction, state, base)?;
+        // A conversion defers its foreign keys, so a violation it caused would
+        // surface here, attributed to no card. It cannot arise in practice:
+        // the terminal and its transcript metadata move together.
         transaction.commit()?;
         Ok(commit)
     }
@@ -2168,100 +2227,29 @@ fn save_workspace_transaction(
     let mut card_generations = BTreeMap::new();
 
     for (ordinal, card) in state.cards.iter().enumerate() {
-        let kind = card_kind(&card.kind);
-        let card_id = card.id.to_string();
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
-        let stored = existing.get(&card.id);
-
-        if stored.is_none() {
-            // Only a card this workspace has never owned can collide with a row
-            // belonging to another workspace; every entry in `existing` is ours
-            // by construction, which keeps this lookup off the steady-state
-            // path entirely.
-            if let Some(other) = transaction
-                .prepare_cached(SELECT_CARD_WORKSPACE)?
-                .query_row([&card_id], |row| row.get::<_, String>(0))
-                .optional()?
-                && other != workspace_id
-            {
-                return Err(StoreError::InvalidState(format!(
-                    "card {card_id} already belongs to workspace {other}"
-                )));
-            }
-        }
-
-        if let Some(stored) = stored {
-            if matches!(stored.existence, Existence::Closed { .. })
-                && !matches!(card.existence, Existence::Closed { .. })
-            {
-                return Err(StoreError::InvalidState(format!(
-                    "tombstoned card {card_id} cannot be resurrected"
-                )));
-            }
-            if expected != stored.generation {
-                return Err(StoreError::StaleGeneration {
-                    entity: format!("card {card_id}"),
-                    expected,
-                    actual: stored.generation,
-                });
-            }
-            if stored.kind != kind {
-                validate_card_conversion(transaction, card, stored.kind)?;
-            }
-        } else if expected != 0 {
-            return Err(StoreError::StaleGeneration {
-                entity: format!("new card {card_id}"),
-                expected,
-                actual: 0,
-            });
-        }
-        if let CardKind::Chat(session) = &card.kind {
-            validate_chat_identity(
-                transaction,
-                card.id,
-                session,
-                stored.map(|stored| stored.kind),
-            )?;
-        }
-
-        let write = CardWrite::build(&workspace_id, &card_id, ordinal, card, kind)?;
-        if stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash)) {
-            // Every value this write would bind, apart from `generation` and
-            // `updated_at_unix_ms`, is already stored byte for byte. Both of
-            // those columns describe the last *content* change, so leaving the
-            // rows untouched is not an approximation of the write — it is the
-            // write, with zero dirtied pages and zero WAL frames.
-            card_generations.insert(card.id, expected);
-            continue;
-        }
-
-        let card_generation = next_generation(expected, "card", card.id)?;
-        transaction.prepare_cached(UPSERT_CARD)?.execute(params![
-            card_id,
-            workspace_id,
-            write.ordinal,
-            u64_to_i64(card_generation, "card generation")?,
-            card.title,
-            f64::from(card.width_fraction),
-            write.existence_json,
-            kind.as_str(),
-            write.content_json,
-            write.content_hash,
+        let save = if card.existence.is_open() {
+            save_card
+        } else {
+            save_closed_card
+        };
+        let generation = save(
+            transaction,
+            &workspace_id,
+            ordinal,
+            card,
+            expected,
+            existing.get(&card.id),
             timestamp,
-        ])?;
-        save_card_payload(transaction, &card_id, &write, card_generation, timestamp)?;
-        card_generations.insert(card.id, card_generation);
+        )
+        .map_err(|error| error.in_card(card.id))?;
+        card_generations.insert(card.id, generation);
     }
 
     for (card_id, stored) in &existing {
         if incoming_ids.contains(card_id) {
             continue;
         }
-        if matches!(stored.existence, Existence::Closed { .. }) {
-            card_generations.insert(*card_id, stored.generation);
-            continue;
-        }
-        let generation = next_generation(stored.generation, "card", *card_id)?;
         let tombstone = Existence::Closed {
             tombstone: Tombstone {
                 operation_id: None,
@@ -2269,14 +2257,7 @@ fn save_workspace_transaction(
                 reason: Some("absent from a newer workspace snapshot".into()),
             },
         };
-        transaction
-            .prepare_cached(TOMBSTONE_CARD)?
-            .execute(params![
-                u64_to_i64(generation, "card generation")?,
-                to_json(&tombstone)?,
-                timestamp,
-                card_id.to_string(),
-            ])?;
+        let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
     }
 
@@ -2284,6 +2265,175 @@ fn save_workspace_transaction(
         generation: next,
         card_generations,
     })
+}
+
+/// Writes one card of a workspace snapshot, returning the generation storage
+/// holds for it afterwards.
+fn save_card(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    ordinal: usize,
+    card: &CardState,
+    expected: u64,
+    stored: Option<&ExistingCard>,
+    timestamp: i64,
+) -> Result<u64> {
+    let kind = card_kind(&card.kind);
+    let card_id = card.id.to_string();
+
+    if stored.is_none() {
+        // Only a card this workspace has never owned can collide with a row
+        // belonging to another workspace; every stored card is ours by
+        // construction, which keeps this lookup off the steady-state path
+        // entirely.
+        if let Some(other) = transaction
+            .prepare_cached(SELECT_CARD_WORKSPACE)?
+            .query_row([&card_id], |row| row.get::<_, String>(0))
+            .optional()?
+            && other != workspace_id
+        {
+            return Err(StoreError::InvalidState(format!(
+                "card {card_id} already belongs to workspace {other}"
+            )));
+        }
+    }
+
+    if let Some(stored) = stored {
+        if matches!(stored.existence, Existence::Closed { .. })
+            && !matches!(card.existence, Existence::Closed { .. })
+        {
+            return Err(StoreError::InvalidState(format!(
+                "tombstoned card {card_id} cannot be resurrected"
+            )));
+        }
+        if expected != stored.generation {
+            return Err(StoreError::StaleGeneration {
+                entity: format!("card {card_id}"),
+                expected,
+                actual: stored.generation,
+            });
+        }
+        if stored.kind != kind {
+            validate_card_conversion(transaction, card, stored.kind)?;
+        }
+    } else if expected != 0 {
+        return Err(StoreError::StaleGeneration {
+            entity: format!("new card {card_id}"),
+            expected,
+            actual: 0,
+        });
+    }
+    if let CardKind::Chat(session) = &card.kind {
+        validate_chat_identity(
+            transaction,
+            card.id,
+            session,
+            stored.map(|stored| stored.kind),
+        )?;
+    }
+
+    let write = CardWrite::build(workspace_id, &card_id, ordinal, card, kind)?;
+    if stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash)) {
+        // Every value this write would bind, apart from `generation` and
+        // `updated_at_unix_ms`, is already stored byte for byte. Both of
+        // those columns describe the last *content* change, so leaving the
+        // rows untouched is not an approximation of the write — it is the
+        // write, with zero dirtied pages and zero WAL frames.
+        return Ok(expected);
+    }
+
+    let card_generation = next_generation(expected, "card", card.id)?;
+    transaction.prepare_cached(UPSERT_CARD)?.execute(params![
+        card_id,
+        workspace_id,
+        write.ordinal,
+        u64_to_i64(card_generation, "card generation")?,
+        card.title,
+        f64::from(card.width_fraction),
+        write.existence_json,
+        kind.as_str(),
+        write.content_json,
+        write.content_hash,
+        timestamp,
+    ])?;
+    save_card_payload(transaction, &card_id, &write, card_generation, timestamp)?;
+    Ok(card_generation)
+}
+
+/// Writes a card the snapshot holds closed.
+///
+/// A closed card is final, but its content still matters: restore reads which
+/// terminal it claims, so a hosted terminal it ran is never adopted as a new
+/// card. It is written in full when storage accepts that. When storage refuses
+/// the content instead - a conversion, a rebound identity - the tombstone
+/// alone is stored over what storage holds: a card the user closed must never
+/// keep the rest of the window from saving, and closing is the remedy offered
+/// for exactly that refusal.
+fn save_closed_card(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    ordinal: usize,
+    card: &CardState,
+    expected: u64,
+    stored: Option<&ExistingCard>,
+    timestamp: i64,
+) -> Result<u64> {
+    transaction.execute_batch("SAVEPOINT closed_card")?;
+    let written = save_card(
+        transaction,
+        workspace_id,
+        ordinal,
+        card,
+        expected,
+        stored,
+        timestamp,
+    );
+    match written {
+        Err(error) if error.refuses_content() => {
+            transaction.execute_batch("ROLLBACK TO closed_card; RELEASE closed_card")?;
+            tracing::warn!(
+                card = %card.id,
+                %error,
+                "storage refused a closed card's final content; storing its tombstone alone"
+            );
+            match stored {
+                Some(stored) => {
+                    tombstone_card(transaction, card.id, stored, &card.existence, timestamp)
+                }
+                // Storage never held the card, so there is nothing to close.
+                None => Ok(0),
+            }
+        }
+        written => {
+            transaction.execute_batch("RELEASE closed_card")?;
+            written
+        }
+    }
+}
+
+/// Stores `tombstone` over the card row storage holds, leaving its content,
+/// and returns the card's generation afterwards. A card storage already holds
+/// closed stays as it is.
+fn tombstone_card(
+    transaction: &Transaction<'_>,
+    card: CardId,
+    stored: &ExistingCard,
+    tombstone: &Existence,
+    timestamp: i64,
+) -> Result<u64> {
+    if !stored.existence.is_open() {
+        return Ok(stored.generation);
+    }
+    let generation = next_generation(stored.generation, "card", card)?;
+    transaction
+        .prepare_cached(TOMBSTONE_CARD)?
+        .execute(params![
+            u64_to_i64(generation, "card generation")?,
+            to_json(tombstone)?,
+            timestamp,
+            card.to_string(),
+        ])?;
+    Ok(generation)
 }
 
 /// Kind changes are restricted to an exact conversation handoff, within the
@@ -3665,6 +3815,17 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    /// The refusal storage attributed to `card` within a failed snapshot.
+    fn card_refusal<T: std::fmt::Debug>(result: Result<T>, card: CardId) -> StoreError {
+        match result {
+            Err(StoreError::Card {
+                card: refused,
+                error,
+            }) if refused == card => *error,
+            other => panic!("expected storage to refuse card {card}, got {other:?}"),
+        }
+    }
     use crate::model::{
         BrowserId, BrowserSession, CardState, HostIncarnation, HostSessionId, LaunchRecipe,
         TerminalSession,
@@ -3977,8 +4138,8 @@ mod tests {
         let claude = fresh(crate::agent::Provider::Claude, codex.id, None);
         workspace.cards[0].kind = CardKind::Chat(claude.clone());
         assert!(matches!(
-            lane.save(&store, &workspace),
-            Err(StoreError::InvalidState(_))
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
         ));
         store
             .replace_chat_identity(card, codex.id, &claude)
@@ -4082,15 +4243,15 @@ mod tests {
             elsewhere.owned_codex_remote(),
         ] {
             assert!(matches!(
-                save(&started(remote)),
-                Err(StoreError::InvalidState(message)) if message.contains("launch recipe")
+                card_refusal(save(&started(remote)), workspace.cards[0].id),
+                StoreError::InvalidState(message) if message.contains("launch recipe")
             ));
         }
         let mut other_option = started(asked.owned_codex_remote());
         other_option.launch.recipe.arguments.push("--search".into());
         assert!(matches!(
-            save(&other_option),
-            Err(StoreError::InvalidState(_))
+            card_refusal(save(&other_option), workspace.cards[0].id),
+            StoreError::InvalidState(_)
         ));
 
         let own = started(asked.owned_codex_remote());
@@ -4108,7 +4269,10 @@ mod tests {
         // Once begun, the thread keeps that endpoint.
         let mut rewound = own.clone();
         rewound.launch.recipe.arguments[1] = "unix://".into();
-        assert!(matches!(save(&rewound), Err(StoreError::InvalidState(_))));
+        assert!(matches!(
+            card_refusal(save(&rewound), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
     }
 
     #[test]
@@ -4123,8 +4287,8 @@ mod tests {
         wrong.launch.session_id = Some("88888888-1111-4111-8111-111111111111".into());
         workspace.cards[0].kind = CardKind::Chat(wrong);
         assert!(matches!(
-            lane.save(&store, &workspace),
-            Err(StoreError::InvalidState(_))
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
         ));
         workspace.cards[0].kind = CardKind::Chat(chat.clone());
         lane.save(&store, &workspace).unwrap();
@@ -4132,8 +4296,8 @@ mod tests {
         wrong.id = TerminalId::new();
         workspace.cards[0].kind = CardKind::Chat(wrong);
         assert!(matches!(
-            lane.save(&store, &workspace),
-            Err(StoreError::InvalidState(_))
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
         ));
         let terminal = chat.terminal.unwrap();
         workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
@@ -4198,15 +4362,15 @@ mod tests {
             for wrong in [other_host, other_command, unproven] {
                 workspace.cards[0].kind = CardKind::Terminal(wrong.clone());
                 assert!(matches!(
-                    lane.save(&store, &workspace),
-                    Err(StoreError::InvalidState(_))
+                    card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+                    StoreError::InvalidState(_)
                 ));
                 let mut paired = native.clone();
                 paired.terminal = Some(wrong);
                 workspace.cards[0].kind = CardKind::Chat(paired);
                 assert!(matches!(
-                    lane.save(&store, &workspace),
-                    Err(StoreError::InvalidState(_))
+                    card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+                    StoreError::InvalidState(_)
                 ));
             }
             if paired_first {
@@ -4929,7 +5093,7 @@ mod tests {
             panic!("expected terminal card");
         };
         session.id = TerminalId::new();
-        let error = lane.save(&store, &next).unwrap_err();
+        let error = card_refusal(lane.save(&store, &next), next.cards[0].id);
 
         assert!(matches!(error, StoreError::InvalidState(_)));
     }

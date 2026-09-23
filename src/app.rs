@@ -80,7 +80,10 @@ use crate::{
     repository_widget::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
     },
-    session::{SessionRuntime, SessionSaveHealth, SessionSaveHealthEvent},
+    session::{
+        QUARANTINE_GUIDANCE, QuarantinedWrite, ReplacedIdentity, SessionRuntime, SessionSaveHealth,
+        SessionSaveHealthEvent, WriteSubject,
+    },
     settings::{
         self, AppSettings, AppTheme, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture,
         PullRequestOpenTarget, TerminalCursorStyle,
@@ -315,6 +318,7 @@ struct SaveHealthState {
     revision: u64,
     health: SessionSaveHealth,
     last_successful_flush_at_unix_ms: Option<i64>,
+    quarantined: Vec<QuarantinedWrite>,
     retry_requested: bool,
 }
 
@@ -325,6 +329,7 @@ impl SaveHealthState {
             revision: 0,
             health: SessionSaveHealth::Healthy,
             last_successful_flush_at_unix_ms: None,
+            quarantined: Vec::new(),
             retry_requested: false,
         }
     }
@@ -335,6 +340,7 @@ impl SaveHealthState {
             revision: 1,
             health: SessionSaveHealth::WriterUnavailable,
             last_successful_flush_at_unix_ms: None,
+            quarantined: Vec::new(),
             retry_requested: false,
         }
     }
@@ -359,13 +365,26 @@ impl SaveHealthState {
         ) {
             self.health = event.health;
         }
+        self.quarantined = event.quarantined;
         self.retry_requested = false;
         true
     }
 
+    /// Whether a retry can do anything the lane will not do on its own: after
+    /// its automatic attempts ran out, or for a write storage refused. A
+    /// writer that stopped would take the request and never answer it, leaving
+    /// the notice waiting for good.
+    fn offers_retry(&self) -> bool {
+        !self.retry_requested
+            && match self.health {
+                SessionSaveHealth::RetryExhausted { .. } => true,
+                SessionSaveHealth::WriterUnavailable => false,
+                _ => !self.quarantined.is_empty(),
+            }
+    }
+
     fn request_retry(&mut self, session: &SessionRuntime) -> bool {
-        if self.retry_requested || !matches!(self.health, SessionSaveHealth::RetryExhausted { .. })
-        {
+        if !self.offers_retry() {
             return false;
         }
         self.retry_requested = session.retry_save();
@@ -382,7 +401,15 @@ impl SaveHealthState {
     }
 
     fn is_visible(&self) -> bool {
-        !matches!(self.health, SessionSaveHealth::Healthy)
+        !matches!(self.health, SessionSaveHealth::Healthy) || !self.quarantined.is_empty()
+    }
+
+    /// Whether storage refused part of the window's own state, which a
+    /// terminal handoff has to be committed in.
+    fn window_state_refused(&self) -> bool {
+        self.quarantined
+            .iter()
+            .any(|write| write.subject.is_window_state())
     }
 }
 
@@ -592,14 +619,130 @@ fn notice_surface_action<'a>(
         .into()
 }
 
-fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
-    if !health.is_visible() {
-        return None;
-    }
+/// The save-health notices: the writer lane's state, and the writes storage
+/// refused, which the lane reports beside its state rather than as one.
+/// `card_title` names the card a refused terminal identity belongs to.
+fn save_health_views<'a>(
+    health: &'a SaveHealthState,
+    card_title: impl Fn(CardId) -> Option<&'a str>,
+) -> Vec<Element<'a, Message>> {
     let path = health.database_path.as_deref().map_or_else(
         || "unavailable (the data directory could not be resolved)".to_owned(),
         |path| path.display().to_string(),
     );
+    let refused = save_quarantine_view(health, &path, card_title);
+    save_lane_view(health, path)
+        .into_iter()
+        .chain(refused)
+        .collect()
+}
+
+/// One refused write as the save-health notice lists it.
+fn quarantined_write_line<'a>(
+    write: &QuarantinedWrite,
+    card_title: &impl Fn(CardId) -> Option<&'a str>,
+) -> String {
+    let subject = match &write.subject {
+        WriteSubject::Workspace { card: None } => "Window layout and cards".to_owned(),
+        WriteSubject::Workspace { card: Some(card) } => card_title(*card).map_or_else(
+            || "Window layout and cards (one card was refused)".to_owned(),
+            |title| format!("Window layout and cards (card “{title}” was refused)"),
+        ),
+        WriteSubject::CardIdentity {
+            card,
+            kind: ReplacedIdentity::Terminal,
+        } => card_title(*card).map_or_else(
+            || "A relaunched terminal's new identity".to_owned(),
+            |title| format!("Relaunched terminal “{title}”"),
+        ),
+        WriteSubject::CardIdentity {
+            card,
+            kind: ReplacedIdentity::Chat,
+        } => card_title(*card).map_or_else(
+            || "A chat card's new conversation".to_owned(),
+            |title| format!("New conversation in “{title}”"),
+        ),
+        WriteSubject::Project { name, .. } => format!("Project “{name}”"),
+        WriteSubject::Worktree { path, branch, .. } => match branch {
+            Some(branch) => format!("Worktree {} ({branch})", path.display()),
+            None => format!("Worktree {}", path.display()),
+        },
+    };
+    let mut line = format!(
+        "{subject} — {} · since {}",
+        write.category.label(),
+        unix_time_label(write.refused_at_unix_ms),
+    );
+    // Changing the card cannot supersede a refusal of the card
+    // itself, so name the remedy the generic guidance only implies.
+    if matches!(
+        write.subject,
+        WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
+    ) {
+        line.push_str(" · closing the card clears it");
+    }
+    match write.held_back {
+        0 => {}
+        1 => line.push_str(" · 1 worktree waits on it"),
+        count => line.push_str(&format!(" · {count} worktrees wait on it")),
+    }
+    line
+}
+
+fn save_quarantine_view<'a>(
+    health: &'a SaveHealthState,
+    path: &str,
+    card_title: impl Fn(CardId) -> Option<&'a str>,
+) -> Option<Element<'a, Message>> {
+    if health.quarantined.is_empty() {
+        return None;
+    }
+    let title = match health.quarantined.len() {
+        1 => "A change cannot be saved — storage refused it".to_owned(),
+        count => format!("{count} changes cannot be saved — storage refused them"),
+    };
+    let mut detail = health
+        .quarantined
+        .iter()
+        .map(|write| quarantined_write_line(write, &card_title))
+        .collect::<Vec<_>>();
+    detail.push(format!("Database: {path}"));
+    // An exhausted lane offers the one retry on its own notice; a retry
+    // re-offers these writes too, so a second button would only repeat it.
+    let lane_offers_retry = matches!(health.health, SessionSaveHealth::RetryExhausted { .. });
+    let (guidance, action) = if health.retry_requested {
+        ("Retry requested; waiting for the session writer.", None)
+    } else {
+        (
+            QUARANTINE_GUIDANCE,
+            (health.offers_retry() && !lane_offers_retry).then(|| {
+                notice_surface_action(
+                    NoticeSeverity::Error,
+                    "Retry save",
+                    "Offer the refused changes to storage again",
+                    widget::Id::new("session-save.retry"),
+                    Message::RetrySessionSave,
+                )
+            }),
+        )
+    };
+    let spacing = cosmic::theme::spacing();
+    Some(notice_surface(
+        NoticeSeverity::Error,
+        widget::column::with_children(vec![
+            notice_body(title),
+            notice_surface_detail(NoticeSeverity::Error, detail.join("\n")),
+            notice_surface_detail(NoticeSeverity::Error, guidance),
+        ])
+        .spacing(spacing.space_xxxs)
+        .width(Length::Fill)
+        .into(),
+        action,
+        false,
+    ))
+}
+
+fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, Message>> {
     let last_success = last_success_label(health.last_successful_flush_at_unix_ms);
     let (severity, title, detail, guidance, action): (
         _,
@@ -901,6 +1044,9 @@ fn session_health_stream(
                         revision: u64::MAX,
                         health: SessionSaveHealth::WriterUnavailable,
                         last_successful_flush_at_unix_ms: None,
+                        // The writer is gone, and with it every write it held;
+                        // the unavailable notice already says nothing saves.
+                        quarantined: Vec::new(),
                     },
                     (receiver, true),
                 )),
@@ -5138,7 +5284,7 @@ impl Cagents {
                 !matches!(
                     health.health,
                     SessionSaveHealth::Healthy | SessionSaveHealth::Recovered { .. }
-                )
+                ) || health.window_state_refused()
             })
         {
             return Task::none();
@@ -13010,6 +13156,7 @@ mod tests {
             revision,
             health,
             last_successful_flush_at_unix_ms,
+            quarantined: Vec::new(),
         }
     }
 
@@ -13038,6 +13185,7 @@ mod tests {
                     revision: u64::MAX,
                     health: SessionSaveHealth::WriterUnavailable,
                     last_successful_flush_at_unix_ms: None,
+                    quarantined: Vec::new(),
                 })
             );
             assert_eq!(stream.next().await, None);
@@ -13132,6 +13280,103 @@ mod tests {
         assert!(state.apply(health_event(6, SessionSaveHealth::WriterUnavailable, None,)));
         assert_eq!(state.last_successful_flush_at_unix_ms, Some(40));
         assert!(state.is_visible());
+    }
+
+    #[test]
+    fn refused_writes_keep_save_health_visible_beside_a_healthy_lane() {
+        let refused = |subject| QuarantinedWrite {
+            subject,
+            category: crate::session::SaveFailureCategory::InvalidData,
+            refused_at_unix_ms: 20,
+            held_back: 0,
+        };
+        let mut state = SaveHealthState::new(PathBuf::from("/exact/session.sqlite3"));
+        let mut event = health_event(1, SessionSaveHealth::Healthy, Some(10));
+        event.quarantined = vec![refused(WriteSubject::Project {
+            id: ProjectId::new(),
+            name: "poisoned".into(),
+        })];
+        assert!(state.apply(event));
+        assert!(
+            state.is_visible(),
+            "a healthy lane still reports what it refused"
+        );
+        assert!(state.offers_retry());
+        assert!(
+            !state.window_state_refused(),
+            "a refused catalog row leaves terminal handoffs free to commit"
+        );
+        assert_eq!(save_health_views(&state, |_| None).len(), 1);
+
+        let mut event = health_event(
+            2,
+            SessionSaveHealth::RetryExhausted {
+                category: crate::session::SaveFailureCategory::Busy,
+                first_failed_at_unix_ms: 30,
+                attempts: 4,
+            },
+            Some(10),
+        );
+        event.quarantined = vec![refused(WriteSubject::Workspace { card: None })];
+        assert!(state.apply(event));
+        assert!(state.window_state_refused());
+        assert_eq!(
+            save_health_views(&state, |_| None).len(),
+            2,
+            "the lane's failure and the refusal are separate notices"
+        );
+
+        state.retry_requested = true;
+        assert!(!state.offers_retry(), "one retry at a time");
+        assert!(state.apply(health_event(3, SessionSaveHealth::Healthy, Some(40))));
+        assert!(
+            !state.is_visible(),
+            "a superseded refusal leaves nothing to show"
+        );
+        assert!(!state.offers_retry());
+
+        let mut event = health_event(4, SessionSaveHealth::WriterUnavailable, Some(40));
+        event.quarantined = vec![refused(WriteSubject::Workspace { card: None })];
+        assert!(state.apply(event));
+        assert!(
+            !state.offers_retry(),
+            "a stopped writer cannot answer a retry"
+        );
+    }
+
+    #[test]
+    fn a_refused_card_is_named_with_its_remedy() {
+        let card = CardId::new();
+        let write = |subject| QuarantinedWrite {
+            subject,
+            category: crate::session::SaveFailureCategory::InvalidData,
+            refused_at_unix_ms: 20,
+            held_back: 0,
+        };
+        let titled = |id| (id == card).then_some("build");
+        let untitled = |_| None;
+
+        let snapshot = write(WriteSubject::Workspace { card: Some(card) });
+        let line = quarantined_write_line(&snapshot, &titled);
+        assert!(
+            line.starts_with("Window layout and cards (card “build” was refused)"),
+            "{line}"
+        );
+        assert!(line.contains("closing the card clears it"), "{line}");
+        let line = quarantined_write_line(&snapshot, &untitled);
+        assert!(line.contains("(one card was refused)"), "{line}");
+
+        let relaunch = write(WriteSubject::CardIdentity {
+            card,
+            kind: ReplacedIdentity::Terminal,
+        });
+        let line = quarantined_write_line(&relaunch, &titled);
+        assert!(line.starts_with("Relaunched terminal “build”"), "{line}");
+        assert!(line.contains("closing the card clears it"), "{line}");
+
+        let line = quarantined_write_line(&write(WriteSubject::Workspace { card: None }), &titled);
+        assert!(line.starts_with("Window layout and cards —"), "{line}");
+        assert!(!line.contains("closing the card"), "{line}");
     }
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
