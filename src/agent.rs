@@ -208,6 +208,15 @@ impl Provider {
         }
     }
 
+    /// Open the provider's own conversation picker rather than naming one.
+    pub(crate) fn append_resume_picker(self, arguments: &mut Vec<String>) {
+        if self.adapter().resume_precedes_options {
+            arguments.insert(0, self.resume_flag().into());
+        } else {
+            arguments.push(self.resume_flag().into());
+        }
+    }
+
     /// A filename alone is a convention, never proof that a process owns a session.
     pub fn session_file_id(self, path: &Path) -> Option<String> {
         (path.extension()?.to_str()? == "jsonl").then_some(())?;

@@ -7,8 +7,8 @@ use crate::model::{LaunchRecipe, TerminalSession};
 use std::{fs, io};
 use std::{os::unix::fs::MetadataExt, path::Path};
 
-/// Whether an upgrade starts fresh conversations for agents it cannot resume
-/// exactly, when the command names neither choice: the Settings preference
+/// Whether an upgrade relaunches agents it cannot resume exactly into their
+/// resume picker, when the command names neither choice: the Settings preference
 /// `relaunch_agents_on_upgrade` in `settings`, which is on by default.
 ///
 /// Only that key is read, so the CLI needs none of the UI's settings model.
@@ -33,18 +33,66 @@ pub fn relaunch_agents_by_default(settings: &Path) -> Result<bool, String> {
         .map_err(|error| format!("cannot read {}: {error}", settings.display()))
 }
 
-/// Automatic recovery never replays arbitrary command recipes.
+/// How a terminal comes back after its daemon is gone, and why.
 #[cfg(any(feature = "host", feature = "ui", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryKind {
+    /// The exact saved conversation resumes.
+    Exact,
+    /// A recognised agent without an exact conversation reopens its provider's
+    /// resume picker, so the conversation stays one choice away.
+    Picker,
+    /// A plain login shell relaunches.
+    Shell,
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl RecoveryKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact resume",
+            Self::Picker => "resume picker",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+/// Automatic recovery never replays arbitrary command recipes.
+#[cfg(any(feature = "host", test))]
 pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe, String> {
+    recovery_plan(session).map(|(recipe, _)| recipe)
+}
+
+/// The recipe `recovery_recipe` chooses, with the kind of recovery it is.
+///
+/// An agent the terminal was known to run is never downgraded to the shell it
+/// ran in: a shell would leave its conversation findable only by someone who
+/// knows where the provider keeps it.
+#[cfg(any(feature = "host", feature = "ui", test))]
+pub(crate) fn recovery_plan(
+    session: &TerminalSession,
+) -> Result<(LaunchRecipe, RecoveryKind), String> {
+    use crate::model::agent_recovery;
     if let Some(recipe) = session.agent_resume_recipe() {
-        return Ok(recipe);
+        return Ok((recipe, RecoveryKind::Exact));
+    }
+    // A recognised agent without exact identity: the hint's observed launch
+    // when it ran inside a shell, otherwise the terminal's own agent command.
+    if let Some(recipe) = session
+        .resume_hint
+        .as_deref()
+        .and_then(agent_recovery::observed_launch_from_hint)
+        .and_then(|launch| agent_recovery::picker_recipe(&launch))
+        .or_else(|| agent_recovery::picker_recipe(&session.launch))
+    {
+        return Ok((recipe, RecoveryKind::Picker));
     }
     if LaunchRecipe::shell(session.launch.working_directory.clone())
         .is_ok_and(|shell| shell == session.launch)
     {
-        return Ok(session.launch.clone());
+        return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
-    Err("This command has no exact agent identity and cannot safely be replayed; finish or close it before upgrading".into())
+    Err("This command has no agent identity and cannot safely be replayed; finish or close it before upgrading".into())
 }
 
 #[cfg(any(feature = "host", test))]
@@ -56,10 +104,14 @@ pub(crate) fn checkpoint_recipe(
         .iter()
         .find(|accepted| accepted.source == *session)
     {
-        if crate::model::agent_recovery::fresh_recipe(&accepted.recipe).as_ref()
-            != Some(&accepted.recipe)
+        use crate::model::agent_recovery;
+        if !agent_recovery::is_picker_recipe(&accepted.recipe)
+            && agent_recovery::fresh_recipe(&accepted.recipe).as_ref() != Some(&accepted.recipe)
         {
-            return Err("Accepted relaunch must be a fresh interactive agent recipe".into());
+            return Err(
+                "Accepted relaunch must be a resume picker or fresh interactive agent recipe"
+                    .into(),
+            );
         }
         return Ok(accepted.recipe.clone());
     }
@@ -877,8 +929,60 @@ mod tests {
                 .1,
             uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap()
         );
+        // A recognised agent without exact identity reopens its picker, never
+        // the newest conversation its latest-session shortcut would pick.
         source.launch.arguments = vec!["--continue".into()];
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (
+                LaunchRecipe {
+                    arguments: vec!["--resume".into()],
+                    ..source.launch.clone()
+                },
+                RecoveryKind::Picker
+            )
+        );
+        source.launch.arguments = vec!["repeat this prompt".into()];
         assert!(recovery_recipe(source).is_err());
+    }
+
+    #[test]
+    fn agent_without_exact_identity_reopens_its_picker_from_the_best_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        let source = &mut checkpoint.terminals[0].source;
+        let shell = source.launch.clone();
+        let claude = |arguments: &[&str]| LaunchRecipe {
+            program: "claude".into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+            ..shell.clone()
+        };
+        // An agent observed inside the shell reopens as that agent.
+        source.resume_hint = crate::model::agent_recovery::observed_hint_from_launch(&claude(&[
+            "--model", "sonnet",
+        ]));
+        let (recipe, kind) = recovery_plan(source).unwrap();
+        assert_eq!(kind, RecoveryKind::Picker);
+        assert_eq!(recipe, claude(&["--model", "sonnet", "--resume"]));
+        // An observation the picker cannot carry falls back to the terminal's
+        // own agent command, and to its shell when that is all it ran.
+        source.resume_hint =
+            crate::model::agent_recovery::observed_hint_from_launch(&claude(&["--unknown"]));
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (shell.clone(), RecoveryKind::Shell)
+        );
+        source.launch = claude(&["--bare"]);
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (claude(&["--bare", "--resume"]), RecoveryKind::Picker)
+        );
+        // An exact identity always wins over the picker.
+        source.launch = claude(&["--resume", "12345678-1234-4234-8234-123456789abc"]);
+        assert_eq!(recovery_plan(source).unwrap().1, RecoveryKind::Exact);
     }
 
     #[test]
@@ -908,6 +1012,17 @@ mod tests {
         let accepted = duplicate.terminals[0].relaunches[0].clone();
         duplicate.terminals[0].relaunches.push(accepted);
         assert!(duplicate.validate().is_err());
+        let mut picker = checkpoint.clone();
+        picker.terminals[0].relaunches[0].recipe.arguments = vec!["--resume".into()];
+        picker.terminals[0].recipe = picker.terminals[0].relaunches[0].recipe.clone();
+        picker.validate().unwrap();
+        let mut exact = picker.clone();
+        exact.terminals[0].relaunches[0]
+            .recipe
+            .arguments
+            .push("12345678-1234-4234-8234-123456789abc".into());
+        exact.terminals[0].recipe = exact.terminals[0].relaunches[0].recipe.clone();
+        assert!(exact.validate().is_err());
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]

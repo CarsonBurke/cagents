@@ -613,9 +613,10 @@ pub struct AppSettings {
     /// no Accounts pane is open.
     #[serde(default = "default_show_status_bar")]
     pub show_status_bar: bool,
-    /// Whether a daemon upgrade starts a fresh conversation for an agent whose
-    /// conversation cannot be resumed exactly, rather than refusing to
-    /// upgrade until it is closed. `cagents daemon prepare-upgrade` reads it
+    /// Whether a daemon upgrade relaunches an agent whose conversation cannot
+    /// be resumed exactly - into its provider's resume picker, or a fresh
+    /// conversation when it had none yet - rather than refusing to upgrade
+    /// until it is closed. `cagents daemon prepare-upgrade` reads it
     /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,

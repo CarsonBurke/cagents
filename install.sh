@@ -15,7 +15,7 @@ Options:
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
-  --relaunch-agents  With --restart-daemon, accept fresh launches for non-resumable agents
+  --relaunch-agents  With --restart-daemon, relaunch non-resumable agents into their resume picker
   --no-relaunch-agents  With --restart-daemon, refuse while agents are non-resumable
                      (without either, the installed CLI follows its Settings)
   --uninstall        Remove program files while preserving user data

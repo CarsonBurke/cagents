@@ -117,9 +117,11 @@ Success means the checkpoint was persisted and shutdown requested, so callers
 must still wait for `daemon status` to report stopped. Prefer the installer's
 `--restart-daemon` flow when replacing an installed release.
 
-An identified agent with no exact resume identity is relaunched as a fresh
-conversation by default: the checkpoint records the choice and its pane says
-**Relaunched after upgrade**. Turning off **Relaunch agents on upgrade** in
+An identified agent with no exact resume identity is relaunched into its
+provider's resume picker by default (`claude --resume`, `codex resume` or
+`omp --resume` with its original options), or as a fresh conversation when its
+provider reports it had none yet: the checkpoint records the choice and its
+pane says **Relaunched after upgrade**. Turning off **Relaunch agents on upgrade** in
 Settings (`relaunch_agents_on_upgrade = false` in `settings.toml`) makes the
 upgrade refuse instead and list every blocker. `daemon prepare-upgrade` reads
 that setting unless `--relaunch-agents` or `--no-relaunch-agents` chooses for
@@ -148,6 +150,25 @@ Daemon startup waiting scales with the checkpoint inventory, including a
 provider-confirmation allowance for each native chat. A missing listening socket
 does not mean shutdown is complete while the daemon still holds its inventory
 lease.
+
+### When the daemon stops without an upgrade
+
+A daemon that crashes, is killed or does not survive a reboot leaves no
+checkpoint, so the application recovers each terminal card from its saved
+record instead. The daemon keeps that record current for every terminal,
+including ones not on screen, by observing the foreground agent periodically.
+
+| Saved record | Recovery |
+|--------------|----------|
+| An exact agent conversation | Resumes that conversation |
+| An agent recognised without an exact conversation (for example mid-`/clear`) | Opens the provider's resume picker in the same directory with the original options |
+| A plain login shell | Starts a new shell |
+| Any other command | Waits for **Retry**; it is never replayed automatically |
+
+Each decision is logged at `info` level with the terminal ID, program and
+working directory: the checkpoint in `cagentsd.log` and card recovery in
+`cagents-ui.log`, both in the cagents data directory
+(`~/.local/share/cagents` by default).
 
 ### Failure and rollback
 

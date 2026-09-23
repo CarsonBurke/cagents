@@ -1120,6 +1120,20 @@ fn upgrade_error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
 
+/// How an upgrade restarts an agent it cannot resume exactly. Only an agent
+/// its provider says has no conversation yet starts a fresh one; any other
+/// reopens the provider's resume picker, so a conversation the agent moved to
+/// without cagents seeing it is still one choice away rather than lost.
+fn upgrade_relaunch(
+    agent: &crate::model::agent_recovery::AgentProcess,
+) -> Option<(crate::model::LaunchRecipe, &'static str)> {
+    use crate::model::agent_recovery;
+    if agent_recovery::fresh_omp_session(agent).is_some() {
+        return agent_recovery::fresh_recipe(&agent.recovery).map(|recipe| (recipe, "fresh"));
+    }
+    agent_recovery::picker_recipe(&agent.recovery).map(|recipe| (recipe, "resume picker"))
+}
+
 /// Names a terminal whose running job would be lost by the upgrade: what is
 /// running, where, and which terminal it is, so the user can find it in the
 /// sidebar without opening each one.
@@ -1148,7 +1162,7 @@ fn upgrade_blockers_message(blockers: &[String], relaunch_agents: bool) -> Strin
     message.push_str(if relaunch_agents {
         " Each runs a job that is not an agent cagents can relaunch:"
     } else {
-        " Identified agents can instead start fresh conversations: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
+        " Identified agents can instead be relaunched into their resume picker: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
     });
     for blocker in blockers {
         message.push_str("\n  ");
@@ -1411,13 +1425,28 @@ fn prepare_upgrade_with_policy(
                 .then(|| handle.observe_agent_process())
                 .flatten()
                 .filter(|agent| snapshot.only_agent_tree(agent.pid))
-                .and_then(|agent| crate::model::agent_recovery::fresh_recipe(&agent.recovery));
+                .and_then(|agent| upgrade_relaunch(&agent));
             match accepted {
-                Some(recipe) => relaunches.push(crate::terminal_ipc::UpgradeRelaunch {
-                    source: source.clone(),
-                    recipe,
-                }),
+                Some((recipe, kind)) => {
+                    tracing::info!(
+                        terminal = %source.id,
+                        program = %recipe.program,
+                        cwd = %recipe.working_directory.display(),
+                        relaunch = kind,
+                        "upgrade relaunches an agent without exact conversation identity"
+                    );
+                    relaunches.push(crate::terminal_ipc::UpgradeRelaunch {
+                        source: source.clone(),
+                        recipe,
+                    });
+                }
                 None => {
+                    tracing::info!(
+                        terminal = %source.id,
+                        program = %source.launch.program,
+                        relaunch_agents,
+                        "upgrade blocked by an active job without agent identity"
+                    );
                     blockers.push(describe_upgrade_blocker(&source));
                     continue;
                 }
@@ -1425,6 +1454,17 @@ fn prepare_upgrade_with_policy(
         }
         let recipe =
             crate::upgrade::checkpoint_recipe(&source, &relaunches).map_err(upgrade_error)?;
+        if !relaunches.iter().any(|accepted| accepted.source == source) {
+            tracing::info!(
+                terminal = %source.id,
+                program = %recipe.program,
+                cwd = %recipe.working_directory.display(),
+                active = snapshot.active,
+                recovery = crate::upgrade::recovery_plan(&source)
+                    .map_or("none", |(_, kind)| kind.label()),
+                "upgrade checkpoints a terminal"
+            );
+        }
         if let Some(execution) = execution_environment {
             validate_terminal_upgrade_environment(&recipe, &execution)?;
         }
@@ -2194,9 +2234,15 @@ mod tests {
         use crate::upgrade::handoff::Store;
         let directory = tempfile::tempdir().unwrap();
         // A real foreground process, recognized by its provider argv. Its
-        // executable is deliberately different from the recovery command.
+        // executable is deliberately different from the recovery command, and
+        // it ignores the resume picker selector a relaunch adds.
         let executable = directory.path().join("claude");
-        std::os::unix::fs::symlink("/bin/cat", &executable).unwrap();
+        fs::write(&executable, "#!/bin/bash\nexec -a \"$0\" /bin/cat\n").unwrap();
+        fs::set_permissions(
+            &executable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         let recipe = crate::model::LaunchRecipe {
             program: executable.to_string_lossy().into_owned(),
             arguments: Vec::new(),
@@ -2265,6 +2311,8 @@ mod tests {
                 executable.to_string_lossy()
             );
             assert!(!saved.terminals[0].relaunches.is_empty());
+            // With no conversation identified, the agent reopens its picker.
+            assert_eq!(saved.terminals[0].recipe.arguments, ["--resume"]);
             host = Arc::new(Mutex::new(test_host_with_incarnation(incarnation)));
             restore_upgrade_from(&host, Store::open(directory.path()).unwrap(), &empty_proc)
                 .unwrap();
