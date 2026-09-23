@@ -40,20 +40,23 @@ impl State {
     /// Starts deleting the worktree at `path` as a confirmed deletion does,
     /// for a test of what that refuses.
     #[cfg(test)]
-    pub(super) fn begin_deleting(&mut self, path: PathBuf) {
+    pub(super) fn begin_deleting(&mut self, path: PathBuf) -> Target {
+        let worktree = WorktreeId::new();
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(worktree),
+            repository: path.clone(),
+            label: String::new(),
+            path,
+        };
         self.deletions.insert(
-            WorktreeId::new(),
+            worktree,
             Deletion {
-                target: Target {
-                    project: ProjectId::new(),
-                    worktree: None,
-                    repository: path.clone(),
-                    label: String::new(),
-                    path,
-                },
+                target: target.clone(),
                 failure: None,
             },
         );
+        target
     }
 
     /// Whether `directory` is inside a worktree whose deletion is running.
@@ -453,8 +456,10 @@ impl Cagents {
                     }
                     self.sync_worktree_operation_rows();
                     // The worktree stays, so the cards the sweep held back
-                    // while it was going can mount again.
-                    return self.lifecycle_sweep();
+                    // while it was going can mount again, and the agents
+                    // whose rows waited on it can be attached.
+                    let sweep = self.lifecycle_sweep();
+                    return Task::batch([sweep, self.attach_next_restored_agent()]);
                 }
                 Ok(()) => {
                     if let Some(id) = target.worktree {

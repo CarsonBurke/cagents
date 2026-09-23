@@ -2848,8 +2848,9 @@ pub enum Message {
         committed: bool,
     },
     NewTerminal,
+    /// Polls the agents whose hibernation matches, or every agent for `None`.
     PollTerminalAgentActivity {
-        hibernated: bool,
+        hibernated: Option<bool>,
     },
     TerminalStarted {
         card: CardId,
@@ -4119,23 +4120,33 @@ impl Cagents {
         if self.terminal_starts_in_flight() > 0 {
             return Task::none();
         }
+        // A worktree being deleted is about to close its cards, so theirs
+        // wait: a deletion that fails leaves them to be attached after all.
+        let mut deleting = Vec::new();
+        let mut task = Task::none();
         while let Some(card) = self.restored_agent_attaches.pop_front() {
-            // A worktree being deleted is about to close the card anyway.
-            if !matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated)))
-                || self
-                    .card_state(card)
-                    .is_some_and(|state| self.project_ui.deleting_card(state))
+            if !matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))) {
+                continue;
+            }
+            if self
+                .card_state(card)
+                .is_some_and(|state| self.project_ui.deleting_card(state))
             {
+                deleting.push(card);
                 continue;
             }
             if let Some(session) = deferred_terminal_session(
                 self.card_state(card),
                 matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
             ) {
-                return self.attach_restored_agent(card, session);
+                task = self.attach_restored_agent(card, session);
+                break;
             }
         }
-        Task::none()
+        for card in deleting.into_iter().rev() {
+            self.restored_agent_attaches.push_front(card);
+        }
+        task
     }
 
     fn terminal_started(
@@ -9608,7 +9619,7 @@ impl Application for Cagents {
         );
         let task = match message {
             Message::PollTerminalAgentActivity { hibernated } => {
-                self.poll_terminal_agent_activity(Some(hibernated));
+                self.poll_terminal_agent_activity(hibernated);
                 Task::none()
             }
             Message::NewTerminal => match self.terminal_directory() {
@@ -16160,6 +16171,32 @@ mod tests {
             Some(CardRuntime::Terminal(surface)) => surface.visibility(),
             _ => panic!("expected an attached terminal"),
         }
+    }
+
+    /// An agent in a worktree being deleted waits in the queue rather than
+    /// leaving it, so a deletion that fails still has its row attached.
+    #[test]
+    fn an_agent_waits_out_its_worktrees_deletion_for_its_row_attach() {
+        let (mut app, card, session) = hibernated_agent_app(None);
+        let target = app
+            .project_ui
+            .begin_deleting(session.launch.working_directory.clone());
+        app.restored_agent_attaches.push_back(card);
+        drop(app.attach_next_restored_agent());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert_eq!(app.restored_agent_attaches, [card]);
+
+        let _ = app.update(Message::ProjectUi(project_ui::Action::Deleted {
+            target,
+            result: Err("the worktree has changes".into()),
+        }));
+        // The card is started, by the row attach or by the sweep hydrating it
+        // outright, and no hibernated agent is left waiting on the deletion.
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert!(app.restored_agent_attaches.iter().all(|queued| !matches!(
+            app.lifecycle.state(*queued),
+            Some((_, Residency::Hibernated))
+        )));
     }
 
     /// An attach for the row keeps the card hibernated, so it streams no

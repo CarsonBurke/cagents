@@ -185,6 +185,14 @@ impl Cagents {
 
     fn adopt_hosted_terminal(&mut self, session: TerminalSession) -> Task<Message> {
         let directory = session.launch.working_directory.clone();
+        // An agent is attached for its row as a restored one is, which needs
+        // it hibernated rather than cold; both hydrate alike once seen.
+        let observed = agent_ui::observes_terminal_agent(&session);
+        let residency = if observed {
+            Residency::Hibernated
+        } else {
+            Residency::Cold
+        };
         let matched = self.worktree_scope_for(&directory);
         // Where a user would look for it: the worktree that owns the launch
         // directory, and otherwise the workspace they are looking at.
@@ -200,11 +208,11 @@ impl Cagents {
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
             // Adoption is not a user action, so it claims no camera and no
-            // focus. The card enters cold and offscreen and is hydrated by the
-            // ordinary lifecycle sweep, which is also what admits it when the
-            // strip scrolls it into view.
+            // focus. The card enters offscreen - cold, or hibernated for an
+            // agent's row - and is hydrated by the ordinary lifecycle sweep,
+            // which is also what admits it when the strip scrolls it into view.
             exposure: Exposure::Offscreen,
-            residency: Residency::Cold,
+            residency: residency.clone(),
             kind: CardKind::Terminal(session),
         };
         let durable = Arc::make_mut(&mut self.durable);
@@ -218,17 +226,16 @@ impl Cagents {
             durable.card_scopes.insert(card_id, scope.clone());
         }
         self.cards.insert(card_id, CardRuntime::Loading);
-        self.lifecycle.register(
-            card_id,
-            Exposure::Offscreen,
-            Residency::Cold,
-            Instant::now(),
-        );
+        self.lifecycle
+            .register(card_id, Exposure::Offscreen, residency, Instant::now());
+        if observed {
+            self.restored_agent_attaches.push_back(card_id);
+        }
         // A channel strip shows exactly its own cards, and an adopted terminal
         // is not one of them. Another worktree's strip is rebuilt from the
         // durable cards when the user navigates there.
         if self.durable.active_channel.is_some() || scope != self.active_workspace {
-            return Task::none();
+            return self.attach_next_restored_agent();
         }
         let index = self.workspace.cards().len();
         match self.workspace.add_card(
@@ -241,10 +248,15 @@ impl Cagents {
             index,
             false,
         ) {
-            Ok(update) => self.apply_viewport(update, true, false),
+            // A card the strip shows at once hydrates instead, which the
+            // queued attach then skips.
+            Ok(update) => {
+                let viewport = self.apply_viewport(update, true, false);
+                Task::batch([viewport, self.attach_next_restored_agent()])
+            }
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
-                Task::none()
+                self.attach_next_restored_agent()
             }
         }
     }
@@ -361,6 +373,32 @@ mod tests {
         // observed repeatedly and must not accumulate cards.
         let _ = app.observe_hosted_terminals(vec![session.clone()]);
         assert_eq!(cards_for(&app, session.id).len(), 1);
+    }
+
+    /// An adopted agent reports what it is doing on its row before anyone
+    /// opens it, as a restored one does; an adopted shell stays cold.
+    #[test]
+    fn an_adopted_agent_is_attached_for_its_row() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
+        let _ = app.select_worktree("/repo".into(), false);
+        let shell = hosted("/repo/worktree");
+        let mut agent = hosted("/repo/worktree");
+        agent.launch.program = "/usr/bin/claude".into();
+
+        drop(app.observe_hosted_terminals(vec![shell.clone(), agent.clone()]));
+
+        let [shell, agent] = [shell, agent].map(|session| cards_for(&app, session.id)[0].id);
+        assert_eq!(
+            app.lifecycle.state(shell).map(|(_, residency)| residency),
+            Some(&Residency::Cold)
+        );
+        assert_eq!(
+            app.lifecycle.state(agent).map(|(_, residency)| residency),
+            Some(&Residency::Hibernated)
+        );
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 1);
     }
 
     #[test]

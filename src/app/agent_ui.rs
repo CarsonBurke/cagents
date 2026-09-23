@@ -19,9 +19,14 @@ pub(super) fn observes_terminal_agent(session: &TerminalSession) -> bool {
 
 /// How often the daemon is asked what the agent in a live pane is doing.
 const AGENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// An agent not opened this session drives only its sidebar row, which can
-/// trail the agent by a few seconds more than an open pane's can.
+/// A hibernated agent - restored and never opened, or evicted from memory -
+/// shows no pane, only its sidebar row, which can trail the agent by a few
+/// seconds more than an open pane's can.
 const HIBERNATED_AGENT_POLL_INTERVAL: Duration = Duration::from_secs(6);
+/// Every agent while the window is unfocused: a window on another monitor, or
+/// one glanced at from another application, still shows a turn ending, but
+/// nobody is typing into it.
+const UNFOCUSED_AGENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Cagents {
     /// Whether `card` runs an observed agent, and whether it is hibernated,
@@ -38,12 +43,9 @@ impl Cagents {
             .then(|| matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))))
     }
 
-    /// Polling stops while the window is unfocused, and regaining focus polls
-    /// every agent at once, so rows are current whenever they can be read.
+    /// Polling slows while the window is unfocused, and regaining focus polls
+    /// every agent at once, so rows are current whenever they are looked at.
     pub(super) fn terminal_agent_activity_subscription(&self) -> Subscription<Message> {
-        if !self.refresh_ui.focused {
-            return Subscription::none();
-        }
         let (mut live, mut hibernated) = (false, false);
         for (card, runtime) in &self.cards {
             if let CardRuntime::Terminal(_) = runtime {
@@ -54,16 +56,28 @@ impl Cagents {
                 }
             }
         }
+        if !self.refresh_ui.focused {
+            return if live || hibernated {
+                iced::time::every(UNFOCUSED_AGENT_POLL_INTERVAL)
+                    .map(|_| Message::PollTerminalAgentActivity { hibernated: None })
+            } else {
+                Subscription::none()
+            };
+        }
         Subscription::batch([
             if live {
-                iced::time::every(AGENT_POLL_INTERVAL)
-                    .map(|_| Message::PollTerminalAgentActivity { hibernated: false })
+                iced::time::every(AGENT_POLL_INTERVAL).map(|_| Message::PollTerminalAgentActivity {
+                    hibernated: Some(false),
+                })
             } else {
                 Subscription::none()
             },
             if hibernated {
-                iced::time::every(HIBERNATED_AGENT_POLL_INTERVAL)
-                    .map(|_| Message::PollTerminalAgentActivity { hibernated: true })
+                iced::time::every(HIBERNATED_AGENT_POLL_INTERVAL).map(|_| {
+                    Message::PollTerminalAgentActivity {
+                        hibernated: Some(true),
+                    }
+                })
             } else {
                 Subscription::none()
             },

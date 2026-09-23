@@ -404,8 +404,14 @@ impl ActivityWorker {
             .name(format!("cagentsd-activity-{client_id}"))
             .spawn(move || {
                 for query in received {
-                    observe_agent_activity(&host, client_id, &delivery, &cancelled, query);
-                    idle.store(false, Ordering::Release);
+                    observe_agent_activity(
+                        &host,
+                        client_id,
+                        &delivery,
+                        &cancelled,
+                        Admitted(&idle),
+                        query,
+                    );
                 }
             })
             .map_err(|error| {
@@ -423,11 +429,21 @@ impl ActivityWorker {
     }
 }
 
+/// A worker's admission of one query, released when the query is done with.
+struct Admitted<'a>(&'a AtomicBool);
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn observe_agent_activity(
     host: &SharedHost,
     client_id: ClientId,
     delivery: &Arc<DeliveryQueue>,
     cancelled: &Mutex<bool>,
+    admitted: Admitted<'_>,
     query: ActivityQuery,
 ) {
     let ActivityQuery {
@@ -499,6 +515,9 @@ fn observe_agent_activity(
         }
         Err(error) => ServerMessage::Error(error),
     };
+    // Released before the reply, which a client may answer with its next
+    // query at once.
+    drop(admitted);
     let _ = delivery.push(ServerEnvelope {
         version: PROTOCOL_VERSION,
         request_id: Some(request_id),
