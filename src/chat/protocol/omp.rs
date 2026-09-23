@@ -12,6 +12,8 @@ use std::{
 };
 
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+const MAX_IMAGE: u64 =
+    chat::AttachmentRules::for_provider(crate::agent::Provider::Omp).max_image_bytes;
 /// The same bound the Codex adapter puts on the items it keeps live, so the two
 /// adapters retain a comparable amount of a session's tool history.
 const MAX_CALLS: usize = 128;
@@ -510,8 +512,8 @@ impl Adapter for Omp {
                     let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
                     let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
                     if let Some(mime)=mime {
-                        let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take((MAX_PAYLOAD+1) as u64).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
-                        if bytes.len()>MAX_PAYLOAD {return Err("Image exceeds the 16 MiB attachment limit.".into());}
+                        let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take(MAX_IMAGE+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+                        if bytes.len() as u64>MAX_IMAGE {return Err("Image exceeds the 16 MiB attachment limit.".into());}
                         images.push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(bytes)}));
                     } else {
                         message.push_str("\nAttached file (read this exact path): "); message.push_str(&serde_json::to_string(&path.to_string_lossy()).map_err(|e|e.to_string())?);

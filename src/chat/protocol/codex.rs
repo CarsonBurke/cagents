@@ -499,12 +499,7 @@ impl Codex {
             } else {
                 self.cwd.join(attachment.path)
             };
-            let extension = path
-                .extension()
-                .and_then(|x| x.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+            if !crate::chat::is_image_path(&path) {
                 return Err("Codex native attachments support local images (PNG/JPEG/GIF/WebP), not arbitrary files".into());
             }
             if !path.is_file() {

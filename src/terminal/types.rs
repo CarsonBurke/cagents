@@ -127,6 +127,18 @@ pub struct KeyInput {
     pub unshifted_codepoint: Option<char>,
 }
 
+/// Where pasted text came from, which decides how much of it may act as keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PasteOrigin {
+    /// The reader pasted it, from the clipboard or the primary selection. A
+    /// line break in it enters the line, as it does in every terminal.
+    Clipboard,
+    /// A drag dropped it. The reader aimed at a pane, not at a command line,
+    /// and a drag source chooses its own text - a web page can make it
+    /// anything - so a drop never enters a line or presses a key of its own.
+    Drop,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MouseAction {
     Press,
@@ -182,4 +194,12 @@ pub enum TerminalSendError {
     Full,
     #[error("terminal worker has closed")]
     Closed,
+    /// Text larger than the daemon takes as one paste, refused before it is
+    /// sent: a request that large would not fit in a frame, and losing the
+    /// connection over it would lose the paste without a word.
+    #[error(
+        "cannot paste {0} bytes into a terminal at once; the limit is {limit} bytes",
+        limit = super::ipc::MAX_INPUT_BYTES
+    )]
+    PasteTooLarge(usize),
 }

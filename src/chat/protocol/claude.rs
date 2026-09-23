@@ -3,10 +3,11 @@
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
 use super::{Adapter, ProcessSpec, Step};
+use crate::agent::Provider;
 use crate::chat::{
-    Answer, Attachment, Capabilities, Choice, Command, CommandAction, Event, Field, Item,
-    ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SlashCommand, ToolStatus, Usage,
-    clock_label,
+    Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction, Event,
+    Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SlashCommand,
+    ToolStatus, Usage, clock_label,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -19,8 +20,9 @@ use std::{
 
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
-const MAX_IMAGE: u64 = 5 * 1024 * 1024;
-const MAX_DOCUMENT: u64 = 20 * 1024 * 1024;
+const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
+const MAX_IMAGE: u64 = ATTACHMENTS.max_image_bytes;
+const MAX_DOCUMENT: u64 = ATTACHMENTS.max_file_bytes.unwrap();
 const MAX_PAYLOAD: usize = 30 * 1024 * 1024;
 const HISTORY_PAGE: u64 = 4 * 1024 * 1024;
 const MAX_TEXT: usize = 1024 * 1024;
@@ -346,7 +348,7 @@ impl Claude {
         if self.busy {
             return Err("Claude is busy; interrupt or wait before sending another prompt".into());
         }
-        if text.len() > MAX_TEXT || attachments.len() > 8 {
+        if text.len() > MAX_TEXT || attachments.len() > ATTACHMENTS.max_count.unwrap() {
             return Err("Claude prompt exceeds the native transport limit".into());
         }
         if text.trim().is_empty() && attachments.is_empty() {

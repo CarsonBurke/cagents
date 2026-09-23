@@ -5,8 +5,8 @@ use crossbeam_channel::Receiver;
 use crate::model::HostSessionProof;
 
 use super::{
-    HostedTerminalHandle, KeyInput, MouseInput, RenderSnapshot, TerminalEvent, TerminalSendError,
-    TerminalSize,
+    HostedTerminalHandle, KeyInput, MouseInput, PasteOrigin, RenderSnapshot, TerminalEvent,
+    TerminalSendError, TerminalSize,
 };
 
 /// UI-side rendering and input surface backed by the daemon protocol.
@@ -59,6 +59,17 @@ impl TerminalSurface {
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.0.input(bytes)
+    }
+
+    /// Pastes text the way a terminal does: framed as a bracketed paste when
+    /// the child asked for one, and otherwise typed, with as much of it acting
+    /// as keys as `origin` allows; see [`PasteOrigin`].
+    pub fn paste(
+        &self,
+        text: impl Into<String>,
+        origin: PasteOrigin,
+    ) -> Result<(), TerminalSendError> {
+        self.0.paste(text, origin)
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
