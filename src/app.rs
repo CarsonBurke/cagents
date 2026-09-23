@@ -3421,20 +3421,12 @@ pub struct Cagents {
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
-    /// The generation of the latest load of each project, drawn from
-    /// `repository_load_sequence`.
+    /// The generation of the latest load of each project. Every generation is
+    /// drawn from `repository_load_sequence`, so generations of different
+    /// projects are ordered too: a load that reaches another project's
+    /// repository can tell whether that project has been loaded since it began.
     repository_generations: HashMap<ProjectId, u64>,
-    /// The generation of the latest load of each project that has landed,
-    /// whether it read the repository or failed to. A load is outstanding
-    /// until its generation is settled here.
-    repository_settled: HashMap<ProjectId, u64>,
-    /// Numbers every repository load, so loads of different projects are
-    /// ordered against each other and against the deletions below.
     repository_load_sequence: u64,
-    /// For each worktree this window deleted, the last load generation drawn
-    /// before Git confirmed the removal. A listing from that load or an
-    /// earlier one can still name the worktree; one begun later cannot.
-    deleted_worktrees: HashMap<crate::model::WorktreeId, u64>,
     worktree_dialog: Option<WorktreeDialog>,
     /// Resetting settings destroys every customization with no undo, so it
     /// confirms first like every other destructive action in the shell.
@@ -9221,9 +9213,7 @@ impl Application for Cagents {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
-            repository_settled: HashMap::new(),
             repository_load_sequence: 0,
-            deleted_worktrees: HashMap::new(),
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,
@@ -9582,20 +9572,6 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
-                // A deletion is remembered only while a load that may have
-                // listed the worktree before it went, this one included, is
-                // still outstanding.
-                let outstanding: Vec<u64> = self
-                    .repository_generations
-                    .iter()
-                    .filter(|(project, generation)| {
-                        self.repository_settled.get(project) < Some(generation)
-                    })
-                    .map(|(_, &generation)| generation)
-                    .collect();
-                self.deleted_worktrees
-                    .retain(|_, &mut deleted| outstanding.iter().any(|&load| load <= deleted));
-                self.repository_settled.insert(project_id, generation);
                 self.refresh_ui.projects.remove(&project_id);
                 let mut task = Task::none();
                 match result {
@@ -9628,42 +9604,29 @@ impl Application for Cagents {
                             })
                         {
                             // A load of that project which began after this
-                            // one and has landed already listed the
-                            // repository more recently, successfully or not;
-                            // this listing speaks for nothing that one did not.
-                            let stale = self
-                                .repository_settled
+                            // one lists the repository more recently, whether
+                            // it has landed yet or not, and it is also how a
+                            // deletion is followed up. This listing may still
+                            // name a worktree removed since, by this window or
+                            // anyone else, so adding from it could bring one
+                            // back, open; and the row's reloading or failed
+                            // state is that newer load's to settle.
+                            let superseded = self
+                                .repository_generations
                                 .get(&existing.id)
-                                .is_some_and(|&settled| settled > generation);
-                            let listed = if stale {
+                                .is_some_and(|&latest| latest > generation);
+                            let listed = if superseded {
                                 &[][..]
                             } else {
                                 // This read reached the same repository, so
                                 // whatever an earlier failure recorded about
-                                // the row it landed on no longer holds. A
-                                // newer load of it still under way keeps
-                                // the row reloading.
+                                // the row it landed on no longer holds.
                                 existing.unreachable = None;
-                                if self
-                                    .repository_generations
-                                    .get(&existing.id)
-                                    .is_none_or(|&latest| latest <= generation)
-                                {
-                                    existing.reloading = false;
-                                }
+                                existing.reloading = false;
                                 &loaded.worktrees[..]
                             };
                             for (record, status) in listed {
-                                // A worktree deleted after this listing began
-                                // is still in it; adding it would bring the
-                                // deleted worktree back, open.
-                                let deleted_since = self
-                                    .deleted_worktrees
-                                    .get(&record.id)
-                                    .is_some_and(|&deleted| generation <= deleted);
-                                if deleted_since
-                                    || existing.worktrees.iter().any(|known| known.id == record.id)
-                                {
+                                if existing.worktrees.iter().any(|known| known.id == record.id) {
                                     continue;
                                 }
                                 // A newly created linked worktree can be added
@@ -9690,7 +9653,6 @@ impl Application for Cagents {
                                 ));
                             }
                             self.repository_generations.remove(&project_id);
-                            self.repository_settled.remove(&project_id);
                             self.github_availability.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
@@ -17123,9 +17085,7 @@ mod tests {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
-            repository_settled: HashMap::new(),
             repository_load_sequence: 0,
-            deleted_worktrees: HashMap::new(),
             worktree_dialog: None,
             settings_reset_confirm: false,
             pull_request_dialog: None,

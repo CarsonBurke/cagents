@@ -10531,6 +10531,13 @@ struct WorktreeJournal {
     base_oid: Option<String>,
     #[serde(default)]
     existing_branch_oid: Option<String>,
+    /// The administrative directory Git keeps for the created worktree,
+    /// `<common dir>/worktrees/<name>`. Unlike its path, it stays with the
+    /// worktree when the worktree is moved, and no two live worktrees share
+    /// one. Absent until the worktree is known to be created, and in
+    /// journals written before it was recorded.
+    #[serde(default)]
+    admin_dir: Option<PathBuf>,
     outcome: Option<WorktreeCreationOutcome>,
     warnings: Vec<ProcessFailure>,
     detail: String,
@@ -10562,23 +10569,40 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
     .expect("byte slices and strings serialize")
 }
 
-/// Releases the identities held by the applied creations of `worktree`,
-/// which Git has just removed from the repository whose canonical common
-/// directory is `common_dir`, at the user's request.
+/// A worktree Git has just removed at the user's request, as it was right
+/// before the removal.
+#[derive(Debug, Clone)]
+pub struct RemovedWorktree {
+    /// The canonical common directory of its repository.
+    pub common_dir: PathBuf,
+    /// Its canonical administrative directory; see [`RepositoryService::git_dir`].
+    pub admin_dir: PathBuf,
+    pub path: PathBuf,
+    /// The branch it had checked out, as a full ref.
+    pub branch: Option<String>,
+}
+
+/// Releases the identities held by the applied creations of `removed`.
 ///
 /// An applied creation keeps its identity so that a replay of the request
 /// cannot run while what it made exists. Once the user has deleted the
 /// worktree there is nothing left to protect, and holding on would refuse
-/// creating the same worktree again for good (#269). A creation is known by
-/// its repository and the path it made the worktree at, so a worktree moved
-/// or removed outside the app keeps its creation's identity: nothing here
-/// saw the user ask for that.
+/// creating the same worktree again for good (#269).
+///
+/// A creation is known to have made `removed` by the administrative
+/// directory it recorded, which follows the worktree wherever it was moved
+/// and is never shared by two live worktrees, so a creation whose worktree
+/// still exists is never released. A creation recorded before that directory
+/// was must have been made at the removed path on the branch the removed
+/// worktree had checked out; Git refuses checking a branch out twice, so its
+/// worktree cannot be live elsewhere on that branch. A worktree removed
+/// outside the app keeps its creation's identity: nothing here saw the user
+/// ask for that.
 ///
 /// Every matching creation is attempted; the failures are returned.
 pub fn release_deleted_worktree_creations(
     store: &StateStore,
-    common_dir: &Path,
-    worktree: &Path,
+    removed: &RemovedWorktree,
 ) -> Result<(), Vec<StoreError>> {
     let mut failures = Vec::new();
     let operations = store
@@ -10591,7 +10615,7 @@ pub fn release_deleted_worktree_creations(
         let Ok(journal) = serde_json::from_value::<WorktreeJournal>(operation.payload) else {
             continue;
         };
-        if journal.created(common_dir, worktree)
+        if journal.created(removed)
             && let Err(error) = store.release_worktree_creation(operation.id)
         {
             failures.push(error);
@@ -10730,15 +10754,19 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 }
 
 impl WorktreeJournal {
-    /// Whether this creation made the worktree at `path` in the repository
-    /// whose canonical common directory is `common_dir`.
-    fn created(&self, common_dir: &Path, path: &Path) -> bool {
-        self.common_dir == common_dir
-            && (self.request.destination == path
-                || matches!(
-                    &self.outcome,
-                    Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.path == path
-                ))
+    /// Whether this creation made `removed`; see
+    /// [`release_deleted_worktree_creations`].
+    fn created(&self, removed: &RemovedWorktree) -> bool {
+        if self.common_dir != removed.common_dir {
+            return false;
+        }
+        match &self.admin_dir {
+            Some(admin_dir) => *admin_dir == removed.admin_dir,
+            None => {
+                self.request.destination == removed.path
+                    && removed.branch.as_deref() == Some(self.request.branch.full_ref().as_str())
+            }
+        }
     }
 
     fn report(&self, created_at_unix_ms: i64) -> WorktreeOperationReport {
@@ -10804,6 +10832,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         )?;
         Ok(
             fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
+                .map_err(|e| ValidationError::Io(e.to_string()))?,
+        )
+    }
+
+    /// The canonical Git directory of `worktree`: for a linked worktree, the
+    /// administrative directory Git keeps for it in the common directory.
+    pub fn git_dir(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-dir"],
+            ),
+            cancellation,
+        )?;
+        Ok(
+            fs::canonicalize(parse_path_line(&output.stdout, "git_dir")?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }
@@ -11210,6 +11258,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             checkout_completed: false,
             base_oid: None,
             existing_branch_oid,
+            admin_dir: None,
             outcome: None,
             warnings: Vec::new(),
             detail: "Prepared durable worktree request".into(),
@@ -11316,8 +11365,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     && worktree.lock.reason.as_deref()
                         == Some(format!("cagents:{}", journal.request.operation_id).as_str())
             });
-        let destination_matches = self.created_destination_evidence(journal);
-        if residual.branch_exists && owned && destination_matches {
+        let admin_dir = self.created_admin_dir(journal);
+        if residual.branch_exists && owned && admin_dir.is_some() {
+            journal.admin_dir = admin_dir;
             journal.state = WorktreeOperationState::Created;
             journal.outcome = Some(WorktreeCreationOutcome::Created {
                 worktree: residual.registered_worktree.expect("ownership checked"),
@@ -11351,26 +11401,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
-    fn created_destination_evidence(&self, journal: &WorktreeJournal) -> bool {
+    /// The created worktree's administrative directory, when the destination
+    /// is evidently the worktree this journal created.
+    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<PathBuf> {
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
         if fs::canonicalize(destination).ok().as_ref() != Some(destination) {
-            return false;
+            return None;
         }
-        let git_dir = self
-            .run_checked(
-                &self.git_read(
-                    destination,
-                    ["rev-parse", "--path-format=absolute", "--git-dir"],
-                ),
-                &token,
-            )
-            .ok()
-            .and_then(|output| parse_path_line(&output.stdout, "git_dir").ok())
-            .and_then(|path| fs::canonicalize(path).ok());
-        let Some(git_dir) = git_dir else {
-            return false;
-        };
+        let git_dir = self.git_dir(destination, &token).ok()?;
         // A linked worktree must resolve to its own administrative directory,
         // whose backlink names exactly this destination's .git file.
         if git_dir.parent() != Some(journal.common_dir.join("worktrees").as_path())
@@ -11386,15 +11425,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .as_ref()
                 != Some(&journal.common_dir)
         {
-            return false;
+            return None;
         }
         if journal.checkout_completed {
-            return true;
+            return Some(git_dir);
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
         // comparison; partial checkout and subsequent edits remain unknown.
-        fs::symlink_metadata(git_dir.join("index")).is_ok_and(|metadata| metadata.is_file())
+        let clean = fs::symlink_metadata(git_dir.join("index"))
+            .is_ok_and(|metadata| metadata.is_file())
             && self
                 .run_checked(
                     &self.git_read(
@@ -11403,7 +11443,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ),
                     &token,
                 )
-                .is_ok_and(|output| output.stdout.is_empty())
+                .is_ok_and(|output| output.stdout.is_empty());
+        clean.then_some(git_dir)
     }
 
     /// Only the original live request may clean up its own Git lock. Startup
@@ -11658,6 +11699,40 @@ mod worktree_journal_tests {
             }
         }
 
+        /// The worktree at `path` as the app describes it before deleting it.
+        fn removal(&self, path: &Path) -> RemovedWorktree {
+            let cancellation = CancellationToken::new();
+            let branch = self
+                .service
+                .list_worktrees(&self.request.repository, &cancellation)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.path == path)
+                .unwrap()
+                .branch;
+            RemovedWorktree {
+                common_dir: self
+                    .service
+                    .common_dir(&self.request.repository, &cancellation)
+                    .unwrap(),
+                admin_dir: self.service.git_dir(path, &cancellation).unwrap(),
+                path: path.to_path_buf(),
+                branch,
+            }
+        }
+
+        /// The journal of the creation `id`.
+        fn journal(&self, id: OperationId) -> WorktreeJournal {
+            let operation = self
+                .store
+                .journaled_worktree_operations()
+                .unwrap()
+                .into_iter()
+                .find(|operation| operation.id == id)
+                .unwrap();
+            serde_json::from_value(operation.payload).unwrap()
+        }
+
         /// Whether the creation `id` still holds its identity.
         fn holds(&self, id: OperationId) -> bool {
             self.store
@@ -11764,13 +11839,10 @@ mod worktree_journal_tests {
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         let destination = fixture.request.destination.clone();
+        let removed = fixture.removal(&destination);
         fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
 
-        let common_dir = fixture
-            .service
-            .common_dir(&fixture.request.repository, &CancellationToken::new())
-            .unwrap();
-        release_deleted_worktree_creations(&fixture.store, &common_dir, &destination).unwrap();
+        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
         assert!(
             !fixture.holds(report.operation_id),
             "the applied creation still holds its identity"
@@ -11787,9 +11859,9 @@ mod worktree_journal_tests {
         assert!(destination.join("tracked.txt").is_file());
     }
 
-    /// Only the creation that made the deleted worktree is released: not the
-    /// one of a worktree still listed, nor one whose repository differs, nor
-    /// one moved outside the app since.
+    /// Only the creation that made the deleted worktree is released: not one
+    /// of another repository, nor one whose worktree was moved away from the
+    /// deleted path and is still live, while one moved and then deleted is.
     #[test]
     fn a_deletion_releases_only_the_creation_of_the_worktree_it_removed() {
         let mut fixture = Fixture::new();
@@ -11798,41 +11870,78 @@ mod worktree_journal_tests {
         assert_eq!(doomed.state, WorktreeOperationState::Created, "{doomed:?}");
         let destination = fixture.request.destination.clone();
         fixture.resolve(fixture.input("bar"));
-        let kept = fixture.run(&CancellationToken::new());
-        assert_eq!(kept.state, WorktreeOperationState::Created, "{kept:?}");
+        let moved = fixture.run(&CancellationToken::new());
+        assert_eq!(moved.state, WorktreeOperationState::Created, "{moved:?}");
         let moved_from = fixture.request.destination.clone();
-        let common_dir = fixture
-            .service
-            .common_dir(&fixture.request.repository, &CancellationToken::new())
-            .unwrap();
 
-        let elsewhere = tempfile::tempdir().unwrap();
-        release_deleted_worktree_creations(
-            &fixture.store,
-            &fs::canonicalize(elsewhere.path()).unwrap(),
-            &destination,
-        )
-        .unwrap();
+        let mut other_repository = fixture.removal(&destination);
+        other_repository.common_dir = PathBuf::from("/elsewhere/.git");
+        release_deleted_worktree_creations(&fixture.store, &other_repository).unwrap();
         assert!(
             fixture.holds(doomed.operation_id),
             "another repository's deletion released this creation"
         );
 
-        let moved = moved_from.with_file_name("moved");
+        // `bar` is moved outside the app, and another worktree takes its old
+        // path. Deleting that one leaves the live `bar`'s identity alone.
+        let moved_to = moved_from.with_file_name("moved");
         fixture.git(&[
             "worktree",
             "move",
             moved_from.to_str().unwrap(),
-            moved.to_str().unwrap(),
+            moved_to.to_str().unwrap(),
         ]);
-        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
-        release_deleted_worktree_creations(&fixture.store, &common_dir, &destination).unwrap();
-        fixture.git(&["worktree", "remove", moved.to_str().unwrap()]);
-        release_deleted_worktree_creations(&fixture.store, &common_dir, &moved).unwrap();
-        assert!(!fixture.holds(doomed.operation_id));
+        fixture.git(&[
+            "worktree",
+            "add",
+            "-b",
+            "squatter",
+            moved_from.to_str().unwrap(),
+        ]);
+        let squatter = fixture.removal(&moved_from);
+        fixture.git(&["worktree", "remove", moved_from.to_str().unwrap()]);
+        release_deleted_worktree_creations(&fixture.store, &squatter).unwrap();
         assert!(
-            fixture.holds(kept.operation_id),
-            "a creation moved outside the app since was released"
+            fixture.holds(moved.operation_id),
+            "deleting the worktree at its old path released the live creation"
+        );
+
+        let removed = fixture.removal(&destination);
+        fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
+        assert!(!fixture.holds(doomed.operation_id));
+        assert!(fixture.holds(moved.operation_id));
+
+        let removed = fixture.removal(&moved_to);
+        fixture.git(&["worktree", "remove", moved_to.to_str().unwrap()]);
+        release_deleted_worktree_creations(&fixture.store, &removed).unwrap();
+        assert!(
+            !fixture.holds(moved.operation_id),
+            "deleting the moved worktree kept its creation's identity"
+        );
+    }
+
+    /// A creation journaled before administrative directories were recorded
+    /// is the removed worktree's only at the same path on the same branch.
+    #[test]
+    fn a_creation_without_its_admin_dir_is_matched_by_path_and_branch() {
+        let mut fixture = Fixture::new();
+        fixture.resolve(fixture.input("foo"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let destination = fixture.request.destination.clone();
+        let mut journal = fixture.journal(report.operation_id);
+        let removed = fixture.removal(&destination);
+        assert_eq!(journal.admin_dir.as_ref(), Some(&removed.admin_dir));
+
+        journal.admin_dir = None;
+        assert!(journal.created(&removed));
+        let mut elsewhere = removed.clone();
+        elsewhere.admin_dir = PathBuf::from("/nonexistent");
+        elsewhere.branch = Some("refs/heads/squatter".into());
+        assert!(
+            !journal.created(&elsewhere),
+            "another branch at the same path was taken for this creation"
         );
     }
 

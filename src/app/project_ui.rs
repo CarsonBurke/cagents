@@ -1,5 +1,5 @@
 use super::*;
-use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
     model::WorktreeId,
@@ -459,8 +459,6 @@ impl Cagents {
                 Ok(()) => {
                     if let Some(id) = target.worktree {
                         self.project_ui.deletions.remove(&id);
-                        self.deleted_worktrees
-                            .insert(id, self.repository_load_sequence);
                     }
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
@@ -612,14 +610,11 @@ impl Cagents {
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let common_dir = delete_worktree(&request)?;
+                let removed = delete_worktree(&request)?;
                 if let Some(store) = store
-                    && let Some(common_dir) = common_dir
-                    && let Err(errors) = crate::repository::release_deleted_worktree_creations(
-                        &store,
-                        &common_dir,
-                        &request.path,
-                    )
+                    && let Some(removed) = removed
+                    && let Err(errors) =
+                        crate::repository::release_deleted_worktree_creations(&store, &removed)
                 {
                     // The worktree is gone either way; what stays held is
                     // only the chance to create the same one again.
@@ -982,9 +977,9 @@ fn close_worktree_sessions(target: &Target) -> Result<(), String> {
 /// moments ago. The deletion is recorded in the catalog afterwards, on the same
 /// ordered lane as every other catalog write.
 ///
-/// Returns the repository's canonical common directory, by which the removed
-/// worktree's creation is released, or `None` when it cannot be read.
-fn delete_worktree(target: &Target) -> Result<Option<PathBuf>, String> {
+/// Returns what was removed, by which its creation is released, or `None`
+/// when Git could not say where the worktree's administrative files were.
+fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     let id = target
         .worktree
         .ok_or("The primary repository cannot be deleted.")?;
@@ -1011,13 +1006,21 @@ fn delete_worktree(target: &Target) -> Result<Option<PathBuf>, String> {
     {
         return Err("The worktree has changes; commit, stash, or discard them first.".into());
     }
-    let common_dir = service
+    let removed = service
         .common_dir(&target.repository, &cancellation)
+        .and_then(|common_dir| {
+            Ok(RemovedWorktree {
+                common_dir,
+                admin_dir: service.git_dir(&target.path, &cancellation)?,
+                path: target.path.clone(),
+                branch: record.branch.clone(),
+            })
+        })
         .inspect_err(|error| {
             tracing::warn!(
-                repository = %target.repository.display(),
+                worktree = %target.path.display(),
                 %error,
-                "could not read the common directory of a worktree being deleted"
+                "could not identify a worktree being deleted"
             );
         })
         .ok();
@@ -1044,7 +1047,7 @@ fn delete_worktree(target: &Target) -> Result<Option<PathBuf>, String> {
             return Err(error.reported_detail());
         }
     }
-    Ok(common_dir)
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1361,8 +1364,8 @@ mod tests {
     }
 
     /// A load that reached this repository under another project entry, with
-    /// a listing taken before the deletion, lands after it. The deleted
-    /// worktree is the one thing that listing no longer speaks for.
+    /// a listing taken before the deletion, lands after it. A load of the
+    /// project begun since speaks for the repository instead.
     #[test]
     fn a_listing_older_than_a_deletion_cannot_bring_the_worktree_back() {
         let directory = tempfile::tempdir().unwrap();
@@ -1388,9 +1391,11 @@ mod tests {
         )
         .unwrap();
         app.session = Some(session);
-        let load = || {
-            super::super::load_repository(&repository, None, CancellationToken::default()).unwrap()
+        let load_as = |project| {
+            super::super::load_repository(&repository, project, CancellationToken::default())
+                .unwrap()
         };
+        let load = || load_as(None);
         let loaded = |app: &mut Cagents, project_id, repository, open_cards| {
             let generation = app.repository_generations[&project_id];
             drop(app.update(Message::RepositoryLoaded {
@@ -1459,18 +1464,18 @@ mod tests {
             target,
             result: Ok(()),
         });
+        // The deletion's follow-up load of the project has begun, so the
+        // older listing lands superseded: it neither brings the worktree
+        // back nor settles the row that follow-up is reloading.
+        assert!(app.sidebar_model.projects[0].reloading);
         loaded(&mut app, alias, stale, false);
-
         assert!(
             row(&app, id).is_none(),
             "the stale listing re-added the row"
         );
         assert!(
-            app.sidebar_model.projects[0]
-                .worktrees
-                .iter()
-                .any(|worktree| worktree.path == second_path),
-            "the rest of an older listing still counts"
+            app.sidebar_model.projects[0].reloading,
+            "the stale listing settled the follow-up load"
         );
         let session = app.session.as_ref().unwrap();
         session.flush(Duration::from_secs(5)).unwrap();
@@ -1484,10 +1489,18 @@ mod tests {
                 .is_open(),
             "the stale listing reopened the catalog row"
         );
+        // What that listing had that was new, the follow-up lists too.
+        loaded(&mut app, project, load_as(Some(project)), false);
+        assert!(row(&app, id).is_none());
+        assert!(
+            app.sidebar_model.projects[0]
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == second_path)
+        );
 
-        // A worktree removed outside the app is not one this window deleted.
-        // Once a load of the project begun after the older listing has
-        // landed without it, that listing cannot bring it back either.
+        // A worktree removed outside the app is caught the same way, and a
+        // newer load's failure is not erased by the older success.
         let external = root.join("external");
         git(
             &repository,
@@ -1507,19 +1520,45 @@ mod tests {
             &["worktree", "remove", external.to_str().unwrap()],
         );
         let _ = app.repository_load_task(repository.clone(), Some(project), false);
-        loaded(&mut app, project, load(), false);
+        let generation = app.repository_generations[&project];
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation,
+            result: Err("fixture: unreadable".into()),
+        }));
         loaded(&mut app, alias, older, false);
+        let row_state = &app.sidebar_model.projects[0];
         assert!(
-            !app.sidebar_model.projects[0]
+            !row_state
                 .worktrees
                 .iter()
                 .any(|worktree| worktree.path == external),
             "an older listing brought back a worktree removed outside the app"
         );
         assert!(
-            app.deleted_worktrees.is_empty(),
-            "a deletion is remembered after every load that could list it landed"
+            row_state.unreachable.is_some(),
+            "an older success erased a newer failure"
         );
+
+        // A listing no load of the project has overtaken still adds what the
+        // project has not listed yet.
+        let later = root.join("later");
+        git(
+            &repository,
+            &["worktree", "add", "-b", "later", later.to_str().unwrap()],
+        );
+        let alias = ProjectId::new();
+        let _ = app.repository_load_task(repository.clone(), Some(alias), false);
+        loaded(&mut app, alias, load(), false);
+        let row_state = &app.sidebar_model.projects[0];
+        assert!(
+            row_state
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == later)
+        );
+        assert!(row_state.unreachable.is_none());
     }
 
     fn git(directory: &Path, arguments: &[&str]) {
