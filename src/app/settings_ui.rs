@@ -467,6 +467,22 @@ fn settings_category_controls<'a>(
                     ),
                 )],
             ),
+            settings_group(
+                "Upgrades",
+                "Replacing the daemon checkpoints terminals and conversations, then resumes them.",
+                vec![setting_field(
+                    "Unresumable agents",
+                    "Start a fresh conversation for an agent whose conversation cannot be resumed exactly, instead of refusing the upgrade. Other running jobs still block it.",
+                    crate::settings_widgets::toggle(
+                        "Relaunch agents on upgrade",
+                        draft.relaunch_agents_on_upgrade,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::RelaunchAgentsOnUpgrade,
+                            value: enabled.to_string(),
+                        },
+                    ),
+                )],
+            ),
         ],
         SettingsCategory::Links => vec![settings_group(
             "Link handling",

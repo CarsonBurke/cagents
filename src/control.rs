@@ -133,9 +133,13 @@ pub enum DaemonCommand {
         /// Authorize interruption and resumption of all supported hosted sessions.
         #[arg(long)]
         yes: bool,
-        /// Accept starting fresh conversations for identified agents without an exact resume ID.
-        #[arg(long)]
+        /// Start fresh conversations for identified agents without an exact resume ID.
+        /// Without this or --no-relaunch-agents, Settings decides; it defaults to on.
+        #[arg(long, conflicts_with = "no_relaunch_agents")]
         relaunch_agents: bool,
+        /// Refuse the upgrade while identified agents have no exact resume ID.
+        #[arg(long)]
+        no_relaunch_agents: bool,
     },
     /// Archive an interrupted upgrade checkpoint without resuming its processes.
     AbandonUpgrade {
@@ -1618,6 +1622,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         DaemonCommand::PrepareUpgrade {
             yes,
             relaunch_agents,
+            no_relaunch_agents,
         } => {
             if !yes {
                 return Err(AppError::new(
@@ -1625,6 +1630,21 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "full upgrade interrupts hosted processes; pass --yes to checkpoint and resume supported sessions",
                 ));
             }
+            let relaunch_agents = if relaunch_agents || no_relaunch_agents {
+                relaunch_agents
+            } else {
+                crate::instance::settings_path()
+                    .ok_or_else(|| "no settings directory is available".to_owned())
+                    .and_then(|settings| crate::upgrade::relaunch_agents_by_default(&settings))
+                    .map_err(|error| {
+                        AppError::new(
+                            "settings",
+                            format!(
+                                "{error}; pass --relaunch-agents or --no-relaunch-agents to choose explicitly"
+                            ),
+                        )
+                    })?
+            };
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
@@ -2403,6 +2423,31 @@ mod tests {
             } => confirm,
             other => panic!("expected a daemon stop command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn upgrade_relaunch_choice_is_explicit_either_way_or_left_to_settings() {
+        let parsed = |arguments: &[&str]| {
+            let arguments = ["cagents", "daemon", "prepare-upgrade", "--yes"]
+                .into_iter()
+                .chain(arguments.iter().copied());
+            match Cli::try_parse_from(arguments).map(|cli| cli.command) {
+                Ok(TopCommand::Daemon {
+                    command:
+                        DaemonCommand::PrepareUpgrade {
+                            relaunch_agents,
+                            no_relaunch_agents,
+                            ..
+                        },
+                }) => Some((relaunch_agents, no_relaunch_agents)),
+                Ok(other) => panic!("expected an upgrade command, got {other:?}"),
+                Err(_) => None,
+            }
+        };
+        assert_eq!(parsed(&[]), Some((false, false)));
+        assert_eq!(parsed(&["--relaunch-agents"]), Some((true, false)));
+        assert_eq!(parsed(&["--no-relaunch-agents"]), Some((false, true)));
+        assert_eq!(parsed(&["--relaunch-agents", "--no-relaunch-agents"]), None);
     }
 
     #[test]

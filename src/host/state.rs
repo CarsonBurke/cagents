@@ -1137,13 +1137,19 @@ fn describe_upgrade_blocker(source: &TerminalSession) -> String {
     )
 }
 
-fn upgrade_blockers_message(blockers: &[String]) -> String {
+fn upgrade_blockers_message(blockers: &[String], relaunch_agents: bool) -> String {
     // "Active work" is narrower than it sounds, and the message says so: the
     // session's process cannot be resumed after the daemon restarts, only
     // started again, and the upgrade will not make that choice for the user.
     let mut message = String::from(
-        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading. For identified agents, --relaunch-agents accepts starting fresh conversations; unrelated shell jobs still block the upgrade:",
+        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading.",
     );
+    // With relaunching accepted, whatever still blocks is no identified agent.
+    message.push_str(if relaunch_agents {
+        " Each runs a job that is not an agent cagents can relaunch:"
+    } else {
+        " Identified agents can instead start fresh conversations: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
+    });
     for blocker in blockers {
         message.push_str("\n  ");
         message.push_str(blocker);
@@ -1438,7 +1444,10 @@ fn prepare_upgrade_with_policy(
         frozen.push(snapshot);
     }
     if !blockers.is_empty() {
-        return Err(upgrade_error(upgrade_blockers_message(&blockers)));
+        return Err(upgrade_error(upgrade_blockers_message(
+            &blockers,
+            relaunch_agents,
+        )));
     }
     let checkpoint = Checkpoint::new(proof, saved, chats);
     let counts = (

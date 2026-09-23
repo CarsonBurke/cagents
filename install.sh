@@ -16,6 +16,8 @@ Options:
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
   --relaunch-agents  With --restart-daemon, accept fresh launches for non-resumable agents
+  --no-relaunch-agents  With --restart-daemon, refuse while agents are non-resumable
+                     (without either, the installed CLI follows its Settings)
   --uninstall        Remove program files while preserving user data
   --purge            Uninstall and also remove cagents user data
   --help             Show this help
@@ -38,7 +40,7 @@ UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
 REQUIRE_EMPTY_DAEMON=0
-RELAUNCH_AGENTS=0
+RELAUNCH_AGENTS=
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -58,6 +60,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --relaunch-agents)
             RELAUNCH_AGENTS=1
+            shift
+            ;;
+        --no-relaunch-agents)
+            RELAUNCH_AGENTS=0
             shift
             ;;
         --require-empty-daemon)
@@ -83,8 +89,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ "$RELAUNCH_AGENTS" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
-    || fail '--relaunch-agents requires --restart-daemon'
+[ -z "$RELAUNCH_AGENTS" ] || [ "$RESTART_DAEMON" -eq 1 ] \
+    || fail '--relaunch-agents and --no-relaunch-agents require --restart-daemon'
 [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
     || fail '--require-empty-daemon requires --restart-daemon'
 
@@ -207,12 +213,17 @@ prepare_daemon_upgrade() {
         fail 'the installed CLI cannot checkpoint upgrades; for the one-time legacy bootstrap, finish sessions or explicitly terminate disposable sessions with the installed CLI, then retry after its daemon exits; installation was not changed'
     fi
     set -- --yes
-    if [ "$RELAUNCH_AGENTS" -eq 1 ]; then
+    if [ -n "$RELAUNCH_AGENTS" ]; then
         relaunch_help=$("$daemon_cli" daemon prepare-upgrade --help 2>/dev/null) \
             || fail 'cannot inspect installed upgrade support; installation was not changed'
-        printf '%s\n' "$relaunch_help" | awk '$1 == "--relaunch-agents" { supported = 1 } END { exit !supported }' \
-            || fail 'the installed CLI cannot record agent relaunch acceptance; finish blocking sessions before upgrading; installation was not changed'
-        set -- "$@" --relaunch-agents
+        if [ "$RELAUNCH_AGENTS" -eq 1 ]; then
+            printf '%s\n' "$relaunch_help" | awk '$1 == "--relaunch-agents" { supported = 1 } END { exit !supported }' \
+                || fail 'the installed CLI cannot record agent relaunch acceptance; finish blocking sessions before upgrading; installation was not changed'
+            set -- "$@" --relaunch-agents
+        # A CLI older than the setting never relaunches unless asked to.
+        elif printf '%s\n' "$relaunch_help" | awk '$1 == "--no-relaunch-agents" { supported = 1 } END { exit !supported }'; then
+            set -- "$@" --no-relaunch-agents
+        fi
     fi
     "$daemon_cli" --json daemon prepare-upgrade "$@" >/dev/null \
         || fail 'daemon checkpoint preparation failed; installation was not changed'
