@@ -2848,7 +2848,10 @@ pub enum Message {
         committed: bool,
     },
     NewTerminal,
-    PollTerminalAgentActivity,
+    /// Polls the agents whose hibernation matches, or every agent for `None`.
+    PollTerminalAgentActivity {
+        hibernated: Option<bool>,
+    },
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -4117,18 +4120,33 @@ impl Cagents {
         if self.terminal_starts_in_flight() > 0 {
             return Task::none();
         }
+        // A worktree being deleted is about to close its cards, so theirs
+        // wait: a deletion that fails leaves them to be attached after all.
+        let mut deleting = Vec::new();
+        let mut task = Task::none();
         while let Some(card) = self.restored_agent_attaches.pop_front() {
             if !matches!(self.lifecycle.state(card), Some((_, Residency::Hibernated))) {
+                continue;
+            }
+            if self
+                .card_state(card)
+                .is_some_and(|state| self.project_ui.deleting_card(state))
+            {
+                deleting.push(card);
                 continue;
             }
             if let Some(session) = deferred_terminal_session(
                 self.card_state(card),
                 matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
             ) {
-                return self.attach_restored_agent(card, session);
+                task = self.attach_restored_agent(card, session);
+                break;
             }
         }
-        Task::none()
+        for card in deleting.into_iter().rev() {
+            self.restored_agent_attaches.push_front(card);
+        }
+        task
     }
 
     fn terminal_started(
@@ -5335,6 +5353,26 @@ impl Cagents {
         self.sidebar_model.worktree_at(self.card_worktree(state)?)
     }
 
+    /// Whether `project` holds the scope the workspace shows: the active
+    /// channel's project, or the one with a worktree at or above `active`,
+    /// which is either a worktree root or a directory no known root owned.
+    fn project_owns_active_scope(&self, project: ProjectId, active: &Path) -> bool {
+        if let Some(channel) = self.durable.active_channel {
+            return self
+                .durable
+                .channels
+                .iter()
+                .any(|known| known.id == channel && known.project_id == project);
+        }
+        self.sidebar_model.project(project).is_some_and(|project| {
+            active.starts_with(&project.repository)
+                || project
+                    .worktrees
+                    .iter()
+                    .any(|worktree| active.starts_with(&worktree.path))
+        })
+    }
+
     fn pane_is_active(&self, card: CardId) -> bool {
         self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
@@ -5384,8 +5422,16 @@ impl Cagents {
         let worktree = (finished || activity.is_some())
             .then(|| self.agent_worktree(card))
             .flatten();
-        if finished && let Some(key) = &worktree {
-            self.refresh_ui.mark_stale(key.project_id);
+        if finished
+            && let Some(project) = worktree.as_ref().map(|key| key.project_id).or_else(|| {
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card))
+                    .map(|channel| channel.project_id)
+            })
+        {
+            self.refresh_ui.mark_stale(project);
         }
         if let Some((key, activity)) = worktree.zip(activity) {
             self.sidebar_state
@@ -9572,7 +9618,10 @@ impl Application for Cagents {
                 }
         );
         let task = match message {
-            Message::PollTerminalAgentActivity => self.poll_terminal_agent_activity(),
+            Message::PollTerminalAgentActivity { hibernated } => {
+                self.poll_terminal_agent_activity(hibernated);
+                Task::none()
+            }
             Message::NewTerminal => match self.terminal_directory() {
                 Some(directory) => self.add_terminal(directory),
                 None => cosmic::task::message(Message::OpenRepository),
@@ -9719,6 +9768,12 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.projects.remove(&project_id);
+                self.refresh_ui.finished(
+                    project_id,
+                    result.as_ref().is_ok_and(|loaded| {
+                        !matches!(loaded.github, GitHubAvailability::Failed { .. })
+                    }),
+                );
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
@@ -9896,9 +9951,13 @@ impl Application for Cagents {
                             if !self.refuse_in_deleting_worktree(&worktree) {
                                 task = self.select_worktree(worktree, true);
                             }
-                        } else if let Some(active) = self.active_workspace.clone() {
+                        } else if let Some(active) = self.active_workspace.clone()
+                            && self.project_owns_active_scope(project_id, &active)
+                        {
                             // Discovery can resolve legacy launch directories
                             // into distinct worktrees after session restoration.
+                            // Only the project holding the scope can move it,
+                            // and re-selecting resolves every card's owner.
                             task = if let Some(channel) = self.durable.active_channel {
                                 self.select_channel(channel)
                             } else {
@@ -16067,6 +16126,284 @@ mod tests {
         assert_eq!(app.terminal_starts_in_flight(), 0);
     }
 
+    /// A restored agent off screen, registered as the queue leaves it.
+    fn hibernated_agent_app(
+        continuity: Option<TerminalContinuity>,
+    ) -> (Cagents, CardId, TerminalSession) {
+        let mut app = context_inspector_test_app(false);
+        let mut agent = restored_live_terminal("/usr/bin/claude", Exposure::Offscreen);
+        let CardKind::Terminal(session) = &mut agent.kind else {
+            unreachable!("terminal fixture");
+        };
+        if let Some(continuity) = continuity {
+            session.continuity = continuity;
+        }
+        let session = session.clone();
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![agent.clone()],
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.cards.insert(agent.id, CardRuntime::Loading);
+        app.lifecycle.register(
+            agent.id,
+            Exposure::Offscreen,
+            Residency::Hibernated,
+            Instant::now(),
+        );
+        (app, agent.id, session)
+    }
+
+    fn unconnected_surface(directory: &Path, terminal: TerminalId) -> TerminalSurface {
+        TerminalSurface::from(
+            HostedTerminalHandle::connect_at(
+                directory.join("missing.sock"),
+                terminal,
+                None,
+                |_| {},
+            )
+            .expect("terminal client starts before the socket accepts"),
+        )
+    }
+
+    fn surface_visibility(app: &Cagents, card: CardId) -> crate::terminal_ipc::TerminalVisibility {
+        match app.cards.get(&card) {
+            Some(CardRuntime::Terminal(surface)) => surface.visibility(),
+            _ => panic!("expected an attached terminal"),
+        }
+    }
+
+    /// An agent in a worktree being deleted waits in the queue rather than
+    /// leaving it, so a deletion that fails still has its row attached.
+    #[test]
+    fn an_agent_waits_out_its_worktrees_deletion_for_its_row_attach() {
+        let (mut app, card, session) = hibernated_agent_app(None);
+        let target = app
+            .project_ui
+            .begin_deleting(session.launch.working_directory.clone());
+        app.restored_agent_attaches.push_back(card);
+        drop(app.attach_next_restored_agent());
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert_eq!(app.restored_agent_attaches, [card]);
+
+        let _ = app.update(Message::ProjectUi(project_ui::Action::Deleted {
+            target,
+            result: Err("the worktree has changes".into()),
+        }));
+        // The card is started, by the row attach or by the sweep hydrating it
+        // outright, and no hibernated agent is left waiting on the deletion.
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert!(app.restored_agent_attaches.iter().all(|queued| !matches!(
+            app.lifecycle.state(*queued),
+            Some((_, Residency::Hibernated))
+        )));
+    }
+
+    /// An attach for the row keeps the card hibernated, so it streams no
+    /// screen, and opening the card later reuses that connection.
+    #[test]
+    fn an_attached_agent_stays_hibernated_until_its_card_is_opened() {
+        use crate::terminal_ipc::TerminalVisibility;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, session) = hibernated_agent_app(None);
+        app.restored_agent_attaches.push_back(card);
+        drop(app.attach_next_restored_agent());
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        let _ = app.update(Message::RestoredAgentAttached {
+            card,
+            terminal: session.id,
+            result: Ok(Some(StartedTerminal {
+                handle: unconnected_surface(directory.path(), session.id),
+                session: session.clone(),
+                spawned: false,
+            })),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert_eq!(
+            surface_visibility(&app, card),
+            TerminalVisibility::Hibernated
+        );
+        assert_eq!(
+            app.lifecycle.state(card).map(|(_, residency)| residency),
+            Some(&Residency::Hibernated)
+        );
+
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert_ne!(
+            surface_visibility(&app, card),
+            TerminalVisibility::Hibernated
+        );
+        assert!(!matches!(
+            app.lifecycle.state(card).map(|(_, residency)| residency),
+            Some(Residency::Hibernated)
+        ));
+    }
+
+    /// Opening the card while its row's attach is still under way starts the
+    /// card's own attach too; whichever lands first is kept, and the other is
+    /// let go without failing the card.
+    #[test]
+    fn an_agent_opened_during_its_row_attach_keeps_one_connection() {
+        use crate::terminal_ipc::TerminalVisibility;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, card, session) = hibernated_agent_app(None);
+        app.restored_agent_attaches.push_back(card);
+        drop(app.attach_next_restored_agent());
+        drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new()));
+        assert_eq!(app.terminal_starts_in_flight(), 2);
+        let started = || StartedTerminal {
+            handle: unconnected_surface(directory.path(), session.id),
+            session: session.clone(),
+            spawned: false,
+        };
+        let _ = app.update(Message::RestoredAgentAttached {
+            card,
+            terminal: session.id,
+            result: Ok(Some(started())),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        // The card is being opened, so the row's attach is not kept hibernated.
+        assert_ne!(
+            surface_visibility(&app, card),
+            TerminalVisibility::Hibernated
+        );
+        let _ = app.update(Message::TerminalStarted {
+            card,
+            terminal: session.id,
+            result: Ok(started()),
+        });
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Terminal(_))
+        ));
+        assert!(app.notices.entries.is_empty(), "{:?}", app.notices.entries);
+    }
+
+    /// Losing the daemon connection of an agent attached only for its row
+    /// queues another attach, and never launches the agent again: that is the
+    /// user's decision, made by opening the card.
+    #[test]
+    fn a_hibernated_agent_that_loses_its_daemon_is_only_attached_again() {
+        use crate::{
+            model::{BootId, HostIncarnation, HostSessionId},
+            terminal::ipc::{
+                ClientEnvelope, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+                ServerMessage, read_frame, write_frame,
+            },
+        };
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("replacement"),
+                        boot_id: BootId::new("boot"),
+                        host_incarnation: HostIncarnation::new("replacement"),
+                    },
+                    message: ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::ProofMismatch,
+                        "daemon was replaced",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+        });
+        let (mut app, card, session) = hibernated_agent_app(None);
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, session.id, Some(proof), move |wake| {
+                let _ = wake_tx.send(wake);
+            })
+            .unwrap();
+        app.cards
+            .insert(card, CardRuntime::Terminal(TerminalSurface::from(handle)));
+        let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        let notices = app.notices.entries.len();
+
+        drop(app.update(Message::TerminalWake {
+            card,
+            generation: wake.generation,
+        }));
+        // The attach-only path took it up again; a relaunch would have made
+        // the card hydrate.
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(app.restored_agent_attaches.is_empty());
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert_eq!(
+            app.lifecycle.state(card),
+            Some((&Exposure::Offscreen, &Residency::Hibernated))
+        );
+        assert_eq!(
+            app.card_state(card).map(|state| &state.residency),
+            Some(&Residency::Hibernated)
+        );
+        assert_eq!(app.notices.entries.len(), notices);
+    }
+
+    #[test]
+    fn a_background_read_reselects_only_the_scope_its_project_holds() {
+        use crate::model::{ChannelId, ProjectChannel, WorktreeId};
+        use crate::sidebar::{SidebarProject, SidebarWorktree};
+
+        let mut app = context_inspector_test_app(false);
+        let [holding, other] = [ProjectId::new(), ProjectId::new()];
+        for (project, root) in [(holding, "/repo"), (other, "/elsewhere")] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "project".into(),
+                root.into(),
+                vec![SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    format!("{root}/worktrees/feature").into(),
+                    Some("feature".into()),
+                )],
+                Vec::new(),
+            ));
+        }
+        let launch = Path::new("/repo/worktrees/feature/src");
+        assert!(app.project_owns_active_scope(holding, launch));
+        assert!(!app.project_owns_active_scope(other, launch));
+        let channel = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: channel,
+                project_id: other,
+                title: "channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        assert!(app.project_owns_active_scope(other, launch));
+        assert!(!app.project_owns_active_scope(holding, launch));
+    }
+
     #[test]
     fn restored_successful_terminal_is_completed_without_automatic_relaunch() {
         let mut app = context_inspector_test_app(true);
@@ -17421,7 +17758,7 @@ mod tests {
     #[test]
     fn an_agent_finishing_its_turn_marks_its_project_for_a_read() {
         use crate::agent::{Activity, ActivityState, Provider};
-        use crate::model::WorktreeId;
+        use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
 
         let mut app = context_inspector_test_app(true);
@@ -17451,6 +17788,80 @@ mod tests {
         app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
         app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
         assert!(app.refresh_ui.is_stale(project));
+
+        // A channel's agent works in its project without a worktree row.
+        let channel_project = ProjectId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: ChannelId::new(),
+                project_id: channel_project,
+                title: "channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: None,
+            });
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
+        assert!(app.refresh_ui.is_stale(channel_project));
+    }
+
+    /// A refresh tick reads one project at a time, only while the window is
+    /// focused, and leaves a project whose checkout failed to its retry.
+    #[test]
+    fn refresh_ticks_read_one_reachable_project_at_a_time_while_focused() {
+        use crate::model::WorktreeId;
+        use crate::sidebar::{SidebarProject, SidebarWorktree};
+
+        let mut app = context_inspector_test_app(false);
+        let projects = [ProjectId::new(), ProjectId::new(), ProjectId::new()];
+        for (index, &project) in projects.iter().enumerate() {
+            let root = PathBuf::from(format!("/nonexistent/project-{index}"));
+            let mut row = SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                format!("project {index}"),
+                root.clone(),
+                vec![SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    root,
+                    Some("main".into()),
+                )],
+                Vec::new(),
+            );
+            if index == 0 {
+                row.unreachable = Some("fixture".into());
+            }
+            app.sidebar_model.projects.push(row);
+        }
+        let tick =
+            |app: &mut Cagents| drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        tick(&mut app);
+        assert!(
+            app.refresh_ui.projects.is_empty(),
+            "unfocused windows read nothing"
+        );
+
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        let reading = app.refresh_ui.projects.keys().copied().collect::<Vec<_>>();
+        assert_eq!(reading.len(), 1);
+        assert_ne!(reading[0], projects[0]);
+        tick(&mut app);
+        assert_eq!(
+            app.refresh_ui.projects.keys().copied().collect::<Vec<_>>(),
+            reading
+        );
+        // Once that read lands, the next tick moves on to the other one.
+        app.refresh_ui.projects.clear();
+        tick(&mut app);
+        let next = app.refresh_ui.projects.keys().copied().collect::<Vec<_>>();
+        assert_eq!(next.len(), 1);
+        assert!(!next.contains(&reading[0]) && !next.contains(&projects[0]));
     }
 
     #[test]

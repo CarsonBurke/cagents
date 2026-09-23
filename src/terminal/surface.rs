@@ -33,6 +33,11 @@ impl TerminalSurface {
         self.0.agent_activity()
     }
 
+    #[cfg(test)]
+    pub(crate) fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
+        self.0.visibility()
+    }
+
     pub fn generation(&self) -> u64 {
         self.0.generation()
     }

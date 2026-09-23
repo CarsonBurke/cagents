@@ -498,6 +498,18 @@ impl SidebarProject {
         )
     }
 
+    /// Whether one of this project's worktrees has a pull request still
+    /// open, whose checks and review can change without anything here
+    /// noticing.
+    pub fn has_open_pull_request(&self) -> bool {
+        self.worktrees.iter().any(|worktree| {
+            matches!(
+                worktree.pull_request_state,
+                Some(WorktreePullRequestState::Open | WorktreePullRequestState::Draft)
+            )
+        })
+    }
+
     pub fn display_pull_requests(&self) -> &[SidebarPullRequest] {
         self.cached_display
             .as_ref()
