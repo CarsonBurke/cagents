@@ -3121,6 +3121,102 @@ mod tests {
     }
 
     #[test]
+    fn control_c_interrupts_whatever_keyboard_protocol_the_shell_left_behind() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let mut encoder = KeyEncoder::new().unwrap();
+        let mut control_c = |terminal: &Terminal<'_, '_>, text: &str| {
+            let mut input = key_input(
+                KeyAction::Press,
+                TerminalKey::Character('c'),
+                Some(text),
+                Some('c'),
+            );
+            input.modifiers.control = true;
+            encode_key_input(terminal, &mut encoder, input).unwrap()
+        };
+
+        // A child that never asked for the kitty protocol reads ETX, which the
+        // line discipline turns into SIGINT.
+        assert_eq!(control_c(&terminal, "c"), b"\x03");
+        // fish pushes the protocol at its prompt...
+        terminal.vt_write(b"\x1b[>5u");
+        assert_eq!(control_c(&terminal, "c"), b"\x1b[99;5u");
+        // ...and pops it before running a command, which reads ETX again.
+        terminal.vt_write(b"\x1b[<u");
+        assert_eq!(control_c(&terminal, "c"), b"\x03");
+        // Handed the ETX itself as the key's text, the encoder has no key to
+        // name and never produces one, which is why the widget hands over
+        // what the key types without Ctrl.
+        assert_eq!(control_c(&terminal, "\u{3}"), b"\x1b[3;5u");
+
+        // The other control characters come from the key's own text as well,
+        // and a chord with no control character of its own is named instead.
+        let control = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        for (key, text, unshifted, modifiers, expected) in [
+            (' ', " ", ' ', control, &b"\x00"[..]),
+            ('2', "2", '2', control, b"\x00"),
+            ('/', "/", '/', control, b"\x1f"),
+            (
+                'c',
+                "c",
+                'c',
+                KeyModifiers {
+                    alt: true,
+                    ..control
+                },
+                b"\x1b\x03",
+            ),
+            (
+                'a',
+                "A",
+                'a',
+                KeyModifiers {
+                    shift: true,
+                    ..control
+                },
+                b"\x1b[97;6u",
+            ),
+            ('[', "[", '[', control, b"\x1b[91;5u"),
+        ] {
+            let mut input = key_input(
+                KeyAction::Press,
+                TerminalKey::Character(key),
+                Some(text),
+                Some(unshifted),
+            );
+            input.modifiers = modifiers;
+            assert_eq!(
+                encode_key_input(&terminal, &mut encoder, input).unwrap(),
+                expected,
+                "{modifiers:?} {text:?}"
+            );
+        }
+
+        // Keys that type control characters even without Ctrl are encoded
+        // from the key alone.
+        for (key, expected) in [
+            (TerminalKey::Enter, &b"\r"[..]),
+            (TerminalKey::Tab, b"\t"),
+            (TerminalKey::Escape, b"\x1b"),
+        ] {
+            let input = key_input(KeyAction::Press, key, None, None);
+            assert_eq!(
+                encode_key_input(&terminal, &mut encoder, input).unwrap(),
+                expected,
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
     fn control_backspace_kills_words_only_in_legacy_encoding() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 80,

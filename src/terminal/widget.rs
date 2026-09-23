@@ -1634,6 +1634,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
+                modified_key,
                 modifiers,
                 text,
                 repeat,
@@ -1683,17 +1684,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let input = KeyInput {
-                    action: if *repeat {
-                        KeyAction::Repeat
-                    } else {
-                        KeyAction::Press
-                    },
-                    key: map_iced_key(key),
-                    modifiers: map_iced_modifiers(*modifiers),
-                    text: text.as_ref().map(ToString::to_string),
-                    unshifted_codepoint: character_from_key(key),
-                };
+                let input = key_press(key, modified_key, *modifiers, text.as_deref(), *repeat);
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
                     Err(error) => self.publish_error(error, shell),
@@ -2641,6 +2632,55 @@ fn map_iced_modifiers(modifiers: keyboard::Modifiers) -> KeyModifiers {
     }
 }
 
+/// The press iced reported, as the encoder takes it.
+fn key_press(
+    key: &keyboard::Key,
+    modified_key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    text: Option<&str>,
+    repeat: bool,
+) -> KeyInput {
+    KeyInput {
+        action: if repeat {
+            KeyAction::Repeat
+        } else {
+            KeyAction::Press
+        },
+        key: map_iced_key(key),
+        modifiers: map_iced_modifiers(modifiers),
+        text: key_text(text, modified_key),
+        unshifted_codepoint: character_from_key(key),
+    }
+}
+
+/// The text a key press hands the encoder: what the key types without Ctrl.
+///
+/// Winit's text carries Ctrl's effect, so Ctrl+C types U+0003. Ghostty's
+/// encoder makes control characters itself, from the key and its modifiers,
+/// but it reads a one-byte text before the key, and U+0003 is not a character
+/// it knows how to control: it falls back to `CSI 3;5u`, which no line
+/// discipline turns into SIGINT. So a lone control character is replaced by
+/// the key's own text, as Ghostty's GTK and macOS front ends do. Enter, Tab,
+/// Escape and Backspace type control characters even without Ctrl; they hand
+/// over no text, and the encoder names them from the key alone.
+fn key_text(text: Option<&str>, modified_key: &keyboard::Key) -> Option<String> {
+    let text = text?;
+    let mut characters = text.chars();
+    let lone_control = characters
+        .next()
+        .is_some_and(|character| u32::from(character) < 0x20)
+        && characters.next().is_none();
+    if !lone_control {
+        return Some(text.to_owned());
+    }
+    match modified_key {
+        keyboard::Key::Character(typed) if !typed.chars().any(char::is_control) => {
+            Some(typed.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn character_from_key(key: &keyboard::Key) -> Option<char> {
     let keyboard::Key::Character(text) = key else {
         return None;
@@ -2931,6 +2971,43 @@ mod tests {
             viewport_scroll(&keyboard::Key::Character("a".into()), shift, 24),
             None
         );
+    }
+
+    #[test]
+    fn a_key_hands_over_what_it_types_without_ctrl() {
+        let key = |text: &str| keyboard::Key::Character(text.into());
+        let named = |named| keyboard::Key::Named(named);
+
+        // Ctrl+C, Ctrl+C under Caps Lock, and Ctrl+[ as winit reports them.
+        assert_eq!(key_text(Some("\u{3}"), &key("c")).as_deref(), Some("c"));
+        assert_eq!(key_text(Some("\u{3}"), &key("C")).as_deref(), Some("C"));
+        assert_eq!(key_text(Some("\u{1b}"), &key("[")).as_deref(), Some("["));
+        for (text, key) in [
+            ("\r", keyboard::key::Named::Enter),
+            ("\t", keyboard::key::Named::Tab),
+            ("\u{1b}", keyboard::key::Named::Escape),
+            ("\u{8}", keyboard::key::Named::Backspace),
+        ] {
+            assert_eq!(key_text(Some(text), &named(key)), None, "{key:?}");
+        }
+        // Text without a control character is the key's own.
+        assert_eq!(key_text(Some("a"), &key("a")).as_deref(), Some("a"));
+        assert_eq!(key_text(Some("é"), &key("é")).as_deref(), Some("é"));
+        assert_eq!(key_text(None, &key("c")), None);
+
+        // The press a terminal sends for Ctrl+C names the key and its text,
+        // never the ETX winit typed for it.
+        let press = key_press(
+            &key("c"),
+            &key("c"),
+            keyboard::Modifiers::CTRL,
+            Some("\u{3}"),
+            false,
+        );
+        assert_eq!(press.key, TerminalKey::Character('c'));
+        assert!(press.modifiers.control);
+        assert_eq!(press.text.as_deref(), Some("c"));
+        assert_eq!(press.unshifted_codepoint, Some('c'));
     }
 
     #[test]
