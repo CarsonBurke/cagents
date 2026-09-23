@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::{
     instance,
     model::{
-        BootId, CardId, ProjectId, ProjectState, TerminalId, TerminalSession, WorkspaceId,
-        WorkspaceState, WorktreeId, WorktreeState,
+        BootId, CardId, CardKind, ProjectId, ProjectState, TerminalId, TerminalSession,
+        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::{
         SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
@@ -66,6 +66,12 @@ pub enum SaveFailureCategory {
     Io,
     Database,
 }
+
+/// What to do about writes storage refused by construction. Retrying the same
+/// content cannot help, so the remedy is changing it.
+pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
+     its own; everything else keeps saving. Changing or closing the item saves it again. If this \
+     repeats, report the failure category and database path.";
 
 impl SaveFailureCategory {
     pub fn label(self) -> &'static str {
@@ -156,6 +162,64 @@ pub struct SessionSaveHealthEvent {
     pub revision: u64,
     pub health: SessionSaveHealth,
     pub last_successful_flush_at_unix_ms: Option<i64>,
+    /// Writes storage refused by construction, set aside so they cannot hold
+    /// the rest of the lane hostage. Orthogonal to `health`: a lane that saves
+    /// everything else is healthy while still reporting these.
+    pub quarantined: Vec<QuarantinedWrite>,
+}
+
+/// What one refused write would have saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteSubject {
+    /// The window's layout and cards: an autosave or a conversion checkpoint.
+    /// `card` is the card storage refused within it, when it named one.
+    Workspace {
+        card: Option<CardId>,
+    },
+    /// The fresh identity a card's payload was rebound to: a relaunched
+    /// terminal, or a new conversation in a chat card.
+    CardIdentity {
+        card: CardId,
+        kind: ReplacedIdentity,
+    },
+    Project {
+        id: ProjectId,
+        name: String,
+    },
+    Worktree {
+        id: WorktreeId,
+        path: PathBuf,
+        branch: Option<String>,
+    },
+}
+
+/// What kind of payload an identity replacement rebinds a card to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacedIdentity {
+    Terminal,
+    Chat,
+}
+
+impl WriteSubject {
+    /// Whether the refused write is part of the window's own state, the
+    /// state a restart restores and a terminal handoff has to be committed in.
+    /// A refused catalog row loses that row alone.
+    pub fn is_window_state(&self) -> bool {
+        matches!(self, Self::Workspace { .. } | Self::CardIdentity { .. })
+    }
+}
+
+/// A write storage refused by construction. It is never retried on its own;
+/// a newer write of the same subject supersedes it, and an explicit retry
+/// offers it to storage once more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedWrite {
+    pub subject: WriteSubject,
+    pub category: SaveFailureCategory,
+    pub refused_at_unix_ms: i64,
+    /// Writes that cannot land before this one does and are held back until
+    /// it is superseded: the worktree rows of a project storage has no row for.
+    pub held_back: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,9 +283,27 @@ impl Replacement {
     fn same_kind(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
     }
+
+    fn kind(&self) -> ReplacedIdentity {
+        match self {
+            Self::Terminal(_) => ReplacedIdentity::Terminal,
+            Self::Chat(_) => ReplacedIdentity::Chat,
+        }
+    }
 }
 
 impl IdentityReplacement {
+    /// Whether a card of `kind` still holds the payload this replacement
+    /// would rebind, so it still has something to replace.
+    fn replaces(&self, kind: &CardKind) -> bool {
+        let held = match (&self.replacement, kind) {
+            (Replacement::Terminal(_), CardKind::Terminal(session)) => session.id,
+            (Replacement::Chat(_), CardKind::Chat(session)) => session.id,
+            _ => return false,
+        };
+        held == self.expected_terminal_id && held != self.replacement.id()
+    }
+
     fn apply(&self, store: &impl SessionStore) -> Result<(), StoreError> {
         match &self.replacement {
             Replacement::Terminal(session) => {
@@ -711,8 +793,304 @@ struct PendingWrites {
     identity_replacements: HashMap<CardId, IdentityReplacement>,
     workspace_generation: u64,
     card_generations: BTreeMap<CardId, u64>,
+    /// Doubles as the set of projects storage holds a row for, which is what
+    /// decides whether a worktree row can be written yet.
     project_generations: HashMap<ProjectId, u64>,
     worktree_generations: HashMap<WorktreeId, u64>,
+    quarantine: Quarantine,
+}
+
+/// When storage first refused a subject, and why it refuses it now.
+#[derive(Debug, Clone, Copy)]
+struct Refusal {
+    category: SaveFailureCategory,
+    at_unix_ms: i64,
+}
+
+/// Writes storage refused by construction, one per subject.
+///
+/// A refused write leaves the pending set, so it no longer fails every attempt
+/// and exhausts the lane for writes that have nothing to do with it (#268). It
+/// is kept rather than dropped for two reasons: an explicit retry offers it to
+/// storage again, and it has to stay visible until something supersedes it.
+/// What supersedes it is a newer write of the same subject that storage
+/// accepts. A refusal of that newer write replaces the entry but keeps the
+/// time of the first one, so the reader sees how long the subject has gone
+/// unsaved.
+#[derive(Debug, Default)]
+struct Quarantine {
+    /// The newest workspace snapshot storage refused, with the card it
+    /// refused within it when it named one. Every snapshot is the whole
+    /// window, so any later one that lands supersedes it.
+    workspace: Option<(Arc<WorkspaceState>, Option<CardId>, Refusal)>,
+    identity_replacements: HashMap<CardId, (IdentityReplacement, Refusal)>,
+    projects: HashMap<ProjectId, (ProjectState, Refusal)>,
+    worktrees: HashMap<WorktreeId, (WorktreeState, Refusal)>,
+}
+
+impl Refusal {
+    fn new(error: &StoreError) -> Self {
+        Self {
+            category: save_failure_category(error),
+            at_unix_ms: unix_millis(),
+        }
+    }
+}
+
+/// Records a refusal of `subject`, keeping the time of the first one.
+///
+/// The store error is logged in full here and nowhere else. A write refused by
+/// construction fails on content cagents produced, and its error names that
+/// content by identifier - which is what makes the log line worth writing - but
+/// never carries the connection details a storage failure can, which is why
+/// only these errors are logged verbatim.
+fn refuse<K: Eq + std::hash::Hash, V>(
+    entries: &mut HashMap<K, (V, Refusal)>,
+    key: K,
+    write: V,
+    subject: WriteSubject,
+    error: &StoreError,
+) {
+    let refusal = record_refusal(
+        entries.get(&key).map(|(_, refusal)| *refusal),
+        subject,
+        error,
+    );
+    entries.insert(key, (write, refusal));
+}
+
+fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &StoreError) -> Refusal {
+    let refusal = Refusal::new(error);
+    match previous {
+        None => {
+            tracing::warn!(
+                ?subject,
+                %error,
+                category = refusal.category.label(),
+                "storage refused a cagents write by construction; setting it aside so the rest \
+                 of the session keeps saving"
+            );
+            refusal
+        }
+        Some(first) => {
+            tracing::debug!(?subject, %error, "storage refused a newer write of a refused subject");
+            Refusal {
+                at_unix_ms: first.at_unix_ms,
+                ..refusal
+            }
+        }
+    }
+}
+
+fn identity_subject(replacement: &IdentityReplacement) -> WriteSubject {
+    WriteSubject::CardIdentity {
+        card: replacement.card_id,
+        kind: replacement.replacement.kind(),
+    }
+}
+
+fn project_subject(project: &ProjectState) -> WriteSubject {
+    WriteSubject::Project {
+        id: project.id,
+        name: project.name.clone(),
+    }
+}
+
+fn worktree_subject(worktree: &WorktreeState) -> WriteSubject {
+    WriteSubject::Worktree {
+        id: worktree.id,
+        path: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+    }
+}
+
+/// Logs a refused subject that a newer write of it superseded.
+fn superseded(subject: Option<WriteSubject>) {
+    if let Some(subject) = subject {
+        tracing::info!(
+            ?subject,
+            "a newer write of a refused subject landed; it is saved again"
+        );
+    }
+}
+
+impl Quarantine {
+    fn is_empty(&self) -> bool {
+        self.workspace.is_none()
+            && self.identity_replacements.is_empty()
+            && self.projects.is_empty()
+            && self.worktrees.is_empty()
+    }
+
+    /// Why the window's own state is not fully saved, when a refusal is the
+    /// reason. A barrier and a clean shutdown both vouch for that state.
+    fn window_state(&self) -> Option<SaveFailureCategory> {
+        self.workspace
+            .iter()
+            .map(|(_, _, refusal)| refusal)
+            .chain(
+                self.identity_replacements
+                    .values()
+                    .map(|(_, refusal)| refusal),
+            )
+            .map(|refusal| refusal.category)
+            .min_by_key(|category| category.selection_rank())
+    }
+
+    /// Rewrites a replacement that continues from a refused one to start at the
+    /// identity storage still holds.
+    ///
+    /// Replacements chain identities: once `A -> B` is refused, storage still
+    /// holds `A` while the card moves on to `B -> C`. The writer lane merges such
+    /// a chain while both halves are pending; this is the same merge for a first
+    /// half storage already refused, and without it `B -> C` could only be
+    /// refused for expecting an identity storage never held.
+    fn continue_refused(&self, replacement: &mut IdentityReplacement) {
+        if let Some((refused, _)) = self.identity_replacements.get(&replacement.card_id)
+            && refused.replacement.id() == replacement.expected_terminal_id
+            && refused.replacement.same_kind(&replacement.replacement)
+        {
+            replacement.expected_terminal_id = refused.expected_terminal_id;
+        }
+    }
+
+    fn refuse_workspace(&mut self, snapshot: Arc<WorkspaceState>, error: &StoreError) {
+        let card = match error {
+            StoreError::Card { card, .. } => Some(*card),
+            _ => None,
+        };
+        let refusal = record_refusal(
+            self.workspace.as_ref().map(|(_, _, refusal)| *refusal),
+            WriteSubject::Workspace { card },
+            error,
+        );
+        self.workspace = Some((snapshot, card, refusal));
+    }
+
+    /// Clears what a snapshot storage accepted settles: the refused snapshot it
+    /// replaces, and every refused identity replacement whose card it no
+    /// longer holds open at the identity that replacement would replace.
+    ///
+    /// Storage rejects a snapshot that rebinds a card's payload to an identity
+    /// other than the one it holds, so the card's identity in a landed
+    /// snapshot is the one storage holds. Anything but the replaced identity
+    /// leaves the refusal with nothing to replace - the card closed, converted,
+    /// or first stored at its new identity - and nothing else could clear it:
+    /// it would fail every barrier and the clean shutdown for the rest of the
+    /// session.
+    fn snapshot_landed(&mut self, snapshot: &WorkspaceState) {
+        superseded(
+            self.workspace
+                .take()
+                .map(|(_, card, _)| WriteSubject::Workspace { card }),
+        );
+        self.identity_replacements.retain(|card, (refused, _)| {
+            let outstanding = snapshot.cards.iter().any(|state| {
+                state.id == *card && state.existence.is_open() && refused.replaces(&state.kind)
+            });
+            if !outstanding {
+                tracing::info!(
+                    subject = ?identity_subject(refused),
+                    "a refused identity replacement no longer applies to the saved window"
+                );
+            }
+            outstanding
+        });
+    }
+
+    fn refuse_replacement(&mut self, replacement: IdentityReplacement, error: &StoreError) {
+        let subject = identity_subject(&replacement);
+        refuse(
+            &mut self.identity_replacements,
+            replacement.card_id,
+            replacement,
+            subject,
+            error,
+        );
+    }
+
+    fn replacement_landed(&mut self, card: CardId) {
+        superseded(
+            self.identity_replacements
+                .remove(&card)
+                .map(|(refused, _)| identity_subject(&refused)),
+        );
+    }
+
+    fn refuse_project(&mut self, project: ProjectState, error: &StoreError) {
+        let subject = project_subject(&project);
+        refuse(&mut self.projects, project.id, project, subject, error);
+    }
+
+    fn project_landed(&mut self, id: ProjectId) {
+        superseded(
+            self.projects
+                .remove(&id)
+                .map(|(project, _)| project_subject(&project)),
+        );
+    }
+
+    fn refuse_worktree(&mut self, worktree: WorktreeState, error: &StoreError) {
+        let subject = worktree_subject(&worktree);
+        refuse(&mut self.worktrees, worktree.id, worktree, subject, error);
+    }
+
+    fn worktree_landed(&mut self, id: WorktreeId) {
+        superseded(
+            self.worktrees
+                .remove(&id)
+                .map(|(worktree, _)| worktree_subject(&worktree)),
+        );
+    }
+
+    /// What the health lane reports. `held_back` counts the pending worktree
+    /// rows that wait on a refused project storage holds no row for.
+    fn report(
+        &self,
+        pending_worktrees: &HashMap<WorktreeId, WorktreeState>,
+        stored_projects: &HashMap<ProjectId, u64>,
+    ) -> Vec<QuarantinedWrite> {
+        let entry = |subject, refusal: &Refusal, held_back| QuarantinedWrite {
+            subject,
+            category: refusal.category,
+            refused_at_unix_ms: refusal.at_unix_ms,
+            held_back,
+        };
+        let mut report = Vec::new();
+        if let Some((_, card, refusal)) = &self.workspace {
+            report.push(entry(WriteSubject::Workspace { card: *card }, refusal, 0));
+        }
+        let mut replacements = self.identity_replacements.values().collect::<Vec<_>>();
+        replacements.sort_by_key(|(replacement, _)| replacement.card_id);
+        report.extend(
+            replacements
+                .into_iter()
+                .map(|(replacement, refusal)| entry(identity_subject(replacement), refusal, 0)),
+        );
+        let mut projects = self.projects.values().collect::<Vec<_>>();
+        projects
+            .sort_by(|(left, _), (right, _)| (&left.name, left.id).cmp(&(&right.name, right.id)));
+        report.extend(projects.into_iter().map(|(project, refusal)| {
+            let held_back = if stored_projects.contains_key(&project.id) {
+                0
+            } else {
+                pending_worktrees
+                    .values()
+                    .filter(|worktree| worktree.project_id == project.id)
+                    .count()
+            };
+            entry(project_subject(project), refusal, held_back)
+        }));
+        let mut worktrees = self.worktrees.values().collect::<Vec<_>>();
+        worktrees
+            .sort_by(|(left, _), (right, _)| (&left.path, left.id).cmp(&(&right.path, right.id)));
+        report.extend(
+            worktrees
+                .into_iter()
+                .map(|(worktree, refusal)| entry(worktree_subject(worktree), refusal, 0)),
+        );
+        report
+    }
 }
 
 trait SessionStore {
@@ -877,15 +1255,73 @@ impl PendingWrites {
             card_generations,
             project_generations,
             worktree_generations,
+            quarantine: Quarantine::default(),
         }
     }
 
-    fn is_empty(&self) -> bool {
+    /// Whether storage holds every pending write it can currently accept.
+    ///
+    /// A worktree row waiting on a project storage has no row for is not one
+    /// of them: it is held back rather than failed, so it neither keeps a
+    /// retry cycle going nor exhausts one. It lands in the same flush as its
+    /// project, and a project still retrying keeps the lane unsettled on its
+    /// own.
+    fn is_settled(&self) -> bool {
         self.workspace.is_none()
             && self.conversions.is_empty()
             && self.projects.is_empty()
-            && self.worktrees.is_empty()
             && self.identity_replacements.is_empty()
+            && self
+                .worktrees
+                .values()
+                .all(|worktree| !self.project_generations.contains_key(&worktree.project_id))
+    }
+
+    /// Pending worktrees whose project storage has no row for, with nothing
+    /// pending or refused that would give it one. No flush releases them. The
+    /// writer never queues such a worktree; this names one if it ever does.
+    fn orphaned_worktrees(&self) -> Vec<WorktreeId> {
+        self.worktrees
+            .values()
+            .filter(|worktree| {
+                let project = &worktree.project_id;
+                !self.project_generations.contains_key(project)
+                    && !self.projects.contains_key(project)
+                    && !self.quarantine.projects.contains_key(project)
+            })
+            .map(|worktree| worktree.id)
+            .collect()
+    }
+
+    /// The quarantine as the health lane reports it.
+    fn quarantined(&self) -> Vec<QuarantinedWrite> {
+        self.quarantine
+            .report(&self.worktrees, &self.project_generations)
+    }
+
+    /// Offers every refused write to storage once more, for the reader who
+    /// asked to retry. A subject with a newer write pending is already being
+    /// retried by that write, so its refused one is not reinstated.
+    fn rearm_quarantine(&mut self) {
+        if let Some((snapshot, _, _)) = &self.quarantine.workspace
+            && self.workspace.is_none()
+            && self.conversions.is_empty()
+        {
+            self.workspace = Some(Arc::clone(snapshot));
+        }
+        for (card, (replacement, _)) in &self.quarantine.identity_replacements {
+            self.identity_replacements
+                .entry(*card)
+                .or_insert_with(|| replacement.clone());
+        }
+        for (id, (project, _)) in &self.quarantine.projects {
+            self.projects.entry(*id).or_insert_with(|| project.clone());
+        }
+        for (id, (worktree, _)) in &self.quarantine.worktrees {
+            self.worktrees
+                .entry(*id)
+                .or_insert_with(|| worktree.clone());
+        }
     }
 
     /// The workspace every pending snapshot in this batch belongs to.
@@ -973,93 +1409,139 @@ impl PendingWrites {
         Ok(())
     }
 
-    /// Applies everything still pending, leaving whatever failed queued for a
-    /// later attempt. Returns one message per failed write.
+    /// Writes the conversion checkpoints in order, then the coalesced
+    /// autosave, stopping at the first write that failed for a reason that may
+    /// clear. That write goes back where it came from, so neither a retry nor
+    /// shutdown can reorder the queue.
+    ///
+    /// A checkpoint storage refused by construction does not stop the ones
+    /// after it. Each snapshot is the whole window and storage validates it on
+    /// its own, so a later one is not built on the refused one; it is what
+    /// replaces the refused content.
+    fn flush_checkpoints(&mut self, store: &impl SessionStore) -> Result<(), StoreError> {
+        loop {
+            let autosave = self.conversions.is_empty();
+            let Some(checkpoint) = self
+                .conversions
+                .pop_front()
+                .or_else(|| self.workspace.take().map(ConversionCheckpoint::Snapshot))
+            else {
+                return Ok(());
+            };
+            match checkpoint {
+                ConversionCheckpoint::IdentityReplacement(mut replacement) => {
+                    self.quarantine.continue_refused(&mut replacement);
+                    match replacement.apply(store) {
+                        Ok(()) => self.quarantine.replacement_landed(replacement.card_id),
+                        Err(error) if error.refuses_content() => {
+                            self.quarantine.refuse_replacement(replacement, &error);
+                        }
+                        Err(error) => {
+                            self.conversions
+                                .push_front(ConversionCheckpoint::IdentityReplacement(replacement));
+                            return Err(error);
+                        }
+                    }
+                }
+                ConversionCheckpoint::Snapshot(snapshot) => {
+                    match store.save_workspace(
+                        &snapshot,
+                        SnapshotBase {
+                            workspace: self.workspace_generation,
+                            cards: &self.card_generations,
+                        },
+                    ) {
+                        Ok(commit) => {
+                            self.workspace_generation = commit.generation;
+                            self.card_generations = commit.card_generations;
+                            self.quarantine.snapshot_landed(&snapshot);
+                        }
+                        Err(error) if error.refuses_content() => {
+                            self.quarantine.refuse_workspace(snapshot, &error);
+                        }
+                        Err(error) => {
+                            if autosave {
+                                self.workspace = Some(snapshot);
+                            } else {
+                                self.conversions
+                                    .push_front(ConversionCheckpoint::Snapshot(snapshot));
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies everything still pending. A write that failed for a reason that
+    /// may clear stays queued for a later attempt and is returned; one storage
+    /// refused by construction moves to the quarantine instead, so it cannot
+    /// fail every later attempt on behalf of writes that would land.
     fn flush(&mut self, store: &impl SessionStore) -> Vec<StoreError> {
         let mut errors = Vec::new();
-        let replacement_cards = self
-            .identity_replacements
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for card_id in replacement_cards {
-            let replacement = &self.identity_replacements[&card_id];
+        for (card_id, mut replacement) in std::mem::take(&mut self.identity_replacements) {
+            self.quarantine.continue_refused(&mut replacement);
             match replacement.apply(store) {
-                Ok(()) => {
-                    self.identity_replacements.remove(&card_id);
+                Ok(()) => self.quarantine.replacement_landed(card_id),
+                Err(error) if error.refuses_content() => {
+                    self.quarantine.refuse_replacement(replacement, &error);
                 }
-                Err(error) => errors.push(error),
-            }
-        }
-
-        // Conversion checkpoints precede later autosaves, and failed writes
-        // stay at the front so neither a retry nor shutdown can reorder them.
-        if self.identity_replacements.is_empty() {
-            loop {
-                let snapshot = match self.conversions.front() {
-                    Some(ConversionCheckpoint::Snapshot(snapshot)) => snapshot,
-                    Some(ConversionCheckpoint::IdentityReplacement(replacement)) => {
-                        match replacement.apply(store) {
-                            Ok(()) => {
-                                self.conversions.pop_front();
-                            }
-                            Err(error) => {
-                                errors.push(error);
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    None => match self.workspace.as_ref() {
-                        Some(snapshot) => snapshot,
-                        None => break,
-                    },
-                };
-                match store.save_workspace(
-                    snapshot,
-                    SnapshotBase {
-                        workspace: self.workspace_generation,
-                        cards: &self.card_generations,
-                    },
-                ) {
-                    Ok(commit) => {
-                        self.workspace_generation = commit.generation;
-                        self.card_generations = commit.card_generations;
-                        if self.conversions.pop_front().is_none() {
-                            self.workspace = None;
-                        }
-                    }
-                    Err(error) => {
-                        errors.push(error);
-                        break;
-                    }
+                Err(error) => {
+                    errors.push(error);
+                    self.identity_replacements.insert(card_id, replacement);
                 }
             }
         }
 
-        let project_ids = self.projects.keys().copied().collect::<Vec<_>>();
-        for id in project_ids {
-            let mut project = self.projects[&id].clone();
+        // Conversion checkpoints precede the coalesced autosave, and every one
+        // of them follows the unordered replacements.
+        if self.identity_replacements.is_empty()
+            && let Err(error) = self.flush_checkpoints(store)
+        {
+            errors.push(error);
+        }
+
+        for (id, mut project) in std::mem::take(&mut self.projects) {
             project.generation = self.project_generations.get(&id).copied().unwrap_or(0);
             match store.save_project(&project) {
                 Ok(generation) => {
                     self.project_generations.insert(id, generation);
-                    self.projects.remove(&id);
+                    self.quarantine.project_landed(id);
                 }
-                Err(error) => errors.push(error),
+                Err(error) if error.refuses_content() => {
+                    self.quarantine.refuse_project(project, &error);
+                }
+                Err(error) => {
+                    errors.push(error);
+                    self.projects.insert(id, project);
+                }
             }
         }
 
-        let worktree_ids = self.worktrees.keys().copied().collect::<Vec<_>>();
-        for id in worktree_ids {
-            let mut worktree = self.worktrees[&id].clone();
+        // Projects go first because a worktree row references its project's
+        // row. A worktree whose project storage still has no row waits for it,
+        // whatever keeps the project out - a retry under way, a refusal, or a
+        // project never saved - rather than failing on the missing parent: it
+        // lands in the flush that lands its project.
+        for (id, mut worktree) in std::mem::take(&mut self.worktrees) {
+            if !self.project_generations.contains_key(&worktree.project_id) {
+                self.worktrees.insert(id, worktree);
+                continue;
+            }
             worktree.generation = self.worktree_generations.get(&id).copied().unwrap_or(0);
             match store.save_worktree(&worktree) {
                 Ok(generation) => {
                     self.worktree_generations.insert(id, generation);
-                    self.worktrees.remove(&id);
+                    self.quarantine.worktree_landed(id);
                 }
-                Err(error) => errors.push(error),
+                Err(error) if error.refuses_content() => {
+                    self.quarantine.refuse_worktree(worktree, &error);
+                }
+                Err(error) => {
+                    errors.push(error);
+                    self.worktrees.insert(id, worktree);
+                }
             }
         }
 
@@ -1079,6 +1561,9 @@ struct HealthPublisher {
     revision: u64,
     last_successful_flush_at_unix_ms: Option<i64>,
     incident: Option<FailureIncident>,
+    /// The lane state an event repeats when only the quarantine changed.
+    health: SessionSaveHealth,
+    quarantined: Vec<QuarantinedWrite>,
 }
 
 impl HealthPublisher {
@@ -1088,6 +1573,8 @@ impl HealthPublisher {
             revision: 0,
             last_successful_flush_at_unix_ms: None,
             incident: None,
+            health: SessionSaveHealth::Healthy,
+            quarantined: Vec::new(),
         };
         publisher.publish(SessionSaveHealth::Healthy);
         publisher
@@ -1097,9 +1584,35 @@ impl HealthPublisher {
         self.revision = self.revision.saturating_add(1);
         let _ = self.sender.try_send(SessionSaveHealthEvent {
             revision: self.revision,
-            health,
+            health: health.clone(),
             last_successful_flush_at_unix_ms: self.last_successful_flush_at_unix_ms,
+            quarantined: self.quarantined.clone(),
         });
+        // Recovery is an edge, not a state. Repeating it beside a later
+        // quarantine change would bring back a notice the reader already
+        // acknowledged.
+        self.health = match health {
+            SessionSaveHealth::Recovered { .. } => SessionSaveHealth::Healthy,
+            health => health,
+        };
+    }
+
+    fn quarantine(&mut self, quarantined: Vec<QuarantinedWrite>) {
+        if quarantined != self.quarantined {
+            self.quarantined = quarantined;
+            self.publish(self.health.clone());
+        }
+    }
+
+    /// Answers an explicit retry that published nothing since `since`.
+    ///
+    /// The reader's notice waits for the next event before it offers a retry
+    /// again, and a retry storage refuses the same way leaves the lane and the
+    /// quarantine exactly as they were, which no other event would report.
+    fn answer_retry(&mut self, since: u64) {
+        if self.revision == since {
+            self.publish(self.health.clone());
+        }
     }
 
     fn failed(&mut self, errors: &[StoreError], exhausted: bool) {
@@ -1142,6 +1655,7 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
     use rusqlite::ErrorCode;
 
     match error {
+        StoreError::Card { error, .. } => save_failure_category(error),
         StoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => match error.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => SaveFailureCategory::Busy,
             ErrorCode::ReadOnly => SaveFailureCategory::ReadOnly,
@@ -1152,6 +1666,7 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
             ErrorCode::CannotOpen | ErrorCode::NotFound => SaveFailureCategory::StorageUnavailable,
             ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => SaveFailureCategory::Corrupt,
             ErrorCode::SystemIoFailure => SaveFailureCategory::Io,
+            ErrorCode::ConstraintViolation => SaveFailureCategory::InvalidData,
             _ => SaveFailureCategory::Database,
         },
         StoreError::Sqlite(_) => SaveFailureCategory::Database,
@@ -1281,7 +1796,11 @@ fn persistence_loop(
             merge_identity_replacement(&mut writes.identity_replacements, replacement);
         }
         let retry_requested = std::mem::take(&mut state.retry_requested);
-        if retry_requested && !writes.is_empty() {
+        let retry_answered_after = retry_requested.then_some(health.revision);
+        if retry_requested && !(writes.is_settled() && writes.quarantine.is_empty()) {
+            // An explicit retry is also the one way a refused write is offered
+            // to storage again: the reader may have fixed what storage refused.
+            writes.rearm_quarantine();
             retry_exhausted = false;
             attempts_this_cycle = 0;
             // An explicit retry is the reader re-arming the lane, so it also
@@ -1315,7 +1834,8 @@ fn persistence_loop(
         if should_persist {
             let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut rebases_remaining);
             record_flush_errors(&last_error, &errors);
-            if writes.is_empty() {
+            health.quarantine(writes.quarantined());
+            if writes.is_settled() {
                 health.flushed();
                 // Commits accumulate in the WAL, which SQLite never shrinks on
                 // its own; this costs one `stat` per flush and only does real
@@ -1343,26 +1863,26 @@ fn persistence_loop(
                         category = failure.map(SaveFailureCategory::label),
                         "a cagents workspace write could not be stored"
                     );
-                    // Which card a refusal of saved state names is what
-                    // explains it. Those messages are this crate's own and
-                    // carry no connection string, unlike the other errors,
-                    // which stay behind their category.
-                    for error in &errors {
-                        if let StoreError::InvalidState(reason) = error {
-                            tracing::debug!(reason, "workspace write refused");
-                        }
-                    }
                 }
                 health.failed(&errors, retry_exhausted);
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
         }
+        if let Some(revision) = retry_answered_after {
+            health.answer_retry(revision);
+        }
         for checkpoint in checkpoints {
-            let result = if writes.is_empty() {
-                Ok(())
-            } else {
+            let result = if !writes.is_settled() {
                 Err(save_refusal(failure))
+            } else if let Some(category) = writes.quarantine.window_state() {
+                // A barrier vouches for the window's state - a terminal handoff
+                // releases the daemon's replay evidence on the strength of it -
+                // so a refused snapshot fails it. A refused catalog row does
+                // not: waiting cannot save it, and the window state is whole.
+                Err(window_state_refusal(category))
+            } else {
+                Ok(())
             };
             let _ = checkpoint.send(result);
         }
@@ -1371,14 +1891,15 @@ fn persistence_loop(
             // The steady-state lane retries a failed batch until it lands, so
             // the last flush of the session has to as well: the single attempt
             // this once made discarded the user's final snapshot the first time
-            // storage was momentarily unwritable.
+            // storage was momentarily unwritable. Refused writes are not part
+            // of that batch, so they cannot spend the budget either.
             let deadline = Instant::now() + config.shutdown_flush_budget;
             // The last flush of the session gets a recovery of its own,
             // whatever the steady-state lane already spent: losing the final
             // snapshot to a base that fell behind is exactly the loss this
             // retry loop exists to prevent.
             let mut shutdown_rebases = PERSIST_REBASES_PER_BATCH;
-            while !writes.is_empty() {
+            while !writes.is_settled() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -1389,17 +1910,36 @@ fn persistence_loop(
                 thread::sleep(retry_delay.min(remaining));
                 let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut shutdown_rebases);
                 record_flush_errors(&last_error, &errors);
-                if writes.is_empty() {
+                health.quarantine(writes.quarantined());
+                if writes.is_settled() {
                     health.flushed();
                 } else {
                     health.failed(&errors, false);
                 }
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
-            // `clean_shutdown` asserts that storage holds everything this
-            // session produced, so only a complete flush earns it; otherwise
-            // the next open must recover rather than trust the database.
-            if writes.is_empty()
+            let refused = writes.quarantined();
+            if !refused.is_empty() {
+                tracing::warn!(
+                    refused = ?refused,
+                    "the session ended with writes storage refused; they were not saved"
+                );
+            }
+            let orphaned = writes.orphaned_worktrees();
+            if !orphaned.is_empty() {
+                tracing::warn!(
+                    ?orphaned,
+                    "the session ended with worktrees whose project was never saved; they were \
+                     not saved"
+                );
+            }
+            // `clean_shutdown` asserts that storage holds the window this
+            // session ended with, so only a complete flush earns it; otherwise
+            // the next open must recover rather than trust the database. A
+            // refused catalog row does not undo that: it is lost either way,
+            // and nothing a recovery reconciles depends on it.
+            if writes.is_settled()
+                && writes.quarantine.window_state().is_none()
                 && let Err(error) = store.shutdown()
                 && let Ok(mut message) = last_error.lock()
             {
@@ -1530,6 +2070,15 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
     }
 }
 
+/// Why a barrier cannot vouch for a window whose state storage refused.
+fn window_state_refusal(category: SaveFailureCategory) -> String {
+    format!(
+        "workspace could not be saved: storage refused part of the window's own state ({}). {}",
+        category.label(),
+        QUARANTINE_GUIDANCE
+    )
+}
+
 pub fn current_boot_id() -> Result<BootId, SessionError> {
     let value =
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(SessionError::BootId)?;
@@ -1562,6 +2111,8 @@ mod tests {
         FailDiskFull,
         /// A base generation storage rejected.
         FailStale,
+        /// A write storage refuses by construction.
+        Refuse,
         Panic,
     }
 
@@ -1573,6 +2124,10 @@ mod tests {
         /// Counts the generation re-reads the writer lane performed, which is
         /// what tells a rebase apart from an ordinary retry.
         rebases: Arc<AtomicUsize>,
+        /// Counts the clean shutdowns the lane recorded.
+        shutdowns: Arc<AtomicUsize>,
+        /// Counts every write the lane offered, whatever its outcome.
+        attempts: Arc<AtomicUsize>,
     }
 
     impl FakeStore {
@@ -1581,6 +2136,8 @@ mod tests {
                 writes: Mutex::new(writes.into_iter().collect()),
                 exhausted: FakeWrite::Succeed,
                 rebases: Arc::new(AtomicUsize::new(0)),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+                attempts: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1589,10 +2146,13 @@ mod tests {
                 writes: Mutex::new(VecDeque::new()),
                 exhausted: write,
                 rebases: Arc::new(AtomicUsize::new(0)),
+                shutdowns: Arc::new(AtomicUsize::new(0)),
+                attempts: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn write(&self) -> Result<(), StoreError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
             match self
                 .writes
                 .lock()
@@ -1613,6 +2173,7 @@ mod tests {
                     expected: 1,
                     actual: 2,
                 }),
+                FakeWrite::Refuse => Err(StoreError::InvalidState("injected refusal".to_owned())),
                 FakeWrite::Panic => panic!("injected writer panic"),
             }
         }
@@ -1677,6 +2238,7 @@ mod tests {
         }
 
         fn shutdown(&self) -> Result<(), StoreError> {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -2787,5 +3349,995 @@ mod tests {
         lock.lock().unwrap().shutdown = true;
         changed.notify_one();
         worker.join().unwrap();
+    }
+
+    fn project(name: &str) -> ProjectState {
+        ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: name.into(),
+            repository: PathBuf::from("/repo").join(name),
+            existence: Existence::Open,
+        }
+    }
+
+    fn worktree(project: &ProjectState, name: &str) -> WorktreeState {
+        WorktreeState {
+            id: WorktreeId::new(),
+            project_id: project.id,
+            generation: 0,
+            path: project.repository.join("worktrees").join(name),
+            branch: Some(name.into()),
+            existence: Existence::Open,
+        }
+    }
+
+    fn closed() -> Existence {
+        Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by the test".into()),
+            },
+        }
+    }
+
+    /// The last event the lane published so far.
+    fn latest_health(
+        receiver: &async_channel::Receiver<SessionSaveHealthEvent>,
+    ) -> SessionSaveHealthEvent {
+        let mut latest = None;
+        while let Ok(event) = receiver.try_recv() {
+            latest = Some(event);
+        }
+        latest.expect("the lane publishes an event for every change the test waits on")
+    }
+
+    /// The first event, up to a deadline, that satisfies `wanted`.
+    fn health_until(
+        receiver: &async_channel::Receiver<SessionSaveHealthEvent>,
+        wanted: impl Fn(&SessionSaveHealthEvent) -> bool,
+    ) -> SessionSaveHealthEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match receiver.try_recv() {
+                Ok(event) if wanted(&event) => return event,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the lane never reached the awaited health"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    fn foreign_key_violation() -> StoreError {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some("FOREIGN KEY constraint failed".into()),
+        ))
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ProjectWrite {
+        Land,
+        Busy,
+        Refuse,
+    }
+
+    /// A catalog store that enforces the worktree -> project reference the way
+    /// SQLite does, and scripts what each project's writes do. A project with
+    /// no script left lands.
+    #[derive(Default)]
+    struct CatalogStore {
+        projects: Mutex<HashMap<ProjectId, VecDeque<ProjectWrite>>>,
+        stored_projects: Mutex<HashSet<ProjectId>>,
+        saved_worktrees: Mutex<Vec<WorktreeId>>,
+        missing_parents: AtomicUsize,
+    }
+
+    impl CatalogStore {
+        fn new<const N: usize>(project: ProjectId, writes: [ProjectWrite; N]) -> Self {
+            Self {
+                projects: Mutex::new(HashMap::from([(project, writes.into())])),
+                ..Self::default()
+            }
+        }
+
+        fn saved_worktrees(&self) -> Vec<WorktreeId> {
+            self.saved_worktrees.lock().unwrap().clone()
+        }
+    }
+
+    impl SessionStore for CatalogStore {
+        fn replace_terminal_identity(
+            &self,
+            _card_id: CardId,
+            _expected_terminal_id: TerminalId,
+            _replacement: &TerminalSession,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn replace_chat_identity(
+            &self,
+            _card_id: CardId,
+            _expected_id: TerminalId,
+            _replacement: &crate::chat::Session,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn save_workspace(
+            &self,
+            _state: &WorkspaceState,
+            _base: SnapshotBase<'_>,
+        ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+            Ok(crate::persistence::WorkspaceCommit::default())
+        }
+
+        fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
+            let write = self
+                .projects
+                .lock()
+                .unwrap()
+                .get_mut(&project.id)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(ProjectWrite::Land);
+            match write {
+                ProjectWrite::Land => {
+                    self.stored_projects.lock().unwrap().insert(project.id);
+                    Ok(project.generation + 1)
+                }
+                ProjectWrite::Busy => Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                ))),
+                ProjectWrite::Refuse => Err(StoreError::InvalidState(format!(
+                    "tombstoned project {} cannot be resurrected",
+                    project.id
+                ))),
+            }
+        }
+
+        fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
+            if !self
+                .stored_projects
+                .lock()
+                .unwrap()
+                .contains(&worktree.project_id)
+            {
+                self.missing_parents.fetch_add(1, Ordering::Relaxed);
+                return Err(foreign_key_violation());
+            }
+            self.saved_worktrees.lock().unwrap().push(worktree.id);
+            Ok(worktree.generation + 1)
+        }
+
+        fn stored_generations(
+            &self,
+            _workspace: WorkspaceId,
+        ) -> Result<StoredGenerations, StoreError> {
+            Ok(StoredGenerations::default())
+        }
+
+        fn stored_project_generation(
+            &self,
+            _project: ProjectId,
+        ) -> Result<Option<u64>, StoreError> {
+            Ok(None)
+        }
+
+        fn stored_worktree_generation(
+            &self,
+            _worktree: WorktreeId,
+        ) -> Result<Option<u64>, StoreError> {
+            Ok(None)
+        }
+
+        fn shutdown(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn empty_writes() -> PendingWrites {
+        PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_content_itself_is_permanent() {
+        let constraint = |extended_code| {
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(extended_code),
+                None,
+            ))
+        };
+        for permanent in [
+            StoreError::InvalidState("tombstoned card cannot be resurrected".into()),
+            StoreError::Serialization(serde_json::from_str::<u8>("x").unwrap_err()),
+            StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+            constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+            constraint(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+            constraint(rusqlite::ffi::SQLITE_TOOBIG),
+            foreign_key_violation(),
+            StoreError::Card {
+                card: CardId::new(),
+                error: Box::new(StoreError::InvalidState("invalid conversion".into())),
+            },
+        ] {
+            assert!(permanent.refuses_content(), "{permanent:?}");
+        }
+        for transient in [
+            constraint(rusqlite::ffi::SQLITE_BUSY),
+            constraint(rusqlite::ffi::SQLITE_READONLY),
+            constraint(rusqlite::ffi::SQLITE_FULL),
+            constraint(rusqlite::ffi::SQLITE_CORRUPT),
+            StoreError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            StoreError::StaleGeneration {
+                entity: "workspace".into(),
+                expected: 1,
+                actual: 2,
+            },
+            StoreError::UnsupportedSchema {
+                found: 99,
+                supported: 1,
+            },
+            StoreError::Closed,
+            StoreError::Card {
+                card: CardId::new(),
+                error: Box::new(constraint(rusqlite::ffi::SQLITE_BUSY)),
+            },
+        ] {
+            assert!(!transient.refuses_content(), "{transient:?}");
+        }
+        assert_eq!(
+            save_failure_category(&constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)),
+            SaveFailureCategory::InvalidData
+        );
+        assert_eq!(
+            save_failure_category(&foreign_key_violation()),
+            SaveFailureCategory::InvalidData
+        );
+    }
+
+    /// #268: a write storage refuses by construction used to exhaust the
+    /// lane, after which nothing else the window produced was written.
+    #[test]
+    fn a_refused_catalog_write_is_set_aside_while_later_writes_land() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("refused-catalog.sqlite3");
+        let boot = BootId::new("boot-refused-catalog");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let poisoned = project("poisoned");
+        runtime.save_project(poisoned.clone());
+        runtime.flush(timeout).unwrap();
+        runtime.save_project(ProjectState {
+            existence: closed(),
+            ..poisoned.clone()
+        });
+        runtime.flush(timeout).unwrap();
+
+        runtime.save_project(poisoned.clone());
+        runtime
+            .flush(timeout)
+            .expect("a refused catalog row leaves the window state whole");
+        let refused = latest_health(&health);
+        assert_eq!(refused.health, SessionSaveHealth::Healthy);
+        assert_eq!(refused.quarantined.len(), 1);
+        assert_eq!(
+            refused.quarantined[0].subject,
+            WriteSubject::Project {
+                id: poisoned.id,
+                name: "poisoned".into(),
+            }
+        );
+        assert_eq!(
+            refused.quarantined[0].category,
+            SaveFailureCategory::InvalidData
+        );
+
+        let unrelated = project("unrelated");
+        let unrelated_worktree = worktree(&unrelated, "feature");
+        let later = workspace();
+        runtime.save_project(unrelated.clone());
+        runtime.save_worktrees([unrelated_worktree.clone()]);
+        runtime.snapshot(Arc::new(later.clone()));
+        runtime.flush(timeout).unwrap();
+        runtime.shutdown();
+        assert_eq!(runtime.last_error(), None);
+
+        let (mut reopened, restored) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        assert_eq!(restored.map(|state| state.id), Some(later.id));
+        let (projects, worktrees) = reopened.take_catalog();
+        assert!(projects.iter().any(|project| project.id == unrelated.id));
+        assert!(
+            projects
+                .iter()
+                .any(|project| project.id == poisoned.id && !project.existence.is_open()),
+            "the refused resurrection never reached storage"
+        );
+        assert_eq!(
+            worktrees
+                .iter()
+                .map(|worktree| worktree.id)
+                .collect::<Vec<_>>(),
+            vec![unrelated_worktree.id]
+        );
+        reopened.shutdown();
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(
+            !store.recovery_report().dirty_shutdown,
+            "a refused catalog row does not cost the session its clean shutdown"
+        );
+    }
+
+    #[test]
+    fn a_worktree_waits_for_its_project_instead_of_failing_on_it() {
+        let parent = project("parent");
+        let child = worktree(&parent, "child");
+        let store = CatalogStore::new(parent.id, [ProjectWrite::Busy]);
+        let mut writes = empty_writes();
+        writes.projects.insert(parent.id, parent.clone());
+        writes.worktrees.insert(child.id, child.clone());
+
+        let errors = writes.flush(&store);
+        assert_eq!(errors.len(), 1, "only the project failed: {errors:?}");
+        assert_eq!(save_failure_category(&errors[0]), SaveFailureCategory::Busy);
+        assert!(
+            !writes.is_settled(),
+            "the project's retry keeps the lane busy"
+        );
+        assert!(
+            writes.quarantine.is_empty(),
+            "a busy database refuses nothing"
+        );
+        assert!(writes.orphaned_worktrees().is_empty());
+
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.is_settled());
+        assert_eq!(store.saved_worktrees(), vec![child.id]);
+        assert_eq!(
+            store.missing_parents.load(Ordering::Relaxed),
+            0,
+            "the lane never offers a worktree ahead of its project"
+        );
+    }
+
+    #[test]
+    fn only_the_worktrees_of_a_refused_project_are_held_back() {
+        let refused = project("refused");
+        let held = worktree(&refused, "held");
+        let unrelated = project("unrelated");
+        let landed = worktree(&unrelated, "landed");
+        let store = CatalogStore::new(refused.id, [ProjectWrite::Refuse]);
+        let mut writes = empty_writes();
+        writes.projects.insert(refused.id, refused.clone());
+        writes.worktrees.insert(held.id, held.clone());
+        writes.projects.insert(unrelated.id, unrelated.clone());
+        writes.worktrees.insert(landed.id, landed.clone());
+
+        let errors = writes.flush(&store);
+        assert!(errors.is_empty(), "a refusal is not a retry: {errors:?}");
+        assert!(
+            writes.is_settled(),
+            "a held-back write neither retries nor exhausts the lane"
+        );
+        assert_eq!(
+            writes.quarantined(),
+            vec![QuarantinedWrite {
+                subject: WriteSubject::Project {
+                    id: refused.id,
+                    name: "refused".into(),
+                },
+                category: SaveFailureCategory::InvalidData,
+                refused_at_unix_ms: writes.quarantine.projects[&refused.id].1.at_unix_ms,
+                held_back: 1,
+            }]
+        );
+        assert_eq!(store.saved_worktrees(), vec![landed.id]);
+        assert_eq!(store.missing_parents.load(Ordering::Relaxed), 0);
+        assert!(
+            writes.orphaned_worktrees().is_empty(),
+            "the refusal explains the held-back worktree"
+        );
+
+        // A newer write of the refused project supersedes the refusal and
+        // releases the worktree it held back, in the same flush.
+        writes.projects.insert(refused.id, refused.clone());
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.is_settled());
+        assert!(writes.quarantine.is_empty());
+        assert_eq!(store.saved_worktrees(), vec![landed.id, held.id]);
+        assert_eq!(store.missing_parents.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_worktree_whose_project_was_never_queued_is_named() {
+        let unsaved = project("unsaved");
+        let orphan = worktree(&unsaved, "orphan");
+        let store = CatalogStore::default();
+        let mut writes = empty_writes();
+        writes.worktrees.insert(orphan.id, orphan.clone());
+
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.is_settled());
+        assert!(store.saved_worktrees().is_empty());
+        assert_eq!(writes.orphaned_worktrees(), vec![orphan.id]);
+    }
+
+    #[test]
+    fn a_refused_update_of_a_stored_project_holds_nothing_back() {
+        let parent = project("parent");
+        let child = worktree(&parent, "child");
+        let store = CatalogStore::new(parent.id, [ProjectWrite::Refuse]);
+        store.stored_projects.lock().unwrap().insert(parent.id);
+        let mut writes = PendingWrites::restored(
+            0,
+            BTreeMap::new(),
+            HashMap::from([(parent.id, 1)]),
+            HashMap::new(),
+        );
+        writes.projects.insert(parent.id, parent.clone());
+        writes.worktrees.insert(child.id, child.clone());
+
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.is_settled());
+        assert_eq!(store.saved_worktrees(), vec![child.id]);
+        assert_eq!(writes.quarantined()[0].held_back, 0);
+    }
+
+    #[test]
+    fn a_refused_checkpoint_does_not_stop_the_snapshots_after_it() {
+        let store = FakeStore::new([FakeWrite::Refuse, FakeWrite::Succeed, FakeWrite::Succeed]);
+        let attempts = Arc::clone(&store.attempts);
+        let mut writes = empty_writes();
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::Snapshot(Arc::new(workspace())));
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::Snapshot(Arc::new(workspace())));
+        writes.workspace = Some(Arc::new(workspace()));
+
+        assert!(writes.flush(&store).is_empty());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert!(writes.is_settled());
+        assert!(
+            writes.quarantine.is_empty(),
+            "a later snapshot that landed supersedes the refused one"
+        );
+    }
+
+    #[test]
+    fn a_refused_autosave_stays_reported_until_a_later_one_lands() {
+        let store = FakeStore::new([FakeWrite::Refuse, FakeWrite::Refuse, FakeWrite::Succeed]);
+        let mut writes = empty_writes();
+        writes.workspace = Some(Arc::new(workspace()));
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.is_settled());
+        let first = writes.quarantined();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].subject, WriteSubject::Workspace { card: None });
+        assert_eq!(
+            writes.quarantine.window_state(),
+            Some(SaveFailureCategory::InvalidData)
+        );
+
+        // The reader's retry offers the refused snapshot again; refused
+        // again, it keeps the time storage first refused it.
+        writes.rearm_quarantine();
+        assert!(!writes.is_settled());
+        assert!(writes.flush(&store).is_empty());
+        assert_eq!(writes.quarantined(), first);
+
+        writes.workspace = Some(Arc::new(workspace()));
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.quarantine.is_empty());
+        assert_eq!(writes.quarantine.window_state(), None);
+    }
+
+    #[test]
+    fn a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("refused-workspace.sqlite3");
+        let boot = BootId::new("boot-refused-workspace");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        let card = state.cards.remove(0);
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+
+        // Bringing a closed card back is refused by construction.
+        let resurrected = card.id;
+        state.cards.push(card);
+        runtime.snapshot(Arc::new(state.clone()));
+        let refusal = runtime
+            .flush(timeout)
+            .expect_err("a barrier cannot vouch for a window storage refused");
+        assert!(refusal.contains("refused part of the window"), "{refusal}");
+        assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
+        let refused = latest_health(&health);
+        assert_eq!(refused.health, SessionSaveHealth::Healthy);
+        assert_eq!(
+            refused
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::Workspace {
+                card: Some(resurrected)
+            }]
+        );
+
+        // The catalog still saves beside it.
+        let unrelated = project("unrelated");
+        runtime.save_project(unrelated.clone());
+        runtime.flush(timeout).unwrap_err();
+        runtime.shutdown();
+
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(
+            store.recovery_report().dirty_shutdown,
+            "storage does not hold the window the session ended with"
+        );
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == unrelated.id)
+        );
+    }
+
+    #[test]
+    fn a_later_snapshot_supersedes_a_refused_one() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("superseded-workspace.sqlite3");
+        let boot = BootId::new("boot-superseded-workspace");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        let card = state.cards.remove(0);
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        state.cards.push(card);
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap_err();
+
+        state.cards.clear();
+        state.focused = None;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+    }
+
+    /// A relaunch storage refused leaves the stored identity where it was, and
+    /// the next relaunch continues from the refused one's identity. Without the
+    /// merge the second replacement could only be refused for expecting an
+    /// identity storage never held, and every snapshot carrying it after that.
+    #[test]
+    fn a_relaunch_after_a_refused_one_starts_from_the_stored_identity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("refused-relaunch.sqlite3");
+        let boot = BootId::new("boot-refused-relaunch");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        let card_id = state.cards[0].id;
+        let CardKind::Terminal(original) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        let relaunch = |id| TerminalSession {
+            id,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: original.launch.clone(),
+                last_exit: None,
+            },
+            ..original.clone()
+        };
+
+        // Storage refuses a relaunch whose recipe does not match its launch.
+        let mut refused = relaunch(TerminalId::new());
+        refused.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: LaunchRecipe {
+                program: "/bin/false".into(),
+                ..original.launch.clone()
+            },
+            last_exit: None,
+        };
+        runtime.replace_terminal_identity(card_id, original.id, refused.clone());
+        runtime.flush(timeout).unwrap_err();
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::CardIdentity {
+                card: card_id,
+                kind: ReplacedIdentity::Terminal,
+            }]
+        );
+
+        let latest = relaunch(TerminalId::new());
+        runtime.replace_terminal_identity(card_id, refused.id, latest.clone());
+        state.cards[0].kind = CardKind::Terminal(latest.clone());
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+
+        let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+        assert_eq!(restored.unwrap().cards[0].kind, CardKind::Terminal(latest));
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn closing_a_card_drops_its_refused_relaunch() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("closed-refused-relaunch.sqlite3");
+        let boot = BootId::new("boot-closed-refused-relaunch");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+        let card_id = state.cards[0].id;
+        let CardKind::Terminal(original) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        // Storage refuses a relaunch whose recipe does not match its launch.
+        let refused = TerminalSession {
+            id: TerminalId::new(),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: LaunchRecipe {
+                    program: "/bin/false".into(),
+                    ..original.launch.clone()
+                },
+                last_exit: None,
+            },
+            ..original.clone()
+        };
+        runtime.replace_terminal_identity(card_id, original.id, refused.clone());
+        runtime.flush(timeout).unwrap_err();
+
+        // A snapshot that still holds the card at the identity storage kept
+        // lands, and the relaunch it never took stays refused.
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap_err();
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::CardIdentity {
+                card: card_id,
+                kind: ReplacedIdentity::Terminal,
+            }]
+        );
+
+        // The window moves on to the relaunch, and storage refuses every
+        // snapshot that rebinds the card to it.
+        state.cards[0].kind = CardKind::Terminal(refused);
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap_err();
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![
+                &WriteSubject::Workspace {
+                    card: Some(card_id)
+                },
+                &WriteSubject::CardIdentity {
+                    card: card_id,
+                    kind: ReplacedIdentity::Terminal,
+                },
+            ]
+        );
+
+        // Closing the card, as the notice says, stores its tombstone over the
+        // identity storage kept, and leaves no identity to replace.
+        state.cards[0].existence = closed();
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+        let stored = store.load_card(card_id, None).unwrap().unwrap();
+        assert!(!stored.existence.is_open());
+        assert!(matches!(stored.kind, CardKind::Terminal(session) if session.id == original.id));
+    }
+
+    #[test]
+    fn a_card_first_saved_at_its_new_identity_drops_its_refused_relaunch() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("first-saved-refused-relaunch.sqlite3");
+        let boot = BootId::new("boot-first-saved-refused-relaunch");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        let card_id = state.cards[0].id;
+        let CardKind::Terminal(original) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        // The terminal exits before its first snapshot, and storage refuses
+        // the relaunch's content before it ever looks for the card.
+        let fresh_id = TerminalId::new();
+        runtime.replace_terminal_identity(
+            card_id,
+            original.id,
+            TerminalSession {
+                id: fresh_id,
+                continuity: TerminalContinuity::RelaunchAvailable {
+                    recipe: LaunchRecipe {
+                        program: "/bin/false".into(),
+                        ..original.launch.clone()
+                    },
+                    last_exit: None,
+                },
+                ..original.clone()
+            },
+        );
+        runtime.flush(timeout).unwrap_err();
+        assert_eq!(latest_health(&health).quarantined.len(), 1);
+
+        // The first snapshot stores the card at the fresh identity, which
+        // leaves the refused relaunch nothing to replace.
+        state.cards[0].kind = CardKind::Terminal(TerminalSession {
+            id: fresh_id,
+            ..original
+        });
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+
+        let store = StateStore::open(&path, boot).unwrap();
+        assert!(!store.recovery_report().dirty_shutdown);
+    }
+
+    #[test]
+    fn closing_a_chat_card_drops_its_refused_conversation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("closed-refused-conversation.sqlite3");
+        let boot = BootId::new("boot-closed-refused-conversation");
+        let timeout = Duration::from_secs(5);
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let health = runtime.health_receiver();
+        let mut state = workspace();
+        let card = state.cards[0].id;
+        let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        let chat = |session_id: Option<&str>| crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: crate::agent::Provider::Codex.executable().into(),
+                    arguments: Vec::new(),
+                    ..terminal.launch.clone()
+                },
+                session_id: session_id.map(str::to_owned),
+            },
+            proof: None,
+            terminal: None,
+        };
+        let original = chat(None);
+        state.cards[0].kind = CardKind::Chat(original.clone());
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap();
+
+        // Storage refuses a replacement conversation that has already begun.
+        // The window still shows the conversation storage holds.
+        runtime.replace_chat_identity(
+            card,
+            original.id,
+            chat(Some("begun")),
+            Arc::new(state.clone()),
+        );
+        runtime.flush(timeout).unwrap_err();
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Chat,
+            }]
+        );
+
+        state.cards[0].existence = closed();
+        runtime.snapshot(Arc::new(state));
+        runtime.flush(timeout).unwrap();
+        assert!(latest_health(&health).quarantined.is_empty());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn a_retry_storage_refuses_again_is_still_answered() {
+        let store = FakeStore::always(FakeWrite::Refuse);
+        let attempts = Arc::clone(&store.attempts);
+        let refused = project("refused");
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                projects: HashMap::from([(refused.id, refused)]),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(2),
+            );
+        });
+        let quarantined = health_until(&health_rx, |event| !event.quarantined.is_empty());
+
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        // The reader's notice waits on this event to offer a retry again.
+        let answer = health_until(&health_rx, |event| event.revision > quarantined.revision);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(answer.health, SessionSaveHealth::Healthy);
+        assert_eq!(answer.quarantined, quarantined.quarantined);
+
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_skips_refused_writes() {
+        for (window_state, clean) in [(false, true), (true, false)] {
+            let store = FakeStore::always(FakeWrite::Refuse);
+            let attempts = Arc::clone(&store.attempts);
+            let shutdowns = Arc::clone(&store.shutdowns);
+            let queue = Arc::new((
+                Mutex::new(QueueState {
+                    latest: window_state.then(|| Arc::new(workspace())),
+                    projects: HashMap::from_iter((!window_state).then(|| {
+                        let project = project("refused");
+                        (project.id, project)
+                    })),
+                    shutdown: true,
+                    ..QueueState::default()
+                }),
+                Condvar::new(),
+            ));
+            let (health_tx, _health_rx) = async_channel::unbounded();
+            let mut health = HealthPublisher::new(health_tx);
+            let started = Instant::now();
+
+            persistence_loop(
+                store,
+                empty_writes(),
+                queue,
+                Arc::new(Mutex::new(None)),
+                &mut health,
+                PersistenceConfig {
+                    // Long enough that spending it would time the test out.
+                    shutdown_flush_budget: Duration::from_secs(60),
+                    ..fast_persistence_config(2)
+                },
+            );
+
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                1,
+                "a refused write is offered once, not retried until the budget runs out"
+            );
+            assert_eq!(shutdowns.load(Ordering::Relaxed), usize::from(clean));
+        }
+    }
+
+    #[test]
+    fn a_retry_offers_refused_writes_to_storage_again() {
+        let store = FakeStore::new([FakeWrite::Refuse, FakeWrite::Succeed]);
+        let attempts = Arc::clone(&store.attempts);
+        let refused = project("refused");
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                projects: HashMap::from([(refused.id, refused.clone())]),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                empty_writes(),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(2),
+            );
+        });
+
+        let quarantined = health_until(&health_rx, |event| !event.quarantined.is_empty());
+        assert_eq!(quarantined.health, SessionSaveHealth::Healthy);
+        // Nothing retries a refusal on its own.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        let cleared = health_until(&health_rx, |event| event.quarantined.is_empty());
+        assert_eq!(cleared.health, SessionSaveHealth::Healthy);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_quarantine_change_never_repeats_a_recovery() {
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let mut publisher = HealthPublisher::new(health_tx);
+        publisher.failed(&[StoreError::Closed], false);
+        publisher.flushed();
+        let _ = latest_health(&health_rx);
+
+        let refused = QuarantinedWrite {
+            subject: WriteSubject::Workspace { card: None },
+            category: SaveFailureCategory::InvalidData,
+            refused_at_unix_ms: 1,
+            held_back: 0,
+        };
+        publisher.quarantine(vec![refused.clone()]);
+        let event = latest_health(&health_rx);
+        assert_eq!(event.health, SessionSaveHealth::Healthy);
+        assert_eq!(event.quarantined, vec![refused.clone()]);
+
+        publisher.quarantine(vec![refused]);
+        assert!(
+            health_rx.try_recv().is_err(),
+            "an unchanged quarantine publishes nothing"
+        );
     }
 }
