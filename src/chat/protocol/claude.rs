@@ -7,8 +7,8 @@ use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat::{
     Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction, Event,
-    Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, Skill, SlashCommand,
-    ToolStatus, Usage, clock_label,
+    Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, Skill, SkillReach,
+    SlashCommand, ToolStatus, Usage, clock_label,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -284,16 +284,18 @@ struct Claude {
     cache_write_tokens: u64,
     reasoning: Option<String>,
     commands: Vec<SlashCommand>,
-    /// The commands Claude Code marks as its own, which before the session's
-    /// first turn is all that tells a command from a skill; `None` when its
-    /// list marks none, as a version without the mark sends it.
-    builtin: Option<HashSet<String>>,
-    /// The skills the session reported when it began its latest turn, `None`
-    /// until it has.
-    skills: Option<HashSet<String>>,
-    /// Every command listed when `skills` was reported, which it rules on;
-    /// one listed since is told apart by the mark alone.
-    reported: HashSet<String>,
+    /// The commands the session's latest described list names without
+    /// Claude Code's mark for its own: the user's, the project's and
+    /// plugins'. Empty when the list marks none, as a version without the
+    /// mark sends it, since then nothing tells them apart.
+    authored: HashSet<String>,
+    /// The skills the session reported when it began its latest turn.
+    skills: HashSet<String>,
+    /// The name each command goes by in a turn's lists, keyed to the name
+    /// Claude Code shows for it. A plugin's skill is shown by its own name
+    /// but listed by the plugin's, and the session gives the second as an
+    /// alias of the first.
+    aliases: HashMap<String, String>,
     usage: Usage,
     history: Option<History>,
 }
@@ -320,6 +322,7 @@ impl Claude {
             model_selection: !self.models.is_empty(),
             reasoning_selection: self.models.iter().any(|m| !m.reasoning.is_empty()),
             permission_modes: MODES.iter().map(|s| (*s).into()).collect(),
+            skill_reach: SkillReach::Leading,
             ..Capabilities::default()
         }
     }
@@ -573,15 +576,22 @@ impl Claude {
                 .collect();
         }
         if let Some(commands) = data["commands"].as_array() {
-            let mut builtin = HashSet::new();
+            let mut authored = HashSet::new();
             let mut marked = false;
+            self.aliases.clear();
             self.commands = commands
                 .iter()
                 .filter_map(|c| {
                     let name: String = c["name"].as_str()?.trim_start_matches('/').into();
                     marked |= c.get("builtin").is_some();
-                    if c["builtin"].as_bool() == Some(true) {
-                        builtin.insert(name.clone());
+                    for alias in c["aliases"].as_array().into_iter().flatten() {
+                        if let Some(alias) = alias.as_str() {
+                            self.aliases
+                                .insert(alias.trim_start_matches('/').into(), name.clone());
+                        }
+                    }
+                    if c["builtin"].as_bool() != Some(true) {
+                        authored.insert(name.clone());
                     }
                     Some(SlashCommand {
                         name,
@@ -589,35 +599,37 @@ impl Claude {
                     })
                 })
                 .collect();
-            self.builtin = marked.then_some(builtin);
+            if !marked {
+                authored.clear();
+            }
+            self.authored = authored;
         } else if let Some(commands) = data["slash_commands"].as_array() {
             // The turn's own list names the commands without describing
-            // them, so a description the session already gave is kept.
+            // them, so a description the session already gave is kept. A
+            // command listed both by its name and by an alias of it is one.
             let described = std::mem::take(&mut self.commands);
-            self.commands = commands
-                .iter()
-                .filter_map(|c| {
-                    let name = c.as_str()?.trim_start_matches('/');
-                    Some(SlashCommand {
-                        name: name.into(),
-                        description: described
-                            .iter()
-                            .find(|known| known.name == name)
-                            .map(|known| known.description.clone())
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect();
+            for listed in commands.iter().filter_map(Value::as_str) {
+                let name = self.shown(listed);
+                if self.commands.iter().any(|known| known.name == name) {
+                    continue;
+                }
+                let description = described
+                    .iter()
+                    .find(|known| known.name == name)
+                    .map(|known| known.description.clone())
+                    .unwrap_or_default();
+                self.commands.push(SlashCommand {
+                    name: name.into(),
+                    description,
+                });
+            }
         }
         if let Some(skills) = data["skills"].as_array() {
-            self.skills = Some(
-                skills
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|name| name.trim_start_matches('/').to_owned())
-                    .collect(),
-            );
-            self.reported = self.commands.iter().map(|c| c.name.clone()).collect();
+            self.skills = skills
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| self.shown(name).to_owned())
+                .collect();
         }
         let terminal = data["terminal_slash_commands"].as_array();
         self.commands.retain(|c| {
@@ -656,26 +668,38 @@ impl Claude {
             Event::Capabilities(self.capabilities()),
         ]);
     }
+    /// The name Claude Code shows for a command a turn's list names.
+    fn shown<'a>(&'a self, listed: &'a str) -> &'a str {
+        let listed = listed.trim_start_matches('/');
+        self.aliases.get(listed).map_or(listed, String::as_str)
+    }
     /// Whether a listed command is a skill: a prompt the model can be pointed
     /// at from anywhere in a message, which Claude Code runs through its Skill
     /// tool, rather than a command it only runs as the whole of one.
     ///
-    /// Claude Code lists skills among its slash commands, and names them
-    /// apart only when a turn begins; what the latest turn said of a command
-    /// it listed is final. Anything else is judged by Claude Code's mark:
-    /// what it does not mark as its own - the user's, the project's, and
-    /// plugins' - is taken for a skill, including one added mid-session, and
-    /// its own are commands, as are an MCP server's prompts. A list without
-    /// the mark tells nothing, so such a command stays a command, which is
-    /// only ever offered where Claude Code acts on it.
+    /// Claude Code lists its skills among its slash commands and names them
+    /// apart only when a turn begins, and that list leaves out some the model
+    /// can still be pointed at: a command in `.claude/commands`, and a skill
+    /// without a description. So a command is also a skill when the latest
+    /// described list does not mark it as Claude Code's own, as the user's,
+    /// the project's and plugins' are, including one added mid-session. A
+    /// command neither list vouches for stays a command, which is only ever
+    /// offered where Claude Code acts on it, and so does every command of a
+    /// list without the mark, which cannot tell `/clear` from a skill.
+    ///
+    /// An MCP server's prompt is shown as `server:prompt (MCP)` until a turn
+    /// lists it as `mcp__server__prompt`; neither is ever a skill. A server
+    /// reached over HTTP may show a prompt by its bare name, which nothing
+    /// tells apart from a skill.
+    ///
+    /// A skill its author keeps from the model (`disable-model-invocation`)
+    /// is still listed as one, and Claude Code refuses it when the model
+    /// asks for it mid-message; nothing in the session tells it apart.
     fn is_skill(&self, name: &str) -> bool {
-        match &self.skills {
-            Some(skills) if self.reported.contains(name) => skills.contains(name),
-            _ => self
-                .builtin
-                .as_ref()
-                .is_some_and(|builtin| !builtin.contains(name) && !name.starts_with("mcp__")),
+        if name.starts_with("mcp__") || name.ends_with(" (MCP)") {
+            return false;
         }
+        self.skills.contains(name) || self.authored.contains(name)
     }
     fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let carrier = required(frame, "uuid")?;
@@ -3787,7 +3811,10 @@ mod tests {
                     {"name":"alpha","description":"Alpha (user)","argumentHint":""},
                     {"name":"simplify","description":"Tidy","argumentHint":"","builtin":true},
                     {"name":"compact","description":"Compact","argumentHint":"","builtin":true},
-                    {"name":"mcp__docs__search","description":"Search","argumentHint":""},
+                    {"name":"docs:search (MCP)","description":"Search","argumentHint":""},
+                    {"name":"review","description":"Review (plugin)","argumentHint":"",
+                        "aliases":["tools:review"]},
+                    {"name":"legacy","description":"Legacy (.claude/commands)","argumentHint":""},
                 ]}),
             ))
             .unwrap();
@@ -3797,15 +3824,27 @@ mod tests {
                 vec![
                     "simplify".to_owned(),
                     "compact".to_owned(),
-                    "mcp__docs__search".to_owned()
+                    "docs:search (MCP)".to_owned()
                 ],
-                vec![("alpha".into(), "Alpha (user)".into(), "/alpha".into())]
+                vec![
+                    ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
+                    ("review".into(), "Review (plugin)".into(), "/review".into()),
+                    (
+                        "legacy".into(),
+                        "Legacy (.claude/commands)".into(),
+                        "/legacy".into()
+                    ),
+                ]
             )
         );
+        // The turn lists a plugin's skill by the plugin's name, which the
+        // session gave as an alias, and an MCP prompt by its tool name. A
+        // command no described list has named is not taken for a skill.
         let began = adapter
             .receive(json!({"type":"system","subtype":"init","uuid":"i",
-                "slash_commands":["alpha","simplify","compact","local","mcp__docs__search"],
-                "skills":["alpha","simplify"]}))
+                "slash_commands":["alpha","simplify","compact","local","mcp__docs__search",
+                    "tools:review","review","legacy"],
+                "skills":["alpha","simplify","tools:review"]}))
             .unwrap();
         assert_eq!(
             listed(&began),
@@ -3818,11 +3857,22 @@ mod tests {
                 vec![
                     ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
                     ("simplify".into(), "Tidy".into(), "/simplify".into()),
+                    ("review".into(), "Review (plugin)".into(), "/review".into()),
+                    // Its list leaves out a legacy command, which the
+                    // model still runs as a skill, so it does not change
+                    // class once a turn begins.
+                    (
+                        "legacy".into(),
+                        "Legacy (.claude/commands)".into(),
+                        "/legacy".into()
+                    ),
                 ]
             )
         );
         // A skill added mid-session is one as soon as it is listed, before
-        // any turn names it; what the turn said of the rest still holds.
+        // any turn names it. So is a command of the user's the turn does not
+        // list as a skill, as it leaves out `.claude/commands`, which the
+        // model runs as skills all the same.
         let changed = adapter
             .receive(
                 json!({"type":"system","subtype":"commands_changed","uuid":"c",
@@ -3838,21 +3888,20 @@ mod tests {
         assert_eq!(
             listed(&changed),
             (
-                vec!["local".to_owned(), "compact".to_owned()],
+                vec!["compact".to_owned()],
                 vec![
                     ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
                     ("gamma".into(), "Gamma (project)".into(), "/gamma".into()),
+                    ("local".into(), "Local".into(), "/local".into()),
                     ("simplify".into(), "Tidy".into(), "/simplify".into()),
                 ]
             )
         );
-        // A skill at the head of a message still dispatches as one.
-        assert!(
-            adapter
-                .command(Command::Slash {
-                    command: "/alpha now".into()
-                })
-                .is_ok()
-        );
+        // Claude Code loads only a skill a message opens with; the composer
+        // is told so it can say which named skills will not load.
+        assert!(changed.events.iter().any(|event| matches!(
+            event,
+            Event::Capabilities(capabilities) if capabilities.skill_reach == SkillReach::Leading
+        )));
     }
 }

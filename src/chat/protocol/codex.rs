@@ -8,7 +8,7 @@ use crate::account::{self, LiveReport};
 use crate::chat::{
     Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
     FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode, Request,
-    Role, SearchResult, Skill, ToolStatus, Usage,
+    Role, SearchResult, Skill, SkillReach, ToolStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -282,6 +282,7 @@ fn create_inner(
             cursor: None,
             history_loading: false,
             skills_stale: false,
+            skill_paths: Vec::new(),
             materialized: launch.session_id.is_some(),
         }),
     ))
@@ -337,6 +338,9 @@ struct Codex {
     /// Whether the catalog was invalidated again while a request for it was
     /// still outstanding, so exactly one refetch follows that answer.
     skills_stale: bool,
+    /// Each skill in the catalog by name and the path to its `SKILL.md`,
+    /// which is how a message's input names one exactly.
+    skill_paths: Vec<(String, String)>,
     materialized: bool,
 }
 impl Drop for Codex {
@@ -387,6 +391,7 @@ impl Codex {
             reasoning_selection: self.direct_input
                 && model.is_some_and(|m| !m.reasoning.is_empty()),
             permission_modes: Vec::new(),
+            skill_reach: SkillReach::Anywhere,
         }
     }
     /// Ask the account's server which skills apply to this conversation's
@@ -488,9 +493,18 @@ impl Codex {
     }
     fn input(&self, text: String, attachments: Vec<Attachment>) -> Result<Vec<Value>, String> {
         let mut input = Vec::with_capacity(1 + attachments.len());
+        // Each skill the text names goes with it as an input of its own, as
+        // Codex's own composer sends one: the text names a skill only by its
+        // name, which loads nothing when two skills share it.
+        let skills = self.named_skills(&text);
         if !text.is_empty() {
             input.push(json!({"type":"text","text":text}));
         }
+        input.extend(
+            skills
+                .into_iter()
+                .map(|(name, path)| json!({"type":"skill","name":name,"path":path})),
+        );
         for attachment in attachments {
             if !self.capabilities().attachments {
                 return Err("The selected Codex model does not advertise image input".into());
@@ -512,6 +526,30 @@ impl Codex {
             return Err("Enter a message or attach an image".into());
         }
         Ok(input)
+    }
+    /// The catalog's skills `text` names, each once, the way Codex reads
+    /// them: a `[$name](path)` link names the skill at that path, and a bare
+    /// `$name` the one skill of that name, if only one has it.
+    fn named_skills(&self, text: &str) -> Vec<(&str, &str)> {
+        let mut named: Vec<(&str, &str)> = Vec::new();
+        for mention in skill_mentions(text) {
+            let skill = match mention {
+                Mention::Linked(path) => self.skill_paths.iter().find(|(_, known)| known == path),
+                Mention::Named(name) => {
+                    let mut matching = self.skill_paths.iter().filter(|(known, _)| known == name);
+                    match (matching.next(), matching.next()) {
+                        (Some(skill), None) => Some(skill),
+                        _ => None,
+                    }
+                }
+            };
+            if let Some((name, path)) = skill
+                && !named.iter().any(|(_, known)| known == path)
+            {
+                named.push((name, path));
+            }
+        }
+        named
     }
     fn invalidate(&mut self, step: &mut Step) {
         for id in std::mem::take(&mut self.requests).into_keys() {
@@ -963,21 +1001,28 @@ impl Adapter for Codex {
                     self.model_events(&mut step);
                 }
                 Pending::Skills => {
-                    let mut skills: Vec<Skill> = Vec::new();
+                    // Each skill with the path it is at and the scope that
+                    // owns it, which tell apart two skills sharing a name.
+                    let mut catalog: Vec<(Skill, Option<String>, &str)> = Vec::new();
                     // The cap has to stop the outer walk as well: a catalog
                     // split across many directories would otherwise add one
                     // more skill per directory after the cap was reached.
-                    'catalog: for entry in result["data"].as_array().unwrap_or(&Vec::new()) {
-                        for value in entry["skills"].as_array().unwrap_or(&Vec::new()) {
-                            if skills.len() >= MAX_SKILLS {
+                    'catalog: for entry in result["data"].as_array().into_iter().flatten() {
+                        for value in entry["skills"].as_array().into_iter().flatten() {
+                            if catalog.len() >= MAX_SKILLS {
                                 break 'catalog;
                             }
                             let Some(name) = value["name"].as_str().filter(|n| !n.is_empty())
                             else {
                                 continue;
                             };
+                            let path = value["path"].as_str().map(str::to_owned);
+                            // The same skill reached from two directories is
+                            // listed under each.
                             if value["enabled"].as_bool() == Some(false)
-                                || skills.iter().any(|skill| skill.name == name)
+                                || catalog.iter().any(|(skill, known, _)| {
+                                    skill.name == name && (*known == path || path.is_none())
+                                })
                             {
                                 continue;
                             }
@@ -993,22 +1038,56 @@ impl Adapter for Codex {
                                 .or_else(|| value["shortDescription"].as_str())
                                 .or_else(|| value["description"].as_str())
                                 .unwrap_or_default();
-                            skills.push(Skill {
-                                description: description
-                                    .lines()
-                                    .next()
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(160)
-                                    .collect(),
-                                // Codex acts on a skill the message names with
-                                // a leading dollar sign. It has no command for
-                                // one, so there is nothing to dispatch.
-                                invocation: format!("${name}"),
-                                name,
-                            });
+                            catalog.push((
+                                Skill {
+                                    description: description
+                                        .lines()
+                                        .next()
+                                        .unwrap_or_default()
+                                        .chars()
+                                        .take(160)
+                                        .collect(),
+                                    // Codex acts on a skill the message names
+                                    // with a leading dollar sign. It has no
+                                    // command for one, so there is nothing to
+                                    // dispatch.
+                                    invocation: format!("${name}"),
+                                    name,
+                                },
+                                path,
+                                value["scope"].as_str().unwrap_or_default(),
+                            ));
                         }
                     }
+                    // A name two skills share loads neither, so each is named
+                    // by a link to its own file instead, which Codex reads
+                    // too, and its scope says which one it is.
+                    let shared = |name: &str| {
+                        catalog
+                            .iter()
+                            .filter(|(skill, _, _)| skill.name == name)
+                            .nth(1)
+                            .is_some()
+                    };
+                    let skills = catalog
+                        .iter()
+                        .map(|(skill, path, scope)| match path {
+                            Some(path) if shared(&skill.name) && !path.contains(')') => Skill {
+                                invocation: format!("[${}]({path})", skill.name),
+                                description: if scope.is_empty() {
+                                    skill.description.clone()
+                                } else {
+                                    format!("{scope} · {}", skill.description)
+                                },
+                                name: skill.name.clone(),
+                            },
+                            _ => skill.clone(),
+                        })
+                        .collect();
+                    self.skill_paths = catalog
+                        .into_iter()
+                        .filter_map(|(skill, path, _)| Some((skill.name, path?)))
+                        .collect();
                     step.events.push(Event::Skills(skills));
                     if std::mem::take(&mut self.skills_stale) {
                         self.skills(&mut step)?;
@@ -1615,8 +1694,11 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                         },
                         at: None,
                     }),
-                    // A mention, skill or audio part has no rendering of its
-                    // own, and neither has a part type this build cannot name,
+                    // A skill or a mention part names what the text beside it
+                    // already names, so it adds nothing to show.
+                    "skill" | "mention" => {}
+                    // An audio part has no rendering of its own, and neither
+                    // has a part type this build cannot name,
                     // whether because a later Codex introduced it or because
                     // the part never stated one. Showing the payload keeps the
                     // user's own input in the transcript, where rejecting it
@@ -1917,6 +1999,87 @@ fn elicitation_answers(
     Ok(Value::Object(content))
 }
 
+/// A skill a message names, as Codex finds it in the text.
+#[derive(Debug, PartialEq, Eq)]
+enum Mention<'a> {
+    /// `[$name](path)`, naming the skill at `path`.
+    Linked(&'a str),
+    /// `$name`.
+    Named(&'a str),
+}
+
+/// The skills `text` names, in the order it names them, read as Codex's own
+/// `extract_tool_mentions` reads them: anywhere in the text, a name being
+/// the characters Codex allows in one and never a common environment
+/// variable.
+fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
+    fn name_end(text: &str, start: usize) -> Option<usize> {
+        let length = text[start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+            .count();
+        (length > 0).then_some(start + length)
+    }
+    fn environment(name: &str) -> bool {
+        [
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "PWD",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "LANG",
+            "TERM",
+            "XDG_CONFIG_HOME",
+        ]
+        .iter()
+        .any(|variable| variable.eq_ignore_ascii_case(name))
+    }
+    let bytes = text.as_bytes();
+    let mut mentions = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'['
+            && bytes.get(index + 1) == Some(&b'$')
+            && let Some(end) = name_end(text, index + 2)
+            && bytes.get(end) == Some(&b']')
+        {
+            let open = end
+                + 1
+                + text[end + 1..]
+                    .bytes()
+                    .take_while(u8::is_ascii_whitespace)
+                    .count();
+            // A link without a path is read as the bare name inside it.
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = text[open..].find(')')
+                && let path = text[open + 1..open + close].trim()
+                && !path.is_empty()
+            {
+                if !environment(&text[index + 2..end]) {
+                    mentions.push(Mention::Linked(path));
+                }
+                index = open + close + 1;
+                continue;
+            }
+        }
+        if bytes[index] == b'$'
+            && let Some(end) = name_end(text, index + 1)
+        {
+            let name = &text[index + 1..end];
+            if !environment(name) {
+                mentions.push(Mention::Named(name));
+            }
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    mentions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2002,6 +2165,7 @@ mod tests {
             cursor: None,
             history_loading: false,
             skills_stale: false,
+            skill_paths: Vec::new(),
             materialized: true,
         }
     }
@@ -2160,6 +2324,117 @@ mod tests {
             .unwrap();
         assert_eq!(skills.len(), MAX_SKILLS);
         assert_eq!(skills[0].invocation, "$skill-0");
+    }
+
+    /// The skills a catalog lists, answered to a fresh adapter.
+    fn listed(adapter: &mut Codex, data: Value) -> Vec<Skill> {
+        let initialize = adapter.initialize().unwrap();
+        let setup = adapter
+            .receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":"/tmp"}}))
+            .unwrap();
+        let list = setup
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        adapter
+            .receive(json!({"id":list["id"],"result":{"data":data}}))
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Skills(skills) => Some(skills),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// Codex loads a skill a message names by `$name` only when no other
+    /// skill has that name, so two sharing one are each named by a link to
+    /// their own file, and every skill a message names goes with it as a
+    /// `skill` input carrying its path, as Codex's own composer sends it.
+    #[test]
+    fn named_skills_go_with_the_message_by_path() {
+        let mut adapter = adapter();
+        let skills = listed(
+            &mut adapter,
+            json!([
+                {"cwd":"/repo","skills":[
+                    {"name":"commits","description":"Write commits","path":"/u/commits/SKILL.md","scope":"user","enabled":true},
+                    {"name":"lint","description":"Lint","path":"/u/lint/SKILL.md","scope":"user","enabled":true},
+                    {"name":"lint","description":"Lint here","path":"/repo/lint/SKILL.md","scope":"repo","enabled":true},
+                    {"name":"off","path":"/u/off/SKILL.md","enabled":false}
+                ]},
+                // The same skill reached from another directory is one skill.
+                {"cwd":"/repo/sub","skills":[
+                    {"name":"commits","description":"Write commits","path":"/u/commits/SKILL.md","scope":"user","enabled":true}
+                ]}
+            ]),
+        );
+        let shown = skills
+            .iter()
+            .map(|skill| (skill.invocation.as_str(), skill.description.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                ("$commits", "Write commits"),
+                ("[$lint](/u/lint/SKILL.md)", "user · Lint"),
+                ("[$lint](/repo/lint/SKILL.md)", "repo · Lint here"),
+            ]
+        );
+
+        let text =
+            "$commits then [$lint](/repo/lint/SKILL.md), $commits again, $lint, $off and $HOME";
+        let input = adapter.input(text.into(), Vec::new()).unwrap();
+        assert_eq!(
+            input,
+            [
+                json!({"type":"text","text":text}),
+                json!({"type":"skill","name":"commits","path":"/u/commits/SKILL.md"}),
+                json!({"type":"skill","name":"lint","path":"/repo/lint/SKILL.md"}),
+            ],
+            "a bare shared name, a disabled skill and a variable name nothing"
+        );
+        assert_eq!(
+            adapter.input("no skills here".into(), Vec::new()).unwrap(),
+            [json!({"type":"text","text":"no skills here"})]
+        );
+    }
+
+    #[test]
+    fn mentions_are_read_the_way_codex_reads_them() {
+        assert_eq!(
+            skill_mentions(
+                "[$a-b:c](/x/SKILL.md) and $d_e.$PATH $ [$f] (/y) cost$9 [$g](/z/SKILL.md"
+            ),
+            [
+                Mention::Linked("/x/SKILL.md"),
+                Mention::Named("d_e"),
+                Mention::Linked("/y"),
+                Mention::Named("9"),
+                Mention::Named("g"),
+            ]
+        );
+        assert!(skill_mentions("naïve $ é [$HOME](/h)").is_empty());
+        assert_eq!(
+            skill_mentions("[$x]( ) [$y]\u{a0}(/p)"),
+            [Mention::Named("x"), Mention::Named("y"),]
+        );
+    }
+
+    /// A skill part in an echoed message names what its text already names.
+    #[test]
+    fn skill_parts_of_a_user_message_add_nothing_to_show() {
+        let echoed = json!({"id":"1","type":"userMessage","content":[
+            {"type":"text","text":"$commits please"},
+            {"type":"skill","name":"commits","path":"/u/commits/SKILL.md"},
+            {"type":"mention","name":"x","path":"app://x"}
+        ]});
+        let items = parse_item(&echoed, true, "turn").unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0].content,
+            ItemContent::Text { text, .. } if text == "$commits please"));
     }
 
     #[test]
