@@ -219,8 +219,11 @@ fn notice_entry<'a>(message: &'a str) -> Element<'a, Message> {
 enum CompletionKey {
     /// Moves the highlight down, or up when `false`.
     Move(bool),
-    /// Chooses the highlighted row.
+    /// Chooses the highlighted row, as Tab always does.
     Choose,
+    /// Chooses the highlighted row unless the word is already whole, as
+    /// Enter does.
+    Confirm,
     Dismiss,
 }
 
@@ -243,7 +246,8 @@ fn completion_key(press: &text_editor::KeyPress) -> Option<CompletionKey> {
     match key {
         keyboard::key::Named::ArrowDown => Some(CompletionKey::Move(true)),
         keyboard::key::Named::ArrowUp => Some(CompletionKey::Move(false)),
-        keyboard::key::Named::Enter | keyboard::key::Named::Tab => Some(CompletionKey::Choose),
+        keyboard::key::Named::Tab => Some(CompletionKey::Choose),
+        keyboard::key::Named::Enter => Some(CompletionKey::Confirm),
         keyboard::key::Named::Escape => Some(CompletionKey::Dismiss),
         _ => None,
     }
@@ -874,11 +878,16 @@ impl Runtime {
                     .into(),
             );
         }
-        // What Enter and Tab choose while the completion list is open.
+        // What Tab chooses while the completion list is open, and whether
+        // Enter does too.
         let mut chosen = None;
-        if let Some((_, rows)) = self.completion() {
+        if let Some((token, rows)) = self.completion() {
             let highlighted = self.completion.highlighted.min(rows.len() - 1);
-            chosen = Some(rows[highlighted].insertion.clone());
+            let insertion = &rows[highlighted].insertion;
+            chosen = Some((
+                insertion.clone(),
+                self.completion.enter_chooses(&token, insertion),
+            ));
             let (_, viewport) = completion_extent(rows.len());
             let rows = rows
                 .into_iter()
@@ -1040,12 +1049,15 @@ impl Runtime {
                     }
                     // An open completion list has the keys a reader uses to
                     // pick from it ahead of sending and history.
-                    if let Some(chosen) = &chosen
+                    if let Some((chosen, enter_chooses)) = &chosen
                         && let Some(key) = completion_key(&press)
+                            .filter(|key| *key != CompletionKey::Confirm || *enter_chooses)
                     {
                         return Some(text_editor::Binding::Custom(action(match key {
                             CompletionKey::Move(down) => Action::CompletionMove(target, down),
-                            CompletionKey::Choose => Action::Complete(target, chosen.clone()),
+                            CompletionKey::Choose | CompletionKey::Confirm => {
+                                Action::Complete(target, chosen.clone())
+                            }
                             CompletionKey::Dismiss => Action::CompletionDismiss(target),
                         })));
                     }

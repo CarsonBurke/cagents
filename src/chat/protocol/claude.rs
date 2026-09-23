@@ -284,8 +284,9 @@ struct Claude {
     reasoning: Option<String>,
     commands: Vec<SlashCommand>,
     /// The commands Claude Code marks as its own, which before the session's
-    /// first turn is all that tells a command from a skill.
-    builtin: HashSet<String>,
+    /// first turn is all that tells a command from a skill; `None` when its
+    /// list marks none, as a version without the mark sends it.
+    builtin: Option<HashSet<String>>,
     /// The skills the session reported when it began its first turn, `None`
     /// until it has.
     skills: Option<HashSet<String>>,
@@ -568,13 +569,15 @@ impl Claude {
                 .collect();
         }
         if let Some(commands) = data["commands"].as_array() {
-            self.builtin.clear();
+            let mut builtin = HashSet::new();
+            let mut marked = false;
             self.commands = commands
                 .iter()
                 .filter_map(|c| {
                     let name: String = c["name"].as_str()?.trim_start_matches('/').into();
+                    marked |= c.get("builtin").is_some();
                     if c["builtin"].as_bool() == Some(true) {
-                        self.builtin.insert(name.clone());
+                        builtin.insert(name.clone());
                     }
                     Some(SlashCommand {
                         name,
@@ -582,6 +585,7 @@ impl Claude {
                     })
                 })
                 .collect();
+            self.builtin = marked.then_some(builtin);
         } else if let Some(commands) = data["slash_commands"].as_array() {
             // The turn's own list names the commands without describing
             // them, so a description the session already gave is kept.
@@ -651,15 +655,22 @@ impl Claude {
     /// at from anywhere in a message, which Claude Code runs through its Skill
     /// tool, rather than a command it only runs as the whole of one.
     ///
-    /// Claude Code lists skills among its slash commands. It names them apart
-    /// only when a turn begins, so until then everything it does not mark as
-    /// its own - the user's, the project's, and plugins' - is taken for one,
-    /// and its own are taken for commands, as are an MCP server's prompts.
+    /// Claude Code lists skills among its slash commands, and names them
+    /// apart only when a turn begins. Everything it does not mark as its own
+    /// - the user's, the project's, and plugins' - is taken for a skill as
+    /// soon as it is listed, including one added mid-session. Its own are
+    /// commands, as are an MCP server's prompts, unless a turn has named them
+    /// skills. A list without the mark tells nothing, so until a turn does
+    /// everything stays a command, which is only ever offered where Claude
+    /// Code acts on it.
     fn is_skill(&self, name: &str) -> bool {
-        match &self.skills {
-            Some(skills) => skills.contains(name),
-            None => !self.builtin.contains(name) && !name.starts_with("mcp__"),
-        }
+        self.skills
+            .as_ref()
+            .is_some_and(|skills| skills.contains(name))
+            || self
+                .builtin
+                .as_ref()
+                .is_some_and(|builtin| !builtin.contains(name) && !name.starts_with("mcp__"))
     }
     fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let carrier = required(frame, "uuid")?;
@@ -3660,6 +3671,39 @@ mod tests {
     /// of one, so the two are told apart: by Claude Code's own mark before
     /// the first turn, then by the skills the turn reports, keeping each
     /// description when the turn's list names the commands bare.
+    /// A list that does not mark Claude Code's own commands cannot tell
+    /// `/clear` from a skill, so nothing is taken for one until a turn says.
+    #[test]
+    fn an_unmarked_command_list_offers_no_skills_until_a_turn_names_them() {
+        let mut adapter = Claude::default();
+        let initialize = adapter.initialize().unwrap();
+        let id = initialize.writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let connected = adapter
+            .receive(reply(
+                &id,
+                json!({"commands":[
+                    {"name":"alpha","description":"Alpha","argumentHint":""},
+                    {"name":"clear","description":"Clear","argumentHint":""},
+                ]}),
+            ))
+            .unwrap();
+        assert!(connected.events.iter().any(|event| matches!(
+            event,
+            Event::Skills(skills) if skills.is_empty()
+        )));
+        let began = adapter
+            .receive(json!({"type":"system","subtype":"init","uuid":"i",
+                "slash_commands":["alpha","clear"],"skills":["alpha"]}))
+            .unwrap();
+        assert!(began.events.iter().any(|event| matches!(
+            event,
+            Event::Skills(skills) if skills.len() == 1 && skills[0].name == "alpha"
+        )));
+    }
+
     #[test]
     fn skills_are_told_apart_from_the_commands_they_are_listed_with() {
         fn listed(step: &Step) -> (Vec<String>, Vec<(String, String, String)>) {
@@ -3724,6 +3768,30 @@ mod tests {
                 vec!["compact".to_owned(), "mcp__docs__search".to_owned()],
                 vec![
                     ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
+                    ("simplify".into(), "Tidy".into(), "/simplify".into()),
+                ]
+            )
+        );
+        // A skill added mid-session is one as soon as it is listed, before
+        // any turn names it.
+        let changed = adapter
+            .receive(
+                json!({"type":"system","subtype":"commands_changed","uuid":"c",
+                "commands":[
+                    {"name":"alpha","description":"Alpha (user)","argumentHint":""},
+                    {"name":"gamma","description":"Gamma (project)","argumentHint":""},
+                    {"name":"simplify","description":"Tidy","argumentHint":"","builtin":true},
+                    {"name":"compact","description":"Compact","argumentHint":"","builtin":true},
+                ]}),
+            )
+            .unwrap();
+        assert_eq!(
+            listed(&changed),
+            (
+                vec!["compact".to_owned()],
+                vec![
+                    ("alpha".into(), "Alpha (user)".into(), "/alpha".into()),
+                    ("gamma".into(), "Gamma (project)".into(), "/gamma".into()),
                     ("simplify".into(), "Tidy".into(), "/simplify".into()),
                 ]
             )

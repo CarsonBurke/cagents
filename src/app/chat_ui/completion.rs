@@ -28,8 +28,8 @@ pub(super) struct Token {
     pub sigil: char,
     /// What the reader has typed after the sigil, up to the caret.
     pub query: String,
-    /// Whether only whitespace comes before the word in the whole draft,
-    /// which is the one place a provider reads a command.
+    /// Whether the word is a slash with only whitespace before it in the
+    /// whole draft, which is the one place a provider reads a command.
     pub leading: bool,
 }
 
@@ -37,19 +37,16 @@ impl Token {
     /// The token the caret is in, or `None` when the reader is not naming
     /// something.
     ///
-    /// `lines` is the draft as the editor holds it, one entry per line, and
-    /// the caret's column is a byte offset into its line.
+    /// `line` is the caret's line as the editor holds it, and the caret's
+    /// column is a byte offset into it. `earlier_blank` answers whether every
+    /// line above it is blank; it is only asked for a slash opening its line,
+    /// so the common keystroke reads nothing but the line being typed on.
     pub fn at(
-        mut lines: impl Iterator<Item = impl AsRef<str>>,
+        line: &str,
         caret: Position,
         sigils: &[char],
+        earlier_blank: impl FnOnce() -> bool,
     ) -> Option<Self> {
-        let mut leading = true;
-        for _ in 0..caret.line {
-            leading &= lines.next()?.as_ref().trim().is_empty();
-        }
-        let line = lines.next()?;
-        let line = line.as_ref();
         // A column the editor reports is always on a character boundary; one
         // that is not means the draft changed under it, and there is nothing
         // sensible to complete.
@@ -62,21 +59,39 @@ impl Token {
         let word = &before[start..];
         let sigil = word.chars().next().filter(|sigil| sigils.contains(sigil))?;
         let query = &word[sigil.len_utf8()..];
-        // A second sigil inside the word makes it a path or an expression,
-        // `/usr/bin` or `$HOME/x`, rather than a name.
-        if query.contains(sigils) {
+        // Anything but a name inside the word makes it a path, an expression
+        // or punctuation, `/usr/bin` or `$HOME/x`, rather than a name.
+        if !query.chars().all(is_name_character) {
             return None;
         }
+        // The word runs on past the caret as far as the name does, so a comma
+        // or a closing parenthesis after it stays where it is.
         let after = &line[caret.column..];
-        let end = caret.column + after.find(char::is_whitespace).unwrap_or(after.len());
+        let rest = after
+            .find(|character: char| !is_name_character(character))
+            .unwrap_or(after.len());
+        if after[rest..].starts_with(sigils) {
+            return None;
+        }
+        let leading = sigil == COMMAND_SIGIL && line[..start].trim().is_empty() && earlier_blank();
         Some(Self {
             line: caret.line,
             start,
-            end,
+            end: caret.column + rest,
             sigil,
             query: query.to_owned(),
-            leading: leading && line[..start].trim().is_empty(),
+            leading,
         })
+    }
+
+    /// Whether the word already names what `insertion` does, with the caret
+    /// at its end, so there is nothing left for choosing it to do. The sigil
+    /// is not compared: `/commits` is sent to Codex as its `$commits`.
+    pub fn spells(&self, insertion: &str) -> bool {
+        let mut name = insertion.chars();
+        name.next();
+        self.end == self.start + self.sigil.len_utf8() + self.query.len()
+            && name.as_str() == self.query
     }
 
     /// The selection covering the word, from its sigil to its end, which is
@@ -202,40 +217,38 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
     ranked.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
-/// Puts `insertion` over `token` as one edit and leaves the caret past the
-/// space that follows it, ready for the rest of the sentence.
+/// Puts `insertion` over `token` as one edit and leaves the caret after it,
+/// ready for the rest of the sentence.
 ///
-/// The space is added unless the draft already has one there, so completing a
-/// word in the middle of a sentence does not double it.
+/// At the end of a line a space follows the name, so the reader can go on
+/// writing. Mid-sentence the caret steps over the space already there rather
+/// than doubling it, and punctuation right after the word stays against it.
 pub(super) fn apply(
     composer: &mut text_editor::Content<cosmic::Renderer>,
     token: &Token,
     insertion: &str,
 ) {
-    let spaced = composer.line(token.line).is_some_and(|line| {
-        line.text
-            .get(token.end..)
-            .is_some_and(|after| after.starts_with(char::is_whitespace))
-    });
-    let text = if spaced {
-        insertion.to_owned()
-    } else {
-        format!("{insertion} ")
+    let next = composer
+        .line(token.line)
+        .and_then(|line| line.text.get(token.end..)?.chars().next());
+    let text = match next {
+        None => format!("{insertion} "),
+        Some(_) => insertion.to_owned(),
     };
     composer.move_to(token.selection());
     composer.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
         std::sync::Arc::new(text),
     )));
-    if spaced {
+    if next.is_some_and(char::is_whitespace) {
         composer.perform(text_editor::Action::Move(text_editor::Motion::Right));
     }
 }
 
 /// Whether `character` can be part of a skill's name where it is named in a
-/// message: the characters Codex reads a `$name` mention with, which also
-/// cover Claude's `plugin:skill` names.
+/// message: the punctuation Codex reads a `$name` mention with, which also
+/// covers Claude's `plugin:skill` names, around letters and digits.
 fn is_name_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':')
+    character.is_alphanumeric() || matches!(character, '_' | '-' | ':')
 }
 
 /// The message with each skill the reader named with a slash spelled the way
@@ -244,15 +257,21 @@ fn is_name_character(character: char) -> bool {
 /// The slash is the composer's way to name a skill whatever the provider, so
 /// a reader who types `/commits` to Codex, which acts on `$commits`, still
 /// gets the skill. A word is only rewritten when it names a skill outright;
-/// a path, a URL, or a name the provider does not have is left as written.
+/// a path, a URL, a name the provider does not have, or anything quoted as
+/// code is left as written.
 pub(super) fn invocations<'a>(message: &'a str, skills: &[Skill]) -> Cow<'a, str> {
     let mut rewritten = String::new();
     let mut copied = 0;
     let mut previous = None;
+    // Every backtick opens or closes code, which a fence's three do once.
+    let mut code = false;
     for (index, character) in message.char_indices() {
         let opens_word = previous.is_none_or(char::is_whitespace);
         previous = Some(character);
-        if character != COMMAND_SIGIL || !opens_word {
+        if character == '`' {
+            code = !code;
+        }
+        if character != COMMAND_SIGIL || !opens_word || code {
             continue;
         }
         let rest = &message[index + 1..];
@@ -289,9 +308,13 @@ pub(super) fn invocations<'a>(message: &'a str, skills: &[Skill]) -> Cow<'a, str
 pub(super) struct State {
     /// The highlighted row, which Enter and Tab choose.
     pub highlighted: usize,
-    /// The token Escape dismissed the list for. The list stays away while the
-    /// reader is still on that word as it was, and returns once they type.
-    pub dismissed: Option<Token>,
+    /// Where the word Escape dismissed the list for starts, as its line and
+    /// byte column. The list stays away while the reader moves about that
+    /// word, and returns once they type.
+    pub dismissed: Option<(usize, usize)>,
+    /// Whether the reader has moved the highlight since the list opened,
+    /// which makes Enter a choice even before anything follows the sigil.
+    pub browsed: bool,
     /// How far the list is scrolled, so moving the highlight can keep its row
     /// in view.
     pub offset: f32,
@@ -303,10 +326,21 @@ impl State {
     /// Escape sent away. Returns whether the list has to scroll back up.
     pub fn restart(&mut self, edited: bool) -> bool {
         self.highlighted = 0;
+        self.browsed = false;
         if edited {
             self.dismissed = None;
         }
         std::mem::take(&mut self.offset) > 0.0
+    }
+
+    /// Whether Enter chooses `highlighted` for `token`, rather than doing
+    /// what it does in the editor: sending, or starting a new line.
+    ///
+    /// A name already spelled out is left to send, so a reader typing
+    /// `/clear` from memory needs one Enter, not two. So is a bare sigil
+    /// mid-sentence the reader has not looked into, as "cd /" ends.
+    pub fn enter_chooses(&self, token: &Token, highlighted: &str) -> bool {
+        !token.spells(highlighted) && (self.browsed || token.leading || !token.query.is_empty())
     }
 
     /// Moves the highlight one row among `count`, wrapping at either end, and
@@ -316,6 +350,7 @@ impl State {
         if count == 0 {
             return None;
         }
+        self.browsed = true;
         let current = self.highlighted.min(count - 1);
         self.highlighted = if down {
             (current + 1) % count
@@ -345,8 +380,18 @@ mod tests {
         Position { line, column }
     }
 
+    /// The token at `caret` in `draft`, found as the composer finds it.
+    fn token_in(draft: &str, caret: Position, sigils: &[char]) -> Option<Token> {
+        let lines: Vec<&str> = draft.split('\n').collect();
+        Token::at(lines.get(caret.line)?, caret, sigils, || {
+            lines[..caret.line]
+                .iter()
+                .all(|line| line.trim().is_empty())
+        })
+    }
+
     fn token(draft: &str, caret: Position) -> Option<Token> {
-        Token::at(draft.split('\n'), caret, &['/', '$'])
+        token_in(draft, caret, &['/', '$'])
     }
 
     /// The caret placed where `|` is in `draft`, and the draft without it.
@@ -387,7 +432,7 @@ mod tests {
 
     fn insertions(snapshot: &Snapshot, draft: &str) -> Vec<String> {
         let (draft, caret) = marked(draft);
-        let token = Token::at(draft.split('\n'), caret, &sigils(snapshot)).expect("a token");
+        let token = token_in(&draft, caret, &sigils(snapshot)).expect("a token");
         candidates(snapshot, &token)
             .into_iter()
             .map(|row| row.insertion)
@@ -413,6 +458,14 @@ mod tests {
         assert!(token(&draft, at).expect("a token").leading);
         let (draft, at) = marked("context\n/cl|");
         assert!(!token(&draft, at).expect("a token").leading);
+        // Only a slash opens a command, wherever it is.
+        let (draft, at) = marked("$cl|");
+        assert!(!token(&draft, at).expect("a token").leading);
+
+        // The word ends where the name does, so punctuation after it stays.
+        let (draft, at) = marked("try /com|mits, then");
+        let found = token(&draft, at).expect("a token before a comma");
+        assert_eq!(&draft[found.start..found.end], "/commits");
     }
 
     #[test]
@@ -423,6 +476,8 @@ mod tests {
             "/usr/bi|n",
             "echo $HOME/x|",
             "a /skill |",
+            "/co|mmits/src",
+            "(/co|)",
             "",
         ] {
             let (draft, at) = if draft.contains('|') {
@@ -486,12 +541,7 @@ mod tests {
             position: at,
             selection: None,
         });
-        let found = Token::at(
-            composer.lines().map(|line| line.text.into_owned()),
-            at,
-            &['/', '$'],
-        )
-        .expect("a token");
+        let found = token(&composer.text(), at).expect("a token");
         apply(&mut composer, &found, insertion);
         (composer.text(), composer.cursor().position)
     }
@@ -516,6 +566,10 @@ mod tests {
             apply_at("quoted\u{a0}$co|", "$commits"),
             ("quoted\u{a0}$commits ".into(), caret(0, 17))
         );
+        assert_eq!(
+            apply_at("try /comm|its, then", "/commits"),
+            ("try /commits, then".into(), caret(0, 12))
+        );
 
         // A second skill after the first leaves the first where it was.
         let (draft, _) = apply_at("run /comm|", "/commits");
@@ -538,15 +592,40 @@ mod tests {
         assert_eq!(state.step(true, 10, 28.0, 84.0), Some(28.0));
         assert_eq!(state.highlighted, 3);
 
-        state.dismissed = token("/x", caret(0, 2));
+        state.dismissed = Some((0, 0));
         assert!(state.restart(false));
         assert_eq!(state.highlighted, 0);
+        assert!(!state.browsed);
         assert!(
             state.dismissed.is_some(),
             "moving the caret keeps Escape's word"
         );
         assert!(!state.restart(true));
         assert!(state.dismissed.is_none(), "typing brings the list back");
+    }
+
+    /// Enter goes to the list only while choosing still does something, so
+    /// a name typed out in full sends in one keystroke, and a sentence ending
+    /// in a bare slash is not completed behind the reader's back.
+    #[test]
+    fn enter_chooses_only_while_there_is_something_to_choose() {
+        let mut state = State::default();
+        let at = |draft: &str| {
+            let (draft, at) = marked(draft);
+            token(&draft, at).expect("a token")
+        };
+        assert!(state.enter_chooses(&at("/cle|"), "/clear"));
+        assert!(!state.enter_chooses(&at("/clear|"), "/clear"));
+        // Codex is sent `$commits` for a slash, so the slash spelling is whole.
+        assert!(!state.enter_chooses(&at("use /commits|"), "$commits"));
+        // Back inside a whole word, choosing still replaces the rest of it.
+        assert!(state.enter_chooses(&at("/cl|ear"), "/clear"));
+        // A bare slash chooses at the head of a message, where a lone slash
+        // would never be sent, but not mid-sentence until the reader browses.
+        assert!(state.enter_chooses(&at("/|"), "/clear"));
+        assert!(!state.enter_chooses(&at("cd /|"), "/commits"));
+        state.step(true, 2, 28.0, 56.0);
+        assert!(state.enter_chooses(&at("cd /|"), "/commits"));
     }
 
     /// What is sent names every skill the way the provider invokes it, at
@@ -574,10 +653,16 @@ mod tests {
             invocations("line one\n/commits.", &codex),
             "line one\n$commits."
         );
+        // Code closes again, and a skill named after it is still found.
+        assert_eq!(
+            invocations("`/commits` then /commits", &codex),
+            "`/commits` then $commits"
+        );
         for untouched in [
             "see /usr/commits and https://x/commits",
             "/commits/x a/commits /unknown",
             "$commits already spelled",
+            "run `/commits` or\n```\n/commits\n```",
             "",
         ] {
             assert!(

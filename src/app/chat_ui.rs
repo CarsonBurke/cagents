@@ -1206,13 +1206,20 @@ impl Runtime {
         if caret.selection.is_some() {
             return None;
         }
+        let line = self.composer.line(caret.position.line)?;
         let token = completion::Token::at(
-            (0..=caret.position.line)
-                .map_while(|line| self.composer.line(line).map(|line| line.text)),
+            &line.text,
             caret.position,
             &completion::sigils(&self.snapshot),
+            || {
+                (0..caret.position.line).all(|earlier| {
+                    self.composer
+                        .line(earlier)
+                        .is_some_and(|line| line.text.trim().is_empty())
+                })
+            },
         )?;
-        if self.completion.dismissed.as_ref() == Some(&token) {
+        if self.completion.dismissed == Some((token.line, token.start)) {
             return None;
         }
         let rows = completion::candidates(&self.snapshot, &token);
@@ -1287,7 +1294,14 @@ impl Runtime {
             None => std::mem::take(&mut self.history_stash),
         };
         self.history_cursor = next;
-        self.composer = text_editor::Content::with_text(text.trim_end_matches('\n'));
+        self.replace_draft(text_editor::Content::with_text(text.trim_end_matches('\n')));
+    }
+
+    /// Puts a whole new draft in the composer. Whatever the completion list
+    /// was doing belonged to the old one.
+    fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
+        self.composer = composer;
+        self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -1407,8 +1421,7 @@ impl Runtime {
             && self.composer.text().trim().is_empty()
             && let Some(text) = &snapshot.composer
         {
-            self.composer = text_editor::Content::with_text(text);
-            self.revision = self.revision.wrapping_add(1);
+            self.replace_draft(text_editor::Content::with_text(text));
         }
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
@@ -3184,8 +3197,7 @@ impl Cagents {
                             text.push('\n');
                         }
                         text.push_str(provided);
-                        runtime.composer = text_editor::Content::with_text(&text);
-                        runtime.revision = runtime.revision.wrapping_add(1);
+                        runtime.replace_draft(text_editor::Content::with_text(&text));
                     }
                 }
             }
@@ -3242,9 +3254,8 @@ impl Cagents {
                             runtime.permission_mode = Some(mode);
                         }
                         if pending.draft_revision == Some(runtime.revision) {
-                            runtime.composer = text_editor::Content::new();
+                            runtime.replace_draft(text_editor::Content::new());
                             runtime.attachments.clear();
-                            runtime.revision = runtime.revision.wrapping_add(1);
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -3616,7 +3627,9 @@ impl Cagents {
             }
             Action::CompletionDismiss(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.completion.dismissed = runtime.completion().map(|(token, _)| token);
+                    runtime.completion.dismissed = runtime
+                        .completion()
+                        .map(|(token, _)| (token.line, token.start));
                 }
             }
             Action::CompletionScrolled(target, offset) => {
@@ -5196,6 +5209,11 @@ mod tests {
                 .unwrap()
             ),
             "/alpha this, and /beta that"
+        );
+        // A skill alone is a message Claude Code expands, not a command.
+        assert_eq!(
+            prompt(submission("/alpha", &claude, &[], PromptMode::Send).unwrap()),
+            "/alpha"
         );
         assert!(matches!(
             submission("/clear", &claude, &[], PromptMode::Send),
