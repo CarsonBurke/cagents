@@ -340,6 +340,19 @@ impl ClientHandle {
             .push(report, observed_at)
     }
 
+    /// Records an activity edge as the reader thread would, and says whether
+    /// it would have woken the surface.
+    #[cfg(test)]
+    pub(crate) fn observe_activity_for_test(&self, state: ActivityState) -> bool {
+        let mut activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let generation = activity.generation;
+        activity.observe(generation, state)
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         *self

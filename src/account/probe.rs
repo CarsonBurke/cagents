@@ -56,13 +56,22 @@ const SCRUBBED_ENVIRONMENT: &[&str] = &[
 ];
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
-/// else of its environment, between a newline that sets it apart from a
-/// greeting a startup file printed without one and a NUL that ends it.
+/// else of its environment, after [`SHELL_PATH_MARKER`] and its length in
+/// bytes, and before a NUL that ends it. One `printf` writes it all at once,
+/// so nothing a startup file printed, or a job it left running prints, lands
+/// in between.
 ///
 /// The printing is left to `/bin/sh`, whose `printf` is the same whatever
 /// the reader's shell; theirs only has to run it, and every shell reads
-/// single quotes as literal.
-const SHELL_PATH_COMMAND: &str = r#"exec /bin/sh -c 'printf "\n%s\0" "$PATH"'"#;
+/// single quotes as literal. `LC_ALL=C` makes `${#PATH}` count bytes where
+/// `/bin/sh` would otherwise count a UTF-8 locale's characters.
+const SHELL_PATH_COMMAND: &str =
+    r#"exec /bin/sh -c 'LC_ALL=C; printf "__cagents_path__%d:%s\0" "${#PATH}" "$PATH"'"#;
+/// What the shell prints in front of its `PATH`.
+const SHELL_PATH_MARKER: &[u8] = b"__cagents_path__";
+/// The most a shell may print before its `PATH`: a startup file that prints
+/// more is not waited out.
+const MAX_SHELL_OUTPUT: usize = 1 << 20;
 
 /// Variables the shell asked for its `PATH` goes without as well, so that a
 /// startup file that wants a password or a key's passphrase cannot put a
@@ -275,9 +284,15 @@ pub fn shell_search_path() -> Option<&'static OsStr> {
 /// The `PATH` `shell` sets up when started interactively, as a terminal
 /// starts it, or `None` if it does not say within `timeout`.
 ///
+/// Interactive, and not a login shell, because that is how a terminal starts
+/// it: the startup files that put a CLI on the `PATH` - `.bashrc`, `.zshrc`,
+/// a Node version manager's hook - are the interactive ones, which a login
+/// shell run without a terminal would skip.
+///
 /// It runs with no terminal and its output discarded but for the `PATH` it
 /// prints, in its own process group, which goes with it. Nothing it starts
-/// can ask the reader for anything: no terminal, no display, no askpass.
+/// can ask the reader for anything: no terminal, no input, no display, no
+/// askpass.
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args(["-i", "-c", SHELL_PATH_COMMAND]);
@@ -298,20 +313,22 @@ async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
         .process_group(0);
     let mut group = Group::spawn(command).await.ok()?;
     let mut stdout = group.stdout().ok()?;
-    let mut output = Vec::new();
-    // The value ends at its NUL. A job a startup file left running may hold
-    // the pipe open long after, so the read stops there rather than at the
-    // end of the output.
+    // A job a startup file left running may hold the pipe open long after
+    // the value, so the read stops at the value rather than at the end of
+    // the output.
     let read = tokio::time::timeout(timeout, async {
+        let mut output = Vec::new();
         let mut chunk = [0; 4096];
         loop {
             match stdout.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) if chunk[..read].contains(&0) => {
-                    output.extend_from_slice(&chunk[..read]);
-                    break;
-                }
+                Ok(0) | Err(_) => return None,
                 Ok(read) => output.extend_from_slice(&chunk[..read]),
+            }
+            if let Some(path) = path_from_output(&output) {
+                return Some(path);
+            }
+            if output.len() > MAX_SHELL_OUTPUT {
+                return None;
             }
         }
     })
@@ -322,16 +339,39 @@ async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
         group.kill();
     }
     group.finish().await;
-    read.ok()?;
-    path_from_output(&output)
+    read.ok()?
 }
 
-/// The `PATH` in what the shell printed: the text between the last newline
-/// and the NUL that ends it, after whatever a startup file printed first.
+/// The `PATH` in what the shell printed, after whatever a startup file
+/// printed first: the first marker followed by a length, a colon, a value of
+/// that many bytes and a NUL. The length is what tells the value apart from
+/// startup output that happens to hold the marker or a NUL, and from a
+/// `PATH` that holds the marker itself.
 fn path_from_output(output: &[u8]) -> Option<OsString> {
-    let end = output.iter().position(|byte| *byte == 0)?;
-    let value = output[..end].rsplit(|byte| *byte == b'\n').next()?;
-    (!value.is_empty()).then(|| OsString::from_vec(value.to_vec()))
+    let mut from = 0;
+    while let Some(found) = output[from..]
+        .windows(SHELL_PATH_MARKER.len())
+        .position(|window| window == SHELL_PATH_MARKER)
+    {
+        from += found + SHELL_PATH_MARKER.len();
+        if let Some(value) = length_prefixed(&output[from..]) {
+            return (!value.is_empty()).then(|| OsString::from_vec(value.to_vec()));
+        }
+    }
+    None
+}
+
+/// The value at the start of `text`, written as its length in decimal, a
+/// colon, the value and a NUL, if `text` holds all of it.
+fn length_prefixed(text: &[u8]) -> Option<&[u8]> {
+    let colon = text.iter().position(|byte| *byte == b':')?;
+    let digits = &text[..colon];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let length: usize = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    let value = &text[colon + 1..];
+    (value.get(length) == Some(&0)).then(|| &value[..length])
 }
 
 /// The first executable named `name` on `search_path`.
@@ -1014,7 +1054,7 @@ cat >/dev/null
                  [ \"$1 $2\" = '-i -c' ] || exit 9\n\
                  [ -z \"${{DISPLAY-}}${{WAYLAND_DISPLAY-}}${{SSH_ASKPASS-}}\" ] || exit 8\n\
                  printf '%s' \"$3\" > '{}'\n\
-                 printf 'Welcome back'\n\
+                 printf 'Welcome back\\0__cagents_path__'\n\
                  sleep 30 &\n\
                  PATH='relative:{}' eval \"$3\"\n",
                 asked.display(),
@@ -1044,19 +1084,32 @@ cat >/dev/null
     #[test]
     fn the_path_is_read_past_a_greeting() {
         assert_eq!(
-            path_from_output(b"Hello\nthere\n/a:/b\0"),
+            path_from_output(b"Hello\nthere, no newline__cagents_path__5:/a:/b\0"),
             Some(OsString::from("/a:/b"))
         );
         assert_eq!(
-            path_from_output(b"\n/c\0late output"),
-            Some(OsString::from("/c"))
+            path_from_output(b"a NUL\0and __cagents_path__ named__cagents_path__2:/c\0late"),
+            Some(OsString::from("/c")),
+            "a greeting's NUL or marker is not the value"
         );
-        assert_eq!(path_from_output(b"\n\0"), None);
         assert_eq!(
-            path_from_output(b"\n/d"),
+            path_from_output(b"__cagents_path__22:/x__cagents_path__2:/y\0"),
+            Some(OsString::from("/x__cagents_path__2:/y")),
+            "a PATH that holds the marker is read whole"
+        );
+        assert_eq!(path_from_output(b"__cagents_path__0:\0"), None);
+        assert_eq!(path_from_output(b"/a:/b\0"), None, "no marker, no value");
+        assert_eq!(
+            path_from_output(b"__cagents_path__4:/d\0"),
+            None,
+            "a value of the wrong length is not taken"
+        );
+        assert_eq!(
+            path_from_output(b"__cagents_path__4:/d/e"),
             None,
             "a value cut off is not taken"
         );
+        assert_eq!(path_from_output(b"__cagents_path__+2:/f\0"), None);
         assert_eq!(path_from_output(b""), None);
     }
 
