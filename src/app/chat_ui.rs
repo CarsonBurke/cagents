@@ -196,7 +196,9 @@ impl Action {
     /// The card whose provider session this action starts afresh.
     fn starts_session(&self) -> Option<CardId> {
         match self {
-            Self::ChooseProvider(target, _) | Self::Reconnect(target) => Some(target.card),
+            Self::ChooseProvider(target, _)
+            | Self::ChooseAccount(target, _)
+            | Self::Reconnect(target) => Some(target.card),
             Self::ChooseFreshProvider(card, _) | Self::Switch(card) | Self::StartFresh(card) => {
                 Some(*card)
             }
@@ -4405,6 +4407,33 @@ mod tests {
             "the replacement never starts"
         );
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// Moving a chat to another account starts its replacement, so it is
+    /// refused in a worktree being deleted before anything is closed.
+    #[test]
+    fn a_chat_in_a_worktree_being_deleted_keeps_its_account() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let (target, provider) = match app.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => (runtime.target, runtime.session.launch.provider),
+            _ => unreachable!(),
+        };
+        let managed = app.account_ui.add_managed_fixture(provider, 22);
+        app.project_ui
+            .begin_deleting(PathBuf::from(FIXTURE_DIRECTORY));
+
+        let _ = app.update(Message::ChatUi(Action::ChooseAccount(target, managed)));
+        assert!(!app.chat_ui.closing.contains(&target));
+        assert!(!app.chat_ui.restarting.contains_key(&card));
+        assert!(app.chat_ui.attempts.is_empty());
+        assert_eq!(
+            app.notices
+                .entries
+                .back()
+                .map(|entry| entry.notice.message.as_str()),
+            Some("That worktree is being deleted.")
+        );
     }
 
     /// A restart already closing the old conversation when its worktree is
