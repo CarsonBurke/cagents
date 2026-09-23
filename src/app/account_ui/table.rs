@@ -281,8 +281,15 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
     let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
-    for provider in Account::PROVIDERS {
-        sections.push(group(app, provider, &layout));
+    for provider in Account::REPORTED {
+        // A provider accounts cannot be added to is listed only while it
+        // reports some, or its record of them cannot be read.
+        if Account::PROVIDERS.contains(&provider)
+            || !rows(state, provider, state.table.sort).is_empty()
+            || (provider == Provider::Omp && state.omp_problem().is_some())
+        {
+            sections.push(group(app, provider, &layout));
+        }
     }
     widget::scrollable(
         widget::container(
@@ -435,7 +442,7 @@ fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'
         .filter(|login| login.provider == provider)
         .collect();
     let count = rows.len();
-    let header = widget::row::with_children(vec![
+    let mut header = vec![
         widget::icon(crate::ui_controls::provider_icon(provider))
             .size(design::ROW_ICON_SIZE)
             .into(),
@@ -446,18 +453,23 @@ fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'
         })
         .into(),
         iced::widget::Space::new().width(Length::Fill).into(),
-        crate::ui_controls::compact_icon_control(
-            crate::ui_controls::symbolic_icon("list-add-symbolic"),
-            format!("Add a {} account", provider.label()),
-            Some(Message::AccountUi(Action::Add {
-                provider,
-                device: false,
-            })),
-        )
-        .into(),
-    ])
-    .spacing(design::GRID_UNIT * 2.0)
-    .align_y(Alignment::Center);
+    ];
+    if Account::PROVIDERS.contains(&provider) {
+        header.push(
+            crate::ui_controls::compact_icon_control(
+                crate::ui_controls::symbolic_icon("list-add-symbolic"),
+                format!("Add a {} account", provider.label()),
+                Some(Message::AccountUi(Action::Add {
+                    provider,
+                    device: false,
+                })),
+            )
+            .into(),
+        );
+    }
+    let header = widget::row::with_children(header)
+        .spacing(design::GRID_UNIT * 2.0)
+        .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
     if (count > 0 || !logins.is_empty()) && !layout.stacked {
@@ -472,14 +484,20 @@ fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'
         lines.push(login_row(login));
     }
     if lines.is_empty() {
+        let empty = match state.omp_problem().filter(|_| provider == Provider::Omp) {
+            Some(problem) => format!(
+                "{problem}, so the accounts {} keeps cannot be listed.",
+                probe::cli_name(provider)
+            ),
+            None => format!(
+                "No {} account yet. {} signs in with its own login, in a terminal here.",
+                provider.label(),
+                probe::cli_name(provider),
+            ),
+        };
         lines.push(
             widget::container(
-                design::caption(format!(
-                    "No {} account yet. {} signs in with its own login, in a terminal here.",
-                    provider.label(),
-                    probe::cli_name(provider),
-                ))
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                design::caption(empty).wrapping(cosmic::iced::widget::text::Wrapping::Word),
             )
             .padding([design::GRID_UNIT * 3.0, design::GRID_UNIT * 3.0])
             .into(),
@@ -706,7 +724,13 @@ fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, 
     }
     let email = account.email(&state.registry);
     let mut subtitle: Vec<String> = Vec::new();
-    if let Some(email) = email.filter(|email| *email != state.display_name(account)) {
+    if account.account.is_brokered() {
+        // Its name already carries its address.
+        subtitle.push(format!(
+            "Kept by {}, which picks the login to use",
+            probe::cli_name(account.account.provider)
+        ));
+    } else if let Some(email) = email.filter(|email| *email != state.display_name(account)) {
         subtitle.push(email.to_owned());
     }
     if account.account.is_system() {
@@ -828,12 +852,22 @@ fn actions<'a>(state: &'a State, account: &'a AccountState, now: Millis) -> Elem
         "Account actions",
         (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
     );
-    let menu = crate::ui_controls::popover(
-        menu_button,
-        open.then(|| menu(state, account)),
-        widget::popover::Position::Bottom,
-        Message::AccountUi(Action::Menu(None)),
-    );
+    // Omp names, signs in to and forgets its accounts itself, which leaves
+    // nothing to do with one here but read it again. The space keeps its
+    // refresh control in line with the other rows'.
+    let menu: Element<'a, Message> = if account.account.is_brokered() {
+        iced::widget::Space::new()
+            .width(design::COMPACT_CONTROL_SIZE)
+            .into()
+    } else {
+        crate::ui_controls::popover(
+            menu_button,
+            open.then(|| menu(state, account)),
+            widget::popover::Position::Bottom,
+            Message::AccountUi(Action::Menu(None)),
+        )
+        .into()
+    };
     let first: Element<'a, Message> = if removing {
         design::caption("Removing…").into()
     } else {
@@ -918,7 +952,7 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
             )
             .into(),
         );
-        if !account.account.is_system() {
+        if account.account.managed_key().is_some() {
             items.push(
                 crate::ui_controls::popover_item(
                     crate::ui_controls::symbolic_icon("list-remove-symbolic"),

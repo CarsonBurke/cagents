@@ -26,7 +26,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Account, AccountId, Identity, home::Homes};
+use super::{Account, AccountHome, AccountId, Identity, home::Homes};
 use crate::agent::Provider;
 
 const FILE_NAME: &str = "accounts.toml";
@@ -138,44 +138,54 @@ impl Registry {
         }
     }
 
+    /// Whether new conversations of `account`'s provider start on it. A
+    /// brokered account never is: its CLI picks between its accounts itself.
     pub fn is_default(&self, account: &Account) -> bool {
         let chosen = self.defaults.get(account.provider.executable());
-        match account.managed_key() {
-            None => chosen.is_none_or(|chosen| {
+        match &account.home {
+            AccountHome::System => chosen.is_none_or(|chosen| {
                 chosen == SYSTEM
                     || Uuid::parse_str(chosen)
                         .ok()
                         .and_then(|key| self.find(key))
                         .is_none()
             }),
-            Some(key) => chosen.is_some_and(|chosen| Uuid::parse_str(chosen).ok() == Some(key)),
+            AccountHome::Managed { key, .. } => {
+                chosen.is_some_and(|chosen| Uuid::parse_str(chosen).ok() == Some(*key))
+            }
+            AccountHome::Brokered { .. } => false,
         }
     }
 
     pub fn set_default(&mut self, account: &Account) {
-        let value = account
-            .managed_key()
-            .map_or_else(|| SYSTEM.to_owned(), |key| key.hyphenated().to_string());
+        let value = match &account.home {
+            AccountHome::System => SYSTEM.to_owned(),
+            AccountHome::Managed { key, .. } => key.hyphenated().to_string(),
+            AccountHome::Brokered { .. } => return,
+        };
         self.defaults
             .insert(account.provider.executable().to_owned(), value);
     }
 
-    /// The name the reader gave `account`, if any.
+    /// The name the reader gave `account`, if any. A brokered account is
+    /// named by its CLI, not here.
     pub fn label(&self, account: &Account) -> Option<&str> {
-        match account.managed_key() {
-            None => self
+        match &account.home {
+            AccountHome::System => self
                 .system_labels
                 .get(account.provider.executable())
                 .map(String::as_str),
-            Some(key) => self.find(key)?.label.as_deref(),
+            AccountHome::Managed { key, .. } => self.find(*key)?.label.as_deref(),
+            AccountHome::Brokered { .. } => None,
         }
     }
 
     /// Names `account`, or clears its name with `None`.
     pub fn set_label(&mut self, account: &Account, label: Option<String>) {
         let label = label.as_deref().and_then(super::clean_label);
-        match account.managed_key() {
-            None => {
+        match &account.home {
+            AccountHome::Brokered { .. } => {}
+            AccountHome::System => {
                 let provider = account.provider.executable().to_owned();
                 match label {
                     Some(label) => {
@@ -186,8 +196,9 @@ impl Registry {
                     }
                 }
             }
-            Some(key) => {
-                if let Some(managed) = self.accounts.iter_mut().find(|managed| managed.key == key) {
+            AccountHome::Managed { key, .. } => {
+                if let Some(managed) = self.accounts.iter_mut().find(|managed| managed.key == *key)
+                {
                     managed.label = label;
                 }
             }

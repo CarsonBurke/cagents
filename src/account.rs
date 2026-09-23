@@ -4,6 +4,8 @@
 //! in. Everything cagents knows about one comes from that CLI: its identity
 //! from `claude auth status` or Codex's `account/read`, and its limits from
 //! Claude's `get_usage` control request or Codex's `account/rateLimits/read`.
+//! Omp keeps several logins of its own and picks between them itself; its
+//! accounts, and their limits, come from the usage record it keeps.
 //! cagents never opens a credential file and never talks to a provider's
 //! service itself - a subscription login belongs to the provider's own client,
 //! and the account model below holds only the non-secret metadata those
@@ -28,6 +30,7 @@ pub mod claude;
 pub mod codex;
 #[cfg(feature = "ui")]
 pub mod home;
+pub mod omp;
 #[cfg(feature = "ui")]
 pub mod probe;
 #[cfg(feature = "ui")]
@@ -63,10 +66,16 @@ fn fraction(value: f64) -> f32 {
 /// beside the key only so nothing has to recompute it: the key alone decides
 /// the account's identity, so the same account keeps its name however the
 /// data directory is spelled.
+///
+/// A brokered account is one a CLI keeps among several of its own and picks
+/// between itself, as Omp does: cagents has no home to point it at, only the
+/// record the CLI keeps of each account's usage. It is named by the service
+/// the login is for and the key the CLI files it under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AccountHome {
     System,
     Managed { key: uuid::Uuid, path: PathBuf },
+    Brokered { service: String, key: String },
 }
 
 /// One provider login, identified by the home its CLI keeps it in.
@@ -96,6 +105,22 @@ impl std::fmt::Display for AccountId {
     }
 }
 
+/// A short, stable stand-in for a brokered account's key in its id and lock
+/// name. The key is the broker's own filing name and often spells out the
+/// login's address, which an id - read in logs and tests - has no need of.
+fn brokered_digest(service: &str, key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(service.as_bytes())
+        .chain_update([0])
+        .chain_update(key.as_bytes())
+        .finalize();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// The environment variable a provider's CLI reads its home from.
 pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
@@ -122,9 +147,18 @@ impl Account {
         }
     }
 
+    /// An account a CLI brokers among its own, known only from its record of
+    /// the account's usage.
+    pub fn brokered(provider: Provider, service: String, key: String) -> Self {
+        Self {
+            provider,
+            home: AccountHome::Brokered { service, key },
+        }
+    }
+
     /// The system accounts, which every installation reports on whether or
-    /// not it added any account of its own. Omp brokers its own accounts and
-    /// reports no limits through its CLI, so it has none here.
+    /// not it added any account of its own. Omp brokers its own accounts,
+    /// which are found in its usage record rather than listed here.
     pub fn system_accounts() -> [Self; 2] {
         [
             Self::system(Provider::Claude),
@@ -136,24 +170,44 @@ impl Account {
     /// listed.
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
+    /// The providers whose usage is reported, in the order they are listed.
+    pub const REPORTED: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
         AccountId(match &self.home {
             AccountHome::System => format!("{provider}/system"),
             AccountHome::Managed { key, .. } => format!("{provider}/{key}"),
+            AccountHome::Brokered { service, key } => {
+                format!("{provider}/{service}/{}", brokered_digest(service, key))
+            }
         })
     }
 
-    /// The key of a managed account, `None` for the system account.
+    /// The key of a managed account, `None` for any other.
     pub fn managed_key(&self) -> Option<uuid::Uuid> {
         match &self.home {
-            AccountHome::System => None,
+            AccountHome::System | AccountHome::Brokered { .. } => None,
             AccountHome::Managed { key, .. } => Some(*key),
         }
     }
 
     pub fn is_system(&self) -> bool {
         self.home == AccountHome::System
+    }
+
+    /// Whether a CLI keeps this account among its own and picks between
+    /// them itself, so cagents only reads what the CLI records of it.
+    pub fn is_brokered(&self) -> bool {
+        matches!(self.home, AccountHome::Brokered { .. })
+    }
+
+    /// The service a brokered account's login is for, `None` for any other.
+    pub fn brokered_service(&self) -> Option<&str> {
+        match &self.home {
+            AccountHome::Brokered { service, .. } => Some(service),
+            AccountHome::System | AccountHome::Managed { .. } => None,
+        }
     }
 
     /// The name of this account's probe lock, which keeps two windows from
@@ -165,13 +219,20 @@ impl Account {
             AccountHome::Managed { key, .. } => {
                 format!("{}-{}", self.provider.executable(), key.simple())
             }
+            AccountHome::Brokered { service, key } => format!(
+                "{}-{}",
+                self.provider.executable(),
+                brokered_digest(service, key)
+            ),
         }
     }
 
     /// The directory the CLI keeps this account's login in, resolved against
-    /// `environment` the way the CLI itself resolves it.
+    /// `environment` the way the CLI itself resolves it. A brokered account
+    /// has none of its own.
     pub fn home_directory(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         match &self.home {
+            AccountHome::Brokered { .. } => None,
             AccountHome::Managed { path, .. } => Some(path.clone()),
             AccountHome::System => {
                 let variable = home_variable(self.provider)?;
@@ -200,7 +261,7 @@ impl Account {
     /// exactly as it would in the user's own shell.
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
-            AccountHome::System => None,
+            AccountHome::System | AccountHome::Brokered { .. } => None,
             AccountHome::Managed { path, .. } => {
                 Some((home_variable(self.provider)?, path.clone()))
             }
@@ -210,6 +271,9 @@ impl Account {
     /// The key the cross-window cache files this account under: the provider
     /// and the canonical home, so two windows started with differently
     /// spelled paths to the same directory share one entry.
+    ///
+    /// A brokered account has no home, and needs no cache: the record it is
+    /// read from is one every window reads alike.
     pub fn cache_key(&self) -> Option<String> {
         let home = self.resolved_home()?;
         let canonical = std::fs::canonicalize(&home).unwrap_or(home);
@@ -414,6 +478,9 @@ pub enum UsageSource {
     Probe,
     /// Read back from the cache another window, or an earlier run, wrote.
     Cache,
+    /// Read from the record a CLI that brokers its own accounts keeps of what
+    /// it observed, as of when it observed it.
+    Recorded,
 }
 
 /// Everything known about an account's limits at one moment.
@@ -1072,6 +1139,8 @@ mod credential_guard {
             ["OAUTH", "_TOKEN"],
             // Claude Code's entry in the system keyring.
             ["Claude Code", "-credentials"],
+            // Omp's logins, kept in the same database as its usage record.
+            ["auth_", "credential"],
             // Provider services, which only the providers' own clients call.
             ["anthropic", ".com"],
             ["claude.ai", "/api"],

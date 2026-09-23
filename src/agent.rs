@@ -11,6 +11,13 @@ mod omp;
 #[cfg(feature = "host")]
 pub(crate) mod observe;
 
+/// Where Omp keeps its data - its sessions and its agent database - for
+/// `launch`, resolved as Omp resolves it: its profile, its configuration
+/// directory, `PI_CODING_AGENT_DIR` and `XDG_DATA_HOME`.
+pub fn omp_data_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
+    omp::data_root(launch, home)
+}
+
 // Declaration order is persisted by the binary IPC codec and indexes ADAPTERS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Provider {
