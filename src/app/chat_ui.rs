@@ -2530,6 +2530,21 @@ impl Cagents {
         let launch = runtime.session.launch.clone();
         self.account_reported(launch.provider, &launch.recipe, reports)
     }
+    /// Reads the activity of a conversation that stays on its connection
+    /// after its return to a terminal, or its close, failed. An activity wake
+    /// that arrived meanwhile was dropped, and the connection wakes for
+    /// activity again only once it has been read, which for a hidden card
+    /// nothing else would do.
+    fn reread_chat_activity(&mut self, target: Target) {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return;
+        };
+        let activity = Activity {
+            provider: runtime.session.launch.provider,
+            state: runtime.handle.take_activity(),
+        };
+        self.observe_agent_activity_for_card(target.card, Some(activity));
+    }
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
             Some(CardRuntime::Chat(runtime)) if runtime.target == target => Some(runtime),
@@ -3014,6 +3029,7 @@ impl Cagents {
                 };
                 if let Some(error) = kept {
                     self.status = Some(TransientNotice::error(error));
+                    self.reread_chat_activity(target);
                     return if close {
                         self.begin_chat_close(card)
                     } else {
@@ -3061,6 +3077,16 @@ impl Cagents {
                         .chat_runtime_mut(target)
                         .is_some_and(|runtime| runtime.provider_closed)
                 {
+                    // The account reports go unread, as the recipe may already
+                    // name the account the conversation is moving to, but
+                    // not left queued: the queue wakes the surface only when
+                    // it fills from empty, so reports left behind would keep
+                    // every later one on this connection from waking it.
+                    if matches!(wake, Wake::AccountUsage)
+                        && let Some(runtime) = self.chat_runtime_mut(target)
+                    {
+                        runtime.handle.take_account_usage();
+                    }
                     return Task::none();
                 }
                 // Before the runtime is borrowed, as the account it reports
@@ -3674,6 +3700,7 @@ impl Cagents {
                     Ok(terminal) => terminal,
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error));
+                        self.reread_chat_activity(target);
                         return if close {
                             self.begin_chat_close(target.card)
                         } else {
@@ -3756,6 +3783,7 @@ impl Cagents {
                 if let Err(error) = result {
                     self.chat_ui.restarting.remove(&target.card);
                     self.status = Some(TransientNotice::error(error));
+                    self.reread_chat_activity(target);
                     return Task::none();
                 }
                 if self.refuse_for_deleting_card(target.card) {
@@ -4243,7 +4271,8 @@ mod tests {
         let used = |app: &Cagents| {
             app.account_ui
                 .snapshot_for_test(&account)
-                .map(|snapshot| snapshot.windows[0].used)
+                .and_then(|snapshot| snapshot.windows.first())
+                .map(|window| window.used)
         };
         let now = crate::chat::now_ms().unwrap();
         // Live figures refine a reading the account already has.
@@ -4259,6 +4288,10 @@ mod tests {
             },
         }));
         assert!(handle.push_account_usage_for_test(report(20), now));
+        // The wake it sent lands while the start is still pending, which
+        // leaves the report to the attachment.
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::AccountUsage)));
+        assert_eq!(used(&app), None);
         answer_start(&mut app, target, Ok(handle.clone()));
         assert_eq!(used(&app), Some(0.2));
         assert!(
@@ -4269,6 +4302,20 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::AccountUsage)));
         assert_eq!(used(&app), Some(0.7));
         assert!(handle.take_account_usage().is_empty());
+
+        // A wake that arrives while the connection is being closed is not
+        // read, but its reports do not stay queued to silence the next.
+        match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.provider_closed = true,
+            _ => unreachable!(),
+        }
+        assert!(handle.push_account_usage_for_test(report(90), now + 3));
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::AccountUsage)));
+        assert_eq!(used(&app), Some(0.7));
+        assert!(
+            handle.push_account_usage_for_test(report(95), now + 4),
+            "the next report wakes the surface again"
+        );
     }
 
     /// A disconnected conversation's close request failed before it was sent,
@@ -4815,6 +4862,43 @@ mod tests {
         assert_eq!(app.workspace.pending_close(), None);
         assert!(app.chat_switch_ready(card), "it can be tried again");
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// Activity that arrives while a chat returns to its terminal is not read
+    /// then, and the connection wakes for activity again only once it has
+    /// been read. A chat whose return failed stays on that connection, so it
+    /// reads it then, or a hidden card would never show activity again.
+    #[test]
+    fn a_chat_whose_return_failed_reads_the_activity_it_missed() {
+        use crate::agent::ActivityState;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.handoffs.iter().next().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        let handle = runtime.handle.clone();
+        assert!(handle.observe_activity_for_test(ActivityState::Working));
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Activity)));
+        let _ = app.update(Message::ChatUi(Action::HandoffFinished(
+            target,
+            Err("fixture: the terminal could not start".into()),
+        )));
+        assert!(matches!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(_)
+        ));
+        assert_eq!(
+            app.sidebar_state
+                .card_activity(card)
+                .map(|activity| activity.state),
+            Some(ActivityState::Working)
+        );
+        assert!(
+            handle.observe_activity_for_test(ActivityState::Idle),
+            "the next edge wakes the surface again"
+        );
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
