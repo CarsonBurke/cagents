@@ -28,6 +28,8 @@ pub(super) struct Token {
     pub sigil: char,
     /// What the reader has typed after the sigil, up to the caret.
     pub query: String,
+    /// The rest of the name past the caret.
+    pub tail: String,
     /// Whether the word is a slash with only whitespace before it in the
     /// whole draft, which is the one place a provider reads a command.
     pub leading: bool,
@@ -86,8 +88,28 @@ impl Token {
             end: caret.column + rest,
             sigil,
             query: query.to_owned(),
+            tail: after[..rest].to_owned(),
             leading,
         })
+    }
+
+    /// Keeps the part of the word past the caret only when the whole word is
+    /// still part of a name among `rows`, as when the reader goes back into a
+    /// name to change it. Otherwise it is a word of its own the sigil was
+    /// typed against, as `/re|please` is, and choosing leaves it be.
+    pub fn fit(&mut self, rows: &[Candidate]) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let word = format!("{}{}", self.query, self.tail).to_lowercase();
+        if !rows.iter().any(|row| {
+            let mut name = row.insertion.chars();
+            name.next();
+            name.as_str().to_lowercase().contains(&word)
+        }) {
+            self.end -= self.tail.len();
+            self.tail.clear();
+        }
     }
 
     /// Whether the word already names what `insertion` does, with the caret
@@ -96,8 +118,7 @@ impl Token {
     pub fn spells(&self, insertion: &str) -> bool {
         let mut name = insertion.chars();
         name.next();
-        self.end == self.start + self.sigil.len_utf8() + self.query.len()
-            && name.as_str() == self.query
+        self.tail.is_empty() && name.as_str() == self.query
     }
 
     /// The selection covering the word, from its sigil to its end, which is
@@ -573,7 +594,9 @@ mod tests {
             position: at,
             selection: None,
         });
-        let found = token(&composer.text(), at).expect("a token");
+        let mut found = token(&composer.text(), at).expect("a token");
+        let snapshot = snapshot();
+        found.fit(&candidates(&snapshot, &found));
         apply(&mut composer, &found, insertion);
         (composer.text(), composer.cursor().position)
     }
@@ -605,6 +628,10 @@ mod tests {
         // A slash typed against a word leaves the word to follow the name.
         assert_eq!(
             apply_at("/|please look", "/review"),
+            ("/review please look".into(), caret(0, 8))
+        );
+        assert_eq!(
+            apply_at("/re|please look", "/review"),
             ("/review please look".into(), caret(0, 8))
         );
 

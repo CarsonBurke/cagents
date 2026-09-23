@@ -1207,7 +1207,7 @@ impl Runtime {
             return None;
         }
         let line = self.composer.line(caret.position.line)?;
-        let token = completion::Token::at(
+        let mut token = completion::Token::at(
             &line.text,
             caret.position,
             &completion::sigils(&self.snapshot),
@@ -1223,6 +1223,7 @@ impl Runtime {
             return None;
         }
         let rows = completion::candidates(&self.snapshot, &token);
+        token.fit(&rows);
         (!rows.is_empty()).then_some((token, rows))
     }
 
