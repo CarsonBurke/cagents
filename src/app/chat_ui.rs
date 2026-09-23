@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::{Activity, Provider};
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot, clock_label};
+use crate::file_drop;
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
@@ -134,6 +135,8 @@ pub enum Action {
     OpenUrl(String),
     Attach(Target),
     Attached(Target, Result<Option<Vec<PathBuf>>, String>),
+    /// Files or text dropped on the conversation.
+    Dropped(Target, file_drop::Payload),
     RemoveAttachment(Target, usize),
     Model(Target, String),
     Reasoning(Target, String, String),
@@ -202,6 +205,7 @@ impl Action {
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Attach(target)
+            | Self::Dropped(target, _)
             | Self::RemoveAttachment(target, _)
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
@@ -1159,6 +1163,23 @@ fn slash_invocation(draft: &str, snapshot: &Snapshot) -> Option<SlashInvocation>
 }
 
 impl Runtime {
+    /// Adds files to the next message, each at most once.
+    fn attach(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let before = self.attachments.len();
+        for path in paths {
+            if !self
+                .attachments
+                .iter()
+                .any(|attachment| attachment.path == path)
+            {
+                self.attachments.push(Attachment { path });
+            }
+        }
+        if self.attachments.len() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     /// Records a message the provider accepted. The same message sent twice
     /// in a row is one entry, as a shell keeps it, and the walk restarts
     /// from the newest.
@@ -3217,22 +3238,50 @@ impl Cagents {
                         return Task::none();
                     }
                     match result {
-                        Ok(Some(paths)) => {
-                            for path in paths {
-                                if !runtime
-                                    .attachments
-                                    .iter()
-                                    .any(|attachment| attachment.path == path)
-                                {
-                                    runtime.attachments.push(Attachment { path });
-                                }
-                            }
-                            runtime.revision = runtime.revision.wrapping_add(1);
-                        }
+                        Ok(Some(paths)) => runtime.attach(paths),
                         Ok(None) => {}
                         Err(error) => runtime.error = Some(error),
                     }
                 }
+            }
+            Action::Dropped(target, payload) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Dropped files become attachments where the provider takes
+                // them, as they would from the chooser; anything else is
+                // written into the draft as a terminal would type it.
+                let dropped = match payload.decode() {
+                    file_drop::Dropped::Items(items)
+                        if runtime.snapshot.capabilities.attachments =>
+                    {
+                        let mut files = Vec::new();
+                        let mut rest = Vec::new();
+                        for item in items {
+                            match item {
+                                file_drop::Item::File(path) => files.push(path),
+                                other => rest.push(other),
+                            }
+                        }
+                        runtime.attach(files);
+                        file_drop::Dropped::Items(rest)
+                    }
+                    dropped => dropped,
+                };
+                let insertion = dropped.insertion();
+                if !insertion.text.is_empty() {
+                    runtime.revision = runtime.revision.wrapping_add(1);
+                    runtime.history_cursor = None;
+                    runtime
+                        .composer
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                            Arc::new(insertion.text.clone()),
+                        )));
+                }
+                if let Some(refusal) = insertion.refusal() {
+                    self.status = Some(TransientNotice::warning(refusal));
+                }
+                return cosmic::task::message(Message::FocusCard(target.card));
             }
             Action::RemoveAttachment(target, index) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {

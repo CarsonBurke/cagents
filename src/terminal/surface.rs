@@ -61,6 +61,13 @@ impl TerminalSurface {
         self.0.input(bytes)
     }
 
+    /// Pastes text the way a terminal does: framed as a bracketed paste when
+    /// the child asked for one, and never carrying a control byte that could
+    /// act as a keystroke of its own.
+    pub fn paste(&self, text: impl Into<String>) -> Result<(), TerminalSendError> {
+        self.0.paste(text)
+    }
+
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         self.0.key(key)
     }

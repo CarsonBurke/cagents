@@ -68,7 +68,12 @@ use crate::{
 /// Version 14 distinguishes root process exit from final PTY completion and
 /// publishes semantic conversation titles independently of terminal titles.
 /// Version 15 adds terminal palettes and durable recovery-origin identity.
-pub const PROTOCOL_VERSION: u16 = 16;
+/// Version 16 carries the name of the signal that ended a terminal.
+/// Version 17 adds `ClientRequest::Paste`, which the PTY owner encodes against
+/// the child's own bracketed-paste mode. It is appended, but unlike the
+/// observation requests above a current client issues it on every paste, so a
+/// daemon that predates it would be sent a variant index it cannot decode.
+pub const PROTOCOL_VERSION: u16 = 17;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -294,6 +299,14 @@ pub enum ClientRequest {
         edit: crate::workspace_model::ModelEdit,
     },
     BuildInfo,
+    /// Text to paste, which the PTY owner frames as a bracketed paste when the
+    /// child asked for one and strips of the control bytes a paste must never
+    /// deliver. Only the owner can decide this: the mode is the child's, and
+    /// a snapshot of it would be stale by the time the paste arrived.
+    Paste {
+        terminal_id: TerminalId,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

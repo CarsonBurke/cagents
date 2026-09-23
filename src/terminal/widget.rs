@@ -754,31 +754,6 @@ fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell))
     text
 }
 
-/// The bytes a paste puts on the child's input.
-///
-/// A terminal's line terminator on input is the carriage return the Enter key
-/// sends, so text copied from anywhere with newlines in it has to arrive that
-/// way or the child sees half a line ending. NUL is dropped because no child
-/// can receive it as typed input.
-fn normalize_paste(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\0' => {}
-            '\r' => {
-                if characters.peek() == Some(&'\n') {
-                    characters.next();
-                }
-                normalized.push('\r');
-            }
-            '\n' => normalized.push('\r'),
-            _ => normalized.push(character),
-        }
-    }
-    normalized
-}
-
 #[derive(Default)]
 struct WidgetState {
     last_size: Option<TerminalSize>,
@@ -1492,17 +1467,14 @@ impl<Message> TerminalWidget<Message> {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Sends pasted text to the child, on the same path a committed
-    /// composition takes: it has no key of its own to encode either.
+    /// Sends pasted text to the child. The terminal's owner encodes it, since
+    /// only the owner knows whether the child is expecting a bracketed paste
+    /// at the moment the text arrives.
     fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
-        if self.read_only {
+        if self.read_only || text.is_empty() {
             return;
         }
-        let normalized = normalize_paste(text);
-        if normalized.is_empty() {
-            return;
-        }
-        if let Err(error) = self.handle.input(normalized.into_bytes()) {
+        if let Err(error) = self.handle.paste(text) {
             self.publish_error(error, shell);
         }
     }
@@ -4067,16 +4039,6 @@ mod tests {
 
         // A triple click takes the row whole, however far into it it landed.
         assert_eq!(clicked(5, SelectionMode::Line), (at(7, 0), at(7, 39)));
-    }
-
-    #[test]
-    fn a_paste_arrives_as_carriage_returns_and_never_carries_a_nul() {
-        assert_eq!(
-            normalize_paste("one\r\ntwo\nthree\rfour"),
-            "one\rtwo\rthree\rfour"
-        );
-        assert_eq!(normalize_paste("trailing\r\n"), "trailing\r");
-        assert_eq!(normalize_paste("a\0b"), "ab");
     }
 
     /// One command the widget handed its terminal, in the order it did.

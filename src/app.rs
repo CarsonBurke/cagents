@@ -1946,6 +1946,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
         | Message::CyclePaneWidth
@@ -2718,6 +2719,11 @@ pub enum Message {
     TerminalError {
         card: CardId,
         message: String,
+    },
+    /// Files or text dropped on a terminal pane.
+    TerminalDropped {
+        card: CardId,
+        payload: crate::file_drop::Payload,
     },
     OpenRepository,
     RepositorySelected(Result<PathBuf, String>),
@@ -6341,31 +6347,38 @@ impl Cagents {
         };
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id),
-            Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
-                .read_only(ended_terminal(card).is_some())
-                .id(chrome.map_or_else(
-                    || workspace_widget::card_focus_id(id),
-                    |chrome| chrome.focus_id.clone(),
-                ))
-                .font_size(self.settings.terminal_font_size)
-                .font_family(&self.settings.terminal_font_family)
-                .line_height(self.settings.terminal_line_height)
-                .padding(self.settings.terminal_padding)
-                .scroll_size(self.settings.terminal_scroll_size)
-                .scroll_speed(self.settings.terminal_scroll_speed)
-                .cursor_style(self.settings.terminal_cursor_style)
-                .scale_factor(effective_surface_scale(
-                    self.window_scale_factor,
-                    self.settings.ui_scale,
-                ))
-                .model_focused(card_focused)
-                .on_focus(Message::FocusCard(id))
-                .on_open_link(Message::OpenLink)
-                .on_command_error(move |error| Message::TerminalError {
-                    card: id,
-                    message: error.to_string(),
-                })
-                .into(),
+            Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
+                TerminalWidget::new(handle.clone())
+                    .read_only(ended_terminal(card).is_some())
+                    .id(chrome.map_or_else(
+                        || workspace_widget::card_focus_id(id),
+                        |chrome| chrome.focus_id.clone(),
+                    ))
+                    .font_size(self.settings.terminal_font_size)
+                    .font_family(&self.settings.terminal_font_family)
+                    .line_height(self.settings.terminal_line_height)
+                    .padding(self.settings.terminal_padding)
+                    .scroll_size(self.settings.terminal_scroll_size)
+                    .scroll_speed(self.settings.terminal_scroll_speed)
+                    .cursor_style(self.settings.terminal_cursor_style)
+                    .scale_factor(effective_surface_scale(
+                        self.window_scale_factor,
+                        self.settings.ui_scale,
+                    ))
+                    .model_focused(card_focused)
+                    .on_focus(Message::FocusCard(id))
+                    .on_open_link(Message::OpenLink)
+                    .on_command_error(move |error| Message::TerminalError {
+                        card: id,
+                        message: error.to_string(),
+                    }),
+                id,
+                // A dialog over the workspace owns the pointer as well as the
+                // keyboard, so a drop aimed through it is refused rather than
+                // typed into a shell the reader cannot see.
+                ended_terminal(card).is_none() && !self.workspace_inputs_blocked(),
+                move |payload| Message::TerminalDropped { card: id, payload },
+            ),
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
                 .model_focused(card_focused)
@@ -9349,6 +9362,25 @@ impl Application for Cagents {
                 self.status = Some(TransientNotice::error(message));
                 Task::none()
             }
+            Message::TerminalDropped { card, payload } => {
+                let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                if ended_terminal(self.card_state(card)).is_some() {
+                    return Task::none();
+                }
+                let insertion = payload.decode().insertion();
+                if !insertion.text.is_empty()
+                    && let Err(error) = handle.paste(insertion.text.as_str())
+                {
+                    self.status = Some(TransientNotice::error(error.to_string()));
+                } else if let Some(refusal) = insertion.refusal() {
+                    self.status = Some(TransientNotice::warning(refusal));
+                }
+                // A drop is aimed the way a click is, so typing carries on in
+                // the pane the drop landed in.
+                cosmic::task::message(Message::FocusCard(card))
+            }
             #[cfg(feature = "integrated-browser")]
             Message::BrowserError { card: _, message } => {
                 self.status = Some(TransientNotice::error(message));
@@ -12283,6 +12315,7 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
+        let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,

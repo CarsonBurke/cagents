@@ -586,6 +586,7 @@ impl HostedPublishedState {
 #[derive(Debug)]
 enum ClientCommand {
     Input(Vec<u8>),
+    Paste(String),
     Key(KeyInput),
     Mouse(MouseInput),
     Focus(bool),
@@ -605,6 +606,7 @@ impl ClientCommand {
     fn operation(&self) -> &'static str {
         match self {
             Self::Input(_) => "write terminal input",
+            Self::Paste(_) => "paste into terminal",
             Self::Key(_) => "send terminal key",
             Self::Mouse(_) => "send terminal mouse input",
             Self::Focus(_) => "set terminal focus",
@@ -624,6 +626,7 @@ impl ClientCommand {
     fn into_request(self, terminal_id: TerminalId) -> ClientRequest {
         match self {
             Self::Input(bytes) => ClientRequest::Input { terminal_id, bytes },
+            Self::Paste(text) => ClientRequest::Paste { terminal_id, text },
             Self::Key(input) => ClientRequest::Key { terminal_id, input },
             Self::Mouse(input) => ClientRequest::Mouse { terminal_id, input },
             Self::Focus(focused) => ClientRequest::Focus {
@@ -894,6 +897,10 @@ impl HostedTerminalHandle {
 
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Input(bytes.into()))
+    }
+
+    pub fn paste(&self, text: impl Into<String>) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::Paste(text.into()))
     }
 
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {

@@ -29,6 +29,8 @@ pub mod editor;
 #[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
+pub mod file_drop;
+#[cfg(feature = "ui")]
 pub mod file_icon;
 pub mod fs_safety;
 #[cfg(feature = "ui")]

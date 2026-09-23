@@ -5,6 +5,7 @@ use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Operation, Tree, tree},
 };
+use cosmic::iced::clipboard::dnd::DndDestinationRectangle;
 use cosmic::iced::widget;
 use cosmic::iced::{
     Event, Length, Point, Rectangle, Size, Subscription, Vector, keyboard, mouse, time::Instant,
@@ -1443,13 +1444,44 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         renderer: &Renderer,
         destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
     ) {
+        let mut inner = cosmic::iced::advanced::clipboard::DndDestinationRectangles::new();
         self.content.as_widget().drag_destinations(
             &state.children[0],
             Self::child_layout(layout),
             renderer,
-            destinations,
+            &mut inner,
         );
+        let mut rectangles = inner.into_rectangles();
+        clip_drag_destinations(&mut rectangles, layout.bounds());
+        destinations.append(&mut rectangles);
     }
+}
+
+/// Keeps only the part of each drop target that the strip shows.
+///
+/// The strip mounts cards past its edges and scrolls them without clipping
+/// their drop targets, so a card scrolled half out of view would otherwise
+/// reach under the sidebar and take a drop aimed there.
+fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
+    let (left, top) = (f64::from(bounds.x), f64::from(bounds.y));
+    let (right, bottom) = (
+        left + f64::from(bounds.width),
+        top + f64::from(bounds.height),
+    );
+    rectangles.retain_mut(|destination| {
+        let rectangle = &mut destination.rectangle;
+        let x = rectangle.x.max(left);
+        let y = rectangle.y.max(top);
+        let width = (rectangle.x + rectangle.width).min(right) - x;
+        let height = (rectangle.y + rectangle.height).min(bottom) - y;
+        *rectangle = cosmic::iced::clipboard::dnd::Rectangle {
+            x,
+            y,
+            width,
+            height,
+        };
+        width > 0.0 && height > 0.0
+    });
 }
 
 impl<'a, Message: 'a> From<WorkspaceSurface<'a, Message>> for Element<'a, Message> {
@@ -1464,6 +1496,54 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn drop_targets_end_at_the_edges_of_the_strip() {
+        use cosmic::iced::clipboard::dnd::{DndAction, Rectangle as DndRectangle};
+
+        let destination = |id, x| DndDestinationRectangle {
+            id,
+            rectangle: DndRectangle {
+                x,
+                y: 0.0,
+                width: 400.0,
+                height: 600.0,
+            },
+            mime_types: Vec::new(),
+            actions: DndAction::Copy,
+            preferred: DndAction::Copy,
+        };
+        // A strip beside a 240-wide sidebar, under a 40-high header.
+        let strip = Rectangle::new(Point::new(240.0, 40.0), Size::new(800.0, 500.0));
+        let mut rectangles = vec![
+            destination(1, 0.0),
+            destination(2, 400.0),
+            destination(3, 1040.0),
+        ];
+        clip_drag_destinations(&mut rectangles, strip);
+        let kept: Vec<_> = rectangles
+            .iter()
+            .map(|destination| {
+                let rectangle = &destination.rectangle;
+                (
+                    destination.id,
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            // The card scrolled half out of view keeps only its visible part;
+            // the one wholly past the edge takes no drops at all.
+            vec![
+                (1, 240.0, 40.0, 160.0, 500.0),
+                (2, 400.0, 40.0, 400.0, 500.0)
+            ]
+        );
+    }
 
     #[test]
     fn card_cursor_uses_translated_child_coordinates_without_reviving_blocked_hover() {

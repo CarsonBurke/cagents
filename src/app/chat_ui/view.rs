@@ -554,6 +554,7 @@ impl Cagents {
                     self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
                     self.settings.chat_enter_sends,
                     place,
+                    !self.workspace_inputs_blocked(),
                 )
             }
             _ => widget::text::body("Connecting to native chat…").into(),
@@ -568,7 +569,13 @@ struct Place {
 }
 
 impl Runtime {
-    fn view(&self, transitioning: bool, enter_sends: bool, place: Place) -> Element<'_, Message> {
+    fn view(
+        &self,
+        transitioning: bool,
+        enter_sends: bool,
+        place: Place,
+        accepting_drops: bool,
+    ) -> Element<'_, Message> {
         let target = self.target;
         let available =
             !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
@@ -1224,7 +1231,7 @@ impl Runtime {
             .align_y(Alignment::Center)
             .into(),
         );
-        widget::container(
+        let pane = widget::container(
             widget::column::with_children(content)
                 .spacing(step::GAP_S)
                 .height(Length::Fill)
@@ -1232,8 +1239,16 @@ impl Runtime {
         )
         .padding(step::GAP_M)
         .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+        // The whole pane takes a drop, not just the composer: the transcript
+        // is most of what a reader aims at, and a drop lands in the draft
+        // wherever it was aimed.
+        crate::file_drop::target(
+            pane,
+            target.card,
+            accepting_drops && !transitioning,
+            move |payload| action(Action::Dropped(target, payload)),
+        )
     }
 
     /// The page of history this conversation is waiting on, if any.

@@ -625,6 +625,21 @@ fn process_request(
             handle.input(bytes).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::Paste { terminal_id, text } => {
+            if text.len() > MAX_INPUT_BYTES {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    format!("terminal paste exceeds the {MAX_INPUT_BYTES}-byte limit"),
+                    false,
+                ));
+            }
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .surface_handle(client_id, terminal_id)?;
+            handle.paste(text).map_err(send_error)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Key { terminal_id, input } => {
             if input
                 .text
