@@ -87,12 +87,26 @@ pub(crate) fn recovery_plan(
     {
         return Ok((recipe, RecoveryKind::Picker));
     }
-    if LaunchRecipe::shell(session.launch.working_directory.clone())
-        .is_ok_and(|shell| shell == session.launch)
-    {
+    if recoverable_shell(&session.launch) {
         return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
     Err("This command has no agent identity and cannot safely be replayed; finish or close it before upgrading".into())
+}
+
+/// A shell cagents made can carry the selected provider homes. Other
+/// environment overrides can change what the shell executes and are not
+/// enough evidence to replay a command during an upgrade.
+#[cfg(any(feature = "host", feature = "ui", test))]
+fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
+    let Ok(shell) = LaunchRecipe::shell(recipe.working_directory.clone()) else {
+        return false;
+    };
+    shell.program == recipe.program
+        && shell.arguments == recipe.arguments
+        && recipe.environment.iter().all(|(name, home)| {
+            matches!(name.as_str(), "CODEX_HOME" | "CLAUDE_CONFIG_DIR")
+                && std::path::Path::new(home).is_absolute()
+        })
 }
 
 #[cfg(any(feature = "host", test))]
@@ -1049,6 +1063,27 @@ mod tests {
         );
         source.launch.arguments = vec!["repeat this prompt".into()];
         assert!(recovery_recipe(source).is_err());
+    }
+
+    #[test]
+    fn shell_recovery_keeps_selected_provider_homes_without_accepting_other_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        let source = &mut checkpoint.terminals[0].source;
+        source.launch.environment.insert(
+            "CODEX_HOME".into(),
+            directory.path().join("codex").display().to_string(),
+        );
+        source.launch.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            directory.path().join("claude").display().to_string(),
+        );
+        assert_eq!(recovery_plan(source).unwrap().1, RecoveryKind::Shell);
+        source
+            .launch
+            .environment
+            .insert("PATH".into(), "/another/bin".into());
+        assert!(recovery_plan(source).is_err());
     }
 
     #[test]

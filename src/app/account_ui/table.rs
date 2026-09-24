@@ -55,6 +55,9 @@ pub(in crate::app) struct Table {
     pub(in crate::app) add_menu: bool,
     /// The row being renamed, and the name typed so far.
     pub(in crate::app) rename: Option<(AccountId, String)>,
+    /// A provider home to link, and the path entered so far.
+    pub(in crate::app) link: Option<(Provider, String)>,
+    pub(in crate::app) linking: bool,
 }
 
 impl Table {
@@ -65,7 +68,7 @@ impl Table {
     }
 
     pub(in crate::app) fn has_popup(&self) -> bool {
-        self.menu.is_some() || self.add_menu || self.rename.is_some()
+        self.menu.is_some() || self.add_menu || self.rename.is_some() || self.link.is_some()
     }
 
     /// Closes the innermost thing open, as Escape does: a popup, and
@@ -73,8 +76,9 @@ impl Table {
     pub(in crate::app) fn escape(&mut self) {
         if self.menu.is_some() || self.add_menu {
             self.close_popups();
-        } else {
+        } else if !self.linking {
             self.rename = None;
+            self.link = None;
         }
     }
 
@@ -94,6 +98,10 @@ impl Table {
 
 pub(in crate::app) fn rename_id() -> widget::Id {
     widget::Id::new("accounts.rename")
+}
+
+pub(in crate::app) fn link_id() -> widget::Id {
+    widget::Id::new("accounts.link-home")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +289,9 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
     let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
+    if let Some((provider, path)) = &state.table.link {
+        sections.push(link_form(state, *provider, path));
+    }
     for provider in Account::REPORTED {
         // A provider accounts cannot be added to is listed only while it
         // reports some, or its record of them cannot be read.
@@ -393,6 +404,20 @@ fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
                         }),
                     )
                     .into(),
+                    crate::ui_controls::popover_item(
+                        crate::ui_controls::provider_icon(Provider::Claude),
+                        "Existing Claude home",
+                        "Use a Claude login and history already on this computer",
+                        action(Action::LinkStart(Provider::Claude)),
+                    )
+                    .into(),
+                    crate::ui_controls::popover_item(
+                        crate::ui_controls::provider_icon(Provider::Codex),
+                        "Existing Codex home",
+                        "Use a Codex login and history already on this computer",
+                        action(Action::LinkStart(Provider::Codex)),
+                    )
+                    .into(),
                 ])
                 .spacing(2),
             )
@@ -431,6 +456,38 @@ fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
         .spacing(design::GRID_UNIT * 3.0)
         .align_y(Alignment::Center)
         .into()
+}
+
+fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element<'a, Message> {
+    let name = provider.label();
+    widget::container(
+        widget::column::with_children(vec![
+            design::heading(format!("Use an existing {name} home")).into(),
+            design::caption("Choose the provider's home directory. Its login and session history stay where they are; removing this link will leave its files untouched.")
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            widget::text_input("Absolute path to the provider home", path)
+                .id(link_id())
+                .on_input(|value| Message::AccountUi(Action::LinkInput(value)))
+                .on_submit(|_| Message::AccountUi(Action::LinkCommit))
+                .width(Length::Fill)
+                .into(),
+            widget::row::with_children(vec![
+                widget::button::standard("Cancel")
+                    .on_press_maybe((!state.table.linking).then_some(Message::AccountUi(Action::LinkCancel)))
+                    .into(),
+                widget::button::suggested(if state.table.linking { "Adding…" } else { "Use home" })
+                    .on_press_maybe((!state.table.linking && !path.trim().is_empty()).then_some(Message::AccountUi(Action::LinkCommit)))
+                    .into(),
+            ])
+            .spacing(design::GRID_UNIT * 2.0)
+            .into(),
+        ])
+        .spacing(design::GRID_UNIT * 2.0),
+    )
+    .padding(design::GRID_UNIT * 3.0)
+    .class(design::surface(Some(design::raised), [design::RADIUS_M; 4], true))
+    .into()
 }
 
 fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'a, Message> {
@@ -738,6 +795,10 @@ fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, 
             "{}'s own login",
             probe::cli_name(account.account.provider)
         ));
+    } else if account.account.is_linked() {
+        if let Some(home) = account.account.resolved_home() {
+            subtitle.push(format!("Existing home · {}", home.display()));
+        }
     }
     if renaming.is_some() {
         subtitle =
@@ -880,14 +941,21 @@ fn actions<'a>(state: &'a State, account: &'a AccountState, now: Millis) -> Elem
 }
 
 /// What removing an account does to the cards open on it.
-fn in_use_warning<'a>(cards: usize) -> Element<'a, Message> {
+fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
     match cards {
         0 => iced::widget::Space::new().into(),
-        count => design::caption(format!(
-            "{count} open {} on this account {} signed out with it.",
-            if count == 1 { "card runs" } else { "cards run" },
-            if count == 1 { "and is" } else { "and are" },
-        ))
+        count => design::caption(if linked {
+            format!(
+                "{count} open {} on this home and will keep running.",
+                if count == 1 { "card runs" } else { "cards run" }
+            )
+        } else {
+            format!(
+                "{count} open {} on this account {} signed out with it.",
+                if count == 1 { "card runs" } else { "cards run" },
+                if count == 1 { "and is" } else { "and are" },
+            )
+        })
         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
         .into(),
     }
@@ -899,13 +967,17 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
         widget::column::with_children(vec![
             design::body(format!("Remove {}?", state.display_name(account))).into(),
-            design::caption(format!(
-                "{} signs this account out and cagents deletes its files. Conversations started on it can no longer be resumed here.",
-                probe::cli_name(account.account.provider)
-            ))
+            design::caption(if account.account.is_linked() {
+                "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
+            } else {
+                format!(
+                    "{} signs this account out and cagents deletes its files. Conversations started on it can no longer be resumed here.",
+                    probe::cli_name(account.account.provider)
+                )
+            })
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into(),
-            in_use_warning(state.table.confirm_in_use),
+            in_use_warning(state.table.confirm_in_use, account.account.is_linked()),
             widget::row::with_children(vec![
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::button::standard("Cancel")
@@ -928,7 +1000,7 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
                 crate::ui_controls::popover_item(
                     crate::ui_controls::symbolic_icon("emblem-ok-symbolic"),
                     "Set as default",
-                    "New conversations start on this account",
+                    "New conversations and shell terminals use this account",
                     action(Action::SetDefault(id.clone())),
                 )
                 .into(),
@@ -952,12 +1024,16 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
             )
             .into(),
         );
-        if account.account.managed_key().is_some() {
+        if account.account.registry_key().is_some() {
             items.push(
                 crate::ui_controls::popover_item(
                     crate::ui_controls::symbolic_icon("list-remove-symbolic"),
                     "Remove",
-                    "Sign out and delete this account's files",
+                    if account.account.is_linked() {
+                        "Forget this home without changing its files"
+                    } else {
+                        "Sign out and delete this account's files"
+                    },
                     action(Action::Remove(id.clone())),
                 )
                 .into(),
@@ -1084,7 +1160,7 @@ mod tests {
         let keys = |sort| {
             rows(&state, Provider::Claude, sort)
                 .iter()
-                .map(|row| row.account.managed_key().map_or(0, |key| key.as_u128()))
+                .map(|row| row.account.registry_key().map_or(0, |key| key.as_u128()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(keys(Sort::Headroom), [2, 3, 1, 0]);

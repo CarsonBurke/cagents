@@ -1932,8 +1932,14 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
 /// stood in for.
 fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
     if session.launch.session_id.is_none() {
-        return LaunchRecipe::shell(session.launch.recipe.working_directory.clone())
-            .map_err(|error| format!("Could not open a terminal here: {error}"));
+        let mut shell = LaunchRecipe::shell(session.launch.recipe.working_directory.clone())
+            .map_err(|error| format!("Could not open a terminal here: {error}"))?;
+        if let Some(variable) = account::home_variable(session.launch.provider)
+            && let Some(home) = session.launch.recipe.environment.get(variable)
+        {
+            shell.environment.insert(variable.to_owned(), home.clone());
+        }
+        return Ok(shell);
     }
     session
         .launch
@@ -1943,12 +1949,12 @@ fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> 
 
 /// A new conversation for `provider` on `account`.
 ///
-/// A managed account is chosen by pointing the provider's CLI at its home
+/// An account is chosen by pointing the provider's CLI at its home
 /// through the recipe's environment, which the daemon lays over its own and
 /// which travels with the conversation: resuming or recovering it later
 /// starts the CLI on the same home, never on whatever the default has become
-/// since. The system account sets nothing, so the CLI resolves its home as it
-/// would in the reader's shell.
+/// since. Even the system home is recorded explicitly, because the daemon
+/// may have inherited a different environment from the interface.
 fn fresh_chat_session(
     provider: Provider,
     id: TerminalId,
@@ -1962,7 +1968,8 @@ fn fresh_chat_session(
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
     if account.provider == provider
-        && let Some((variable, home)) = account.probe_environment()
+        && let (Some(variable), Some(home)) =
+            (account::home_variable(provider), account.resolved_home())
     {
         let home = home
             .into_os_string()
@@ -5793,6 +5800,14 @@ mod tests {
     fn a_chat_with_no_conversation_to_return_to_switches_to_a_shell_in_its_directory() {
         for failed in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
+            let account = app.account_ui.add_managed_fixture(Provider::Codex, 17);
+            let _ = app.update(Message::AccountUi(
+                crate::app::account_ui::Action::SetDefault(account),
+            ));
+            let home = app
+                .default_account(Provider::Codex)
+                .resolved_home()
+                .unwrap();
             let card = if failed {
                 failed_chat(&mut app)
             } else {
@@ -5804,7 +5819,10 @@ mod tests {
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
             let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
             assert!(!plan.resumes);
-            let shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+            let mut shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+            shell
+                .environment
+                .insert("CODEX_HOME".into(), home.display().to_string());
             assert_eq!(plan.launch, shell);
             assert!(!app.chat_switch_ready(card), "one return at a time");
 
@@ -6247,7 +6265,15 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::Switch(card)));
         let target = *app.chat_ui.local_returns.keys().next().unwrap();
         let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
-        let shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+        let mut shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+        shell.environment.insert(
+            "CODEX_HOME".into(),
+            app.default_account(Provider::Codex)
+                .resolved_home()
+                .unwrap()
+                .display()
+                .to_string(),
+        );
         assert_replaced_by_terminal(&mut app, card, &shell);
         let terminal = terminal_cards(&app)[0];
         assert!(

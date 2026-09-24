@@ -3,12 +3,11 @@
 //!
 //! `accounts.toml` in the instance's configuration directory holds only
 //! what the reader chose and what the provider's CLI reported as display
-//! metadata: a key per managed account, its provider, the name the reader
+//! metadata: a key per registered account, its provider, the name the reader
 //! gave it, the email and organization its CLI named, when it was added, and
 //! the default account per provider. It never holds a token, a key or a
-//! path: a home's path is derived from its key ([`super::home::Homes::path`]),
-//! so nothing read back from this file can point cagents at another
-//! directory.
+//! path for homes cagents created. A linked account records the absolute path
+//! the reader explicitly chose; cagents never deletes or signs out that home.
 //!
 //! Every window of the installation shares the file. A change takes an
 //! advisory lock, reads the file afresh, applies itself, and writes the whole
@@ -31,16 +30,19 @@ use crate::agent::Provider;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
-/// One account cagents added, as the registry records it.
+/// One account cagents added, as the registry records it. An account with
+/// `linked_home` belongs to another application or the reader, not cagents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Managed {
+pub struct Registered {
     pub key: Uuid,
     #[serde(with = "provider_name")]
     pub provider: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_home: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +54,7 @@ pub struct Managed {
     pub added_at: u64,
 }
 
-impl Managed {
+impl Registered {
     pub fn identity(&self) -> Identity {
         Identity {
             email: self.email.clone(),
@@ -81,7 +83,7 @@ pub struct Registry {
     #[serde(default)]
     version: u32,
     /// The account each provider starts new conversations on, by provider
-    /// executable name: `"system"` or a managed account's key. A provider
+    /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
     /// system account.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -90,7 +92,7 @@ pub struct Registry {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     system_labels: BTreeMap<String, String>,
     #[serde(default, rename = "account", skip_serializing_if = "Vec::is_empty")]
-    accounts: Vec<Managed>,
+    accounts: Vec<Registered>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<Pending>,
 }
@@ -98,43 +100,62 @@ pub struct Registry {
 const SYSTEM: &str = "system";
 
 impl Registry {
-    pub fn managed(&self) -> &[Managed] {
+    pub fn registered(&self) -> &[Registered] {
         &self.accounts
     }
 
-    pub fn find(&self, key: Uuid) -> Option<&Managed> {
+    pub fn find(&self, key: Uuid) -> Option<&Registered> {
         self.accounts.iter().find(|account| account.key == key)
     }
 
-    /// Every account, system accounts first and then managed ones in the
-    /// order they were added, with each managed home placed under `homes`.
+    /// Every account, system accounts first and then registered ones in the
+    /// order they were added.
     pub fn accounts(&self, homes: Option<&Homes>) -> Vec<Account> {
         let mut accounts: Vec<Account> = Account::system_accounts().into();
-        if let Some(homes) = homes {
-            accounts.extend(self.accounts.iter().map(|managed| {
-                Account::managed(
-                    managed.provider,
-                    managed.key,
-                    homes.path(managed.provider, managed.key),
-                )
-            }));
-        }
+        accounts.extend(self.accounts.iter().filter_map(|registered| {
+            if let Some(path) = &registered.linked_home {
+                Some(Account::linked(
+                    registered.provider,
+                    registered.key,
+                    path.clone(),
+                ))
+            } else {
+                let homes = homes?;
+                Some(Account::managed(
+                    registered.provider,
+                    registered.key,
+                    homes.path(registered.provider, registered.key),
+                ))
+            }
+        }));
         accounts
     }
 
     /// The account `provider` starts new conversations on.
     pub fn default_account(&self, provider: Provider, homes: Option<&Homes>) -> Account {
-        let managed = self
+        let registered = self
             .defaults
             .get(provider.executable())
             .and_then(|key| Uuid::parse_str(key).ok())
             .and_then(|key| self.find(key))
             .filter(|managed| managed.provider == provider);
-        match (managed, homes) {
-            (Some(managed), Some(homes)) => {
-                Account::managed(provider, managed.key, homes.path(provider, managed.key))
-            }
-            _ => Account::system(provider),
+        match registered {
+            Some(Registered {
+                key,
+                linked_home: Some(path),
+                ..
+            }) => Account::linked(provider, *key, path.clone()),
+            Some(registered) => homes.map_or_else(
+                || Account::system(provider),
+                |homes| {
+                    Account::managed(
+                        provider,
+                        registered.key,
+                        homes.path(provider, registered.key),
+                    )
+                },
+            ),
+            None => Account::system(provider),
         }
     }
 
@@ -150,7 +171,7 @@ impl Registry {
                         .and_then(|key| self.find(key))
                         .is_none()
             }),
-            AccountHome::Managed { key, .. } => {
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 chosen.is_some_and(|chosen| Uuid::parse_str(chosen).ok() == Some(*key))
             }
             AccountHome::Brokered { .. } => false,
@@ -160,7 +181,9 @@ impl Registry {
     pub fn set_default(&mut self, account: &Account) {
         let value = match &account.home {
             AccountHome::System => SYSTEM.to_owned(),
-            AccountHome::Managed { key, .. } => key.hyphenated().to_string(),
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
+                key.hyphenated().to_string()
+            }
             AccountHome::Brokered { .. } => return,
         };
         self.defaults
@@ -175,7 +198,9 @@ impl Registry {
                 .system_labels
                 .get(account.provider.executable())
                 .map(String::as_str),
-            AccountHome::Managed { key, .. } => self.find(*key)?.label.as_deref(),
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
+                self.find(*key)?.label.as_deref()
+            }
             AccountHome::Brokered { .. } => None,
         }
     }
@@ -196,7 +221,7 @@ impl Registry {
                     }
                 }
             }
-            AccountHome::Managed { key, .. } => {
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 if let Some(managed) = self.accounts.iter_mut().find(|managed| managed.key == *key)
                 {
                     managed.label = label;
@@ -209,7 +234,7 @@ impl Registry {
     /// names the same login; returns the account it duplicates, if any.
     pub fn register(
         &mut self,
-        managed: Managed,
+        managed: Registered,
         system: &[(Provider, Identity)],
     ) -> Result<(), AccountId> {
         let identity = managed.identity();
@@ -221,6 +246,7 @@ impl Registry {
         }
         if let Some(existing) = self.accounts.iter().find(|existing| {
             existing.key != managed.key
+                && existing.linked_home.is_none()
                 && existing.provider == managed.provider
                 && existing.identity().same_login(&identity)
         }) {
@@ -235,6 +261,47 @@ impl Registry {
             Some(existing) => *existing = managed,
             None => self.accounts.push(managed),
         }
+        Ok(())
+    }
+
+    /// Records an existing provider home without taking ownership of it.
+    /// Its canonical path, not its reported email, determines whether it is
+    /// already registered: separate homes can hold the same login but have
+    /// different histories.
+    pub fn link(
+        &mut self,
+        provider: Provider,
+        key: Uuid,
+        path: PathBuf,
+        system_home: Option<&Path>,
+        homes: Option<&Homes>,
+        added_at: u64,
+    ) -> Result<(), String> {
+        if !path.is_absolute() {
+            return Err("Choose an absolute account home path".into());
+        }
+        if system_home
+            .and_then(|home| fs::canonicalize(home).ok())
+            .is_some_and(|home| home == path)
+            || self.accounts(homes).iter().any(|account| {
+                account.provider == provider
+                    && account
+                        .resolved_home()
+                        .and_then(|home| fs::canonicalize(home).ok())
+                        .is_some_and(|home| home == path)
+            })
+        {
+            return Err("That account home is already listed".into());
+        }
+        self.accounts.push(Registered {
+            key,
+            provider,
+            linked_home: Some(path),
+            label: None,
+            email: None,
+            organization: None,
+            added_at,
+        });
         Ok(())
     }
 
@@ -279,7 +346,7 @@ impl Registry {
     }
 
     /// Forgets a managed account, and its place as a default.
-    pub fn unregister(&mut self, key: Uuid) -> Option<Managed> {
+    pub fn unregister(&mut self, key: Uuid) -> Option<Registered> {
         let index = self
             .accounts
             .iter()
@@ -425,10 +492,11 @@ mod tests {
 
     use super::*;
 
-    fn managed(provider: Provider, email: &str) -> Managed {
-        Managed {
+    fn managed(provider: Provider, email: &str) -> Registered {
+        Registered {
             key: Uuid::new_v4(),
             provider,
+            linked_home: None,
             label: None,
             email: Some(email.into()),
             organization: None,
@@ -462,7 +530,7 @@ mod tests {
         assert_eq!(reloaded, registry);
         let homes = Homes::at("/data/accounts");
         let default = reloaded.default_account(Provider::Claude, Some(&homes));
-        assert_eq!(default.managed_key(), Some(key));
+        assert_eq!(default.registry_key(), Some(key));
         assert_eq!(
             default.resolved_home(),
             Some(homes.path(Provider::Claude, key))
@@ -474,9 +542,73 @@ mod tests {
         assert_eq!(reloaded.accounts(Some(&homes)).len(), 3);
     }
 
-    /// The policy this file exists under, held as a test: whatever the
-    /// registry is asked to remember, what it writes is only the fields named
-    /// here, none of which is a credential or a path.
+    #[test]
+    fn linked_home_is_selected_by_path_and_unlinking_keeps_its_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("existing-codex");
+        fs::create_dir(&home).unwrap();
+        let history = home.join("session_index.jsonl");
+        fs::write(&history, "saved session").unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("managed"));
+        let key = Uuid::new_v4();
+        store
+            .update(|registry| {
+                registry
+                    .link(Provider::Codex, key, home.clone(), None, Some(&homes), 1)
+                    .unwrap();
+                // A second home with the same login identity may have a
+                // different history; only the path is unique.
+                registry
+                    .register(managed(Provider::Codex, "same@example.com"), &[])
+                    .unwrap();
+                registry.set_default(&Account::linked(Provider::Codex, key, home.clone()));
+            })
+            .unwrap();
+        let mut registry = store.load().unwrap();
+        let default = registry.default_account(Provider::Codex, Some(&homes));
+        assert_eq!(default.resolved_home(), Some(home.clone()));
+        assert!(default.is_linked());
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                home.clone(),
+                None,
+                Some(&homes),
+                2
+            ),
+            Err("That account home is already listed".into())
+        );
+        registry.unregister(key).unwrap();
+        assert!(history.is_file());
+    }
+
+    #[test]
+    fn linking_and_signing_in_to_the_same_identity_are_order_independent() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("existing");
+        fs::create_dir(&home).unwrap();
+        let mut registry = Registry::default();
+        let linked = Uuid::new_v4();
+        registry
+            .link(Provider::Codex, linked, home.clone(), None, None, 1)
+            .unwrap();
+        registry.observe_identity(
+            linked,
+            &Identity {
+                email: Some("same@example.com".into()),
+                ..Identity::default()
+            },
+        );
+        registry
+            .register(managed(Provider::Codex, "same@example.com"), &[])
+            .expect("a managed home has its own history and may share a login with a linked home");
+        assert_eq!(registry.registered().len(), 2);
+    }
+
+    /// A home cagents creates records display metadata only, never CLI
+    /// credentials or a path to its files.
     #[test]
     fn the_file_holds_display_metadata_and_nothing_token_shaped() {
         let directory = tempfile::tempdir().unwrap();
@@ -594,7 +726,7 @@ mod tests {
             registry.register(managed(Provider::Codex, "sys@example.com"), &system),
             Err(Account::system(Provider::Codex).id())
         );
-        assert_eq!(registry.managed().len(), 2);
+        assert_eq!(registry.registered().len(), 2);
     }
 
     #[test]

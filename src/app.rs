@@ -55,6 +55,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
+    account::{self, Account},
     design::{self, DockLayout, InspectorLayout},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
@@ -4536,7 +4537,7 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        let launch = match LaunchRecipe::shell(working_directory.clone()) {
+        let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -4545,6 +4546,19 @@ impl Cagents {
                 return Task::none();
             }
         };
+        // A shell can start either provider's CLI. Give it the same default
+        // homes as native conversations, and persist those choices in its
+        // launch recipe so a restored terminal never silently changes login.
+        for provider in Account::PROVIDERS {
+            if let (Some(variable), Some(home)) = (
+                account::home_variable(provider),
+                self.default_account(provider).resolved_home(),
+            ) {
+                launch
+                    .environment
+                    .insert(variable.to_owned(), home.display().to_string());
+            }
+        }
         self.add_terminal_recipe(launch)
     }
 
