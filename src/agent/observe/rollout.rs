@@ -68,9 +68,12 @@ struct Cursor {
 /// One file, as long as its name and inode are the same.
 type FileKey = (u64, u64, OsString);
 
+/// Each file followed, with when a process was last seen holding it.
+type Cursors = BTreeMap<FileKey, (Instant, Arc<Mutex<Cursor>>)>;
+
 #[derive(Default)]
 pub(super) struct Rollouts {
-    cursors: Mutex<BTreeMap<FileKey, (Instant, Arc<Mutex<Cursor>>)>>,
+    cursors: Mutex<Cursors>,
 }
 
 impl Rollouts {
