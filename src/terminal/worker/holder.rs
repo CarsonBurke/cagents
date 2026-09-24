@@ -26,7 +26,6 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     process::{Child, Command, Stdio},
-    sync::OnceLock,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -54,44 +53,12 @@ const RELEASE_GRACE: Duration = Duration::from_millis(500);
 /// the slow part, and a terminal worker waits on this; it only bounds a holder
 /// that wedged, so it is generous to a slow filesystem.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a released holder's watch waits to see its release, which a
+/// concurrent fork can hold up.
+const RELEASE_SETTLE: Duration = Duration::from_millis(100);
+
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
-
-/// The descriptor limit this daemon inherited, before
-/// [`raise_descriptor_limit`] raised it. A terminal's root gets it back.
-static INHERITED_DESCRIPTOR_LIMIT: OnceLock<libc::rlim_t> = OnceLock::new();
-
-/// Raises this process's open-descriptor limit as far as it may go.
-///
-/// Each terminal costs the daemon about fifteen descriptors - its PTY, its
-/// holder's socket and pidfds, and the pipes that wake its threads - so the
-/// customary soft limit of 1024 would cap a daemon at a few dozen terminals.
-/// Only the daemon needs the room: every root is started with the limit the
-/// daemon inherited, because programs that still use `select` break past it.
-pub(crate) fn raise_descriptor_limit() {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live rlimit for the call to fill in.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == -1 {
-        return;
-    }
-    let inherited = *INHERITED_DESCRIPTOR_LIMIT.get_or_init(|| limit.rlim_cur);
-    let raised = libc::rlimit {
-        rlim_cur: limit.rlim_max,
-        rlim_max: limit.rlim_max,
-    };
-    // SAFETY: as above, and a soft limit equal to the hard one is permitted.
-    if inherited < limit.rlim_max && unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == -1
-    {
-        tracing::warn!(
-            error = %io::Error::last_os_error(),
-            limit = inherited,
-            "cannot raise the open-descriptor limit; the daemon holds fewer terminals"
-        );
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Request {
@@ -102,9 +69,6 @@ enum Request {
         /// from its own image, so a binary encoding cannot straddle versions.
         command: String,
         size: PtySize,
-        /// The open-descriptor limit the root starts with.
-        #[serde(default)]
-        descriptor_limit: Option<libc::rlim_t>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -167,6 +131,8 @@ pub(super) fn spawn(
             Ok(())
         });
     }
+    // The root inherits the holder's limit.
+    crate::host::descriptor_limit::inherit(&mut process);
     // `/proc/self/exe` runs this image even after an upgrade has replaced the
     // file it was loaded from, so a holder always matches its daemon.
     let process = process
@@ -191,14 +157,7 @@ pub(super) fn spawn(
         .control
         .set_read_timeout(Some(START_TIMEOUT))
         .and_then(|()| holder.control.set_write_timeout(Some(START_TIMEOUT)))
-        .and_then(|()| {
-            let request = Request::Spawn {
-                command,
-                size,
-                descriptor_limit: INHERITED_DESCRIPTOR_LIMIT.get().copied(),
-            };
-            send(&holder.control, &request, &[])
-        })
+        .and_then(|()| send(&holder.control, &Request::Spawn { command, size }, &[]))
         .and_then(|()| receive::<Report>(&holder.control))
         .and_then(|report| {
             holder.control.set_read_timeout(None)?;
@@ -320,15 +279,24 @@ pub(super) struct Holder {
     release: Option<std::io::PipeWriter>,
 }
 
-/// Whether the write end of `pipe` has closed.
+/// Whether the write end of `pipe` closes within [`RELEASE_SETTLE`].
+///
+/// A release closes it before the holder can exit, but a fork elsewhere in
+/// the daemon can briefly hold a copy until that child execs.
 fn hung_up(pipe: &std::io::PipeReader) -> bool {
     let mut target = libc::pollfd {
         fd: pipe.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: one live pollfd, polled without waiting.
-    unsafe { libc::poll(&mut target, 1, 0) == 1 }
+    let timeout = RELEASE_SETTLE.as_millis() as libc::c_int;
+    loop {
+        // SAFETY: one live pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut target, 1, timeout) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            ready => return ready == 1,
+        }
+    }
 }
 
 impl Drop for Holder {
@@ -493,31 +461,10 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, descriptor_limit) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
-                command,
-                size,
-                descriptor_limit,
-            },
-            _,
-        ))) => (command, size, descriptor_limit),
+    let (command, size) = match receive::<Request>(&control) {
+        Ok(Some((Request::Spawn { command, size }, _))) => (command, size),
         _ => return 1,
     };
-    if let Some(soft) = descriptor_limit {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a live rlimit; lowering a soft limit is always
-        // permitted. The root inherits it.
-        unsafe {
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && soft < limit.rlim_cur {
-                limit.rlim_cur = soft;
-                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-            }
-        }
-    }
     let command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
@@ -908,44 +855,6 @@ mod tests {
         let (root_parent, root_session) = session(root as u32);
         assert_eq!(root_parent, holder as i32);
         assert_eq!(root_session, root);
-    }
-
-    #[test]
-    fn a_root_starts_with_the_descriptor_limit_its_daemon_inherited() {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a live rlimit for the call to fill in.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        // A daemon started with the customary soft limit, below its hard one.
-        limit.rlim_cur = limit.rlim_cur.min(1024).min(limit.rlim_max - 1);
-        // SAFETY: as above; lowering a soft limit is always permitted.
-        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-        raise_descriptor_limit();
-        let inherited = *INHERITED_DESCRIPTOR_LIMIT.get().unwrap();
-        assert_eq!(inherited, limit.rlim_cur);
-        let (exits, _exited) = crossbeam_channel::bounded(1);
-        let held = spawn(
-            command("printf 'limit=%s.\\n' \"$(ulimit -n)\"; read line"),
-            size(),
-            exits,
-        )
-        .unwrap();
-        let output = read_until(&held.master, ".\r\n");
-        assert!(
-            output.contains(&format!("limit={inherited}.")),
-            "{output:?}"
-        );
-        // SAFETY: as above.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-            0
-        );
-        assert_eq!(limit.rlim_cur, limit.rlim_max);
     }
 
     #[test]
