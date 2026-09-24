@@ -18594,7 +18594,11 @@ mod tests {
             workspace.card(card_id).unwrap().width,
             CardWidth::Fraction(0.125)
         );
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        workspace.resize_viewport(800.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 800.0);
+        workspace.resize_viewport(3_840.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
         workspace
             .add_card(
                 WorkspaceCard::new(CardId::new(), "Second", CardWidth::Fraction(0.5)).unwrap(),
