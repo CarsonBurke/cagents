@@ -3023,10 +3023,12 @@ impl Cagents {
         };
         let snapshot = handle.snapshot();
         if snapshot.exited {
-            let stopped = "The conversation stopped before it took the first message";
+            // The error is the last the conversation reported, which is
+            // not always why it stopped.
+            let stopped = "The conversation stopped before it took the first message.";
             let error = match &snapshot.error {
-                Some(error) => format!("{stopped}: {error}"),
-                None => format!("{stopped}."),
+                Some(error) => format!("{stopped} Its last report: {error}"),
+                None => stopped.to_owned(),
             };
             return self.revert_chat_draft(target, Some(error));
         }
@@ -6490,7 +6492,9 @@ mod tests {
         assert_eq!(runtime.composer.text().trim(), "hello");
         assert_eq!(
             runtime.error.as_deref(),
-            Some("The conversation stopped before it took the first message: fixture: no state")
+            Some(
+                "The conversation stopped before it took the first message. Its last report: fixture: no state"
+            )
         );
         retired(&mut app, card);
     }
