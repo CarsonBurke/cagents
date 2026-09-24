@@ -164,6 +164,7 @@ impl From<PlatformError> for HostError {
 
 pub fn run() -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
+    crate::terminal::raise_descriptor_limit();
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,

@@ -132,7 +132,13 @@ pub(super) struct FrozenFamily {
 impl FrozenFamily {
     pub(super) fn capture(root: &RootIdentity, deadline: Instant) -> Result<Self, String> {
         let current = read_process(root.process.pid).map_err(|error| error.to_string())?;
-        if !same_identity(&current, &root.process) || current.session != current.pid {
+        // The root's parent is its holder, and a holder that died left the
+        // root reparented; the pidfd and start time already pin the root.
+        let reparented = CloseProcess {
+            parent: current.parent,
+            ..root.process
+        };
+        if !same_identity(&current, &reparented) || current.session != current.pid {
             return Err("Terminal child identity changed".into());
         }
         let mut family = Self {

@@ -2,6 +2,7 @@ mod close_processes;
 #[cfg(test)]
 mod close_tests;
 mod holder;
+pub(crate) use holder::raise_descriptor_limit;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
