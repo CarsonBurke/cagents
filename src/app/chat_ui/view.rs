@@ -1092,7 +1092,7 @@ impl Runtime {
             Some(PromptMode::Send) => "Message",
             Some(PromptMode::Steer) => "Steer this turn",
             Some(PromptMode::Queue) => "Queue for the next turn",
-            None => "This turn accepts no further input",
+            None => "Message",
         };
         // A chord only submits what a send control would accept right now.
         let submit = if available && has_draft {
