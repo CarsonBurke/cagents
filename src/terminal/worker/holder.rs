@@ -14,6 +14,11 @@
 //! master closes with it, which hangs the terminal up exactly as the daemon's
 //! own exit did before holders existed.
 //!
+//! A daemon that is being replaced can instead [detach](Holder::detach) a
+//! holder. The holder then keeps its terminal running, holds the output that
+//! arrives meanwhile, and listens on a socket for the replacement to
+//! [`adopt`] the terminal: same PTY, same root, nothing restarted.
+//!
 //! Control messages are length-prefixed JSON, so a field added later is
 //! ignored by a holder that predates it, and descriptors travel as
 //! `SCM_RIGHTS` on a message's first byte.
@@ -23,15 +28,19 @@ use std::{
     io::{self, Read},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{
+            net::{UnixListener, UnixStream},
+            process::CommandExt,
+        },
     },
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -40,7 +49,10 @@ use super::{ChildExit, close_processes::signal};
 /// The argument that makes an image serve as a holder. Deliberately not a
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
-const PROTOCOL: u32 = 1;
+/// Protocol 1 holders could not be detached.
+const PROTOCOL: u32 = 2;
+/// The holders a daemon can adopt: any that speak detaching.
+const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
 /// comes near this.
 const MAX_FRAME: u32 = 16 << 20;
@@ -59,6 +71,18 @@ const RELEASE_SETTLE: Duration = Duration::from_millis(100);
 
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
+/// How long a detached holder waits for a successor before it hangs its
+/// terminal up. A replacement daemon adopts within seconds; this bounds a
+/// replacement that never comes, without stranding the terminal forever.
+const ADOPTION_GRACE: Duration = Duration::from_secs(15 * 60);
+/// Output a detached holder keeps for its successor. Past this it stops
+/// reading, so the terminal's writers block rather than lose anything.
+const DETACHED_OUTPUT: usize = 1 << 20;
+/// How long either side of a detach or an adoption waits on the other.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most screen a detached holder keeps for its successor. With the
+/// output it keeps, base64 in one frame, it stays within [`MAX_FRAME`].
+pub(super) const MAX_SCREEN: usize = 8 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Request {
@@ -73,6 +97,17 @@ enum Request {
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
     Release,
+    /// The daemon is going away without ending the terminal. The holder
+    /// listens on `socket` for a successor and answers [`Report::Detached`].
+    Detach {
+        socket: PathBuf,
+        /// What the daemon last showed of the terminal, base64, for the
+        /// successor to show again. Opaque to the holder.
+        screen: String,
+    },
+    /// A successor, connected to a detached holder's socket, takes the
+    /// terminal over. Answered with [`Report::Attached`].
+    Attach { protocol: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +121,20 @@ enum Report {
     /// The root's raw wait status, reported once, after the holder reaps it.
     Exited {
         wait_status: libc::c_int,
+    },
+    /// The holder listens for a successor; this connection ends here.
+    Detached,
+    /// Carries the PTY master, then a pidfd for the root, to a successor.
+    Attached {
+        protocol: u32,
+        pid: libc::pid_t,
+        /// The root's raw wait status, when it exited while detached.
+        exited: Option<libc::c_int>,
+        /// The screen the previous daemon detached with, base64.
+        screen: String,
+        /// Output that arrived while detached, base64. Output after it is
+        /// still unread on the terminal.
+        output: String,
     },
 }
 
@@ -141,13 +190,7 @@ pub(super) fn spawn(
     drop(remote);
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
-    let mut holder = Holder {
-        control,
-        process: Some(process),
-        pidfd: None,
-        watch: None,
-        release: None,
-    };
+    let mut holder = Holder::new(control, Some(process));
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
     let command = postcard::to_stdvec(&command)
@@ -183,23 +226,127 @@ pub(super) fn spawn(
             ));
         }
         Report::Failed(message) => return Err(message),
-        Report::Exited { .. } => return Err("terminal holder reported an exit first".into()),
+        _ => return Err("terminal holder answered out of turn".into()),
     };
+    holder.protocol = PROTOCOL;
+    watched(holder, pid, descriptors, None, exits)
+}
+
+/// A terminal taken over from a detached holder.
+pub(super) struct Adopted {
+    pub(super) held: Held,
+    /// The screen its previous daemon detached with.
+    pub(super) screen: Vec<u8>,
+    /// Output that followed that screen, which precedes anything still
+    /// unread on the terminal.
+    pub(super) output: Vec<u8>,
+}
+
+/// Takes over the terminal of a holder a previous daemon
+/// [detached](Holder::detach) onto `socket`. A root that exited meanwhile
+/// has its exit delivered to `exits` straight away.
+pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, String> {
+    let failed =
+        |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
+    let control = UnixStream::connect(socket).map_err(failed)?;
+    let peer = peer_credentials(&control).map_err(failed)?;
+    // SAFETY: getuid cannot fail.
+    if peer.uid != unsafe { libc::getuid() } {
+        return Err(format!(
+            "adopt terminal holder at {}: it belongs to another user",
+            socket.display()
+        ));
+    }
+    let pidfd = peer_pidfd(&control, peer.pid).map_err(failed)?;
+    let mut holder = Holder::new(control, None);
+    holder.pidfd = Some(pidfd);
+    let attached = holder
+        .control
+        .set_read_timeout(Some(HANDOVER_TIMEOUT))
+        .and_then(|()| {
+            send(
+                &holder.control,
+                &Request::Attach { protocol: PROTOCOL },
+                &[],
+            )
+        })
+        .and_then(|()| receive::<Report>(&holder.control))
+        .and_then(|report| {
+            holder.control.set_read_timeout(None)?;
+            Ok(report)
+        })
+        .map_err(failed)?
+        .ok_or_else(|| format!("terminal holder at {} closed", socket.display()))?;
+    let (report, descriptors) = attached;
+    let Report::Attached {
+        protocol,
+        pid,
+        exited,
+        screen,
+        output,
+    } = report
+    else {
+        return Err(format!(
+            "terminal holder at {} answered out of turn",
+            socket.display()
+        ));
+    };
+    if !ADOPTABLE.contains(&protocol) {
+        return Err(format!(
+            "terminal holder at {} speaks protocol {protocol}, which this daemon cannot adopt",
+            socket.display()
+        ));
+    }
+    let decode = |encoded: String| {
+        STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("decode held terminal: {error}"))
+    };
+    let (screen, output) = (decode(screen)?, decode(output)?);
+    holder.protocol = protocol;
+    Ok(Adopted {
+        held: watched(holder, pid, descriptors, exited, exits)?,
+        screen,
+        output,
+    })
+}
+
+/// Starts watching a holder that just handed over its terminal.
+fn watched(
+    mut holder: Holder,
+    pid: libc::pid_t,
+    descriptors: Vec<OwnedFd>,
+    exited: Option<libc::c_int>,
+    exits: Sender<ChildExit>,
+) -> Result<Held, String> {
     let [master, pidfd]: [OwnedFd; 2] = descriptors
         .try_into()
         .map_err(|_| "terminal holder sent the wrong descriptors")?;
-
     let root = File::from(pidfd);
-    let watched = (|| {
+    if let Some(wait_status) = exited {
+        let _ = exits.try_send(Ok(exit_status(wait_status)));
+    }
+    let (acknowledge, acknowledged) = crossbeam_channel::bounded(1);
+    holder.acknowledged = Some(acknowledged);
+    let watching = (|| {
         let reader = holder.control.try_clone()?;
         let root = root.try_clone()?;
         let (released, release) = std::io::pipe()?;
         holder.release = Some(release);
         thread::Builder::new()
             .name(format!("terminal-holder-{pid}"))
-            .spawn(move || watch(&reader, &root, &released, &exits))
+            .spawn(move || {
+                watch(
+                    &reader,
+                    &root,
+                    &released,
+                    &exits,
+                    &acknowledge,
+                    exited.is_some(),
+                );
+            })
     })();
-    holder.watch = Some(watched.map_err(|error| format!("watch terminal holder: {error}"))?);
+    holder.watch = Some(watching.map_err(|error| format!("watch terminal holder: {error}"))?);
     Ok(Held {
         master: PtyMaster(master),
         child: HeldChild { pid, pidfd: root },
@@ -207,7 +354,13 @@ pub(super) fn spawn(
     })
 }
 
-/// Delivers the root's exit, then waits for the holder to go away.
+fn exit_status(wait_status: libc::c_int) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from(std::process::ExitStatus::from_raw(wait_status))
+}
+
+/// Delivers the root's exit and the holder's answers to a detach, then waits
+/// for the holder to go away.
 ///
 /// A holder that vanishes first - killed, or crashed - leaves its root
 /// running on a terminal this daemon still reads. That root has not exited,
@@ -218,24 +371,31 @@ fn watch(
     root: &File,
     released: &std::io::PipeReader,
     exits: &Sender<ChildExit>,
+    acknowledge: &Sender<Result<(), String>>,
+    mut reported: bool,
 ) {
-    use std::os::unix::process::ExitStatusExt;
-
     loop {
         match receive::<Report>(control) {
-            Ok(Some((Report::Exited { wait_status }, _))) => {
-                let status = std::process::ExitStatus::from_raw(wait_status);
-                let _ = exits.try_send(Ok(ExitStatus::from(status)));
-                // Nothing further matters; wait for the holder to go away.
-                while let Ok(Some(_)) = receive::<Report>(control) {}
+            Ok(Some((Report::Exited { wait_status }, _))) if !reported => {
+                reported = true;
+                let _ = exits.try_send(Ok(exit_status(wait_status)));
+            }
+            // The holder keeps the terminal for a successor; nothing it does
+            // from here concerns this daemon.
+            Ok(Some((Report::Detached, _))) => {
+                let _ = acknowledge.try_send(Ok(()));
                 return;
+            }
+            Ok(Some((Report::Failed(message), _))) => {
+                let _ = acknowledge.try_send(Err(message));
             }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }
     }
-    // A holder this daemon released ends its connection too.
-    if hung_up(released) {
+    // A root already reported leaves nothing to wait for, and a holder this
+    // daemon released ends its connection too.
+    if reported || hung_up(released) {
         return;
     }
     tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
@@ -268,15 +428,82 @@ fn watch(
     }
 }
 
-/// The daemon's end of a holder: its control socket and its process, which
-/// this daemon reaps. Dropping it releases the holder.
+/// The daemon's end of a holder: its control socket and its process.
+/// Dropping it releases the holder, unless the holder was detached.
 pub(super) struct Holder {
     control: UnixStream,
+    /// A holder this daemon started is its child, which it reaps. An adopted
+    /// holder's parent is whoever inherited it from the daemon that started it.
     process: Option<Child>,
     pidfd: Option<File>,
+    protocol: u32,
     watch: Option<JoinHandle<()>>,
     /// Dropping this ends a watch still waiting on a root its holder left.
     release: Option<std::io::PipeWriter>,
+    /// The holder's answer to a detach, relayed by the watch.
+    acknowledged: Option<Receiver<Result<(), String>>>,
+    detached: bool,
+}
+
+impl Holder {
+    fn new(control: UnixStream, process: Option<Child>) -> Self {
+        Self {
+            control,
+            process,
+            pidfd: None,
+            protocol: 0,
+            watch: None,
+            release: None,
+            acknowledged: None,
+            detached: false,
+        }
+    }
+
+    /// Leaves the terminal running under its holder, which listens on
+    /// `socket` for a successor to [`adopt`] it, with `screen` and the
+    /// terminal's output meanwhile. Nothing may read the terminal here once
+    /// this succeeds: the holder reads it now, and dropping this leaves it be.
+    /// On failure the holder is still attached.
+    pub(super) fn detach(&mut self, socket: &Path, screen: &[u8]) -> Result<(), String> {
+        if !ADOPTABLE.contains(&self.protocol) {
+            return Err(format!(
+                "terminal holder speaks protocol {}, which cannot be detached",
+                self.protocol
+            ));
+        }
+        if screen.len() > MAX_SCREEN {
+            return Err("terminal screen is too large to detach".to_owned());
+        }
+        // A socket left by an earlier attempt would refuse the holder's bind.
+        match std::fs::remove_file(socket) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(format!("clear {}: {error}", socket.display()));
+            }
+            _ => {}
+        }
+        let request = Request::Detach {
+            socket: socket.to_owned(),
+            screen: STANDARD.encode(screen),
+        };
+        // A holder that stopped reading must not hold its daemon's shutdown.
+        self.control
+            .set_write_timeout(Some(HANDOVER_TIMEOUT))
+            .and_then(|()| send(&self.control, &request, &[]))
+            .and_then(|()| self.control.set_write_timeout(None))
+            .map_err(|error| format!("detach terminal holder: {error}"))?;
+        let answer = self
+            .acknowledged
+            .as_ref()
+            .map(|answer| answer.recv_timeout(HANDOVER_TIMEOUT));
+        match answer {
+            Some(Ok(Ok(()))) => {
+                self.detached = true;
+                Ok(())
+            }
+            Some(Ok(Err(message))) => Err(message),
+            _ => Err("terminal holder did not acknowledge detaching".to_owned()),
+        }
+    }
 }
 
 /// Whether the write end of `pipe` closes within [`RELEASE_SETTLE`].
@@ -301,24 +528,33 @@ fn hung_up(pipe: &std::io::PipeReader) -> bool {
 
 impl Drop for Holder {
     fn drop(&mut self) {
-        // First, so the watch takes the holder's exit for the release it is.
-        drop(self.release.take());
-        let _ = send(&self.control, &Request::Release, &[]);
-        if let Some(mut process) = self.process.take() {
+        if !self.detached {
+            // First, so the watch takes the holder's exit for the release it is.
+            drop(self.release.take());
+            let _ = send(&self.control, &Request::Release, &[]);
             let exited = self
                 .pidfd
                 .as_ref()
                 .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
             if !exited {
-                tracing::warn!(
-                    pid = process.id(),
-                    "killing a terminal holder that did not exit when released"
-                );
-                let _ = process.kill();
+                tracing::warn!("killing a terminal holder that did not exit when released");
+                match (&mut self.process, &self.pidfd) {
+                    (Some(process), _) => {
+                        let _ = process.kill();
+                    }
+                    (None, Some(pidfd)) => {
+                        let _ = signal(pidfd, libc::SIGKILL);
+                    }
+                    (None, None) => {}
+                }
             }
-            let _ = process.wait();
+            if let Some(mut process) = self.process.take() {
+                let _ = process.wait();
+            }
         }
-        // The holder is gone, so its socket has hung up.
+        // A released holder is gone, and a detached one outlives this daemon,
+        // which reaps it only by exiting; either way its watch is ending.
+        drop(self.release.take());
         if let Some(watch) = self.watch.take() {
             let _ = watch.join();
         }
@@ -381,6 +617,56 @@ impl HeldChild {
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
             result => result,
         }
+    }
+}
+
+fn peer_credentials(socket: &UnixStream) -> io::Result<libc::ucred> {
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` and `length` describe a live ucred buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(credentials)
+}
+
+/// A pidfd for the process at the other end of `socket`, whose pid is `pid`.
+/// The kernel names that very process where it can; otherwise the pid names
+/// it only while the holder lives, which it does until it has handed over.
+fn peer_pidfd(socket: &UnixStream, pid: libc::pid_t) -> io::Result<File> {
+    let mut fd: libc::c_int = -1;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` and `length` describe a live c_int buffer.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&raw mut fd).cast(),
+            &mut length,
+        )
+    };
+    if result == 0 {
+        // SAFETY: a successful SO_PEERPIDFD returns a fresh owned descriptor.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    match io::Error::last_os_error() {
+        // Before Linux 6.5.
+        error if error.raw_os_error() == Some(libc::ENOPROTOOPT) => open_pidfd(pid),
+        error => Err(error),
     }
 }
 
@@ -515,7 +801,48 @@ fn serve(control: UnixStream) -> i32 {
         return 1;
     }
 
-    let mut reaped = false;
+    let mut exit = None;
+    let mut control = control;
+    loop {
+        let Some((socket, screen)) = attend(&control, pid, &pidfd, &mut exit) else {
+            break;
+        };
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let refusal = Report::Failed(format!("listen on {}: {error}", socket.display()));
+                if send(&control, &refusal, &[]).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if send(&control, &Report::Detached, &[]).is_err() {
+            let _ = std::fs::remove_file(&socket);
+            break;
+        }
+        drop(control);
+        let successor = await_successor(&listener, master, pid, &pidfd, &mut exit, &screen);
+        let _ = std::fs::remove_file(&socket);
+        match successor {
+            Some(successor) => control = successor,
+            None => break,
+        }
+    }
+    drop(child);
+    // The master closes with the holder, hanging up whatever is left on it.
+    drop(pair.master);
+    0
+}
+
+/// Serves an attached daemon until it releases the terminal, which answers
+/// `None`, or asks for it to be detached onto a socket, with its screen.
+fn attend(
+    control: &UnixStream,
+    pid: libc::pid_t,
+    pidfd: &File,
+    exit: &mut Option<libc::c_int>,
+) -> Option<(PathBuf, String)> {
     loop {
         let mut targets = [
             libc::pollfd {
@@ -525,7 +852,11 @@ fn serve(control: UnixStream) -> i32 {
             },
             libc::pollfd {
                 // A negative descriptor is skipped once the root is reaped.
-                fd: if reaped { -1 } else { pidfd.as_raw_fd() },
+                fd: if exit.is_some() {
+                    -1
+                } else {
+                    pidfd.as_raw_fd()
+                },
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -535,28 +866,131 @@ fn serve(control: UnixStream) -> i32 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return 1;
+            return None;
         }
         if targets[1].revents != 0 {
             // A root this holder cannot reap leaves nothing to report: ending
             // the holder lets the daemon report that exit as unknown instead
             // of polling a pidfd that stays ready forever.
-            let Some(wait_status) = reap(pid) else {
-                break;
-            };
-            reaped = true;
-            let _ = send(&control, &Report::Exited { wait_status }, &[]);
+            let wait_status = reap(pid)?;
+            *exit = Some(wait_status);
+            let _ = send(control, &Report::Exited { wait_status }, &[]);
         }
         if targets[0].revents != 0 {
             // A release, a hangup and anything unintelligible all end the
             // holder: only a daemon that can still talk to it may keep it.
-            break;
+            return match receive::<Request>(control) {
+                Ok(Some((Request::Detach { socket, screen }, _))) => Some((socket, screen)),
+                _ => None,
+            };
         }
     }
-    drop(child);
-    // The master closes with the holder, hanging up whatever is left on it.
-    drop(pair.master);
-    0
+}
+
+/// Keeps a detached terminal until a successor attaches, which it returns,
+/// or [`ADOPTION_GRACE`] passes. Output read meanwhile goes to the
+/// successor.
+fn await_successor(
+    listener: &UnixListener,
+    master: RawFd,
+    pid: libc::pid_t,
+    pidfd: &File,
+    exit: &mut Option<libc::c_int>,
+    screen: &str,
+) -> Option<UnixStream> {
+    let deadline = Instant::now() + ADOPTION_GRACE;
+    let mut output = Vec::new();
+    let mut buffer = vec![0u8; 64 << 10];
+    // The master reads EIO once the terminal's last process has closed it.
+    let mut open = true;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let reading = open && output.len() < DETACHED_OUTPUT;
+        let mut targets = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if exit.is_some() {
+                    -1
+                } else {
+                    pidfd.as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if reading { master } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        // SAFETY: all three pollfds live for the duration of the call.
+        if unsafe { libc::poll(targets.as_mut_ptr(), 3, timeout) } == -1 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if targets[1].revents != 0 {
+            // As when attended: nothing to hand over is better than a spin.
+            *exit = Some(reap(pid)?);
+        }
+        if targets[2].revents != 0 {
+            let room = (DETACHED_OUTPUT - output.len()).min(buffer.len());
+            // SAFETY: `buffer` has at least `room` writable bytes.
+            match unsafe { libc::read(master, buffer.as_mut_ptr().cast(), room) } {
+                read if read > 0 => output.extend_from_slice(&buffer[..read as usize]),
+                -1 if matches!(
+                    io::Error::last_os_error().kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+                _ => open = false,
+            }
+        }
+        if targets[0].revents != 0
+            && let Ok((successor, _)) = listener.accept()
+            && hand_over(&successor, master, pid, pidfd, *exit, screen, &output).is_ok()
+        {
+            return Some(successor);
+        }
+    }
+}
+
+/// Gives a connecting successor the terminal, if it is this user's and asks
+/// for it properly.
+fn hand_over(
+    successor: &UnixStream,
+    master: RawFd,
+    pid: libc::pid_t,
+    pidfd: &File,
+    exit: Option<libc::c_int>,
+    screen: &str,
+    output: &[u8],
+) -> io::Result<()> {
+    // SAFETY: getuid cannot fail.
+    if peer_credentials(successor)?.uid != unsafe { libc::getuid() } {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    successor.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
+    let Some((Request::Attach { .. }, _)) = receive::<Request>(successor)? else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    let attached = Report::Attached {
+        protocol: PROTOCOL,
+        pid,
+        exited: exit,
+        screen: screen.to_owned(),
+        output: STANDARD.encode(output),
+    };
+    send(successor, &attached, &[master, pidfd.as_raw_fd()])?;
+    successor.set_read_timeout(None)
 }
 
 /// Reaps the root once its pidfd says it exited, returning its wait status.
@@ -933,6 +1367,125 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("exit status is unknown"), "{error}");
         drop(held);
+    }
+
+    /// Detaches a fresh terminal running `script` onto a socket in `directory`,
+    /// once it printed "ready". Returns the socket and the root's pid.
+    fn detached(script: &str, directory: &Path) -> (PathBuf, libc::pid_t) {
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let Held {
+            master,
+            child,
+            mut holder,
+        } = spawn(command(script), size(), exits).unwrap();
+        read_until(&master, "ready");
+        let socket = directory.join("holder.sock");
+        if let Err(error) = holder.detach(&socket, b"screen") {
+            panic!("{error}");
+        }
+        // The daemon's descriptors close with it.
+        (socket, child.pid())
+    }
+
+    #[test]
+    fn a_detached_terminal_keeps_running_for_a_successor_with_its_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, root) = detached(
+            "echo ready; sleep 0.2; echo while-away; read line; echo got:$line; exit 6",
+            directory.path(),
+        );
+        thread::sleep(Duration::from_millis(600));
+        assert!(alive(root));
+
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let Adopted {
+            held,
+            screen,
+            output,
+        } = adopt(&socket, exits).unwrap();
+        assert_eq!(held.child.pid(), root);
+        assert!(held.child.unreaped());
+        assert_eq!(screen, b"screen");
+        assert!(
+            String::from_utf8_lossy(&output).contains("while-away"),
+            "{output:?}"
+        );
+        // The holder no longer listens once adopted.
+        assert!(!socket.exists());
+
+        let mut writer = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"hello\n").unwrap();
+        assert!(read_until(&held.master, "got:hello").contains("got:hello"));
+        let status = exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.exit_code(), 6);
+    }
+
+    #[test]
+    fn a_root_that_exits_while_detached_reports_to_its_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, root) = detached("echo ready; sleep 0.2; exit 9", directory.path());
+        wait_gone(root);
+
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = adopt(&socket, exits).unwrap().held;
+        let status = exited
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.exit_code(), 9);
+        // Reported once: the holder does not report it again.
+        assert!(exited.recv_timeout(Duration::from_millis(200)).is_err());
+        drop(held);
+    }
+
+    #[test]
+    fn releasing_an_adopted_holder_hangs_up_its_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, root) = detached("echo ready; while :; do sleep 1; done", directory.path());
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let held = adopt(&socket, exits).unwrap().held;
+        let holder = held.holder.pidfd.as_ref().map(|pidfd| pidfd.as_raw_fd());
+        assert!(holder.is_some());
+        drop(held);
+        wait_gone(root);
+    }
+
+    #[test]
+    fn a_holder_can_be_detached_again_by_its_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let (socket, root) = detached("echo ready; read line; exit 2", directory.path());
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let held = adopt(&socket, exits).unwrap().held;
+        let Held { mut holder, .. } = held;
+        if let Err(error) = holder.detach(&socket, b"again") {
+            panic!("{error}");
+        }
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let Adopted { held, screen, .. } = adopt(&socket, exits).unwrap();
+        assert_eq!(held.child.pid(), root);
+        // Each detach carries its own daemon's screen.
+        assert_eq!(screen, b"again");
+        let mut writer = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"\n").unwrap();
+        let status = exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.exit_code(), 2);
+    }
+
+    #[test]
+    fn nothing_adopts_a_holder_that_is_not_listening() {
+        let directory = tempfile::tempdir().unwrap();
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let error = match adopt(&directory.path().join("absent.sock"), exits) {
+            Ok(_) => panic!("an absent holder must not be adopted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("absent.sock"), "{error}");
     }
 
     #[test]

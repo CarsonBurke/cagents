@@ -1627,7 +1627,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             if !yes {
                 return Err(AppError::new(
                     "confirmation_required",
-                    "full upgrade interrupts hosted processes; pass --yes to checkpoint and resume supported sessions",
+                    "full upgrade restarts the daemon: terminals are carried across where the running daemon supports it, and other sessions resume in new processes, which interrupts their jobs; pass --yes to proceed",
                 ));
             }
             let relaunch_agents = if relaunch_agents || no_relaunch_agents {

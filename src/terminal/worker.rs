@@ -1,3 +1,4 @@
+mod carry;
 mod close_processes;
 #[cfg(test)]
 mod close_tests;
@@ -80,6 +81,10 @@ enum Command {
     },
     ObserveAgent(Sender<Option<String>>),
     PrepareUpgrade(Sender<Result<UpgradeSnapshot, String>>),
+    Carry {
+        socket: PathBuf,
+        reply: Sender<Result<Carried, String>>,
+    },
     ObserveAgentProcess(Sender<Option<AgentProcess>>),
     ApplyAgentActivity {
         process: AgentProcess,
@@ -115,6 +120,15 @@ impl UpgradeSnapshot {
         self.family
             .kill(std::time::Instant::now() + std::time::Duration::from_secs(10))
     }
+}
+
+/// What a successor needs to show a carried terminal as it was.
+#[derive(Clone, Debug)]
+pub(crate) struct Carried {
+    pub(crate) size: TerminalSize,
+    pub(crate) theme: TerminalTheme,
+    /// The conversation its agent was last seen in, as of the carry.
+    pub(crate) hint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -572,6 +586,30 @@ impl TerminalHandle {
             .map_err(|error| format!("Cannot freeze terminal for upgrade: {error}"))?
     }
 
+    /// Leaves the terminal running under its holder for a successor daemon
+    /// to [adopt](TerminalConfig::adoption) from `socket`, with its screen as
+    /// this worker last drew it. The worker then ends without touching the
+    /// terminal's processes. On failure its processes stay here, though a
+    /// full-screen program's display may need redrawing.
+    ///
+    /// This waits for the worker's answer however long it takes, as shutdown
+    /// does: every step of a carry is bounded, and a caller that stopped
+    /// waiting could not tell a terminal left here from one already carried.
+    pub(crate) fn carry(&self, socket: PathBuf) -> Result<Carried, String> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.send_command(Command::Carry { socket, reply })
+            .map_err(|error| error.to_string())?;
+        let carried = result
+            .recv()
+            .map_err(|_| "the terminal ended before it could be carried".to_owned())??;
+        if let Ok(mut worker) = self.inner.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+        Ok(carried)
+    }
+
     /// Inspection and the close decision are one serialized PTY-owner command.
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
@@ -683,6 +721,9 @@ struct Worker {
     child_exit_rx: Receiver<ChildExit>,
     child_identity: Option<RootIdentity>,
     checked_shutdown: bool,
+    /// The terminal was left to its holder for a successor daemon, so ending
+    /// this worker must not end its processes.
+    carried: bool,
     /// The process that owns this terminal's PTY and reaps its root.
     /// Released last, once nothing here reads or writes the terminal.
     holder: holder::Holder,
@@ -693,6 +734,59 @@ struct Worker {
     /// Disconnects when the reader thread returns, so shutdown can wait for
     /// it with a deadline instead of joining unconditionally.
     reader_done: Receiver<()>,
+    pty_capacity: usize,
+}
+
+/// The thread that reads a terminal's PTY into its worker.
+struct Reader {
+    thread: JoinHandle<()>,
+    /// Closing this releases the reader, however long a read would block.
+    wake: OwnedFd,
+    done: Receiver<()>,
+    output: Receiver<PtyMessage>,
+}
+
+impl Reader {
+    /// Starts reading `master`, delivering `pending` before anything it reads.
+    fn start(
+        terminal_id: crate::model::TerminalId,
+        master: &holder::PtyMaster,
+        capacity: usize,
+        pending: Vec<u8>,
+    ) -> Result<Self, String> {
+        let duplicate = |purpose: &str| {
+            master
+                .duplicate()
+                .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
+        };
+        let mut reader = File::from(duplicate("reading")?);
+        // Closing the master does not release a read already blocked on a
+        // duplicate: a PTY master read only fails with EIO once the last slave
+        // descriptor closes, which a disowned grandchild can defer forever.
+        // Wait for readiness on a descriptor this worker hands over instead,
+        // alongside a pipe whose closure is the shutdown signal, so the reader
+        // always has a way out.
+        let readiness = duplicate("readiness")?;
+        let (wake_rx, wake) = wake_pipe()?;
+        let (pty_tx, output) = crossbeam_channel::bounded(capacity.max(1));
+        if !pending.is_empty() {
+            let _ = pty_tx.send(PtyMessage::Bytes(pending));
+        }
+        let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
+        let thread = thread::Builder::new()
+            .name(format!("terminal-pty-reader-{terminal_id:?}"))
+            .spawn(move || {
+                let _done = done_tx;
+                read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+            })
+            .map_err(|error| format!("start PTY reader: {error}"))?;
+        Ok(Self {
+            thread,
+            wake,
+            done,
+            output,
+        })
+    }
 }
 
 impl Worker {
@@ -774,7 +868,23 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let held = holder::spawn(command, pty_size(current_size), child_exit_tx)?;
+        let (held, output) = match &config.adoption {
+            Some(socket) => {
+                let adopted = holder::adopt(socket, child_exit_tx)?;
+                // Drawing the screen again is not news, except for the title
+                // it sets: whatever it provoked, a reply or a bell, happened
+                // when its predecessor drew it.
+                terminal.vt_write(&adopted.screen);
+                effects
+                    .borrow_mut()
+                    .retain(|effect| matches!(effect, Effect::Title(_)));
+                (adopted.held, adopted.output)
+            }
+            None => (
+                holder::spawn(command, pty_size(current_size), child_exit_tx)?,
+                Vec::new(),
+            ),
+        };
         // The holder reaps the root, so its pid identifies it only while the
         // pidfd still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.
@@ -786,26 +896,10 @@ impl Worker {
                 .duplicate()
                 .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
         };
-        let mut reader = File::from(duplicate("reading")?);
         let writer = File::from(duplicate("writing")?);
-
-        // Closing the master does not release a read already blocked on a
-        // duplicate: a PTY master read only fails with EIO once the last slave
-        // descriptor closes, which a disowned grandchild can defer forever.
-        // Wait for readiness on a descriptor this worker hands over instead,
-        // alongside a pipe whose closure is the shutdown signal, so the reader
-        // always has a way out.
-        let readiness = duplicate("readiness")?;
-        let (wake_rx, wake_tx) = wake_pipe()?;
-        let (pty_tx, pty_rx) = crossbeam_channel::bounded(config.pty_capacity.max(1));
-        let (reader_done_tx, reader_done) = crossbeam_channel::bounded::<()>(0);
-        let reader_thread = thread::Builder::new()
-            .name(format!("terminal-pty-reader-{:?}", session.id))
-            .spawn(move || {
-                let _done = reader_done_tx;
-                read_pty(&mut reader, &pty_tx, readiness, wake_rx);
-            })
-            .map_err(|error| format!("start PTY reader: {error}"))?;
+        // Output an adopted terminal produced between daemons comes first, as
+        // any other output would.
+        let reader = Reader::start(session.id, &held.master, config.pty_capacity, output)?;
 
         let transcript = session
             .transcript_path
@@ -857,7 +951,7 @@ impl Worker {
             applied_pty_size: current_size,
             applied_parser_size: current_size,
             commands,
-            pty_rx,
+            pty_rx: reader.output,
             events,
             transcript,
             published,
@@ -867,14 +961,18 @@ impl Worker {
             child_exit_rx,
             child_identity,
             checked_shutdown: false,
+            carried: false,
             holder: held.holder,
-            reader: Some(reader_thread),
-            reader_wake: Some(wake_tx),
-            reader_done,
+            pty_capacity: config.pty_capacity,
+            reader: Some(reader.thread),
+            reader_wake: Some(reader.wake),
+            reader_done: reader.done,
         })
     }
 
     fn run(mut self) {
+        // An adopted terminal's title, set by drawing its screen again.
+        self.drain_effects();
         if self.visibility == Visibility::Visible {
             self.publish_snapshot(true);
         }
@@ -938,7 +1036,7 @@ impl Worker {
                 .store(self.generation, Ordering::Release);
             self.capture_if_ready();
         }
-        if shutting_down && !exited {
+        if shutting_down && !exited && !self.carried {
             match self.child_exit_rx.try_recv() {
                 Ok(result) => self.handle_child_exit(&mut exited, result),
                 Err(TryRecvError::Disconnected) => {
@@ -1177,6 +1275,12 @@ impl Worker {
                         })
                     });
                 let _ = reply.send(result);
+            }
+            Command::Carry { socket, reply } => {
+                let carried = self.carry(&socket);
+                let succeeded = carried.is_ok();
+                let _ = reply.send(carried);
+                return succeeded;
             }
             Command::ObserveAgent(sender) => {
                 self.refresh_resume_hint(true);
@@ -1540,6 +1644,73 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Stops reading the terminal, takes in everything already read, and
+    /// detaches its holder with the screen that output drew. A terminal that
+    /// cannot be detached is read again; one whose reader would not stop is
+    /// left to that reader.
+    fn carry(&mut self, socket: &std::path::Path) -> Result<Carried, String> {
+        // Observed while this worker still owns the terminal's processes.
+        self.refresh_resume_hint(true);
+        self.stop_reading()?;
+        let detached = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+            .and_then(|screen| self.holder.detach(socket, &screen));
+        if let Err(error) = detached {
+            match Reader::start(
+                self.terminal_id,
+                &self.master,
+                self.pty_capacity,
+                Vec::new(),
+            ) {
+                Ok(reader) => {
+                    self.reader = Some(reader.thread);
+                    self.reader_wake = Some(reader.wake);
+                    self.reader_done = reader.done;
+                    self.pty_rx = reader.output;
+                }
+                Err(restart) => self.error("resume reading terminal", restart),
+            }
+            return Err(error);
+        }
+        self.carried = true;
+        Ok(Carried {
+            size: self.current_size,
+            theme: self.theme.get(),
+            hint: self.resume_hint.clone(),
+        })
+    }
+
+    /// Stops the reader and takes in everything it read. A reader that will
+    /// not stop may still read, which leaves the terminal to it.
+    fn stop_reading(&mut self) -> Result<(), String> {
+        drop(self.reader_wake.take());
+        let deadline = std::time::Instant::now() + READER_SHUTDOWN_GRACE;
+        let mut reading = true;
+        while reading {
+            crossbeam_channel::select! {
+                recv(self.pty_rx) -> message => match message {
+                    Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
+                    // Nothing more to read; the holder has the rest.
+                    Ok(PtyMessage::Eof | PtyMessage::Error(_)) | Err(_) => reading = false,
+                },
+                recv(self.reader_done) -> _ => reading = false,
+                default(deadline.saturating_duration_since(std::time::Instant::now())) => {
+                    // The reader may yet read: handing the terminal over now
+                    // could lose or reorder its output.
+                    return Err("the terminal's reader did not stop".into());
+                }
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        while let Ok(message) = self.pty_rx.try_recv() {
+            if let PtyMessage::Bytes(bytes) = message {
+                self.process_output(bytes);
+            }
+        }
+        Ok(())
     }
 
     fn inspect_close(&self, deadline: std::time::Instant) -> Result<(bool, FrozenFamily), String> {
@@ -2491,6 +2662,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn shell_session(script: &str) -> TerminalSession {
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), script.into()],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+        };
+        TerminalSession {
+            recovery_origin: None,
+            id: crate::model::TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        }
+    }
+
+    /// The handle's screen as text, once it shows `needle`.
+    fn wait_for_text(handle: &TerminalHandle, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot();
+            handle.acknowledge_redraw(snapshot.generation);
+            let text = snapshot
+                .lines
+                .iter()
+                .map(|line| {
+                    let row: String = line.cells.iter().map(|cell| cell.text.as_str()).collect();
+                    row.trim_end().to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never showed {needle:?}:\n{text}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_carried_terminal_keeps_its_process_and_screen_for_a_successor() {
+        let directory = tempdir().unwrap();
+        let socket = directory.path().join("holder.sock");
+        let session = shell_session(
+            "printf '\\033]2;carried title\\007'; echo before; \
+             read line; echo \"after:$line\"; read line",
+        );
+        let first =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let before = wait_for_text(&first, "before");
+        let carried = first.carry(socket.clone()).unwrap();
+        assert_eq!(carried.size.columns, TerminalConfig::default().columns);
+        // The worker is gone; the terminal's process is not.
+        assert!(first.is_completed());
+        assert!(first.input("lost?").is_err());
+
+        let config = TerminalConfig {
+            adoption: Some(socket.clone()),
+            ..TerminalConfig::default()
+        };
+        let second = TerminalHandle::spawn(session, config, |_| {}).unwrap();
+        assert_eq!(wait_for_text(&second, "before"), before);
+        second.input(b"hello\n".to_vec()).unwrap();
+        wait_for_text(&second, "after:hello");
+        let events: Vec<_> = second.events().try_iter().collect();
+        assert!(
+            events.contains(&TerminalEvent::TitleChanged("carried title".into())),
+            "{events:?}"
+        );
+        assert!(!socket.exists());
+        second.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_carried_keeps_running_here() {
+        let directory = tempdir().unwrap();
+        let session = shell_session("echo before; read line; echo \"after:$line\"; read line");
+        let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
+        wait_for_text(&handle, "before");
+        let unreachable = directory.path().join("missing").join("holder.sock");
+        assert!(handle.carry(unreachable).is_err());
+        assert!(!handle.is_completed());
+        handle.input(b"still here\n".to_vec()).unwrap();
+        wait_for_text(&handle, "after:still here");
+        handle.shutdown().unwrap();
     }
 
     #[test]

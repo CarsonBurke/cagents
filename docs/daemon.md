@@ -94,8 +94,9 @@ version directories are retained.
 
 ## Full daemon upgrades
 
-A full upgrade replaces the daemon and resumes supported sessions in new
-processes. The in-app **Update** action coordinates saving and closing windows
+A full upgrade replaces the daemon without ending its terminals: each one is
+carried across, processes, screen and scrollback intact. Native chats, and
+terminals a chat owns, are resumed in new processes. The in-app **Update** action coordinates saving and closing windows
 automatically. From the command line, close the application windows and run the
 verified installer with `--restart-daemon` (see
 [Updating](installation.md#updating)).
@@ -117,6 +118,20 @@ Success means the checkpoint was persisted and shutdown requested, so callers
 must still wait for `daemon status` to report stopped. Prefer the installer's
 `--restart-daemon` flow when replacing an installed release.
 
+A terminal is carried by handing it to its holder process, which keeps its
+processes running and waits for the next daemon, for up to 15 minutes, to adopt
+it. Carried terminals are never frozen, so their jobs do not block an upgrade.
+The next daemon adopts them before relaunching any other terminal. If a
+terminal cannot be carried, the old daemon checkpoints it the way it
+checkpoints the terminals it restarts, and one whose running job a restart
+would lose ends with the old daemon. If a terminal cannot be adopted, the new
+daemon restarts it from its safe recipe once nothing of it survives; otherwise
+it is logged and not restarted beside its surviving processes, which its
+holder hangs up when its wait ends. Carrying needs the old daemon to support it, so an upgrade
+from a build without it restarts every terminal.
+
+The rest of this section concerns the sessions that are restarted.
+
 An identified agent with no exact resume identity is relaunched into its
 provider's resume picker by default (`claude --resume`, `codex resume` or
 `omp --resume` with its original options), or as a fresh conversation when its
@@ -132,7 +147,8 @@ without either option it leaves the choice to the installed CLI.
 
 ### What is restored
 
-The replacement daemon restores supported shell launches and the same
+Carried terminals keep their processes, so they lose nothing. For everything
+else, the replacement daemon restores supported shell launches and the same
 provider-backed agent conversations, including native chats, only after proving
 that the previous writers are gone. These are **new processes and PTYs**: shell
 memory, foreground jobs, and arbitrary commands are not preserved. Unknown

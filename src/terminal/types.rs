@@ -29,6 +29,9 @@ pub struct TerminalConfig {
     /// Exact native execution environment for a host-owned CLI replacement.
     /// Never serialized with the terminal's durable launch recipe.
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
+    /// Take over the terminal a previous daemon left to its holder, which
+    /// waits on this socket, instead of starting the session's launch.
+    pub adoption: Option<std::path::PathBuf>,
 }
 
 impl Default for TerminalConfig {
@@ -46,6 +49,7 @@ impl Default for TerminalConfig {
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
+            adoption: None,
         }
     }
 }

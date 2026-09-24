@@ -383,7 +383,10 @@ pub(crate) mod handoff {
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
 
-    const VERSION: u16 = 1;
+    /// Checkpoints that carry terminals are version 2; any other is still
+    /// written as version 1, which a daemon from before carrying can replay.
+    const VERSION: u16 = 2;
+    const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_TERMINALS: usize = 1024;
     const MAX_CHATS: usize = 128;
@@ -413,6 +416,21 @@ pub(crate) mod handoff {
         pub options: TerminalSpawnOptions,
     }
 
+    /// A terminal left running under its holder for the next daemon to adopt,
+    /// processes, screen and all. Its launch is unchanged, so its lineage
+    /// records the carry as a source whose successor launched the same way.
+    #[cfg(any(feature = "host", test))]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct Carried {
+        pub source: TerminalSession,
+        /// Oldest first, as for [`Terminal`].
+        #[serde(default)]
+        pub previous_sources: Vec<TerminalSession>,
+        #[serde(default)]
+        pub relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
+        pub options: TerminalSpawnOptions,
+    }
+
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Chat {
@@ -436,32 +454,53 @@ pub(crate) mod handoff {
     #[cfg(any(feature = "host", test))]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct Checkpoint {
+        /// Read, and checked, but written by [`Store::save`] from what the
+        /// checkpoint holds.
+        #[serde(skip_serializing)]
         version: u16,
         pub proof: HostSessionProof,
         pub phase: Phase,
         pub terminals: Vec<Terminal>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub carried: Vec<Carried>,
         pub chats: Vec<Chat>,
     }
 
     #[cfg(any(feature = "host", test))]
     impl Checkpoint {
-        pub fn new(proof: HostSessionProof, terminals: Vec<Terminal>, chats: Vec<Chat>) -> Self {
+        pub fn new(
+            proof: HostSessionProof,
+            terminals: Vec<Terminal>,
+            carried: Vec<Carried>,
+            chats: Vec<Chat>,
+        ) -> Self {
             Self {
                 version: VERSION,
                 proof,
                 phase: Phase::Prepared,
                 terminals,
+                carried,
                 chats,
             }
         }
 
+        /// The oldest version that can hold this checkpoint.
+        fn format(&self) -> u16 {
+            if self.carried.is_empty() { 1 } else { 2 }
+        }
+
         pub fn validate(&self) -> Result<(), String> {
-            if self.version != VERSION || !self.proof.is_complete() {
+            if !VERSIONS.contains(&self.version)
+                || self.format() > self.version
+                || !self.proof.is_complete()
+            {
                 return Err(
                     "Unsupported or incomplete upgrade checkpoint; checkpoint retained".into(),
                 );
             }
-            if self.terminals.len() > MAX_TERMINALS || self.chats.len() > MAX_CHATS {
+            if self.terminals.len() + self.carried.len() > MAX_TERMINALS
+                || self.chats.len() > MAX_CHATS
+            {
                 return Err("Upgrade checkpoint exceeds session limits".into());
             }
             fn source_proof(
@@ -480,33 +519,34 @@ pub(crate) mod handoff {
             let mut ids = std::collections::BTreeSet::new();
             let mut conversations = std::collections::BTreeSet::new();
             let mut chat_ids = std::collections::BTreeSet::new();
-            for terminal in &self.terminals {
-                if !ids.insert(terminal.source.id)
-                    || terminal.source.continuity.live_proof().as_ref() != Some(&self.proof)
-                    || checkpoint_recipe(&terminal.source, &terminal.relaunches)? != terminal.recipe
-                {
-                    return Err("Upgrade terminal source or safe recipe is inconsistent".into());
+            // Each source daemon either relaunched its terminal from the
+            // source's safe recipe, or carried it, launched as it was.
+            let lineage = |source: &TerminalSession,
+                           previous_sources: &[TerminalSession],
+                           relaunches: &[crate::terminal_ipc::UpgradeRelaunch]|
+             -> Result<(), String> {
+                if source.continuity.live_proof().as_ref() != Some(&self.proof) {
+                    return Err("Upgrade terminal source is inconsistent".into());
                 }
                 let mut proofs = Vec::new();
-                for (source, next) in terminal.previous_sources.iter().zip(
-                    terminal
-                        .previous_sources
+                for (previous, next) in previous_sources.iter().zip(
+                    previous_sources
                         .iter()
                         .skip(1)
-                        .chain(std::iter::once(&terminal.source)),
+                        .chain(std::iter::once(source)),
                 ) {
-                    source_proof(source.continuity.live_proof(), &mut proofs)?;
-                    if source.id != terminal.source.id
-                        || checkpoint_recipe(source, &terminal.relaunches)? != next.launch
+                    source_proof(previous.continuity.live_proof(), &mut proofs)?;
+                    if previous.id != source.id
+                        || (previous.launch != next.launch
+                            && checkpoint_recipe(previous, relaunches)? != next.launch)
                     {
                         return Err("Upgrade terminal lineage is inconsistent".into());
                     }
                 }
-                source_proof(terminal.source.continuity.live_proof(), &mut proofs)?;
-                for (index, accepted) in terminal.relaunches.iter().enumerate() {
-                    if (accepted.source != terminal.source
-                        && !terminal.previous_sources.contains(&accepted.source))
-                        || terminal.relaunches[..index]
+                source_proof(source.continuity.live_proof(), &mut proofs)?;
+                for (index, accepted) in relaunches.iter().enumerate() {
+                    if (accepted.source != *source && !previous_sources.contains(&accepted.source))
+                        || relaunches[..index]
                             .iter()
                             .any(|old| old.source == accepted.source)
                     {
@@ -516,8 +556,51 @@ pub(crate) mod handoff {
                         );
                     }
                 }
+                Ok(())
+            };
+            for terminal in &self.terminals {
+                if !ids.insert(terminal.source.id)
+                    || checkpoint_recipe(&terminal.source, &terminal.relaunches)? != terminal.recipe
+                {
+                    return Err("Upgrade terminal source or safe recipe is inconsistent".into());
+                }
+                lineage(
+                    &terminal.source,
+                    &terminal.previous_sources,
+                    &terminal.relaunches,
+                )?;
                 if let Some((provider, id)) = exact_conversation(&terminal.recipe)
                     && !conversations.insert((provider.executable(), id))
+                {
+                    return Err("Upgrade checkpoint contains duplicate conversation writers".into());
+                }
+            }
+            for carried in &self.carried {
+                if !ids.insert(carried.source.id) {
+                    return Err("Upgrade terminal source is inconsistent".into());
+                }
+                lineage(
+                    &carried.source,
+                    &carried.previous_sources,
+                    &carried.relaunches,
+                )?;
+                // A carried agent is still the writer of its conversation,
+                // whether it was launched into it or was last seen in it.
+                let observed = carried
+                    .source
+                    .resume_hint
+                    .as_deref()
+                    .and_then(crate::model::agent_recovery::recipe_from_hint);
+                let mut writes = [Some(&carried.source.launch), observed.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(exact_conversation)
+                    .map(|(provider, id)| (provider.executable(), id))
+                    .collect::<Vec<_>>();
+                writes.dedup();
+                if writes
+                    .into_iter()
+                    .any(|conversation| !conversations.insert(conversation))
                 {
                     return Err("Upgrade checkpoint contains duplicate conversation writers".into());
                 }
@@ -614,6 +697,8 @@ pub(crate) mod handoff {
         version: u16,
         #[serde(deserialize_with = "count_items")]
         terminals: usize,
+        #[serde(default, deserialize_with = "count_items")]
+        carried: usize,
         #[serde(deserialize_with = "count_items")]
         chats: usize,
     }
@@ -689,14 +774,18 @@ pub(crate) mod handoff {
             };
             let inventory: Inventory =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            if inventory.version != VERSION {
+            if !VERSIONS.contains(&inventory.version) {
                 return Err("Unsupported upgrade checkpoint; checkpoint retained".into());
             }
-            if inventory.terminals > MAX_TERMINALS || inventory.chats > MAX_CHATS {
+            if inventory.terminals + inventory.carried > MAX_TERMINALS
+                || inventory.chats > MAX_CHATS
+            {
                 return Err("Upgrade checkpoint exceeds session limits".into());
             }
+            // Adopting a carried terminal is a local handshake with its holder.
             Ok(std::time::Duration::from_secs(
-                5 + 30 * (inventory.terminals + inventory.chats) as u64,
+                5 + 30 * (inventory.terminals + inventory.chats) as u64
+                    + 5 * inventory.carried as u64,
             ))
         }
 
@@ -731,8 +820,18 @@ pub(crate) mod handoff {
                     Ok(())
                 }
             }
+            #[derive(Serialize)]
+            struct Versioned<'a> {
+                version: u16,
+                #[serde(flatten)]
+                checkpoint: &'a Checkpoint,
+            }
+            let versioned = Versioned {
+                version: checkpoint.format(),
+                checkpoint,
+            };
             let mut bytes = Bounded(Vec::new());
-            serde_json::to_writer(&mut bytes, checkpoint).map_err(|error| error.to_string())?;
+            serde_json::to_writer(&mut bytes, &versioned).map_err(|error| error.to_string())?;
             let (mut file, name) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
@@ -810,7 +909,12 @@ pub(crate) mod handoff {
                 store.startup_timeout().unwrap(),
                 std::time::Duration::from_secs(95)
             );
-            save(br#"{"version":2,"terminals":[],"chats":[]}"#);
+            save(br#"{"version":2,"terminals":[{}],"carried":[{},{}],"chats":[]}"#);
+            assert_eq!(
+                store.startup_timeout().unwrap(),
+                std::time::Duration::from_secs(45)
+            );
+            save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());
@@ -854,7 +958,7 @@ pub fn abandon() -> Result<std::path::PathBuf, String> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalId};
-    use handoff::{Checkpoint, Phase, Store, Terminal};
+    use handoff::{Carried, Checkpoint, Phase, Store, Terminal};
 
     #[test]
     fn upgrades_relaunch_agents_unless_settings_say_otherwise() {
@@ -906,6 +1010,7 @@ mod tests {
                 recipe,
                 options: crate::terminal_ipc::TerminalSpawnOptions::default(),
             }],
+            Vec::new(),
             Vec::new(),
         )
     }
@@ -1163,6 +1268,103 @@ mod tests {
         duplicate.source.id = TerminalId::new();
         checkpoint.terminals.push(duplicate);
         assert!(checkpoint.validate().is_err());
+    }
+
+    fn carry(terminal: Terminal) -> Carried {
+        Carried {
+            source: terminal.source,
+            previous_sources: terminal.previous_sources,
+            relaunches: terminal.relaunches,
+            options: terminal.options,
+        }
+    }
+
+    #[test]
+    fn only_a_checkpoint_that_carries_terminals_needs_the_newer_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let written = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap()
+        };
+        // A daemon from before carrying can still replay what does not carry.
+        let mut checkpoint = checkpoint(directory.path());
+        store.save(&checkpoint).unwrap();
+        assert_eq!(written()["version"], 1);
+        assert!(written().get("carried").is_none());
+        store.load().unwrap().unwrap().validate().unwrap();
+
+        let terminal = checkpoint.terminals.pop().unwrap();
+        checkpoint.carried.push(carry(terminal));
+        store.save(&checkpoint).unwrap();
+        assert_eq!(written()["version"], 2);
+        let loaded = store.load().unwrap().unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded.carried[0].source, checkpoint.carried[0].source);
+        // Carried terminals never pass as an older format that ignores them.
+        let mut mislabelled = written();
+        mislabelled["version"] = 1.into();
+        fs::write(&store.path, serde_json::to_vec(&mislabelled).unwrap()).unwrap();
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn carried_terminals_keep_one_identity_one_writer_and_a_consistent_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        let relaunched = checkpoint.terminals[0].clone();
+
+        // One terminal cannot be both relaunched and carried.
+        checkpoint.carried.push(carry(relaunched.clone()));
+        assert!(checkpoint.validate().is_err());
+
+        // A terminal carried once before launched exactly as its source did;
+        // one relaunched before launched the source's safe recipe.
+        let mut carried = carry(relaunched.clone());
+        carried.source.id = TerminalId::new();
+        let mut earlier = carried.source.clone();
+        earlier.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: HostSessionId::new("earlier-daemon"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("earlier"),
+        };
+        carried.previous_sources.push(earlier);
+        checkpoint.carried[0] = carried.clone();
+        checkpoint.validate().unwrap();
+        let mut forged = checkpoint.clone();
+        forged.carried[0].previous_sources[0].launch.arguments = vec!["-c".into(), "rm".into()];
+        assert!(forged.validate().is_err());
+        let mut foreign = checkpoint.clone();
+        foreign.carried[0].source.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: carried.source.launch.clone(),
+            last_exit: None,
+        };
+        assert!(foreign.validate().is_err());
+
+        // A carried agent still writes its conversation, so nothing restarts
+        // another writer of it.
+        let exact = LaunchRecipe {
+            program: "claude".into(),
+            arguments: vec![
+                "--resume".into(),
+                "12345678-1234-4234-8234-123456789abc".into(),
+            ],
+            ..relaunched.recipe.clone()
+        };
+        let mut writers = checkpoint.clone();
+        writers.carried[0].previous_sources.clear();
+        writers.carried[0].source.launch = exact.clone();
+        writers.validate().unwrap();
+        let mut observed = checkpoint.clone();
+        observed.carried[0].previous_sources.clear();
+        observed.carried[0].source.resume_hint =
+            crate::model::agent_recovery::hint_from_launch(&exact);
+        observed.validate().unwrap();
+        observed.terminals[0].source.launch = exact.clone();
+        observed.terminals[0].recipe = recovery_recipe(&observed.terminals[0].source).unwrap();
+        assert!(observed.validate().is_err());
+        writers.terminals[0].source.launch = exact.clone();
+        writers.terminals[0].recipe = recovery_recipe(&writers.terminals[0].source).unwrap();
+        assert!(writers.validate().is_err());
     }
 
     #[test]

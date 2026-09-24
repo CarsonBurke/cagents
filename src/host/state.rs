@@ -234,12 +234,20 @@ pub(crate) struct HostState {
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
-    upgrade: Option<(
-        crate::upgrade::handoff::Store,
-        crate::upgrade::handoff::Checkpoint,
-        Vec<crate::terminal::UpgradeSnapshot>,
-    )>,
+    upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
+}
+
+/// A checkpoint saved and awaiting this daemon's exit.
+struct PreparedUpgrade {
+    store: crate::upgrade::handoff::Store,
+    checkpoint: crate::upgrade::handoff::Checkpoint,
+    /// The relaunched terminals' processes, stopped only once the checkpoint
+    /// is final.
+    frozen: Vec<crate::terminal::UpgradeSnapshot>,
+    relaunch_agents: bool,
+    /// Where carried terminals' holders wait, prepared before the checkpoint.
+    holders: Option<std::path::PathBuf>,
 }
 
 impl HostState {
@@ -750,6 +758,24 @@ impl HostState {
         }
     }
 
+    /// Records that a restored terminal continues `source`, so clients that
+    /// still hold the previous daemon's session find it again.
+    fn adopt_upgrade_lineage(
+        &mut self,
+        source: &TerminalSession,
+        previous_sources: &[TerminalSession],
+        relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
+    ) -> Result<(), ProtocolError> {
+        let record = self
+            .terminals
+            .get_mut(&source.id)
+            .ok_or_else(|| not_found(source.id))?;
+        record.upgrade_sources = previous_sources.to_vec();
+        record.upgrade_sources.push(source.clone());
+        record.upgrade_relaunches = relaunches.to_vec();
+        self.detach(0, source.id)
+    }
+
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
@@ -1177,10 +1203,16 @@ pub(super) fn prepare_upgrade(
     capability: ShutdownCapability,
     relaunch_agents: bool,
 ) -> Result<(u64, u64), ProtocolError> {
+    let holders = holder_directory()
+        .inspect_err(|error| {
+            tracing::warn!(%error, "no directory for holders; upgrade restarts every terminal")
+        })
+        .ok();
     prepare_upgrade_with_policy(
         host,
         capability,
         relaunch_agents,
+        holders.as_deref(),
         crate::upgrade::handoff::Store::discover,
     )
 }
@@ -1208,17 +1240,31 @@ fn prepare_upgrade_with(
     capability: ShutdownCapability,
     discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
 ) -> Result<(u64, u64), ProtocolError> {
-    prepare_upgrade_with_policy(host, capability, false, discover)
+    prepare_upgrade_with_policy(host, capability, false, None, discover)
 }
 
+/// `holders` is where carried terminals' holders wait; without it, every
+/// terminal is restarted as it was before carrying.
 fn prepare_upgrade_with_policy(
     host: &SharedHost,
     capability: ShutdownCapability,
     relaunch_agents: bool,
+    holders: Option<&std::path::Path>,
     discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
 ) -> Result<(u64, u64), ProtocolError> {
-    use crate::upgrade::handoff::{Chat, Checkpoint, Phase, Terminal};
-    let (proof, terminals, chats, paired_codex) = {
+    use crate::upgrade::handoff::{Carried, Chat, Checkpoint, Phase, Terminal};
+    // What can stop a carry is checked now, while the upgrade can still be
+    // refused: past this point a terminal that fails to carry is lost if a
+    // restart cannot stand in for its running job.
+    let holders = holders.filter(|holders| {
+        crate::secure_file::prepare_private_directory(holders)
+            .inspect_err(|error| {
+                tracing::warn!(holders = %holders.display(), %error,
+                    "cannot prepare the holders' directory; upgrade restarts every terminal")
+            })
+            .is_ok()
+    });
+    let (proof, terminals, carried, chats, paired_codex) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
             .validate_upgrade_capability(&capability, Instant::now())
@@ -1253,10 +1299,33 @@ fn prepare_upgrade_with_policy(
                 "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
             ));
         }
+        // A terminal is carried to the next daemon, processes and all, unless
+        // a native conversation shares its identity or it runs in one's exact
+        // environment, which is never written down: those restart as before.
+        let carries = |id: &TerminalId, record: &TerminalRecord| {
+            !state.chats.contains_key(id)
+                && record.execution_environment.is_none()
+                && holders.is_some_and(|holders| holder_socket_fits(&holder_socket(holders, *id)))
+        };
+        let carried = state
+            .terminals
+            .iter()
+            .filter(|(id, record)| !record.handle.is_completed() && carries(id, record))
+            .map(|(&id, record)| {
+                let mut options = record.options.clone();
+                options.initially_visible = false;
+                Ok(Carried {
+                    source: state.descriptor(0, id)?.session,
+                    previous_sources: record.upgrade_sources.clone(),
+                    relaunches: record.upgrade_relaunches.clone(),
+                    options,
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
         let terminals = state
             .terminals
             .iter()
-            .filter(|(_, record)| !record.handle.is_completed())
+            .filter(|(id, record)| !record.handle.is_completed() && !carries(id, record))
             .map(|(&id, record)| {
                 if let Some(execution) = &record.execution_environment {
                     validate_terminal_upgrade_environment(&record.session.launch, execution)?;
@@ -1353,7 +1422,13 @@ fn prepare_upgrade_with_policy(
                 launch,
             });
         }
-        ((*state.proof).clone(), terminals, chats, paired_codex)
+        (
+            (*state.proof).clone(),
+            terminals,
+            carried,
+            chats,
+            paired_codex,
+        )
     };
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
@@ -1415,45 +1490,18 @@ fn prepare_upgrade_with_policy(
         } else {
             snapshot.hint.clone()
         };
-        let exact = source
-            .resume_hint
-            .as_deref()
-            .and_then(crate::model::agent_recovery::recipe_from_hint);
-        // A shell recipe alone cannot authorize losing its arbitrary running job.
-        if snapshot.active && exact.is_none() {
-            let accepted = relaunch_agents
-                .then(|| handle.observe_agent_process())
-                .flatten()
-                .filter(|agent| snapshot.only_agent_tree(agent.pid))
-                .and_then(|agent| upgrade_relaunch(&agent));
-            match accepted {
-                Some((recipe, kind)) => {
-                    tracing::info!(
-                        terminal = %source.id,
-                        program = %recipe.program,
-                        cwd = %recipe.working_directory.display(),
-                        relaunch = kind,
-                        "upgrade relaunches an agent without exact conversation identity"
-                    );
-                    relaunches.push(crate::terminal_ipc::UpgradeRelaunch {
-                        source: source.clone(),
-                        recipe,
-                    });
-                }
-                None => {
-                    tracing::info!(
-                        terminal = %source.id,
-                        program = %source.launch.program,
-                        relaunch_agents,
-                        "upgrade blocked by an active job without agent identity"
-                    );
-                    blockers.push(describe_upgrade_blocker(&source));
-                    continue;
-                }
-            }
-        }
-        let recipe =
-            crate::upgrade::checkpoint_recipe(&source, &relaunches).map_err(upgrade_error)?;
+        let Some(recipe) = upgrade_recipe(
+            &source,
+            &handle,
+            &snapshot,
+            &mut relaunches,
+            relaunch_agents,
+        )
+        .map_err(upgrade_error)?
+        else {
+            blockers.push(describe_upgrade_blocker(&source));
+            continue;
+        };
         if !relaunches.iter().any(|accepted| accepted.source == source) {
             tracing::info!(
                 terminal = %source.id,
@@ -1468,11 +1516,7 @@ fn prepare_upgrade_with_policy(
         if let Some(execution) = execution_environment {
             validate_terminal_upgrade_environment(&recipe, &execution)?;
         }
-        options.columns = snapshot.size.columns;
-        options.rows = snapshot.size.rows;
-        options.cell_width_px = snapshot.size.cell_width_px;
-        options.cell_height_px = snapshot.size.cell_height_px;
-        options.theme = snapshot.theme;
+        apply_size(&mut options, snapshot.size, snapshot.theme);
         options.initially_visible = false;
         saved.push(Terminal {
             source,
@@ -1489,9 +1533,9 @@ fn prepare_upgrade_with_policy(
             relaunch_agents,
         )));
     }
-    let checkpoint = Checkpoint::new(proof, saved, chats);
+    let checkpoint = Checkpoint::new(proof, saved, carried, chats);
     let counts = (
-        checkpoint.terminals.len() as u64,
+        (checkpoint.terminals.len() + checkpoint.carried.len()) as u64,
         checkpoint.chats.len() as u64,
     );
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1500,15 +1544,95 @@ fn prepare_upgrade_with_policy(
         .map_err(upgrade_error)?;
     // Failure leaves control enabled and drops reversible pidfd freeze guards.
     store.save(&checkpoint).map_err(upgrade_error)?;
-    state.upgrade = Some((store, checkpoint, frozen));
+    state.upgrade = Some(PreparedUpgrade {
+        store,
+        checkpoint,
+        frozen,
+        relaunch_agents,
+        holders: holders.map(std::path::Path::to_owned),
+    });
     state.shutting_down = true;
     state.shutdown_capabilities.clear();
     Ok(counts)
 }
 
+/// The launch that restarts a frozen terminal in the next daemon, or `None`
+/// when that would lose an active job: a shell recipe alone cannot authorize
+/// losing an arbitrary running job, so only an agent's own relaunch, accepted
+/// by policy, stands in for one.
+fn upgrade_recipe(
+    source: &TerminalSession,
+    handle: &TerminalHandle,
+    snapshot: &crate::terminal::UpgradeSnapshot,
+    relaunches: &mut Vec<crate::terminal_ipc::UpgradeRelaunch>,
+    relaunch_agents: bool,
+) -> Result<Option<crate::model::LaunchRecipe>, String> {
+    let exact = source
+        .resume_hint
+        .as_deref()
+        .and_then(crate::model::agent_recovery::recipe_from_hint);
+    if snapshot.active && exact.is_none() {
+        let accepted = relaunch_agents
+            .then(|| handle.observe_agent_process())
+            .flatten()
+            .filter(|agent| snapshot.only_agent_tree(agent.pid))
+            .and_then(|agent| upgrade_relaunch(&agent));
+        let Some((recipe, kind)) = accepted else {
+            tracing::info!(
+                terminal = %source.id,
+                program = %source.launch.program,
+                relaunch_agents,
+                "upgrade blocked by an active job without agent identity"
+            );
+            return Ok(None);
+        };
+        tracing::info!(
+            terminal = %source.id,
+            program = %recipe.program,
+            cwd = %recipe.working_directory.display(),
+            relaunch = kind,
+            "upgrade relaunches an agent without exact conversation identity"
+        );
+        relaunches.push(crate::terminal_ipc::UpgradeRelaunch {
+            source: source.clone(),
+            recipe,
+        });
+    }
+    crate::upgrade::checkpoint_recipe(source, relaunches).map(Some)
+}
+
+/// Where carried terminals' holders wait for the next daemon: this daemon's
+/// private runtime directory, which the next one shares.
+fn holder_directory() -> Result<std::path::PathBuf, String> {
+    crate::daemon::RuntimePaths::discover()
+        .map(|paths| paths.directory.join("holders"))
+        .map_err(|error| error.to_string())
+}
+
+fn holder_socket(holders: &std::path::Path, terminal: TerminalId) -> std::path::PathBuf {
+    holders.join(terminal.to_string())
+}
+
+/// Whether a Unix socket can be bound at `socket`, whose path must fit in
+/// `sockaddr_un` with its terminating NUL.
+fn holder_socket_fits(socket: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: sockaddr_un is plain old data; only its field's size is read.
+    let capacity = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    socket.as_os_str().as_bytes().len() < capacity
+}
+
 /// Provider close must succeed before Ready can authorize another writer.
 pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
-    let Some((store, mut checkpoint, mut frozen)) = host
+    let Some(PreparedUpgrade {
+        store,
+        mut checkpoint,
+        mut frozen,
+        relaunch_agents,
+        holders,
+    }) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .upgrade
@@ -1545,6 +1669,21 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             "Closed provider did not retain its exact conversation identity; checkpoint retained",
         )?;
     }
+    // Carried last: a holder left waiting by an upgrade that then fails
+    // outlives its daemon for nothing, and only the final save follows this.
+    if let Some(holders) = &holders {
+        let mut stopping = Vec::new();
+        carry_terminals(
+            host,
+            &mut checkpoint,
+            &mut stopping,
+            relaunch_agents,
+            holders,
+        );
+        for terminal in &mut stopping {
+            terminal.stop()?;
+        }
+    }
     let handles = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1563,12 +1702,122 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
     store.save(&checkpoint)
 }
 
+/// Leaves each carried terminal to its holder, to wait for the next daemon.
+///
+/// The upgrade is past refusing by now, so a terminal that cannot be carried
+/// is checkpointed as prepare would have: frozen with the relaunched terminals
+/// and restarted by the next daemon, unless that would lose an active job, in
+/// which case it ends with this daemon like any terminal did before carrying.
+fn carry_terminals(
+    host: &SharedHost,
+    checkpoint: &mut crate::upgrade::handoff::Checkpoint,
+    frozen: &mut Vec<crate::terminal::UpgradeSnapshot>,
+    relaunch_agents: bool,
+    holders: &std::path::Path,
+) {
+    if checkpoint.carried.is_empty() {
+        return;
+    }
+    let prepared = crate::secure_file::prepare_private_directory(holders)
+        .map_err(|error| format!("prepare {}: {error}", holders.display()));
+    let mut carried = Vec::with_capacity(checkpoint.carried.len());
+    let prepared_hints = checkpoint
+        .carried
+        .iter()
+        .map(|terminal| (terminal.source.id, terminal.source.resume_hint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for mut terminal in std::mem::take(&mut checkpoint.carried) {
+        let id = terminal.source.id;
+        let Some(handle) = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .terminals
+            .get(&id)
+            .map(|record| record.handle.clone())
+        else {
+            tracing::warn!(terminal = %id, "a terminal to carry ended before the upgrade");
+            continue;
+        };
+        let error = match prepared
+            .clone()
+            .and_then(|()| handle.carry(holder_socket(holders, id)))
+        {
+            Ok(state) => {
+                tracing::info!(terminal = %id, "upgrade carries a terminal to the next daemon");
+                apply_size(&mut terminal.options, state.size, state.theme);
+                terminal.source.resume_hint = state.hint;
+                carried.push(terminal);
+                continue;
+            }
+            Err(error) => error,
+        };
+        let fallback = handle.prepare_upgrade().and_then(|snapshot| {
+            let mut source = terminal.source.clone();
+            source.resume_hint.clone_from(&snapshot.hint);
+            let mut relaunches = terminal.relaunches.clone();
+            Ok(upgrade_recipe(
+                &source,
+                &handle,
+                &snapshot,
+                &mut relaunches,
+                relaunch_agents,
+            )?
+            .map(|recipe| (source, relaunches, recipe, snapshot)))
+        });
+        match fallback {
+            Ok(Some((source, relaunches, recipe, snapshot))) => {
+                tracing::warn!(terminal = %id, %error, program = %recipe.program,
+                    "upgrade could not carry a terminal; the next daemon restarts it");
+                let mut options = terminal.options;
+                apply_size(&mut options, snapshot.size, snapshot.theme);
+                checkpoint
+                    .terminals
+                    .push(crate::upgrade::handoff::Terminal {
+                        source,
+                        previous_sources: terminal.previous_sources,
+                        relaunches,
+                        recipe,
+                        options,
+                    });
+                frozen.push(snapshot);
+            }
+            Ok(None) => tracing::warn!(terminal = %id, %error,
+                "upgrade could not carry a terminal whose active job a restart would lose; it ends with this daemon"),
+            Err(unrestartable) => tracing::warn!(terminal = %id, %error, %unrestartable,
+                "upgrade could neither carry nor safely restart a terminal; it ends with this daemon"),
+        }
+    }
+    checkpoint.carried = carried;
+    // An agent can have moved to another conversation since prepare; one that
+    // another writer claims would make the checkpoint unsaveable, and so
+    // strand every carried terminal. Its restart then relies on what prepare saw.
+    if let Err(error) = checkpoint.validate() {
+        tracing::warn!(%error, "keeping the conversations prepare observed for carried terminals");
+        for terminal in &mut checkpoint.carried {
+            terminal.source.resume_hint = prepared_hints[&terminal.source.id].clone();
+        }
+    }
+}
+
+fn apply_size(
+    options: &mut TerminalSpawnOptions,
+    size: crate::terminal::TerminalSize,
+    theme: crate::terminal::TerminalTheme,
+) {
+    options.columns = size.columns;
+    options.rows = size.rows;
+    options.cell_width_px = size.cell_width_px;
+    options.cell_height_px = size.cell_height_px;
+    options.theme = theme;
+}
+
 /// Runs while HostLease is held, before binding the public listener.
 pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
     restore_upgrade_from(
         host,
         crate::upgrade::handoff::Store::discover()?,
         std::path::Path::new("/proc"),
+        holder_directory().ok().as_deref(),
     )
 }
 
@@ -1591,6 +1840,7 @@ fn restore_upgrade_from(
     host: &SharedHost,
     store: crate::upgrade::handoff::Store,
     proc_root: &std::path::Path,
+    holders: Option<&std::path::Path>,
 ) -> Result<(), String> {
     use crate::upgrade::{ensure_no_surviving_process, handoff::Phase};
     let Some(mut checkpoint) = store.load()? else {
@@ -1633,12 +1883,23 @@ fn restore_upgrade_from(
     }
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
+    let mut adopted = Vec::new();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if super::chat::owns_codex_listener(&chat.source) {
                 super::chat::restore_upgrade(host, chat)?;
+            }
+        }
+        // Carried terminals are adopted before anything is relaunched: their
+        // processes have been waiting unattended since the previous daemon left.
+        for terminal in &checkpoint.carried {
+            if crate::daemon::termination_requested() {
+                return Err(RESTORE_TERMINATED.to_owned());
+            }
+            if adopt_carried_terminal(host, terminal, holders, proc_root) {
+                adopted.push(terminal.source.id);
             }
         }
         for terminal in &checkpoint.terminals {
@@ -1669,21 +1930,12 @@ fn restore_upgrade_from(
                 chat.returning_terminal = false;
                 chat.session.terminal = Some(descriptor.session);
             }
-            let sources = &mut state
-                .terminals
-                .get_mut(&terminal.source.id)
-                .expect("restored terminal")
-                .upgrade_sources;
-            sources.clone_from(&terminal.previous_sources);
-            sources.push(terminal.source.clone());
             state
-                .terminals
-                .get_mut(&terminal.source.id)
-                .expect("restored terminal")
-                .upgrade_relaunches
-                .clone_from(&terminal.relaunches);
-            state
-                .detach(0, terminal.source.id)
+                .adopt_upgrade_lineage(
+                    &terminal.source,
+                    &terminal.previous_sources,
+                    &terminal.relaunches,
+                )
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
@@ -1701,7 +1953,7 @@ fn restore_upgrade_from(
         // A synchronous failure can be retried only after positively closing
         // every newly started writer. A crash has no such proof and retains
         // Restoring, which is never automatically replayed for native sessions.
-        let closed = close_failed_restore(host).is_ok();
+        let closed = close_failed_restore(host, &adopted, holders).is_ok();
         if closed {
             checkpoint.phase = Phase::Ready;
             store.save(&checkpoint)?;
@@ -1724,7 +1976,148 @@ fn restore_upgrade_from(
     store.remove()
 }
 
-fn close_failed_restore(host: &SharedHost) -> Result<(), String> {
+/// How many times a carried terminal's holder is asked for it before the
+/// terminal is given up, and how long apart: a holder busy with another
+/// connection answers the next one.
+const ADOPTION_ATTEMPTS: u32 = 3;
+const ADOPTION_RETRY: Duration = Duration::from_millis(500);
+/// How long the processes of a carried terminal that could not be adopted may
+/// take to end, once their holder hangs them up, before a restart is refused.
+const ABANDONED_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Adopts a carried terminal from the holder its predecessor left it with,
+/// reporting whether it did.
+///
+/// Its process has already outlived one daemon, so no failure here aborts the
+/// rest of the restore: a terminal whose holder is gone is restarted from its
+/// safe recipe once nothing of it survives, and otherwise left for the user,
+/// since starting a second copy beside a surviving one could corrupt its work.
+fn adopt_carried_terminal(
+    host: &SharedHost,
+    terminal: &crate::upgrade::handoff::Carried,
+    holders: Option<&std::path::Path>,
+    proc_root: &std::path::Path,
+) -> bool {
+    let id = terminal.source.id;
+    let mut error = "no directory for holders".to_owned();
+    if let Some(holders) = holders {
+        let socket = holder_socket(holders, id);
+        for attempt in 1..=ADOPTION_ATTEMPTS {
+            let mut session = terminal.source.clone();
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.clone(),
+                last_exit: None,
+            };
+            match start_terminal_view(
+                host,
+                0,
+                session,
+                terminal.options.clone(),
+                None,
+                false,
+                Some(socket.clone()),
+            ) {
+                Ok(_) => {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    // The worker learns a conversation's identity only from
+                    // output it sees, which the previous daemon already saw.
+                    if let Some(record) = state.terminals.get_mut(&id)
+                        && terminal.source.resume_hint.is_some()
+                    {
+                        record
+                            .session
+                            .resume_hint
+                            .clone_from(&terminal.source.resume_hint);
+                    }
+                    if let Err(error) = state.adopt_upgrade_lineage(
+                        &terminal.source,
+                        &terminal.previous_sources,
+                        &terminal.relaunches,
+                    ) {
+                        tracing::warn!(terminal = %id, error = %error.message,
+                            "adopted a carried terminal but could not record its lineage");
+                    } else {
+                        tracing::info!(terminal = %id, "adopted a terminal carried across the upgrade");
+                    }
+                    return true;
+                }
+                Err(failure) => error = failure.message,
+            }
+            // A holder that stopped listening does not start again.
+            if attempt == ADOPTION_ATTEMPTS || !socket.exists() {
+                break;
+            }
+            thread::sleep(ADOPTION_RETRY);
+        }
+    }
+    let recipe = match crate::upgrade::checkpoint_recipe(&terminal.source, &terminal.relaunches) {
+        Ok(recipe) => recipe,
+        Err(unsafe_recipe) => {
+            tracing::warn!(terminal = %id, %error, %unsafe_recipe,
+                "could not adopt a carried terminal, which cannot safely be restarted");
+            return false;
+        }
+    };
+    let deadline = Instant::now() + ABANDONED_EXIT_GRACE;
+    while let Err(survivor) =
+        crate::upgrade::ensure_no_surviving_process(&terminal.source, std::process::id(), proc_root)
+    {
+        if Instant::now() >= deadline {
+            tracing::warn!(terminal = %id, %error, %survivor,
+                "could not adopt a carried terminal whose processes survive; it is not restarted beside them");
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    tracing::warn!(terminal = %id, %error, program = %recipe.program,
+        "could not adopt a carried terminal; restarting it");
+    let mut session = terminal.source.clone();
+    session.launch = recipe;
+    session.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: session.launch.clone(),
+        last_exit: None,
+    };
+    let restarted = spawn_terminal_view(host, 0, session, terminal.options.clone(), None, false)
+        .and_then(|_| {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .adopt_upgrade_lineage(
+                    &terminal.source,
+                    &terminal.previous_sources,
+                    &terminal.relaunches,
+                )
+        });
+    if let Err(error) = restarted {
+        tracing::warn!(terminal = %id, error = %error.message,
+            "could not restart a carried terminal");
+    }
+    false
+}
+
+/// Positively ends everything a failed restore started, so the checkpoint
+/// can be replayed. Terminals it adopted are carried back to their holders
+/// instead, to be adopted again by that replay.
+fn close_failed_restore(
+    host: &SharedHost,
+    adopted: &[TerminalId],
+    holders: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if let Some(holders) = holders {
+        for &id in adopted {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminals
+                .get(&id)
+                .map(|record| record.handle.clone());
+            if let Some(handle) = handle
+                && let Err(error) = handle.carry(holder_socket(holders, id))
+            {
+                tracing::warn!(terminal = %id, %error,
+                    "could not return an adopted terminal to its holder after a failed restore");
+            }
+        }
+    }
     let (chats, terminals) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -1790,6 +2183,28 @@ pub(super) fn spawn_terminal_view(
     execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    start_terminal_view(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        None,
+    )
+}
+
+/// Starts a terminal's worker, spawning its process or, given `adoption`,
+/// adopting the one a predecessor daemon's holder waits with there.
+fn start_terminal_view(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+) -> Result<TerminalDescriptor, ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     let terminal_id = session.id;
@@ -1812,6 +2227,7 @@ pub(super) fn spawn_terminal_view(
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
+        adoption,
         ..TerminalConfig::default()
     };
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
@@ -2281,7 +2697,7 @@ mod tests {
                 .unwrap()
                 .capability;
             assert!(
-                prepare_upgrade_with_policy(&host, capability, false, || Store::open(
+                prepare_upgrade_with_policy(&host, capability, false, None, || Store::open(
                     directory.path()
                 ))
                 .is_err()
@@ -2294,7 +2710,7 @@ mod tests {
                 .unwrap()
                 .capability;
             assert_eq!(
-                prepare_upgrade_with_policy(&host, capability, true, || Store::open(
+                prepare_upgrade_with_policy(&host, capability, true, None, || Store::open(
                     directory.path()
                 ))
                 .unwrap(),
@@ -2314,8 +2730,13 @@ mod tests {
             // With no conversation identified, the agent reopens its picker.
             assert_eq!(saved.terminals[0].recipe.arguments, ["--resume"]);
             host = Arc::new(Mutex::new(test_host_with_incarnation(incarnation)));
-            restore_upgrade_from(&host, Store::open(directory.path()).unwrap(), &empty_proc)
-                .unwrap();
+            restore_upgrade_from(
+                &host,
+                Store::open(directory.path()).unwrap(),
+                &empty_proc,
+                None,
+            )
+            .unwrap();
             let descriptor = host.lock().unwrap().descriptor(0, source.id).unwrap();
             assert!(!descriptor.upgrade_relaunches.is_empty());
         }
@@ -2444,7 +2865,7 @@ for line in sys.stdin:
         fs::create_dir(&empty_proc).unwrap();
         let replacement = test_host_with_incarnation("replacement-incarnation");
         let replacement = Arc::new(Mutex::new(replacement));
-        restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
+        restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
         let restored = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(restored.launch.session_id.as_deref(), Some(B));
         assert_ne!(restored.proof, source.proof);
@@ -2480,6 +2901,7 @@ for line in sys.stdin:
             &replacement,
             Store::open(&cwd.join("checkpoint")).unwrap(),
             &empty_proc,
+            None,
         )
         .unwrap();
         // The durable P1 card stays closed at P2. A second full handoff must
@@ -2514,7 +2936,7 @@ for line in sys.stdin:
         assert!(forged.validate().is_err());
         let third = test_host_with_incarnation("third-incarnation");
         let replacement = Arc::new(Mutex::new(third));
-        restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
+        restore_upgrade_from(&replacement, store, &empty_proc, None).unwrap();
         let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
         assert_eq!(third.launch.session_id.as_deref(), Some(B));
         assert_ne!(third.proof, restored.proof);
@@ -2537,6 +2959,7 @@ for line in sys.stdin:
             &replacement,
             Store::open(&cwd.join("checkpoint")).unwrap(),
             &empty_proc,
+            None,
         )
         .unwrap();
         let launches: Vec<Vec<String>> = fs::read_to_string(log)
@@ -2716,6 +3139,212 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
+        use crate::upgrade::handoff::Store;
+        let directory = tempfile::tempdir().unwrap();
+        let holders = directory.path().join("holders");
+        let empty_proc = directory.path().join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let pid_file = directory.path().join("pid");
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; exec sleep 1000", pid_file.display()),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let source = TerminalSession {
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let host = Arc::new(Mutex::new(test_host()));
+        spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell never started");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let old = host.lock().unwrap().terminals[&source.id].handle.clone();
+        let carried_source = host
+            .lock()
+            .unwrap()
+            .descriptor(0, source.id)
+            .unwrap()
+            .session;
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        // Its job keeps running, so no relaunch has to be accepted for it.
+        assert_eq!(
+            prepare_upgrade_with_policy(&host, capability, false, Some(&holders), || Store::open(
+                directory.path()
+            ))
+            .unwrap(),
+            (1, 0)
+        );
+        finish_upgrade(&host).unwrap();
+        assert!(old.is_completed());
+        let saved = Store::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(saved.terminals.is_empty());
+        assert_eq!(saved.carried[0].source, carried_source);
+
+        // A restore that fails after adopting it hands it back to its holder,
+        // so replaying the checkpoint adopts it again.
+        let store = Store::open(directory.path()).unwrap();
+        let mut failing = store.load().unwrap().unwrap();
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        failing.terminals.push(crate::upgrade::handoff::Terminal {
+            source: TerminalSession {
+                recovery_origin: None,
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: TerminalContinuity::DetachedSameBoot {
+                    host_session_id: failing.proof.host_session_id.clone(),
+                    boot_id: failing.proof.boot_id.clone(),
+                    host_incarnation: failing.proof.host_incarnation.clone(),
+                },
+            },
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            recipe,
+            // No terminal can start at this size.
+            options: TerminalSpawnOptions {
+                columns: 0,
+                ..TerminalSpawnOptions::default()
+            },
+        });
+        store.save(&failing).unwrap();
+        let failed = Arc::new(Mutex::new(test_host_with_incarnation("failed")));
+        assert!(restore_upgrade_from(&failed, store, &empty_proc, Some(&holders)).is_err());
+        assert!(
+            failed.lock().unwrap().terminals[&source.id]
+                .handle
+                .is_completed()
+        );
+        assert!(holders.join(source.id.to_string()).exists());
+        let store = Store::open(directory.path()).unwrap();
+        let mut retained = store.load().unwrap().unwrap();
+        retained.terminals.clear();
+        store.save(&retained).unwrap();
+
+        let replacement = Arc::new(Mutex::new(test_host_with_incarnation("second")));
+        restore_upgrade_from(
+            &replacement,
+            Store::open(directory.path()).unwrap(),
+            &empty_proc,
+            Some(&holders),
+        )
+        .unwrap();
+        assert!(
+            Store::open(directory.path())
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        let descriptor = replacement
+            .lock()
+            .unwrap()
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
+        assert_eq!(descriptor.session.launch, source.launch);
+        assert_eq!(
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .unwrap()
+                .trim(),
+            "sleep",
+            "the successor adopted the same process rather than starting another"
+        );
+        let handle = replacement.lock().unwrap().terminals[&source.id]
+            .handle
+            .clone();
+        assert!(!handle.is_completed());
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn a_carried_terminal_whose_holder_is_gone_restarts_from_its_recipe() {
+        use crate::upgrade::handoff::{Carried, Checkpoint, Phase, Store};
+        let directory = tempfile::tempdir().unwrap();
+        let empty_proc = directory.path().join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let old = test_host().proof().clone();
+        let source = TerminalSession {
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: old.host_session_id.clone(),
+                boot_id: old.boot_id.clone(),
+                host_incarnation: old.host_incarnation.clone(),
+            },
+        };
+        let mut checkpoint = Checkpoint::new(
+            old,
+            Vec::new(),
+            vec![Carried {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: TerminalSpawnOptions::default(),
+            }],
+            Vec::new(),
+        );
+        checkpoint.phase = Phase::Ready;
+        let store = Store::open(directory.path()).unwrap();
+        store.save(&checkpoint).unwrap();
+        let host = Arc::new(Mutex::new(test_host_with_incarnation("second")));
+        restore_upgrade_from(
+            &host,
+            store,
+            &empty_proc,
+            Some(&directory.path().join("holders")),
+        )
+        .unwrap();
+        let descriptor = host.lock().unwrap().descriptor(0, source.id).unwrap();
+        assert_eq!(descriptor.upgrade_sources, vec![source]);
+        let handle = host.lock().unwrap().terminals[&descriptor.session.id]
+            .handle
+            .clone();
+        assert!(!handle.is_completed());
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
+
+    #[test]
     fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
         let directory = tempfile::tempdir().unwrap();
@@ -2745,6 +3374,7 @@ for line in sys.stdin:
                 options: TerminalSpawnOptions::default(),
             }],
             Vec::new(),
+            Vec::new(),
         );
         checkpoint.phase = Phase::Ready;
         let store = Store::open(directory.path()).unwrap();
@@ -2752,7 +3382,7 @@ for line in sys.stdin:
         let replacement = test_host_with_incarnation("replacement-incarnation");
         let expected = (*replacement.proof).clone();
         let host = Arc::new(Mutex::new(replacement));
-        restore_upgrade_from(&host, store, &empty_proc).unwrap();
+        restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let descriptor = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2761,7 +3391,13 @@ for line in sys.stdin:
         assert_eq!(descriptor.upgrade_sources, vec![source.clone()]);
         assert_eq!(descriptor.session.continuity.live_proof(), Some(expected));
         assert_eq!(descriptor.session.transcript_path, source.transcript_path);
-        restore_upgrade_from(&host, Store::open(directory.path()).unwrap(), &empty_proc).unwrap();
+        restore_upgrade_from(
+            &host,
+            Store::open(directory.path()).unwrap(),
+            &empty_proc,
+            None,
+        )
+        .unwrap();
         let capability = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2787,7 +3423,7 @@ for line in sys.stdin:
         assert!(forged.validate().is_err());
         let third = test_host_with_incarnation("third-incarnation");
         let host = Arc::new(Mutex::new(third));
-        restore_upgrade_from(&host, store, &empty_proc).unwrap();
+        restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let third = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
