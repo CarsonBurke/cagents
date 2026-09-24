@@ -676,15 +676,15 @@ impl Cagents {
                     runtime.session.launch.provider,
                     &runtime.session.launch.recipe,
                 );
-                // A draft chooses among every provider it could start on; a
-                // started conversation only among its own provider's models.
+                // A draft chooses among every provider it could start on,
+                // its own first; a started conversation only among its own
+                // provider's models.
+                let current = runtime.session.launch.provider;
                 let offers = if runtime.choosing() {
-                    MODEL_FAMILIES
-                        .into_iter()
-                        .filter(|provider| {
-                            *provider == runtime.session.launch.provider
-                                || self.account_ui.offers(*provider)
-                        })
+                    std::iter::once(current)
+                        .chain(MODEL_FAMILIES.into_iter().filter(|provider| {
+                            *provider != current && self.account_ui.offers(*provider)
+                        }))
                         .map(|provider| Offer {
                             provider,
                             models: self
@@ -710,14 +710,15 @@ impl Cagents {
     }
 }
 
-/// The providers a draft offers, in the order its picker lists them.
+/// The providers a draft offers, in the order its picker lists them after
+/// its own.
 const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
     provider: Provider,
-    /// What the provider listed last. Empty where it never has, and then
-    /// the picker offers the provider's default model alone.
+    /// What the provider listed last, under its default model. Empty where
+    /// it never has, and then the picker offers the default alone.
     models: &'a [chat::Model],
 }
 
@@ -1843,7 +1844,7 @@ impl Runtime {
     fn model_search<'a>(&'a self, offers: Vec<Offer<'a>>) -> Option<Element<'a, Message>> {
         let query = self.model_picker.as_deref()?;
         let provider = self.session.launch.provider;
-        let draft = self.is_draft();
+        let draft = self.choosing();
         let offers = if draft {
             offers
         } else {
@@ -1918,11 +1919,17 @@ impl Runtime {
     /// and a message that vanished until the provider answered would read
     /// as lost.
     fn queued_view<'a>(&'a self, queued: &'a Queued) -> Element<'a, Message> {
-        let waiting = if queued.since.is_none() {
+        let waiting = if self.is_draft() || !self.snapshot.ready {
             format!("Starting {}…", family_label(self.session.launch.provider))
         } else {
             "Sending…".to_owned()
         };
+        // Until the message itself is on its way it can still be taken back,
+        // to be edited or sent somewhere else.
+        let sending = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
         let mut rows: Vec<Element<'a, Message>> = vec![
             widget::container(
                 widget::text(queued.text.trim_end())
@@ -1945,10 +1952,13 @@ impl Runtime {
         ];
         for attachment in &queued.attachments {
             rows.push(
-                design::caption(Self::attachment_label(
-                    attachment.path.to_str().unwrap_or_default(),
-                    "",
-                ))
+                design::caption(
+                    attachment
+                        .path
+                        .file_name()
+                        .unwrap_or(attachment.path.as_os_str())
+                        .to_string_lossy(),
+                )
                 .into(),
             );
         }
@@ -1961,6 +1971,12 @@ impl Runtime {
                 design::caption(waiting)
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .into(),
+                crate::ui_controls::compact_icon_control(
+                    crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+                    "Take the message back to edit it",
+                    (!sending).then(|| action(Action::CancelQueued(self.target))),
+                )
+                .into(),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -2464,37 +2480,55 @@ impl ModelRow<'_> {
 /// The rows `query` names in each of `offers`, grouped by provider.
 ///
 /// A query naming a provider names every model it offers, so "claude" lists
-/// Claude's models whatever they are called. A provider that has never
-/// listed its models is still a choice: its default.
-fn model_rows<'a>(offers: &[Offer<'a>], query: &str) -> Vec<(Provider, Vec<ModelRow<'a>>)> {
+/// Claude's models whatever they are called. A draft can also start on a
+/// provider's default model, which heads its group, and is all a provider
+/// that has never listed its models offers; a started conversation can only
+/// switch to a model it names.
+fn model_rows<'a>(
+    offers: &[Offer<'a>],
+    query: &str,
+    draft: bool,
+) -> Vec<(Provider, Vec<ModelRow<'a>>)> {
     let needle = query.trim().to_lowercase();
     offers
         .iter()
         .filter_map(|offer| {
-            let named = !needle.is_empty()
-                && family_label(offer.provider)
-                    .to_lowercase()
-                    .contains(&needle);
-            let rows: Vec<ModelRow<'a>> = if offer.models.is_empty() {
-                (needle.is_empty() || named || "default".contains(&needle))
-                    .then_some(ModelRow {
-                        provider: offer.provider,
-                        model: None,
-                    })
-                    .into_iter()
-                    .collect()
-            } else {
-                model_hits(offer.models, if named { "" } else { query })
-                    .into_iter()
-                    .map(|model| ModelRow {
-                        provider: offer.provider,
-                        model: Some(model),
-                    })
-                    .collect()
-            };
+            // A letter alone begins too many names to mean one provider.
+            let named = needle.chars().count() > 1 && names_provider(offer.provider, &needle);
+            let default = (draft || offer.models.is_empty())
+                && (needle.is_empty() || named || "default".starts_with(&needle));
+            let rows: Vec<ModelRow<'a>> = default
+                .then_some(ModelRow {
+                    provider: offer.provider,
+                    model: None,
+                })
+                .into_iter()
+                .chain(
+                    model_hits(offer.models, if named { "" } else { query })
+                        .into_iter()
+                        .map(|model| ModelRow {
+                            provider: offer.provider,
+                            model: Some(model),
+                        }),
+                )
+                .collect();
             (!rows.is_empty()).then_some((offer.provider, rows))
         })
         .collect()
+}
+
+/// Whether `needle`, lowercased, begins a word the reader could know
+/// `provider` by: what its models are listed under, or the agent that runs
+/// them.
+fn names_provider(provider: Provider, needle: &str) -> bool {
+    let names: &[&str] = match provider {
+        Provider::Codex => &["chatgpt", "codex", "openai"],
+        Provider::Claude => &["claude", "anthropic"],
+        Provider::Omp => &["other models", "omp"],
+    };
+    names.iter().any(|name| {
+        name.starts_with(needle) || name.split(' ').any(|word| word.starts_with(needle))
+    })
 }
 
 /// The search field and the models `query` names among `offers`, under a
@@ -2510,10 +2544,13 @@ fn model_list<'a>(
     current: (Provider, Option<&str>),
     query: &'a str,
 ) -> Element<'a, Message> {
-    let groups = model_rows(offers, query);
+    let groups = model_rows(offers, query, draft);
+    // Only a search has a best match; Enter on an empty one would move the
+    // conversation to whatever happens to be listed first.
     let top = groups
         .first()
         .and_then(|(_, rows)| rows.first())
+        .filter(|_| !query.trim().is_empty())
         .map(|row| row.choose(target, draft));
     let headed = draft && offers.len() > 1;
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
@@ -2555,9 +2592,17 @@ fn model_list<'a>(
         for row in models {
             let selected =
                 provider == current.0 && row.model.map(|model| model.id.as_str()) == current.1;
-            let (title, id) = match row.model {
-                Some(model) => (model.label.as_str(), Some(model.id.as_str())),
-                None => ("Default model", None),
+            let (title, id, name) = match row.model {
+                Some(model) => (
+                    model.label.as_str(),
+                    Some(model.id.as_str()),
+                    Cow::Borrowed(model.label.as_str()),
+                ),
+                None => (
+                    "Default model",
+                    None,
+                    Cow::Owned(format!("{} default model", family_label(provider))),
+                ),
             };
             let mut label: Vec<Element<'a, Message>> = vec![
                 design::body(title)
@@ -2567,9 +2612,13 @@ fn model_list<'a>(
             // The identifier is shown only where it is not already the
             // label, because most providers use one string for both and a
             // row that prints it twice is half a list of duplicates.
+            let listed = offers
+                .iter()
+                .any(|offer| offer.provider == provider && !offer.models.is_empty());
             let detail = match id {
                 Some(id) if id != title => Some(id),
                 Some(_) => None,
+                None if listed => Some("Whichever it would choose itself"),
                 None => Some("Its models are listed once it has run"),
             };
             if let Some(detail) = detail {
@@ -2602,7 +2651,7 @@ fn model_list<'a>(
                     .spacing(step::GAP_S)
                     .align_y(Alignment::Center),
                 )
-                .name(title)
+                .name(name)
                 .class(crate::ui_controls::control_style(selected, None))
                 .selected(selected)
                 .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
@@ -3068,6 +3117,86 @@ mod tests {
             label: label.into(),
             reasoning: Vec::new(),
         }
+    }
+
+    fn listed<'a>(groups: &[(Provider, Vec<ModelRow<'a>>)]) -> Vec<(Provider, Vec<&'a str>)> {
+        groups
+            .iter()
+            .map(|(provider, rows)| {
+                (
+                    *provider,
+                    rows.iter()
+                        .map(|row| row.model.map_or("default", |model| model.id.as_str()))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A draft can start on a provider's default model as well as a named
+    /// one, so the default heads each provider's group; a started
+    /// conversation can only switch to a model it names.
+    #[test]
+    fn a_draft_offers_each_providers_default_ahead_of_its_models() {
+        let model = |id: &str| chat::Model {
+            id: id.into(),
+            label: id.into(),
+            reasoning: Vec::new(),
+        };
+        let codex = [model("gpt-a"), model("gpt-b")];
+        let offers = [
+            Offer {
+                provider: Provider::Codex,
+                models: &codex,
+            },
+            Offer {
+                provider: Provider::Claude,
+                models: &[],
+            },
+        ];
+        assert_eq!(
+            listed(&model_rows(&offers, "", true)),
+            [
+                (Provider::Codex, vec!["default", "gpt-a", "gpt-b"]),
+                (Provider::Claude, vec!["default"]),
+            ]
+        );
+        assert_eq!(
+            listed(&model_rows(&offers[..1], "", false)),
+            [(Provider::Codex, vec!["gpt-a", "gpt-b"])]
+        );
+        assert_eq!(
+            listed(&model_rows(&offers, "gpt-b", true)),
+            [(Provider::Codex, vec!["gpt-b"])]
+        );
+    }
+
+    /// A provider is named by the start of a word it is known by, not by
+    /// any letters its heading happens to contain, and not by one letter.
+    #[test]
+    fn a_search_names_a_provider_by_the_start_of_its_names() {
+        let omp = [chat::Model {
+            id: "kimi".into(),
+            label: "Kimi".into(),
+            reasoning: Vec::new(),
+        }];
+        let offers = [Offer {
+            provider: Provider::Omp,
+            models: &omp,
+        }];
+        for query in ["omp", "Other", "mod"] {
+            assert_eq!(
+                listed(&model_rows(&offers, query, true)),
+                [(Provider::Omp, vec!["default", "kimi"])],
+                "{query}"
+            );
+        }
+        for query in ["the", "o", "er"] {
+            assert!(model_rows(&offers, query, true).is_empty(), "{query}");
+        }
+        assert!(names_provider(Provider::Codex, "codex"));
+        assert!(names_provider(Provider::Codex, "chat"));
+        assert!(!names_provider(Provider::Claude, "laude"));
     }
 
     #[test]

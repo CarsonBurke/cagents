@@ -440,6 +440,9 @@ pub struct Snapshot {
     /// Defaulted so a snapshot written before plans were carried still loads.
     #[serde(default)]
     pub plan: Vec<PlanStep>,
+    /// Whether the provider takes commands, so that what waits to be sent
+    /// can wait for it rather than for a refusal.
+    pub ready: bool,
 }
 
 impl Snapshot {
@@ -920,6 +923,10 @@ pub enum Event {
     /// runs on. It is about the account, not the conversation: the runtime
     /// forwards it to every surface and keeps it out of the transcript.
     AccountUsage(crate::account::LiveReport),
+    /// Whether the provider now takes commands. A provider refuses them
+    /// while it connects or loads a conversation, and says so only by
+    /// refusing, which a sender cannot tell from a refusal of the command.
+    Ready(bool),
 }
 
 #[cfg(test)]

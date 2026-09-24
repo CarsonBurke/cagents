@@ -109,6 +109,9 @@ pub enum Action {
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
     DispatchQueued(Target),
+    /// Takes back a draft's first message before its conversation has it,
+    /// so the draft can be edited or moved again.
+    CancelQueued(Target),
     Switch(CardId),
     Ready(Target, Ready),
     /// The result of giving up a conversation's daemon actor after its card
@@ -1038,6 +1041,9 @@ struct PendingCommand {
     permission_mode: Option<String>,
     /// The first user prompt, used to name a new channel once locally queued.
     first_prompt: Option<String>,
+    /// The model this command chooses, remembered for new drafts of the
+    /// provider once the provider has accepted it.
+    model: Option<(String, Option<String>)>,
     /// The message this command sends, kept for the composer's history once
     /// the provider has accepted it. A rejected send is not history: the
     /// draft it came from is still in the composer.
@@ -1071,10 +1077,14 @@ struct Queued {
     /// The model the draft chose, to be selected before the message is sent.
     /// `None` once it has been, or when the provider's default was chosen.
     model: Option<(String, Option<String>)>,
-    /// When the connection opened, from which the waiting is bounded.
+    /// The draft as its start was asked for, which the card goes back to if
+    /// the conversation never takes the message.
+    draft: chat::Session,
+    /// When the provider was first seen ready, from which the wait for it to
+    /// list the chosen model is bounded.
     since: Option<Instant>,
-    /// Whether a delayed retry is already scheduled.
-    retrying: bool,
+    /// Whether a look back once that wait is over is already scheduled.
+    rechecking: bool,
 }
 
 /// Which step of sending a queued first message a command is.
@@ -1420,10 +1430,11 @@ impl Runtime {
     }
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
-    fn unqueue(&mut self) {
-        let Some(queued) = self.queued.take() else {
-            return;
-        };
+    fn unqueue(&mut self) -> Option<chat::Session> {
+        let queued = self.queued.take()?;
+        // Nothing waits on the snapshot of a hidden card any more; a
+        // connection that has gone has nothing to be told.
+        let _ = self.present();
         let written = self.composer.text();
         let text = if written.trim().is_empty() {
             queued.text
@@ -1433,6 +1444,7 @@ impl Runtime {
         self.replace_draft(text_editor::Content::with_text(&text));
         let written = std::mem::replace(&mut self.attachments, queued.attachments);
         self.attach(written.into_iter().map(|attachment| attachment.path));
+        Some(queued.draft)
     }
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
@@ -1561,6 +1573,15 @@ impl Runtime {
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        self.present()
+    }
+    /// Tells the connection whether to keep the card's snapshot current.
+    ///
+    /// A first message waiting to be sent keeps it current while the card is
+    /// hidden, since its provider becoming ready, and the models it lists,
+    /// reach the card only through that snapshot.
+    fn present(&self) -> Result<(), String> {
+        let visible = self.visible.load(Ordering::Relaxed) || self.queued.is_some();
         self.handle()
             .map_or(Ok(()), |handle| handle.set_visible(visible))
     }
@@ -1934,13 +1955,10 @@ fn draft_snapshot(
     }
 }
 
-/// How long a queued first message waits for its conversation to take it.
-const QUEUE_PATIENCE: Duration = Duration::from_secs(45);
-/// How long it waits for the conversation to list the model it was meant to
-/// be sent to, before going to the provider's default instead.
+/// How long a queued first message waits, once its provider is ready, for
+/// the conversation to list the model it was meant to be sent to, before
+/// going to the provider's default instead.
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
-/// How soon a refused step of a queued first message is tried again.
-const QUEUE_RETRY: Duration = Duration::from_millis(250);
 
 impl Cagents {
     /// Points a draft at `model` of `provider`, or at that provider's
@@ -2026,6 +2044,36 @@ impl Cagents {
             None => {
                 self.chat_ui.last_models.remove(&provider);
             }
+        }
+    }
+
+    /// What a new draft of `provider` shows: the models it listed last, and
+    /// the one last chosen among them.
+    fn chat_draft_snapshot(&self, provider: Provider) -> Snapshot {
+        let models = self
+            .account_ui
+            .catalog(provider)
+            .map(|catalog| catalog.models.clone())
+            .unwrap_or_default();
+        let (model, reasoning) = self
+            .chat_ui
+            .last_models
+            .get(&provider)
+            .cloned()
+            .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
+        draft_snapshot(provider, models, model, reasoning)
+    }
+
+    /// Stops offering `model` to new drafts of `provider`, as a conversation
+    /// of that provider would not take it.
+    fn forget_chat_model(&mut self, provider: Provider, model: &str) {
+        if self
+            .chat_ui
+            .last_models
+            .get(&provider)
+            .is_some_and(|(remembered, _)| remembered == model)
+        {
+            self.chat_ui.last_models.remove(&provider);
         }
     }
 
@@ -2293,24 +2341,13 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) {
-        let provider = session.launch.provider;
-        let models = self
-            .account_ui
-            .catalog(provider)
-            .map(|catalog| catalog.models.clone())
-            .unwrap_or_default();
-        let (model, reasoning) = self
-            .chat_ui
-            .last_models
-            .get(&provider)
-            .cloned()
-            .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
+        let snapshot = self.chat_draft_snapshot(session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
             target,
             session,
-            draft_snapshot(provider, models, model, reasoning),
+            snapshot,
             visible,
             self.settings.editor_syntax_theme,
         );
@@ -2886,12 +2923,15 @@ impl Cagents {
             .selected_model
             .clone()
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
+        let mut session = runtime.session.clone();
+        session.id = TerminalId::new();
         runtime.queued = Some(Queued {
             text: runtime.composer.text(),
             attachments: std::mem::take(&mut runtime.attachments),
             model,
+            draft: session.clone(),
             since: None,
-            retrying: false,
+            rechecking: false,
         });
         runtime.replace_draft(text_editor::Content::new());
         runtime.history_cursor = None;
@@ -2900,8 +2940,6 @@ impl Cagents {
         runtime.model_picker = None;
         runtime.account_picker = false;
         runtime.reasoning_picker = false;
-        let mut session = runtime.session.clone();
-        session.id = TerminalId::new();
         runtime.session = session.clone();
         self.replace_chat_conversation(target.card, session.clone());
         self.start_chat(target.card, session, chat::Intent::Start, None, false)
@@ -2910,10 +2948,10 @@ impl Cagents {
     /// Takes the next step of sending a started draft's first message: its
     /// model, where one was chosen, and then the message.
     ///
-    /// Each step waits until the conversation can take it. A model the
-    /// conversation does not list is not waited for past
-    /// [`MODEL_PATIENCE`]; the message is sent on the default instead, and
-    /// the transcript says so.
+    /// Nothing is sent before the provider says it takes commands, which the
+    /// next snapshot to say so brings back here. A model the conversation
+    /// does not list is not waited for past [`MODEL_PATIENCE`]; the message
+    /// is sent on the default instead, and the transcript says so.
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
@@ -2924,17 +2962,21 @@ impl Cagents {
         if runtime.pending.is_some() || runtime.disconnected {
             return Task::none();
         }
+        let provider = runtime.session.launch.provider;
         let Some(queued) = runtime.queued.as_mut() else {
             return Task::none();
         };
         let snapshot = handle.snapshot();
-        let waited = queued.since.map_or(Duration::ZERO, |since| since.elapsed());
         if snapshot.exited {
-            runtime.unqueue();
-            runtime.error =
-                Some("The conversation stopped before it took the first message.".into());
+            return self.revert_chat_draft(
+                target,
+                Some("The conversation stopped before it took the first message.".into()),
+            );
+        }
+        if !snapshot.ready {
             return Task::none();
         }
+        let waited = queued.since.get_or_insert_with(Instant::now).elapsed();
         if let Some((model, reasoning)) = queued.model.clone() {
             if snapshot.selected_model.as_ref() == Some(&model)
                 && (reasoning.is_none() || snapshot.reasoning == reasoning)
@@ -2953,101 +2995,174 @@ impl Cagents {
                 runtime.note(format!(
                     "This conversation does not offer {model}, so the message went to its default model."
                 ));
+                self.forget_chat_model(provider, &model);
             } else {
-                return self.retry_queued(target);
+                // The models it lists arrive in a later snapshot, which
+                // brings this back; this is for the one that never comes.
+                if std::mem::replace(&mut queued.rechecking, true) {
+                    return Task::none();
+                }
+                let wait = MODEL_PATIENCE - waited;
+                return cosmic::task::future(async move {
+                    tokio::time::sleep(wait).await;
+                    Message::ChatUi(Action::DispatchQueued(target))
+                });
             }
         }
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
         let Some(queued) = runtime.queued.as_ref() else {
             return Task::none();
         };
-        let command = match submission(
+        match submission(
             &queued.text,
             &snapshot,
             &queued.attachments,
             PromptMode::Send,
         ) {
-            Ok(command) => command,
-            Err(refusal) => {
-                runtime.unqueue();
-                runtime.error = Some(refusal.into());
-                return Task::none();
-            }
-        };
-        self.chat_send_step(target, command, false, Some(QueuedStep::Prompt))
-    }
-
-    /// Tries the queued first message again shortly, once however often it
-    /// is asked.
-    fn retry_queued(&mut self, target: Target) -> Task<Message> {
-        let Some(queued) = self
-            .chat_runtime_mut(target)
-            .and_then(|runtime| runtime.queued.as_mut())
-        else {
-            return Task::none();
-        };
-        if std::mem::replace(&mut queued.retrying, true) {
-            return Task::none();
+            Ok(command) => self.chat_send_step(target, command, false, Some(QueuedStep::Prompt)),
+            Err(refusal) => self.revert_chat_draft(target, Some(refusal.into())),
         }
-        cosmic::task::future(async move {
-            tokio::time::sleep(QUEUE_RETRY).await;
-            Message::ChatUi(Action::DispatchQueued(target))
-        })
     }
 
     /// Carries on after a step of a queued first message was answered.
     ///
-    /// A provider refuses commands until it is ready, and says so only by
-    /// refusing, so a refusal is tried again until the conversation has had
-    /// [`QUEUE_PATIENCE`] to become ready. Past that, a model that could not
-    /// be chosen is given up and the message sent anyway, and a message that
-    /// could not be sent goes back to the composer.
+    /// The provider was ready when the step was sent, so a refusal is its
+    /// answer, not a sign to try again: a message sent twice is worse than
+    /// one returned. A model that could not be chosen is given up and the
+    /// message sent anyway. A message the conversation did not take sends the
+    /// card back to its draft, with the message where it was written; one
+    /// its transcript shows arriving was taken, whatever the answer said.
     fn queued_step_finished(
         &mut self,
         target: Target,
         step: QueuedStep,
+        first_prompt: Option<String>,
         result: Result<(), String>,
     ) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        let provider = runtime.session.launch.provider;
         let Some(queued) = runtime.queued.as_mut() else {
             return Task::none();
         };
-        match (step, result) {
-            (QueuedStep::Model, Ok(())) => queued.model = None,
-            (QueuedStep::Prompt, Ok(())) => {
-                let text = queued.text.clone();
-                runtime.queued = None;
-                runtime.remember(text.clone());
-                runtime.refresh();
-                self.name_channel_from_prompt(target.card, &text);
-                return Task::none();
+        let taken = match (step, result) {
+            (QueuedStep::Model, Ok(())) => {
+                queued.model = None;
+                None
             }
-            (step, Err(error)) => {
-                if queued
-                    .since
-                    .is_some_and(|since| since.elapsed() < QUEUE_PATIENCE)
-                {
-                    return self.retry_queued(target);
+            (QueuedStep::Model, Err(error)) => {
+                let model = queued.model.take().map(|(model, _)| model);
+                runtime.note(format!(
+                    "{} could not be chosen ({error}), so the message went to the default model.",
+                    model.as_deref().unwrap_or("The model")
+                ));
+                if let Some(model) = model {
+                    self.forget_chat_model(provider, &model);
                 }
-                match step {
-                    QueuedStep::Model => {
-                        let model = queued.model.take().map(|(model, _)| model);
-                        runtime.note(format!(
-                            "{} could not be chosen ({error}), so the message went to the default model.",
-                            model.as_deref().unwrap_or("The model")
-                        ));
-                    }
-                    QueuedStep::Prompt => {
-                        runtime.unqueue();
-                        runtime.note(error.clone());
-                        runtime.error = Some(error);
-                        return Task::none();
-                    }
-                }
+                None
             }
+            (QueuedStep::Prompt, Ok(())) => Some(None),
+            (QueuedStep::Prompt, Err(error)) => {
+                let arrived = runtime.handle().is_some_and(|handle| {
+                    let snapshot = handle.snapshot();
+                    snapshot.busy || !snapshot.items.is_empty()
+                });
+                if !arrived {
+                    return self.revert_chat_draft(target, Some(error));
+                }
+                Some(Some(error))
+            }
+        };
+        let Some(error) = taken else {
+            return self.dispatch_queued(target);
+        };
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let text = runtime.queued.take().map(|queued| queued.text);
+        let _ = runtime.present();
+        if let Some(error) = error {
+            runtime.note(format!(
+                "The first message arrived, but its sending reported: {error}"
+            ));
         }
-        self.dispatch_queued(target)
+        if let Some(text) = text {
+            runtime.remember(text);
+        }
+        runtime.refresh();
+        if let Some(prompt) = first_prompt {
+            self.name_channel_from_prompt(target.card, &prompt);
+        }
+        Task::none()
+    }
+
+    /// Returns a card whose conversation never took its first message to the
+    /// draft it was started from, with the message back in the composer and
+    /// `error` saying why, and gives up whatever the start left running.
+    ///
+    /// A conversation with nothing in it is not worth keeping, and a draft
+    /// can be moved to another model, account or provider where the started
+    /// conversation could not.
+    fn revert_chat_draft(&mut self, target: Target, error: Option<String>) -> Task<Message> {
+        let Some(provider) = self
+            .chat_runtime_mut(target)
+            .map(|runtime| runtime.session.launch.provider)
+        else {
+            return Task::none();
+        };
+        let snapshot = self.chat_draft_snapshot(provider);
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let Some(draft) = runtime.unqueue() else {
+            return Task::none();
+        };
+        let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
+            Connection::Live(handle) => Some(handle),
+            Connection::Draft => None,
+        };
+        runtime.session = draft.clone();
+        runtime.snapshot = Arc::new(snapshot);
+        runtime.pending = None;
+        runtime.disconnected = false;
+        runtime.error = error;
+        runtime.refresh();
+        self.replace_chat_conversation(target.card, draft.clone());
+        self.observe_agent_activity_for_card(target.card, None);
+        self.retire_chat(target.card, handle, Some(draft))
+    }
+
+    /// Takes back a first message its conversation does not have yet.
+    ///
+    /// A start still under way is abandoned, which retires whatever it
+    /// produces; a conversation that has started is given up, as one that
+    /// never took its first message. A message already on its way cannot be
+    /// taken back.
+    fn cancel_queued(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.queued.is_none()
+            || runtime
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.queued == Some(QueuedStep::Prompt))
+        {
+            return Task::none();
+        }
+        if runtime.is_draft() {
+            runtime.unqueue();
+            if let Some(attempt) = self.chat_ui.attempts.remove(&target.card) {
+                self.chat_ui
+                    .abandoned
+                    .insert(attempt.target, attempt.session);
+            }
+            return Task::none();
+        }
+        self.revert_chat_draft(target, None)
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
@@ -3114,12 +3229,17 @@ impl Cagents {
             Command::Slash { command } => Some(command.clone()),
             _ => None,
         };
+        let model = match &command {
+            Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
+            _ => None,
+        };
         runtime.pending = Some(PendingCommand {
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
             permission_mode,
             first_prompt,
+            model,
             page,
             sent,
             queued: step,
@@ -3188,10 +3308,11 @@ impl Cagents {
                     .chat_runtime_mut(target)
                     .and_then(|runtime| runtime.queued.as_mut())
                 {
-                    queued.retrying = false;
+                    queued.rechecking = false;
                 }
                 return self.dispatch_queued(target);
             }
+            Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
                 if self.chat_start_pending(card) {
                     return Task::none();
@@ -3405,9 +3526,6 @@ impl Cagents {
                             runtime.model_picker = None;
                             runtime.account_picker = false;
                             runtime.reasoning_picker = false;
-                            if let Some(queued) = &mut runtime.queued {
-                                queued.since = Some(Instant::now());
-                            }
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             runtime.pending = None;
@@ -3689,10 +3807,13 @@ impl Cagents {
                     // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
+                        // A first message still waiting will not be taken
+                        // now, and a conversation without it holds nothing.
+                        if runtime.queued.is_some() {
+                            return self.revert_chat_draft(target, Some(error));
+                        }
                         runtime.disconnected = true;
                         runtime.error = Some(error);
-                        // A first message still waiting will not be taken now.
-                        runtime.unqueue();
                     }
                 }
                 let session = runtime.session.clone();
@@ -3836,9 +3957,18 @@ impl Cagents {
                     return Task::none();
                 }
                 let pending = runtime.pending.take().unwrap();
-                if let Some(step) = pending.queued {
-                    return self.queued_step_finished(target, step, result);
+                let provider = runtime.session.launch.provider;
+                if result.is_ok()
+                    && let Some((model, reasoning)) = pending.model.clone()
+                {
+                    self.remember_chat_model(provider, Some(model), reasoning);
                 }
+                if let Some(step) = pending.queued {
+                    return self.queued_step_finished(target, step, pending.first_prompt, result);
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
                 let first_prompt = match result {
                     Ok(()) => {
                         if let Some(mode) = pending.permission_mode {
@@ -4057,8 +4187,6 @@ impl Cagents {
                     .reasoning
                     .clone()
                     .filter(|reasoning| model.reasoning.contains(reasoning));
-                let provider = runtime.session.launch.provider;
-                self.remember_chat_model(provider, Some(id.clone()), reasoning.clone());
                 let command = Command::SetModel {
                     model: id,
                     reasoning,
@@ -4089,7 +4217,6 @@ impl Cagents {
                     self.remember_chat_model(provider, Some(model), Some(reasoning));
                     return Task::none();
                 }
-                self.remember_chat_model(provider, Some(model.clone()), Some(reasoning.clone()));
                 let command = Command::SetModel {
                     model,
                     reasoning: Some(reasoning),
@@ -4688,6 +4815,7 @@ mod tests {
             session,
             Snapshot {
                 session_id: session_id.map(str::to_owned),
+                ready: true,
                 ..Snapshot::default()
             },
         ))
@@ -6066,6 +6194,7 @@ mod tests {
         let handle = fixture_handle(app, card, None);
         handle.replace_snapshot_for_test(Snapshot {
             models: listed,
+            ready: true,
             ..Snapshot::default()
         });
         answer_start(app, target, Ok(handle));
@@ -6123,49 +6252,208 @@ mod tests {
         assert_eq!(pending_step(&app, card), None);
         let runtime = chat_runtime(&app, card);
         let queued = runtime.queued.as_ref().unwrap();
-        assert!(queued.retrying, "it looks again shortly");
+        assert!(queued.rechecking, "it looks again once the wait is over");
         assert!(queued.model.is_some());
 
         let handle = runtime.handle().unwrap().clone();
         let target = runtime.target;
         handle.replace_snapshot_for_test(Snapshot {
             models: vec![fixture_model("gpt-b", &[])],
+            ready: true,
             ..Snapshot::default()
         });
-        let _ = app.update(Message::ChatUi(Action::DispatchQueued(target)));
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
         assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
     }
 
-    /// A provider refuses commands until it is ready, so a refused first
-    /// message is tried again; past the patience it goes back to the
-    /// composer rather than being lost.
+    /// Nothing is sent before the provider takes commands, and the snapshot
+    /// that says it does sends the message; the hidden card of a message
+    /// still waiting keeps that snapshot coming.
     #[test]
-    fn a_refused_first_message_is_retried_then_returned_to_the_composer() {
+    fn a_first_message_waits_for_its_provider_to_be_ready() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle.clone()));
+        assert_eq!(pending_step(&app, card), None);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.queued.is_some());
+        let _ = runtime.set_visible(false);
+        assert!(
+            handle.is_visible_for_test(),
+            "a hidden card waiting to send still hears from its provider"
+        );
+
+        handle.replace_snapshot_for_test(Snapshot {
+            ready: true,
+            ..Snapshot::default()
+        });
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        settle(&mut app, card, Ok(()));
+        assert!(
+            !handle.is_visible_for_test(),
+            "once sent, the hidden card goes quiet again"
+        );
+    }
+
+    /// A ready provider's refusal of the first message is its answer, and
+    /// is never met by sending the message again: the card goes back to its
+    /// draft, with the message where it was written, and the conversation
+    /// that holds nothing is given up.
+    #[test]
+    fn a_refused_first_message_returns_the_card_to_its_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let started = app.chat_ui.attempts.get(&card).unwrap().session.clone();
+        let handle = fixture_handle(&app, card, None);
+        answer_start(&mut app, target, Ok(handle));
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        settle(&mut app, card, Err("fixture: refused".into()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing(), "the card is a draft again");
+        assert!(runtime.pending.is_none());
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert_eq!(runtime.error.as_deref(), Some("fixture: refused"));
+        assert_eq!(
+            runtime.session, started,
+            "the draft its start was asked for"
+        );
+        assert!(runtime.session.is_unstarted());
+        retired(&mut app, card);
+        let CardKind::Chat(saved) = &app.card_state(card).unwrap().kind else {
+            panic!("the card is a chat");
+        };
+        assert_eq!(saved, &started, "a restore reopens it as a draft");
+    }
+
+    /// A message the transcript shows arriving was taken, whatever its
+    /// sending reported, so it is neither sent again nor handed back.
+    #[test]
+    fn a_first_message_that_arrived_is_not_handed_back() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        answer_start(&mut app, target, Ok(handle.clone()));
+        handle.replace_snapshot_for_test(Snapshot {
+            ready: true,
+            busy: true,
+            ..Snapshot::default()
+        });
+        settle(
+            &mut app,
+            card,
+            Err("fixture: acknowledgement timed out".into()),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.queued.is_none());
+        assert!(!runtime.is_draft());
+        assert!(runtime.composer.text().trim().is_empty());
+        assert!(
+            runtime
+                .failures
+                .iter()
+                .any(|(_, notice)| notice.contains("acknowledgement timed out")),
+            "{:?}",
+            runtime.failures
+        );
+    }
+
+    /// A conversation that goes away before it takes the first message
+    /// leaves the card a draft, not a dead conversation with nothing in it.
+    #[test]
+    fn a_conversation_lost_before_its_first_message_leaves_a_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle));
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::Wake(
+            target,
+            Wake::Disconnected("fixture: gone".into()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing());
+        assert!(!runtime.disconnected);
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert_eq!(runtime.error.as_deref(), Some("fixture: gone"));
+        retired(&mut app, card);
+    }
+
+    /// A first message can be taken back until it is on its way: while its
+    /// conversation starts, and after, while it waits on the provider.
+    #[test]
+    fn a_first_message_can_be_taken_back_until_it_is_on_its_way() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, started) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::CancelQueued(target)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing());
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert!(!app.chat_start_pending(card));
+        // What the abandoned start produces is given up when it lands.
+        answer_start(&mut app, started, Ok(handle));
+        retired(&mut app, card);
+        assert!(chat_runtime(&app, card).is_draft());
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle));
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::CancelQueued(target)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing());
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        retired(&mut app, card);
+
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = starting_chat(&mut app);
         let handle = fixture_handle(&app, card, None);
         answer_start(&mut app, target, Ok(handle));
         assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
-        settle(&mut app, card, Err("fixture: not ready".into()));
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.pending.is_none());
-        assert!(runtime.queued.as_ref().unwrap().retrying);
-        assert_eq!(runtime.error, None, "a retry is not a failure");
-        let target = runtime.target;
-        let _ = app.update(Message::ChatUi(Action::DispatchQueued(target)));
-        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::CancelQueued(target)));
+        assert_eq!(
+            pending_step(&app, card),
+            Some(QueuedStep::Prompt),
+            "a message on its way is not taken back"
+        );
+    }
 
-        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
-            unreachable!()
-        };
-        runtime.queued.as_mut().unwrap().since =
-            Instant::now().checked_sub(QUEUE_PATIENCE + Duration::from_secs(1));
-        settle(&mut app, card, Err("fixture: not ready".into()));
-        let runtime = chat_runtime(&app, card);
-        assert!(runtime.queued.is_none());
-        assert_eq!(runtime.composer.text().trim(), "hello");
-        assert_eq!(runtime.error.as_deref(), Some("fixture: not ready"));
-        assert!(!runtime.is_draft(), "the conversation itself is running");
+    /// A model is remembered for new drafts once its provider takes it, not
+    /// when it is asked for.
+    #[test]
+    fn a_model_is_remembered_once_its_conversation_takes_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        show_chat_snapshot_for_test(
+            &mut app,
+            card,
+            Snapshot {
+                generation: 1,
+                models: vec![fixture_model("gpt-b", &[])],
+                ready: true,
+                ..Snapshot::default()
+            },
+        );
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::Model(target, "gpt-b".into())));
+        assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
+        settle(&mut app, card, Err("fixture: refused".into()));
+        assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
+        let _ = app.update(Message::ChatUi(Action::Model(target, "gpt-b".into())));
+        settle(&mut app, card, Ok(()));
+        assert_eq!(
+            app.chat_ui.last_models.get(&Provider::Codex),
+            Some(&("gpt-b".to_owned(), None))
+        );
     }
 
     /// A saved conversation nothing ever ran reopens as a draft, and any

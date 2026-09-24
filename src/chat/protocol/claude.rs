@@ -1175,6 +1175,7 @@ impl Adapter for Claude {
                     match string(&request, "subtype") {
                         "initialize" => {
                             self.ready = true;
+                            step.events.push(Event::Ready(true));
                             self.metadata(&response["response"], &mut step);
                             self.status(self.busy, "Claude connected", &mut step);
                             for key in [
@@ -3752,6 +3753,8 @@ mod tests {
                 ]}),
             ))
             .unwrap();
+        // A sender waits for this rather than for a refusal.
+        assert!(connected.events.contains(&Event::Ready(true)));
         assert_eq!(
             listed(&connected),
             (

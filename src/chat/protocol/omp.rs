@@ -642,6 +642,7 @@ impl Adapter for Omp {
                             step.events.push(Event::Reset {
                                 reason: "OMP changed the current conversation.".into(),
                             });
+                            step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
                         self.busy = data["isStreaming"].as_bool().unwrap_or(false)
@@ -722,6 +723,7 @@ impl Adapter for Omp {
                             step.writes.push(self.history_page(Some(cursor)));
                         } else {
                             self.ready = true;
+                            step.events.push(Event::Ready(true));
                             step.events.push(Event::Status {
                                 busy: self.busy,
                                 detail: if self.busy { "Working" } else { "Ready" }.into(),
@@ -1289,6 +1291,8 @@ mod tests {
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
         );
         assert!(adapter.ready);
+        // A sender waits for this rather than for a refusal.
+        assert!(finished.events.contains(&Event::Ready(true)));
         assert!(
             adapter
                 .command(Command::Answer {

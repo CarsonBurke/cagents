@@ -1305,7 +1305,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.exited = true;
             state.waiting = false;
             state.busy = false;
+            state.ready = false;
         }
+        Event::Ready(ready) => state.ready = ready,
     }
 }
 
@@ -1339,6 +1341,18 @@ mod tests {
             })
             .collect()
     }
+    /// Readiness is what a sender waits on, so it ends with the provider.
+    #[test]
+    fn a_snapshot_is_ready_from_its_providers_word_until_it_exits() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        assert!(!state.ready);
+        apply_event(&mut state, &mut indices, Event::Ready(true));
+        assert!(state.ready);
+        apply_event(&mut state, &mut indices, Event::Exited { code: Some(0) });
+        assert!(!state.ready);
+    }
+
     #[test]
     fn outstanding_decisions_remain_waiting_after_streaming_stops() {
         let mut state = Snapshot::default();

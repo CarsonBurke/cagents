@@ -924,6 +924,7 @@ impl Adapter for Codex {
                     }
                     self.thread = Some(id.into());
                     self.ready = true;
+                    step.events.push(Event::Ready(true));
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
@@ -1295,6 +1296,7 @@ impl Adapter for Codex {
             }
             "thread/closed" | "thread/deleted" => {
                 self.ready = false;
+                step.events.push(Event::Ready(false));
                 self.busy = false;
                 self.invalidate(&mut step);
                 step.events.push(Event::Error {
@@ -2435,6 +2437,8 @@ mod tests {
             .find(|frame| frame["method"] == "thread/start")
             .unwrap();
         let attached = adapter.receive(json!({"id":start["id"],"result":{"thread":{"id":"fresh","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"gpt-test"}})).unwrap();
+        // A sender waits for this rather than for a refusal.
+        assert!(attached.events.contains(&Event::Ready(true)));
         assert!(
             attached
                 .events
