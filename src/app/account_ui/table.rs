@@ -289,6 +289,18 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
     let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
+    let project = app
+        .active_workspace
+        .as_deref()
+        .and_then(|directory| app.project_for_directory(directory));
+    if let Some((_, name)) = project {
+        sections.push(
+            design::caption(format!(
+                "Project: {name} · Choose ‘Use for this project’ from an account’s menu to use it for new shells and conversations in every worktree."
+            ))
+            .into(),
+        );
+    }
     if let Some((provider, path)) = &state.table.link {
         sections.push(link_form(state, *provider, path));
     }
@@ -299,7 +311,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             || !rows(state, provider, state.table.sort).is_empty()
             || (provider == Provider::Omp && state.omp_problem().is_some())
         {
-            sections.push(group(app, provider, &layout));
+            sections.push(group(app, provider, &layout, project));
         }
     }
     widget::scrollable(
@@ -490,7 +502,12 @@ fn link_form<'a>(state: &'a State, provider: Provider, path: &'a str) -> Element
     .into()
 }
 
-fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'a, Message> {
+fn group<'a>(
+    app: &'a Cagents,
+    provider: Provider,
+    layout: &Layout,
+    project: Option<(crate::model::ProjectId, &'a str)>,
+) -> Element<'a, Message> {
     let state = &app.account_ui;
     let rows = rows(state, provider, state.table.sort);
     let logins: Vec<&Login> = state
@@ -534,7 +551,7 @@ fn group<'a>(app: &'a Cagents, provider: Provider, layout: &Layout) -> Element<'
     }
     for account in &rows {
         lines.push(design::horizontal_rule());
-        lines.push(row(app, account, layout));
+        lines.push(row(app, account, layout, project));
     }
     for login in logins {
         lines.push(design::horizontal_rule());
@@ -637,7 +654,12 @@ fn dash<'a>() -> Element<'a, Message> {
     design::caption("—").into()
 }
 
-fn row<'a>(app: &'a Cagents, account: &'a AccountState, layout: &Layout) -> Element<'a, Message> {
+fn row<'a>(
+    app: &'a Cagents,
+    account: &'a AccountState,
+    layout: &Layout,
+    project: Option<(crate::model::ProjectId, &'a str)>,
+) -> Element<'a, Message> {
     let state = &app.account_ui;
     let now = state.now_ms;
     let snapshot = account.snapshot.as_ref().filter(|snapshot| {
@@ -701,15 +723,15 @@ fn row<'a>(app: &'a Cagents, account: &'a AccountState, layout: &Layout) -> Elem
         .collect::<Vec<_>>();
     if layout.stacked {
         return stacked_row(
-            account_cell(state, account),
+            account_cell(app, account, project),
             layout.columns.iter().copied().zip(cells).collect(),
-            actions(state, account, now),
+            actions(app, account, now, project),
         );
     }
     line(
-        account_cell(state, account),
+        account_cell(app, account, project),
         cells,
-        actions(state, account, now),
+        actions(app, account, now, project),
         ROW_HEIGHT,
     )
 }
@@ -743,7 +765,12 @@ fn stacked_row<'a>(
     .into()
 }
 
-fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message> {
+fn account_cell<'a>(
+    app: &'a Cagents,
+    account: &'a AccountState,
+    project: Option<(crate::model::ProjectId, &'a str)>,
+) -> Element<'a, Message> {
+    let state = &app.account_ui;
     let renaming = state
         .table
         .rename
@@ -777,6 +804,15 @@ fn account_cell<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, 
         title.push(design::badge(
             "Default",
             design::Tone::Themed(design::muted_color),
+        ));
+    }
+    if let Some((project, _)) = project
+        && state.registry.is_project_default(project, &account.account)
+        && renaming.is_none()
+    {
+        title.push(design::badge(
+            "This project",
+            design::Tone::Themed(design::accent_color),
         ));
     }
     let email = account.email(&state.registry);
@@ -905,7 +941,13 @@ fn status_badge<'a>(account: &AccountState) -> Element<'a, Message> {
     }
 }
 
-fn actions<'a>(state: &'a State, account: &'a AccountState, now: Millis) -> Element<'a, Message> {
+fn actions<'a>(
+    app: &'a Cagents,
+    account: &'a AccountState,
+    now: Millis,
+    project: Option<(crate::model::ProjectId, &'a str)>,
+) -> Element<'a, Message> {
+    let state = &app.account_ui;
     let open = state.table.menu.as_ref() == Some(&account.id);
     let removing = state.removing.contains(&account.id);
     let menu_button = crate::ui_controls::compact_icon_control(
@@ -923,7 +965,7 @@ fn actions<'a>(state: &'a State, account: &'a AccountState, now: Millis) -> Elem
     } else {
         crate::ui_controls::popover(
             menu_button,
-            open.then(|| menu(state, account)),
+            open.then(|| menu(app, account, project)),
             widget::popover::Position::Bottom,
             Message::AccountUi(Action::Menu(None)),
         )
@@ -961,7 +1003,12 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
     }
 }
 
-fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message> {
+fn menu<'a>(
+    app: &'a Cagents,
+    account: &'a AccountState,
+    project: Option<(crate::model::ProjectId, &'a str)>,
+) -> Element<'a, Message> {
+    let state = &app.account_ui;
     let action = |action| Message::AccountUi(action);
     let id = &account.id;
     let content: Element<'a, Message> = if state.table.confirm_remove.as_ref() == Some(id) {
@@ -1005,6 +1052,32 @@ fn menu<'a>(state: &'a State, account: &'a AccountState) -> Element<'a, Message>
                 )
                 .into(),
             );
+        }
+        if let Some((project, _)) = project {
+            if state.registry.is_project_default(project, &account.account) {
+                items.push(
+                    crate::ui_controls::popover_item(
+                        crate::ui_controls::symbolic_icon("edit-clear-symbolic"),
+                        "Use global default for this project",
+                        "Remove this project's account choice",
+                        action(Action::ClearProjectDefault(
+                            project,
+                            account.account.provider,
+                        )),
+                    )
+                    .into(),
+                );
+            } else {
+                items.push(
+                    crate::ui_controls::popover_item(
+                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        "Use for this project",
+                        "New shells and conversations in every worktree of this project use this account",
+                        action(Action::SetProjectDefault(project, id.clone())),
+                    )
+                    .into(),
+                );
+            }
         }
         items.push(
             crate::ui_controls::popover_item(
