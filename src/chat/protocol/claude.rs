@@ -692,6 +692,12 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        // Claude injects skill bodies as meta messages during a turn.
+        // They are context for the agent, not conversation messages.
+        if frame["isMeta"].as_bool() == Some(true) {
+            self.track_carrier(carrier, Vec::new());
+            return Ok(());
+        }
         let message = &frame["message"];
         let id = message["id"]
             .as_str()
@@ -713,7 +719,11 @@ impl Claude {
             step.events.push(Event::Item(text_item(
                 format!("{id}:0"),
                 role,
-                content.into(),
+                if role == Role::User {
+                    slash_command_prompt(content).unwrap_or_else(|| content.into())
+                } else {
+                    content.into()
+                },
                 false,
             )));
         } else if let Some(content) = message["content"].as_array() {
@@ -900,6 +910,10 @@ impl Claude {
                 _ => None,
             })
             .collect();
+        self.track_carrier(carrier, ids);
+        Ok(())
+    }
+    fn track_carrier(&mut self, carrier: &str, ids: Vec<String>) {
         if !self.carrier_items.contains_key(carrier) {
             self.carrier_order.push_back(carrier.into());
         }
@@ -910,7 +924,6 @@ impl Claude {
                 self.carrier_offsets.remove(&old);
             }
         }
-        Ok(())
     }
     fn update_usage(&mut self, value: &Value, step: &mut Step) {
         if !value.is_object() {
@@ -1412,6 +1425,21 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
 }
+fn slash_command_prompt(content: &str) -> Option<String> {
+    let content = content.strip_prefix("<command-message>")?;
+    let (message, content) = content.split_once("</command-message>\n<command-name>")?;
+    let (name, args) = content.split_once("</command-name>\n<command-args>")?;
+    let args = args.strip_suffix("</command-args>")?;
+    if name.strip_prefix('/')? != message || message.is_empty() {
+        return None;
+    }
+    Some(if args.is_empty() {
+        name.into()
+    } else {
+        format!("{name} {args}")
+    })
+}
+
 fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
     Item {
         id,
@@ -2842,6 +2870,57 @@ mod tests {
                 duration_ms: None,
                 output: "3 passed".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn live_skill_context_is_not_rendered_as_a_user_message() {
+        let mut adapter = Claude::default();
+        let skill = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "skill-context",
+                "isMeta": true,
+                "turnCompanion": true,
+                "message": {"role": "user", "content": [{"type": "text", "text": "Base directory for this skill: /skills/example"}]}
+            }))
+            .unwrap();
+        assert!(skill.events.is_empty());
+        let superseding = adapter
+            .receive(json!({"type": "user", "uuid": "replacement", "supersedes": ["skill-context"], "message": {"role": "user", "content": "Continue"}}))
+            .unwrap();
+        assert!(
+            !superseding
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+
+        let user = adapter
+            .receive(json!({"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "Use the skill"}}))
+            .unwrap();
+        assert!(user.events.iter().any(|event| matches!(event, Event::Item(item)
+            if item.role == Role::User && matches!(&item.content, ItemContent::Text { text, .. } if text == "Use the skill"))));
+    }
+
+    #[test]
+    fn slash_command_envelope_displays_the_command_the_user_typed() {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "command",
+                "message": {"role": "user", "content": "<command-message>solve-task</command-message>\n<command-name>/solve-task</command-name>\n<command-args>in worktree</command-args>"}
+            }))
+            .unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Item(item)
+            if item.role == Role::User && matches!(&item.content, ItemContent::Text { text, .. } if text == "/solve-task in worktree"))));
+        assert_eq!(slash_command_prompt("plain message"), None);
+        assert_eq!(
+            slash_command_prompt(
+                "<command-message>other</command-message>\n<command-name>/solve-task</command-name>\n<command-args>in worktree</command-args>"
+            ),
+            None
         );
     }
 
