@@ -1628,7 +1628,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         }
     }
     for path in &absent {
-        tracing::info!(setting = %dotted(path), "settings.toml lacks a setting; its default is used and not written until changed");
+        tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; its default is used and not written until changed");
     }
     let settings = loop {
         let mut unknown = Vec::new();
@@ -1637,6 +1637,9 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
                 unknown.extend(ignored_path(&path, &read));
             }),
         );
+        // A value that no longer decodes once something inside it was set
+        // aside fails because of that, not for a reason of its own.
+        let follow_on = decoded.is_err();
         let (path, reason, error) = match decoded {
             Ok(settings) => {
                 let fault = settings.keyboard_shortcuts.fault();
@@ -1670,15 +1673,20 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
             return Err(error);
         };
         // A setting that falls back whole takes with it what was set aside
-        // inside it, and the first reason, which is why it fell back.
-        let mut reason = ForeignReason::UnreadableValue(reason);
-        foreign.retain(|setting| {
-            let inside = setting.path.starts_with(&path);
-            if inside && matches!(setting.reason, ForeignReason::UnreadableValue(_)) {
-                reason = setting.reason.clone();
-            }
-            !inside
-        });
+        // inside it; when that is why it fell back, the first value set aside
+        // inside it is the reason.
+        let inside = |setting: &Foreign| setting.path.starts_with(&path);
+        let reason = foreign
+            .iter()
+            .find(|setting| {
+                follow_on
+                    && inside(setting)
+                    && matches!(setting.reason, ForeignReason::UnreadableValue(_))
+            })
+            .map_or(ForeignReason::UnreadableValue(reason), |setting| {
+                setting.reason.clone()
+            });
+        foreign.retain(|setting| !inside(setting));
         foreign.push(Foreign { path, reason });
     };
 
@@ -1901,14 +1909,6 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
             return;
         }
     };
-    for path in &decoded.absent {
-        if get(document, path) == get(&baseline, path)
-            && let Some((Segment::Key(key), parent)) = path.split_last()
-            && let Some(toml::Value::Table(table)) = get_mut(document, parent)
-        {
-            table.remove(key);
-        }
-    }
     let current = toml::Value::Table(current.clone());
     let kept: Vec<(Vec<Segment>, toml::Value)> = decoded
         .foreign
@@ -1921,50 +1921,97 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
             .then_some((target, value))
         })
         .collect();
+    // Only a plain default stays out: a value a migration filled in, such as
+    // an action left unbound because the file gave its chord to another, is
+    // written so that it still holds once that chord is free.
+    let defaults = written(&AppSettings::default()).ok();
+    for path in &decoded.absent {
+        if get(document, path) == get(&baseline, path)
+            && defaults
+                .as_ref()
+                .is_some_and(|defaults| get(defaults, path) == get(&baseline, path))
+            && let Some((Segment::Key(key), parent)) = path.split_last()
+            && let Some(toml::Value::Table(table)) = get_mut(document, parent)
+        {
+            table.remove(key);
+        }
+    }
     // Chords the file will bind apart from what is kept. A newer build rejects
     // a file in which two actions share one, so a kept action gives up any
     // chord this build has bound since; kept actions never cost each other,
-    // since the file already held them together.
+    // since the file already held them together. A kept action left with no
+    // chord is not kept, so the file binds this build's chords for it instead,
+    // which other kept actions must then give up in turn.
     let shortcuts = Segment::Key("keyboard_shortcuts".into());
-    let bound: Vec<ShortcutBinding> = document
-        .get("keyboard_shortcuts")
-        .and_then(toml::Value::as_table)
-        .into_iter()
-        .flatten()
-        .filter(|(action, _)| {
-            !kept
-                .iter()
-                .any(|(target, _)| *target == [shortcuts.clone(), Segment::Key((*action).clone())])
-        })
-        .filter_map(|(_, chords)| chords.as_array())
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .filter_map(|chord| parse_shortcut(chord).ok())
-        .collect();
-    for (target, mut value) in kept {
+    let is_action =
+        |target: &[Segment]| matches!(target, [table, Segment::Key(_)] if *table == shortcuts);
+    let mut unkept: Vec<&[Segment]> = Vec::new();
+    let bound = loop {
+        let bound: Vec<ShortcutBinding> = document
+            .get("keyboard_shortcuts")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter(|(action, _)| {
+                !kept.iter().any(|(target, _)| {
+                    !unkept.contains(&target.as_slice())
+                        && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
+                })
+            })
+            .filter_map(|(_, chords)| chords.as_array())
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter_map(|chord| parse_shortcut(chord).ok())
+            .collect();
+        let emptied: Vec<&[Segment]> = kept
+            .iter()
+            .filter(|(target, value)| {
+                is_action(target)
+                    && !unkept.contains(&target.as_slice())
+                    && value
+                        .as_array()
+                        .is_some_and(|chords| !chords.is_empty() && free(chords, &bound).is_empty())
+            })
+            .map(|(target, _)| target.as_slice())
+            .collect();
+        if emptied.is_empty() {
+            break bound;
+        }
+        unkept.extend(emptied);
+    };
+    for (target, mut value) in kept.iter().cloned() {
+        // An action left with no chord is left to the newer build to bind
+        // again, which it may insist on.
+        if unkept.contains(&target.as_slice()) {
+            continue;
+        }
         let Some((Segment::Key(key), parent)) = target.split_last() else {
             continue;
         };
-        if *parent == [shortcuts.clone()]
+        if is_action(&target)
             && let toml::Value::Array(chords) = &mut value
-            && !chords.is_empty()
         {
-            chords.retain(|chord| {
-                chord
-                    .as_str()
-                    .and_then(|chord| parse_shortcut(chord).ok())
-                    .is_none_or(|binding| !bound.contains(&binding))
-            });
-            // An action left with no chord is left to the newer build to bind
-            // again, which it may insist on.
-            if chords.is_empty() {
-                continue;
-            }
+            *chords = free(chords, &bound);
         }
         if let Some(toml::Value::Table(table)) = get_mut(document, parent) {
             table.insert(key.clone(), value);
         }
     }
+}
+
+/// The chords of `chords` that nothing in `bound` holds; one this build cannot
+/// read is kept, since only a newer build can tell what it binds.
+fn free(chords: &[toml::Value], bound: &[ShortcutBinding]) -> Vec<toml::Value> {
+    chords
+        .iter()
+        .filter(|chord| {
+            chord
+                .as_str()
+                .and_then(|chord| parse_shortcut(chord).ok())
+                .is_none_or(|binding| !bound.contains(&binding))
+        })
+        .cloned()
+        .collect()
 }
 
 /// `path`, a path into `baseline`, as the path to the same setting in
@@ -3242,7 +3289,7 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     /// A newer build may drop a setting; this one uses its default and
-    /// writes it again.
+    /// writes it only once it is changed here.
     #[test]
     fn a_setting_missing_from_the_file_takes_its_default() {
         let directory = tempfile::tempdir().unwrap();
@@ -3366,6 +3413,57 @@ next_column = ["Alt+W", "Alt+Right"]
             );
             assert!(file["keyboard_shortcuts"].get("search_projects").is_none());
         }
+    }
+
+    /// An action the file lacks whose default chord the file gave another is
+    /// left unbound, and stays so once that chord is freed: the migration's
+    /// choice is written, not the default it withheld.
+    #[test]
+    fn a_missing_action_left_unbound_stays_unbound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("review_toggle_viewed");
+            shortcuts.insert("new_terminal".into(), vec!["Alt+V"].into());
+        });
+        let loaded = load(&path).unwrap();
+        assert!(loaded.keyboard_shortcuts.review_toggle_viewed.is_empty());
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.new_terminal = vec!["Alt+N".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A kept action that gives up its last chord is not kept, so the chords
+    /// this build writes for it in turn cost the other kept actions; the file
+    /// never binds a chord twice.
+    #[test]
+    fn an_unkept_action_never_leaves_a_chord_bound_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("search_projects");
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+            shortcuts.insert("future_action".into(), vec!["Ctrl+T"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+F".into(), "Alt+S".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        let file = saved(&path);
+        let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
+            .as_table()
+            .unwrap()
+            .values()
+            .flat_map(|chords| chords.as_array().unwrap())
+            .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
+            .collect();
+        for (index, binding) in bindings.iter().enumerate() {
+            assert!(!bindings[..index].contains(binding), "{file:#?}");
+        }
+        assert_eq!(load(&path).unwrap(), desired);
     }
 
     /// The channel shortcut's old name is read, and set aside, under the name
