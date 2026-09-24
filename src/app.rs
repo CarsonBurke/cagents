@@ -7048,11 +7048,13 @@ impl Cagents {
             } else {
                 iced::widget::Space::new().into()
             }
-        } else {
+        } else if show_resize_splitter {
             widget::container(crate::design::vertical_rule())
                 .center_x(Length::Fixed(crate::splitter::WIDTH))
                 .height(Length::Fill)
                 .into()
+        } else {
+            iced::widget::Space::new().into()
         };
         crate::interaction::layer(
             surface,
@@ -12426,6 +12428,13 @@ impl Application for Cagents {
                 inspector::mount_for_width(window_width, true, true),
                 Some(InspectorLayout::Docked)
             );
+        // A docked inspector's own resize handle is the trailing edge of a
+        // strip that reaches it; a card's splitter there would double the rule
+        // and compete for the same drag. Every other card keeps the splitter
+        // that separates it from its neighbour or the empty strip beyond.
+        let card_beside_inspector = docked_context_inspector
+            .then(|| self.workspace.card_at_trailing_edge())
+            .flatten();
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let action_buttons = || {
@@ -12503,13 +12512,11 @@ impl Application for Cagents {
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
-                    // A docked inspector's own resize handle is the trailing
-                    // edge of the last card; a second one there would double
-                    // the rule and compete for the same drag. Every other card
-                    // keeps the splitter that separates it from its neighbour.
-                    let beside_inspector = docked_context_inspector
-                        && self.workspace.order().last() == Some(context.id);
-                    self.card_view(context.id, context.focused, !beside_inspector)
+                    self.card_view(
+                        context.id,
+                        context.focused,
+                        card_beside_inspector != Some(context.id),
+                    )
                 },
                 // `sync_chrome` keeps an entry for every durable card, so
                 // the fallback is only reachable for a card the workspace holds

@@ -688,6 +688,15 @@ impl Workspace {
         &self.geometry
     }
 
+    /// The card whose trailing edge is the strip's own once it is scrolled to
+    /// its end: the last card, unless the strip does not fill the viewport and
+    /// leaves room after it.
+    pub fn card_at_trailing_edge(&self) -> Option<CardId> {
+        let card = self.geometry.cards().last()?;
+        (card.end + self.config.trailing_padding >= self.geometry.total_width() - 0.5)
+            .then_some(card.id)
+    }
+
     pub fn camera(&self) -> Camera {
         self.camera
     }
@@ -1787,6 +1796,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_a_strip_that_fills_the_viewport_has_a_card_at_its_trailing_edge() {
+        let filled = workspace_with_widths(&[CardWidth::Fraction(0.6); 2], 800.0);
+        assert_eq!(
+            filled.card_at_trailing_edge(),
+            filled.geometry().cards().last().map(|card| card.id)
+        );
+        let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
+        assert_eq!(underfilled.card_at_trailing_edge(), None);
+        let centered = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
+        assert_eq!(centered.card_at_trailing_edge(), None);
     }
 
     #[test]
