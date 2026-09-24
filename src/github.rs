@@ -25,8 +25,8 @@ use crate::repository::{
 #[cfg(feature = "ui")]
 pub mod avatar;
 
-const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
-const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
+const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 /// The fields every review comment carries, whichever query returns it.
 const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
 /// One review thread with its first page of comments.
@@ -306,6 +306,11 @@ pub struct GitHubActor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubHeadRepository {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubLabel {
     pub name: String,
     #[serde(default)]
@@ -330,6 +335,10 @@ pub struct PullRequest {
     pub head_ref_name: String,
     #[serde(default)]
     pub head_ref_oid: String,
+    #[serde(default)]
+    pub head_repository: Option<GitHubHeadRepository>,
+    #[serde(default)]
+    pub head_repository_owner: Option<GitHubActor>,
     pub base_ref_name: String,
     /// The base branch tip as the forge last computed the pull request against.
     #[serde(default)]
@@ -1525,6 +1534,62 @@ impl<E: ProcessExecutor> GitHubService<E> {
         head_oid: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Option<PullRequest>, GitHubError> {
+        let candidates = self.branch_candidates(repository, branch, cancellation)?;
+        Ok(select_branch_pull_request(&candidates, branch, head_oid)?.cloned())
+    }
+
+    /// Resolve an attached checkout's PR. Exact commits win; a unique PR from
+    /// this repository also matches after a local branch tip has moved.
+    pub fn resolve_branch_head(
+        &self,
+        repository: &GitHubRepoKey,
+        branch: &str,
+        head_oid: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PullRequest>, GitHubError> {
+        let candidates = self.branch_candidates(repository, branch, cancellation)?;
+        if candidates.len() >= 100 {
+            return Err(GitHubError::Inspection(
+                "This branch has too many pull requests to resolve safely".into(),
+            ));
+        }
+        let matching = candidates
+            .into_iter()
+            .filter(|pr| pr.head_ref_name == branch)
+            .collect::<Vec<_>>();
+        let mut exact = matching.iter().filter(|pr| pr.head_ref_oid == head_oid);
+        let first = exact.next();
+        if exact.next().is_some() {
+            return Err(GitHubError::Inspection(
+                "Several pull requests match this checkout's branch and commit".into(),
+            ));
+        }
+        if let Some(first) = first {
+            return Ok(Some(first.clone()));
+        }
+        if matching.len() == 1 {
+            let pr = &matching[0];
+            if pr
+                .head_repository
+                .as_ref()
+                .is_some_and(|head| head.name.eq_ignore_ascii_case(&repository.name))
+                && pr
+                    .head_repository_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.login.eq_ignore_ascii_case(&repository.owner))
+            {
+                return Ok(Some(pr.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn branch_candidates(
+        &self,
+        repository: &GitHubRepoKey,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
         let mut command = self.list_command(&ListPullRequestsRequest {
             repository: repository.clone(),
             state: PullRequestStateFilter::All,
@@ -1538,9 +1603,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .arguments
             .extend([OsString::from("--head"), branch.into()]);
         let output = self.run_checked(&command, repository, cancellation)?;
-        let candidates =
-            attach_process(parse_pull_request_list(&output.stdout, repository), &output)?;
-        Ok(select_branch_pull_request(&candidates, branch, head_oid)?.cloned())
+        attach_process(parse_pull_request_list(&output.stdout, repository), &output)
     }
 
     pub fn inspect_pull_request(
@@ -3084,6 +3147,57 @@ mod tests {
         );
         assert!(
             select_branch_pull_request(&candidates, "unrelated", Some("def"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_head_lookup_finds_older_merged_pr_on_reused_branch() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            br#"[{"number":9,"title":"New","state":"OPEN","headRefName":"feature","headRefOid":"new","baseRefName":"main","updatedAt":"2026-09-01","url":"https://github.com/owner/repo/pull/9"},{"number":7,"title":"Old","state":"MERGED","headRefName":"feature","headRefOid":"old","baseRefName":"main","updatedAt":"2026-01-01","url":"https://github.com/owner/repo/pull/7"}]"#,
+        )]));
+        let service = GitHubService::new("gh", fake);
+        let pr = service
+            .resolve_branch_head(&repository(), "feature", "old", &CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.state.0, "MERGED");
+    }
+
+    #[test]
+    fn unique_same_repository_branch_survives_a_moved_local_tip() {
+        let same_repo = br#"[{"number":7,"title":"Old","state":"MERGED","headRefName":"feature","headRefOid":"old","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-01-01","url":"https://github.com/owner/repo/pull/7"}]"#;
+        let fork = br#"[{"number":8,"title":"Fork","state":"MERGED","headRefName":"feature","headRefOid":"old","headRepository":{"name":"fork"},"headRepositoryOwner":{"login":"someone"},"baseRefName":"main","updatedAt":"2026-01-01","url":"https://github.com/owner/repo/pull/8"}]"#;
+        let service = GitHubService::new(
+            "gh",
+            Arc::new(FakeExecutor::with_outputs(vec![
+                success(same_repo),
+                success(fork),
+            ])),
+        );
+        assert_eq!(
+            service
+                .resolve_branch_head(
+                    &repository(),
+                    "feature",
+                    "local-tip",
+                    &CancellationToken::new()
+                )
+                .unwrap()
+                .unwrap()
+                .number,
+            7
+        );
+        assert!(
+            service
+                .resolve_branch_head(
+                    &repository(),
+                    "feature",
+                    "local-tip",
+                    &CancellationToken::new()
+                )
                 .unwrap()
                 .is_none()
         );
