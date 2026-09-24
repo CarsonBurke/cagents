@@ -729,6 +729,10 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
+    pub fn pull_request(&self) -> Option<&SidebarPullRequest> {
+        self.chrome.pull_request.as_ref()
+    }
+
     pub fn clear_pull_request(&mut self) {
         let changed =
             self.pull_request_state.take().is_some() || self.chrome.pull_request.is_some();
@@ -779,9 +783,16 @@ impl SidebarWorktree {
         );
         if let Some(pr) = &self.chrome.pull_request {
             use std::fmt::Write as _;
+            let state = match pr.state {
+                Some(WorktreePullRequestState::Draft) => "draft",
+                Some(WorktreePullRequestState::Open) => "open",
+                Some(WorktreePullRequestState::Closed) => "closed",
+                Some(WorktreePullRequestState::Merged) => "merged",
+                None => "unknown state",
+            };
             let _ = write!(
                 status,
-                ", pull request #{}, checks {}",
+                ", pull request #{} {state}, checks {}",
                 pr.number,
                 check_description(pr.checks)
             );
@@ -5208,6 +5219,14 @@ fn worktree_status_icon(
             .spacing(0),
         if update {
             "Unread agent update"
+        } else if let Some(pr) = &worktree.chrome.pull_request {
+            match pr.state {
+                Some(WorktreePullRequestState::Merged) => "Merged pull request",
+                Some(WorktreePullRequestState::Closed) => "Closed pull request",
+                Some(WorktreePullRequestState::Draft) => "Draft pull request",
+                Some(WorktreePullRequestState::Open) => "Open pull request",
+                None => "Pull request status",
+            }
         } else {
             "Worktree status"
         },
