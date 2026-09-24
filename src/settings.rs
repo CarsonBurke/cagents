@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -225,7 +226,7 @@ impl LinkOpenGesture {
 /// reserved - the workspace consumes it instead of forwarding it to the
 /// process inside a card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct KeyboardShortcuts {
     pub new_terminal: Vec<String>,
     pub new_channel: Vec<String>,
@@ -287,30 +288,68 @@ impl KeyboardShortcuts {
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
-        let mut parsed = Vec::new();
+        self.fault().map_or(Ok(()), |fault| Err(fault.error))
+    }
+
+    /// The first action this table cannot bind, and why: by index into
+    /// `actions()`, and for a conflict, the earlier action whose chord it
+    /// repeats.
+    fn fault(&self) -> Option<ShortcutFault> {
+        let mut parsed: Vec<(ShortcutBinding, usize)> = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
+            let fault = |error, conflicts_with| {
+                Some(ShortcutFault {
+                    action: index,
+                    conflicts_with,
+                    error: SettingsError::InvalidShortcut(error),
+                })
+            };
             if chords.is_empty() && !matches!(index, 1 | 2 | 7..=12) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
-                return Err(SettingsError::InvalidShortcut(
-                    "every keyboard shortcut needs at least one chord",
-                ));
+                return fault("every keyboard shortcut needs at least one chord", None);
             }
             for chord in chords {
-                let binding = parse_shortcut(chord).map_err(SettingsError::InvalidShortcut)?;
+                let binding = match parse_shortcut(chord) {
+                    Ok(binding) => binding,
+                    Err(error) => return fault(error, None),
+                };
                 if let Some(message) = withheld_from_the_card(binding) {
-                    return Err(SettingsError::InvalidShortcut(message));
+                    return fault(message, None);
                 }
-                if parsed.contains(&binding) {
-                    return Err(SettingsError::InvalidShortcut(
-                        "keyboard shortcuts must not conflict",
-                    ));
+                if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
+                    return fault("keyboard shortcuts must not conflict", Some(owner));
                 }
-                parsed.push(binding);
+                parsed.push((binding, index));
             }
         }
-        Ok(())
+        None
     }
+}
+
+/// The serialized name of each action, in `KeyboardShortcuts::actions` order.
+const SHORTCUT_ACTIONS: [&str; 13] = [
+    "new_terminal",
+    "new_channel",
+    "clone_pane",
+    "close_focused_column",
+    "search_projects",
+    "previous_column",
+    "next_column",
+    "cycle_pane_width",
+    "previous_workspace",
+    "next_workspace",
+    "review_toggle_viewed",
+    "review_next_file",
+    "review_previous_file",
+];
+
+/// An action a shortcut table cannot bind.
+#[derive(Debug)]
+struct ShortcutFault {
+    action: usize,
+    conflicts_with: Option<usize>,
+    error: SettingsError,
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -545,8 +584,14 @@ impl EditorSyntaxTheme {
     }
 }
 
+/// Settings are forward compatible, because mixed builds share one file and an
+/// older one must neither refuse to start nor erase what a newer one wrote. A
+/// key this build does not know is ignored, and a value it cannot read - a
+/// preset a newer build added - is replaced by its default; both are logged
+/// on load and written back on save (see `keep_foreign_settings`). A change
+/// that an older build cannot read that way bumps `SETTINGS_SCHEMA_VERSION`,
+/// and a build never saves over a newer schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
@@ -677,7 +722,6 @@ impl Default for AppSettings {
 
 /// One language a server handles, and the file extensions that select it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LanguageServerLanguage {
     /// LSP `languageId` sent in `textDocument/didOpen`.
     pub language_id: String,
@@ -687,7 +731,6 @@ pub struct LanguageServerLanguage {
 
 /// One external language server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LanguageServerSettings {
     /// Stable unique identifier, also used as the session key prefix.
     pub id: String,
@@ -848,10 +891,9 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str, default
 /// Accepts the pre-rename spelling of the channel-creation shortcut.
 ///
 /// The action was stored as `new_thread` before the project-level container
-/// became a channel, and [`KeyboardShortcuts`] denies unknown fields, so an
-/// existing table would otherwise fail to load rather than migrate. The legacy
-/// key is moved rather than copied because leaving it behind would both be
-/// rejected as unknown and let two spellings of one action disagree; a table
+/// became a channel, so an existing table would otherwise lose its binding
+/// rather than migrate. The legacy key is moved rather than copied because
+/// leaving it behind would let two spellings of one action disagree; a table
 /// already carrying the new spelling keeps it and discards the stale one.
 fn adopt_legacy_channel_shortcut(shortcuts: &mut toml::Table) {
     if let Some(legacy) = shortcuts.remove("new_thread")
@@ -1272,7 +1314,7 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
-    let current = load_unlocked(path)?;
+    let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
         &toml::Value::try_from(base)?,
@@ -1306,16 +1348,27 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<AppSettings, SettingsError> {
-    let path = path.as_ref();
-    let _lock = settings_lock(path)?;
-    load_unlocked(path)
+    load_detailed(path).map(|loaded| loaded.settings)
 }
 
-fn load_unlocked(path: &Path) -> Result<AppSettings, SettingsError> {
+/// Loads settings along with what the file holds that this build set aside.
+pub fn load_detailed(path: impl AsRef<Path>) -> Result<Loaded, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let loaded = load_unlocked(path)?;
+    for setting in &loaded.foreign {
+        setting.warn();
+    }
+    Ok(loaded)
+}
+
+fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
     reject_symlink_components(path)?;
     match fs::symlink_metadata(path) {
         Ok(_) => load_toml(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => migrate_legacy(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            migrate_legacy(path).map(Loaded::complete)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -1333,7 +1386,12 @@ fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsErro
     let directory = open_private_directory(parent)?;
     reject_unsafe_destination(path)?;
 
-    let mut document = toml::to_string_pretty(&settings)?;
+    let mut document = written(&settings)?;
+    // Whatever a newer build wrote, and this one cannot represent, survives.
+    if let Some(current) = current_document(path)? {
+        keep_foreign_settings(&current, &mut document);
+    }
+    let mut document = toml::to_string_pretty(&document)?;
     if !document.ends_with('\n') {
         document.push('\n');
     }
@@ -1358,26 +1416,31 @@ fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsErro
     Ok(())
 }
 
-fn load_toml(path: &Path) -> Result<AppSettings, SettingsError> {
+fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
     let bytes = read_private_file(path)?;
     let document = std::str::from_utf8(&bytes)?;
-    match toml::from_str::<SettingsHeader>(document)?.schema_version {
+    let settings = match toml::from_str::<SettingsHeader>(document)?.schema_version {
         LEGACY_SETTINGS_SCHEMA_VERSION => {
-            AppSettings::from(toml::from_str::<V1TomlSettings>(document)?).validate()
+            AppSettings::from(toml::from_str::<V1TomlSettings>(document)?)
         }
         PREVIOUS_SETTINGS_SCHEMA_VERSION => {
-            AppSettings::from(toml::from_str::<V2TomlSettings>(document)?).validate()
+            AppSettings::from(toml::from_str::<V2TomlSettings>(document)?)
         }
-        SETTINGS_SCHEMA_VERSION => load_current_toml(document),
-        version => Err(SettingsError::UnsupportedSchema(version)),
-    }
+        SETTINGS_SCHEMA_VERSION => return load_current_toml(document),
+        version => return Err(SettingsError::UnsupportedSchema(version)),
+    };
+    Ok(Loaded::complete(settings.validate()?))
 }
 
 /// Renames the short-lived scroll-speed key from the first implementation of
 /// the preference. Its value represented lines per wheel notch, so it is the
 /// same setting; the old default of one is promoted to the new default of two.
-fn load_current_toml(document: &str) -> Result<AppSettings, SettingsError> {
-    let mut table = toml::from_str::<toml::Table>(document)?;
+fn normalize_current(table: &mut toml::Table) {
+    // Decoding moves it too; moving it first lets a setting set aside or
+    // kept be found under the name this build writes.
+    if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
+        adopt_legacy_channel_shortcut(shortcuts);
+    }
     if !table.contains_key("terminal_scroll_size")
         && matches!(
             table.get("terminal_scroll_speed"),
@@ -1391,10 +1454,620 @@ fn load_current_toml(document: &str) -> Result<AppSettings, SettingsError> {
         };
         table.insert("terminal_scroll_size".to_owned(), value);
     }
-    toml::Value::Table(table)
-        .try_into::<AppSettings>()
-        .map_err(SettingsError::Toml)?
-        .validate()
+}
+
+fn load_current_toml(document: &str) -> Result<Loaded, SettingsError> {
+    let mut table = toml::from_str::<toml::Table>(document)?;
+    normalize_current(&mut table);
+    let decoded = decode_current(table)?;
+    Ok(Loaded {
+        settings: decoded.settings,
+        foreign: decoded.foreign,
+    })
+}
+
+/// Settings as this build writes them: the serializer's own text, read back.
+/// A `Value` built directly widens each `f32` to `f64`, so `1.286` would be
+/// written, and compared, as `1.2860000133514404`.
+fn written(settings: &AppSettings) -> Result<toml::Value, SettingsError> {
+    Ok(toml::Value::Table(toml::from_str(&toml::to_string(
+        settings,
+    )?)?))
+}
+
+/// Settings as loaded, with what the file holds that this build left alone.
+pub struct Loaded {
+    pub settings: AppSettings,
+    foreign: Vec<Foreign>,
+}
+
+impl Loaded {
+    fn complete(settings: AppSettings) -> Self {
+        Self {
+            settings,
+            foreign: Vec::new(),
+        }
+    }
+
+    /// One line per value in the file that this build could not use, for the
+    /// reader. A key this build does not know is expected of a newer build's
+    /// file and only logged; a value it knows but cannot use changes what the
+    /// app does, so it is said.
+    pub fn set_aside(&self) -> impl Iterator<Item = String> + '_ {
+        self.foreign
+            .iter()
+            .filter_map(|setting| match &setting.reason {
+                ForeignReason::UnknownKey => None,
+                ForeignReason::UnreadableValue(error) => Some(format!(
+                    "settings.toml: “{}” was not used ({error}), so its default is in effect. The file keeps the value until the setting is changed here.",
+                    dotted(&setting.path)
+                )),
+            })
+    }
+}
+
+/// A setting in the file this build could not use, which it leaves as it
+/// found it.
+#[derive(Clone, Debug, PartialEq)]
+struct Foreign {
+    path: Vec<Segment>,
+    reason: ForeignReason,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ForeignReason {
+    /// A key the settings model has no field for.
+    UnknownKey,
+    /// A value this build cannot read, such as a preset a newer build added,
+    /// or one it reads but does not accept, such as a wider range. The build
+    /// uses its own default in its place.
+    UnreadableValue(String),
+}
+
+impl Foreign {
+    fn warn(&self) {
+        let setting = dotted(&self.path);
+        match &self.reason {
+            ForeignReason::UnknownKey => tracing::warn!(
+                %setting,
+                "settings.toml has a setting this build does not know; it is ignored and kept on save"
+            ),
+            ForeignReason::UnreadableValue(error) => tracing::warn!(
+                %setting,
+                %error,
+                "settings.toml has a value this build cannot use; the default is used and the value is kept on save"
+            ),
+        }
+    }
+}
+
+/// One step of a path into the settings document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Segment {
+    Key(String),
+    Index(usize),
+}
+
+fn dotted(path: &[Segment]) -> String {
+    let mut dotted = String::new();
+    for segment in path {
+        match segment {
+            Segment::Key(key) => {
+                if !dotted.is_empty() {
+                    dotted.push('.');
+                }
+                dotted.push_str(key);
+            }
+            Segment::Index(index) => {
+                let _ = write!(dotted, "[{index}]");
+            }
+        }
+    }
+    dotted
+}
+
+/// A current-schema document as this build understood it.
+struct Decoded {
+    /// Validated.
+    settings: AppSettings,
+    foreign: Vec<Foreign>,
+    /// Settings the file lacks, each the path to a setting this build filled
+    /// in: a top-level setting, or one action of the shortcut table.
+    absent: Vec<Vec<Segment>>,
+}
+
+/// Decodes and validates a current-schema document, setting aside every key
+/// the settings model has no field for and every value it cannot use.
+///
+/// A setting the file lacks, such as one a newer build dropped, takes its
+/// default. A value that does not decode is replaced by its default where the
+/// error points, one at a time, and decoding retried; within a list, where a
+/// default entry at the same index would describe another entry, an optional
+/// key is dropped instead, and otherwise the whole list falls back. A value
+/// that decodes but fails validation, such as a range a newer build widened
+/// or a chord naming a key it added, falls back the same way; each shortcut
+/// action is a setting of its own. Anything else still fails the document.
+fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
+    let defaults = written(&AppSettings::default())?;
+    let mut read = toml::Value::Table(table);
+    let mut foreign: Vec<Foreign> = Vec::new();
+    let mut absent = Vec::new();
+    if let (Some(read), Some(defaults)) = (read.as_table_mut(), defaults.as_table()) {
+        for (key, default) in defaults {
+            if !read.contains_key(key) {
+                absent.push(vec![Segment::Key(key.clone())]);
+                read.insert(key.clone(), default.clone());
+            }
+        }
+    }
+    // The shortcut table is decoded whole by its own migration, so an action
+    // that is not a list of chords is set aside here, before it can cost the
+    // table, and an action the file lacks is noted.
+    if let Some(toml::Value::Table(shortcuts)) = read.get_mut("keyboard_shortcuts") {
+        let defaults = &defaults["keyboard_shortcuts"];
+        for action in SHORTCUT_ACTIONS {
+            let path = vec![
+                Segment::Key("keyboard_shortcuts".into()),
+                Segment::Key(action.into()),
+            ];
+            match shortcuts.get_mut(action) {
+                None => absent.push(path),
+                Some(value)
+                    if !value
+                        .as_array()
+                        .is_some_and(|chords| chords.iter().all(toml::Value::is_str)) =>
+                {
+                    *value = defaults[action].clone();
+                    foreign.push(Foreign {
+                        path,
+                        reason: ForeignReason::UnreadableValue("expected a list of chords".into()),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    for path in &absent {
+        tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; this build fills it in and writes it only if that is not the plain default");
+    }
+    let settings = loop {
+        let mut unknown = Vec::new();
+        let decoded: Result<AppSettings, _> = serde_path_to_error::deserialize(
+            serde_ignored::Deserializer::new(read.clone(), &mut |path: serde_ignored::Path<'_>| {
+                unknown.extend(ignored_path(&path, &read));
+            }),
+        );
+        // Where a value failed to decode: one that fails around what was just
+        // set aside inside it fails because of that, not for its own reason.
+        let failed_at = decoded
+            .as_ref()
+            .err()
+            .and_then(|error| error_path(error.path()));
+        let (path, reason, error) = match decoded {
+            Ok(settings) => {
+                let fault = settings.keyboard_shortcuts.fault();
+                match (settings.validate(), fault) {
+                    (Ok(settings), _) => {
+                        foreign.extend(unknown.into_iter().map(|path| Foreign {
+                            path,
+                            reason: ForeignReason::UnknownKey,
+                        }));
+                        break settings;
+                    }
+                    (Err(_), Some(fault)) => (
+                        blamed_action(&read, &defaults, &fault),
+                        fault.error.to_string(),
+                        fault.error,
+                    ),
+                    (Err(error), None) => (
+                        invalid_setting(&read, &defaults, &error),
+                        error.to_string(),
+                        error,
+                    ),
+                }
+            }
+            Err(error) => (
+                error_path(error.path()),
+                error.inner().to_string(),
+                error.into_inner().into(),
+            ),
+        };
+        let Some(path) = path.and_then(|path| set_aside_value(&mut read, &defaults, &path)) else {
+            return Err(error);
+        };
+        // A setting that falls back whole takes with it what was set aside
+        // inside it; when setting that aside is why it fell back, its reason
+        // is the reason.
+        let inside = |setting: &Foreign| setting.path.starts_with(&path);
+        let reason = foreign
+            .last()
+            .filter(|last| {
+                inside(last)
+                    && failed_at
+                        .as_ref()
+                        .is_some_and(|failed_at| last.path.starts_with(failed_at))
+                    && matches!(last.reason, ForeignReason::UnreadableValue(_))
+            })
+            .map_or(ForeignReason::UnreadableValue(reason), |last| {
+                last.reason.clone()
+            });
+        foreign.retain(|setting| !inside(setting));
+        foreign.push(Foreign { path, reason });
+    };
+
+    if let Some(toml::Value::Table(shortcuts)) = read.get("keyboard_shortcuts") {
+        foreign.extend(
+            shortcuts
+                .keys()
+                .filter(|key| !SHORTCUT_ACTIONS.contains(&key.as_str()))
+                .map(|key| Foreign {
+                    path: vec![
+                        Segment::Key("keyboard_shortcuts".into()),
+                        Segment::Key(key.clone()),
+                    ],
+                    reason: ForeignReason::UnknownKey,
+                }),
+        );
+    }
+    Ok(Decoded {
+        settings,
+        foreign,
+        absent,
+    })
+}
+
+/// The action a shortcut `fault` is set aside from. Of two actions that share
+/// a chord, the one the file set is blamed rather than one this build filled
+/// in or fell back to: that one holds its default, which is no way forward.
+fn blamed_action(
+    read: &toml::Value,
+    defaults: &toml::Value,
+    fault: &ShortcutFault,
+) -> Option<Vec<Segment>> {
+    std::iter::once(fault.action)
+        .chain(fault.conflicts_with)
+        .map(|action| {
+            vec![
+                Segment::Key("keyboard_shortcuts".into()),
+                Segment::Key(SHORTCUT_ACTIONS[action].into()),
+            ]
+        })
+        .find(|path| get(read, path).is_some_and(|value| get(defaults, path) != Some(value)))
+}
+
+/// Where serde stopped, as a path into the document. `None` when the error is
+/// not about any one value.
+fn error_path(path: &serde_path_to_error::Path) -> Option<Vec<Segment>> {
+    use serde_path_to_error::Segment as Step;
+    let path = path
+        .iter()
+        .map(|step| match step {
+            Step::Map { key } => Some(Segment::Key(key.clone())),
+            Step::Seq { index } => Some(Segment::Index(*index)),
+            // An externally tagged variant is a key of its own table.
+            Step::Enum { variant } => Some(Segment::Key(variant.clone())),
+            Step::Unknown => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!path.is_empty()).then_some(path)
+}
+
+/// The one top-level setting that fails validation with `error`: the first
+/// whose default in its place clears the error or turns it into another.
+/// Only a setting that differs from its default can be the cause, and each
+/// setting fails validation with a message of its own. The shortcut table
+/// says itself which action fails; see `blamed_action`.
+fn invalid_setting(
+    read: &toml::Value,
+    defaults: &toml::Value,
+    error: &SettingsError,
+) -> Option<Vec<Segment>> {
+    let failure = error.to_string();
+    read.as_table()?
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "schema_version" | "keyboard_shortcuts"))
+        .map(|key| vec![Segment::Key(key.clone())])
+        .filter(|path| get(defaults, path).is_some_and(|default| get(read, path) != Some(default)))
+        .find(|path| {
+            let mut trial = read.clone();
+            if let (Some(value), Some(default)) = (get_mut(&mut trial, path), get(defaults, path)) {
+                *value = default.clone();
+            }
+            trial
+                .try_into::<AppSettings>()
+                .map_err(SettingsError::from)
+                .and_then(AppSettings::validate)
+                .map_or_else(|error| error.to_string() != failure, |_| true)
+        })
+}
+
+/// Takes the value at `path` out of `read` and returns the path of what was
+/// set aside. Outside any list, the value's default takes its place; inside
+/// one, a default entry at the same index would describe another entry, so an
+/// optional key is dropped instead; failing both, the top-level setting that
+/// holds the value falls back whole.
+fn set_aside_value(
+    read: &mut toml::Value,
+    defaults: &toml::Value,
+    path: &[Segment],
+) -> Option<Vec<Segment>> {
+    let in_list = path
+        .iter()
+        .any(|segment| matches!(segment, Segment::Index(_)));
+    if !in_list && let Some(default) = get(defaults, path) {
+        let value = get_mut(read, path)?;
+        // A default that does not read either is no way forward.
+        if value == default {
+            return None;
+        }
+        *value = default.clone();
+        return Some(path.to_vec());
+    }
+    if let Some((Segment::Key(key), parent)) = path.split_last()
+        && get_mut(read, parent)
+            .and_then(toml::Value::as_table_mut)
+            .is_some_and(|table| table.remove(key).is_some())
+    {
+        return Some(path.to_vec());
+    }
+    let setting = path.get(..1).filter(|setting| setting.len() < path.len())?;
+    set_aside_value(read, defaults, setting)
+}
+
+/// Where serde ignored a key, as a path into `read`, the document it was
+/// decoding. An externally tagged variant's name is the one key of its table.
+fn ignored_path(path: &serde_ignored::Path<'_>, read: &toml::Value) -> Option<Vec<Segment>> {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => Some(Vec::new()),
+        Path::Map { parent, key } => {
+            let mut path = ignored_path(parent, read)?;
+            path.push(Segment::Key(key.clone()));
+            Some(path)
+        }
+        Path::Seq { parent, index } => {
+            let mut path = ignored_path(parent, read)?;
+            path.push(Segment::Index(*index));
+            Some(path)
+        }
+        Path::Some { parent } | Path::NewtypeStruct { parent } => ignored_path(parent, read),
+        Path::NewtypeVariant { parent } => {
+            let mut path = ignored_path(parent, read)?;
+            let variant = get(read, &path)?
+                .as_table()
+                .filter(|table| table.len() == 1)?
+                .keys()
+                .next()?
+                .clone();
+            path.push(Segment::Key(variant));
+            Some(path)
+        }
+    }
+}
+
+/// The settings document on disk, when it is one this build writes.
+fn current_document(path: &Path) -> Result<Option<toml::Table>, SettingsError> {
+    let bytes = match read_private_file(path) {
+        Ok(bytes) => bytes,
+        Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        // A file this user may not read, or that does not parse, holds
+        // nothing this build could keep, and saving over it is how a user
+        // recovers from it. The save itself still refuses an unsafe
+        // destination, and any other failure to read, which may pass, still
+        // fails the save rather than risk writing over a newer schema.
+        Err(SettingsError::Io(error)) if error.raw_os_error() == Some(libc::EACCES) => {
+            tracing::warn!(%error, "replacing a settings.toml that could not be read");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let parsed = std::str::from_utf8(&bytes)
+        .map_err(SettingsError::from)
+        .and_then(|text| Ok(toml::from_str::<toml::Table>(text)?));
+    let mut table = match parsed {
+        Ok(table) => table,
+        Err(error) => {
+            tracing::warn!(%error, "replacing a settings.toml that could not be read");
+            return Ok(None);
+        }
+    };
+    let version = table
+        .get("schema_version")
+        .and_then(toml::Value::as_integer);
+    if version.is_some_and(|version| version > i64::from(SETTINGS_SCHEMA_VERSION)) {
+        // Writing this build's schema over a newer one would erase it.
+        return Err(SettingsError::UnsupportedSchema(
+            version
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(u32::MAX),
+        ));
+    }
+    if version != Some(i64::from(SETTINGS_SCHEMA_VERSION)) {
+        return Ok(None);
+    }
+    normalize_current(&mut table);
+    Ok(Some(table))
+}
+
+/// Copies every foreign setting in `current` into `document`, the settings
+/// this build is about to write, and leaves out what this build only filled
+/// in.
+///
+/// A setting this build replaced with its default keeps the file's value only
+/// while this build still holds that default: a user who then chose a value
+/// here meant it. A key inside a list entry follows the entry by its `id`, so
+/// it survives entries being removed or reordered around it; an entry without
+/// one keeps its keys only while it is unchanged at the same position. A
+/// setting the file lacks stays out of it while this build still holds the
+/// plain default it filled in.
+fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
+    // What this build made of the file, as it would write it: `document`
+    // differs from it exactly where a setting has changed since.
+    let (baseline, decoded) = match decode_current(current.clone())
+        .and_then(|decoded| Ok((written(&decoded.settings)?, decoded)))
+    {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            tracing::warn!(%error, "settings.toml could not be read back; settings this build does not know are not kept");
+            return;
+        }
+    };
+    let current = toml::Value::Table(current.clone());
+    let kept: Vec<(Vec<Segment>, toml::Value)> = decoded
+        .foreign
+        .iter()
+        .filter_map(|setting| {
+            let value = get(&current, &setting.path)?.clone();
+            let target = locate(&baseline, document, &setting.path)?;
+            (matches!(target.last(), Some(Segment::Key(_)))
+                && get(document, &target) == get(&baseline, &setting.path))
+            .then_some((target, value))
+        })
+        .collect();
+    // Only a plain default stays out: a value a migration filled in, such as
+    // an action left unbound because the file gave its chord to another, is
+    // written so that it still holds once that chord is free.
+    let defaults = written(&AppSettings::default()).ok();
+    for path in &decoded.absent {
+        if get(document, path) == get(&baseline, path)
+            && defaults
+                .as_ref()
+                .is_some_and(|defaults| get(defaults, path) == get(&baseline, path))
+            && let Some((Segment::Key(key), parent)) = path.split_last()
+            && let Some(toml::Value::Table(table)) = get_mut(document, parent)
+        {
+            table.remove(key);
+        }
+    }
+    // Chords the file will bind apart from what is kept. A newer build rejects
+    // a file in which two actions share one, so a kept action gives up any
+    // chord this build has bound since; kept actions never cost each other,
+    // since the file already held them together. A kept action left with no
+    // chord is not kept, so the file binds this build's chords for it instead,
+    // which other kept actions must then give up in turn.
+    let shortcuts = Segment::Key("keyboard_shortcuts".into());
+    let is_action =
+        |target: &[Segment]| matches!(target, [table, Segment::Key(_)] if *table == shortcuts);
+    let mut unkept: Vec<&[Segment]> = Vec::new();
+    let bound = loop {
+        let bound: Vec<ShortcutBinding> = document
+            .get("keyboard_shortcuts")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter(|(action, _)| {
+                !kept.iter().any(|(target, _)| {
+                    !unkept.contains(&target.as_slice())
+                        && *target == [shortcuts.clone(), Segment::Key((*action).clone())]
+                })
+            })
+            .filter_map(|(_, chords)| chords.as_array())
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter_map(|chord| parse_shortcut(chord).ok())
+            .collect();
+        let emptied: Vec<&[Segment]> = kept
+            .iter()
+            .filter(|(target, value)| {
+                is_action(target)
+                    && !unkept.contains(&target.as_slice())
+                    && value
+                        .as_array()
+                        .is_some_and(|chords| !chords.is_empty() && free(chords, &bound).is_empty())
+            })
+            .map(|(target, _)| target.as_slice())
+            .collect();
+        if emptied.is_empty() {
+            break bound;
+        }
+        unkept.extend(emptied);
+    };
+    for (target, mut value) in kept.iter().cloned() {
+        // An action left with no chord is left to the newer build to bind
+        // again, which it may insist on.
+        if unkept.contains(&target.as_slice()) {
+            continue;
+        }
+        let Some((Segment::Key(key), parent)) = target.split_last() else {
+            continue;
+        };
+        if is_action(&target)
+            && let toml::Value::Array(chords) = &mut value
+        {
+            *chords = free(chords, &bound);
+        }
+        if let Some(toml::Value::Table(table)) = get_mut(document, parent) {
+            table.insert(key.clone(), value);
+        }
+    }
+}
+
+/// The chords of `chords` that nothing in `bound` holds; one this build cannot
+/// read is kept, since only a newer build can tell what it binds.
+fn free(chords: &[toml::Value], bound: &[ShortcutBinding]) -> Vec<toml::Value> {
+    chords
+        .iter()
+        .filter(|chord| {
+            chord
+                .as_str()
+                .and_then(|chord| parse_shortcut(chord).ok())
+                .is_none_or(|binding| !bound.contains(&binding))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `path`, a path into `baseline`, as the path to the same setting in
+/// `document`.
+fn locate(
+    baseline: &toml::Value,
+    document: &toml::Value,
+    path: &[Segment],
+) -> Option<Vec<Segment>> {
+    let (last, parent) = path.split_last()?;
+    let mut located = Vec::with_capacity(path.len());
+    let (mut read, mut document) = (baseline, document);
+    for segment in parent {
+        let (next_read, next_document, segment) = match segment {
+            Segment::Key(key) => (
+                read.get(key.as_str())?,
+                document.get(key.as_str())?,
+                segment.clone(),
+            ),
+            Segment::Index(index) => {
+                let entry = read.get(*index)?;
+                let entries = document.as_array()?;
+                let position = match entry.get("id") {
+                    Some(id) => entries
+                        .iter()
+                        .position(|other| other.get("id") == Some(id))?,
+                    None => (entries.get(*index)? == entry).then_some(*index)?,
+                };
+                (entry, &entries[position], Segment::Index(position))
+            }
+        };
+        read = next_read;
+        document = next_document;
+        located.push(segment);
+    }
+    located.push(last.clone());
+    Some(located)
+}
+
+fn get<'a>(value: &'a toml::Value, path: &[Segment]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(value, |value, segment| match segment {
+        Segment::Key(key) => value.get(key.as_str()),
+        Segment::Index(index) => value.get(*index),
+    })
+}
+
+fn get_mut<'a>(value: &'a mut toml::Value, path: &[Segment]) -> Option<&'a mut toml::Value> {
+    path.iter().try_fold(value, |value, segment| match segment {
+        Segment::Key(key) => value.get_mut(key.as_str()),
+        Segment::Index(index) => value.get_mut(*index),
+    })
 }
 
 fn migrate_legacy(path: &Path) -> Result<AppSettings, SettingsError> {
@@ -2438,14 +3111,602 @@ next_column = ["Alt+W", "Alt+Right"]
         assert!(legacy_path.exists());
     }
 
+    /// A settings file as a newer build writes it: this build's defaults
+    /// plus whatever `extend` adds.
+    fn newer_build_document(path: &Path, extend: impl FnOnce(&mut toml::Table)) {
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        extend(&mut document);
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    fn saved(path: &Path) -> toml::Table {
+        toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn server_mut(document: &mut toml::Table, index: usize) -> &mut toml::Table {
+        document["language_servers"].as_array_mut().unwrap()[index]
+            .as_table_mut()
+            .unwrap()
+    }
+
     #[test]
-    fn rejects_unknown_future_missing_and_out_of_range_values() {
+    fn a_newer_builds_keys_load_and_survive_an_older_builds_save() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        let valid = toml::to_string(&AppSettings::default()).unwrap();
+        newer_build_document(&path, |document| {
+            document.insert("future_preference".into(), true.into());
+            let mut section = toml::Table::new();
+            section.insert("depth".into(), 2.into());
+            document.insert("future_section".into(), section.into());
+            document["keyboard_shortcuts"]
+                .as_table_mut()
+                .unwrap()
+                .insert("future_action".into(), vec!["Alt+F12"].into());
+            server_mut(document, 0).insert("future_option".into(), 3.into());
+            server_mut(document, 1)["languages"].as_array_mut().unwrap()[0]
+                .as_table_mut()
+                .unwrap()
+                .insert("future_flag".into(), true.into());
+        });
 
-        fs::write(&path, format!("{valid}unknown = true\n")).unwrap();
-        assert!(matches!(load(&path), Err(SettingsError::Toml(_))));
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, AppSettings::default());
+
+        // This build changes one of its own settings; everything it did not
+        // understand is written back where it was.
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        let file = saved(&path);
+        assert_eq!(file["future_preference"], true.into());
+        assert_eq!(file["future_section"]["depth"], 2.into());
+        assert_eq!(
+            file["keyboard_shortcuts"]["future_action"],
+            vec!["Alt+F12"].into()
+        );
+        assert_eq!(file["language_servers"][0]["future_option"], 3.into());
+        assert_eq!(
+            file["language_servers"][1]["languages"][0]["future_flag"],
+            true.into()
+        );
+        assert_eq!(load(&path).unwrap(), desired);
+        let text = fs::read_to_string(&path).unwrap();
+        // The file still reads in this build's own order, and each `f32` at
+        // its shortest form.
+        assert!(text.starts_with("schema_version = "));
+        assert!(text.contains(&format!(
+            "\nterminal_line_height = {}\n",
+            AppSettings::default().terminal_line_height
+        )));
+
+        // A list entry's keys follow the entry, not its position.
+        let first = desired.language_servers[0].id.clone();
+        let mut removed = desired.clone();
+        removed.language_servers.remove(1);
+        save(&path, &removed).unwrap();
+        removed.language_servers.remove(0);
+        save(&path, &removed).unwrap();
+        let file = saved(&path);
+        assert!(
+            file["language_servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|server| server.get("future_option").is_none()
+                    && server["id"].as_str() != Some(first.as_str()))
+        );
+        assert_eq!(file["future_preference"], true.into());
+    }
+
+    #[test]
+    fn a_list_entrys_unknown_key_survives_an_earlier_entry_being_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            server_mut(document, 1).insert("future_option".into(), 3.into());
+        });
+        let mut settings = load(&path).unwrap();
+        let kept = settings.language_servers[1].id.clone();
+        settings.language_servers.remove(0);
+        save(&path, &settings).unwrap();
+        let file = saved(&path);
+        assert_eq!(file["language_servers"][0]["id"], kept.as_str().into());
+        assert_eq!(file["language_servers"][0]["future_option"], 3.into());
+    }
+
+    #[test]
+    fn a_value_this_build_cannot_read_falls_back_and_is_kept_until_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document.insert("terminal_theme".into(), "future_preset".into());
+            document.insert("app_theme".into(), "future_scheme".into());
+            let mut palette =
+                toml::Table::try_from(crate::terminal::TerminalTheme::Dark.palette()).unwrap();
+            palette.insert("selection".into(), "#445566".into());
+            document.insert("custom_terminal_theme".into(), palette.into());
+        });
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.terminal_theme, AppSettings::default().terminal_theme);
+        assert_eq!(loaded.app_theme, AppSettings::default().app_theme);
+
+        // Saved untouched, the newer build's values are still there.
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        let file = saved(&path);
+        assert_eq!(file["terminal_theme"], "future_preset".into());
+        assert_eq!(file["app_theme"], "future_scheme".into());
+        assert_eq!(file["custom_terminal_theme"]["selection"], "#445566".into());
+        assert_eq!(load(&path).unwrap(), desired);
+
+        // A value chosen in this build replaces the one it could not read.
+        let chosen = AppSettings {
+            terminal_theme: crate::terminal::TerminalTheme::Nord,
+            ..desired.clone()
+        };
+        save_merged(&path, &desired, &chosen).unwrap();
+        let file = saved(&path);
+        assert_eq!(file["terminal_theme"], "nord".into());
+        assert_eq!(file["app_theme"], "future_scheme".into());
+    }
+
+    #[test]
+    fn a_kept_shortcut_gives_up_a_chord_this_build_has_since_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document["keyboard_shortcuts"]
+                .as_table_mut()
+                .unwrap()
+                .insert("future_action".into(), vec!["Alt+K", "Alt+F12"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+k".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(
+            saved(&path)["keyboard_shortcuts"]["future_action"],
+            vec!["Alt+F12"].into()
+        );
+    }
+
+    #[test]
+    fn a_newer_schema_is_never_saved_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let newer = AppSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION + 1,
+            ..AppSettings::default()
+        };
+        let text = toml::to_string(&newer).unwrap();
+        fs::write(&path, &text).unwrap();
+        assert!(matches!(
+            save(&path, &AppSettings::default()),
+            Err(SettingsError::UnsupportedSchema(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+
+    /// A newer build may drop a setting; this one uses its default and
+    /// writes it only once it is changed here.
+    #[test]
+    fn a_setting_missing_from_the_file_takes_its_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document.remove("sidebar_width");
+        });
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, AppSettings::default());
+        // It stays out of the file until it is changed here, so a newer
+        // build that dropped it never reads it back.
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert!(!saved(&path).contains_key("sidebar_width"));
+        assert_eq!(load(&path).unwrap(), desired);
+        let chosen = AppSettings {
+            sidebar_width: desired.sidebar_width + 10.0,
+            ..desired.clone()
+        };
+        save_merged(&path, &desired, &chosen).unwrap();
+        assert!(saved(&path).contains_key("sidebar_width"));
+        assert_eq!(load(&path).unwrap(), chosen);
+    }
+
+    #[test]
+    fn shortcut_action_names_are_the_serialized_ones() {
+        let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
+        assert!(table.keys().eq(SHORTCUT_ACTIONS.iter()));
+    }
+
+    /// Each shortcut action this build cannot use falls back alone, however
+    /// many fail the same way, and the file keeps what it held.
+    #[test]
+    fn every_unusable_shortcut_falls_back_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut chords = toml::Table::new();
+        chords.insert("chords".into(), vec!["Alt+Y"].into());
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F13"].into());
+            shortcuts.insert("search_projects".into(), vec!["Alt+F13"].into());
+            // A shape this build does not know costs only its own action.
+            shortcuts.insert("clone_pane".into(), chords.clone().into());
+            shortcuts.insert("cycle_pane_width".into(), vec!["Alt+X"].into());
+        });
+        let original = saved(&path)["keyboard_shortcuts"].clone();
+        let loaded = load_detailed(&path).unwrap();
+        let defaults = KeyboardShortcuts::default();
+        let shortcuts = &loaded.settings.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, defaults.new_terminal);
+        assert_eq!(shortcuts.search_projects, defaults.search_projects);
+        assert_eq!(shortcuts.clone_pane, defaults.clone_pane);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+X"], "the rest is read");
+        assert_eq!(loaded.set_aside().count(), 3);
+
+        // Another shortcut changed here keeps them all.
+        let mut desired = loaded.settings.clone();
+        desired.keyboard_shortcuts.previous_workspace = vec!["Alt+Shift+P".into()];
+        save_merged(&path, &loaded.settings, &desired).unwrap();
+        let file = saved(&path);
+        for action in ["new_terminal", "search_projects", "clone_pane"] {
+            assert_eq!(
+                file["keyboard_shortcuts"][action], original[action],
+                "{action}"
+            );
+        }
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A fallback that takes a chord the file gave another action blames that
+    /// action in this build, and the file keeps both as they were.
+    #[test]
+    fn a_fallback_conflict_costs_the_file_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F13"].into());
+            shortcuts.insert("search_projects".into(), vec!["Ctrl+T"].into());
+        });
+        let original = saved(&path)["keyboard_shortcuts"].clone();
+        let loaded = load(&path).unwrap();
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(saved(&path)["keyboard_shortcuts"], original);
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A newer build that dropped an action may bind its chord elsewhere. This
+    /// build binds the action it still has, and the file keeps the newer
+    /// build's binding and never gains the dropped action.
+    #[test]
+    fn a_dropped_actions_chord_stays_where_the_newer_build_put_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("search_projects");
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+        });
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.search_projects, ["Ctrl+F"]);
+        for _ in 0..2 {
+            let current = load(&path).unwrap();
+            let desired = AppSettings {
+                max_hot_cards: current.max_hot_cards + 1,
+                ..current.clone()
+            };
+            save_merged(&path, &current, &desired).unwrap();
+            let file = saved(&path);
+            assert_eq!(
+                file["keyboard_shortcuts"]["new_terminal"],
+                vec!["Ctrl+F"].into()
+            );
+            assert!(file["keyboard_shortcuts"].get("search_projects").is_none());
+        }
+    }
+
+    /// An action the file lacks whose default chord the file gave another is
+    /// left unbound, and stays so once that chord is freed: the migration's
+    /// choice is written, not the default it withheld.
+    #[test]
+    fn a_missing_action_left_unbound_stays_unbound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("review_toggle_viewed");
+            shortcuts.insert("new_terminal".into(), vec!["Alt+V"].into());
+        });
+        let loaded = load(&path).unwrap();
+        assert!(loaded.keyboard_shortcuts.review_toggle_viewed.is_empty());
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.new_terminal = vec!["Alt+N".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A kept action that gives up its last chord is not kept, so the chords
+    /// this build writes for it in turn cost the other kept actions; the file
+    /// never binds a chord twice.
+    #[test]
+    fn an_unkept_action_never_leaves_a_chord_bound_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("search_projects");
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+            shortcuts.insert("future_action".into(), vec!["Ctrl+T"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+F".into(), "Alt+S".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        let file = saved(&path);
+        let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
+            .as_table()
+            .unwrap()
+            .values()
+            .flat_map(|chords| chords.as_array().unwrap())
+            .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
+            .collect();
+        for (index, binding) in bindings.iter().enumerate() {
+            assert!(!bindings[..index].contains(binding), "{file:#?}");
+        }
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// The channel shortcut's old name is read, and set aside, under the name
+    /// this build writes.
+    #[test]
+    fn a_legacy_shortcut_name_is_set_aside_under_its_current_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("new_channel");
+            shortcuts.insert("new_thread".into(), vec!["Alt+F13"].into());
+        });
+        let loaded = load(&path).unwrap();
+        save(&path, &loaded).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["keyboard_shortcuts"]["new_channel"],
+            vec!["Alt+F13"].into()
+        );
+        assert!(file["keyboard_shortcuts"].get("new_thread").is_none());
+    }
+
+    /// A value this build cannot read inside a list entry is dropped from the
+    /// entry where it may be, and otherwise costs the whole list; either way
+    /// the file keeps it while this build leaves the list as it read it.
+    #[test]
+    fn an_unreadable_value_in_a_list_entry_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut future = toml::Table::new();
+        future.insert("future".into(), 1.into());
+        newer_build_document(&path, |document| {
+            server_mut(document, 0).insert("root_markers".into(), future.clone().into());
+        });
+        let loaded = load_detailed(&path).unwrap();
+        assert!(loaded.settings.language_servers[0].root_markers.is_empty());
+        let notes = loaded.set_aside().collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("“language_servers[0].root_markers”"),
+            "{notes:?}"
+        );
+        save(&path, &loaded.settings).unwrap();
+        assert_eq!(
+            saved(&path)["language_servers"][0]["root_markers"],
+            future.clone().into()
+        );
+
+        // A required key cannot be dropped, so the list falls back whole.
+        newer_build_document(&path, |document| {
+            server_mut(document, 1).insert("command".into(), future.clone().into());
+        });
+        let original = saved(&path)["language_servers"].clone();
+        let loaded = load_detailed(&path).unwrap();
+        assert_eq!(loaded.settings, AppSettings::default());
+        let notes = loaded.set_aside().collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("“language_servers”"), "{notes:?}");
+        assert!(
+            !notes[0].contains("missing field"),
+            "the reason is the value, not the fallback: {notes:?}"
+        );
+        let desired = AppSettings {
+            max_hot_cards: loaded.settings.max_hot_cards + 1,
+            ..loaded.settings.clone()
+        };
+        save_merged(&path, &loaded.settings, &desired).unwrap();
+        assert_eq!(saved(&path)["language_servers"], original);
+        assert_eq!(load(&path).unwrap(), desired);
+
+        // A list that falls back for a fault of another entry reports that
+        // fault, not what was set aside before it.
+        newer_build_document(&path, |document| {
+            server_mut(document, 0).insert("root_markers".into(), future.clone().into());
+            server_mut(document, 1).remove("command");
+        });
+        let notes = load_detailed(&path)
+            .unwrap()
+            .set_aside()
+            .collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("missing field"), "{notes:?}");
+    }
+
+    /// Each `f32` is compared at the form it is written in, so a fallback for
+    /// one is still kept.
+    #[test]
+    fn an_unreadable_float_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document.insert("terminal_line_height".into(), "tall".into());
+        });
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.terminal_line_height,
+            AppSettings::default().terminal_line_height
+        );
+        save(&path, &loaded).unwrap();
+        assert_eq!(saved(&path)["terminal_line_height"], "tall".into());
+    }
+
+    /// A value that reads but that this build does not accept, such as a
+    /// range a newer build widened or a key name it added, costs that one
+    /// setting rather than the file, and says so.
+    #[test]
+    fn a_value_this_build_does_not_accept_falls_back_alone_and_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document.insert("ui_scale".into(), 2.5.into());
+            document.insert("terminal_font_size".into(), 18.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+FutureKey"].into());
+            shortcuts.insert("search_projects".into(), vec!["Alt+S"].into());
+        });
+        let loaded = load_detailed(&path).unwrap();
+        let settings = &loaded.settings;
+        let defaults = AppSettings::default();
+        assert_eq!(settings.ui_scale, defaults.ui_scale);
+        assert_eq!(settings.terminal_font_size, 18.0, "the rest is read");
+        assert_eq!(
+            settings.keyboard_shortcuts.new_terminal,
+            defaults.keyboard_shortcuts.new_terminal
+        );
+        assert_eq!(settings.keyboard_shortcuts.search_projects, ["Alt+S"]);
+        let notes = loaded.set_aside().collect::<Vec<_>>();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(
+            notes.iter().any(
+                |note| note.contains("“ui_scale”") && note.contains("ui_scale must be between")
+            )
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("“keyboard_shortcuts.new_terminal”"))
+        );
+
+        let desired = AppSettings {
+            max_hot_cards: settings.max_hot_cards + 1,
+            ..settings.clone()
+        };
+        save_merged(&path, settings, &desired).unwrap();
+        let file = saved(&path);
+        assert_eq!(file["ui_scale"], 2.5.into());
+        assert_eq!(
+            file["keyboard_shortcuts"]["new_terminal"],
+            vec!["Ctrl+FutureKey"].into()
+        );
+        assert_eq!(load(&path).unwrap(), desired);
+
+        // Chosen here, it is this build's value that is saved.
+        let chosen = AppSettings {
+            ui_scale: 1.25,
+            ..desired.clone()
+        };
+        save_merged(&path, &desired, &chosen).unwrap();
+        assert_eq!(saved(&path)["ui_scale"], 1.25.into());
+        assert_eq!(load(&path).unwrap(), chosen);
+    }
+
+    /// A newer build's action that loses every chord to this build is left
+    /// out rather than written unbound.
+    #[test]
+    fn a_kept_shortcut_left_with_no_chord_is_left_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            document["keyboard_shortcuts"]
+                .as_table_mut()
+                .unwrap()
+                .insert("future_action".into(), vec!["Alt+K"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+k".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert!(
+            saved(&path)["keyboard_shortcuts"]
+                .get("future_action")
+                .is_none()
+        );
+    }
+
+    /// A key a newer build added to the custom palette survives both where
+    /// the palette is chosen and where it is kept.
+    #[test]
+    fn a_newer_palette_color_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut palette =
+            toml::Table::try_from(crate::terminal::TerminalTheme::Dark.palette()).unwrap();
+        palette.insert("future_color".into(), "#112233".into());
+        newer_build_document(&path, |document| {
+            let mut custom = toml::Table::new();
+            custom.insert("custom".into(), palette.clone().into());
+            document.insert("terminal_theme".into(), custom.into());
+            document.insert("custom_terminal_theme".into(), palette.clone().into());
+        });
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.terminal_theme,
+            crate::terminal::TerminalTheme::Custom(crate::terminal::TerminalTheme::Dark.palette())
+        );
+        save(&path, &loaded).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["terminal_theme"]["custom"]["future_color"],
+            "#112233".into()
+        );
+        assert_eq!(
+            file["custom_terminal_theme"]["future_color"],
+            "#112233".into()
+        );
+        assert_eq!(load(&path).unwrap(), loaded);
+    }
+
+    /// Saving over a file that cannot be read is how a user recovers it.
+    #[test]
+    fn a_file_that_cannot_be_read_is_saved_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        fs::write(&path, "schema_version = 3\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&path).is_ok() {
+            // Running with the privilege to read it anyway.
+            return;
+        }
+        save(&path, &AppSettings::default()).unwrap();
+        assert_eq!(load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn rejects_future_missing_and_unusable_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
 
         let future = AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION + 1,
@@ -2460,12 +3721,13 @@ next_column = ["Alt+W", "Alt+Right"]
         fs::write(&path, "schema_version = 1\n").unwrap();
         assert!(matches!(load(&path), Err(SettingsError::Toml(_))));
 
+        // An out-of-range value costs only itself.
         let invalid = AppSettings {
             default_column_fraction: 0.1,
             ..AppSettings::default()
         };
         fs::write(&path, toml::to_string(&invalid).unwrap()).unwrap();
-        assert!(matches!(load(&path), Err(SettingsError::Invalid(_))));
+        assert_eq!(load(&path).unwrap(), AppSettings::default());
 
         let too_large = AppSettings {
             hibernation_delay_ms: MAX_TOML_INTEGER + 1,

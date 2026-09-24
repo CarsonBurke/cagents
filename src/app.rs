@@ -1713,6 +1713,8 @@ pub(crate) struct Bootstrap {
     save_health: Option<SaveHealthState>,
     /// Cards that storage held but could not restore. Advisory, never fatal.
     restore_warnings: Vec<String>,
+    /// Settings the file holds that this build could not use. Advisory.
+    settings_warnings: Vec<String>,
 }
 
 /// Loaded before iced starts: session restoration and file locks never wait on
@@ -3692,10 +3694,14 @@ async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Re
 
 impl Cagents {
     fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
+        let mut settings_warnings = Vec::new();
         let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
-                Ok(path) => match settings::load(&path) {
-                    Ok(settings) => (settings, Some(path), false, None),
+                Ok(path) => match settings::load_detailed(&path) {
+                    Ok(loaded) => {
+                        settings_warnings.extend(loaded.set_aside());
+                        (loaded.settings, Some(path), false, None)
+                    }
                     Err(error) => (
                         AppSettings::default(),
                         Some(path),
@@ -3767,6 +3773,7 @@ impl Cagents {
             status,
             save_health,
             restore_warnings,
+            settings_warnings,
         })
     }
 
@@ -9279,6 +9286,7 @@ impl Application for Cagents {
             status,
             save_health,
             restore_warnings,
+            settings_warnings,
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
         let window_view = startup.window_view;
@@ -9474,7 +9482,7 @@ impl Application for Cagents {
         // by message, so distinct failures stay distinct and a repeated one
         // collapses into a count. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        for warning in restore_warnings {
+        for warning in restore_warnings.into_iter().chain(settings_warnings) {
             app.notices.record(TransientNotice::warning(warning));
         }
         if let Some(view) = window_view {

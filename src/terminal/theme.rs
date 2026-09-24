@@ -69,8 +69,9 @@ pub enum TerminalTheme {
     Custom(TerminalPalette),
 }
 
+/// Unknown keys are ignored rather than refused: a newer build may add a
+/// color, and settings keep what this build does not know.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TerminalPalette {
     pub foreground: ThemeColor,
     pub background: ThemeColor,

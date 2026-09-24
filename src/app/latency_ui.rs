@@ -230,6 +230,7 @@ impl Cagents {
             status: None,
             save_health: None,
             restore_warnings: Vec::new(),
+            settings_warnings: Vec::new(),
         }
     }
 }
