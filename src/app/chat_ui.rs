@@ -2057,7 +2057,13 @@ impl Cagents {
             .catalog(provider)
             .map(|catalog| catalog.models.clone())
             .unwrap_or_default();
-        let account = self.default_account(provider);
+        let Some(directory) = self
+            .chat_runtime_mut(target)
+            .map(|runtime| runtime.session.launch.recipe.working_directory.clone())
+        else {
+            return Task::none();
+        };
+        let account = self.default_account_for_directory(provider, &directory);
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -2301,7 +2307,7 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&working_directory) {
             return Task::none();
         }
-        let account = self.default_account(provider);
+        let account = self.default_account_for_directory(provider, &working_directory);
         let session = match fresh_chat_session(
             provider,
             TerminalId::new(),

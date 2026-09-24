@@ -4552,7 +4552,8 @@ impl Cagents {
         for provider in Account::PROVIDERS {
             if let (Some(variable), Some(home)) = (
                 account::home_variable(provider),
-                self.default_account(provider).resolved_home(),
+                self.default_account_for_directory(provider, &working_directory)
+                    .resolved_home(),
             ) {
                 launch
                     .environment

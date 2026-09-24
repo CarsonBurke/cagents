@@ -27,10 +27,11 @@ use uuid::Uuid;
 
 use super::{Account, AccountHome, AccountId, Identity, home::Homes};
 use crate::agent::Provider;
+use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -82,12 +83,20 @@ pub struct Pending {
 pub struct Registry {
     #[serde(default)]
     version: u32,
+    /// Monotonic file revision. Async window callbacks may arrive out of
+    /// order; an older snapshot must never replace a newer account choice.
+    #[serde(default)]
+    revision: u64,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
     /// system account.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     defaults: BTreeMap<String, String>,
+    /// A project's explicit provider choice. An absent entry inherits the
+    /// installation-wide default, including later changes to that default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    project_defaults: BTreeMap<String, BTreeMap<String, String>>,
     /// Names the reader gave the system accounts, by provider executable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     system_labels: BTreeMap<String, String>,
@@ -100,6 +109,10 @@ pub struct Registry {
 const SYSTEM: &str = "system";
 
 impl Registry {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn registered(&self) -> &[Registered] {
         &self.accounts
     }
@@ -133,9 +146,36 @@ impl Registry {
 
     /// The account `provider` starts new conversations on.
     pub fn default_account(&self, provider: Provider, homes: Option<&Homes>) -> Account {
-        let registered = self
-            .defaults
-            .get(provider.executable())
+        self.chosen_account(provider, self.defaults.get(provider.executable()), homes)
+            .unwrap_or_else(|| Account::system(provider))
+    }
+
+    /// The account used for new work in `project`, inheriting the global
+    /// choice when this project has no usable explicit choice.
+    pub fn project_default_account(
+        &self,
+        project: ProjectId,
+        provider: Provider,
+        homes: Option<&Homes>,
+    ) -> Account {
+        self.project_defaults
+            .get(&project.to_string())
+            .and_then(|choices| choices.get(provider.executable()))
+            .and_then(|chosen| self.chosen_account(provider, Some(chosen), homes))
+            .unwrap_or_else(|| self.default_account(provider, homes))
+    }
+
+    fn chosen_account(
+        &self,
+        provider: Provider,
+        chosen: Option<&String>,
+        homes: Option<&Homes>,
+    ) -> Option<Account> {
+        let chosen = chosen?;
+        if chosen == SYSTEM {
+            return Some(Account::system(provider));
+        }
+        let registered = Some(chosen)
             .and_then(|key| Uuid::parse_str(key).ok())
             .and_then(|key| self.find(key))
             .filter(|managed| managed.provider == provider);
@@ -144,18 +184,54 @@ impl Registry {
                 key,
                 linked_home: Some(path),
                 ..
-            }) => Account::linked(provider, *key, path.clone()),
-            Some(registered) => homes.map_or_else(
-                || Account::system(provider),
-                |homes| {
-                    Account::managed(
-                        provider,
-                        registered.key,
-                        homes.path(provider, registered.key),
-                    )
-                },
-            ),
-            None => Account::system(provider),
+            }) => Some(Account::linked(provider, *key, path.clone())),
+            Some(registered) => homes.map(|homes| {
+                Account::managed(
+                    provider,
+                    registered.key,
+                    homes.path(provider, registered.key),
+                )
+            }),
+            None => None,
+        }
+    }
+
+    pub fn project_choice(&self, project: ProjectId, provider: Provider) -> Option<&str> {
+        self.project_defaults
+            .get(&project.to_string())?
+            .get(provider.executable())
+            .map(String::as_str)
+    }
+
+    pub fn is_project_default(&self, project: ProjectId, account: &Account) -> bool {
+        let Some(chosen) = self.project_choice(project, account.provider) else {
+            return false;
+        };
+        match account.registry_key() {
+            Some(key) => Uuid::parse_str(chosen).ok() == Some(key),
+            None => account.is_system() && chosen == SYSTEM,
+        }
+    }
+
+    pub fn set_project_default(&mut self, project: ProjectId, account: &Account) {
+        let chosen = match account.registry_key() {
+            Some(key) => key.hyphenated().to_string(),
+            None if account.is_system() => SYSTEM.to_owned(),
+            None => return,
+        };
+        self.project_defaults
+            .entry(project.to_string())
+            .or_default()
+            .insert(account.provider.executable().to_owned(), chosen);
+    }
+
+    pub fn clear_project_default(&mut self, project: ProjectId, provider: Provider) {
+        let project = project.to_string();
+        if let Some(choices) = self.project_defaults.get_mut(&project) {
+            choices.remove(provider.executable());
+            if choices.is_empty() {
+                self.project_defaults.remove(&project);
+            }
         }
     }
 
@@ -354,6 +430,10 @@ impl Registry {
         let removed = self.accounts.remove(index);
         let key = key.hyphenated().to_string();
         self.defaults.retain(|_, chosen| *chosen != key);
+        self.project_defaults.retain(|_, choices| {
+            choices.retain(|_, chosen| *chosen != key);
+            !choices.is_empty()
+        });
         Some(removed)
     }
 
@@ -415,6 +495,10 @@ impl Store {
         let result = change(&mut registry);
         if registry != before {
             registry.version = VERSION;
+            registry.revision = before
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
             write(&self.directory, &path, &registry)?;
         }
         Ok((registry, result))
@@ -607,6 +691,46 @@ mod tests {
         assert_eq!(registry.registered().len(), 2);
     }
 
+    #[test]
+    fn project_choices_override_global_defaults_and_survive_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("managed"));
+        let project = ProjectId::new();
+        let other = ProjectId::new();
+        let home = directory.path().join("history");
+        fs::create_dir(&home).unwrap();
+        let key = Uuid::new_v4();
+        let linked = Account::linked(Provider::Codex, key, home.clone());
+        store
+            .update(|registry| {
+                registry
+                    .link(Provider::Codex, key, home, None, Some(&homes), 1)
+                    .unwrap();
+                registry.set_project_default(project, &linked);
+            })
+            .unwrap();
+        let mut registry = store.load().unwrap();
+        assert_eq!(
+            registry.project_default_account(project, Provider::Codex, Some(&homes)),
+            linked
+        );
+        assert!(registry.is_project_default(project, &linked));
+        assert_eq!(
+            registry.project_default_account(other, Provider::Codex, Some(&homes)),
+            Account::system(Provider::Codex)
+        );
+        registry.clear_project_default(project, Provider::Codex);
+        assert_eq!(registry.project_choice(project, Provider::Codex), None);
+        registry.set_project_default(project, &linked);
+        registry.unregister(key).unwrap();
+        assert_eq!(registry.project_choice(project, Provider::Codex), None);
+        assert_eq!(
+            registry.project_default_account(project, Provider::Codex, Some(&homes)),
+            Account::system(Provider::Codex)
+        );
+    }
+
     /// A home cagents creates records display metadata only, never CLI
     /// credentials or a path to its files.
     #[test]
@@ -628,9 +752,12 @@ mod tests {
         let document: toml::Table = toml::from_str(&text).unwrap();
         let allowed = [
             "version",
+            "revision",
             "defaults",
+            "project_defaults",
             "system_labels",
             "account",
+            "linked_home",
             "key",
             "provider",
             "label",

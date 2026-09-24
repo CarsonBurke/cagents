@@ -122,11 +122,11 @@ fn default_account_choice<'a>(
     let (label, detail) = match provider {
         crate::agent::Provider::Claude => (
             "Claude",
-            "The account new Claude conversations and shell terminals use. Existing sessions keep their account.",
+            "The account new Claude conversations and shell terminals use unless the project has its own choice. Existing sessions keep their account.",
         ),
         _ => (
             "ChatGPT (Codex)",
-            "The account new ChatGPT conversations and shell terminals use. Existing sessions keep their account.",
+            "The account new ChatGPT conversations and shell terminals use unless the project has its own choice. Existing sessions keep their account.",
         ),
     };
     let buttons: Vec<Element<'a, Message>> = choices

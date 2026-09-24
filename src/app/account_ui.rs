@@ -219,6 +219,9 @@ impl State {
     }
 
     fn set_registry(&mut self, registry: Registry) {
+        if registry.revision() < self.registry.revision() {
+            return;
+        }
         if self.registry != registry {
             self.registry = registry;
             self.sync_accounts();
@@ -656,6 +659,8 @@ pub enum Action {
     },
     CancelLogin(uuid::Uuid),
     SetDefault(AccountId),
+    SetProjectDefault(crate::model::ProjectId, AccountId),
+    ClearProjectDefault(crate::model::ProjectId, Provider),
     Rename(AccountId),
     RenameInput(String),
     RenameCommit,
@@ -693,6 +698,8 @@ impl Action {
                 | Self::LinkCommit
                 | Self::CancelLogin(_)
                 | Self::SetDefault(_)
+                | Self::SetProjectDefault(_, _)
+                | Self::ClearProjectDefault(_, _)
                 | Self::Rename(_)
                 | Self::RenameCommit
                 | Self::Remove(_)
@@ -1795,6 +1802,29 @@ impl Cagents {
                 };
                 self.save_registry(move |registry| registry.set_default(&account))
             }
+            Action::SetProjectDefault(project, id) => {
+                self.account_ui.table.close_popups();
+                if self.sidebar_model.project(project).is_none() {
+                    return Task::none();
+                }
+                let Some(account) = self
+                    .account_ui
+                    .account(&id)
+                    .map(|state| state.account.clone())
+                else {
+                    return Task::none();
+                };
+                self.save_registry(move |registry| registry.set_project_default(project, &account))
+            }
+            Action::ClearProjectDefault(project, provider) => {
+                self.account_ui.table.close_popups();
+                if self.sidebar_model.project(project).is_none() {
+                    return Task::none();
+                }
+                self.save_registry(move |registry| {
+                    registry.clear_project_default(project, provider)
+                })
+            }
             Action::Rename(id) => {
                 self.account_ui.table.menu = None;
                 let Some(state) = self
@@ -2662,11 +2692,56 @@ impl Cagents {
         })
     }
 
-    /// The account `provider` starts a new conversation on.
+    /// The account `provider` starts new work on outside a project.
     pub(super) fn default_account(&self, provider: Provider) -> Account {
         self.account_ui
             .registry
             .default_account(provider, self.account_ui.homes.as_ref())
+    }
+
+    /// The longest known worktree or repository root containing `directory`
+    /// determines its project. This is a short in-memory scan only when
+    /// starting work or drawing the Accounts pane; no filesystem query is needed.
+    fn project_for_directory(&self, directory: &Path) -> Option<(crate::model::ProjectId, &str)> {
+        self.sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| {
+                std::iter::once(project.repository.as_path())
+                    .chain(
+                        project.repository.parent().filter(|parent| {
+                            sidebar::is_primary_worktree(&project.repository, parent)
+                        }),
+                    )
+                    .chain(
+                        project
+                            .worktrees
+                            .iter()
+                            .map(|worktree| worktree.path.as_path()),
+                    )
+                    .filter_map(move |root| {
+                        directory
+                            .starts_with(root)
+                            .then_some((root.components().count(), project))
+                    })
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, project)| (project.id, project.name.as_str()))
+    }
+
+    pub(super) fn default_account_for_directory(
+        &self,
+        provider: Provider,
+        directory: &Path,
+    ) -> Account {
+        let Some((project, _)) = self.project_for_directory(directory) else {
+            return self.default_account(provider);
+        };
+        self.account_ui.registry.project_default_account(
+            project,
+            provider,
+            self.account_ui.homes.as_ref(),
+        )
     }
 
     /// The account named `id`, if it is still known.
@@ -4419,6 +4494,99 @@ mod app_tests {
             launch.environment.get("CODEX_HOME"),
             Some(&home.display().to_string())
         );
+    }
+
+    #[test]
+    fn project_choice_routes_new_shells_and_chats_without_changing_other_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("redact-history");
+        std::fs::create_dir(&home).unwrap();
+        let mut app = app_in_repo();
+        let project = app.sidebar_model.projects[0].id;
+        let key = uuid::Uuid::new_v4();
+        let linked = Account::linked(Provider::Codex, key, home.clone());
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .link(
+                Provider::Codex,
+                key,
+                home.clone(),
+                None,
+                app.account_ui.homes.as_ref(),
+                1,
+            )
+            .unwrap();
+        registry.set_project_default(project, &linked);
+        app.account_ui.set_registry(registry);
+        assert_eq!(
+            app.default_account_for_directory(Provider::Codex, Path::new("/repo/subdir")),
+            linked
+        );
+        assert_eq!(
+            app.default_account_for_directory(Provider::Codex, Path::new("/other")),
+            Account::system(Provider::Codex)
+        );
+
+        let _ = app.add_terminal(PathBuf::from("/repo"));
+        let shell = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|card| match &card.kind {
+                CardKind::Terminal(session) => Some(&session.launch),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            shell.environment.get("CODEX_HOME"),
+            Some(&home.display().to_string())
+        );
+
+        let _ = app.new_native_chat(Provider::Codex, Some(PathBuf::from("/repo")));
+        let chat = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|card| match &card.kind {
+                CardKind::Chat(session) => Some(&session.launch.recipe),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            chat.environment.get("CODEX_HOME"),
+            Some(&home.display().to_string())
+        );
+        app.sidebar_model.projects[0].repository = PathBuf::from("/repo/.git");
+        app.sidebar_model.projects[0].worktrees.clear();
+        assert_eq!(
+            app.default_account_for_directory(Provider::Codex, Path::new("/repo")),
+            linked,
+            "a channel at the repository root keeps its project choice when no worktree is listed"
+        );
+    }
+
+    #[test]
+    fn delayed_account_save_cannot_restore_an_older_choice_in_the_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let project = crate::model::ProjectId::new();
+        let first = store
+            .update(|registry| {
+                registry.set_project_default(project, &Account::system(Provider::Codex));
+            })
+            .unwrap()
+            .0;
+        let second = store
+            .update(|registry| {
+                registry.set_project_default(project, &Account::system(Provider::Claude));
+            })
+            .unwrap()
+            .0;
+        assert!(second.revision() > first.revision());
+        let mut state = State::default();
+        state.set_registry(second.clone());
+        state.set_registry(first);
+        assert_eq!(state.registry, second);
     }
 
     #[test]
