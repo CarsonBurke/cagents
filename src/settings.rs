@@ -1628,7 +1628,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         }
     }
     for path in &absent {
-        tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; its default is used and not written until changed");
+        tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; this build fills it in and writes it only if that is not the plain default");
     }
     let settings = loop {
         let mut unknown = Vec::new();
@@ -1637,9 +1637,12 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
                 unknown.extend(ignored_path(&path, &read));
             }),
         );
-        // A value that no longer decodes once something inside it was set
-        // aside fails because of that, not for a reason of its own.
-        let follow_on = decoded.is_err();
+        // Where a value failed to decode: one that fails around what was just
+        // set aside inside it fails because of that, not for its own reason.
+        let failed_at = decoded
+            .as_ref()
+            .err()
+            .and_then(|error| error_path(error.path()));
         let (path, reason, error) = match decoded {
             Ok(settings) => {
                 let fault = settings.keyboard_shortcuts.fault();
@@ -1673,18 +1676,20 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
             return Err(error);
         };
         // A setting that falls back whole takes with it what was set aside
-        // inside it; when that is why it fell back, the first value set aside
-        // inside it is the reason.
+        // inside it; when setting that aside is why it fell back, its reason
+        // is the reason.
         let inside = |setting: &Foreign| setting.path.starts_with(&path);
         let reason = foreign
-            .iter()
-            .find(|setting| {
-                follow_on
-                    && inside(setting)
-                    && matches!(setting.reason, ForeignReason::UnreadableValue(_))
+            .last()
+            .filter(|last| {
+                inside(last)
+                    && failed_at
+                        .as_ref()
+                        .is_some_and(|failed_at| last.path.starts_with(failed_at))
+                    && matches!(last.reason, ForeignReason::UnreadableValue(_))
             })
-            .map_or(ForeignReason::UnreadableValue(reason), |setting| {
-                setting.reason.clone()
+            .map_or(ForeignReason::UnreadableValue(reason), |last| {
+                last.reason.clone()
             });
         foreign.retain(|setting| !inside(setting));
         foreign.push(Foreign { path, reason });
@@ -1896,7 +1901,7 @@ fn current_document(path: &Path) -> Result<Option<toml::Table>, SettingsError> {
 /// it survives entries being removed or reordered around it; an entry without
 /// one keeps its keys only while it is unchanged at the same position. A
 /// setting the file lacks stays out of it while this build still holds the
-/// value it filled in.
+/// plain default it filled in.
 fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
     // What this build made of the file, as it would write it: `document`
     // differs from it exactly where a setting has changed since.
@@ -3534,6 +3539,19 @@ next_column = ["Alt+W", "Alt+Right"]
         save_merged(&path, &loaded.settings, &desired).unwrap();
         assert_eq!(saved(&path)["language_servers"], original);
         assert_eq!(load(&path).unwrap(), desired);
+
+        // A list that falls back for a fault of another entry reports that
+        // fault, not what was set aside before it.
+        newer_build_document(&path, |document| {
+            server_mut(document, 0).insert("root_markers".into(), future.clone().into());
+            server_mut(document, 1).remove("command");
+        });
+        let notes = load_detailed(&path)
+            .unwrap()
+            .set_aside()
+            .collect::<Vec<_>>();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("missing field"), "{notes:?}");
     }
 
     /// Each `f32` is compared at the form it is written in, so a fallback for
