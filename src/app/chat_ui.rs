@@ -1094,6 +1094,9 @@ pub(super) struct Runtime {
     /// The empty connection was explicitly closed for a model-family change.
     /// Unlike disconnection, this proves there is no old actor left to close.
     provider_closed: bool,
+    /// A fingerprint of the models this conversation last listed to the
+    /// catalog, which takes each list once rather than on every change.
+    listed_models: u64,
     visible: AtomicBool,
     error: Option<String>,
     /// Local send errors anchored to the exchange that produced them.
@@ -1351,6 +1354,7 @@ impl Runtime {
             next_command: 0,
             disconnected: false,
             provider_closed: false,
+            listed_models: 0,
             visible: AtomicBool::new(visible),
             error: None,
             failures: Vec::new(),
@@ -2517,6 +2521,28 @@ impl Cagents {
         self.retire_terminal_surface(terminal, !retains_source_pty(session));
     }
 
+    /// Hands the models the conversation in `card` lists to the catalog a
+    /// new conversation picks from, once for each list it reports.
+    fn list_chat_models(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        let snapshot = runtime.handle.snapshot();
+        let fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            snapshot.models.hash(&mut hasher);
+            hasher.finish()
+        };
+        if snapshot.models.is_empty()
+            || std::mem::replace(&mut runtime.listed_models, fingerprint) == fingerprint
+        {
+            return Task::none();
+        }
+        let provider = runtime.session.launch.provider;
+        self.observe_listed_models(provider, snapshot.models.clone())
+    }
+
     pub(super) fn start_chat(
         &mut self,
         card: CardId,
@@ -3020,6 +3046,7 @@ impl Cagents {
                         };
                         return Task::batch([
                             usage,
+                            self.list_chat_models(target.card),
                             iced::widget::operation::focus(card_control_id(target.card, control))
                                 .map(cosmic::Action::App),
                         ]);
@@ -3210,7 +3237,7 @@ impl Cagents {
                         {
                             self.persist();
                         }
-                        return Task::none();
+                        return self.list_chat_models(target.card);
                     }
                     Wake::Observed => {
                         runtime.handle.take_observed();
@@ -4355,6 +4382,7 @@ mod tests {
         let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: crate::account::UsageSnapshot::state(
                     crate::account::UsageStatus::Ok,

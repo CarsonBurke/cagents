@@ -21,7 +21,7 @@ pub fn omp_data_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
 }
 
 // Declaration order is persisted by the binary IPC codec and indexes ADAPTERS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Provider {
     Omp,
     Claude,

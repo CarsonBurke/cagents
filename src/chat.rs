@@ -714,11 +714,54 @@ pub struct Request {
     /// Explicit provider decisions; no implicit approval or permissive default.
     pub actions: Vec<Choice>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     pub label: String,
     pub reasoning: Vec<String>,
+}
+
+impl Model {
+    /// One entry of the `models` Claude Code's `initialize` control response
+    /// lists, which both a conversation and an account probe receive.
+    pub fn from_claude(value: &serde_json::Value) -> Option<Self> {
+        let id = value["value"].as_str()?;
+        Some(Self {
+            id: id.into(),
+            label: value["displayName"].as_str().unwrap_or(id).into(),
+            reasoning: strings(value["supportedEffortLevels"].as_array(), |effort| {
+                effort.as_str()
+            }),
+        })
+    }
+
+    /// One entry of the Codex app server's `model/list` page.
+    ///
+    /// An entry that does not describe its efforts, or does not name itself
+    /// for the picker, is still a model the user can select, so only the
+    /// unreadable parts are dropped; an entry without an ID is not a model.
+    pub fn from_codex(value: &serde_json::Value) -> Option<Self> {
+        let id = value["model"].as_str()?;
+        Some(Self {
+            id: id.into(),
+            label: value["displayName"].as_str().unwrap_or(id).into(),
+            reasoning: strings(value["supportedReasoningEfforts"].as_array(), |effort| {
+                effort["reasoningEffort"].as_str()
+            }),
+        })
+    }
+}
+
+fn strings(
+    values: Option<&Vec<serde_json::Value>>,
+    read: impl Fn(&serde_json::Value) -> Option<&str>,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .flatten()
+        .filter_map(read)
+        .map(str::to_owned)
+        .collect()
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {

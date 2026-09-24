@@ -27,7 +27,7 @@ use super::*;
 use crate::account::{
     self, Account, AccountId, Identity, LiveReport, UsageSnapshot, UsageSource, UsageStatus,
     UsageWindow,
-    cache::{Cache, Entry},
+    cache::{Cache, Catalog, Entry},
     home::Homes,
     omp::{self, History},
     probe::{self, Outcome},
@@ -89,7 +89,14 @@ pub(super) struct State {
     /// Accounts whose figures a running conversation reported and the cache
     /// has not been given yet.
     live_unsaved: BTreeSet<AccountId>,
-    /// Whether a write of [`State::live_unsaved`] is already due.
+    /// The models each provider last listed, which a new conversation offers
+    /// before any provider's CLI is started for it.
+    catalogs: BTreeMap<Provider, Catalog>,
+    /// Providers whose running conversation listed models the cache has not
+    /// been given yet.
+    catalogs_unsaved: BTreeSet<Provider>,
+    /// Whether a write of [`State::live_unsaved`] and
+    /// [`State::catalogs_unsaved`] is already due.
     saving_live: bool,
     omp: OmpRecord,
 }
@@ -155,6 +162,8 @@ impl State {
             table: table::Table::default(),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
+            catalogs: BTreeMap::new(),
+            catalogs_unsaved: BTreeSet::new(),
             saving_live: false,
             omp: OmpRecord::default(),
         };
@@ -312,6 +321,26 @@ impl State {
         }
     }
 
+    /// The models `provider` last listed, in a conversation or to a probe.
+    pub(super) fn catalog(&self, provider: Provider) -> Option<&Catalog> {
+        self.catalogs.get(&provider)
+    }
+
+    /// Takes what `provider` listed, unless what is known is newer: another
+    /// window's list read from the cache can be older than this window's.
+    /// Whether it was taken.
+    fn take_catalog(&mut self, provider: Provider, catalog: Catalog) -> bool {
+        if self
+            .catalogs
+            .get(&provider)
+            .is_some_and(|known| known.observed_at > catalog.observed_at)
+        {
+            return false;
+        }
+        self.catalogs.insert(provider, catalog);
+        true
+    }
+
     /// Why Omp's usage record could not be read, when it could not.
     pub(super) fn omp_problem(&self) -> Option<&str> {
         self.omp.problem.as_deref()
@@ -332,6 +361,15 @@ impl State {
                     },
                 ))
             })
+            .collect()
+    }
+
+    /// What running conversations listed since the last write leave for the
+    /// cache.
+    fn take_live_catalogs(&mut self) -> Vec<(Provider, Catalog)> {
+        std::mem::take(&mut self.catalogs_unsaved)
+            .into_iter()
+            .filter_map(|provider| Some((provider, self.catalogs.get(&provider)?.clone())))
             .collect()
     }
 
@@ -489,6 +527,7 @@ pub enum Settled {
 pub struct Loaded {
     registry: Result<Registry, String>,
     restored: Vec<Restored>,
+    catalogs: BTreeMap<Provider, Catalog>,
     /// Whether presence was judged on the interface's own `PATH` because the
     /// shell had not yet said what a terminal would search.
     provisional: bool,
@@ -618,15 +657,21 @@ fn now_ms() -> Millis {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-/// Writes figures running conversations reported to the cache other windows
-/// read. Blocking: finding an account's cache key resolves its home.
-fn store_live(cache: &Cache, entries: Vec<(Account, Entry)>) {
+/// Writes figures and models running conversations reported to the cache
+/// other windows read. Blocking: finding an account's cache key resolves its
+/// home.
+fn store_live(cache: &Cache, entries: Vec<(Account, Entry)>, catalogs: Vec<(Provider, Catalog)>) {
     for (account, entry) in entries {
         let Some(key) = account.cache_key() else {
             continue;
         };
         if let Err(error) = cache.store(&key, entry) {
             tracing::debug!(%error, "live account usage could not be cached");
+        }
+    }
+    for (provider, catalog) in catalogs {
+        if let Err(error) = cache.store_catalog(provider, catalog) {
+            tracing::debug!(%error, ?provider, "listed models could not be cached");
         }
     }
 }
@@ -1035,6 +1080,10 @@ impl Cagents {
                     .unwrap_or_else(|_| Account::system_accounts().into());
                 let now = now_ms();
                 let restored = restore(&accounts, cache.as_ref(), now, search_path.as_deref());
+                let catalogs = cache
+                    .as_ref()
+                    .map(|cache| cache.catalogs(now))
+                    .unwrap_or_default();
                 // Not while the registry cannot be read, or its accounts' homes
                 // cannot be found, which would take every added account for
                 // one since removed.
@@ -1047,6 +1096,7 @@ impl Cagents {
                 Loaded {
                     registry,
                     restored,
+                    catalogs,
                     provisional,
                 }
             })
@@ -1054,6 +1104,7 @@ impl Cagents {
             .unwrap_or_else(|_| Loaded {
                 registry: Err("The accounts could not be read".into()),
                 restored: Vec::new(),
+                catalogs: BTreeMap::new(),
                 provisional,
             });
             Message::AccountUi(Action::Loaded(loaded))
@@ -1392,6 +1443,27 @@ impl Cagents {
         Task::batch([save, probe])
     }
 
+    /// Takes the models a running conversation of `provider` listed, and
+    /// queues them for the cache like its figures.
+    pub(super) fn observe_listed_models(
+        &mut self,
+        provider: Provider,
+        models: Vec<crate::chat::Model>,
+    ) -> Task<Message> {
+        let catalog = Catalog {
+            models,
+            observed_at: now_ms(),
+        };
+        if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog) {
+            return Task::none();
+        }
+        if self.account_ui.cache.is_none() {
+            return Task::none();
+        }
+        self.account_ui.catalogs_unsaved.insert(provider);
+        self.schedule_live_save()
+    }
+
     /// Queues `id`'s figures for the cache, written a little later together
     /// with whatever else arrives meanwhile.
     fn save_live(&mut self, id: AccountId) -> Task<Message> {
@@ -1399,6 +1471,10 @@ impl Cagents {
             return Task::none();
         }
         self.account_ui.live_unsaved.insert(id);
+        self.schedule_live_save()
+    }
+
+    fn schedule_live_save(&mut self) -> Task<Message> {
         if std::mem::replace(&mut self.account_ui.saving_live, true) {
             return Task::none();
         }
@@ -1441,6 +1517,9 @@ impl Cagents {
                     }
                 }
                 self.account_ui.restore(loaded.restored);
+                for (provider, catalog) in loaded.catalogs {
+                    self.account_ui.take_catalog(provider, catalog);
+                }
                 let locate = if loaded.provisional {
                     self.locate_accounts()
                 } else {
@@ -1472,16 +1551,19 @@ impl Cagents {
             Action::SaveLive => {
                 self.account_ui.saving_live = false;
                 let entries = self.account_ui.take_live_entries();
+                let catalogs = self.account_ui.take_live_catalogs();
                 let Some(cache) = self
                     .account_ui
                     .cache
                     .clone()
-                    .filter(|_| !entries.is_empty())
+                    .filter(|_| !entries.is_empty() || !catalogs.is_empty())
                 else {
                     return Task::none();
                 };
                 cosmic::iced::Task::future(async move {
-                    let _ = tokio::task::spawn_blocking(move || store_live(&cache, entries)).await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || store_live(&cache, entries, catalogs))
+                            .await;
                 })
                 .discard()
             }
@@ -1709,9 +1791,17 @@ impl Cagents {
         }
     }
 
-    fn account_probed(&mut self, id: AccountId, outcome: Outcome) -> Task<Message> {
+    fn account_probed(&mut self, id: AccountId, mut outcome: Outcome) -> Task<Message> {
         let now = now_ms();
         self.account_ui.now_ms = now;
+        // The probe cached what its CLI listed itself.
+        if let Outcome::Answered { catalog, .. } = &mut outcome
+            && let Some(catalog) = catalog.take()
+            && let Some(state) = self.account_ui.account(&id)
+        {
+            let provider = state.account.provider;
+            self.account_ui.take_catalog(provider, catalog);
+        }
         let Some(state) = self.account_ui.account_mut(&id) else {
             return Task::none();
         };
@@ -1730,7 +1820,9 @@ impl Cagents {
                 state.schedule.abandon();
             }
             // A probe's own answer is always the newest.
-            Outcome::Answered { identity, snapshot } => {
+            Outcome::Answered {
+                identity, snapshot, ..
+            } => {
                 state.schedule.succeed(snapshot.observed_at);
                 if snapshot.status != UsageStatus::NeedsLogin {
                     state.schedule.login_settled();
@@ -2173,7 +2265,9 @@ impl Cagents {
         };
         let login = &mut self.account_ui.logins[index];
         let (identity, snapshot) = match outcome {
-            Outcome::Answered { identity, snapshot } => (identity, snapshot),
+            Outcome::Answered {
+                identity, snapshot, ..
+            } => (identity, snapshot),
             // A CLI that cannot say who it signed in as right now is asked
             // again a little later. A login that cannot be confirmed at all
             // is neither added nor thrown away: it stays pending, and the
@@ -3676,6 +3770,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             id: id.clone(),
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: snapshot.clone(),
             },
@@ -3698,6 +3793,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             id: id.clone(),
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: Some(account::Identity {
                     email: Some("someone@example.com".into()),
                     organization: None,
@@ -3739,6 +3835,74 @@ mod app_tests {
         recipe
     }
 
+    /// The models each provider lists come from the cache at startup, from
+    /// probes and from running conversations; the newest list wins, and one a
+    /// conversation listed reaches other windows through the cache.
+    #[test]
+    fn listed_models_are_kept_newest_first_and_shared() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.cache = Some(cache.clone());
+        let managed = app.account_ui.add_managed_fixture(Provider::Codex, 3);
+        let model = |id: &str| crate::chat::Model {
+            id: id.into(),
+            label: id.into(),
+            reasoning: Vec::new(),
+        };
+        let catalog = |observed_at, id: &str| Catalog {
+            models: vec![model(id)],
+            observed_at,
+        };
+        let now = now_ms();
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(app.account_ui.registry.clone()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached"))]),
+            provisional: false,
+        })));
+        let listed = |app: &Cagents, provider| {
+            app.account_ui
+                .catalog(provider)
+                .map(|catalog| catalog.models[0].id.clone())
+        };
+        assert_eq!(listed(&app, Provider::Codex).as_deref(), Some("cached"));
+
+        // A probe's list replaces an older one, and is not written again:
+        // the probe cached it.
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "ok", now - 5_000);
+        snapshot.source = UsageSource::Probe;
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            id: managed.clone(),
+            outcome: Outcome::Answered {
+                identity: None,
+                snapshot: snapshot.clone(),
+                catalog: Some(catalog(now - 5_000, "probed")),
+            },
+        }));
+        assert_eq!(listed(&app, Provider::Codex).as_deref(), Some("probed"));
+        assert!(app.account_ui.catalogs_unsaved.is_empty());
+        // An older list, from another window's cache, does not rewind it.
+        assert!(
+            !app.account_ui
+                .take_catalog(Provider::Codex, catalog(1, "older"))
+        );
+
+        // A conversation's list is newer still, and is queued for the cache.
+        let _ = app.observe_listed_models(Provider::Omp, Vec::new());
+        assert!(app.account_ui.catalog(Provider::Omp).is_none(), "no list");
+        let _ = app.observe_listed_models(Provider::Codex, vec![model("live")]);
+        assert_eq!(listed(&app, Provider::Codex).as_deref(), Some("live"));
+        assert!(app.account_ui.saving_live);
+        let catalogs = app.account_ui.take_live_catalogs();
+        assert!(app.account_ui.catalogs_unsaved.is_empty());
+        store_live(&cache, Vec::new(), catalogs);
+        assert_eq!(
+            cache.catalogs(now_ms())[&Provider::Codex].models,
+            [model("live")]
+        );
+    }
+
     /// Figures a running conversation reports refine the reading of the
     /// account its launch points at, count as a probe - a focused window's
     /// tick asks every other account that is due, but not that one - and
@@ -3770,6 +3934,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             id: managed.clone(),
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: probed,
             },
@@ -3816,7 +3981,7 @@ mod app_tests {
         assert_eq!(app.account_ui.live_unsaved.len(), 1);
         let entries = app.account_ui.take_live_entries();
         assert!(app.account_ui.live_unsaved.is_empty());
-        store_live(&cache, entries);
+        store_live(&cache, entries, Vec::new());
         let key = app
             .account_ui
             .account(&managed)
@@ -3876,6 +4041,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             registry: Ok(Registry::default()),
             restored: judged(false),
+            catalogs: BTreeMap::new(),
             provisional: true,
         })));
         for id in [&claude, &codex] {
@@ -3889,6 +4055,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             id: codex.clone(),
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: probed.clone(),
             },
@@ -3921,6 +4088,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
             registry: Ok(Registry::default()),
             restored: judged(true),
+            catalogs: BTreeMap::new(),
             provisional: true,
         })));
         let _ = app.update(Message::AccountUi(Action::Popover(Some(claude.clone()))));
@@ -3941,6 +4109,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::Probed {
             id: id.clone(),
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
             },
@@ -4168,6 +4337,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key: old,
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", now),
             },
@@ -4186,6 +4356,7 @@ mod app_tests {
         let _ = app.update(Message::AccountUi(Action::LoginVerified {
             key,
             outcome: Outcome::Answered {
+                catalog: None,
                 identity: None,
                 snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW),
             },

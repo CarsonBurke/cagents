@@ -948,27 +948,10 @@ impl Adapter for Codex {
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
-                        let id = string(value, "model")?.to_owned();
-                        // A catalog entry that does not describe its efforts,
-                        // or does not name itself for the picker, is still a
-                        // model the user can select, so the unreadable parts
-                        // are dropped rather than the whole catalog with the
-                        // session it arrived in.
-                        let reasoning: Vec<String> = value["supportedReasoningEfforts"]
-                            .as_array()
-                            .map(|efforts| {
-                                efforts
-                                    .iter()
-                                    .filter_map(|effort| effort["reasoningEffort"].as_str())
-                                    .map(str::to_owned)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let model = Model {
-                            id: id.clone(),
-                            label: value["displayName"].as_str().unwrap_or(&id).into(),
-                            reasoning,
-                        };
+                        let model = Model::from_codex(value).ok_or_else(|| {
+                            "Unsupported Codex frame: missing string model".to_owned()
+                        })?;
+                        let id = model.id.clone();
                         if let Some(existing) = self.models.iter_mut().find(|m| m.id == id) {
                             *existing = model;
                         } else {
