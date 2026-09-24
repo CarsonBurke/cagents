@@ -326,6 +326,14 @@ impl State {
         self.catalogs.get(&provider)
     }
 
+    /// Whether a new conversation can be started on `provider`: it has
+    /// listed its models before, or one of its accounts has a CLI to run.
+    pub(super) fn offers(&self, provider: Provider) -> bool {
+        self.catalog(provider)
+            .is_some_and(|catalog| !catalog.models.is_empty())
+            || self.of(provider).any(|account| account.present)
+    }
+
     /// Takes what `provider` listed, unless what is known is newer: another
     /// window's list read from the cache can be older than this window's.
     /// Whether it was taken.
@@ -1457,6 +1465,7 @@ impl Cagents {
         if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog) {
             return Task::none();
         }
+        self.refresh_chat_drafts();
         if self.account_ui.cache.is_none() {
             return Task::none();
         }
@@ -1520,6 +1529,7 @@ impl Cagents {
                 for (provider, catalog) in loaded.catalogs {
                     self.account_ui.take_catalog(provider, catalog);
                 }
+                self.refresh_chat_drafts();
                 let locate = if loaded.provisional {
                     self.locate_accounts()
                 } else {
@@ -1800,7 +1810,9 @@ impl Cagents {
             && let Some(state) = self.account_ui.account(&id)
         {
             let provider = state.account.provider;
-            self.account_ui.take_catalog(provider, catalog);
+            if self.account_ui.take_catalog(provider, catalog) {
+                self.refresh_chat_drafts();
+            }
         }
         let Some(state) = self.account_ui.account_mut(&id) else {
             return Task::none();

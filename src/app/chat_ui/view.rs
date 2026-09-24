@@ -676,16 +676,57 @@ impl Cagents {
                     runtime.session.launch.provider,
                     &runtime.session.launch.recipe,
                 );
+                // A draft chooses among every provider it could start on; a
+                // started conversation only among its own provider's models.
+                let offers = if runtime.choosing() {
+                    MODEL_FAMILIES
+                        .into_iter()
+                        .filter(|provider| {
+                            *provider == runtime.session.launch.provider
+                                || self.account_ui.offers(*provider)
+                        })
+                        .map(|provider| Offer {
+                            provider,
+                            models: self
+                                .account_ui
+                                .catalog(provider)
+                                .map_or(&[][..], |catalog| catalog.models.as_slice()),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 runtime.view(
                     self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
                     self.settings.chat_enter_sends,
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
+                    offers,
                 )
             }
             _ => widget::text::body("Connecting to native chat…").into(),
         }
+    }
+}
+
+/// The providers a draft offers, in the order its picker lists them.
+const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+
+/// One provider's models, as a draft's picker offers them.
+struct Offer<'a> {
+    provider: Provider,
+    /// What the provider listed last. Empty where it never has, and then
+    /// the picker offers the provider's default model alone.
+    models: &'a [chat::Model],
+}
+
+/// What a provider is called where its models are listed.
+fn family_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Codex => "ChatGPT",
+        Provider::Claude => "Claude",
+        Provider::Omp => "Other models",
     }
 }
 
@@ -696,17 +737,22 @@ struct Place {
 }
 
 impl Runtime {
-    fn view(
-        &self,
+    fn view<'a>(
+        &'a self,
         transitioning: bool,
         enter_sends: bool,
         place: Place,
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
-    ) -> Element<'_, Message> {
+        offers: Vec<Offer<'a>>,
+    ) -> Element<'a, Message> {
         let target = self.target;
-        let available =
-            !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
+        // Nothing is sent past a first message still waiting to go.
+        let available = !transitioning
+            && !self.disconnected
+            && !self.snapshot.exited
+            && self.pending.is_none()
+            && self.queued.is_none();
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
@@ -732,7 +778,7 @@ impl Runtime {
                 self.paging() == Some(Page::Earlier),
             ));
         }
-        if self.turns.is_empty() {
+        if self.turns.is_empty() && self.queued.is_none() {
             // The empty state says what to do. It used to show whatever the
             // adapter's last status detail was, which meant an empty
             // conversation greeted the reader with a connection state instead
@@ -762,6 +808,9 @@ impl Runtime {
         }
         if snapshot.has_later {
             transcript.push(paging_view(Page::Newer, self.paging() == Some(Page::Newer)));
+        }
+        if let Some(queued) = &self.queued {
+            transcript.push(self.queued_view(queued));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -817,7 +866,9 @@ impl Runtime {
             transcript,
             snapshot.items.first().map(|item| item.id.as_str()),
         ));
-        if transitioning {
+        // A draft starting for its first message says so on the message
+        // itself.
+        if transitioning && self.queued.is_none() {
             content.push(body(
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             ));
@@ -1227,7 +1278,9 @@ impl Runtime {
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         let failed = self.error.is_some() || snapshot.error.is_some();
-        let (glyph, state): (Option<&'static str>, &str) = if transitioning {
+        let (glyph, state): (Option<&'static str>, &str) = if self.queued.is_some() {
+            (Some("agent-working-symbolic"), "Starting")
+        } else if transitioning {
             (Some("agent-working-symbolic"), "Switching session")
         } else if self.attachment_chooser_pending {
             (Some("agent-working-symbolic"), "Choosing attachments")
@@ -1293,7 +1346,7 @@ impl Runtime {
                 .into(),
             );
         }
-        status.extend(self.session_controls(transitioning, accounts));
+        status.extend(self.session_controls(transitioning, accounts, offers));
         // What the conversation has spent is pinned to the pane's right edge
         // instead of joining that run. The budget and the money are the two
         // figures a reader consults deliberately, and mixing them into the
@@ -1490,30 +1543,42 @@ impl Runtime {
     /// they were about to send. While a session is switching they are drawn as
     /// plain text: the values still matter, and a row of disabled controls
     /// says nothing a reader can act on.
-    fn session_controls(
-        &self,
+    fn session_controls<'a>(
+        &'a self,
         transitioning: bool,
         accounts: Option<ChatAccounts>,
-    ) -> Vec<Element<'_, Message>> {
+        offers: Vec<Offer<'a>>,
+    ) -> Vec<Element<'a, Message>> {
         let target = self.target;
         let snapshot = &self.snapshot;
-        let mut controls: Vec<Element<'_, Message>> = Vec::new();
+        let mut controls: Vec<Element<'a, Message>> = Vec::new();
         if let Some(accounts) = accounts {
             controls.push(self.account_picker(accounts, transitioning));
         }
-        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty())
-            || self.can_choose_provider()
-        {
-            let current = snapshot
+        let draft = self.is_draft();
+        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
+            let label: Cow<'a, str> = match snapshot
                 .models
                 .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref());
+                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
+            {
+                Some(model) => model.label.as_str().into(),
+                None => match &snapshot.selected_model {
+                    // A model the provider no longer lists is still the one
+                    // chosen, so it is named rather than hidden.
+                    Some(id) => id.as_str().into(),
+                    None if draft => format!(
+                        "{} · Default model",
+                        family_label(self.session.launch.provider)
+                    )
+                    .into(),
+                    None => "Model".into(),
+                },
+            };
             if transitioning {
-                controls.push(
-                    design::caption(current.map_or("Model", |model| model.label.as_str())).into(),
-                );
+                controls.push(design::caption(label).into());
             } else {
-                controls.push(self.model_picker(current));
+                controls.push(self.model_picker(label, offers));
             }
         }
         if snapshot.capabilities.reasoning_selection
@@ -1616,11 +1681,9 @@ impl Runtime {
             .ellipsize(iced::widget::text::Ellipsize::End(
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
-        let icon = widget::icon(crate::ui_controls::provider_icon(
-            self.session.launch.provider,
-        ))
-        .size(design::COMPACT_ICON_SIZE);
-        if transitioning || !self.can_choose_provider() {
+        let icon = widget::icon(crate::ui_controls::symbolic_icon("avatar-default-symbolic"))
+            .size(design::COMPACT_ICON_SIZE);
+        if transitioning || !self.choosing() {
             // Fixed: stated, not offered.
             return crate::interaction::tooltip(
                 widget::row::with_children(vec![icon.into(), label.into()])
@@ -1728,24 +1791,26 @@ impl Runtime {
     /// Enter with the top match and Escape by dismissing, so a model can be
     /// changed without the pointer ever entering the list.
     ///
-    /// `current` is the model the conversation is on. It stays in the list
-    /// and stays marked, because the first thing a reader opening this wants
-    /// to know is which one they are already using.
-    fn model_picker<'a>(&'a self, current: Option<&'a chat::Model>) -> Element<'a, Message> {
+    /// The anchor carries the provider's mark, because a draft's model is
+    /// also its choice of agent: the one control says both which model and
+    /// whose.
+    fn model_picker<'a>(
+        &'a self,
+        label: Cow<'a, str>,
+        offers: Vec<Offer<'a>>,
+    ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
-                design::caption(current.map_or(
-                    match self.session.launch.provider {
-                        Provider::Codex => "ChatGPT · Model",
-                        Provider::Claude => "Claude · Model",
-                        Provider::Omp => "Other models",
-                    },
-                    |model| model.label.as_str(),
+                widget::icon(crate::ui_controls::provider_icon(
+                    self.session.launch.provider,
                 ))
-                .wrapping(iced::widget::text::Wrapping::None)
+                .size(design::COMPACT_ICON_SIZE)
                 .into(),
+                design::caption(label)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
                 widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
                     .size(design::COMPACT_ICON_SIZE)
                     .into(),
@@ -1759,7 +1824,7 @@ impl Runtime {
         .on_press(action(Action::ModelPicker(target, !open)));
         crate::ui_controls::popover(
             anchor,
-            self.model_search(),
+            self.model_search(offers),
             widget::popover::Position::Top,
             action(Action::ModelPicker(target, false)),
         )
@@ -1768,44 +1833,32 @@ impl Runtime {
     /// The search field and list, pinned above the status line the picker
     /// sits on, or nothing while the picker is closed.
     ///
+    /// A started conversation lists its own provider's models. A draft lists
+    /// every provider it could start on, in one list under a heading for
+    /// each, because which agent to talk to is part of choosing the model
+    /// rather than a mode the list is in.
+    ///
     /// The shared popover anchors this above its control without changing the
     /// transcript's height or scroll position.
-    fn model_search(&self) -> Option<Element<'_, Message>> {
+    fn model_search<'a>(&'a self, offers: Vec<Offer<'a>>) -> Option<Element<'a, Message>> {
         let query = self.model_picker.as_deref()?;
-        let models = model_list(
+        let provider = self.session.launch.provider;
+        let draft = self.is_draft();
+        let offers = if draft {
+            offers
+        } else {
+            vec![Offer {
+                provider,
+                models: &self.snapshot.models,
+            }]
+        };
+        Some(model_list(
             self.target,
-            &self.snapshot.models,
-            self.snapshot.selected_model.as_deref(),
+            &offers,
+            draft,
+            (provider, self.snapshot.selected_model.as_deref()),
             query,
-        );
-        if !self.can_choose_provider() {
-            return Some(models);
-        }
-        let families = widget::row::with_children(
-            [
-                (Provider::Codex, "ChatGPT"),
-                (Provider::Claude, "Claude"),
-                (Provider::Omp, "Other models"),
-            ]
-            .into_iter()
-            .map(|(provider, label)| {
-                widget::button::custom(design::body(label))
-                    .class(crate::ui_controls::control_style(
-                        provider == self.session.launch.provider,
-                        None,
-                    ))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::ChooseProvider(self.target, provider)))
-                    .into()
-            })
-            .collect::<Vec<_>>(),
-        )
-        .spacing(step::GAP_XS);
-        Some(
-            widget::column::with_children(vec![families.into(), models])
-                .spacing(step::GAP_S)
-                .into(),
-        )
+        ))
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -1856,6 +1909,68 @@ impl Runtime {
         } else {
             description
         }
+    }
+
+    /// A draft's first message while its conversation starts.
+    ///
+    /// It is drawn where it will be once sent, as the reader's own message,
+    /// with what it is waiting on under it: sending it cleared the composer,
+    /// and a message that vanished until the provider answered would read
+    /// as lost.
+    fn queued_view<'a>(&'a self, queued: &'a Queued) -> Element<'a, Message> {
+        let waiting = if queued.since.is_none() {
+            format!("Starting {}…", family_label(self.session.launch.provider))
+        } else {
+            "Sending…".to_owned()
+        };
+        let mut rows: Vec<Element<'a, Message>> = vec![
+            widget::container(
+                widget::text(queued.text.trim_end())
+                    .size(design::TEXT_PROSE)
+                    .width(Length::Shrink),
+            )
+            .class(design::surface(
+                Some(design::accent_wash),
+                [
+                    design::RADIUS_L,
+                    design::RADIUS_L,
+                    design::RADIUS_XS,
+                    design::RADIUS_L,
+                ],
+                false,
+            ))
+            .padding([step::GAP_S as u16, step::GAP_M as u16])
+            .max_width(PROMPT_MEASURE)
+            .into(),
+        ];
+        for attachment in &queued.attachments {
+            rows.push(
+                design::caption(Self::attachment_label(
+                    attachment.path.to_str().unwrap_or_default(),
+                    "",
+                ))
+                .into(),
+            );
+        }
+        rows.push(
+            widget::row::with_children(vec![
+                crate::ui_controls::activity_spinner_tone(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::accent_color,
+                ),
+                design::caption(waiting)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+        widget::column::with_children(rows)
+            .spacing(step::GAP_XS)
+            .align_x(Alignment::End)
+            .width(Length::Fill)
+            .into()
     }
 
     /// The user's own message.
@@ -2327,88 +2442,198 @@ fn answers_view<'a>(
     .into()
 }
 
-/// The search field and the models `query` names.
+/// One row of the model list: a model, or a provider's default where it has
+/// not listed any.
+struct ModelRow<'a> {
+    provider: Provider,
+    model: Option<&'a chat::Model>,
+}
+
+impl ModelRow<'_> {
+    /// What choosing the row does: a draft is pointed at it, and a started
+    /// conversation asked to switch to it.
+    fn choose(&self, target: Target, draft: bool) -> Message {
+        let id = self.model.map(|model| model.id.clone());
+        match id {
+            Some(id) if !draft => action(Action::Model(target, id)),
+            id => action(Action::DraftModel(target, self.provider, id)),
+        }
+    }
+}
+
+/// The rows `query` names in each of `offers`, grouped by provider.
+///
+/// A query naming a provider names every model it offers, so "claude" lists
+/// Claude's models whatever they are called. A provider that has never
+/// listed its models is still a choice: its default.
+fn model_rows<'a>(offers: &[Offer<'a>], query: &str) -> Vec<(Provider, Vec<ModelRow<'a>>)> {
+    let needle = query.trim().to_lowercase();
+    offers
+        .iter()
+        .filter_map(|offer| {
+            let named = !needle.is_empty()
+                && family_label(offer.provider)
+                    .to_lowercase()
+                    .contains(&needle);
+            let rows: Vec<ModelRow<'a>> = if offer.models.is_empty() {
+                (needle.is_empty() || named || "default".contains(&needle))
+                    .then_some(ModelRow {
+                        provider: offer.provider,
+                        model: None,
+                    })
+                    .into_iter()
+                    .collect()
+            } else {
+                model_hits(offer.models, if named { "" } else { query })
+                    .into_iter()
+                    .map(|model| ModelRow {
+                        provider: offer.provider,
+                        model: Some(model),
+                    })
+                    .collect()
+            };
+            (!rows.is_empty()).then_some((offer.provider, rows))
+        })
+        .collect()
+}
+
+/// The search field and the models `query` names among `offers`, under a
+/// heading for each provider where there is more than one to choose from.
+///
+/// `current` is the provider and model the conversation is on. It stays in
+/// the list and stays marked, because the first thing a reader opening this
+/// wants to know is which one they are already using.
 fn model_list<'a>(
     target: Target,
-    models: &'a [chat::Model],
-    selected_model: Option<&str>,
+    offers: &[Offer<'a>],
+    draft: bool,
+    current: (Provider, Option<&str>),
     query: &'a str,
 ) -> Element<'a, Message> {
-    let hits = model_hits(models, query);
-    let top = hits.first().map(|model| model.id.clone());
-    let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    if hits.is_empty() {
+    let groups = model_rows(offers, query);
+    let top = groups
+        .first()
+        .and_then(|(_, rows)| rows.first())
+        .map(|row| row.choose(target, draft));
+    let headed = draft && offers.len() > 1;
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+    if groups.is_empty() {
         rows.push(
             design::caption("No model matches that.")
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .into(),
         );
     }
-    for model in hits {
-        let selected = Some(model.id.as_str()) == selected_model;
-        let mut label: Vec<Element<'_, Message>> = vec![
-            design::body(model.label.as_str())
-                .wrapping(iced::widget::text::Wrapping::None)
+    for (index, (provider, models)) in groups.into_iter().enumerate() {
+        if headed {
+            rows.push(
+                widget::container(
+                    widget::row::with_children(vec![
+                        widget::icon(crate::ui_controls::provider_icon(provider))
+                            .size(design::COMPACT_ICON_SIZE)
+                            .into(),
+                        design::caption(family_label(provider))
+                            .class(cosmic::theme::Text::Custom(design::muted_text))
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                )
+                // Groups are set apart by the space above their heading
+                // rather than by a rule, which would be one more line in a
+                // list that is all lines.
+                .padding(
+                    iced::Padding::from([step::GAP_XS, step::GAP_S]).top(if index == 0 {
+                        step::GAP_XS
+                    } else {
+                        step::GAP_M
+                    }),
+                )
                 .into(),
-        ];
-        // The identifier is shown only where it is not already the label,
-        // because most providers use one string for both and a row that
-        // prints it twice is half a list of duplicates.
-        if model.id != model.label {
-            label.push(
-                design::caption(model.id.as_str())
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
             );
         }
-        rows.push(
-            widget::button::custom(
-                widget::row::with_children(vec![
-                    // The mark keeps its column whether or not this row
-                    // carries it, so the labels stay in one line down the
-                    // list instead of stepping in and out.
-                    if selected {
-                        widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
-                            .size(design::COMPACT_ICON_SIZE)
-                            .into()
-                    } else {
-                        iced::widget::Space::new()
-                            .width(f32::from(design::COMPACT_ICON_SIZE))
-                            .into()
-                    },
-                    widget::column::with_children(label)
-                        .width(Length::Fill)
+        for row in models {
+            let selected =
+                provider == current.0 && row.model.map(|model| model.id.as_str()) == current.1;
+            let (title, id) = match row.model {
+                Some(model) => (model.label.as_str(), Some(model.id.as_str())),
+                None => ("Default model", None),
+            };
+            let mut label: Vec<Element<'a, Message>> = vec![
+                design::body(title)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ];
+            // The identifier is shown only where it is not already the
+            // label, because most providers use one string for both and a
+            // row that prints it twice is half a list of duplicates.
+            let detail = match id {
+                Some(id) if id != title => Some(id),
+                Some(_) => None,
+                None => Some("Its models are listed once it has run"),
+            };
+            if let Some(detail) = detail {
+                label.push(
+                    design::caption(detail)
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center),
-            )
-            .name(model.label.as_str())
-            .class(crate::ui_controls::control_style(selected, None))
-            .selected(selected)
-            .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
-            // The row spans the list, so the highlight under the model in use
-            // is a band across it rather than a patch the width of its name.
-            .width(Length::Fill)
-            .on_press(action(Action::Model(target, model.id.clone())))
-            .into(),
-        );
+                );
+            }
+            rows.push(
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        // The mark keeps its column whether or not this row
+                        // carries it, so the labels stay in one line down
+                        // the list instead of stepping in and out.
+                        if selected {
+                            widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
+                                .size(design::COMPACT_ICON_SIZE)
+                                .into()
+                        } else {
+                            iced::widget::Space::new()
+                                .width(f32::from(design::COMPACT_ICON_SIZE))
+                                .into()
+                        },
+                        widget::column::with_children(label)
+                            .width(Length::Fill)
+                            .into(),
+                    ])
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center),
+                )
+                .name(title)
+                .class(crate::ui_controls::control_style(selected, None))
+                .selected(selected)
+                .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
+                // The row spans the list, so the highlight under the model in
+                // use is a band across it rather than a patch the width of its
+                // name.
+                .width(Length::Fill)
+                .on_press(row.choose(target, draft))
+                .into(),
+            );
+        }
     }
     widget::column::with_children(vec![
-        widget::search_input("Search models", query)
-            .id(card_control_id(target.card, "chat-model-search"))
-            .size(design::TEXT_BODY)
-            .width(Length::Fill)
-            .on_input(move |query| action(Action::ModelQuery(target, query)))
-            // Enter takes the top match, which is what makes three keystrokes
-            // enough to change model.
-            .on_submit_maybe(
-                top.map(move |id| move |_: String| action(Action::Model(target, id.clone()))),
-            )
-            // The popover owns dismissal. Unfocusing on mouse-down inside a
-            // model row must not remove that row before its mouse-up selects it.
-            .into(),
+        widget::search_input(
+            if headed {
+                "Search models and providers"
+            } else {
+                "Search models"
+            },
+            query,
+        )
+        .id(card_control_id(target.card, "chat-model-search"))
+        .size(design::TEXT_BODY)
+        .width(Length::Fill)
+        .on_input(move |query| action(Action::ModelQuery(target, query)))
+        // Enter takes the top match, which is what makes three keystrokes
+        // enough to change model.
+        .on_submit_maybe(top.map(|choice| move |_: String| choice.clone()))
+        // The popover owns dismissal. Unfocusing on mouse-down inside a
+        // model row must not remove that row before its mouse-up selects it.
+        .into(),
         widget::container(
             widget::scrollable(
                 widget::column::with_children(rows)
@@ -2866,7 +3091,11 @@ mod tests {
             generation: 1,
         };
         let models = vec![model("gpt-selected", "ChatGPT selected")];
-        let mut element = model_list(target, &models, None, "");
+        let offers = [Offer {
+            provider: Provider::Codex,
+            models: &models,
+        }];
+        let mut element = model_list(target, &offers, false, (Provider::Codex, None), "");
         let mut tree = Tree::new(element.as_widget());
         let viewport = Rectangle::new(Point::ORIGIN, Size::new(300., 400.));
         let node = element.as_widget_mut().layout(

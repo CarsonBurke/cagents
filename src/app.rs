@@ -4008,12 +4008,10 @@ impl Cagents {
                     // handoff or a fresh resume is not knowable here: only the
                     // live daemon proof answers it, and that is read on the
                     // connection. The card states what it wants.
-                    repository_tasks.push(self.start_chat(
+                    repository_tasks.push(self.open_chat(
                         card.id,
                         session,
                         crate::chat::Intent::Restore,
-                        None,
-                        false,
                     ));
                 }
                 #[cfg(feature = "integrated-browser")]
@@ -4503,9 +4501,7 @@ impl Cagents {
                 self.cards.insert(id, CardRuntime::Loading);
                 self.start_terminal(id, session, true, false)
             }
-            CardKind::Chat(session) => {
-                self.start_chat(id, session, crate::chat::Intent::Start, None, false)
-            }
+            CardKind::Chat(session) => self.open_chat(id, session, crate::chat::Intent::Start),
             #[cfg(feature = "integrated-browser")]
             CardKind::Browser(_) => self.retry_card(id),
             #[cfg(not(feature = "integrated-browser"))]
@@ -5823,9 +5819,7 @@ impl Cagents {
                     .insert(card, CardRuntime::PullRequests(Box::new(pane)));
                 self.open_pending_pull_request(card)
             }
-            CardKind::Chat(session) => {
-                self.start_chat(card, session, crate::chat::Intent::Restore, None, false)
-            }
+            CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
             CardKind::Settings | CardKind::Accounts => {
                 unreachable!("utility panes return before a retry registers them")
             }
@@ -6875,59 +6869,52 @@ impl Cagents {
             }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
-                    widget::column::with_children(
-                        vec![
-                            widget::row::with_children(vec![
-                                widget::icon::from_name("dialog-warning-symbolic")
-                                    .size(24)
-                                    .into(),
-                                widget::text::title3(labels.unavailable).into(),
-                            ])
-                            .align_y(Alignment::Center)
-                            .spacing(spacing.space_xxs)
-                            .into(),
-                            widget::selectable_text(message)
-                                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                                .width(Length::Fill)
+                    widget::column::with_children(vec![
+                        widget::row::with_children(vec![
+                            widget::icon::from_name("dialog-warning-symbolic")
+                                .size(24)
                                 .into(),
-                            widget::row::with_children({
-                                let mut controls = vec![
-                                    widget::button::suggested(retry_label)
-                                        .id(card_control_id(id, "retry"))
-                                        .name(format!("{retry_label} {}", labels.type_label))
-                                        .on_press(Message::RetryCard(id))
-                                        .into(),
-                                ];
-                                // A conversation no retry can reach still has one
-                                // thing left to do with it, and the reader has to
-                                // be the one who asks for it.
-                                if self.chat_offers_fresh_conversation(id) {
-                                    controls.push(
-                                        widget::button::standard("Start a new conversation here")
-                                            .id(card_control_id(id, "chat.fresh"))
-                                            .name("Start a new conversation in the same directory")
-                                            .on_press(Message::ChatUi(chat_ui::Action::StartFresh(
-                                                id,
-                                            )))
-                                            .into(),
-                                    );
-                                }
+                            widget::text::title3(labels.unavailable).into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .spacing(spacing.space_xxs)
+                        .into(),
+                        widget::selectable_text(message)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                            .width(Length::Fill)
+                            .into(),
+                        widget::row::with_children({
+                            let mut controls = vec![
+                                widget::button::suggested(retry_label)
+                                    .id(card_control_id(id, "retry"))
+                                    .name(format!("{retry_label} {}", labels.type_label))
+                                    .on_press(Message::RetryCard(id))
+                                    .into(),
+                            ];
+                            // A conversation no retry can reach still has one
+                            // thing left to do with it, and the reader has to
+                            // be the one who asks for it.
+                            if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
-                                    widget::button::standard("Close")
-                                        .id(card_control_id(id, "failed.close"))
-                                        .name(format!("Close {}", labels.type_label))
-                                        .on_press(Message::CloseCard(id))
+                                    widget::button::standard("Start a new conversation here")
+                                        .id(card_control_id(id, "chat.fresh"))
+                                        .name("Start a new conversation in the same directory")
+                                        .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
                                         .into(),
                                 );
-                                controls
-                            })
-                            .spacing(spacing.space_xxs)
-                            .into(),
-                        ]
-                        .into_iter()
-                        .chain(self.chat_provider_recovery(id))
-                        .collect::<Vec<_>>(),
-                    )
+                            }
+                            controls.push(
+                                widget::button::standard("Close")
+                                    .id(card_control_id(id, "failed.close"))
+                                    .name(format!("Close {}", labels.type_label))
+                                    .on_press(Message::CloseCard(id))
+                                    .into(),
+                            );
+                            controls
+                        })
+                        .spacing(spacing.space_xxs)
+                        .into(),
+                    ])
                     .spacing(spacing.space_s),
                 )
                 .class(cosmic::theme::Container::Secondary)

@@ -306,6 +306,15 @@ pub struct Session {
     pub terminal: Option<crate::model::TerminalSession>,
 }
 impl Session {
+    /// Whether no daemon has ever held this conversation: it has no provider
+    /// identity, no proof of a host that ran it, and no terminal it came
+    /// from. A conversation is proven the moment its start is answered, which
+    /// is before anything can be sent to it, so nothing a reader wrote can be
+    /// in one that is still unstarted.
+    pub fn is_unstarted(&self) -> bool {
+        self.launch.session_id.is_none() && self.proof.is_none() && self.terminal.is_none()
+    }
+
     /// The socket of the Codex listener allocated for this exact cagents
     /// thread, retained in both views.
     ///
