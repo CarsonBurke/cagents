@@ -1607,6 +1607,28 @@ pub(super) fn retains_source_pty(session: &chat::Session) -> bool {
     session.launch.provider == Provider::Codex
 }
 
+/// Whether `recipe` lets its agent act without asking. A new conversation
+/// that carries this over from a terminal names it rather than apply it
+/// quietly, since it is the one launch option that decides that.
+fn bypasses_approvals(recipe: &LaunchRecipe) -> bool {
+    let arguments = &recipe.arguments;
+    arguments.iter().enumerate().any(|(index, argument)| {
+        matches!(
+            argument.as_str(),
+            "--dangerously-bypass-approvals-and-sandbox"
+                | "--yolo"
+                | "--dangerously-skip-permissions"
+                | "--permission-mode=bypassPermissions"
+        ) || (argument == "--permission-mode"
+            && arguments
+                .get(index + 1)
+                .is_some_and(|mode| mode == "bypassPermissions"))
+    }) || recipe
+        .environment
+        .get("CLAUDE_CODE_PERMISSION_MODE")
+        .is_some_and(|mode| mode == "bypassPermissions")
+}
+
 pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, String> {
     let recipe = session
         .agent_resume_recipe()
@@ -2022,25 +2044,56 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let card_id = CardId::new();
-        self.chat_ui.fresh_threads.insert(card_id);
-        let card = CardState {
-            id: card_id,
-            generation: self.durable.generation,
-            title: chat_card_title(provider).into(),
-            width_fraction: self.settings.default_column_fraction,
-            existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hydrating { epoch: 1 },
-            kind: CardKind::Chat(session.clone()),
-        };
         let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
             self.select_worktree(working_directory, false)
         } else {
             Task::none()
         };
-        let (index, durable_index) = self.terminal_insertion_indices();
+        Task::batch([scope, self.insert_chat_card(session, None)])
+    }
+
+    /// Opens a card for the new conversation `session` and starts it: beside
+    /// the card it was started from, filed where that card is, or else where
+    /// a new terminal would go.
+    pub(super) fn insert_chat_card(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+    ) -> Task<Message> {
+        let beside = beside.and_then(|source| {
+            let index = self.workspace.order().position(|id| id == source)?;
+            let durable = self
+                .durable
+                .cards
+                .iter()
+                .position(|state| state.id == source)?;
+            Some((source, (index + 1, durable + 1)))
+        });
+        let card_id = CardId::new();
+        self.chat_ui.fresh_threads.insert(card_id);
+        let card = CardState {
+            id: card_id,
+            generation: self.durable.generation,
+            title: chat_card_title(session.launch.provider).into(),
+            width_fraction: beside
+                .and_then(|(source, _)| self.card_state(source))
+                .map_or(self.settings.default_column_fraction, |source| {
+                    source.width_fraction
+                }),
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hydrating { epoch: 1 },
+            kind: CardKind::Chat(session.clone()),
+        };
+        let (index, durable_index) = beside
+            .map(|(_, slot)| slot)
+            .unwrap_or_else(|| self.terminal_insertion_indices());
         let durable = Arc::make_mut(&mut self.durable);
+        if let Some(scope) =
+            beside.and_then(|(source, _)| durable.card_scopes.get(&source).cloned())
+        {
+            durable.card_scopes.insert(card_id, scope);
+        }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
         self.register_channel_card(card_id);
@@ -2069,7 +2122,6 @@ impl Cagents {
         );
         self.persist();
         Task::batch([
-            scope,
             self.start_chat(card_id, session, chat::Intent::Start, None, false),
             self.apply_viewport(update, true, false),
         ])
@@ -2730,7 +2782,7 @@ impl Cagents {
                 match self.card_state(card).map(|state| &state.kind) {
                     Some(CardKind::Terminal(terminal)) => {
                         let source = terminal.continuity.live_proof();
-                        let mut session = match conversion(terminal) {
+                        let session = match conversion(terminal) {
                             Ok(session) => session,
                             Err(error) => {
                                 self.status = Some(TransientNotice::error(error));
@@ -2745,15 +2797,15 @@ impl Cagents {
                             // live process, which left a stopped agent terminal
                             // with no way into the chat at all.
                             //
-                            // A new conversation is a new session, so it gets
-                            // its own identity: the daemon will not implicitly
-                            // replace a terminal record it still holds, and it
-                            // holds this one until the card is closed. The
-                            // stopped terminal stays named as this card's
-                            // source, because that is what a switch back
-                            // returns to and what proves which card this
-                            // conversation belongs to. The stopped thread is
-                            // deliberately not resumed, because joining an
+                            // The new conversation opens as a card of its own
+                            // beside the stopped terminal. It is not the
+                            // terminal converted in place: a conversion is only
+                            // ever the exact handoff of one conversation, and
+                            // saved state refuses any other. Nor does it take
+                            // the terminal's place, because the terminal still
+                            // relaunches the conversation it ran, which would
+                            // otherwise be lost in one click. That thread is
+                            // deliberately not joined, because joining an
                             // existing thread means joining whichever process
                             // holds it and no process holds this one.
                             let Some(recipe) =
@@ -2764,28 +2816,31 @@ impl Cagents {
                                 ));
                                 return Task::none();
                             };
-                            // A carried bypass is named rather than applied
-                            // quietly: it is the one launch option that decides
-                            // the agent may act without asking.
-                            let unrestricted = recipe.arguments.iter().any(|argument| {
-                                argument == "--dangerously-bypass-approvals-and-sandbox"
-                                    || argument == "--yolo"
-                            });
-                            session.launch.recipe = recipe;
-                            session.launch.session_id = None;
-                            session.id = crate::model::TerminalId::new();
+                            // A terminal still starting may yet run its agent,
+                            // and then switches to chat as that agent.
+                            if self.pending_terminal_spawn(card) {
+                                self.status = Some(TransientNotice::warning(
+                                    "This terminal is still starting. Switch once it has started or stopped.",
+                                ));
+                                return Task::none();
+                            }
+                            let unrestricted = bypasses_approvals(&recipe);
+                            let fresh = chat::Session {
+                                id: crate::model::TerminalId::new(),
+                                launch: chat::Launch {
+                                    recipe,
+                                    session_id: None,
+                                    ..session.launch
+                                },
+                                proof: None,
+                                terminal: None,
+                            };
                             self.status = Some(TransientNotice::warning(if unrestricted {
-                                "This terminal's agent is not running, so a new conversation was opened here, with this terminal's approvals and sandbox left off."
+                                "This terminal's agent is not running, so a new conversation was opened beside it, with this terminal's approvals and sandbox left off."
                             } else {
-                                "This terminal's agent is not running, so a new conversation was opened here."
+                                "This terminal's agent is not running, so a new conversation was opened beside it."
                             }));
-                            return self.start_chat(
-                                card,
-                                session,
-                                chat::Intent::Start,
-                                None,
-                                false,
-                            );
+                            return self.insert_chat_card(fresh, Some(card));
                         }
                         // The daemon reattaches its exact managed thread automatically.
                         // Unmanaged terminals are never matched by directory or recency.
@@ -4432,6 +4487,194 @@ mod tests {
             Some(&home),
             "a new conversation starts on the default account"
         );
+    }
+
+    /// Makes the focused fixture card a stopped agent terminal running
+    /// `arguments`, and returns it.
+    fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -> CardId {
+        let card = app.workspace.focused().unwrap();
+        let launch = LaunchRecipe {
+            program: "claude".into(),
+            arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
+            environment: Default::default(),
+        };
+        let mut state = app.card_state(card).unwrap().clone();
+        let CardKind::Terminal(terminal) = &mut state.kind else {
+            unreachable!()
+        };
+        terminal.launch = launch.clone();
+        terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: exited.then(|| crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            }),
+        };
+        Arc::make_mut(&mut app.durable).cards[0] = state;
+        if exited {
+            // Its agent has ended, so nothing will start in it.
+            app.cards.insert(card, CardRuntime::Completed);
+        }
+        card
+    }
+
+    /// A stopped agent terminal switched to chat opens a new conversation in
+    /// a card of its own beside the terminal. It used to become that
+    /// conversation in place while still naming the terminal as its source,
+    /// which storage refuses for anything but the exact handoff of one
+    /// conversation, so every later save of the window failed and the next
+    /// launch brought back the window as it was before the switch. The
+    /// terminal stays, because it still relaunches the conversation it ran.
+    #[test]
+    fn a_stopped_terminal_switched_to_chat_opens_a_new_conversation_beside_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let card = stopped_agent_terminal(
+            &mut app,
+            &["--resume", KNOWN_THREAD, "--dangerously-skip-permissions"],
+            true,
+        );
+        let terminal = app.card_state(card).unwrap().clone();
+        let neighbour = live_chat(&mut app, Some("neighbour"));
+        // Filed under a worktree its directory is not in, as an adopted
+        // terminal is; the filing, not the directory, is what places the
+        // conversation with it.
+        let filed = PathBuf::from("/workspace/filed");
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, filed.clone());
+        let _ = app.update(Message::FocusCard(card));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [card, neighbour]);
+        let saved = |app: &Cagents, id: CardId| {
+            let writer = app.session.as_ref().unwrap();
+            writer.flush(Duration::from_secs(10)).unwrap();
+            assert_eq!(writer.last_error(), None, "every save is accepted");
+            writer
+                .operation_store()
+                .load_card(id, None)
+                .unwrap()
+                .unwrap()
+        };
+
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let warnings = app
+            .notices
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.notice.severity, crate::app::NoticeSeverity::Warning))
+            .map(|entry| entry.notice.message.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("beside it") && warning.contains("approvals")),
+            "a carried bypass is named: {warnings:?}"
+        );
+        let kept = app.card_state(card).unwrap();
+        assert_eq!(kept.kind, terminal.kind, "the terminal is kept as it was");
+        assert!(kept.existence.is_open());
+        let order = app.workspace.order().collect::<Vec<_>>();
+        assert_eq!(order.len(), 3);
+        assert_eq!((order[0], order[2]), (card, neighbour));
+        let chat = order[1];
+        assert_eq!(app.workspace.focused(), Some(chat));
+        let state = app.card_state(chat).unwrap();
+        assert_eq!(state.width_fraction, terminal.width_fraction);
+        let CardKind::Chat(session) = &state.kind else {
+            panic!("the new card is a chat");
+        };
+        assert_eq!(session.launch.provider, Provider::Claude);
+        assert_eq!(
+            session.launch.session_id, None,
+            "the stopped thread is not joined"
+        );
+        assert!(
+            !session
+                .launch
+                .recipe
+                .arguments
+                .contains(&KNOWN_THREAD.to_owned()),
+            "{:?}",
+            session.launch.recipe.arguments
+        );
+        assert_eq!(session.terminal, None, "no source it did not come from");
+        assert!(
+            app.chat_ui.attempts.contains_key(&chat),
+            "it starts at once"
+        );
+        assert_eq!(app.durable.card_scopes.get(&chat), Some(&filed));
+        let position = |id| app.durable.cards.iter().position(|state| state.id == id);
+        assert_eq!(position(chat), position(card).map(|index| index + 1));
+
+        // The window saves both, and keeps saving once the conversation has
+        // started.
+        assert_eq!(saved(&app, card).kind, terminal.kind);
+        assert!(saved(&app, card).existence.is_open());
+        assert!(matches!(saved(&app, chat).kind, CardKind::Chat(_)));
+        let target = app.chat_ui.attempts.get(&chat).unwrap().target;
+        let handle = fixture_handle(&app, chat, Some("started"));
+        answer_start(&mut app, target, Ok(handle));
+        let CardKind::Chat(stored) = saved(&app, chat).kind else {
+            panic!("the started conversation is saved");
+        };
+        assert_eq!(stored.launch.session_id.as_deref(), Some("started"));
+        assert!(!app.chat_ui.transition_pending());
+    }
+
+    /// A stopped terminal whose relaunch is still starting may yet run its
+    /// agent, so no second conversation is opened for it meanwhile.
+    #[test]
+    fn a_starting_terminal_opens_no_conversation_beside_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = stopped_agent_terminal(&mut app, &[], false);
+        assert!(app.pending_terminal_spawn(card));
+        let before = app.durable.clone();
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        assert_eq!(app.durable.cards, before.cards);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), [card]);
+        assert!(app.chat_ui.attempts.is_empty());
+        assert!(errors(&app).is_empty(), "a wait, not a failure");
+    }
+
+    #[test]
+    fn a_bypass_is_recognised_in_every_form_it_is_carried() {
+        let recipe = |arguments: &[&str], environment: &[(&str, &str)]| LaunchRecipe {
+            program: "agent".into(),
+            arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
+            environment: environment
+                .iter()
+                .map(|&(key, value)| (key.into(), value.into()))
+                .collect(),
+        };
+        for bypassing in [
+            recipe(&["--dangerously-bypass-approvals-and-sandbox"], &[]),
+            recipe(&["--yolo"], &[]),
+            recipe(&["--dangerously-skip-permissions"], &[]),
+            recipe(&["--permission-mode", "bypassPermissions"], &[]),
+            recipe(&["--permission-mode=bypassPermissions"], &[]),
+            recipe(&[], &[("CLAUDE_CODE_PERMISSION_MODE", "bypassPermissions")]),
+        ] {
+            assert!(bypasses_approvals(&bypassing), "{bypassing:?}");
+        }
+        for asking in [
+            recipe(&[], &[]),
+            recipe(&["--allow-dangerously-skip-permissions"], &[]),
+            recipe(&["--permission-mode", "plan"], &[]),
+            recipe(&["bypassPermissions"], &[]),
+            recipe(&[], &[("CLAUDE_CODE_PERMISSION_MODE", "plan")]),
+        ] {
+            assert!(!bypasses_approvals(&asking), "{asking:?}");
+        }
     }
 
     /// A thread that has not begun and moves to another provider, then to
