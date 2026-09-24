@@ -69,15 +69,23 @@ fn observe_inventory(
 /// terminal, because the user's close is an instruction: the daemon may keep
 /// hosting that process, and a later observation of it must not reopen the card
 /// the user shut.
-fn card_claims_terminal(card: &CardState, terminal: TerminalId) -> bool {
+fn saved_terminal_claims_host(saved: &TerminalSession, hosted: &TerminalSession) -> bool {
+    saved.id == hosted.id
+        || (saved.continuity.live_proof().is_some()
+            && saved.continuity.live_proof() != hosted.continuity.live_proof()
+            && hosted.recovery_origin == Some(saved.recovery_origin.unwrap_or(saved.id))
+            && super::daemon_recovery::same_recovery_content(saved, hosted))
+}
+
+fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
     match &card.kind {
-        CardKind::Terminal(session) => session.id == terminal,
+        CardKind::Terminal(session) => saved_terminal_claims_host(session, terminal),
         CardKind::Chat(session) => {
-            session.id == terminal
+            session.id == terminal.id
                 || session
                     .terminal
                     .as_ref()
-                    .is_some_and(|hosted| hosted.id == terminal)
+                    .is_some_and(|saved| saved_terminal_claims_host(saved, terminal))
         }
         CardKind::Browser(_)
         | CardKind::PullRequests(_)
@@ -180,7 +188,7 @@ impl Cagents {
                 .durable
                 .cards
                 .iter()
-                .any(|card| card_claims_terminal(card, session.id))
+                .any(|card| card_claims_terminal(card, session))
     }
 
     fn adopt_hosted_terminal(&mut self, session: TerminalSession) -> Task<Message> {
@@ -337,7 +345,10 @@ mod tests {
         app.durable
             .cards
             .iter()
-            .filter(|card| card_claims_terminal(card, terminal))
+            .filter(|card| match &card.kind {
+                CardKind::Terminal(session) => session.id == terminal,
+                _ => false,
+            })
             .cloned()
             .collect()
     }
@@ -425,6 +436,68 @@ mod tests {
         let remaining = cards_for(&app, card_terminal(&app, card));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].existence, closed);
+    }
+
+    #[test]
+    fn an_agent_descendant_is_claimed_by_its_saved_card() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut saved = hosted("/repo");
+        saved.launch.program = "omp".into();
+        saved.launch.arguments = vec![
+            "--resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        drop(app.observe_hosted_terminals(vec![saved.clone()]));
+
+        let mut descendant = saved.clone();
+        descendant.id = TerminalId::new();
+        descendant.recovery_origin = Some(saved.id);
+        descendant.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: HostSessionId::new("replacement"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("replacement"),
+        };
+        assert!(!app.adoptable(&descendant));
+        drop(app.finish_terminal_start());
+        let cards_before = app.durable.cards.len();
+        drop(app.observe_hosted_terminals(vec![descendant.clone()]));
+        assert_eq!(app.durable.cards.len(), cards_before);
+
+        descendant.launch.arguments[1] = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into();
+        assert!(app.adoptable(&descendant));
+    }
+
+    #[test]
+    fn a_chat_with_a_retained_terminal_claims_its_live_descendant() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut saved = hosted("/repo");
+        saved.launch.program = "claude".into();
+        saved.launch.arguments = vec![
+            "--resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        drop(app.observe_hosted_terminals(vec![saved.clone()]));
+        let card = cards_for(&app, saved.id)[0].id;
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: saved.launch.clone(),
+                session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+            },
+            proof: None,
+            terminal: Some(saved.clone()),
+        });
+        let origin = saved.id;
+        let mut descendant = saved;
+        descendant.id = TerminalId::new();
+        descendant.recovery_origin = Some(origin);
+        descendant.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: HostSessionId::new("replacement"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("replacement"),
+        };
+        assert!(!app.adoptable(&descendant));
     }
 
     #[test]

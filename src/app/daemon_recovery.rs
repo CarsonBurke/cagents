@@ -13,6 +13,35 @@ pub(super) struct RecoveredTerminal {
     pub(super) recovery_lease: Option<crate::daemon::RecoveryLease>,
 }
 
+/// Match the work represented by two terminal records within one proven
+/// recovery lineage. An agent needs an exact conversation; a plain terminal
+/// needs the same launch recipe. Conflicting direct and hinted agent IDs are
+/// never evidence for attachment.
+pub(super) fn same_recovery_content(saved: &TerminalSession, hosted: &TerminalSession) -> bool {
+    let identity = |session: &TerminalSession| {
+        let direct = exact_conversation(&session.launch);
+        let resume = session
+            .agent_resume_recipe()
+            .as_ref()
+            .and_then(exact_conversation);
+        if direct.is_some() && resume.is_some() && direct != resume {
+            return Err(());
+        }
+        Ok(direct.or(resume))
+    };
+    match (identity(saved), identity(hosted)) {
+        (Ok(Some(saved)), Ok(Some(hosted))) => saved == hosted,
+        (Ok(None), Ok(None)) => {
+            saved.resume_hint.is_none()
+                && hosted.resume_hint.is_none()
+                && crate::agent::Provider::from_program(&saved.launch.program).is_none()
+                && crate::agent::Provider::from_program(&hosted.launch.program).is_none()
+                && saved.launch == hosted.launch
+        }
+        _ => false,
+    }
+}
+
 /// Discovery is separate from attachment: an existing handle never changes its
 /// proof or replays buffered input into the replacement terminal.
 pub(super) fn reconcile(
@@ -111,6 +140,37 @@ fn reconcile_at(
     {
         return Err("a different daemon owns this terminal ID; preserving that session instead of retargeting it".into());
     }
+    // Recovery can span more than one daemon replacement. Upgrade receipts
+    // describe only the latest handoff, while the stable recovery origin still
+    // identifies the saved card's process lineage. Adopt a live descendant
+    // only when its exact conversation or plain terminal recipe agrees too.
+    let origin = session.recovery_origin.unwrap_or(session.id);
+    let mut descendants = terminals.iter().filter(|terminal| {
+        proof != expected
+            && terminal.session.recovery_origin == Some(origin)
+            && terminal.session.continuity.can_resume_live(&proof)
+            && same_recovery_content(&session, &terminal.session)
+    });
+    if let Some(restored) = descendants.next() {
+        if descendants.next().is_some() {
+            return Err("multiple live terminals claim this saved conversation".into());
+        }
+        crate::daemon::replacement_owner(socket, &proof)
+            .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
+        return Ok(RecoveredTerminal {
+            session: restored.session.clone(),
+            expected_host: Some(proof),
+            recovery_lease,
+        });
+    }
+    if proof != expected
+        && terminals.iter().any(|terminal| {
+            terminal.session.recovery_origin == Some(origin)
+                && terminal.session.continuity.can_resume_live(&proof)
+        })
+    {
+        return Err("a live terminal shares this recovery lineage but its command or conversation differs; preserving it".into());
+    }
     let owner = crate::daemon::replacement_owner(socket, &proof)
         .map_err(|error| format!("cannot establish replacement daemon ownership: {error}"))?;
     // Explicit replay changes only the recipe policy, never the ownership evidence.
@@ -148,8 +208,8 @@ fn reconcile_at(
         }
         replacement_id = recovery_terminal_id(replacement_id, &proof);
     }
-    let exact_resume = session.agent_resume_recipe();
-    if exact_resume
+    if session
+        .agent_resume_recipe()
         .as_ref()
         .and_then(exact_conversation)
         .is_some_and(|identity| {
@@ -400,6 +460,96 @@ mod tests {
         server.join().unwrap();
         assert_eq!(recovered.session, restored);
         assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn saved_agent_adopts_a_live_descendant_after_multiple_handoffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("latest");
+        let mut original = session(directory.path(), &proof("old"));
+        original.launch.program = "omp".into();
+        original.launch.arguments = vec![
+            "--resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        let mut descendant = session(directory.path(), &owner);
+        descendant.recovery_origin = Some(original.id);
+        descendant.launch = original.launch.clone();
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(descendant.id, descendant.launch.clone(), None);
+        descriptor.session = descendant.clone();
+        // The latest upgrade receipt knows only its immediate predecessor.
+        descriptor.upgrade_sources = vec![session(directory.path(), &proof("intermediate"))];
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner.clone(), vec![descriptor], 1);
+        let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(recovered.session, descendant);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn saved_shell_adopts_a_live_descendant_after_multiple_handoffs() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("latest");
+        let original = session(directory.path(), &proof("old"));
+        let mut descendant = session(directory.path(), &owner);
+        descendant.recovery_origin = Some(original.id);
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(descendant.id, descendant.launch.clone(), None);
+        descriptor.session = descendant.clone();
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner.clone(), vec![descriptor], 1);
+        let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(recovered.session, descendant);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn generic_agent_and_ambiguous_shell_hint_do_not_identify_a_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = session(directory.path(), &proof("old"));
+        let mut hosted = session(directory.path(), &proof("latest"));
+        hosted.recovery_origin = Some(saved.id);
+        saved.launch.program = "claude".into();
+        hosted.launch = saved.launch.clone();
+        assert!(!same_recovery_content(&saved, &hosted));
+
+        saved.launch.program = "/bin/sh".into();
+        hosted.launch = saved.launch.clone();
+        saved.resume_hint = Some("unconfirmed agent identity".into());
+        assert!(!same_recovery_content(&saved, &hosted));
+    }
+
+    #[test]
+    fn recovery_origin_without_the_exact_conversation_cannot_retarget_an_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("latest");
+        let mut original = session(directory.path(), &proof("old"));
+        original.launch.program = "omp".into();
+        original.launch.arguments = vec![
+            "--resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        let mut descendant = session(directory.path(), &owner);
+        descendant.recovery_origin = Some(original.id);
+        descendant.launch.program = "omp".into();
+        descendant.launch.arguments = vec![
+            "--resume".into(),
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+        ];
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(descendant.id, descendant.launch.clone(), None);
+        descriptor.session = descendant;
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![descriptor], 0);
+        let result = reconcile_at(original, false, &socket, directory.path());
+        server.join().unwrap();
+        assert!(result.err().unwrap().contains("conversation differs"));
     }
 
     #[test]
