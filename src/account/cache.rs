@@ -7,11 +7,16 @@
 //! figures any window saw, and lets the window that probes next skip the
 //! probe when another window already has.
 //!
+//! The same file remembers the models each provider last listed, so a new
+//! conversation can offer every provider's models before any of their CLIs
+//! is started for it.
+//!
 //! The file is written whole to a temporary sibling and renamed over the
 //! original, under an advisory lock, so a reader never sees half of it and
 //! two writers never lose each other's entries. It holds display metadata
-//! only - the same figures and identity the interface shows - and is kept
-//! private to the user like every other file in the data directories.
+//! only - the same figures, identity and model names the interface shows -
+//! and is kept private to the user like every other file in the data
+//! directories.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -24,6 +29,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{Identity, UsageSnapshot, schedule::CLOCK_SLACK};
+use crate::{agent::Provider, chat::Model};
 
 const FILE_NAME: &str = "account-usage.json";
 const LOCK_NAME: &str = "account-usage.lock";
@@ -42,10 +48,41 @@ pub struct Entry {
     pub snapshot: UsageSnapshot,
 }
 
+/// The models a provider last listed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Catalog {
+    pub models: Vec<Model>,
+    /// Unix milliseconds at which the provider listed them.
+    pub observed_at: u64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Document {
     version: u32,
     entries: BTreeMap<String, Entry>,
+    /// Added after the first version, which the version does not count: a
+    /// build that predates it reads the rest, and drops it when it writes.
+    #[serde(default, deserialize_with = "readable_catalogs")]
+    catalogs: BTreeMap<Provider, Catalog>,
+}
+
+/// Each provider's list is read on its own, so one this build cannot read -
+/// a provider added since, say - costs only that list, not the whole file.
+fn readable_catalogs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<Provider, Catalog>, D::Error> {
+    let serde_json::Value::Object(catalogs) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(catalogs
+        .into_iter()
+        .filter_map(|(provider, catalog)| {
+            Some((
+                Provider::deserialize(serde_json::Value::String(provider)).ok()?,
+                Catalog::deserialize(catalog).ok()?,
+            ))
+        })
+        .collect())
 }
 
 /// The shared cache file.
@@ -99,18 +136,45 @@ impl Cache {
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
-        match document.entries.get(key) {
-            Some(existing)
-                if existing.snapshot.observed_at > entry.snapshot.observed_at
-                    && existing.snapshot.observed_at
-                        <= entry.snapshot.observed_at.saturating_add(CLOCK_SLACK) =>
-            {
-                return Ok(());
-            }
-            _ => {
-                document.entries.insert(key.to_owned(), entry);
-            }
+        if document.entries.get(key).is_some_and(|existing| {
+            supersedes(existing.snapshot.observed_at, entry.snapshot.observed_at)
+        }) {
+            return Ok(());
         }
+        document.entries.insert(key.to_owned(), entry);
+        self.write(&document)
+    }
+
+    /// The models each provider last listed, as of `now`. Like
+    /// [`Cache::load`], a list stamped in the future is left out.
+    pub fn catalogs(&self, now: u64) -> BTreeMap<Provider, Catalog> {
+        read_document(&self.path())
+            .map(|document| {
+                document
+                    .catalogs
+                    .into_iter()
+                    .filter(|(_, catalog)| catalog.observed_at <= now.saturating_add(CLOCK_SLACK))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Remembers what `provider` listed, unless another window has written
+    /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
+    pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
+        crate::secure_file::prepare_private_directory(&self.directory)?;
+        let _lock = self.lock(libc::LOCK_EX)?;
+        let path = self.path();
+        let mut document = read_document(&path).unwrap_or_default();
+        document.version = VERSION;
+        if document
+            .catalogs
+            .get(&provider)
+            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at))
+        {
+            return Ok(());
+        }
+        document.catalogs.insert(provider, catalog);
         self.write(&document)
     }
 
@@ -176,6 +240,13 @@ impl Cache {
     fn lock(&self, operation: i32) -> io::Result<File> {
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), operation)
     }
+}
+
+/// Whether something already cached at `existing` is newer than an
+/// observation at `incoming`, and stays. A stamp further ahead than
+/// [`CLOCK_SLACK`] is from a clock since set back, and is replaced.
+fn supersedes(existing: u64, incoming: u64) -> bool {
+    existing > incoming && existing <= incoming.saturating_add(CLOCK_SLACK)
 }
 
 /// Whether `entry` is recent enough at `now` to keep with nothing referring
@@ -335,6 +406,77 @@ mod tests {
             .prune(&keep, now)
             .unwrap();
         assert!(!empty.path().join("nested").exists());
+    }
+
+    fn catalog(observed_at: u64, id: &str) -> Catalog {
+        Catalog {
+            models: vec![Model {
+                id: id.into(),
+                label: id.to_uppercase(),
+                reasoning: vec!["high".into()],
+            }],
+            observed_at,
+        }
+    }
+
+    /// Each provider's list is kept beside the figures, and the newer of two
+    /// windows' lists wins, as the figures' do.
+    #[test]
+    fn listed_models_round_trip_beside_the_figures() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        assert!(cache.catalogs(u64::MAX).is_empty());
+        cache.store("k", entry(1, "figures")).unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(10, "opus"))
+            .unwrap();
+        cache
+            .store_catalog(Provider::Codex, catalog(10, "gpt"))
+            .unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(5, "stale"))
+            .unwrap();
+        let catalogs = cache.catalogs(u64::MAX);
+        assert_eq!(catalogs[&Provider::Claude], catalog(10, "opus"));
+        assert_eq!(catalogs[&Provider::Codex], catalog(10, "gpt"));
+        assert_eq!(cache.load(u64::MAX).len(), 1, "the figures stay");
+        // Storing figures keeps the lists.
+        cache.store("k", entry(2, "newer figures")).unwrap();
+        assert_eq!(cache.catalogs(u64::MAX).len(), 2);
+        // A list from a clock since set back is not read.
+        cache
+            .store_catalog(Provider::Omp, catalog(20 * CLOCK_SLACK, "ahead"))
+            .unwrap();
+        assert!(cache.catalogs(u64::MAX).contains_key(&Provider::Omp));
+        assert!(!cache.catalogs(CLOCK_SLACK).contains_key(&Provider::Omp));
+    }
+
+    /// A list this build cannot read - a provider added since, or a model
+    /// described differently - costs only that list, never the figures.
+    #[test]
+    fn an_unreadable_list_costs_only_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(FILE_NAME),
+            br#"{"version": 1, "entries": {}, "catalogs": {
+                "Gemini": {"models": [], "observed_at": 1},
+                "Codex": {"models": "nonsense", "observed_at": 1},
+                "Claude": {"models": [{"id": "opus", "label": "Opus", "reasoning": []}],
+                           "observed_at": 3}}}"#,
+        )
+        .unwrap();
+        let cache = Cache::at(directory.path());
+        let catalogs = cache.catalogs(u64::MAX);
+        assert_eq!(catalogs.keys().collect::<Vec<_>>(), [&Provider::Claude]);
+        cache.store("k", entry(1, "figures")).unwrap();
+        assert_eq!(cache.load(u64::MAX).len(), 1);
+        // A file from before lists were kept reads as having none.
+        fs::write(
+            directory.path().join(FILE_NAME),
+            br#"{"version": 1, "entries": {}}"#,
+        )
+        .unwrap();
+        assert!(cache.catalogs(u64::MAX).is_empty());
     }
 
     #[test]

@@ -552,28 +552,7 @@ impl Claude {
     }
     fn metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(models) = data["models"].as_array() {
-            self.models = models
-                .iter()
-                .filter_map(|m| {
-                    Some(Model {
-                        id: m["value"].as_str()?.into(),
-                        label: m["displayName"]
-                            .as_str()
-                            .unwrap_or(m["value"].as_str()?)
-                            .into(),
-                        reasoning: m["supportedEffortLevels"]
-                            .as_array()
-                            .map(|values| {
-                                values
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_owned)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect();
+            self.models = models.iter().filter_map(Model::from_claude).collect();
         }
         if let Some(commands) = data["commands"].as_array() {
             let mut authored = HashSet::new();
@@ -1196,6 +1175,7 @@ impl Adapter for Claude {
                     match string(&request, "subtype") {
                         "initialize" => {
                             self.ready = true;
+                            step.events.push(Event::Ready(true));
                             self.metadata(&response["response"], &mut step);
                             self.status(self.busy, "Claude connected", &mut step);
                             for key in [
@@ -3773,6 +3753,8 @@ mod tests {
                 ]}),
             ))
             .unwrap();
+        // A sender waits for this rather than for a refusal.
+        assert!(connected.events.contains(&Event::Ready(true)));
         assert_eq!(
             listed(&connected),
             (

@@ -29,10 +29,11 @@ use tokio::{
 };
 
 use super::{
-    Account, Identity, UsageSnapshot, UsageSource, UsageStatus, cache::Cache, cache::Entry,
+    Account, Identity, UsageSnapshot, UsageSource, UsageStatus,
+    cache::{Cache, Catalog, Entry},
     schedule::STALE_AFTER,
 };
-use crate::agent::Provider;
+use crate::{agent::Provider, chat::Model};
 
 /// How long a probe may take in total.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,6 +43,9 @@ pub const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a CLI is given to exit after its input closes.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How much longer than its usage a probe waits for the CLI's list of
+/// models.
+const MODELS_GRACE: Duration = Duration::from_secs(3);
 /// How often `finish` looks for the CLI to have exited on its own.
 const EXIT_POLL: Duration = Duration::from_millis(20);
 
@@ -92,6 +96,9 @@ pub enum Outcome {
     Answered {
         identity: Option<Identity>,
         snapshot: UsageSnapshot,
+        /// The models the CLI listed while it was asked, which a cached
+        /// answer does not repeat: the cache holds its own list.
+        catalog: Option<Catalog>,
     },
     /// The CLI gave no usable answer. The message is cagents' own summary of
     /// the failure, never the CLI's output.
@@ -122,7 +129,18 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
     let outcome = match probed {
-        Ok(Ok((identity, snapshot))) => Outcome::Answered { identity, snapshot },
+        Ok(Ok(Probed {
+            identity,
+            snapshot,
+            models,
+        })) => Outcome::Answered {
+            catalog: (!models.is_empty()).then(|| Catalog {
+                models,
+                observed_at: snapshot.observed_at,
+            }),
+            identity,
+            snapshot,
+        },
         Ok(Err(message)) => Outcome::Failed(message),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
@@ -130,13 +148,22 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
             TIMEOUT.as_secs()
         )),
     };
-    if let (Outcome::Answered { identity, snapshot }, Some(cache), Some(key)) =
-        (&outcome, cache, key)
+    if let (
+        Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        },
+        Some(cache),
+        Some(key),
+    ) = (&outcome, cache, key)
     {
         let entry = Entry {
             identity: identity.clone(),
             snapshot: snapshot.clone(),
         };
+        let catalog = catalog.clone();
+        let provider = account.provider;
         // Written in the background so the answer reaches the reader at
         // once, with the probe lock held until the answer is in the cache:
         // a window that takes the lock next finds it there instead of
@@ -144,6 +171,9 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         // windows a probe.
         tokio::task::spawn_blocking(move || {
             let _ = cache.store(&key, entry);
+            if let Some(catalog) = catalog {
+                let _ = cache.store_catalog(provider, catalog);
+            }
             drop(lock);
         });
     }
@@ -211,7 +241,29 @@ fn prepare(
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
-    Outcome::Answered { identity, snapshot }
+    Outcome::Answered {
+        identity,
+        snapshot,
+        catalog: None,
+    }
+}
+
+/// What a CLI said about its account, and the models it listed meanwhile.
+struct Probed {
+    identity: Option<Identity>,
+    snapshot: UsageSnapshot,
+    /// Empty when the CLI listed none.
+    models: Vec<Model>,
+}
+
+impl Probed {
+    fn state(status: UsageStatus, detail: &str, observed_at: u64, models: Vec<Model>) -> Self {
+        Self {
+            identity: None,
+            snapshot: UsageSnapshot::state(status, detail, observed_at),
+            models,
+        }
+    }
 }
 
 pub fn cli_name(provider: Provider) -> &'static str {
@@ -226,10 +278,7 @@ fn now_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-async fn probe_cli(
-    account: &Account,
-    program: &Path,
-) -> Result<(Option<Identity>, UsageSnapshot), String> {
+async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> {
     match account.provider {
         Provider::Claude => probe_claude(account, program).await,
         Provider::Codex => probe_codex(account, program).await,
@@ -652,10 +701,7 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// slash commands and no session persistence: it only ever answers two
 /// control requests and never takes a turn, and that way it runs none of the
 /// user's hooks and leaves nothing behind in their history.
-async fn probe_claude(
-    account: &Account,
-    program: &Path,
-) -> Result<(Option<Identity>, UsageSnapshot), String> {
+async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
     let mut status = command(account, program);
     status.args(["auth", "status", "--json"]);
     let mut usage = command(account, program);
@@ -674,11 +720,17 @@ async fn probe_claude(
     ]);
     let (status, usage) = tokio::join!(run_json(status), claude_usage(usage));
     let observed_at = now_ms();
+    let (models, usage) = match usage {
+        Ok(ClaudeSession { models, usage }) => (models, Ok(usage)),
+        Err(message) => (Vec::new(), Err(message)),
+    };
     let identity = match status.as_ref().map(super::claude::parse_auth_status) {
         Ok(Err(state)) => {
-            return Ok((
-                None,
-                UsageSnapshot::state(state, "Signed out of Claude Code", observed_at),
+            return Ok(Probed::state(
+                state,
+                "Signed out of Claude Code",
+                observed_at,
+                models,
             ));
         }
         Ok(Ok(identity)) => Some(identity),
@@ -705,33 +757,71 @@ async fn probe_claude(
         // the identity came back, since the limits are what is shown.
         Err(message) => return Err(message),
     };
-    Ok((identity, snapshot))
+    Ok(Probed {
+        identity,
+        snapshot,
+        models,
+    })
 }
 
-/// The `get_usage` control response's inner `response`, or the error message
-/// Claude answered the request with.
-async fn claude_usage(command: Command) -> Result<Result<Value, String>, String> {
+/// What the usage session answered.
+struct ClaudeSession {
+    /// The models `initialize` listed.
+    models: Vec<Model>,
+    /// The `get_usage` control response's inner `response`, or the error
+    /// message Claude answered either request with.
+    usage: Result<Value, String>,
+}
+
+async fn claude_usage(command: Command) -> Result<ClaudeSession, String> {
     let mut session = Session::spawn(command).await?;
     let result = claude_exchange(&mut session).await;
     session.close().await;
     result
 }
 
-async fn claude_exchange(session: &mut Session) -> Result<Result<Value, String>, String> {
+async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String> {
     const INITIALIZE: &str = "cagents-usage-initialize";
     const USAGE: &str = "cagents-usage";
     session
         .send(&json!({"type": "control_request", "request_id": INITIALIZE,
             "request": {"subtype": "initialize"}}))
         .await?;
-    if let Err(message) = claude_response(session, INITIALIZE).await? {
-        return Ok(Err(message));
-    }
+    let initialized = match claude_response(session, INITIALIZE).await? {
+        Ok(initialized) => initialized,
+        Err(message) => {
+            return Ok(ClaudeSession {
+                models: Vec::new(),
+                usage: Err(message),
+            });
+        }
+    };
+    let models = models(initialized["models"].as_array(), Model::from_claude);
     session
         .send(&json!({"type": "control_request", "request_id": USAGE,
             "request": {"subtype": "get_usage", "skip_behaviors": true}}))
         .await?;
-    claude_response(session, USAGE).await
+    Ok(ClaudeSession {
+        models,
+        usage: claude_response(session, USAGE).await?,
+    })
+}
+
+/// The most models a probe keeps from one listing, which is far more than
+/// any provider lists.
+const MAX_MODELS: usize = 512;
+
+/// The models `entries` lists that `parse` can read, the first of any ID
+/// listed twice, and no more than [`MAX_MODELS`].
+fn models(entries: Option<&Vec<Value>>, parse: fn(&Value) -> Option<Model>) -> Vec<Model> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .flatten()
+        .filter_map(parse)
+        .filter(|model| seen.insert(model.id.clone()))
+        .take(MAX_MODELS)
+        .collect()
 }
 
 async fn claude_response(
@@ -767,16 +857,21 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
-async fn probe_codex(
-    account: &Account,
-    program: &Path,
-) -> Result<(Option<Identity>, UsageSnapshot), String> {
+async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String> {
     let mut command = command(account, program);
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
     session.close().await;
-    let (account_read, limits_read) = result?;
+    let CodexSession {
+        account: account_read,
+        limits: limits_read,
+        models,
+    } = result?;
+    let models = models
+        .ok()
+        .map(|result| self::models(result["data"].as_array(), Model::from_codex))
+        .unwrap_or_default();
     let observed_at = now_ms();
     let identity = match account_read {
         Ok(result) => match super::codex::parse_account(&result) {
@@ -786,7 +881,7 @@ async fn probe_codex(
                     UsageStatus::NeedsLogin => "Signed out of Codex",
                     _ => "Codex is not signed in to a ChatGPT plan",
                 };
-                return Ok((None, UsageSnapshot::state(state, detail, observed_at)));
+                return Ok(Probed::state(state, detail, observed_at, models));
             }
         },
         Err(_) => None,
@@ -807,12 +902,26 @@ async fn probe_codex(
             None => return Err("Codex could not read usage just now".into()),
         },
     };
-    Ok((identity, snapshot))
+    Ok(Probed {
+        identity,
+        snapshot,
+        models,
+    })
 }
 
 type RpcResult = Result<Value, Value>;
 
-async fn codex_exchange(session: &mut Session) -> Result<(RpcResult, RpcResult), String> {
+/// What the app server answered.
+struct CodexSession {
+    account: RpcResult,
+    limits: RpcResult,
+    /// The first page of `model/list`, which lists every model Codex offers
+    /// in one page of this size. A version without it answers an error, and
+    /// one that did not answer within [`MODELS_GRACE`] reads as one.
+    models: RpcResult,
+}
+
+async fn codex_exchange(session: &mut Session) -> Result<CodexSession, String> {
     session
         .send(&json!({"id": 1, "method": "initialize", "params": {
             "clientInfo": {"name": "cagents", "title": "cagents", "version": env!("CARGO_PKG_VERSION")},
@@ -828,16 +937,50 @@ async fn codex_exchange(session: &mut Session) -> Result<(RpcResult, RpcResult),
     session
         .send(&json!({"id": 3, "method": "account/rateLimits/read"}))
         .await?;
-    let (mut account, mut limits) = (None, None);
-    while account.is_none() || limits.is_none() {
-        let frame = session.next().await?;
-        match frame["id"].as_i64() {
-            Some(2) if frame.get("method").is_none() => account = Some(rpc_result(frame)),
-            Some(3) if frame.get("method").is_none() => limits = Some(rpc_result(frame)),
-            _ => {}
-        }
+    session
+        .send(&json!({"id": 4, "method": "model/list", "params": {"limit": 100}}))
+        .await?;
+    let mut answers = CodexAnswers::default();
+    while answers.account.is_none() || answers.limits.is_none() {
+        answers.take(session.next().await?);
     }
-    Ok((account.unwrap(), limits.unwrap()))
+    // The usage is what the probe is for, so the listing is only waited for
+    // a little longer, and a probe that has its answer never fails for it.
+    let _ = tokio::time::timeout(MODELS_GRACE, async {
+        while answers.models.is_none() {
+            answers.take(session.next().await?);
+        }
+        Ok::<(), String>(())
+    })
+    .await;
+    Ok(CodexSession {
+        account: answers.account.unwrap(),
+        limits: answers.limits.unwrap(),
+        models: answers.models.unwrap_or(Err(Value::Null)),
+    })
+}
+
+#[derive(Default)]
+struct CodexAnswers {
+    account: Option<RpcResult>,
+    limits: Option<RpcResult>,
+    models: Option<RpcResult>,
+}
+
+impl CodexAnswers {
+    /// Keeps `frame` if it answers one of the requests.
+    fn take(&mut self, frame: Value) {
+        if frame.get("method").is_some() {
+            return;
+        }
+        let slot = match frame["id"].as_i64() {
+            Some(2) => &mut self.account,
+            Some(3) => &mut self.limits,
+            Some(4) => &mut self.models,
+            _ => return,
+        };
+        *slot = Some(rpc_result(frame));
+    }
 }
 
 async fn codex_response(session: &mut Session, id: i64) -> Result<RpcResult, String> {
@@ -888,6 +1031,44 @@ mod tests {
         );
     }
 
+    /// What a probe keeps of a listing: every model it can read, once.
+    #[test]
+    fn a_listing_keeps_each_readable_model_once() {
+        let claude = json!([
+            {"value": "opus", "displayName": "Opus", "supportedEffortLevels": ["high", "max"]},
+            {"displayName": "no id"},
+            {"value": "opus", "displayName": "again"},
+            {"value": "haiku"},
+        ]);
+        let listed = models(claude.as_array(), Model::from_claude);
+        assert_eq!(
+            listed,
+            [
+                Model {
+                    id: "opus".into(),
+                    label: "Opus".into(),
+                    reasoning: vec!["high".into(), "max".into()],
+                },
+                Model {
+                    id: "haiku".into(),
+                    label: "haiku".into(),
+                    reasoning: Vec::new(),
+                },
+            ]
+        );
+        let codex = json!([{"model": "gpt-5", "displayName": "GPT-5",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"effort": "odd"}]}]);
+        assert_eq!(
+            models(codex.as_array(), Model::from_codex),
+            [Model {
+                id: "gpt-5".into(),
+                label: "GPT-5".into(),
+                reasoning: vec!["low".into()],
+            }]
+        );
+        assert!(models(None, Model::from_codex).is_empty());
+    }
+
     #[test]
     fn rpc_frames_split_into_results_and_errors() {
         assert_eq!(
@@ -919,7 +1100,7 @@ if [ "$1" = auth ]; then
 fi
 read init
 echo 'not json'
-echo '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage-initialize","response":{}}}'
+echo '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage-initialize","response":{"models":[{"value":"opus","displayName":"Opus"}]}}}'
 read usage
 echo '{"type":"control_response","response":{"subtype":"success","request_id":"someone-else","response":{}}}'
 echo '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage","response":{"subscription_type":"max","rate_limits":{"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null,"is_active":true}]}}}}'
@@ -929,8 +1110,13 @@ sleep 30
         .unwrap();
         make_executable(&script);
         let account = Account::system(Provider::Claude);
-        let (identity, snapshot) = probe_claude(&account, &script).await.unwrap();
+        let Probed {
+            identity,
+            snapshot,
+            models,
+        } = probe_claude(&account, &script).await.unwrap();
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
+        assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
         assert!(snapshot.windows[0].binding);
         assert_eq!(snapshot.status, UsageStatus::Ok);
@@ -946,7 +1132,9 @@ sleep 30
         )
         .unwrap();
         make_executable(&script);
-        let (identity, snapshot) = probe_claude(&Account::system(Provider::Claude), &script)
+        let Probed {
+            identity, snapshot, ..
+        } = probe_claude(&Account::system(Provider::Claude), &script)
             .await
             .unwrap();
         assert!(identity.is_none());
@@ -972,6 +1160,8 @@ echo '{{"id":1,"result":{{"codexHome":"/tmp"}}}}'
 read initialized
 read account
 read limits
+read models
+echo '{{"id":4,"result":{{"data":[{{"model":"gpt-5","displayName":"GPT-5"}}]}}}}'
 echo '{{"id":2,"result":{{"account":{{"type":"chatgpt","email":"user@example.com","planType":"plus"}},"requiresOpenaiAuth":true}}}}'
 printf '%s\n' '{}'
 cat >/dev/null
@@ -981,10 +1171,15 @@ cat >/dev/null
         )
         .unwrap();
         make_executable(&script);
-        let (identity, snapshot) = probe_codex(&Account::system(Provider::Codex), &script)
+        let Probed {
+            identity,
+            snapshot,
+            models,
+        } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
+        assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
         assert!(snapshot.windows.is_empty());
     }

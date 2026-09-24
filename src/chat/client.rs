@@ -353,6 +353,12 @@ impl ClientHandle {
         activity.observe(generation, state)
     }
 
+    /// Whether the handle has asked its daemon to keep the snapshot current.
+    #[cfg(test)]
+    pub(crate) fn is_visible_for_test(&self) -> bool {
+        self.inner.visible.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
         *self

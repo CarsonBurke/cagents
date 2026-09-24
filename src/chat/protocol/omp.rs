@@ -105,6 +105,10 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
 struct Omp {
     sequence: u64,
     ready: bool,
+    /// Whether the conversation has ever been ready. A conversation that
+    /// changed sessions is not ready again until the new one loads, but it
+    /// is running and is not ended for a reply that failed meanwhile.
+    started: bool,
     busy: bool,
     expected_session: Option<String>,
     session_id: Option<String>,
@@ -603,9 +607,17 @@ impl Adapter for Omp {
                     *pending = None;
                 }
                 if frame["success"].as_bool() != Some(true) {
+                    // The conversation takes commands only once these have
+                    // answered, so one that fails leaves it never ready; it
+                    // ends with the reason rather than waiting on nothing.
+                    let fatal = !self.started
+                        && matches!(
+                            text(&frame, "command"),
+                            "negotiate_protocol" | "get_state" | "get_messages_page"
+                        );
                     step.events.push(Event::Error {
                         message: text(&frame, "error").into(),
-                        fatal: false,
+                        fatal,
                     });
                     return Ok(step);
                 }
@@ -642,6 +654,7 @@ impl Adapter for Omp {
                             step.events.push(Event::Reset {
                                 reason: "OMP changed the current conversation.".into(),
                             });
+                            step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
                         self.busy = data["isStreaming"].as_bool().unwrap_or(false)
@@ -722,6 +735,8 @@ impl Adapter for Omp {
                             step.writes.push(self.history_page(Some(cursor)));
                         } else {
                             self.ready = true;
+                            self.started = true;
+                            step.events.push(Event::Ready(true));
                             step.events.push(Event::Status {
                                 busy: self.busy,
                                 detail: if self.busy { "Working" } else { "Ready" }.into(),
@@ -1289,6 +1304,8 @@ mod tests {
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
         );
         assert!(adapter.ready);
+        // A sender waits for this rather than for a refusal.
+        assert!(finished.events.contains(&Event::Ready(true)));
         assert!(
             adapter
                 .command(Command::Answer {
@@ -1367,6 +1384,30 @@ mod tests {
         assert!(
             matches!(&failure.events[0],Event::Error {message,fatal:false} if message=="Extension failed")
         );
+    }
+
+    /// A reply the conversation needs before it takes commands that fails
+    /// ends it, since it could never be ready; once ready, the same failure
+    /// is only reported.
+    #[test]
+    fn a_failed_start_ends_the_conversation() {
+        // Once started, a conversation loading another session is not ready
+        // but is still not ended.
+        for started in [false, true] {
+            let mut adapter = Omp {
+                started,
+                state_request: Some("state".into()),
+                ..Default::default()
+            };
+            let failure = adapter
+                .receive(json!({"type":"response","id":"state","command":"get_state","success":false,"error":"No session"}))
+                .unwrap();
+            assert!(
+                matches!(&failure.events[0], Event::Error { message, fatal } if message == "No session" && *fatal != started),
+                "{:?}",
+                failure.events
+            );
+        }
     }
 
     #[test]

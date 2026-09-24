@@ -271,6 +271,7 @@ fn create_inner(
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             models: Vec::new(),
+            listing: Vec::new(),
             modalities: BTreeMap::new(),
             selected: None,
             reasoning: None,
@@ -325,6 +326,10 @@ struct Codex {
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
     models: Vec<Model>,
+    /// The pages of a model listing still under way. The listing is
+    /// reported whole, since a model missing from part of it reads as one
+    /// Codex does not offer.
+    listing: Vec<Model>,
     modalities: BTreeMap<String, Vec<String>>,
     selected: Option<String>,
     reasoning: Option<String>,
@@ -874,6 +879,12 @@ impl Adapter for Codex {
                     // worth putting a failure in the transcript over.
                     return Ok(step);
                 }
+                if matches!(pending, Pending::Models) && !self.listing.is_empty() {
+                    // The pages that did arrive are all the listing there
+                    // will be.
+                    self.models = std::mem::take(&mut self.listing);
+                    self.model_events(&mut step);
+                }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 step.events.push(Event::Error {
                     message: format!(
@@ -924,6 +935,7 @@ impl Adapter for Codex {
                     }
                     self.thread = Some(id.into());
                     self.ready = true;
+                    step.events.push(Event::Ready(true));
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
@@ -948,33 +960,16 @@ impl Adapter for Codex {
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
-                        let id = string(value, "model")?.to_owned();
-                        // A catalog entry that does not describe its efforts,
-                        // or does not name itself for the picker, is still a
-                        // model the user can select, so the unreadable parts
-                        // are dropped rather than the whole catalog with the
-                        // session it arrived in.
-                        let reasoning: Vec<String> = value["supportedReasoningEfforts"]
-                            .as_array()
-                            .map(|efforts| {
-                                efforts
-                                    .iter()
-                                    .filter_map(|effort| effort["reasoningEffort"].as_str())
-                                    .map(str::to_owned)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let model = Model {
-                            id: id.clone(),
-                            label: value["displayName"].as_str().unwrap_or(&id).into(),
-                            reasoning,
-                        };
-                        if let Some(existing) = self.models.iter_mut().find(|m| m.id == id) {
+                        let model = Model::from_codex(value).ok_or_else(|| {
+                            "Unsupported Codex frame: missing string model".to_owned()
+                        })?;
+                        let id = model.id.clone();
+                        if let Some(existing) = self.listing.iter_mut().find(|m| m.id == id) {
                             *existing = model;
                         } else {
-                            self.models.push(model);
+                            self.listing.push(model);
                         }
-                        if self.models.len() > MAX_MODELS {
+                        if self.listing.len() > MAX_MODELS {
                             return Err("Codex model catalog exceeds native client bound".into());
                         }
                         self.modalities.insert(
@@ -997,8 +992,10 @@ impl Adapter for Codex {
                             json!({"limit":100,"cursor":cursor}),
                             Pending::Models,
                         )?;
+                    } else {
+                        self.models = std::mem::take(&mut self.listing);
+                        self.model_events(&mut step);
                     }
-                    self.model_events(&mut step);
                 }
                 Pending::Skills => {
                     // Each skill with the path it is at and the scope that
@@ -1312,6 +1309,7 @@ impl Adapter for Codex {
             }
             "thread/closed" | "thread/deleted" => {
                 self.ready = false;
+                step.events.push(Event::Ready(false));
                 self.busy = false;
                 self.invalidate(&mut step);
                 step.events.push(Event::Error {
@@ -2154,6 +2152,7 @@ mod tests {
                 label: "Model".into(),
                 reasoning: vec!["future-effort".into()],
             }],
+            listing: Vec::new(),
             modalities: BTreeMap::new(),
             selected: Some("model".into()),
             reasoning: None,
@@ -2452,6 +2451,8 @@ mod tests {
             .find(|frame| frame["method"] == "thread/start")
             .unwrap();
         let attached = adapter.receive(json!({"id":start["id"],"result":{"thread":{"id":"fresh","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"gpt-test"}})).unwrap();
+        // A sender waits for this rather than for a refusal.
+        assert!(attached.events.contains(&Event::Ready(true)));
         assert!(
             attached
                 .events
@@ -2681,6 +2682,68 @@ mod tests {
             ToolStatus::Failed,
             "what Codex itself calls a failure is still a failure"
         );
+    }
+
+    /// A model listing that comes in pages is reported once it is whole: a
+    /// model on a later page is one Codex offers, not one it lacks.
+    #[test]
+    fn a_paged_model_listing_is_reported_whole() {
+        let mut adapter = adapter();
+        let mut listing = Step::default();
+        adapter
+            .call(
+                &mut listing,
+                "model/list",
+                json!({"limit":100}),
+                Pending::Models,
+            )
+            .unwrap();
+        let first = adapter
+            .receive(json!({"id":listing.writes[0]["id"],"result":{"data":[{"model":"gpt-a"}],"nextCursor":"more"}}))
+            .unwrap();
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Models { .. })),
+            "part of a listing is not reported"
+        );
+        assert_eq!(first.writes[0]["params"]["cursor"], "more");
+        let last = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":{"data":[{"model":"gpt-b"}]}}))
+            .unwrap();
+        let reported = last.events.iter().find_map(|event| match event {
+            Event::Models { models, .. } => Some(
+                models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        assert_eq!(reported, Some(vec!["gpt-a", "gpt-b"]));
+
+        // A later page that fails leaves the pages that arrived.
+        let mut second = self::adapter();
+        let mut listing = Step::default();
+        second
+            .call(
+                &mut listing,
+                "model/list",
+                json!({"limit":100}),
+                Pending::Models,
+            )
+            .unwrap();
+        let first = second
+            .receive(json!({"id":listing.writes[0]["id"],"result":{"data":[{"model":"gpt-a"}],"nextCursor":"more"}}))
+            .unwrap();
+        let failed = second
+            .receive(json!({"id":first.writes[0]["id"],"error":{"message":"busy"}}))
+            .unwrap();
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            Event::Models { models, .. } if models.len() == 1 && models[0].id == "gpt-a"
+        )));
     }
 
     #[test]

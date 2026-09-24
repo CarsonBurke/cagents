@@ -306,6 +306,15 @@ pub struct Session {
     pub terminal: Option<crate::model::TerminalSession>,
 }
 impl Session {
+    /// Whether no daemon has ever held this conversation: it has no provider
+    /// identity, no proof of a host that ran it, and no terminal it came
+    /// from. A conversation is proven the moment its start is answered, which
+    /// is before anything can be sent to it, so nothing a reader wrote can be
+    /// in one that is still unstarted.
+    pub fn is_unstarted(&self) -> bool {
+        self.launch.session_id.is_none() && self.proof.is_none() && self.terminal.is_none()
+    }
+
     /// The socket of the Codex listener allocated for this exact cagents
     /// thread, retained in both views.
     ///
@@ -431,6 +440,9 @@ pub struct Snapshot {
     /// Defaulted so a snapshot written before plans were carried still loads.
     #[serde(default)]
     pub plan: Vec<PlanStep>,
+    /// Whether the provider takes commands, so that what waits to be sent
+    /// can wait for it rather than for a refusal.
+    pub ready: bool,
 }
 
 impl Snapshot {
@@ -714,11 +726,54 @@ pub struct Request {
     /// Explicit provider decisions; no implicit approval or permissive default.
     pub actions: Vec<Choice>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     pub label: String,
     pub reasoning: Vec<String>,
+}
+
+impl Model {
+    /// One entry of the `models` Claude Code's `initialize` control response
+    /// lists, which both a conversation and an account probe receive.
+    pub fn from_claude(value: &serde_json::Value) -> Option<Self> {
+        let id = value["value"].as_str()?;
+        Some(Self {
+            id: id.into(),
+            label: value["displayName"].as_str().unwrap_or(id).into(),
+            reasoning: strings(value["supportedEffortLevels"].as_array(), |effort| {
+                effort.as_str()
+            }),
+        })
+    }
+
+    /// One entry of the Codex app server's `model/list` page.
+    ///
+    /// An entry that does not describe its efforts, or does not name itself
+    /// for the picker, is still a model the user can select, so only the
+    /// unreadable parts are dropped; an entry without an ID is not a model.
+    pub fn from_codex(value: &serde_json::Value) -> Option<Self> {
+        let id = value["model"].as_str()?;
+        Some(Self {
+            id: id.into(),
+            label: value["displayName"].as_str().unwrap_or(id).into(),
+            reasoning: strings(value["supportedReasoningEfforts"].as_array(), |effort| {
+                effort["reasoningEffort"].as_str()
+            }),
+        })
+    }
+}
+
+fn strings(
+    values: Option<&Vec<serde_json::Value>>,
+    read: impl Fn(&serde_json::Value) -> Option<&str>,
+) -> Vec<String> {
+    values
+        .into_iter()
+        .flatten()
+        .filter_map(read)
+        .map(str::to_owned)
+        .collect()
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
@@ -868,6 +923,10 @@ pub enum Event {
     /// runs on. It is about the account, not the conversation: the runtime
     /// forwards it to every surface and keeps it out of the transcript.
     AccountUsage(crate::account::LiveReport),
+    /// Whether the provider now takes commands. A provider refuses them
+    /// while it connects or loads a conversation, and says so only by
+    /// refusing, which a sender cannot tell from a refusal of the command.
+    Ready(bool),
 }
 
 #[cfg(test)]
