@@ -1,11 +1,13 @@
 mod close_processes;
 #[cfg(test)]
 mod close_tests;
+mod holder;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
+    fs::File,
     io::{BufWriter, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
@@ -27,9 +29,7 @@ use libghostty_vt::{
     style::{PaletteIndex, RgbColor},
     terminal::{ColorScheme, CompressionMode, CompressionResult, Mode, ScrollViewport},
 };
-use portable_pty::{
-    ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
-};
+use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 
 use crate::{
     model::{LaunchRecipe, TerminalOutputActivity, TerminalSession, agent_recovery::AgentProcess},
@@ -677,13 +677,15 @@ struct Worker {
     events: Sender<TerminalEvent>,
     transcript: Option<TranscriptWriter>,
     published: Arc<PublishedState>,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child_killer: Box<dyn ChildKiller + Send + Sync>,
+    master: holder::PtyMaster,
+    writer: File,
+    child: holder::HeldChild,
     child_exit_rx: Receiver<ChildExit>,
     child_identity: Option<RootIdentity>,
     checked_shutdown: bool,
-    child_reaper: Option<JoinHandle<()>>,
+    /// The process that owns this terminal's PTY and reaps its root.
+    /// Released last, once nothing here reads or writes the terminal.
+    holder: holder::Holder,
     reader: Option<JoinHandle<()>>,
     /// Write end of the reader's wake pipe. Closing it releases a read that a
     /// disowned grandchild would otherwise hold open indefinitely.
@@ -748,10 +750,6 @@ impl Worker {
             })
             .map_err(|error| format!("register title effect: {error}"))?;
 
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(pty_size(current_size))
-            .map_err(|error| format!("open PTY: {error:#}"))?;
         let mut command = match &config.execution_environment {
             Some(environment) => {
                 let mut command = CommandBuilder::new(&session.launch.program);
@@ -775,30 +773,29 @@ impl Worker {
         let executable = interactive_shell_launch(&session.launch)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("spawn {}: {error:#}", session.launch.program))?;
-        let child_identity = child
-            .process_id()
-            .and_then(|pid| RootIdentity::capture(pid as libc::pid_t, executable).ok());
-        drop(pair.slave);
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| format!("clone PTY reader: {error:#}"))?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| format!("take PTY writer: {error:#}"))?;
+        let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
+        let held = holder::spawn(command, pty_size(current_size), child_exit_tx)?;
+        // The holder reaps the root, so its pid identifies it only while the
+        // pidfd still reaches an unreaped process: checked after the capture,
+        // that proves the capture read the root and not a reused pid.
+        let child_identity = RootIdentity::capture(held.child.pid(), executable)
+            .ok()
+            .filter(|_| held.child.unreaped());
+        let duplicate = |purpose: &str| {
+            held.master
+                .duplicate()
+                .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
+        };
+        let mut reader = File::from(duplicate("reading")?);
+        let writer = File::from(duplicate("writing")?);
 
-        // `try_clone_reader` hides its descriptor, and closing the master does
-        // not release a read already blocked on the clone: a PTY master read
-        // only fails with EIO once the last slave descriptor closes, which a
-        // disowned grandchild can defer forever. Wait for readiness on a
-        // descriptor this worker hands over instead, alongside a pipe whose
-        // closure is the shutdown signal, so the reader always has a way out.
-        let readiness = duplicate_descriptor(&*pair.master)?;
+        // Closing the master does not release a read already blocked on a
+        // duplicate: a PTY master read only fails with EIO once the last slave
+        // descriptor closes, which a disowned grandchild can defer forever.
+        // Wait for readiness on a descriptor this worker hands over instead,
+        // alongside a pipe whose closure is the shutdown signal, so the reader
+        // always has a way out.
+        let readiness = duplicate("readiness")?;
         let (wake_rx, wake_tx) = wake_pipe()?;
         let (pty_tx, pty_rx) = crossbeam_channel::bounded(config.pty_capacity.max(1));
         let (reader_done_tx, reader_done) = crossbeam_channel::bounded::<()>(0);
@@ -835,16 +832,6 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
 
-        let child_killer = child.clone_killer();
-        let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let child_reaper = thread::Builder::new()
-            .name(format!("terminal-child-reaper-{:?}", session.id))
-            .spawn(move || {
-                let result = child.wait().map_err(|error| error.to_string());
-                let _ = child_exit_tx.send(result);
-            })
-            .map_err(|error| format!("start child reaper: {error}"))?;
-
         Ok(Self {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
@@ -874,13 +861,13 @@ impl Worker {
             events,
             transcript,
             published,
-            master: pair.master,
+            master: held.master,
             writer,
-            child_killer,
+            child: held.child,
             child_exit_rx,
             child_identity,
             checked_shutdown: false,
-            child_reaper: Some(child_reaper),
+            holder: held.holder,
             reader: Some(reader_thread),
             reader_wake: Some(wake_tx),
             reader_done,
@@ -964,7 +951,7 @@ impl Worker {
                         .unwrap_or_else(|_| Err("child reaper closed".into()));
                     self.handle_child_exit(&mut exited, result);
                 }
-                Err(TryRecvError::Empty) => match self.child_killer.kill() {
+                Err(TryRecvError::Empty) => match self.child.kill() {
                     Ok(()) => {
                         let result = self
                             .child_exit_rx
@@ -978,9 +965,6 @@ impl Worker {
                     },
                 },
             }
-        }
-        if exited && let Some(child_reaper) = self.child_reaper.take() {
-            let _ = child_reaper.join();
         }
         if let Some(transcript) = self.transcript.take() {
             transcript.finish();
@@ -1018,6 +1002,7 @@ impl Worker {
         }
         drop(self.writer);
         drop(self.master);
+        drop(self.holder);
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
     }
@@ -1347,7 +1332,7 @@ impl Worker {
         if size != self.applied_pty_size {
             match self.master.resize(pty_size(size)) {
                 Ok(()) => self.applied_pty_size = size,
-                Err(error) => self.error("resize PTY", format!("{error:#}")),
+                Err(error) => self.error("resize PTY", error.to_string()),
             }
         }
         if size != self.applied_parser_size {
@@ -1563,12 +1548,8 @@ impl Worker {
             .as_ref()
             .ok_or("Child identity unavailable")?;
         let family = FrozenFamily::capture(root, deadline)?;
-        let fd = self
-            .master
-            .as_raw_fd()
-            .ok_or("PTY descriptor unavailable")?;
         // SAFETY: this worker owns the live PTY throughout the frozen census.
-        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
         if foreground <= 0 {
             return Err("Foreground process group unavailable".into());
         }
@@ -1583,11 +1564,9 @@ impl Worker {
     }
 
     fn foreground_group(&self) -> Option<libc::pid_t> {
-        self.master.as_raw_fd().and_then(|fd| {
-            // SAFETY: this worker owns the live master descriptor.
-            let group = unsafe { libc::tcgetpgrp(fd) };
-            (group > 0).then_some(group)
-        })
+        // SAFETY: this worker owns the live master descriptor.
+        let group = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        (group > 0).then_some(group)
     }
 
     fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
@@ -2023,27 +2002,6 @@ fn pty_size(size: TerminalSize) -> PtySize {
     }
 }
 
-/// Duplicate a master PTY descriptor for the reader's readiness wait.
-///
-/// Readiness is a property of the terminal, not of a particular descriptor, so
-/// a duplicate answers for the clone the reader actually reads from - and the
-/// reader owning it means shutdown never closes a descriptor out from under a
-/// thread that is still polling it.
-fn duplicate_descriptor(master: &dyn MasterPty) -> Result<OwnedFd, String> {
-    let fd = master.as_raw_fd().ok_or("PTY descriptor unavailable")?;
-    // SAFETY: `master` keeps `fd` open across this call, and F_DUPFD_CLOEXEC
-    // returns a fresh descriptor nobody else owns.
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if duplicate < 0 {
-        return Err(format!(
-            "duplicate PTY descriptor: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `fcntl` just returned an owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
-}
-
 /// Read and write ends of the reader's shutdown pipe. Nothing is ever written
 /// to it: dropping the write end hangs the read end up, which is the one event
 /// a blocking reader can always observe.
@@ -2118,6 +2076,12 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
         }
         match reader.read(&mut buffer) {
             Ok(0) => {
+                let _ = sender.send(PtyMessage::Eof);
+                return;
+            }
+            // A PTY master reads EIO, not end of file, once its terminal's
+            // last slave closes: the ordinary end of a terminal.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
                 let _ = sender.send(PtyMessage::Eof);
                 return;
             }
@@ -2479,6 +2443,55 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_terminal_whose_root_exits_ends_its_output_without_an_error() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "echo finished"]);
+        command.cwd("/");
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = holder::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            exits,
+        )
+        .unwrap();
+        let mut reader = File::from(held.master.duplicate().unwrap());
+        let readiness = held.master.duplicate().unwrap();
+        let (wake_rx, _wake_tx) = wake_pipe().unwrap();
+        let (sender, messages) = crossbeam_channel::unbounded();
+        read_pty(&mut reader, &sender, readiness, wake_rx);
+
+        let messages: Vec<_> = messages.try_iter().collect();
+        let output: Vec<u8> = messages
+            .iter()
+            .filter_map(|message| match message {
+                PtyMessage::Bytes(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert!(String::from_utf8_lossy(&output).contains("finished"));
+        assert!(
+            matches!(messages.last(), Some(PtyMessage::Eof)),
+            "{:?}",
+            messages.last().map(|message| match message {
+                PtyMessage::Error(error) => error.as_str(),
+                _ => "not the end",
+            })
+        );
+        let status = exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn omp_display_title_drops_lifecycle_animation_but_preserves_labels() {

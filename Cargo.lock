@@ -7228,6 +7228,8 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "serde",
+ "serde_derive",
  "serial2",
  "shared_library",
  "shell-words",

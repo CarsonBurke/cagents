@@ -135,6 +135,7 @@ impl Handle {
                     .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
                     .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
                     .process_group(0);
+                crate::host::descriptor_limit::inherit(&mut process);
                 Some(ChildGuard(
                     process
                         .spawn()
