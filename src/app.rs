@@ -15927,6 +15927,14 @@ mod tests {
             .unwrap();
         let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         server.join().unwrap();
+        // A rejected handshake wakes its consumer before it queues the error,
+        // so the wake alone does not mean there is anything to drain yet.
+        let events = handle.events();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.is_empty() {
+            assert!(Instant::now() < deadline, "the rejection was never queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // The subscription can deliver this edge before the start task returns.
         let _ = app.update(Message::TerminalWake {
             card,
