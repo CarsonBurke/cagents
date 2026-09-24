@@ -42,8 +42,9 @@ const MAX_CURSORS: usize = 4096;
 /// another is first seen.
 const CURSOR_IDLE: Duration = Duration::from_secs(10 * 60);
 /// How far a turn may be stamped before its process started and still be
-/// its own: the stamp is in whole seconds, the process's start in ticks.
-const START_SLACK: u64 = 2;
+/// its own: the stamp is in whole seconds, the process's start in ticks and
+/// taken back from its age, which a wall clock stepped since skews.
+const START_SLACK: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Turn {
@@ -213,16 +214,21 @@ fn merge(state: Option<ActivityState>, turn: ActivityState) -> ActivityState {
 
 /// The turn boundary `line` records, if it is one.
 fn boundary(line: &[u8]) -> Option<Turn> {
+    // The stamps are read as whatever they are, so one of an unexpected
+    // form costs only the stamp, never the boundary.
     #[derive(Deserialize)]
     struct Kind {
         #[serde(rename = "type")]
         kind: String,
-        started_at: Option<f64>,
+        #[serde(default)]
+        started_at: serde_json::Value,
     }
     #[derive(Deserialize)]
     struct Record {
         #[serde(rename = "type")]
         kind: String,
+        #[serde(default)]
+        timestamp: serde_json::Value,
         payload: Kind,
     }
     const MARKERS: [&[u8]; 3] = [
@@ -243,16 +249,51 @@ fn boundary(line: &[u8]) -> Option<Turn> {
         return None;
     }
     match record.payload.kind.as_str() {
+        // Codex has stated when a turn began only since 2026; before, the
+        // record's own time is when it was written, at the turn's start.
         "task_started" => Some(Turn::Running(
             record
                 .payload
                 .started_at
+                .as_f64()
                 .filter(|at| at.is_finite() && *at >= 0.0)
-                .map(|at| at as u64),
+                .map(|at| at as u64)
+                .or_else(|| record.timestamp.as_str().and_then(unix_seconds)),
         )),
         "task_complete" | "turn_aborted" => Some(Turn::Ended),
         _ => None,
     }
+}
+
+/// The unix second a UTC RFC 3339 time such as `2026-03-01T12:34:56.789Z`
+/// names, as Codex stamps its records.
+fn unix_seconds(time: &str) -> Option<u64> {
+    let bytes = time.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !time.ends_with('Z')
+    {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| time.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute, second) = (field(11..13)?, field(14..16)?, field(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // Days since the epoch of a proleptic Gregorian date, counting years
+    // from March so that a leap day ends its year.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
 }
 
 /// A cursor for a file seen for the first time: its last boundary, searched
@@ -517,7 +558,7 @@ mod tests {
         let started = Some(1_000_000);
         let running = |at| activity(Some(Turn::Running(at)), started);
         assert_eq!(running(Some(900_000)), ActivityState::Idle);
-        assert_eq!(running(Some(999_999)), ActivityState::Working, "slack");
+        assert_eq!(running(Some(999_995)), ActivityState::Working, "slack");
         assert_eq!(running(Some(1_000_050)), ActivityState::Working);
         assert_eq!(running(None), ActivityState::Working, "unstamped");
         assert_eq!(
@@ -536,6 +577,37 @@ mod tests {
             observed(&Rollouts::default(), &file),
             Some(Turn::Running(Some(1_758_000_000)))
         );
+    }
+
+    /// A record from before turns stated their start is dated by its own
+    /// time, and a stamp of an unexpected form still leaves a boundary.
+    #[test]
+    fn a_turn_without_a_start_is_dated_by_its_record() {
+        let started = |line: &str| match boundary(line.as_bytes()) {
+            Some(Turn::Running(at)) => at,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            started(
+                r#"{"timestamp":"2026-03-01T12:34:56.789Z","type":"event_msg","payload":{"type":"task_started"}}"#
+            ),
+            Some(1_772_368_496)
+        );
+        assert_eq!(
+            started(
+                r#"{"timestamp":"2026-03-01T12:34:56Z","type":"event_msg","payload":{"type":"task_started","started_at":"soon"}}"#
+            ),
+            Some(1_772_368_496)
+        );
+        assert_eq!(
+            started(r#"{"type":"event_msg","payload":{"type":"task_started","started_at":null}}"#),
+            None
+        );
+        assert_eq!(unix_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_seconds("2000-02-29T23:59:59Z"), Some(951_868_799));
+        assert_eq!(unix_seconds("2024-12-31T00:00:00Z"), Some(1_735_603_200));
+        assert_eq!(unix_seconds("2026-03-01T12:34:56+02:00"), None);
+        assert_eq!(unix_seconds("garbage"), None);
     }
 
     /// The rollouts a live process writes are found through its descriptors;
