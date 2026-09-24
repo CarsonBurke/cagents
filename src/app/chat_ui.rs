@@ -1083,16 +1083,12 @@ struct Queued {
     /// When the provider was first seen ready, from which the wait for it to
     /// list the chosen model is bounded.
     since: Option<Instant>,
-    /// When the provider was first seen reporting an error before it was
-    /// ready, from which the wait for it to get past the error is bounded.
-    faltering: Option<Instant>,
     /// Whether a look back once a wait is over is already scheduled.
     rechecking: bool,
 }
 impl Queued {
     /// Brings the queue back to [`Cagents::dispatch_queued`] after `wait`,
-    /// once for however many waits are running; the look back that ends the
-    /// sooner one schedules the other.
+    /// unless a look back is already scheduled.
     fn look_again(&mut self, target: Target, wait: Duration) -> Task<Message> {
         if std::mem::replace(&mut self.rechecking, true) {
             return Task::none();
@@ -2003,11 +1999,6 @@ fn draft_snapshot(
 /// The words a chat whose first message is still waiting to be sent refuses
 /// to be left with.
 const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leaving the chat.";
-
-/// How long a queued first message waits for a provider that reported an
-/// error before it was ready to be ready anyway, before the card goes back
-/// to its draft with that error.
-const STARTUP_ERROR_PATIENCE: Duration = Duration::from_secs(5);
 
 /// How long a queued first message waits, once its provider is ready, for
 /// the conversation to list the model it was meant to be sent to, before
@@ -2993,7 +2984,6 @@ impl Cagents {
             model,
             draft: session.clone(),
             since: None,
-            faltering: None,
             rechecking: false,
         });
         runtime.replace_draft(text_editor::Content::new());
@@ -3012,10 +3002,9 @@ impl Cagents {
     /// model, where one was chosen, and then the message.
     ///
     /// Nothing is sent before the provider says it takes commands, which the
-    /// next snapshot to say so brings back here. A provider that reports an
-    /// error first is given [`STARTUP_ERROR_PATIENCE`] to get past it, since
-    /// most such errors leave it never ready, and the card goes back to its
-    /// draft if it does not. A model the conversation does not list is not
+    /// next snapshot to say so brings back here. A provider that cannot get
+    /// that far says so by ending the conversation, which sends the card back
+    /// to its draft with the reason. A model the conversation does not list is not
     /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
     /// instead, and the transcript says so.
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
@@ -3034,24 +3023,15 @@ impl Cagents {
         };
         let snapshot = handle.snapshot();
         if snapshot.exited {
-            return self.revert_chat_draft(
-                target,
-                Some("The conversation stopped before it took the first message.".into()),
-            );
+            let stopped = "The conversation stopped before it took the first message";
+            let error = match &snapshot.error {
+                Some(error) => format!("{stopped}: {error}"),
+                None => format!("{stopped}."),
+            };
+            return self.revert_chat_draft(target, Some(error));
         }
         if !snapshot.ready {
-            let Some(error) = snapshot.error.clone() else {
-                queued.faltering = None;
-                return Task::none();
-            };
-            let faltered = queued.faltering.get_or_insert_with(Instant::now).elapsed();
-            if faltered < STARTUP_ERROR_PATIENCE {
-                return queued.look_again(target, STARTUP_ERROR_PATIENCE - faltered);
-            }
-            return self.revert_chat_draft(
-                target,
-                Some(format!("The conversation could not start: {error}")),
-            );
+            return Task::none();
         }
         let waited = queued.since.get_or_insert_with(Instant::now).elapsed();
         if let Some((model, reasoning)) = queued.model.clone() {
@@ -3676,20 +3656,21 @@ impl Cagents {
                     Err(failure)
                         if failure.recovery == chat::Recovery::Fresh
                             && attempt.session.launch.session_id.is_none()
+                            && attempt.session.terminal.is_none()
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
                             ) =>
                     {
-                        // A conversation its provider never named holds
-                        // nothing to resume, so there is nothing to ask the
-                        // reader about: the card opens as a draft, as it
-                        // would have if nothing had started it. Chats opened
-                        // before a first message started nothing come back
-                        // this way after an update.
+                        // A conversation its provider never named, and that
+                        // no CLI terminal of the reader's holds, has nothing
+                        // to resume, so there is nothing to ask the reader
+                        // about: the card opens as a draft, as it would have
+                        // if nothing had started it. Chats opened before a
+                        // first message started anything come back this way
+                        // after an update.
                         let mut draft = attempt.session.clone();
                         draft.proof = None;
-                        draft.terminal = None;
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_forget(target.card);
                         self.replace_chat_conversation(target.card, draft.clone());
@@ -6479,49 +6460,39 @@ mod tests {
         );
     }
 
-    /// A provider that reports an error before it is ready is given a moment
-    /// to get past it, and the card goes back to its draft, saying why, when
-    /// it does not; one that does is sent the message as usual.
+    /// A provider that cannot start ends its conversation, and the card goes
+    /// back to its draft saying why; a warning it carries on past does not.
     #[test]
-    fn a_provider_stuck_on_an_error_before_it_is_ready_returns_the_card_to_its_draft() {
-        for recovers in [false, true] {
-            let mut app = crate::app::tests::context_inspector_test_app(false);
-            let (card, target) = starting_chat(&mut app);
-            let handle = fixture_handle(&app, card, None);
-            handle.replace_snapshot_for_test(Snapshot {
-                error: Some("fixture: no state".into()),
-                ..Snapshot::default()
-            });
-            answer_start(&mut app, target, Ok(handle.clone()));
-            let target = chat_runtime(&app, card).target;
-            let queued = app
-                .chat_runtime_mut(target)
-                .and_then(|runtime| runtime.queued.as_mut())
-                .expect("the message waits out the error");
-            assert!(queued.rechecking, "it looks again once the wait is over");
-            // The wait is over.
-            queued.faltering = Instant::now().checked_sub(STARTUP_ERROR_PATIENCE);
-            if recovers {
-                handle.replace_snapshot_for_test(Snapshot {
-                    ready: true,
-                    error: Some("fixture: no state".into()),
-                    ..Snapshot::default()
-                });
-            }
-            let _ = app.update(Message::ChatUi(Action::DispatchQueued(target)));
-            if recovers {
-                assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
-                continue;
-            }
-            let runtime = chat_runtime(&app, card);
-            assert!(runtime.choosing());
-            assert_eq!(runtime.composer.text().trim(), "hello");
-            assert_eq!(
-                runtime.error.as_deref(),
-                Some("The conversation could not start: fixture: no state")
-            );
-            retired(&mut app, card);
-        }
+    fn a_provider_that_cannot_start_returns_the_card_to_its_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot {
+            error: Some("fixture: deprecated setting".into()),
+            ..Snapshot::default()
+        });
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let target = chat_runtime(&app, card).target;
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+        assert!(
+            chat_runtime(&app, card).queued.is_some(),
+            "a warning is waited past"
+        );
+
+        handle.replace_snapshot_for_test(Snapshot {
+            error: Some("fixture: no state".into()),
+            exited: true,
+            ..Snapshot::default()
+        });
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.choosing());
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("The conversation stopped before it took the first message: fixture: no state")
+        );
+        retired(&mut app, card);
     }
 
     /// A card that goes back to its draft keeps nothing of the conversation
@@ -6684,6 +6655,27 @@ mod tests {
         };
         assert!(saved.is_unstarted(), "the next launch opens it as a draft");
         assert_eq!(saved.id, session.id);
+
+        // One converted from a CLI terminal may hold a conversation there,
+        // so it asks, as before.
+        let card = live_chat(&mut app, None);
+        let mut session = chat_runtime(&app, card).session.clone();
+        session.terminal = Some(crate::app::fresh_terminal_session(LaunchRecipe {
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: session.launch.recipe.working_directory.clone(),
+            environment: Default::default(),
+        }));
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        let _ = app.open_chat(card, session, chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::fresh("fixture: daemon gone")),
+        );
+        assert!(app.chat_offers_fresh_conversation(card));
     }
 
     /// A saved conversation nothing ever ran reopens as a draft, and any

@@ -603,9 +603,17 @@ impl Adapter for Omp {
                     *pending = None;
                 }
                 if frame["success"].as_bool() != Some(true) {
+                    // The conversation takes commands only once these have
+                    // answered, so one that fails leaves it never ready; it
+                    // ends with the reason rather than waiting on nothing.
+                    let fatal = !self.ready
+                        && matches!(
+                            text(&frame, "command"),
+                            "negotiate_protocol" | "get_state" | "get_messages_page"
+                        );
                     step.events.push(Event::Error {
                         message: text(&frame, "error").into(),
-                        fatal: false,
+                        fatal,
                     });
                     return Ok(step);
                 }
@@ -1371,6 +1379,28 @@ mod tests {
         assert!(
             matches!(&failure.events[0],Event::Error {message,fatal:false} if message=="Extension failed")
         );
+    }
+
+    /// A reply the conversation needs before it takes commands that fails
+    /// ends it, since it could never be ready; once ready, the same failure
+    /// is only reported.
+    #[test]
+    fn a_failed_start_ends_the_conversation() {
+        for ready in [false, true] {
+            let mut adapter = Omp {
+                ready,
+                state_request: Some("state".into()),
+                ..Default::default()
+            };
+            let failure = adapter
+                .receive(json!({"type":"response","id":"state","command":"get_state","success":false,"error":"No session"}))
+                .unwrap();
+            assert!(
+                matches!(&failure.events[0], Event::Error { message, fatal } if message == "No session" && *fatal != ready),
+                "{:?}",
+                failure.events
+            );
+        }
     }
 
     #[test]

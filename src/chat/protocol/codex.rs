@@ -879,6 +879,12 @@ impl Adapter for Codex {
                     // worth putting a failure in the transcript over.
                     return Ok(step);
                 }
+                if matches!(pending, Pending::Models) && !self.listing.is_empty() {
+                    // The pages that did arrive are all the listing there
+                    // will be.
+                    self.models = std::mem::take(&mut self.listing);
+                    self.model_events(&mut step);
+                }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 step.events.push(Event::Error {
                     message: format!(
@@ -2716,6 +2722,28 @@ mod tests {
             _ => None,
         });
         assert_eq!(reported, Some(vec!["gpt-a", "gpt-b"]));
+
+        // A later page that fails leaves the pages that arrived.
+        let mut second = self::adapter();
+        let mut listing = Step::default();
+        second
+            .call(
+                &mut listing,
+                "model/list",
+                json!({"limit":100}),
+                Pending::Models,
+            )
+            .unwrap();
+        let first = second
+            .receive(json!({"id":listing.writes[0]["id"],"result":{"data":[{"model":"gpt-a"}],"nextCursor":"more"}}))
+            .unwrap();
+        let failed = second
+            .receive(json!({"id":first.writes[0]["id"],"error":{"message":"busy"}}))
+            .unwrap();
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            Event::Models { models, .. } if models.len() == 1 && models[0].id == "gpt-a"
+        )));
     }
 
     #[test]
