@@ -288,30 +288,68 @@ impl KeyboardShortcuts {
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
-        let mut parsed = Vec::new();
+        self.fault().map_or(Ok(()), |fault| Err(fault.error))
+    }
+
+    /// The first action this table cannot bind, and why: by index into
+    /// `actions()`, and for a conflict, the earlier action whose chord it
+    /// repeats.
+    fn fault(&self) -> Option<ShortcutFault> {
+        let mut parsed: Vec<(ShortcutBinding, usize)> = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
+            let fault = |error, conflicts_with| {
+                Some(ShortcutFault {
+                    action: index,
+                    conflicts_with,
+                    error: SettingsError::InvalidShortcut(error),
+                })
+            };
             if chords.is_empty() && !matches!(index, 1 | 2 | 7..=12) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
-                return Err(SettingsError::InvalidShortcut(
-                    "every keyboard shortcut needs at least one chord",
-                ));
+                return fault("every keyboard shortcut needs at least one chord", None);
             }
             for chord in chords {
-                let binding = parse_shortcut(chord).map_err(SettingsError::InvalidShortcut)?;
+                let binding = match parse_shortcut(chord) {
+                    Ok(binding) => binding,
+                    Err(error) => return fault(error, None),
+                };
                 if let Some(message) = withheld_from_the_card(binding) {
-                    return Err(SettingsError::InvalidShortcut(message));
+                    return fault(message, None);
                 }
-                if parsed.contains(&binding) {
-                    return Err(SettingsError::InvalidShortcut(
-                        "keyboard shortcuts must not conflict",
-                    ));
+                if let Some(&(_, owner)) = parsed.iter().find(|(other, _)| *other == binding) {
+                    return fault("keyboard shortcuts must not conflict", Some(owner));
                 }
-                parsed.push(binding);
+                parsed.push((binding, index));
             }
         }
-        Ok(())
+        None
     }
+}
+
+/// The serialized name of each action, in `KeyboardShortcuts::actions` order.
+const SHORTCUT_ACTIONS: [&str; 13] = [
+    "new_terminal",
+    "new_channel",
+    "clone_pane",
+    "close_focused_column",
+    "search_projects",
+    "previous_column",
+    "next_column",
+    "cycle_pane_width",
+    "previous_workspace",
+    "next_workspace",
+    "review_toggle_viewed",
+    "review_next_file",
+    "review_previous_file",
+];
+
+/// An action a shortcut table cannot bind.
+#[derive(Debug)]
+struct ShortcutFault {
+    action: usize,
+    conflicts_with: Option<usize>,
+    error: SettingsError,
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -1398,6 +1436,11 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
 /// the preference. Its value represented lines per wheel notch, so it is the
 /// same setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
+    // Decoding moves it too; moving it first lets a setting set aside or
+    // kept be found under the name this build writes.
+    if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
+        adopt_legacy_channel_shortcut(shortcuts);
+    }
     if !table.contains_key("terminal_scroll_size")
         && matches!(
             table.get("terminal_scroll_speed"),
@@ -1528,6 +1571,9 @@ struct Decoded {
     /// Validated.
     settings: AppSettings,
     foreign: Vec<Foreign>,
+    /// Settings the file lacks, each the path to a setting this build filled
+    /// in: a top-level setting, or one action of the shortcut table.
+    absent: Vec<Vec<Segment>>,
 }
 
 /// Decodes and validates a current-schema document, setting aside every key
@@ -1538,20 +1584,52 @@ struct Decoded {
 /// error points, one at a time, and decoding retried; within a list, where a
 /// default entry at the same index would describe another entry, an optional
 /// key is dropped instead, and otherwise the whole list falls back. A value
-/// that decodes but fails validation, such as a range a newer build widened,
-/// falls back the same way. Anything else still fails the document.
+/// that decodes but fails validation, such as a range a newer build widened
+/// or a chord naming a key it added, falls back the same way; each shortcut
+/// action is a setting of its own. Anything else still fails the document.
 fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
     let defaults = written(&AppSettings::default())?;
     let mut read = toml::Value::Table(table);
+    let mut foreign: Vec<Foreign> = Vec::new();
+    let mut absent = Vec::new();
     if let (Some(read), Some(defaults)) = (read.as_table_mut(), defaults.as_table()) {
         for (key, default) in defaults {
             if !read.contains_key(key) {
-                tracing::info!(setting = %key, "settings.toml lacks a setting; its default is used");
+                absent.push(vec![Segment::Key(key.clone())]);
                 read.insert(key.clone(), default.clone());
             }
         }
     }
-    let mut foreign: Vec<Foreign> = Vec::new();
+    // The shortcut table is decoded whole by its own migration, so an action
+    // that is not a list of chords is set aside here, before it can cost the
+    // table, and an action the file lacks is noted.
+    if let Some(toml::Value::Table(shortcuts)) = read.get_mut("keyboard_shortcuts") {
+        let defaults = &defaults["keyboard_shortcuts"];
+        for action in SHORTCUT_ACTIONS {
+            let path = vec![
+                Segment::Key("keyboard_shortcuts".into()),
+                Segment::Key(action.into()),
+            ];
+            match shortcuts.get_mut(action) {
+                None => absent.push(path),
+                Some(value)
+                    if !value
+                        .as_array()
+                        .is_some_and(|chords| chords.iter().all(toml::Value::is_str)) =>
+                {
+                    *value = defaults[action].clone();
+                    foreign.push(Foreign {
+                        path,
+                        reason: ForeignReason::UnreadableValue("expected a list of chords".into()),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    for path in &absent {
+        tracing::info!(setting = %dotted(path), "settings.toml lacks a setting; its default is used and not written until changed");
+    }
     let settings = loop {
         let mut unknown = Vec::new();
         let decoded: Result<AppSettings, _> = serde_path_to_error::deserialize(
@@ -1560,20 +1638,28 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
             }),
         );
         let (path, reason, error) = match decoded {
-            Ok(settings) => match settings.validate() {
-                Ok(settings) => {
-                    foreign.extend(unknown.into_iter().map(|path| Foreign {
-                        path,
-                        reason: ForeignReason::UnknownKey,
-                    }));
-                    break settings;
+            Ok(settings) => {
+                let fault = settings.keyboard_shortcuts.fault();
+                match (settings.validate(), fault) {
+                    (Ok(settings), _) => {
+                        foreign.extend(unknown.into_iter().map(|path| Foreign {
+                            path,
+                            reason: ForeignReason::UnknownKey,
+                        }));
+                        break settings;
+                    }
+                    (Err(_), Some(fault)) => (
+                        blamed_action(&read, &defaults, &fault),
+                        fault.error.to_string(),
+                        fault.error,
+                    ),
+                    (Err(error), None) => (
+                        invalid_setting(&read, &defaults, &error),
+                        error.to_string(),
+                        error,
+                    ),
                 }
-                Err(error) => (
-                    invalid_setting(&read, &defaults, &error),
-                    error.to_string(),
-                    error,
-                ),
-            },
+            }
             Err(error) => (
                 error_path(error.path()),
                 error.inner().to_string(),
@@ -1584,22 +1670,23 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
             return Err(error);
         };
         // A setting that falls back whole takes with it what was set aside
-        // inside it.
-        foreign.retain(|setting| !setting.path.starts_with(&path));
-        foreign.push(Foreign {
-            path,
-            reason: ForeignReason::UnreadableValue(reason),
+        // inside it, and the first reason, which is why it fell back.
+        let mut reason = ForeignReason::UnreadableValue(reason);
+        foreign.retain(|setting| {
+            let inside = setting.path.starts_with(&path);
+            if inside && matches!(setting.reason, ForeignReason::UnreadableValue(_)) {
+                reason = setting.reason.clone();
+            }
+            !inside
         });
+        foreign.push(Foreign { path, reason });
     };
 
-    // The shortcut table is decoded whole by its own migration, so its keys
-    // are checked against the actions this build binds.
     if let Some(toml::Value::Table(shortcuts)) = read.get("keyboard_shortcuts") {
-        let known = &defaults["keyboard_shortcuts"];
         foreign.extend(
             shortcuts
                 .keys()
-                .filter(|key| known.get(key.as_str()).is_none() && *key != "new_thread")
+                .filter(|key| !SHORTCUT_ACTIONS.contains(&key.as_str()))
                 .map(|key| Foreign {
                     path: vec![
                         Segment::Key("keyboard_shortcuts".into()),
@@ -1609,7 +1696,30 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
                 }),
         );
     }
-    Ok(Decoded { settings, foreign })
+    Ok(Decoded {
+        settings,
+        foreign,
+        absent,
+    })
+}
+
+/// The action a shortcut `fault` is set aside from. Of two actions that share
+/// a chord, the one the file set is blamed rather than one this build filled
+/// in or fell back to: that one holds its default, which is no way forward.
+fn blamed_action(
+    read: &toml::Value,
+    defaults: &toml::Value,
+    fault: &ShortcutFault,
+) -> Option<Vec<Segment>> {
+    std::iter::once(fault.action)
+        .chain(fault.conflicts_with)
+        .map(|action| {
+            vec![
+                Segment::Key("keyboard_shortcuts".into()),
+                Segment::Key(SHORTCUT_ACTIONS[action].into()),
+            ]
+        })
+        .find(|path| get(read, path).is_some_and(|value| get(defaults, path) != Some(value)))
 }
 
 /// Where serde stopped, as a path into the document. `None` when the error is
@@ -1629,33 +1739,21 @@ fn error_path(path: &serde_path_to_error::Path) -> Option<Vec<Segment>> {
     (!path.is_empty()).then_some(path)
 }
 
-/// The one setting that fails validation with `error`: the first whose
-/// default in its place clears the error or turns it into another. Only a
-/// setting that differs from its default can be the cause. Each action of the
-/// shortcut table is a setting of its own, so one chord this build cannot
-/// parse does not cost every other.
+/// The one top-level setting that fails validation with `error`: the first
+/// whose default in its place clears the error or turns it into another.
+/// Only a setting that differs from its default can be the cause, and each
+/// setting fails validation with a message of its own. The shortcut table
+/// says itself which action fails; see `blamed_action`.
 fn invalid_setting(
     read: &toml::Value,
     defaults: &toml::Value,
     error: &SettingsError,
 ) -> Option<Vec<Segment>> {
     let failure = error.to_string();
-    let top = read
-        .as_table()?
+    read.as_table()?
         .keys()
-        .filter(|key| !matches!(key.as_str(), "schema_version" | "keyboard_shortcuts"));
-    let actions = read
-        .get("keyboard_shortcuts")
-        .and_then(toml::Value::as_table)
-        .into_iter()
-        .flat_map(toml::Table::keys);
-    top.map(|key| vec![Segment::Key(key.clone())])
-        .chain(actions.map(|action| {
-            vec![
-                Segment::Key("keyboard_shortcuts".into()),
-                Segment::Key(action.clone()),
-            ]
-        }))
+        .filter(|key| !matches!(key.as_str(), "schema_version" | "keyboard_shortcuts"))
+        .map(|key| vec![Segment::Key(key.clone())])
         .filter(|path| get(defaults, path).is_some_and(|default| get(read, path) != Some(default)))
         .find(|path| {
             let mut trial = read.clone();
@@ -1741,10 +1839,12 @@ fn current_document(path: &Path) -> Result<Option<toml::Table>, SettingsError> {
         Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(None);
         }
-        // A file that cannot be read, or does not parse, holds nothing this
-        // build could keep, and saving over it is how a user recovers from
-        // it. The save itself still refuses an unsafe destination.
-        Err(SettingsError::Io(error)) => {
+        // A file this user may not read, or that does not parse, holds
+        // nothing this build could keep, and saving over it is how a user
+        // recovers from it. The save itself still refuses an unsafe
+        // destination, and any other failure to read, which may pass, still
+        // fails the save rather than risk writing over a newer schema.
+        Err(SettingsError::Io(error)) if error.raw_os_error() == Some(libc::EACCES) => {
             tracing::warn!(%error, "replacing a settings.toml that could not be read");
             return Ok(None);
         }
@@ -1779,18 +1879,21 @@ fn current_document(path: &Path) -> Result<Option<toml::Table>, SettingsError> {
 }
 
 /// Copies every foreign setting in `current` into `document`, the settings
-/// this build is about to write.
+/// this build is about to write, and leaves out what this build only filled
+/// in.
 ///
 /// A setting this build replaced with its default keeps the file's value only
 /// while this build still holds that default: a user who then chose a value
 /// here meant it. A key inside a list entry follows the entry by its `id`, so
 /// it survives entries being removed or reordered around it; an entry without
-/// one keeps its keys only while it is unchanged at the same position.
+/// one keeps its keys only while it is unchanged at the same position. A
+/// setting the file lacks stays out of it while this build still holds the
+/// value it filled in.
 fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
     // What this build made of the file, as it would write it: `document`
     // differs from it exactly where a setting has changed since.
-    let (baseline, foreign) = match decode_current(current.clone())
-        .and_then(|decoded| Ok((written(&decoded.settings)?, decoded.foreign)))
+    let (baseline, decoded) = match decode_current(current.clone())
+        .and_then(|decoded| Ok((written(&decoded.settings)?, decoded)))
     {
         Ok(decoded) => decoded,
         Err(error) => {
@@ -1798,33 +1901,51 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
             return;
         }
     };
-    // Chords this build binds now. A newer build rejects a file in which two
-    // actions share one, so a foreign action gives up any this build took.
+    for path in &decoded.absent {
+        if get(document, path) == get(&baseline, path)
+            && let Some((Segment::Key(key), parent)) = path.split_last()
+            && let Some(toml::Value::Table(table)) = get_mut(document, parent)
+        {
+            table.remove(key);
+        }
+    }
+    let current = toml::Value::Table(current.clone());
+    let kept: Vec<(Vec<Segment>, toml::Value)> = decoded
+        .foreign
+        .iter()
+        .filter_map(|setting| {
+            let value = get(&current, &setting.path)?.clone();
+            let target = locate(&baseline, document, &setting.path)?;
+            (matches!(target.last(), Some(Segment::Key(_)))
+                && get(document, &target) == get(&baseline, &setting.path))
+            .then_some((target, value))
+        })
+        .collect();
+    // Chords the file will bind apart from what is kept. A newer build rejects
+    // a file in which two actions share one, so a kept action gives up any
+    // chord this build has bound since; kept actions never cost each other,
+    // since the file already held them together.
+    let shortcuts = Segment::Key("keyboard_shortcuts".into());
     let bound: Vec<ShortcutBinding> = document
         .get("keyboard_shortcuts")
         .and_then(toml::Value::as_table)
         .into_iter()
-        .flat_map(|shortcuts| shortcuts.values())
-        .filter_map(toml::Value::as_array)
+        .flatten()
+        .filter(|(action, _)| {
+            !kept
+                .iter()
+                .any(|(target, _)| *target == [shortcuts.clone(), Segment::Key((*action).clone())])
+        })
+        .filter_map(|(_, chords)| chords.as_array())
         .flatten()
         .filter_map(toml::Value::as_str)
         .filter_map(|chord| parse_shortcut(chord).ok())
         .collect();
-    let current = toml::Value::Table(current.clone());
-    for setting in &foreign {
-        let Some(mut value) = get(&current, &setting.path).cloned() else {
-            continue;
-        };
-        let Some(target) = locate(&baseline, document, &setting.path) else {
-            continue;
-        };
+    for (target, mut value) in kept {
         let Some((Segment::Key(key), parent)) = target.split_last() else {
             continue;
         };
-        if get(document, &target) != get(&baseline, &setting.path) {
-            continue;
-        }
-        if matches!(parent, [Segment::Key(table)] if table == "keyboard_shortcuts")
+        if *parent == [shortcuts.clone()]
             && let toml::Value::Array(chords) = &mut value
             && !chords.is_empty()
         {
@@ -1834,8 +1955,8 @@ fn keep_foreign_settings(current: &toml::Table, document: &mut toml::Value) {
                     .and_then(|chord| parse_shortcut(chord).ok())
                     .is_none_or(|binding| !bound.contains(&binding))
             });
-            // An action left with no chord is left for the newer build to
-            // bind again, which it may insist on.
+            // An action left with no chord is left to the newer build to bind
+            // again, which it may insist on.
             if chords.is_empty() {
                 continue;
             }
@@ -3131,8 +3252,141 @@ next_column = ["Alt+W", "Alt+Right"]
         });
         let loaded = load(&path).unwrap();
         assert_eq!(loaded, AppSettings::default());
-        save(&path, &loaded).unwrap();
+        // It stays out of the file until it is changed here, so a newer
+        // build that dropped it never reads it back.
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert!(!saved(&path).contains_key("sidebar_width"));
+        assert_eq!(load(&path).unwrap(), desired);
+        let chosen = AppSettings {
+            sidebar_width: desired.sidebar_width + 10.0,
+            ..desired.clone()
+        };
+        save_merged(&path, &desired, &chosen).unwrap();
         assert!(saved(&path).contains_key("sidebar_width"));
+        assert_eq!(load(&path).unwrap(), chosen);
+    }
+
+    #[test]
+    fn shortcut_action_names_are_the_serialized_ones() {
+        let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
+        assert!(table.keys().eq(SHORTCUT_ACTIONS.iter()));
+    }
+
+    /// Each shortcut action this build cannot use falls back alone, however
+    /// many fail the same way, and the file keeps what it held.
+    #[test]
+    fn every_unusable_shortcut_falls_back_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut chords = toml::Table::new();
+        chords.insert("chords".into(), vec!["Alt+Y"].into());
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F13"].into());
+            shortcuts.insert("search_projects".into(), vec!["Alt+F13"].into());
+            // A shape this build does not know costs only its own action.
+            shortcuts.insert("clone_pane".into(), chords.clone().into());
+            shortcuts.insert("cycle_pane_width".into(), vec!["Alt+X"].into());
+        });
+        let original = saved(&path)["keyboard_shortcuts"].clone();
+        let loaded = load_detailed(&path).unwrap();
+        let defaults = KeyboardShortcuts::default();
+        let shortcuts = &loaded.settings.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, defaults.new_terminal);
+        assert_eq!(shortcuts.search_projects, defaults.search_projects);
+        assert_eq!(shortcuts.clone_pane, defaults.clone_pane);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+X"], "the rest is read");
+        assert_eq!(loaded.set_aside().count(), 3);
+
+        // Another shortcut changed here keeps them all.
+        let mut desired = loaded.settings.clone();
+        desired.keyboard_shortcuts.previous_workspace = vec!["Alt+Shift+P".into()];
+        save_merged(&path, &loaded.settings, &desired).unwrap();
+        let file = saved(&path);
+        for action in ["new_terminal", "search_projects", "clone_pane"] {
+            assert_eq!(
+                file["keyboard_shortcuts"][action], original[action],
+                "{action}"
+            );
+        }
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A fallback that takes a chord the file gave another action blames that
+    /// action in this build, and the file keeps both as they were.
+    #[test]
+    fn a_fallback_conflict_costs_the_file_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F13"].into());
+            shortcuts.insert("search_projects".into(), vec!["Ctrl+T"].into());
+        });
+        let original = saved(&path)["keyboard_shortcuts"].clone();
+        let loaded = load(&path).unwrap();
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(saved(&path)["keyboard_shortcuts"], original);
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    /// A newer build that dropped an action may bind its chord elsewhere. This
+    /// build binds the action it still has, and the file keeps the newer
+    /// build's binding and never gains the dropped action.
+    #[test]
+    fn a_dropped_actions_chord_stays_where_the_newer_build_put_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("search_projects");
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
+        });
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.search_projects, ["Ctrl+F"]);
+        for _ in 0..2 {
+            let current = load(&path).unwrap();
+            let desired = AppSettings {
+                max_hot_cards: current.max_hot_cards + 1,
+                ..current.clone()
+            };
+            save_merged(&path, &current, &desired).unwrap();
+            let file = saved(&path);
+            assert_eq!(
+                file["keyboard_shortcuts"]["new_terminal"],
+                vec!["Ctrl+F"].into()
+            );
+            assert!(file["keyboard_shortcuts"].get("search_projects").is_none());
+        }
+    }
+
+    /// The channel shortcut's old name is read, and set aside, under the name
+    /// this build writes.
+    #[test]
+    fn a_legacy_shortcut_name_is_set_aside_under_its_current_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        newer_build_document(&path, |document| {
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.remove("new_channel");
+            shortcuts.insert("new_thread".into(), vec!["Alt+F13"].into());
+        });
+        let loaded = load(&path).unwrap();
+        save(&path, &loaded).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["keyboard_shortcuts"]["new_channel"],
+            vec!["Alt+F13"].into()
+        );
+        assert!(file["keyboard_shortcuts"].get("new_thread").is_none());
     }
 
     /// A value this build cannot read inside a list entry is dropped from the
@@ -3171,6 +3425,10 @@ next_column = ["Alt+W", "Alt+Right"]
         let notes = loaded.set_aside().collect::<Vec<_>>();
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("“language_servers”"), "{notes:?}");
+        assert!(
+            !notes[0].contains("missing field"),
+            "the reason is the value, not the fallback: {notes:?}"
+        );
         let desired = AppSettings {
             max_hot_cards: loaded.settings.max_hot_cards + 1,
             ..loaded.settings.clone()
