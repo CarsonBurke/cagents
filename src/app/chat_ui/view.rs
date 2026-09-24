@@ -1222,8 +1222,11 @@ impl Runtime {
             Some(PromptMode::Queue) => "Queue for the next turn",
             None => "Message",
         };
-        // A chord only submits what a send control would accept right now.
-        let submit = if available && has_draft {
+        // Key bindings must remain available while the editor changes its own
+        // contents. The action handler checks the current draft before sending;
+        // tying the binding to a view-time draft snapshot can leave Enter
+        // inserting a newline until another pointer event redraws the pane.
+        let key_submit = if available {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -1299,12 +1302,14 @@ impl Runtime {
                             target,
                             &press,
                             open,
-                            submit_chord(&press, submit.0, submit.1, enter_sends),
+                            submit_chord(&press, key_submit.0, key_submit.1, enter_sends),
                         )
                     {
                         return Some(text_editor::Binding::Custom(action(choice)));
                     }
-                    if let Some(mode) = submit_chord(&press, submit.0, submit.1, enter_sends) {
+                    if let Some(mode) =
+                        submit_chord(&press, key_submit.0, key_submit.1, enter_sends)
+                    {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
                         ))));
@@ -1351,9 +1356,8 @@ impl Runtime {
         // present send control that is merely disabled is a control a reader
         // cannot use and cannot interpret: the queue button in particular was
         // a bare plus that never responded and never said what it was for.
-        // The chords are gated on this same condition, so the keyboard path
-        // is unchanged.
-        if submit.0.is_some() {
+        // Buttons still appear only when there is a message to send.
+        if available && has_draft && key_submit.0.is_some() {
             for (slot, mode) in modes.iter().enumerate() {
                 let (name, label) = submit_control(*mode, slot, enter_sends);
                 actions.push(icon(name, label, true, Action::Submit(target, *mode)));
