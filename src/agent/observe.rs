@@ -111,7 +111,12 @@ impl Observer {
         // the rollouts it holds open; only one that holds none can be a client
         // of the shared server the census asks.
         if provider == Provider::Codex
-            && let Some(state) = self.rollouts.state(process.pid)
+            && let Some(state) = self.rollouts.state(
+                process.pid,
+                crate::model::agent_recovery::process_started(process.start)
+                    .and_then(|started| started.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|started| started.as_secs()),
+            )
         {
             return Some(Observation {
                 activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
