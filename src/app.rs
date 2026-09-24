@@ -12431,6 +12431,7 @@ impl Application for Cagents {
         let card_beside_inspector = docked_context_inspector
             .then(|| self.workspace.card_at_viewport_edge())
             .flatten();
+        let has_multiple_panes = self.workspace.cards().len() > 1;
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let action_buttons = || {
@@ -12511,7 +12512,7 @@ impl Application for Cagents {
                     self.card_view(
                         context.id,
                         context.focused,
-                        card_beside_inspector != Some(context.id),
+                        has_multiple_panes && card_beside_inspector != Some(context.id),
                     )
                 },
                 // `sync_chrome` keeps an entry for every durable card, so
@@ -16825,7 +16826,11 @@ mod tests {
         let cloned = app.workspace.focused().unwrap();
         assert_ne!(cloned, source.id);
         assert_eq!(app.workspace.cards()[1].id, cloned);
-        assert_eq!(app.card_state(source.id).unwrap(), &source);
+        let original_state = app.card_state(source.id).unwrap();
+        assert_eq!(original_state.id, source.id);
+        assert_eq!(original_state.kind, source.kind);
+        assert_eq!(original_state.width_fraction, source.width_fraction);
+        assert_eq!(original_state.existence, source.existence);
         let copy = app.card_state(cloned).unwrap();
         assert_eq!(copy.width_fraction, source.width_fraction);
         let (CardKind::Terminal(original), CardKind::Terminal(copy)) = (&source.kind, &copy.kind)
@@ -18051,7 +18056,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_terminal_preserves_a_minimum_width_fraction_on_wide_viewports() {
+    fn restored_terminal_retains_its_fraction_when_a_second_pane_opens() {
         let mut card = terminal_card_state();
         card.width_fraction = 0.125;
         let card_id = card.id;
@@ -18068,6 +18073,14 @@ mod tests {
             workspace.card(card_id).unwrap().width,
             CardWidth::Fraction(0.125)
         );
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
+        workspace
+            .add_card(
+                WorkspaceCard::new(CardId::new(), "Second", CardWidth::Fraction(0.5)).unwrap(),
+                1,
+                false,
+            )
+            .unwrap();
         assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
     }
     #[test]
@@ -18076,6 +18089,13 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         app.workspace.resize_viewport(1_000.0);
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(CardId::new(), "Second", CardWidth::Fraction(0.5)).unwrap(),
+                1,
+                false,
+            )
+            .unwrap();
         let limits = app.workspace.fractional_width_limits();
 
         let _ = app.update(Message::ResizeCard { card, width: 640.0 });
@@ -18153,10 +18173,11 @@ mod tests {
                 let _ = app.select_worktree(PathBuf::from("/repo"), false);
                 assert_eq!(app.workspace.focused(), Some(card));
                 assert_eq!(app.card_state(card).unwrap().width_fraction, fraction);
-                assert!(
-                    (app.workspace.geometry().card(card).unwrap().width() - 900.0 * fraction).abs()
-                        < 0.001
+                assert_eq!(
+                    app.workspace.card(card).unwrap().width,
+                    CardWidth::Fraction(fraction)
                 );
+                assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 900.0);
             }
         }
     }

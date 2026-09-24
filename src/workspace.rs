@@ -244,24 +244,17 @@ pub struct StripGeometry {
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
-        let leading = if cards.len() == 1 {
-            let width = cards[0].width.resolve(viewport_width, config.width_limits);
-            let available = viewport_width - config.leading_padding - config.trailing_padding;
-            if width < available {
-                config.leading_padding + (available - width) / 2.0
-            } else {
-                config.leading_padding
-            }
-        } else {
-            config.leading_padding
-        };
-        let mut cursor = leading;
+        let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
         let mut prefix_ends = Vec::with_capacity(cards.len());
 
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
-            let width = card.width.resolve(viewport_width, config.width_limits);
+            let width = if cards.len() == 1 && viewport_width > 0.0 {
+                (viewport_width - config.leading_padding - config.trailing_padding).max(0.0)
+            } else {
+                card.width.resolve(viewport_width, config.width_limits)
+            };
             let end = start + width;
             geometry.push(CardGeometry {
                 id: card.id,
@@ -281,9 +274,8 @@ impl StripGeometry {
         } else {
             cursor + config.trailing_padding
         };
-        // Multi-pane strips stay anchored to navigation. A lone underfilled
-        // pane is centered, while centering the entire strip would introduce
-        // a dead leading band and move existing columns on insertion.
+        // A lone pane fills the viewport while its stored width is retained
+        // for the moment another pane is added.
         let total_width = total_width.max(viewport_width);
 
         Self {
@@ -1823,8 +1815,8 @@ mod tests {
 
         let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
         assert_eq!(underfilled.card_at_viewport_edge(), None);
-        let centered = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
-        assert_eq!(centered.card_at_viewport_edge(), None);
+        let lone = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
+        assert_eq!(lone.card_at_viewport_edge(), lone.focused());
     }
 
     #[test]
@@ -1870,6 +1862,9 @@ mod tests {
     fn cycled_fractional_columns_use_the_actual_viewport_without_peek_or_width_clamps() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.61)], 320.0);
         let id = workspace.focused().unwrap();
+        workspace
+            .add_card(card(CardWidth::Fraction(0.5)), 1, false)
+            .unwrap();
         for viewport in [320.0, 800.0, 3_840.0] {
             workspace.resize_viewport(viewport);
             workspace
@@ -1888,15 +1883,15 @@ mod tests {
     }
 
     #[test]
-    fn lone_underfilled_pane_is_centered_but_multi_pane_strips_stay_leading_aligned() {
+    fn lone_pane_fills_the_viewport_and_restores_its_width_when_another_opens() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.35)], 1_000.0);
         let first = workspace.focused().unwrap();
         for width in [1_000.0, 1_440.0, 800.0] {
             workspace.resize_viewport(width);
             let geometry = workspace.geometry();
             let card = geometry.card(first).unwrap();
-            let expected = (width - card.width()) / 2.0;
-            assert!((card.start - expected).abs() < f32::EPSILON);
+            assert_eq!(card.start, workspace.config.leading_padding);
+            assert_eq!(card.width(), width);
             assert_eq!(geometry.max_offset(width), 0.0);
             assert_eq!(workspace.projection(width).mounted[0].start, card.start);
         }
@@ -1910,11 +1905,21 @@ mod tests {
             geometry.card(first).unwrap().start,
             workspace.config.leading_padding
         );
+        assert!((geometry.card(first).unwrap().width() - 1_440.0 * 0.35).abs() < 0.001);
         assert_eq!(geometry.max_offset(workspace.viewport_width()), 0.0);
         assert_eq!(
             geometry.card_at(1).unwrap().start,
             geometry.card(first).unwrap().end + workspace.config.gap,
         );
+
+        let second = geometry.card_at(1).unwrap().id;
+        workspace.request_close(second).unwrap();
+        workspace.commit_close(second).unwrap();
+        assert_eq!(workspace.geometry().card(first).unwrap().width(), 1_440.0);
+
+        let fixed = workspace_with_widths(&[CardWidth::Fixed(2_000.0)], 320.0);
+        assert_eq!(fixed.geometry().card_at(0).unwrap().width(), 320.0);
+        assert_eq!(fixed.geometry().max_offset(320.0), 0.0);
     }
 
     #[test]
