@@ -842,13 +842,20 @@ impl Adapter for Omp {
             }
             "subagent_lifecycle" | "subagent_progress" => {
                 let payload = &frame["payload"];
+                let id = format!("subagent:{}", text(payload, "id"));
                 let status = match text(payload, "status") {
                     "completed" => ToolStatus::Succeeded,
                     "failed" | "aborted" => ToolStatus::Failed,
                     _ => ToolStatus::Running,
                 };
+                step.events.push(Event::Subagent {
+                    id: id.clone(),
+                    kind: text(payload, "agent").into(),
+                    description: text(payload, "task").into(),
+                    status: Some(status),
+                });
                 step.events.push(Event::Item(Item {
-                    id: format!("subagent:{}", text(payload, "id")),
+                    id,
                     role: Role::Assistant,
                     content: ItemContent::Tool {
                         name: format!("Agent {}", text(payload, "agent")),

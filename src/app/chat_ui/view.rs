@@ -738,6 +738,17 @@ struct Place {
 }
 
 impl Runtime {
+    // Provider descriptions can contain a whole prompt. Keep status controls
+    // compact while the full transcript remains available on selection.
+    fn short_description(raw: &str, limit: usize) -> String {
+        let mut chars = raw.chars();
+        let text: String = chars.by_ref().take(limit).collect();
+        if chars.next().is_some() {
+            format!("{text}…")
+        } else {
+            text
+        }
+    }
     fn view<'a>(
         &'a self,
         transitioning: bool,
@@ -772,46 +783,102 @@ impl Runtime {
                 }),
             )
         };
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut transcript = Vec::new();
-        if snapshot.has_earlier {
-            transcript.push(paging_view(
-                Page::Earlier,
-                self.paging() == Some(Page::Earlier),
-            ));
-        }
-        if self.turns.is_empty() && self.queued.is_none() {
-            // The empty state says what to do. It used to show whatever the
-            // adapter's last status detail was, which meant an empty
-            // conversation greeted the reader with a connection state instead
-            // of an invitation; the status line is where a state belongs.
-            transcript.push(
-                widget::container(
-                    design::body("Your conversation appears here. Send a message to begin.")
-                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+        if let Some(agent) = selected {
+            let heading = if agent.description.is_empty() {
+                if agent.kind.is_empty() {
+                    "Subagent".to_owned()
+                } else {
+                    agent.kind.clone()
+                }
+            } else {
+                format!(
+                    "{} · {}",
+                    if agent.kind.is_empty() {
+                        "Subagent"
+                    } else {
+                        &agent.kind
+                    },
+                    Self::short_description(&agent.description, 160),
                 )
-                .center_x(Length::Fill)
-                .padding(design::GRID_UNIT * 8.0)
-                .into(),
+            };
+            transcript.push(
+                design::caption(heading)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
             );
-        }
-        for (_, error) in self.failures.iter().filter(|(anchor, _)| anchor.is_none()) {
-            transcript.push(notice_entry(error));
-        }
-        for turn in &self.turns {
-            transcript.push(self.turn_view(turn, markdown_settings));
-            for (_, error) in self
-                .failures
-                .iter()
-                .filter(|(anchor, _)| anchor.as_ref() == Some(&turn.key))
-            {
+            if agent.items.is_empty() {
+                transcript.push(body(if agent.status == chat::ToolStatus::Running {
+                    "Waiting for subagent activity…"
+                } else {
+                    "No recent subagent activity is available here."
+                }));
+            }
+            for item in &agent.items {
+                let Some(cached) = self.cache.get(&item.id) else {
+                    continue;
+                };
+                transcript.push(match &item.content {
+                    ItemContent::Text { thinking, .. } => self.prose_view(
+                        item,
+                        cached,
+                        if *thinking {
+                            turn::Slot::Thinking
+                        } else if item.role == chat::Role::System {
+                            turn::Slot::Commentary
+                        } else {
+                            turn::Slot::Prose
+                        },
+                        markdown_settings,
+                    ),
+                    _ => self.step_view(item, cached, markdown_settings),
+                });
+            }
+        } else {
+            if snapshot.has_earlier {
+                transcript.push(paging_view(
+                    Page::Earlier,
+                    self.paging() == Some(Page::Earlier),
+                ));
+            }
+            if self.turns.is_empty() && self.queued.is_none() {
+                // The empty state says what to do. It used to show whatever the
+                // adapter's last status detail was, which meant an empty
+                // conversation greeted the reader with a connection state instead
+                // of an invitation; the status line is where a state belongs.
+                transcript.push(
+                    widget::container(
+                        design::body("Your conversation appears here. Send a message to begin.")
+                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                    )
+                    .center_x(Length::Fill)
+                    .padding(design::GRID_UNIT * 8.0)
+                    .into(),
+                );
+            }
+            for (_, error) in self.failures.iter().filter(|(anchor, _)| anchor.is_none()) {
                 transcript.push(notice_entry(error));
             }
-        }
-        if snapshot.has_later {
-            transcript.push(paging_view(Page::Newer, self.paging() == Some(Page::Newer)));
-        }
-        if let Some(queued) = &self.queued {
-            transcript.push(self.queued_view(queued));
+            for turn in &self.turns {
+                transcript.push(self.turn_view(turn, markdown_settings));
+                for (_, error) in self
+                    .failures
+                    .iter()
+                    .filter(|(anchor, _)| anchor.as_ref() == Some(&turn.key))
+                {
+                    transcript.push(notice_entry(error));
+                }
+            }
+            if snapshot.has_later {
+                transcript.push(paging_view(Page::Newer, self.paging() == Some(Page::Newer)));
+            }
+            if let Some(queued) = &self.queued {
+                transcript.push(self.queued_view(queued));
+            }
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -865,7 +932,10 @@ impl Runtime {
         .width(Length::Fill);
         content.push(scroll::transcript(
             transcript,
-            snapshot.items.first().map(|item| item.id.as_str()),
+            selected
+                .and_then(|agent| agent.items.first())
+                .or_else(|| snapshot.items.first())
+                .map(|item| item.id.as_str()),
         ));
         // A draft starting for its first message says so on the message
         // itself.
@@ -965,6 +1035,64 @@ impl Runtime {
                 .max_height(REQUEST_CEILING)
                 .into(),
             );
+        }
+        if !snapshot.subagents.is_empty() {
+            let mut chips: Vec<Element<'_, Message>> = vec![
+                widget::button::text("Conversation")
+                    .class(crate::ui_controls::control_style(selected.is_none(), None))
+                    .on_press(action(Action::SelectSubagent(target, None)))
+                    .into(),
+            ];
+            for agent in snapshot.subagents.iter().rev() {
+                let label = if agent.description.is_empty() {
+                    if agent.kind.is_empty() {
+                        "Subagent".to_owned()
+                    } else {
+                        agent.kind.clone()
+                    }
+                } else {
+                    agent.description.clone()
+                };
+                let marker = match agent.status {
+                    chat::ToolStatus::Running => "◌",
+                    chat::ToolStatus::Succeeded => "✓",
+                    chat::ToolStatus::Failed => "!",
+                    chat::ToolStatus::Denied => "×",
+                };
+                chips.push(
+                    widget::button::text(format!(
+                        "{marker} {}",
+                        Self::short_description(&label, 56)
+                    ))
+                    .class(crate::ui_controls::control_style(
+                        selected.is_some_and(|active| active.id == agent.id),
+                        None,
+                    ))
+                    .on_press(action(Action::SelectSubagent(
+                        target,
+                        Some(agent.id.clone()),
+                    )))
+                    .into(),
+                );
+            }
+            content.push(
+                widget::scrollable(widget::row::with_children(chips).spacing(step::GAP_XS))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        design::scrollbar(),
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Shrink)
+                    .into(),
+            );
+            if selected.is_some() {
+                content.push(
+                    design::caption(
+                        "Viewing a subagent · messages still go to the main conversation",
+                    )
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+                );
+            }
         }
         let draft = self.composer.text();
         if let Some(provided) = &snapshot.composer

@@ -243,8 +243,7 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The API message one stream is delivering, keyed by parent tool use. Claude
-/// Code streams only the main thread today, but the wire names the parent.
+/// The API message one stream is delivering, keyed by parent tool use.
 struct Stream {
     message: String,
     /// Set once the live blocks reach their bound. The message's remaining
@@ -271,6 +270,7 @@ struct Claude {
     message_offsets: HashMap<String, usize>,
     message_order: VecDeque<String>,
     carrier_items: HashMap<String, Vec<String>>,
+    carrier_parent: HashMap<String, String>,
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
@@ -278,6 +278,7 @@ struct Claude {
     tool_order: VecDeque<String>,
     /// Running background tasks, oldest first.
     tasks: VecDeque<String>,
+    background_agents: HashSet<String>,
     models: Vec<Model>,
     selected: Option<String>,
     cache_read_tokens: u64,
@@ -686,6 +687,9 @@ impl Claude {
             return Ok(());
         }
         self.retract(&frame["supersedes"], step)?;
+        let child = frame["parent_tool_use_id"]
+            .as_str()
+            .filter(|id| !id.is_empty());
         let event_start = step.events.len();
         let role = if string(frame, "type") == "user" {
             Role::User
@@ -695,7 +699,7 @@ impl Claude {
         // Claude injects skill bodies as meta messages during a turn.
         // They are context for the agent, not conversation messages.
         if frame["isMeta"].as_bool() == Some(true) {
-            self.track_carrier(carrier, Vec::new());
+            self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
         let message = &frame["message"];
@@ -703,18 +707,6 @@ impl Claude {
             .as_str()
             .or_else(|| frame["uuid"].as_str())
             .ok_or("Claude message is missing its stable identifier")?;
-        if let Some(parent) = frame["parent_tool_use_id"].as_str() {
-            step.events.push(Event::Item(text_item(
-                format!("{id}:subagent"),
-                Role::System,
-                format!(
-                    "Subagent {} · parent tool {parent} · {}",
-                    string(frame, "subagent_type"),
-                    string(frame, "task_description")
-                ),
-                false,
-            )));
-        }
         if let Some(content) = message["content"].as_str() {
             step.events.push(Event::Item(text_item(
                 format!("{id}:0"),
@@ -805,7 +797,7 @@ impl Claude {
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
                         let item = Item {
-                            id: tool_id,
+                            id: tool_id.clone(),
                             role: Role::Assistant,
                             content: tool_content(
                                 required(block, "name")?,
@@ -820,6 +812,17 @@ impl Claude {
                                 .status()
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
+                            if string(block, "name") == "Agent" {
+                                if block["input"]["run_in_background"].as_bool() == Some(true) {
+                                    self.background_agents.insert(tool_id.clone());
+                                }
+                                step.events.push(Event::Subagent {
+                                    id: tool_id.clone(),
+                                    kind: string(&block["input"], "subagent_type").into(),
+                                    description: string(&block["input"], "description").into(),
+                                    status: Some(ToolStatus::Running),
+                                });
+                            }
                             self.tool(item.clone());
                             step.events.push(Event::Item(item));
                         }
@@ -827,7 +830,7 @@ impl Claude {
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
                         let mut item = self.tools.get(&tool_id).cloned().unwrap_or(Item {
-                            id: tool_id,
+                            id: tool_id.clone(),
                             role: Role::Assistant,
                             content: ItemContent::Tool {
                                 name: "Tool".into(),
@@ -842,6 +845,22 @@ impl Claude {
                             content_text(&block["content"]),
                             block["is_error"].as_bool() == Some(true),
                         );
+                        if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent")
+                        {
+                            let status = if self.background_agents.contains(&tool_id)
+                                && item.content.status() == Some(ToolStatus::Succeeded)
+                            {
+                                ToolStatus::Running
+                            } else {
+                                item.content.status().unwrap_or(ToolStatus::Running)
+                            };
+                            step.events.push(Event::Subagent {
+                                id: tool_id.clone(),
+                                kind: String::new(),
+                                description: String::new(),
+                                status: Some(status),
+                            });
+                        }
                         if let Some(content) = block["content"].as_array() {
                             for (index, attachment) in content
                                 .iter()
@@ -910,17 +929,30 @@ impl Claude {
                 _ => None,
             })
             .collect();
-        self.track_carrier(carrier, ids);
+        if let Some(parent) = child {
+            step.events.push(Event::Subagent {
+                id: parent.into(),
+                kind: string(frame, "subagent_type").into(),
+                description: string(frame, "task_description").into(),
+                status: None,
+            });
+            route_subagent_events(&mut step.events, event_start, parent);
+        }
+        self.track_carrier(carrier, ids, child);
         Ok(())
     }
-    fn track_carrier(&mut self, carrier: &str, ids: Vec<String>) {
+    fn track_carrier(&mut self, carrier: &str, ids: Vec<String>, parent: Option<&str>) {
         if !self.carrier_items.contains_key(carrier) {
             self.carrier_order.push_back(carrier.into());
         }
         self.carrier_items.insert(carrier.into(), ids);
+        if let Some(parent) = parent {
+            self.carrier_parent.insert(carrier.into(), parent.into());
+        }
         while self.carrier_order.len() > 2048 {
             if let Some(old) = self.carrier_order.pop_front() {
                 self.carrier_items.remove(&old);
+                self.carrier_parent.remove(&old);
                 self.carrier_offsets.remove(&old);
             }
         }
@@ -949,6 +981,7 @@ impl Claude {
             return Ok(());
         };
         let mut ids = Vec::new();
+        let mut child_ids: HashMap<String, Vec<String>> = HashMap::new();
         for carrier in carriers {
             let carrier = carrier
                 .as_str()
@@ -966,15 +999,25 @@ impl Claude {
                 self.remember_retracted(carrier);
                 continue;
             };
-            ids.extend(items.iter().cloned());
+            if let Some(parent) = self.carrier_parent.get(carrier) {
+                child_ids
+                    .entry(parent.clone())
+                    .or_default()
+                    .extend(items.iter().cloned());
+            } else {
+                ids.extend(items.iter().cloned());
+            }
             self.remember_retracted(carrier);
         }
-        for id in &ids {
+        for id in ids.iter().chain(child_ids.values().flatten()) {
             self.tools.remove(id);
             self.blocks.retain(|_, item| &item.id != id);
         }
         if !ids.is_empty() {
             step.events.push(Event::ItemsRemoved { ids });
+        }
+        for (id, ids) in child_ids {
+            step.events.push(Event::SubagentItemsRemoved { id, ids });
         }
         Ok(())
     }
@@ -998,26 +1041,64 @@ impl Adapter for Claude {
             json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[]}),
         )?;
         if let Some(mut history) = self.history.take() {
+            self.background_agents.extend(
+                history
+                    .background_agent_tools
+                    .iter()
+                    .filter(|id| history.agent_status.get(*id) == Some(&ToolStatus::Running))
+                    .cloned(),
+            );
             let frames = history.page()?;
             let mut history_step = Step::default();
             for frame in frames {
                 self.message(&frame, &mut history_step)?;
             }
-            let items = history_step
-                .events
-                .into_iter()
-                .filter_map(|e| {
-                    if let Event::Item(i) = e {
-                        Some(i)
-                    } else {
-                        None
+            // Replayed Agent tool uses can reinsert completed background jobs.
+            // The full history index is authoritative even when a sidecar is
+            // absent or fell outside the bounded child-history window.
+            self.background_agents
+                .retain(|id| history.agent_status.get(id) == Some(&ToolStatus::Running));
+            for (id, status) in &history.agent_status {
+                history_step.events.push(Event::Subagent {
+                    id: id.clone(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(*status),
+                });
+            }
+            for (parent, kind, description, frames) in history.subagent_frames().unwrap_or_default()
+            {
+                history_step.events.push(Event::Subagent {
+                    id: parent.clone(),
+                    kind,
+                    description,
+                    status: history.agent_status.get(&parent).copied(),
+                });
+                for mut frame in frames {
+                    frame["parent_tool_use_id"] = json!(parent);
+                    let mut child_step = Step::default();
+                    if self.message(&frame, &mut child_step).is_ok() {
+                        history_step.events.extend(child_step.events);
                     }
-                })
-                .collect();
+                }
+            }
+            let mut items = Vec::new();
+            let mut children = Vec::new();
+            for event in history_step.events {
+                match event {
+                    Event::Item(item) => items.push(item),
+                    Event::Subagent { .. }
+                    | Event::SubagentItem { .. }
+                    | Event::SubagentTextDelta { .. }
+                    | Event::SubagentItemsRemoved { .. } => children.push(event),
+                    _ => {}
+                }
+            }
             step.events.push(Event::History {
                 items,
                 has_earlier: history.offset > 0,
             });
+            step.events.extend(children);
             self.history = Some(history);
         }
         self.status(false, "Initializing Claude stream-json", &mut step);
@@ -1257,7 +1338,14 @@ impl Adapter for Claude {
                         self.stream_events.pop_front();
                     }
                 }
+                let event_start = step.events.len();
                 self.stream(&frame, &mut step)?;
+                if let Some(parent) = frame["parent_tool_use_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                {
+                    route_subagent_events(&mut step.events, event_start, parent);
+                }
             }
             "result" => {
                 let busy = !self.tasks.is_empty() || !self.pending.is_empty();
@@ -1424,6 +1512,46 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
+}
+/// A child frame belongs to its agent's transcript, even when Claude gives it
+/// the wire role `user` for an internal prompt or tool result.
+fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
+    let child: Vec<_> = events
+        .drain(start..)
+        .map(|event| match event {
+            Event::Item(mut item) => {
+                if item.role == Role::User {
+                    item.role = Role::System;
+                }
+                Event::SubagentItem {
+                    id: parent.into(),
+                    item,
+                }
+            }
+            Event::TextDelta {
+                id,
+                role,
+                thinking,
+                delta,
+            } => Event::SubagentTextDelta {
+                id: parent.into(),
+                item_id: id,
+                role: if role == Role::User {
+                    Role::System
+                } else {
+                    role
+                },
+                thinking,
+                delta,
+            },
+            Event::ItemsRemoved { ids } => Event::SubagentItemsRemoved {
+                id: parent.into(),
+                ids,
+            },
+            event => event,
+        })
+        .collect();
+    events.extend(child);
 }
 fn slash_command_prompt(content: &str) -> Option<String> {
     let content = content.strip_prefix("<command-message>")?;
@@ -2001,8 +2129,25 @@ impl Claude {
                     *status = match string(patch, "status") {
                         "completed" => ToolStatus::Succeeded,
                         "failed" | "stopped" => ToolStatus::Failed,
+                        _ if string(frame, "subtype") == "task_notification" => {
+                            ToolStatus::Succeeded
+                        }
                         _ => *status,
                     };
+                }
+                if let Some(parent) = frame["tool_use_id"].as_str()
+                    && self.background_agents.contains(parent)
+                {
+                    let status = item.content.status().unwrap_or(ToolStatus::Running);
+                    step.events.push(Event::Subagent {
+                        id: parent.into(),
+                        kind: String::new(),
+                        description: String::new(),
+                        status: Some(status),
+                    });
+                    if status != ToolStatus::Running {
+                        self.background_agents.remove(parent);
+                    }
                 }
                 self.tool(item.clone());
                 step.events.push(Event::Item(item));
@@ -2048,6 +2193,11 @@ struct History {
     file: File,
     chain: Vec<(u64, u64, usize)>,
     offset: usize,
+    session_id: String,
+    subagent_dir: Option<PathBuf>,
+    agent_tools: HashSet<String>,
+    agent_status: HashMap<String, ToolStatus>,
+    background_agent_tools: HashSet<String>,
 }
 struct HistoryNode {
     parent: Option<String>,
@@ -2096,9 +2246,11 @@ impl History {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options
-            .open(path)
+            .open(&path)
             .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
-        Self::index(file, id)
+        let mut history = Self::index(file, id)?;
+        history.subagent_dir = Some(path.with_extension("").join("subagents"));
+        Ok(history)
     }
     fn index(mut file: File, id: &str) -> Result<Self, String> {
         use std::io::BufRead as _;
@@ -2111,6 +2263,9 @@ impl History {
         let mut parents = std::collections::HashSet::new();
         let mut message_offsets = HashMap::<String, usize>::new();
         let mut retracted = std::collections::HashSet::<String>::new();
+        let mut agent_tools = HashSet::new();
+        let mut agent_status = HashMap::new();
+        let mut background_agent_tools = HashSet::new();
         let mut position = 0;
         let mut line = Vec::new();
         while position < metadata.len() {
@@ -2134,6 +2289,55 @@ impl History {
                 .map_err(|e| format!("Malformed exact Claude transcript: {e}"))?;
             if value["sessionId"].as_str().is_some_and(|value| value != id) {
                 return Err("Claude transcript contains another session identity".into());
+            }
+            if let Some(blocks) = value["message"]["content"].as_array() {
+                for block in blocks {
+                    if string(&value, "type") == "assistant" {
+                        if string(block, "name") == "Agent"
+                            && let Some(tool_id) = block["id"].as_str()
+                        {
+                            agent_tools.insert(tool_id.to_owned());
+                            if block["input"]["run_in_background"].as_bool() == Some(true) {
+                                background_agent_tools.insert(tool_id.to_owned());
+                            }
+                        }
+                    } else if string(block, "type") == "tool_result"
+                        && let Some(tool_id) = block["tool_use_id"].as_str()
+                        && agent_tools.contains(tool_id)
+                    {
+                        agent_status.insert(
+                            tool_id.to_owned(),
+                            if block["is_error"].as_bool() == Some(true) {
+                                ToolStatus::Failed
+                            } else if background_agent_tools.contains(tool_id) {
+                                ToolStatus::Running
+                            } else {
+                                ToolStatus::Succeeded
+                            },
+                        );
+                    }
+                }
+            }
+            if string(&value, "type") == "system"
+                && matches!(
+                    string(&value, "subtype"),
+                    "task_started" | "task_progress" | "task_notification" | "task_updated"
+                )
+                && let Some(tool_id) = value["tool_use_id"].as_str()
+                && background_agent_tools.contains(tool_id)
+            {
+                let patch = if value["patch"].is_object() {
+                    &value["patch"]
+                } else {
+                    &value
+                };
+                let status = match string(patch, "status") {
+                    "completed" => ToolStatus::Succeeded,
+                    "failed" | "stopped" => ToolStatus::Failed,
+                    _ if string(&value, "subtype") == "task_notification" => ToolStatus::Succeeded,
+                    _ => ToolStatus::Running,
+                };
+                agent_status.insert(tool_id.into(), status);
             }
             for field in ["supersedes", "retracted_message_uuids"] {
                 if let Some(ids) = value[field].as_array() {
@@ -2233,7 +2437,146 @@ impl History {
             file,
             chain,
             offset,
+            session_id: id.into(),
+            subagent_dir: None,
+            agent_tools,
+            agent_status,
+            background_agent_tools,
         })
+    }
+    /// Load only children linked by a tool-use ID in this exact parent session.
+    /// A bounded tail keeps reopening a long-running session cheap.
+    fn subagent_frames(&self) -> Result<Vec<(String, String, String, Vec<Value>)>, String> {
+        use std::io::BufRead as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let Some(dir) = &self.subagent_dir else {
+            return Ok(Vec::new());
+        };
+        match std::fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("Cannot inspect Claude subagents: {error}")),
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(Vec::new());
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".meta.json"))
+            })
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| {
+            std::cmp::Reverse(
+                std::fs::symlink_metadata(path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok()),
+            )
+        });
+        let mut children = Vec::new();
+        for meta_path in paths.into_iter().take(32) {
+            let Some(stem) = meta_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".meta.json"))
+            else {
+                continue;
+            };
+            let agent_id = stem.strip_prefix("agent-").unwrap_or("");
+            if agent_id.is_empty() || !agent_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let meta_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&meta_path);
+            let Ok(meta_file) = meta_file else { continue };
+            if !meta_file
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= 16 * 1024)
+            {
+                continue;
+            }
+            let Ok(meta) = serde_json::from_reader::<_, Value>(meta_file) else {
+                continue;
+            };
+            let Some(parent) = meta["toolUseId"]
+                .as_str()
+                .filter(|id| self.agent_tools.contains(*id))
+            else {
+                continue;
+            };
+            let path = dir.join(format!("{stem}.jsonl"));
+            let Ok(mut file) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+            else {
+                continue;
+            };
+            let Ok(info) = file.metadata() else { continue };
+            if !info.is_file() || info.len() > 256 * 1024 * 1024 {
+                continue;
+            }
+            let offset = info.len().saturating_sub(256 * 1024);
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            let mut reader = std::io::BufReader::new(file);
+            let mut line = Vec::new();
+            if offset > 0 && reader.read_until(b'\n', &mut line).is_err() {
+                continue;
+            }
+            let mut frames = VecDeque::new();
+            let mut retained_bytes = 0;
+            loop {
+                line.clear();
+                let Ok(count) = reader
+                    .by_ref()
+                    .take(MAX_PAYLOAD as u64 + 1)
+                    .read_until(b'\n', &mut line)
+                else {
+                    break;
+                };
+                if count == 0 {
+                    break;
+                }
+                if count > MAX_PAYLOAD {
+                    break;
+                }
+                if count > 48 * 1024 {
+                    continue;
+                }
+                let Ok(frame) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
+                if frame["sessionId"].as_str() != Some(&self.session_id)
+                    || frame["agentId"].as_str() != Some(agent_id)
+                    || frame["isSidechain"].as_bool() != Some(true)
+                    || !matches!(string(&frame, "type"), "user" | "assistant")
+                {
+                    continue;
+                }
+                retained_bytes += count;
+                frames.push_back((frame, count));
+                while frames.len() > 64 || retained_bytes > 48 * 1024 {
+                    if let Some((_, bytes)) = frames.pop_front() {
+                        retained_bytes -= bytes;
+                    }
+                }
+            }
+            children.push((
+                parent.to_owned(),
+                string(&meta, "agentType").into(),
+                string(&meta, "description").into(),
+                frames.into_iter().map(|(frame, _)| frame).collect(),
+            ));
+        }
+        Ok(children)
     }
     fn page(&mut self) -> Result<Vec<Value>, String> {
         let mut start = self.offset;
@@ -3060,6 +3403,110 @@ mod tests {
         events
     }
 
+    #[test]
+    fn child_frames_stay_in_their_subagent_transcript() {
+        let mut adapter = Claude::default();
+        let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"subagent_type":"Explore","description":"Inspect parser"}}]}})).unwrap();
+        assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, description, status:Some(ToolStatus::Running) } if id == "tool-agent" && kind == "Explore" && description == "Inspect parser")));
+        let child = adapter.receive(json!({"type":"user","uuid":"child-carrier","parent_tool_use_id":"tool-agent","message":{"content":"Internal prompt"}})).unwrap();
+        assert!(
+            !child
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        assert!(child.events.iter().any(|event| matches!(event, Event::SubagentItem { id, item } if id == "tool-agent" && item.role == Role::System)));
+        let streamed = stream_message(
+            &mut adapter,
+            Some("tool-agent"),
+            "child-answer",
+            &[json!({"type":"text","text":"Found it"})],
+        );
+        assert!(streamed.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "tool-agent" && delta == "Found it")));
+        assert!(
+            !streamed
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::TextDelta { .. }))
+        );
+        let finished = adapter.receive(json!({"type":"user","uuid":"result-carrier","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Done"}]}})).unwrap();
+        assert!(finished.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn background_agent_stays_running_until_task_notification() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}})).unwrap();
+        let returned = adapter.receive(json!({"type":"user","uuid":"background-result","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Background task launched"}]}})).unwrap();
+        assert!(returned.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Running), .. } if id == "tool-agent")));
+        let done = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"task-one","tool_use_id":"tool-agent","patch":{"status":"completed"}})).unwrap();
+        assert!(done.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn completed_background_agent_replays_without_a_sidecar() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"assistant","uuid":"launch","parentUuid":null,"sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"returned","parentUuid":"launch","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}}),
+            json!({"type":"system","subtype":"task_notification","uuid":"done","parentUuid":"returned","sessionId":session,"tool_use_id":"tool-agent","patch":{"status":"completed"}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut adapter = Claude {
+            history: Some(History::index(file, session).unwrap()),
+            ..Claude::default()
+        };
+        let replayed = adapter.initialize().unwrap();
+        assert!(!adapter.background_agents.contains("tool-agent"));
+        assert!(replayed.events.iter().rev().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn retraction_uses_old_carrier_scope() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"child-old","parent_tool_use_id":"tool-agent","message":{"id":"child-answer","content":"Old"}})).unwrap();
+        let replacement = adapter.receive(json!({"type":"assistant","uuid":"parent-new","supersedes":["child-old"],"message":{"id":"parent-answer","content":"New"}})).unwrap();
+        assert!(replacement.events.iter().any(|event| matches!(event, Event::SubagentItemsRemoved { id, ids } if id == "tool-agent" && ids == &vec!["child-answer:0".to_owned()])));
+        assert!(
+            !replacement
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ItemsRemoved { .. }))
+        );
+    }
+
+    #[test]
+    fn exact_history_links_only_its_own_child_transcript() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = "00000000-0000-4000-8000-000000000001";
+        let root = directory.path().join("root.jsonl");
+        std::fs::write(&root, format!("{}\n", json!({"type":"assistant","sessionId":session,"uuid":"root","message":{"id":"root-message","content":[{"type":"tool_use","id":"tool-one","name":"Agent","input":{}}]}}))).unwrap();
+        let mut history = History::index(File::open(root).unwrap(), session).unwrap();
+        let children = directory.path().join("subagents");
+        std::fs::create_dir(&children).unwrap();
+        history.subagent_dir = Some(children.clone());
+        std::fs::write(
+            children.join("agent-one.meta.json"),
+            json!({"toolUseId":"tool-one","agentType":"Explore","description":"Inspect"})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(children.join("agent-one.jsonl"), format!("{}\n{}\n", json!({"type":"assistant","sessionId":session,"agentId":"one","isSidechain":true,"uuid":"child","message":{"content":"Valid"}}), json!({"type":"assistant","sessionId":"another","agentId":"one","isSidechain":true,"uuid":"foreign","message":{"content":"Foreign"}}))).unwrap();
+        std::fs::write(
+            children.join("agent-other.meta.json"),
+            json!({"toolUseId":"unrelated","description":"Wrong parent"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(children.join("agent-other.jsonl"), format!("{}\n", json!({"type":"assistant","sessionId":session,"agentId":"other","isSidechain":true,"uuid":"unrelated-child","message":{"content":"Wrong"}}))).unwrap();
+        let loaded = history.subagent_frames().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "tool-one");
+        assert_eq!(loaded[0].3.len(), 1);
+        assert_eq!(loaded[0].3[0]["uuid"], "child");
+    }
+
     fn errors(events: &[Event]) -> Vec<&str> {
         events
             .iter()
@@ -3110,8 +3557,7 @@ mod tests {
 
     /// Streams stay independent per parent tool use, and a stream that has
     /// stopped no longer counts against the simultaneous-stream bound.
-    /// Claude Code currently streams only the main thread, so this guards
-    /// the adapter's own contract rather than a captured sequence.
+    /// The main stream remains available while child streams start and stop.
     #[test]
     fn stopped_parent_streams_leave_an_open_stream_intact() {
         let mut adapter = Claude::default();
@@ -3130,7 +3576,7 @@ mod tests {
             );
             assert_eq!(errors(&events), Vec::<&str>::new());
             assert!(events.iter().any(
-                |e| matches!(e, Event::TextDelta { id, .. } if *id == format!("sub-{task}:0"))
+                |e| matches!(e, Event::SubagentTextDelta { id, item_id, .. } if *id == format!("task-{task}") && *item_id == format!("sub-{task}:0"))
             ));
         }
         assert_eq!(adapter.streams.len(), 1);

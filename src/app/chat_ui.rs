@@ -144,6 +144,8 @@ pub enum Action {
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
+    /// Opens a child agent's transcript, or returns to the main conversation.
+    SelectSubagent(Target, Option<String>),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     Attach(Target),
@@ -1120,6 +1122,7 @@ pub(super) struct Runtime {
     /// The snapshot's items grouped into stretches of work, rebuilt only when
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
+    selected_subagent: Option<String>,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -1402,6 +1405,7 @@ impl Runtime {
             cache: HashMap::new(),
             syntax_theme,
             turns: Vec::new(),
+            selected_subagent: None,
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -1438,6 +1442,7 @@ impl Runtime {
     fn forget_transcript(&mut self) {
         self.cache.clear();
         self.turns.clear();
+        self.selected_subagent = None;
         self.asked_after.clear();
         self.asked.clear();
         self.opened.clear();
@@ -1525,7 +1530,24 @@ impl Runtime {
         {
             return;
         }
-        let live_ids: HashSet<&str> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
+        let live_ids: HashSet<&str> = snapshot
+            .items
+            .iter()
+            .chain(
+                snapshot
+                    .subagents
+                    .iter()
+                    .flat_map(|agent| agent.items.iter()),
+            )
+            .map(|item| item.id.as_str())
+            .collect();
+        if self
+            .selected_subagent
+            .as_ref()
+            .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
+        {
+            self.selected_subagent = None;
+        }
         self.cache.retain(|id, _| live_ids.contains(id.as_str()));
         // Both sets are keyed by item id and the store drops items past its
         // window, so without this they grow for the life of the card: one
@@ -1533,7 +1555,12 @@ impl Runtime {
         // ever asked, held after the item it named stopped existing.
         self.expanded.retain(|id| live_ids.contains(id.as_str()));
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
-        for item in &snapshot.items {
+        for item in snapshot.items.iter().chain(
+            snapshot
+                .subagents
+                .iter()
+                .flat_map(|agent| agent.items.iter()),
+        ) {
             let token = ChangeToken::of(&item.content);
             if let Some(cached) = self.cache.get_mut(&item.id) {
                 if cached.token == token {
@@ -4082,7 +4109,19 @@ impl Cagents {
                     if !runtime.expanded.remove(&id) {
                         runtime.expanded.insert(id.clone());
                     }
-                    if let Some(item) = runtime.snapshot.items.iter().find(|item| item.id == id) {
+                    if let Some(item) = runtime
+                        .snapshot
+                        .items
+                        .iter()
+                        .chain(
+                            runtime
+                                .snapshot
+                                .subagents
+                                .iter()
+                                .flat_map(|agent| agent.items.iter()),
+                        )
+                        .find(|item| item.id == id)
+                    {
                         let previous = runtime.cache.remove(&id);
                         runtime.cache.insert(
                             id.clone(),
@@ -4109,6 +4148,24 @@ impl Cagents {
                     }
                 }
             }
+            Action::SelectSubagent(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.selected_subagent = id.filter(|id| {
+                        runtime
+                            .snapshot
+                            .subagents
+                            .iter()
+                            .any(|agent| &agent.id == id)
+                    });
+                    return iced::widget::scrollable::snap_to(
+                        card_control_id(target.card, "chat-transcript"),
+                        iced::widget::scrollable::RelativeOffset {
+                            x: None,
+                            y: Some(1.0),
+                        },
+                    );
+                }
+            }
             Action::Copy(target, id, part) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -4125,6 +4182,13 @@ impl Cagents {
                         .snapshot
                         .items
                         .iter()
+                        .chain(
+                            runtime
+                                .snapshot
+                                .subagents
+                                .iter()
+                                .flat_map(|agent| agent.items.iter()),
+                        )
                         .find(|item| item.id == id)
                         .and_then(|item| copy_text(part, &item.content)),
                 };
@@ -4585,6 +4649,9 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.selected_subagent.is_some() {
+                    return Task::none();
+                }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
                 // Leaving an end is what arms the page at it, so a reader who
