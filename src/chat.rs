@@ -440,9 +440,22 @@ pub struct Snapshot {
     /// Defaulted so a snapshot written before plans were carried still loads.
     #[serde(default)]
     pub plan: Vec<PlanStep>,
+    /// Child conversations associated with this exact parent conversation.
+    #[serde(default)]
+    pub subagents: Vec<Subagent>,
     /// Whether the provider takes commands, so that what waits to be sent
     /// can wait for it rather than for a refusal.
     pub ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subagent {
+    /// The parent conversation's tool-use ID, which also keys child frames.
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+    pub status: ToolStatus,
+    pub items: Vec<Item>,
 }
 
 impl Snapshot {
@@ -873,6 +886,27 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    Subagent {
+        id: String,
+        kind: String,
+        description: String,
+        status: Option<ToolStatus>,
+    },
+    SubagentItem {
+        id: String,
+        item: Item,
+    },
+    SubagentTextDelta {
+        id: String,
+        item_id: String,
+        role: Role,
+        thinking: bool,
+        delta: String,
+    },
+    SubagentItemsRemoved {
+        id: String,
+        ids: Vec<String>,
+    },
     ItemsRemoved {
         ids: Vec<String>,
     },

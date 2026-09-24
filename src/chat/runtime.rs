@@ -1,6 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
-    Command, Event, Item, ItemContent, Phase, Snapshot,
+    Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
 use crate::account::LiveReport;
@@ -535,10 +535,11 @@ pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store,
     }
     let mut count = ByteCounter(0);
     serde_json::to_writer(&mut count, &metadata).map_err(|error| error.to_string())?;
-    if count.0 > STATE_LIMIT {
-        return Err(
-            "Provider initial request/model metadata exceeds IPC presentation capacity".into(),
-        );
+    // Child transcripts are bounded presentation items, not long-lived
+    // request/model metadata. The actor checks that metadata alone stays
+    // under STATE_LIMIT after applying this initial batch.
+    if count.0 > 4 * STATE_LIMIT {
+        return Err("Provider initial presentation exceeds IPC capacity".into());
     }
     initial.events = metadata;
     Ok(store)
@@ -1043,9 +1044,17 @@ impl Actor {
         apply_event(&mut state, &mut self.indices, event);
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
+        let child_items: Vec<_> = state
+            .subagents
+            .iter_mut()
+            .map(|agent| std::mem::take(&mut agent.items))
+            .collect();
         let mut counter = ByteCounter(0);
         let _ = serde_json::to_writer(&mut counter, &*state);
         state.items = items;
+        for (agent, items) in state.subagents.iter_mut().zip(child_items) {
+            agent.items = items;
+        }
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
@@ -1146,6 +1155,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::Reset { reason } => {
             state.items.clear();
+            state.subagents.clear();
             indices.clear();
             state.requests.clear();
             state.usage = Default::default();
@@ -1209,6 +1219,65 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             } else {
                 indices.insert(item.id.clone(), state.items.len());
                 state.items.push(item);
+            }
+        }
+        Event::Subagent {
+            id,
+            kind,
+            description,
+            status,
+        } => {
+            let agent = subagent(state, &id);
+            if !kind.is_empty() {
+                agent.kind = kind;
+            }
+            if !description.is_empty() {
+                agent.description = description;
+            }
+            if let Some(status) = status {
+                agent.status = status;
+            }
+        }
+        Event::SubagentItem { id, mut item } => {
+            item.at = observed_at();
+            let agent = subagent(state, &id);
+            if let Some(old) = agent.items.iter_mut().find(|old| old.id == item.id) {
+                *old = item;
+            } else {
+                agent.items.push(item);
+            }
+            trim_subagent(agent);
+        }
+        Event::SubagentTextDelta {
+            id,
+            item_id,
+            role,
+            thinking,
+            delta,
+        } => {
+            let agent = subagent(state, &id);
+            if let Some(item) = agent.items.iter_mut().find(|item| item.id == item_id) {
+                if let ItemContent::Text { text, .. } = &mut item.content {
+                    text.push_str(&delta);
+                    item.at = observed_at();
+                }
+            } else {
+                agent.items.push(Item {
+                    id: item_id,
+                    role,
+                    content: ItemContent::Text {
+                        text: delta,
+                        thinking,
+                        phase: Phase::Final,
+                    },
+                    at: observed_at(),
+                });
+            }
+            trim_subagent(agent);
+        }
+        Event::SubagentItemsRemoved { id, ids } => {
+            if let Some(agent) = state.subagents.iter_mut().find(|agent| agent.id == id) {
+                agent.items.retain(|item| !ids.contains(&item.id));
             }
         }
         Event::History { items, has_earlier } => {
@@ -1312,6 +1381,51 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
 }
 
+fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
+    if let Some(index) = state.subagents.iter().position(|agent| agent.id == id) {
+        return &mut state.subagents[index];
+    }
+    if state.subagents.len() >= 32 {
+        let oldest_finished = state
+            .subagents
+            .iter()
+            .position(|agent| agent.status != ToolStatus::Running)
+            .unwrap_or(0);
+        state.subagents.remove(oldest_finished);
+    }
+    state.subagents.push(Subagent {
+        id: id.into(),
+        kind: String::new(),
+        description: String::new(),
+        status: ToolStatus::Running,
+        items: Vec::new(),
+    });
+    state.subagents.last_mut().expect("subagent was inserted")
+}
+
+fn trim_subagent(agent: &mut Subagent) {
+    const MAX_BYTES: usize = 64 * 1024;
+    const MAX_ITEMS: usize = 64;
+    if let Some(last) = agent.items.last_mut()
+        && last.content.byte_len() > MAX_BYTES
+    {
+        last.content = ItemContent::Text {
+            text: "[This large item is available in the provider transcript.]".into(),
+            thinking: false,
+            phase: Phase::Commentary,
+        };
+    }
+    let mut bytes = agent
+        .items
+        .iter()
+        .map(|item| item.content.byte_len())
+        .sum::<usize>();
+    while agent.items.len() > MAX_ITEMS || bytes > MAX_BYTES {
+        let removed = agent.items.remove(0);
+        bytes = bytes.saturating_sub(removed.content.byte_len());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::Role;
@@ -1341,6 +1455,67 @@ mod tests {
                 item
             })
             .collect()
+    }
+    #[test]
+    fn child_transcript_is_separate_and_bounded() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "agent-tool".into(),
+                kind: "Explore".into(),
+                description: "Inspect".into(),
+                status: None,
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::SubagentItem {
+                id: "agent-tool".into(),
+                item: text("child-one", "Found a path"),
+            },
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::SubagentTextDelta {
+                id: "agent-tool".into(),
+                item_id: "child-one".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " and a test".into(),
+            },
+        );
+        assert!(state.items.is_empty());
+        assert_eq!(
+            state.subagents[0].items[0].content,
+            text("child-one", "Found a path and a test").content
+        );
+        for index in 0..80 {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::SubagentItem {
+                    id: "agent-tool".into(),
+                    item: text(&format!("child-{index}"), "x"),
+                },
+            );
+        }
+        assert_eq!(state.subagents[0].items.len(), 64);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "agent-tool".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Succeeded),
+            },
+        );
+        assert_eq!(state.subagents[0].status, ToolStatus::Succeeded);
     }
     /// Readiness is what a sender waits on, so it ends with the provider.
     #[test]
