@@ -271,6 +271,7 @@ fn create_inner(
             requests: BTreeMap::new(),
             active_items: BTreeMap::new(),
             models: Vec::new(),
+            listing: Vec::new(),
             modalities: BTreeMap::new(),
             selected: None,
             reasoning: None,
@@ -325,6 +326,10 @@ struct Codex {
     requests: BTreeMap<String, PendingRequest>,
     active_items: BTreeMap<String, Item>,
     models: Vec<Model>,
+    /// The pages of a model listing still under way. The listing is
+    /// reported whole, since a model missing from part of it reads as one
+    /// Codex does not offer.
+    listing: Vec<Model>,
     modalities: BTreeMap<String, Vec<String>>,
     selected: Option<String>,
     reasoning: Option<String>,
@@ -953,12 +958,12 @@ impl Adapter for Codex {
                             "Unsupported Codex frame: missing string model".to_owned()
                         })?;
                         let id = model.id.clone();
-                        if let Some(existing) = self.models.iter_mut().find(|m| m.id == id) {
+                        if let Some(existing) = self.listing.iter_mut().find(|m| m.id == id) {
                             *existing = model;
                         } else {
-                            self.models.push(model);
+                            self.listing.push(model);
                         }
-                        if self.models.len() > MAX_MODELS {
+                        if self.listing.len() > MAX_MODELS {
                             return Err("Codex model catalog exceeds native client bound".into());
                         }
                         self.modalities.insert(
@@ -981,8 +986,10 @@ impl Adapter for Codex {
                             json!({"limit":100,"cursor":cursor}),
                             Pending::Models,
                         )?;
+                    } else {
+                        self.models = std::mem::take(&mut self.listing);
+                        self.model_events(&mut step);
                     }
-                    self.model_events(&mut step);
                 }
                 Pending::Skills => {
                     // Each skill with the path it is at and the scope that
@@ -2139,6 +2146,7 @@ mod tests {
                 label: "Model".into(),
                 reasoning: vec!["future-effort".into()],
             }],
+            listing: Vec::new(),
             modalities: BTreeMap::new(),
             selected: Some("model".into()),
             reasoning: None,
@@ -2668,6 +2676,46 @@ mod tests {
             ToolStatus::Failed,
             "what Codex itself calls a failure is still a failure"
         );
+    }
+
+    /// A model listing that comes in pages is reported once it is whole: a
+    /// model on a later page is one Codex offers, not one it lacks.
+    #[test]
+    fn a_paged_model_listing_is_reported_whole() {
+        let mut adapter = adapter();
+        let mut listing = Step::default();
+        adapter
+            .call(
+                &mut listing,
+                "model/list",
+                json!({"limit":100}),
+                Pending::Models,
+            )
+            .unwrap();
+        let first = adapter
+            .receive(json!({"id":listing.writes[0]["id"],"result":{"data":[{"model":"gpt-a"}],"nextCursor":"more"}}))
+            .unwrap();
+        assert!(
+            !first
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Models { .. })),
+            "part of a listing is not reported"
+        );
+        assert_eq!(first.writes[0]["params"]["cursor"], "more");
+        let last = adapter
+            .receive(json!({"id":first.writes[0]["id"],"result":{"data":[{"model":"gpt-b"}]}}))
+            .unwrap();
+        let reported = last.events.iter().find_map(|event| match event {
+            Event::Models { models, .. } => Some(
+                models
+                    .iter()
+                    .map(|model| model.id.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        assert_eq!(reported, Some(vec!["gpt-a", "gpt-b"]));
     }
 
     #[test]
