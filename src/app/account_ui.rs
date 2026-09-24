@@ -2665,11 +2665,11 @@ impl Cagents {
         }
         let bar = widget::container(
             widget::row::with_children(vec![
-                iced::widget::Space::new().width(Length::Fill).into(),
                 widget::row::with_children(chips)
                     .spacing(design::GRID_UNIT)
                     .align_y(Alignment::Center)
                     .into(),
+                iced::widget::Space::new().width(Length::Fill).into(),
             ])
             .align_y(Alignment::Center),
         )
