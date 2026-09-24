@@ -12428,12 +12428,13 @@ impl Application for Cagents {
                 inspector::mount_for_width(window_width, true, true),
                 Some(InspectorLayout::Docked)
             );
-        // A docked inspector's own resize handle is the trailing edge of a
-        // strip that reaches it; a card's splitter there would double the rule
-        // and compete for the same drag. Every other card keeps the splitter
-        // that separates it from its neighbour or the empty strip beyond.
+        // A docked inspector's resize handle draws the viewport's trailing
+        // edge; a card scrolled against it would double that rule with its
+        // own splitter and compete for the same drag. Every other card keeps
+        // the splitter that separates it from its neighbour or the empty
+        // strip beyond.
         let card_beside_inspector = docked_context_inspector
-            .then(|| self.workspace.card_at_trailing_edge())
+            .then(|| self.workspace.card_at_viewport_edge())
             .flatten();
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
