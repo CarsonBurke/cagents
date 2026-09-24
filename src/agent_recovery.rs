@@ -396,6 +396,26 @@ fn claude_process_identity(
     Some(identity.unwrap_or(SessionIdentity::Ambiguous))
 }
 
+/// When, by the wall clock, a process started that started `start` clock
+/// ticks after boot, as `/proc/<pid>/stat` states it.
+#[cfg(feature = "host")]
+pub(crate) fn process_started(start: u64) -> Option<std::time::SystemTime> {
+    // SAFETY: sysconf has no pointer arguments; CLOCK_BOOTTIME writes to ts.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if ticks <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return None;
+    }
+    let uptime = std::time::Duration::new(ts.tv_sec.try_into().ok()?, ts.tv_nsec.try_into().ok()?);
+    let age = uptime.checked_sub(std::time::Duration::from_secs_f64(
+        start as f64 / ticks as f64,
+    ))?;
+    std::time::SystemTime::now().checked_sub(age)
+}
+
 #[cfg(feature = "host")]
 fn omp_terminal_identity(
     root: &Path,
@@ -413,21 +433,7 @@ fn omp_terminal_identity(
         .join("terminal-sessions")
         .join(format!("pts-{tty}"));
     let modified = fs::metadata(&marker).ok()?.modified().ok()?;
-    // SAFETY: sysconf has no pointer arguments; CLOCK_BOOTTIME writes to ts.
-    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if ticks <= 0 || unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
-        return None;
-    }
-    let uptime = std::time::Duration::new(ts.tv_sec.try_into().ok()?, ts.tv_nsec.try_into().ok()?);
-    let age = uptime.checked_sub(std::time::Duration::from_secs_f64(
-        start as f64 / ticks as f64,
-    ))?;
-    let started = std::time::SystemTime::now().checked_sub(age)?;
-    if modified < started {
+    if modified < process_started(start)? {
         return None;
     }
     let identity = (|| {

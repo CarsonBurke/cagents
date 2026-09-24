@@ -10,6 +10,7 @@ use std::{
 
 mod claude;
 mod codex;
+mod rollout;
 pub(crate) mod socket;
 
 const TTL: Duration = Duration::from_secs(2);
@@ -76,6 +77,7 @@ struct Entry {
 /// Lazily invoked by terminal activity requests; no background thread or timer.
 pub(crate) struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
+    rollouts: rollout::Rollouts,
 }
 
 #[derive(Default)]
@@ -88,6 +90,7 @@ impl Observer {
     pub fn new() -> Self {
         Self {
             accounts: Mutex::new(BTreeMap::new()),
+            rollouts: rollout::Rollouts::default(),
         }
     }
 
@@ -103,6 +106,22 @@ impl Observer {
         let recipe = &process.launch;
         if provider == Provider::Omp || !recipe.working_directory.is_absolute() {
             return None;
+        }
+        // A Codex CLI that keeps its own threads says what they are doing in
+        // the rollouts it holds open; only one that holds none can be a client
+        // of the shared server the census asks.
+        if provider == Provider::Codex
+            && let Some(state) = self.rollouts.state(
+                process.pid,
+                crate::model::agent_recovery::process_started(process.start)
+                    .and_then(|started| started.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|started| started.as_secs()),
+            )
+        {
+            return Some(Observation {
+                activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
+                title: None,
+            });
         }
         let key = key(provider, recipe).ok()?;
         let entry = {
