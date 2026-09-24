@@ -122,7 +122,7 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
 lsp-types = { version = "0.95", optional = true }
-portable-pty = { version = "0.9", optional = true }
+portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the

@@ -468,7 +468,7 @@ fn open_target(process: &CloseProcess) -> io::Result<File> {
     }
     Ok(file)
 }
-fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
+pub(super) fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
     // SAFETY: the owned pidfd pins one process and null siginfo uses ordinary delivery.
     let result = unsafe {
         libc::syscall(
