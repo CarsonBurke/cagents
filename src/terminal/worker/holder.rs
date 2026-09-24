@@ -46,15 +46,13 @@ const PROTOCOL: u32 = 1;
 const MAX_FRAME: u32 = 16 << 20;
 /// Descriptors any one message may carry.
 const MAX_DESCRIPTORS: usize = 4;
-/// The grace a SIGHUP gets before SIGKILL: portable-pty's own killer waits the
-/// same before escalating.
-const HANGUP_GRACE: Duration = Duration::from_millis(200);
 /// How long a released holder has to exit before it is killed. It exits as
 /// soon as it reads the release, so this only bounds a wedged one.
 const RELEASE_GRACE: Duration = Duration::from_millis(500);
 /// How long a new holder has to report its terminal. The root's own exec is
-/// the slow part, and a terminal worker waits on this.
-const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// the slow part, and a terminal worker waits on this; it only bounds a holder
+/// that wedged, so it is generous to a slow filesystem.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
 
@@ -110,6 +108,7 @@ pub(super) fn spawn(
     let remote_fd = remote.as_raw_fd();
     let mut process = Command::new("/proc/self/exe");
     process
+        .arg0(PROCESS_NAME.to_str().expect("the holder name is ASCII"))
         .arg(ARGUMENT)
         .arg(remote_fd.to_string())
         .stdin(Stdio::null())
@@ -117,9 +116,11 @@ pub(super) fn spawn(
         .stderr(Stdio::null());
     // SAFETY: only async-signal-safe calls run between fork and exec. The
     // holder leads its own session, so nothing aimed at the daemon's process
-    // group or terminal reaches it, and it inherits exactly one descriptor.
+    // group or terminal reaches it, and it inherits exactly one descriptor:
+    // a holder can outlive whatever else the daemon had open.
     unsafe {
         process.pre_exec(move || {
+            crate::daemon::seal_inherited_descriptors()?;
             if libc::setsid() == -1 || libc::fcntl(remote_fd, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -132,11 +133,16 @@ pub(super) fn spawn(
         .spawn()
         .map_err(|error| format!("start terminal holder: {error}"))?;
     drop(remote);
+    // The holder is this daemon's unreaped child until `Holder` reaps it.
+    let pidfd = open_pidfd(process.id() as libc::pid_t);
     let mut holder = Holder {
         control,
         process: Some(process),
+        pidfd: None,
         watch: None,
+        release: None,
     };
+    holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
@@ -175,47 +181,76 @@ pub(super) fn spawn(
         .try_into()
         .map_err(|_| "terminal holder sent the wrong descriptors")?;
 
-    let reader = holder
-        .control
-        .try_clone()
-        .map_err(|error| format!("watch terminal holder: {error}"))?;
-    holder.watch = Some(
+    let root = File::from(pidfd);
+    let watched = (|| {
+        let reader = holder.control.try_clone()?;
+        let root = root.try_clone()?;
+        let (released, release) = std::io::pipe()?;
+        holder.release = Some(release);
         thread::Builder::new()
             .name(format!("terminal-holder-{pid}"))
-            .spawn(move || watch(&reader, &exits))
-            .map_err(|error| format!("watch terminal holder: {error}"))?,
-    );
+            .spawn(move || watch(&reader, &root, &released, &exits))
+    })();
+    holder.watch = Some(watched.map_err(|error| format!("watch terminal holder: {error}"))?);
     Ok(Held {
         master: PtyMaster(master),
-        child: HeldChild {
-            pid,
-            pidfd: File::from(pidfd),
-        },
+        child: HeldChild { pid, pidfd: root },
         holder,
     })
 }
 
 /// Delivers the root's exit, then waits for the holder to go away.
-fn watch(control: &UnixStream, exits: &Sender<ChildExit>) {
+///
+/// A holder that vanishes first - killed, or crashed - leaves its root
+/// running on a terminal this daemon still reads. That root has not exited,
+/// so its exit is reported only once its pidfd says so, with the status the
+/// holder took with it unknown. `released` hanging up ends the wait.
+fn watch(
+    control: &UnixStream,
+    root: &File,
+    released: &std::io::PipeReader,
+    exits: &Sender<ChildExit>,
+) {
     use std::os::unix::process::ExitStatusExt;
 
-    let mut reported = false;
     loop {
-        let exit = match receive::<Report>(control) {
-            Ok(Some((Report::Exited { wait_status }, _))) => Ok(ExitStatus::from(
-                std::process::ExitStatus::from_raw(wait_status),
-            )),
-            Ok(Some(_)) => continue,
-            Ok(None) => Err("terminal holder ended before its process".to_owned()),
-            Err(error) => Err(format!("terminal holder connection failed: {error}")),
-        };
-        let ended = exit.is_err();
-        if !reported {
-            reported = true;
-            let _ = exits.try_send(exit);
+        match receive::<Report>(control) {
+            Ok(Some((Report::Exited { wait_status }, _))) => {
+                let status = std::process::ExitStatus::from_raw(wait_status);
+                let _ = exits.try_send(Ok(ExitStatus::from(status)));
+                // Nothing further matters; wait for the holder to go away.
+                while let Ok(Some(_)) = receive::<Report>(control) {}
+                return;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
         }
-        if ended {
-            return;
+    }
+    tracing::warn!("a terminal holder ended before its root process; the terminal stays attached");
+    let mut targets = [
+        libc::pollfd {
+            fd: root.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: released.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: both pollfds live for the duration of the call.
+        match unsafe { libc::poll(targets.as_mut_ptr(), 2, -1) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            -1 => return,
+            _ if targets[0].revents != 0 => {
+                let _ = exits.try_send(Err(
+                    "the terminal's holder ended before it, so its exit status is unknown".into(),
+                ));
+                return;
+            }
+            _ => return,
         }
     }
 }
@@ -225,33 +260,31 @@ fn watch(control: &UnixStream, exits: &Sender<ChildExit>) {
 pub(super) struct Holder {
     control: UnixStream,
     process: Option<Child>,
+    pidfd: Option<File>,
     watch: Option<JoinHandle<()>>,
+    /// Dropping this ends a watch still waiting on a root its holder left.
+    release: Option<std::io::PipeWriter>,
 }
 
 impl Drop for Holder {
     fn drop(&mut self) {
         let _ = send(&self.control, &Request::Release, &[]);
         if let Some(mut process) = self.process.take() {
-            let deadline = Instant::now() + RELEASE_GRACE;
-            loop {
-                match process.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok(None) | Err(_) => {
-                        tracing::warn!(
-                            pid = process.id(),
-                            "killing a terminal holder that did not exit when released"
-                        );
-                        let _ = process.kill();
-                        let _ = process.wait();
-                        break;
-                    }
-                }
+            let exited = self
+                .pidfd
+                .as_ref()
+                .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
+            if !exited {
+                tracing::warn!(
+                    pid = process.id(),
+                    "killing a terminal holder that did not exit when released"
+                );
+                let _ = process.kill();
             }
+            let _ = process.wait();
         }
-        // The holder is gone, so its socket has hung up and the watch returns.
+        // The holder is gone, so its socket has hung up.
+        drop(self.release.take());
         if let Some(watch) = self.watch.take() {
             let _ = watch.join();
         }
@@ -307,38 +340,40 @@ impl HeldChild {
         signal(&self.pidfd, 0).is_ok()
     }
 
-    /// Hangs the root up and, if it is still running after a short grace,
-    /// kills it. A root that already exited counts as killed.
+    /// Hangs the root up, as closing its terminal would. A root that already
+    /// exited counts as hung up; one that ignores the hangup keeps running.
     pub(super) fn kill(&self) -> io::Result<()> {
         match signal(&self.pidfd, libc::SIGHUP) {
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(()),
-            result => result?,
-        }
-        if self.exits_within(HANGUP_GRACE)? {
-            return Ok(());
-        }
-        match signal(&self.pidfd, libc::SIGKILL) {
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
             result => result,
         }
     }
+}
 
-    /// A pidfd becomes readable when its process exits.
-    fn exits_within(&self, grace: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + grace;
-        let mut target = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            // SAFETY: one live pollfd for the duration of the call.
-            match unsafe { libc::poll(&mut target, 1, remaining.as_millis() as libc::c_int) } {
-                -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-                -1 => return Err(io::Error::last_os_error()),
-                ready => return Ok(ready > 0),
-            }
+fn open_pidfd(pid: libc::pid_t) -> io::Result<File> {
+    // SAFETY: pidfd_open takes scalars; a success is a fresh owned descriptor.
+    match unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } {
+        -1 => Err(io::Error::last_os_error()),
+        fd => Ok(unsafe { File::from_raw_fd(fd as RawFd) }),
+    }
+}
+
+/// Whether a pidfd's process exits within `grace`: a pidfd becomes readable
+/// when it does.
+fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + grace;
+    let mut target = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // SAFETY: one live pollfd for the duration of the call.
+        match unsafe { libc::poll(&mut target, 1, remaining.as_millis() as libc::c_int) } {
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            -1 => return Err(io::Error::last_os_error()),
+            ready => return Ok(ready > 0),
         }
     }
 }
@@ -419,20 +454,19 @@ fn serve(control: UnixStream) -> i32 {
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
     };
-    // SAFETY: the root is this holder's unreaped child, so its pid is its own.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if pidfd == -1 {
-        let error = io::Error::last_os_error();
-        // SAFETY: as above; the root cannot be handed over, so it must not
-        // outlive this failure.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
+    // The root is this holder's unreaped child, so its pid is its own.
+    let pidfd = match open_pidfd(pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            // SAFETY: as above; the root cannot be handed over, so it must
+            // not outlive this failure.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            return fail(format!("open pidfd for {program}: {error}"));
         }
-        return fail(format!("open pidfd for {program}: {error}"));
-    }
-    // SAFETY: pidfd_open returned a fresh descriptor this holder owns.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+    };
     let Some(master) = pair.master.as_raw_fd() else {
         return fail("PTY descriptor unavailable".into());
     };
@@ -807,10 +841,10 @@ mod tests {
     }
 
     #[test]
-    fn killing_a_held_root_escalates_past_an_ignored_hangup() {
+    fn killing_a_held_root_hangs_it_up() {
         let (exits, exited) = crossbeam_channel::bounded(1);
         let held = spawn(
-            command("trap '' HUP; echo ready; while :; do sleep 1; done"),
+            command("trap 'exit 3' HUP; echo ready; while :; do sleep 1; done"),
             size(),
             exits,
         )
@@ -821,17 +855,31 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            status.signal(),
-            ExitStatus::from(
-                <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(
-                    libc::SIGKILL
-                ),
-            )
-            .signal()
-        );
-        // A root that is already gone counts as killed.
+        assert_eq!(status.exit_code(), 3);
+        // A root that is already gone counts as hung up.
         held.child.kill().unwrap();
+    }
+
+    #[test]
+    fn a_root_outliving_its_holder_reports_only_its_own_exit() {
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = spawn(command("echo ready; read line; exit 4"), size(), exits).unwrap();
+        read_until(&held.master, "ready");
+        let holder = holder_pid(&held) as libc::pid_t;
+        // SAFETY: signals a child this test spawned.
+        assert_eq!(unsafe { libc::kill(holder, libc::SIGKILL) }, 0);
+        // The root keeps its terminal, so its exit is not the holder's.
+        assert!(exited.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(held.child.unreaped());
+
+        let mut writer = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"\n").unwrap();
+        let error = exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("exit status is unknown"), "{error}");
+        drop(held);
     }
 
     #[test]

@@ -2079,6 +2079,12 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: Owned
                 let _ = sender.send(PtyMessage::Eof);
                 return;
             }
+            // A PTY master reads EIO, not end of file, once its terminal's
+            // last slave closes: the ordinary end of a terminal.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                let _ = sender.send(PtyMessage::Eof);
+                return;
+            }
             Ok(read) => {
                 if sender
                     .send(PtyMessage::Bytes(buffer[..read].to_vec()))
@@ -2437,6 +2443,55 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_terminal_whose_root_exits_ends_its_output_without_an_error() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "echo finished"]);
+        command.cwd("/");
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let held = holder::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            exits,
+        )
+        .unwrap();
+        let mut reader = File::from(held.master.duplicate().unwrap());
+        let readiness = held.master.duplicate().unwrap();
+        let (wake_rx, _wake_tx) = wake_pipe().unwrap();
+        let (sender, messages) = crossbeam_channel::unbounded();
+        read_pty(&mut reader, &sender, readiness, wake_rx);
+
+        let messages: Vec<_> = messages.try_iter().collect();
+        let output: Vec<u8> = messages
+            .iter()
+            .filter_map(|message| match message {
+                PtyMessage::Bytes(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert!(String::from_utf8_lossy(&output).contains("finished"));
+        assert!(
+            matches!(messages.last(), Some(PtyMessage::Eof)),
+            "{:?}",
+            messages.last().map(|message| match message {
+                PtyMessage::Error(error) => error.as_str(),
+                _ => "not the end",
+            })
+        );
+        let status = exited
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn omp_display_title_drops_lifecycle_animation_but_preserves_labels() {
