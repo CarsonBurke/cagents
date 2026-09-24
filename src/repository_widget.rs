@@ -5075,10 +5075,9 @@ fn pdf_tone_inverted(theme: &cosmic::Theme) -> crate::editor::PdfTone {
 
 /// A hairline around a rendered document page.
 fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
-    let container = theme.current_container();
     cosmic::widget::container::Style {
         border: iced::Border {
-            color: container.divider.into(),
+            color: crate::design::rule(theme),
             width: crate::design::BORDER_WIDTH,
             radius: 0.0.into(),
         },

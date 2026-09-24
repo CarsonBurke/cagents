@@ -7048,11 +7048,13 @@ impl Cagents {
             } else {
                 iced::widget::Space::new().into()
             }
-        } else {
+        } else if show_resize_splitter {
             widget::container(crate::design::vertical_rule())
                 .center_x(Length::Fixed(crate::splitter::WIDTH))
                 .height(Length::Fill)
                 .into()
+        } else {
+            iced::widget::Space::new().into()
         };
         crate::interaction::layer(
             surface,
@@ -12426,6 +12428,14 @@ impl Application for Cagents {
                 inspector::mount_for_width(window_width, true, true),
                 Some(InspectorLayout::Docked)
             );
+        // A docked inspector's resize handle draws the viewport's trailing
+        // edge; a card scrolled against it would double that rule with its
+        // own splitter and compete for the same drag. Every other card keeps
+        // the splitter that separates it from its neighbour or the empty
+        // strip beyond.
+        let card_beside_inspector = docked_context_inspector
+            .then(|| self.workspace.card_at_viewport_edge())
+            .flatten();
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let action_buttons = || {
@@ -12503,7 +12513,11 @@ impl Application for Cagents {
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
-                    self.card_view(context.id, context.focused, !docked_context_inspector)
+                    self.card_view(
+                        context.id,
+                        context.focused,
+                        card_beside_inspector != Some(context.id),
+                    )
                 },
                 // `sync_chrome` keeps an entry for every durable card, so
                 // the fallback is only reachable for a card the workspace holds
@@ -15921,6 +15935,14 @@ mod tests {
             .unwrap();
         let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         server.join().unwrap();
+        // A rejected handshake wakes its consumer before it queues the error,
+        // so the wake alone does not mean there is anything to drain yet.
+        let events = handle.events();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while events.is_empty() {
+            assert!(Instant::now() < deadline, "the rejection was never queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         // The subscription can deliver this edge before the start task returns.
         let _ = app.update(Message::TerminalWake {
             card,

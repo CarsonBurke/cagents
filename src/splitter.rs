@@ -373,14 +373,14 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
             crate::separator::Axis::Vertical,
             self.edge == Edge::Trailing,
         );
-        // The exact rule color cosmic dividers paint
-        // (`current_container().divider`): the component-level divider and
-        // pre-compositing against the window background both rendered a
-        // brighter, stronger line than every sibling border.
+        // The same rule every separator paints (`design::rule`): the
+        // component-level divider and pre-compositing against the window
+        // background both rendered a brighter, stronger line than every
+        // sibling border.
         let color: Color = if tree.state.downcast_ref::<SplitterState>().is_focused {
             theme.current_container().component.on.into()
         } else {
-            theme.current_container().divider.into()
+            crate::design::rule(theme)
         };
         renderer.fill_quad(
             renderer::Quad {

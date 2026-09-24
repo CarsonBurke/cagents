@@ -337,7 +337,7 @@ pub fn popover<'a, Message: Clone + 'static>(
                     theme.current_container().component.base.into(),
                 )),
                 border: iced::Border {
-                    color: theme.current_container().component.divider.into(),
+                    color: crate::design::component_rule(theme),
                     width: crate::design::BORDER_WIDTH,
                     radius: theme.cosmic().corner_radii.radius_s.into(),
                 },

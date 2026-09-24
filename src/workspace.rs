@@ -688,6 +688,22 @@ impl Workspace {
         &self.geometry
     }
 
+    /// The card whose trailing edge currently sits on the viewport's own
+    /// trailing edge, if any.
+    ///
+    /// That is where whatever is docked beside the strip draws its edge, so a
+    /// rule of the card's own there would double it. It follows the camera:
+    /// any card can be scrolled against the edge, and the last card of a strip
+    /// that does not fill the viewport never is.
+    pub fn card_at_viewport_edge(&self) -> Option<CardId> {
+        let edge = self.camera.offset() + self.viewport_width;
+        self.presentation_geometry()
+            .cards()
+            .iter()
+            .find(|card| (card.end - edge).abs() < 0.5)
+            .map(|card| card.id)
+    }
+
     pub fn camera(&self) -> Camera {
         self.camera
     }
@@ -1787,6 +1803,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_card_at_the_viewport_edge_follows_the_camera() {
+        let mut filled = workspace_with_widths(&[CardWidth::Fraction(0.5); 4], 800.0);
+        let cards: Vec<_> = filled
+            .geometry()
+            .cards()
+            .iter()
+            .map(|card| card.id)
+            .collect();
+        // Unscrolled, the second of four half-width cards meets the edge.
+        assert_eq!(filled.card_at_viewport_edge(), Some(cards[1]));
+        filled.camera.jump_to(200.0);
+        assert_eq!(filled.card_at_viewport_edge(), None);
+        filled.camera.jump_to(400.0);
+        assert_eq!(filled.card_at_viewport_edge(), Some(cards[2]));
+
+        let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
+        assert_eq!(underfilled.card_at_viewport_edge(), None);
+        let centered = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
+        assert_eq!(centered.card_at_viewport_edge(), None);
     }
 
     #[test]

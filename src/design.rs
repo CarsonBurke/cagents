@@ -302,7 +302,61 @@ fn base(theme: &cosmic::Theme) -> cosmic::iced::Color {
 /// line only defines where one surface stops, which is all a border on a
 /// transcript needs to do.
 pub fn hairline(theme: &cosmic::Theme) -> cosmic::iced::Color {
-    mix(base(theme), theme.current_container().on.into(), 0.12)
+    mix(
+        base(theme),
+        theme.current_container().on.into(),
+        0.12 * rule_strength(theme),
+    )
+}
+
+/// How strongly shell rules paint relative to the theme's own divider. The
+/// theme's divider is tuned for cosmic's boxed widgets; between panes that
+/// already differ in content it reads heavier than an edge needs to.
+const RULE_STRENGTH: f32 = 0.8;
+
+/// The color every shell rule between surfaces paints: pane separators,
+/// splitters, popover and page edges.
+///
+/// It is opaque, so rules that cross or meet paint one solid junction rather
+/// than compounding into a darker dot where two translucent lines overlap.
+pub fn rule(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let container = theme.current_container();
+    soften(theme, base(theme), container.divider.into())
+}
+
+/// `rule` for an edge drawn on a component surface such as a popover.
+pub fn component_rule(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let component = &theme.current_container().component;
+    soften(theme, component.base.into(), component.divider.into())
+}
+
+/// How strongly `theme` paints its rules. A high-contrast theme asked for its
+/// edges at full strength, so it keeps them.
+fn rule_strength(theme: &cosmic::Theme) -> f32 {
+    if theme.cosmic().is_high_contrast {
+        1.0
+    } else {
+        RULE_STRENGTH
+    }
+}
+
+fn soften(
+    theme: &cosmic::Theme,
+    surface: cosmic::iced::Color,
+    divider: cosmic::iced::Color,
+) -> cosmic::iced::Color {
+    softened(surface, divider, rule_strength(theme))
+}
+
+/// `divider` as painted on `surface`, moved back toward the surface by the
+/// share of `strength` the rule gives up.
+fn softened(
+    surface: cosmic::iced::Color,
+    divider: cosmic::iced::Color,
+    strength: f32,
+) -> cosmic::iced::Color {
+    let painted = mix(surface, divider, divider.a);
+    mix(surface, painted, strength)
 }
 
 /// One step above the surface: a code block, a composer, a notice.
@@ -598,6 +652,28 @@ pub fn change_counts<'a, Message: 'a>(counts: &str) -> cosmic::Element<'a, Messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_sit_a_fifth_closer_to_their_surface_and_stay_opaque() {
+        use cosmic::iced::Color;
+        let close = |a: Color, b: Color| {
+            [a.r - b.r, a.g - b.g, a.b - b.b, a.a - b.a]
+                .iter()
+                .all(|delta| delta.abs() < 1e-6)
+        };
+        let opaque = softened(Color::BLACK, Color::WHITE, RULE_STRENGTH);
+        assert!(close(opaque, Color::from_rgb(0.8, 0.8, 0.8)), "{opaque:?}");
+        // A translucent divider is first painted on the surface it sits on.
+        let translucent = softened(
+            Color::BLACK,
+            Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+            RULE_STRENGTH,
+        );
+        assert!(
+            close(translucent, Color::from_rgb(0.4, 0.4, 0.4)),
+            "{translucent:?}"
+        );
+    }
 
     #[test]
     fn responsive_boundaries_match_the_workbench_contract() {
