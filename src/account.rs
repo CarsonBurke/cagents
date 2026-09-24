@@ -74,8 +74,20 @@ fn fraction(value: f64) -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AccountHome {
     System,
-    Managed { key: uuid::Uuid, path: PathBuf },
-    Brokered { service: String, key: String },
+    Managed {
+        key: uuid::Uuid,
+        path: PathBuf,
+    },
+    /// A provider home the reader linked from elsewhere. cagents never owns
+    /// or removes its files.
+    Linked {
+        key: uuid::Uuid,
+        path: PathBuf,
+    },
+    Brokered {
+        service: String,
+        key: String,
+    },
 }
 
 /// One provider login, identified by the home its CLI keeps it in.
@@ -147,6 +159,13 @@ impl Account {
         }
     }
 
+    pub fn linked(provider: Provider, key: uuid::Uuid, path: PathBuf) -> Self {
+        Self {
+            provider,
+            home: AccountHome::Linked { key, path },
+        }
+    }
+
     /// An account a CLI brokers among its own, known only from its record of
     /// the account's usage.
     pub fn brokered(provider: Provider, service: String, key: String) -> Self {
@@ -177,19 +196,26 @@ impl Account {
         let provider = self.provider.executable();
         AccountId(match &self.home {
             AccountHome::System => format!("{provider}/system"),
-            AccountHome::Managed { key, .. } => format!("{provider}/{key}"),
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
+                format!("{provider}/{key}")
+            }
             AccountHome::Brokered { service, key } => {
                 format!("{provider}/{service}/{}", brokered_digest(service, key))
             }
         })
     }
 
-    /// The key of a managed account, `None` for any other.
-    pub fn managed_key(&self) -> Option<uuid::Uuid> {
+    /// The key of an account registered in cagents, `None` for the system or
+    /// a provider-brokered account.
+    pub fn registry_key(&self) -> Option<uuid::Uuid> {
         match &self.home {
             AccountHome::System | AccountHome::Brokered { .. } => None,
-            AccountHome::Managed { key, .. } => Some(*key),
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => Some(*key),
         }
+    }
+
+    pub fn is_linked(&self) -> bool {
+        matches!(self.home, AccountHome::Linked { .. })
     }
 
     pub fn is_system(&self) -> bool {
@@ -206,7 +232,7 @@ impl Account {
     pub fn brokered_service(&self) -> Option<&str> {
         match &self.home {
             AccountHome::Brokered { service, .. } => Some(service),
-            AccountHome::System | AccountHome::Managed { .. } => None,
+            AccountHome::System | AccountHome::Managed { .. } | AccountHome::Linked { .. } => None,
         }
     }
 
@@ -216,7 +242,7 @@ impl Account {
     pub fn lock_name(&self) -> String {
         match &self.home {
             AccountHome::System => self.provider.executable().to_owned(),
-            AccountHome::Managed { key, .. } => {
+            AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
                 format!("{}-{}", self.provider.executable(), key.simple())
             }
             AccountHome::Brokered { service, key } => format!(
@@ -233,7 +259,9 @@ impl Account {
     pub fn home_directory(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         match &self.home {
             AccountHome::Brokered { .. } => None,
-            AccountHome::Managed { path, .. } => Some(path.clone()),
+            AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
+                Some(path.clone())
+            }
             AccountHome::System => {
                 let variable = home_variable(self.provider)?;
                 if let Some(explicit) = environment(variable).filter(|value| !value.is_empty()) {
@@ -262,7 +290,7 @@ impl Account {
     pub fn probe_environment(&self) -> Option<(&'static str, PathBuf)> {
         match &self.home {
             AccountHome::System | AccountHome::Brokered { .. } => None,
-            AccountHome::Managed { path, .. } => {
+            AccountHome::Managed { path, .. } | AccountHome::Linked { path, .. } => {
                 Some((home_variable(self.provider)?, path.clone()))
             }
         }

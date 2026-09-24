@@ -192,13 +192,19 @@ impl State {
         self.accounts = wanted
             .into_iter()
             .map(|account| {
-                previous.remove(&account.id()).unwrap_or_else(|| {
-                    let mut state = AccountState::new(account);
-                    // A managed home exists by construction; whether its CLI
-                    // is still installed is the probe's to find out.
-                    state.present = !state.account.is_system();
-                    state
-                })
+                match previous.remove(&account.id()) {
+                    Some(state) if state.account == account => state,
+                    // A linked home's recorded path can change in another
+                    // window or an edited registry. Its old usage and login
+                    // observation then belong to the old path.
+                    _ => {
+                        let mut state = AccountState::new(account);
+                        // Whether its CLI is still installed is the probe's to
+                        // find out.
+                        state.present = !state.account.is_system();
+                        state
+                    }
+                }
             })
             .collect();
         if self
@@ -234,8 +240,30 @@ impl State {
         if let Some(label) = self.registry.label(&account.account) {
             return label.to_owned();
         }
+        let linked_hint = account.account.is_linked().then(|| {
+            account
+                .account
+                .resolved_home()
+                .as_deref()
+                .and_then(|home| {
+                    let named = if home.file_name().is_some_and(|name| name == "home") {
+                        home.parent().unwrap_or(home)
+                    } else {
+                        home
+                    };
+                    named.file_name()
+                })
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "existing".into())
+        });
         if let Some(email) = account.email(&self.registry) {
+            if let Some(hint) = linked_hint {
+                return format!("{hint} · {email}");
+            }
             return email.to_owned();
+        }
+        if let Some(hint) = linked_hint {
+            return format!("{} · {hint}", account.name());
         }
         if account.account.is_system() {
             "System default".into()
@@ -450,7 +478,12 @@ impl AccountState {
         self.identity
             .as_ref()
             .and_then(|identity| identity.email.as_deref())
-            .or_else(|| registry.find(self.account.managed_key()?)?.email.as_deref())
+            .or_else(|| {
+                registry
+                    .find(self.account.registry_key()?)?
+                    .email
+                    .as_deref()
+            })
     }
 
     /// The window a summary of this account leads with, while its figures
@@ -589,6 +622,14 @@ pub enum Action {
         provider: Provider,
         device: bool,
     },
+    LinkStart(Provider),
+    LinkInput(String),
+    LinkCommit,
+    LinkCancel,
+    LinkReady {
+        key: uuid::Uuid,
+        result: Result<Registry, String>,
+    },
     /// The new account's home and CLI are ready, or could not be.
     HomeReady {
         provider: Provider,
@@ -648,6 +689,8 @@ impl Action {
                 | Self::OpenPane
                 | Self::SignIn(_)
                 | Self::Add { .. }
+                | Self::LinkStart(_)
+                | Self::LinkCommit
                 | Self::CancelLogin(_)
                 | Self::SetDefault(_)
                 | Self::Rename(_)
@@ -928,11 +971,13 @@ fn login_launch(
     device: bool,
 ) -> Option<LaunchRecipe> {
     let command = login_arguments(account.provider, device)?;
-    let mut environment: BTreeMap<String, String> = account
-        .probe_environment()
-        .map(|(variable, home)| (variable.to_owned(), home.display().to_string()))
-        .into_iter()
-        .collect();
+    let mut environment = BTreeMap::new();
+    if let (Some(variable), Some(account_home)) = (
+        account::home_variable(account.provider),
+        account.resolved_home(),
+    ) {
+        environment.insert(variable.to_owned(), account_home.display().to_string());
+    }
     // The CLI was found on the search path the reader's shell sets up, and
     // runs with it, as the probes run it.
     if let Some(path) = probe::shell_search_path().and_then(|path| path.to_str()) {
@@ -1626,6 +1671,51 @@ impl Cagents {
                 Task::none()
             }
             Action::Add { provider, device } => self.add_account(provider, device),
+            Action::LinkStart(provider) => {
+                self.account_ui.table.add_menu = false;
+                self.account_ui.table.link = Some((provider, String::new()));
+                widget::text_input::focus(table::link_id())
+            }
+            Action::LinkInput(path) => {
+                if !self.account_ui.table.linking {
+                    if let Some((_, draft)) = &mut self.account_ui.table.link {
+                        *draft = path;
+                    }
+                }
+                Task::none()
+            }
+            Action::LinkCommit => self.link_account_home(),
+            Action::LinkCancel => {
+                if !self.account_ui.table.linking {
+                    self.account_ui.table.link = None;
+                }
+                Task::none()
+            }
+            Action::LinkReady { key, result } => {
+                self.account_ui.table.linking = false;
+                match result {
+                    Ok(registry) => {
+                        self.account_ui.set_registry(registry);
+                        self.account_ui.table.link = None;
+                        self.status =
+                            Some(TransientNotice::success("Existing account home added."));
+                        let id = self
+                            .account_ui
+                            .accounts
+                            .iter()
+                            .find(|state| state.account.registry_key() == Some(key))
+                            .map(|state| state.id.clone());
+                        id.and_then(|id| self.probe_account(&id, Trigger::Manual, now_ms()))
+                            .unwrap_or_else(Task::none)
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not use that account home: {error}"
+                        )));
+                        Task::none()
+                    }
+                }
+            }
             Action::HomeReady {
                 provider,
                 device,
@@ -1751,7 +1841,7 @@ impl Cagents {
                 if self
                     .account_ui
                     .account(&id)
-                    .is_some_and(|state| state.account.managed_key().is_some())
+                    .is_some_and(|state| state.account.registry_key().is_some())
                 {
                     self.account_ui.table.confirm_in_use = self.cards_on_account(&id);
                     self.account_ui.table.menu = Some(id.clone());
@@ -1848,7 +1938,7 @@ impl Cagents {
                     state.identity = identity;
                 }
                 if let (Some(key), Some(identity)) =
-                    (state.account.managed_key(), state.identity.as_ref())
+                    (state.account.registry_key(), state.identity.as_ref())
                 {
                     learned = Some((key, identity.clone()));
                 }
@@ -2027,6 +2117,69 @@ impl Cagents {
                 recovered: !restored,
             });
         }
+    }
+
+    /// Links an existing provider home without copying, signing out, or
+    /// taking ownership of any files in it. Validation and the registry write
+    /// run off the interface thread.
+    fn link_account_home(&mut self) -> Task<Message> {
+        let Some((provider, raw_path)) = self.account_ui.table.link.clone() else {
+            return Task::none();
+        };
+        if self.account_ui.table.linking {
+            return Task::none();
+        }
+        self.account_ui.table.linking = true;
+        let key = uuid::Uuid::new_v4();
+        let store = self.account_ui.store.clone();
+        let homes = self.account_ui.homes.clone();
+        let fallback = self.account_ui.registry.clone();
+        let system_home = Account::system(provider).resolved_home();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let raw_path = raw_path.trim();
+                let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .ok_or("HOME is unavailable")?
+                        .join(relative)
+                } else {
+                    PathBuf::from(raw_path)
+                };
+                if !chosen.is_absolute() {
+                    return Err("Enter an absolute path or one starting with ~/".into());
+                }
+                let path = std::fs::canonicalize(&chosen)
+                    .map_err(|error| format!("{}: {error}", chosen.display()))?;
+                crate::secure_file::validate_owned_directory(&path)
+                    .map_err(|error| error.to_string())?;
+                let change = |registry: &mut Registry| {
+                    registry.link(
+                        provider,
+                        key,
+                        path,
+                        system_home.as_deref(),
+                        homes.as_ref(),
+                        now_ms(),
+                    )
+                };
+                match store {
+                    Some(store) => store
+                        .update(change)
+                        .map_err(|error| error.to_string())
+                        .and_then(|(registry, result)| result.map(|()| registry)),
+                    None => {
+                        let mut registry = fallback;
+                        change(&mut registry)?;
+                        Ok(registry)
+                    }
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AccountUi(Action::LinkReady { key, result })
+        })
     }
 
     /// Creates the new account's home off the interface thread, with the
@@ -2321,9 +2474,10 @@ impl Cagents {
             return self.discard_home(key, provider);
         }
         login.phase = LoginPhase::Settling;
-        let managed = registry::Managed {
+        let managed = registry::Registered {
             key,
             provider,
+            linked_home: None,
             label: None,
             email: identity
                 .as_ref()
@@ -2448,10 +2602,8 @@ impl Cagents {
         }
     }
 
-    /// Signs a managed account out through its CLI, forgets it, and deletes
-    /// its home, in that order: once it is forgotten nothing uses the home,
-    /// and a home whose deletion fails is swept later rather than left
-    /// registered and broken.
+    /// Forgets a linked home without touching it. A home cagents created is
+    /// signed out and deleted after it is removed from the registry.
     fn remove_account(&mut self, id: AccountId) -> Task<Message> {
         self.account_ui.table.close_popups();
         let Some(account) = self
@@ -2461,9 +2613,10 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let Some(key) = account.managed_key() else {
+        let Some(key) = account.registry_key() else {
             return Task::none();
         };
+        let linked = account.is_linked();
         if !self.account_ui.removing.insert(id.clone()) {
             return Task::none();
         }
@@ -2472,7 +2625,9 @@ impl Cagents {
         let fallback = self.account_ui.registry.clone();
         let provider = account.provider;
         cosmic::task::future(async move {
-            let _ = probe::logout(account).await;
+            if !linked {
+                let _ = probe::logout(account).await;
+            }
             let (registry, error) = tokio::task::spawn_blocking(move || {
                 let registry = match store {
                     Some(store) => match store.update(|registry| {
@@ -2489,7 +2644,7 @@ impl Cagents {
                 };
                 // Once forgotten, the home is no account's: a deletion that
                 // fails here leaves files, never a broken account.
-                let error = homes.and_then(|homes| {
+                let error = (!linked).then_some(homes).flatten().and_then(|homes| {
                     homes
                         .remove(provider, key)
                         .err()
@@ -3201,9 +3356,10 @@ impl State {
         let mut registry = self.registry.clone();
         registry
             .register(
-                registry::Managed {
+                registry::Registered {
                     key,
                     provider,
+                    linked_home: None,
                     label: None,
                     email: Some(format!("{key}@example.com")),
                     organization: None,
@@ -3359,7 +3515,16 @@ mod tests {
         assert_eq!(launch.program, "/opt/bin/claude");
         assert_eq!(launch.arguments, ["auth", "login", "--claudeai"]);
         assert_eq!(launch.working_directory, Path::new("/home/reader"));
-        assert!(launch.environment.is_empty());
+        assert_eq!(
+            launch
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Account::system(Provider::Claude)
+                .resolved_home()
+                .as_deref()
+                .and_then(Path::to_str)
+        );
         assert_eq!(Provider::recognize_launch(&launch), None);
         assert!(is_sign_in(&launch));
 
@@ -4213,6 +4378,93 @@ mod app_tests {
     }
 
     #[test]
+    fn a_new_shell_pins_the_selected_codex_home_and_keeps_it_after_default_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        let mut app = context_inspector_test_app(false);
+        let key = uuid::Uuid::new_v4();
+        let mut registry = app.account_ui.registry.clone();
+        registry
+            .link(
+                Provider::Codex,
+                key,
+                home.clone(),
+                None,
+                app.account_ui.homes.as_ref(),
+                1,
+            )
+            .unwrap();
+        let linked = Account::linked(Provider::Codex, key, home.clone());
+        registry.set_default(&linked);
+        app.account_ui.set_registry(registry);
+        let _ = app.add_terminal(directory.path().to_path_buf());
+        let launch = app
+            .durable
+            .cards
+            .iter()
+            .find_map(|card| match &card.kind {
+                CardKind::Terminal(session) => Some(session.launch.clone()),
+                _ => None,
+            })
+            .expect("a new terminal was recorded");
+        assert_eq!(
+            launch.environment.get("CODEX_HOME"),
+            Some(&home.display().to_string())
+        );
+        let mut registry = app.account_ui.registry.clone();
+        registry.set_default(&Account::system(Provider::Codex));
+        app.account_ui.set_registry(registry);
+        assert_eq!(
+            launch.environment.get("CODEX_HOME"),
+            Some(&home.display().to_string())
+        );
+    }
+
+    #[test]
+    fn linked_homes_with_the_same_login_have_distinct_picker_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let mut registry = app.account_ui.registry.clone();
+        let mut ids = Vec::new();
+        for name in ["codex-personal-1", "codex-personal-2"] {
+            let home = directory.path().join(name);
+            std::fs::create_dir(&home).unwrap();
+            let key = uuid::Uuid::new_v4();
+            registry
+                .link(
+                    Provider::Codex,
+                    key,
+                    home,
+                    None,
+                    app.account_ui.homes.as_ref(),
+                    1,
+                )
+                .unwrap();
+            registry.observe_identity(
+                key,
+                &Identity {
+                    email: Some("same@example.com".into()),
+                    ..Identity::default()
+                },
+            );
+            ids.push(Account::linked(Provider::Codex, key, PathBuf::new()).id());
+        }
+        app.account_ui.set_registry(registry);
+        let names: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                app.account_ui
+                    .display_name(app.account_ui.account(id).unwrap())
+            })
+            .collect();
+        assert_ne!(names[0], names[1]);
+        assert!(names[0].starts_with("codex-personal-1 · "));
+        assert!(names[1].starts_with("codex-personal-2 · "));
+        assert!(names.iter().all(|name| name.ends_with("same@example.com")));
+    }
+
+    #[test]
     fn only_a_managed_account_can_be_removed_and_only_after_confirming() {
         let mut app = context_inspector_test_app(false);
         let system = signed_out(&mut app);
@@ -4379,7 +4631,7 @@ mod app_tests {
             result: Ok(Settled::Abandoned(None)),
         }));
         assert!(app.account_ui.logins.is_empty());
-        assert!(app.account_ui.registry.managed().is_empty());
+        assert!(app.account_ui.registry.registered().is_empty());
     }
 
     #[test]
@@ -4389,9 +4641,10 @@ mod app_tests {
         let mut registry = app.account_ui.registry.clone();
         registry
             .register(
-                registry::Managed {
+                registry::Registered {
                     key,
                     provider: Provider::Claude,
+                    linked_home: None,
                     label: None,
                     email: Some("new@example.com".into()),
                     organization: None,
@@ -4419,7 +4672,7 @@ mod app_tests {
             .account_ui
             .accounts
             .iter()
-            .find(|state| state.account.managed_key() == Some(key))
+            .find(|state| state.account.registry_key() == Some(key))
             .expect("the account is listed");
         assert!(state.present);
         assert_eq!(state.identity.as_ref(), Some(&identity));
@@ -4439,7 +4692,7 @@ mod app_tests {
             }),
         }));
         assert!(app.account_ui.logins.is_empty());
-        assert!(app.account_ui.registry.managed().is_empty());
+        assert!(app.account_ui.registry.registered().is_empty());
         assert!(
             app.notices
                 .entries
