@@ -2473,6 +2473,17 @@ struct KeyedLock {
     released: Condvar,
 }
 
+/// A key's lock and how many guards and waiters use it. The count changes
+/// only under the registry's own lock, so exactly the last user to leave
+/// removes the key.
+#[derive(Debug, Default)]
+struct Registered {
+    lock: Arc<KeyedLock>,
+    users: usize,
+}
+
+type Registry = Arc<Mutex<BTreeMap<PathBuf, Registered>>>;
+
 /// Serializes mutations per Git common directory.
 ///
 /// Two `git add` runs against one index corrupt each other's `index.lock`, but
@@ -2481,7 +2492,7 @@ struct KeyedLock {
 /// linked worktree of one repository shares an index lock and therefore one
 /// key, while separate repositories never contend.
 #[derive(Debug, Clone, Default)]
-pub struct MutationLocks(Arc<Mutex<BTreeMap<PathBuf, Arc<KeyedLock>>>>);
+pub struct MutationLocks(Registry);
 
 /// Serializes [`RepositoryService::fetch_pull_request_range`] per repository.
 /// The service is constructed per call, so the registry lives for the process.
@@ -2497,11 +2508,9 @@ impl MutationLocks {
     pub fn lock(&self, common_dir: &Path) -> MutationGuard {
         let entry = {
             let mut registry = lock_registry(&self.0);
-            Arc::clone(
-                registry
-                    .entry(common_dir.to_path_buf())
-                    .or_insert_with(|| Arc::new(KeyedLock::default())),
-            )
+            let registered = registry.entry(common_dir.to_path_buf()).or_default();
+            registered.users += 1;
+            Arc::clone(&registered.lock)
         };
         let mut held = entry
             .held
@@ -2532,7 +2541,7 @@ impl MutationLocks {
 /// Held for the duration of one mutation; releasing it wakes one waiter.
 #[derive(Debug)]
 pub struct MutationGuard {
-    registry: Arc<Mutex<BTreeMap<PathBuf, Arc<KeyedLock>>>>,
+    registry: Registry,
     key: PathBuf,
     entry: Arc<KeyedLock>,
 }
@@ -2549,12 +2558,16 @@ impl Drop for MutationGuard {
         self.entry.released.notify_one();
         // The registry entry is only worth keeping while somebody is waiting on
         // it; dropping the last one keeps a long session from accumulating a
-        // key per repository it ever touched.
+        // key per repository it ever touched. The count is explicit because
+        // the `Arc` count is not: a guard's own reference outlives this body,
+        // so two guards leaving together could each see the other and both
+        // keep the key.
         let mut registry = lock_registry(&self.registry);
-        if let Some(entry) = registry.get(&self.key)
-            && Arc::strong_count(entry) == 2
-        {
-            registry.remove(&self.key);
+        if let Some(registered) = registry.get_mut(&self.key) {
+            registered.users -= 1;
+            if registered.users == 0 {
+                registry.remove(&self.key);
+            }
         }
     }
 }
@@ -2562,8 +2575,8 @@ impl Drop for MutationGuard {
 /// A panic while holding this registry cannot leave the map inconsistent, and
 /// refusing to lock afterwards would deadlock every later mutation.
 fn lock_registry(
-    registry: &Mutex<BTreeMap<PathBuf, Arc<KeyedLock>>>,
-) -> MutexGuard<'_, BTreeMap<PathBuf, Arc<KeyedLock>>> {
+    registry: &Mutex<BTreeMap<PathBuf, Registered>>,
+) -> MutexGuard<'_, BTreeMap<PathBuf, Registered>> {
     registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
