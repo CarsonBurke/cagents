@@ -224,6 +224,7 @@ fn column_title_style() -> cosmic::theme::Button {
             background: focused
                 .then(|| iced::Background::Color(theme.current_container().component.hover.into())),
             border_width: 0.0,
+            icon_color: Some(design::muted_icon_color(theme)),
             ..widget::button::Style::new()
         }
     }

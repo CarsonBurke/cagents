@@ -100,7 +100,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8.25a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5Zm9 3.75-2.25-.42a7.04 7.04 0 0 0-.72-1.74l1.29-1.88-1.94-1.94-1.88 1.29a7.04 7.04 0 0 0-1.74-.72L13.34 4h-2.68l-.42 2.25a7.04 7.04 0 0 0-1.74.72L6.62 6.02 4.68 7.96l1.29 1.88a7.04 7.04 0 0 0-.72 1.74L3 12v2.68l2.25.42c.18.61.42 1.19.72 1.74l-1.29 1.88 1.94 1.94 1.88-1.29c.55.3 1.13.54 1.74.72l.42 2.25h2.68l.42-2.25a7.04 7.04 0 0 0 1.74-.72l1.88 1.29 1.94-1.94-1.29-1.88c.3-.55.54-1.13.72-1.74l2.25-.42V12Z" fill="none" stroke="black" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.5 1.5h3l.3 1.55c.45.15.87.39 1.23.7l1.5-.55 1.5 2.6-1.2 1.05c.08.48.08.96 0 1.44l1.2 1.05-1.5 2.6-1.5-.55c-.36.31-.78.55-1.23.7l-.3 1.55h-3l-.3-1.55c-.45-.15-.87-.39-1.23-.7l-1.5.55-1.5-2.6 1.2-1.05a4.3 4.3 0 0 1 0-1.44l-1.2-1.05 1.5-2.6 1.5.55c.36-.31.78-.55 1.23-.7z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="2" fill="none" stroke="black" stroke-width="1.2"/></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
@@ -188,6 +188,22 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     }
 }
 
+/// An informative glyph with the same resting ink as an inactive navigation
+/// row. Use this outside buttons, where no control style supplies icon color.
+pub fn passive_icon<'a, Message: 'a>(
+    icon: widget::icon::Handle,
+    size: u16,
+) -> Element<'a, Message> {
+    widget::container(widget::icon(icon).size(size))
+        .class(cosmic::theme::Container::custom(|theme| {
+            iced::widget::container::Style {
+                icon_color: Some(crate::design::muted_icon_color(theme)),
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
 /// Embedded application artwork does not depend on the installed icon theme.
 pub fn ceditor_icon() -> widget::icon::Handle {
     static ICON: std::sync::LazyLock<widget::icon::Handle> = std::sync::LazyLock::new(|| {
@@ -223,6 +239,8 @@ pub struct IconControl<'a, Message> {
     label: Cow<'a, str>,
     selected: bool,
     enabled: bool,
+    tone: Option<crate::design::Tone>,
+    prominent: bool,
 }
 
 /// A centered, fixed-size icon target with a quiet surface selected state.
@@ -254,6 +272,8 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         label,
         selected: selected && enabled,
         enabled,
+        tone: None,
+        prominent: false,
     }
 }
 
@@ -281,6 +301,8 @@ pub fn compact_icon_control<'a, Message: Clone + 'a>(
         label,
         selected: false,
         enabled: true,
+        tone: None,
+        prominent: false,
     }
 }
 
@@ -297,7 +319,24 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     /// The semantic tone variant: resolved from the drawing theme, so a row
     /// builder never locks the process-global theme to name a color.
     pub fn icon_tone(mut self, tone: crate::design::Tone) -> Self {
-        self.button = self.button.class(control_style(self.selected, Some(tone)));
+        self.tone = Some(tone);
+        self.button = self.button.class(control_style_variant(
+            self.selected,
+            self.tone,
+            self.prominent,
+        ));
+        self
+    }
+
+    /// A persistent, lightly outlined target for a utility that anchors a
+    /// whole workspace rather than a transient row action.
+    pub fn prominent(mut self) -> Self {
+        self.prominent = true;
+        self.button = self
+            .button
+            .class(control_style_variant(self.selected, self.tone, true))
+            .width(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT)
+            .height(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT);
         self
     }
 }
@@ -554,21 +593,45 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
 /// navigation entry - presses the same treatment as the icon controls beside
 /// it instead of reaching for a stock button class.
 pub fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
+    control_style_variant(selected, tone, false)
+}
+
+fn control_style_variant(
+    selected: bool,
+    tone: Option<crate::design::Tone>,
+    prominent: bool,
+) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
-        background: (selected || focused).then(|| {
-            iced::Background::Color(
+        background: if selected || focused {
+            Some(iced::Background::Color(
                 theme
                     .current_container()
                     .component
                     .selected_state_color()
                     .into(),
-            )
-        }),
+            ))
+        } else {
+            prominent.then(|| iced::Background::Color(crate::design::raised(theme)))
+        },
         border_radius: theme.cosmic().corner_radii.radius_s.into(),
-        border_width: 0.0,
-        border_color: theme.current_container().component.on_disabled.into(),
+        border_width: if prominent {
+            crate::design::BORDER_WIDTH
+        } else {
+            0.0
+        },
+        border_color: if prominent {
+            crate::design::hairline(theme)
+        } else {
+            theme.current_container().component.on_disabled.into()
+        },
         icon_color: Some(tone.map_or_else(
-            || theme.current_container().component.on.into(),
+            || {
+                if selected || focused {
+                    theme.current_container().component.on.into()
+                } else {
+                    crate::design::muted_icon_color(theme)
+                }
+            },
             |tone| tone.resolve(theme),
         )),
         ..widget::button::Style::new()
@@ -579,12 +642,16 @@ pub fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmi
             // Symbolic SVG recoloring ignores alpha, so mix against the
             // surface instead of relying on `on_disabled` transparency.
             icon_color: Some(muted_icon_color(theme)),
-            background: None,
+            background: prominent.then(|| iced::Background::Color(crate::design::raised(theme))),
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
             background: Some(iced::Background::Color(
                 theme.current_container().component.hover.into(),
+            )),
+            icon_color: Some(tone.map_or_else(
+                || theme.current_container().component.on.into(),
+                |tone| tone.resolve(theme),
             )),
             ..appearance(focused, theme)
         }),
@@ -806,27 +873,21 @@ fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
 
 /// A ring whose filled sweep is the fraction of a budget in use.
 ///
-/// `tone` is read from the drawing theme, so a gauge whose urgency changes
-/// does not have to be rebuilt to change colour.
+/// The sweep uses the same muted neutral ink as inactive navigation icons.
+/// The adjacent percentage carries urgency without turning the status line
+/// into a row of competing warning colours.
 ///
 /// The linear capsule this replaces cost a status line the width of a whole
 /// caption and, at the height a caption row allows, read as a crack in the
 /// layout. A ring carries the same proportion in the space of a glyph, which
 /// is what lets the budget stay pinned to the pane's right edge however
 /// narrow the pane gets.
-pub fn budget_radial<'a, Message: 'a>(
-    fraction: f32,
-    tone: fn(&cosmic::Theme) -> iced::Color,
-) -> Element<'a, Message> {
-    Element::new(BudgetRadial {
-        fraction,
-        tone: crate::design::Tone::Themed(tone),
-    })
+pub fn budget_radial<'a, Message: 'a>(fraction: f32) -> Element<'a, Message> {
+    Element::new(BudgetRadial { fraction })
 }
 
 struct BudgetRadial {
     fraction: f32,
-    tone: crate::design::Tone,
 }
 
 impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
@@ -889,7 +950,10 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
                 start_angle: cosmic::iced::Radians(start),
                 end_angle: cosmic::iced::Radians(end),
             });
-            frame.stroke(&used.build(), stroke.with_color(self.tone.resolve(theme)));
+            frame.stroke(
+                &used.build(),
+                stroke.with_color(crate::design::muted_icon_color(theme)),
+            );
         }
         let geometry = frame.into_geometry();
 

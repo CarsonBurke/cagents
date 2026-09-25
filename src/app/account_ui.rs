@@ -3040,12 +3040,7 @@ impl Cagents {
                 .into(),
         ];
         if let Some(used) = summary.gauge {
-            let tone = if summary.tone == ChipTone::Stale {
-                design::muted_color
-            } else {
-                design::budget_tone(used)
-            };
-            items.push(crate::ui_controls::budget_radial(used, tone));
+            items.push(crate::ui_controls::budget_radial(used));
         }
         if !compact || summary.essential {
             let text =
@@ -3121,16 +3116,7 @@ impl Cagents {
                 let mut items: Vec<Element<'a, Message>> = Vec::new();
                 match account.headline() {
                     Some(window) => {
-                        let stale = account
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| is_stale(snapshot, now));
-                        let tone = if stale {
-                            design::muted_color
-                        } else {
-                            design::budget_tone(window.used)
-                        };
-                        items.push(crate::ui_controls::budget_radial(window.used, tone));
+                        items.push(crate::ui_controls::budget_radial(window.used));
                     }
                     None => items.push(
                         iced::widget::Space::new()

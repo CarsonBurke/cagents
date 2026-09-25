@@ -893,9 +893,7 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
 fn find_bar(editor: &Editor) -> Element<'_, Message> {
     widget::container(
         widget::row::with_children(vec![
-            widget::icon(symbolic_icon("system-search-symbolic"))
-                .size(16)
-                .into(),
+            cagents::ui_controls::passive_icon(symbolic_icon("system-search-symbolic"), 16),
             widget::text_input("Find in file", &editor.find_query)
                 .id(widget::Id::new("ceditor.find.query"))
                 .on_input(Message::FindQueryChanged)
@@ -991,6 +989,7 @@ impl Editor {
                 self.closing.is_none() && self.file_dialog.is_none(),
                 Some(Message::Settings),
             )
+            .prominent()
             .into(),
         ])
         .padding(cosmic::theme::spacing().space_xxxs)

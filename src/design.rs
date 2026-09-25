@@ -79,16 +79,15 @@ pub const BUDGET_BAR_HEIGHT: f32 = 4.0;
 /// Where a budget stops being a detail and becomes a decision.
 ///
 /// Below the first threshold the figure is background. Above the second the
-/// reader has to compact or lose the thread, so the gauge is drawn in the tone
-/// the shell uses for everything else that is about to go wrong.
+/// reader has to compact or lose the thread, so detailed budget bars use the
+/// tone the shell uses for everything else that is about to go wrong.
 pub const BUDGET_WARNING: f32 = 0.75;
 pub const BUDGET_CRITICAL: f32 = 0.9;
 
 /// The tone a budget that is `used` full is drawn in.
 ///
-/// Named here rather than at each gauge, so the context ring, its percentage
-/// and anything else reporting the same budget cannot disagree about when it
-/// has become urgent.
+/// Detailed usage bars carry this urgency; compact radial gauges stay neutral
+/// so a row of accounts does not become a row of competing warning colors.
 pub fn budget_tone(used: f32) -> fn(&cosmic::Theme) -> cosmic::iced::Color {
     if used > BUDGET_CRITICAL {
         destructive_color
@@ -740,9 +739,8 @@ mod tests {
         assert_eq!(ShellLayout::for_width(-1.0), constrained);
     }
 
-    /// The reader acts on the ring's colour before they read its figure, so
-    /// the two thresholds are a contract: a budget that has crossed one must
-    /// not still be drawn as background.
+    /// Detailed budget bars share these thresholds, so a budget that has
+    /// crossed one must not still be drawn as background.
     #[test]
     fn a_budget_changes_tone_where_it_becomes_a_decision() {
         // Resolvers are compared by address, because the tone is a function of

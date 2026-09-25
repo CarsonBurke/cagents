@@ -3461,12 +3461,16 @@ fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, Sideba
 
 fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let settings = icon_action(
-        "emblem-system-symbolic",
+    let settings: Element<'a, SidebarAction> = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("emblem-system-symbolic"),
         "Settings",
-        gated(SidebarAction::OpenSettings, modal_open),
-        stable_id("settings"),
-    );
+        false,
+        !modal_open,
+        Some(SidebarAction::OpenSettings),
+    )
+    .id(stable_id("settings"))
+    .prominent()
+    .into();
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![settings];
         return widget::column::with_children(children)
@@ -7643,17 +7647,15 @@ fn icon_action<'a>(
     action: Option<SidebarAction>,
     id: Id,
 ) -> Element<'a, SidebarAction> {
-    let label = label.into();
-    crate::interaction::tooltip(
-        button::icon(crate::ui_controls::symbolic_icon(icon_name))
-            .class(sidebar_button_style(false))
-            .id(id)
-            .name(label.clone())
-            .width(ICON_CONTROL_SIZE)
-            .height(ICON_CONTROL_SIZE)
-            .on_press_maybe(action),
+    crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon(icon_name),
         label,
+        false,
+        action.is_some(),
+        action,
     )
+    .id(id)
+    .into()
 }
 
 /// A "new …" command that is a row of its own, on the grid of the rows it

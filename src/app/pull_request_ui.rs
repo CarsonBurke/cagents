@@ -574,9 +574,10 @@ pub fn view(state: &State) -> Element<'_, Action> {
                 .width(Length::Fill)
                 .into(),
             widget::row::with_children(vec![
-                widget::icon(sidebar::worktree_icon())
-                    .size(design::COMPACT_ICON_SIZE)
-                    .into(),
+                crate::ui_controls::passive_icon(
+                    sidebar::worktree_icon(),
+                    design::COMPACT_ICON_SIZE,
+                ),
                 design::caption(format!("{} → {}", pr.head_ref_name, pr.base_ref_name))
                     .width(Length::Fill)
                     .into(),
