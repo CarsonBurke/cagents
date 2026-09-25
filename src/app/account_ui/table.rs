@@ -289,11 +289,8 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
     let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
-    let project = app
-        .active_workspace
-        .as_deref()
-        .and_then(|directory| app.project_for_directory(directory));
-    if let Some((_, name)) = project {
+    let project = app.accounts_project();
+    if let Some((_, name, _)) = project {
         sections.push(
             design::caption(format!(
                 "Project: {name} · Choose ‘Use for this project’ from an account’s menu to use it for new shells and conversations in every worktree."
@@ -506,7 +503,7 @@ fn group<'a>(
     app: &'a Cagents,
     provider: Provider,
     layout: &Layout,
-    project: Option<(crate::model::ProjectId, &'a str)>,
+    project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let rows = rows(state, provider, state.table.sort);
@@ -658,7 +655,7 @@ fn row<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
     layout: &Layout,
-    project: Option<(crate::model::ProjectId, &'a str)>,
+    project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let now = state.now_ms;
@@ -768,7 +765,7 @@ fn stacked_row<'a>(
 fn account_cell<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
-    project: Option<(crate::model::ProjectId, &'a str)>,
+    project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let renaming = state
@@ -806,8 +803,10 @@ fn account_cell<'a>(
             design::Tone::Themed(design::muted_color),
         ));
     }
-    if let Some((project, _)) = project
-        && state.registry.is_project_default(project, &account.account)
+    if let Some((_, _, repository)) = project
+        && state
+            .registry
+            .is_project_default(repository, &account.account)
         && renaming.is_none()
     {
         title.push(design::badge(
@@ -945,7 +944,7 @@ fn actions<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
     now: Millis,
-    project: Option<(crate::model::ProjectId, &'a str)>,
+    project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let open = state.table.menu.as_ref() == Some(&account.id);
@@ -1006,7 +1005,7 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
 fn menu<'a>(
     app: &'a Cagents,
     account: &'a AccountState,
-    project: Option<(crate::model::ProjectId, &'a str)>,
+    project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let action = |action| Message::AccountUi(action);
@@ -1053,8 +1052,11 @@ fn menu<'a>(
                 .into(),
             );
         }
-        if let Some((project, _)) = project {
-            if state.registry.is_project_default(project, &account.account) {
+        if let Some((project, _, repository)) = project {
+            if state
+                .registry
+                .is_project_default(repository, &account.account)
+            {
                 items.push(
                     crate::ui_controls::popover_item(
                         crate::ui_controls::symbolic_icon("edit-clear-symbolic"),

@@ -1566,8 +1566,20 @@ impl Cagents {
         match action {
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
+                let mut migration = Task::none();
                 match loaded.registry {
-                    Ok(registry) => {
+                    Ok(mut registry) => {
+                        let projects = self
+                            .sidebar_model
+                            .projects
+                            .iter()
+                            .map(|project| (project.id, project.repository.clone()))
+                            .collect::<Vec<_>>();
+                        if registry.migrate_project_ids(&projects) {
+                            migration = self.save_registry(move |registry| {
+                                registry.migrate_project_ids(&projects);
+                            });
+                        }
                         self.account_ui.set_registry(registry);
                         self.recover_logins();
                     }
@@ -1587,7 +1599,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([self.probe_accounts(Trigger::Focus), locate])
+                Task::batch([self.probe_accounts(Trigger::Focus), locate, migration])
             }
             Action::Located(restored) => {
                 self.account_ui.restore(restored);
@@ -1657,12 +1669,29 @@ impl Cagents {
             Action::SignIn(id) => self.sign_in(id),
             Action::LoginReady { id, program } => self.open_login(&id, program),
             Action::RegistryLoaded(result) => {
-                if let Ok(registry) = result {
+                if let Ok(mut registry) = result {
+                    let projects = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .map(|project| (project.id, project.repository.clone()))
+                        .collect::<Vec<_>>();
+                    let migrate = registry.migrate_project_ids(&projects);
                     let before = self.account_ui.accounts.len();
                     self.account_ui.set_registry(registry);
-                    if self.account_ui.accounts.len() != before {
-                        return self.probe_accounts(Trigger::Focus);
-                    }
+                    let probe = if self.account_ui.accounts.len() != before {
+                        self.probe_accounts(Trigger::Focus)
+                    } else {
+                        Task::none()
+                    };
+                    let save = if migrate {
+                        self.save_registry(move |registry| {
+                            registry.migrate_project_ids(&projects);
+                        })
+                    } else {
+                        Task::none()
+                    };
+                    return Task::batch([probe, save]);
                 }
                 Task::none()
             }
@@ -1804,9 +1833,13 @@ impl Cagents {
             }
             Action::SetProjectDefault(project, id) => {
                 self.account_ui.table.close_popups();
-                if self.sidebar_model.project(project).is_none() {
+                let Some(repository) = self
+                    .sidebar_model
+                    .project(project)
+                    .map(|row| row.repository.clone())
+                else {
                     return Task::none();
-                }
+                };
                 let Some(account) = self
                     .account_ui
                     .account(&id)
@@ -1814,15 +1847,21 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                self.save_registry(move |registry| registry.set_project_default(project, &account))
+                self.save_registry(move |registry| {
+                    registry.set_project_default(&repository, &account)
+                })
             }
             Action::ClearProjectDefault(project, provider) => {
                 self.account_ui.table.close_popups();
-                if self.sidebar_model.project(project).is_none() {
+                let Some(repository) = self
+                    .sidebar_model
+                    .project(project)
+                    .map(|row| row.repository.clone())
+                else {
                     return Task::none();
-                }
+                };
                 self.save_registry(move |registry| {
-                    registry.clear_project_default(project, provider)
+                    registry.clear_project_default(&repository, provider)
                 })
             }
             Action::Rename(id) => {
@@ -2702,7 +2741,7 @@ impl Cagents {
     /// The longest known worktree or repository root containing `directory`
     /// determines its project. This is a short in-memory scan only when
     /// starting work or drawing the Accounts pane; no filesystem query is needed.
-    fn project_for_directory(&self, directory: &Path) -> Option<(crate::model::ProjectId, &str)> {
+    fn project_for_directory(&self, directory: &Path) -> Option<(ProjectId, &str, &Path)> {
         self.sidebar_model
             .projects
             .iter()
@@ -2726,7 +2765,37 @@ impl Cagents {
                     })
             })
             .max_by_key(|(depth, _)| *depth)
-            .map(|(_, project)| (project.id, project.name.as_str()))
+            .map(|(_, project)| {
+                (
+                    project.id,
+                    project.name.as_str(),
+                    project.repository.as_path(),
+                )
+            })
+    }
+
+    /// A channel owns its project even when its displayed workspace path is
+    /// unavailable or has changed. The Accounts pane uses the selected scope,
+    /// then falls back to the worktree path when no channel is selected.
+    pub(super) fn accounts_project(&self) -> Option<(ProjectId, &str, &Path)> {
+        if let Some(channel) = self.durable.active_channel
+            && let Some(project_id) = self
+                .durable
+                .channels
+                .iter()
+                .find(|entry| entry.id == channel)
+                .map(|entry| entry.project_id)
+            && let Some(project) = self.sidebar_model.project(project_id)
+        {
+            return Some((
+                project.id,
+                project.name.as_str(),
+                project.repository.as_path(),
+            ));
+        }
+        self.active_workspace
+            .as_deref()
+            .and_then(|directory| self.project_for_directory(directory))
     }
 
     pub(super) fn default_account_for_directory(
@@ -2734,11 +2803,11 @@ impl Cagents {
         provider: Provider,
         directory: &Path,
     ) -> Account {
-        let Some((project, _)) = self.project_for_directory(directory) else {
+        let Some((_, _, repository)) = self.project_for_directory(directory) else {
             return self.default_account(provider);
         };
         self.account_ui.registry.project_default_account(
-            project,
+            repository,
             provider,
             self.account_ui.homes.as_ref(),
         )
@@ -4516,7 +4585,7 @@ mod app_tests {
                 1,
             )
             .unwrap();
-        registry.set_project_default(project, &linked);
+        registry.set_project_default(&app.sidebar_model.projects[0].repository, &linked);
         app.account_ui.set_registry(registry);
         assert_eq!(
             app.default_account_for_directory(Provider::Codex, Path::new("/repo/subdir")),
@@ -4557,11 +4626,63 @@ mod app_tests {
             Some(&home.display().to_string())
         );
         app.sidebar_model.projects[0].repository = PathBuf::from("/repo/.git");
+        let mut registry = app.account_ui.registry.clone();
+        registry.set_project_default(Path::new("/repo/.git"), &linked);
+        app.account_ui.set_registry(registry);
         app.sidebar_model.projects[0].worktrees.clear();
         assert_eq!(
             app.default_account_for_directory(Provider::Codex, Path::new("/repo")),
             linked,
             "a channel at the repository root keeps its project choice when no worktree is listed"
+        );
+    }
+
+    #[test]
+    fn accounts_project_uses_the_selected_channel_when_its_workspace_path_is_stale() {
+        let mut app = app_in_repo();
+        let project = app.sidebar_model.projects[0].id;
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "discussion".into(),
+                ordinal: 1,
+                shared: true,
+                cards: Vec::new(),
+                focused: None,
+            });
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.active_workspace = Some(PathBuf::from("/unrelated"));
+
+        assert_eq!(
+            app.accounts_project(),
+            Some((project, "repo", Path::new("/repo")))
+        );
+
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        assert_eq!(app.accounts_project(), None);
+    }
+
+    #[test]
+    fn first_account_load_migrates_a_saved_project_choice_before_new_work_starts() {
+        let mut app = app_in_repo();
+        let project = app.sidebar_model.projects[0].id;
+        let old = format!("version = 3\n[project_defaults.\"{project}\"]\ncodex = \"system\"\n");
+        let registry: Registry = toml::from_str(&old).unwrap();
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            provisional: false,
+        })));
+
+        assert_eq!(
+            app.account_ui
+                .registry
+                .project_choice(Path::new("/repo"), Provider::Codex),
+            Some("system")
         );
     }
 
@@ -4572,13 +4693,14 @@ mod app_tests {
         let project = crate::model::ProjectId::new();
         let first = store
             .update(|registry| {
-                registry.set_project_default(project, &Account::system(Provider::Codex));
+                registry.set_project_default(Path::new("/repo"), &Account::system(Provider::Codex));
             })
             .unwrap()
             .0;
         let second = store
             .update(|registry| {
-                registry.set_project_default(project, &Account::system(Provider::Claude));
+                registry
+                    .set_project_default(Path::new("/repo"), &Account::system(Provider::Claude));
             })
             .unwrap()
             .0;
