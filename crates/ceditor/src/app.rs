@@ -4802,7 +4802,8 @@ impl Editor {
                     body.into(),
                 ])
                 .spacing(0)
-                .height(cagents::settings_widgets::dialog_size(size).height),
+                // Keep a margin around the editor's modal at every window size.
+                .height(Length::Fixed(size.height * 0.87)),
                 900.0,
             ),
             Message::Settings,

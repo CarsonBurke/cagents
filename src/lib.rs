@@ -73,6 +73,8 @@ pub mod sidebar;
 #[cfg(feature = "ui")]
 pub mod splitter;
 #[cfg(feature = "ui")]
+mod sticky_tree;
+#[cfg(feature = "ui")]
 pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;

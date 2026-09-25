@@ -9,7 +9,12 @@
 //! [`State`] a target, forward its actions, and drain the [`Effect`]s it asks
 //! them to carry out.
 
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use cosmic::{
     Element,
@@ -129,6 +134,7 @@ pub enum Action {
     /// Back to the list, forgetting the target.
     Close,
     SelectFile(RepoPath),
+    ToggleDirectory(RepoPath),
     NextFile,
     PreviousFile,
     ToggleViewed(RepoPath),
@@ -223,6 +229,7 @@ pub struct State {
     files: Vec<ReviewFile>,
     files_truncated: bool,
     rows: Vec<Row>,
+    collapsed_directories: BTreeSet<RepoPath>,
     selected: Option<RepoPath>,
     notice: Option<String>,
     effects: Vec<Effect>,
@@ -268,6 +275,7 @@ impl State {
             files: Vec::new(),
             files_truncated: false,
             rows: Vec::new(),
+            collapsed_directories: BTreeSet::new(),
             selected: None,
             notice: None,
             effects: Vec::new(),
@@ -387,6 +395,12 @@ impl State {
             Action::Close => self.close(),
             Action::SelectFile(path) => {
                 self.select_file(path);
+                ActionTask::none()
+            }
+            Action::ToggleDirectory(path) => {
+                if !self.collapsed_directories.remove(&path) {
+                    self.collapsed_directories.insert(path);
+                }
                 ActionTask::none()
             }
             Action::NextFile => {
@@ -559,6 +573,7 @@ impl State {
         self.files.clear();
         self.files_truncated = false;
         self.rows.clear();
+        self.collapsed_directories.clear();
         // The shell's viewer is showing a file of the review that is going
         // away; left alone it would keep rendering a range nothing owns.
         if self.selected.take().is_some() {
@@ -963,19 +978,25 @@ impl State {
         .into()
     }
 
-    /// The always-expanded file tree with a viewed mark per file and a
-    /// tri-state mark per directory.
+    /// The file tree with a viewed mark per file and a tri-state mark per
+    /// directory. Folders start open and may be folded independently.
     pub fn file_list(&self, modal_open: bool) -> Element<'_, Action> {
         let spacing = cosmic::theme::spacing();
         let tallies = directory_tallies(&self.rows, &self.files);
-        let mut rows: Vec<Element<'_, Action>> = Vec::with_capacity(self.rows.len());
-        for (index, row) in self.rows.iter().enumerate() {
-            rows.push(match row.file {
+        let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> =
+            Vec::with_capacity(self.rows.len());
+        for (index, row) in visible_review_rows(&self.rows, &self.collapsed_directories) {
+            let element = match row.file {
                 Some(file) => self.file_row(row, &self.files[file], modal_open),
                 None => {
                     let (viewed, total) = tallies[index];
                     self.directory_row(row, viewed, total, modal_open)
                 }
+            };
+            rows.push(crate::sticky_tree::Row {
+                depth: row.depth,
+                directory: row.file.is_none(),
+                element,
             });
         }
         if rows.is_empty() {
@@ -985,15 +1006,17 @@ impl State {
                 LoadState::Idle | LoadState::Failed(_) => "",
             };
             if !message.is_empty() {
-                rows.push(
-                    widget::container(design::caption(message))
+                rows.push(crate::sticky_tree::Row {
+                    depth: 0,
+                    directory: false,
+                    element: widget::container(design::caption(message))
                         .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
                         .into(),
-                );
+                });
             }
         }
         widget::scrollable(
-            widget::container(widget::column::with_children(rows).spacing(0))
+            widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
                 .padding(design::with_vertical_rail(Padding::from([
                     spacing.space_xxxs,
                     spacing.space_xxs,
@@ -1088,6 +1111,7 @@ impl State {
     ) -> Element<'a, Action> {
         let spacing = cosmic::theme::spacing();
         let mark = Mark::from_tally(viewed, total);
+        let collapsed = self.collapsed_directories.contains(&row.path);
         let content = widget::row::with_children(vec![
             widget::Space::new()
                 .width(Length::Fixed(f32::from(
@@ -1096,7 +1120,7 @@ impl State {
                         .saturating_mul(TREE_INDENT),
                 )))
                 .into(),
-            widget::container(crate::file_icon::folder(true))
+            widget::container(crate::file_icon::folder(!collapsed))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
             design::body(&*row.label)
@@ -1106,6 +1130,23 @@ impl State {
                 ))
                 .width(Length::Fill)
                 .into(),
+        ])
+        .spacing(spacing.space_xxxs)
+        .align_y(Alignment::Center)
+        .height(Length::Fill);
+        let folder = button::custom(content)
+            .class(sidebar_button_style(false))
+            .name(format!(
+                "{} folder {}",
+                if collapsed { "Expand" } else { "Collapse" },
+                row.path.display()
+            ))
+            .on_press_maybe((!modal_open).then(|| Action::ToggleDirectory(row.path.clone())))
+            .padding([0, spacing.space_xxxs])
+            .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
+            .width(Length::Fill);
+        widget::row::with_children(vec![
+            folder.into(),
             viewed_control(
                 mark,
                 "Mark folder viewed",
@@ -1117,16 +1158,9 @@ impl State {
                 },
             ),
         ])
-        .spacing(spacing.space_xxxs)
         .align_y(Alignment::Center)
-        .height(Length::Fill);
-        // Review trees always expand, so a folder offers no toggle: the row
-        // is an inert label whose only control is its mark.
-        widget::container(content)
-            .padding([0, spacing.space_xxxs])
-            .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
-            .width(Length::Fill)
-            .into()
+        .height(Length::Fixed(design::DENSE_ROW_HEIGHT))
+        .into()
     }
 }
 
@@ -1359,6 +1393,27 @@ fn directory_tallies(rows: &[Row], files: &[ReviewFile]) -> Vec<(usize, usize)> 
         }
     }
     tallies
+}
+
+/// Keep the original indices so directory marks still use tallies over all
+/// files, including those hidden under a folded folder.
+fn visible_review_rows<'a>(
+    rows: &'a [Row],
+    collapsed: &BTreeSet<RepoPath>,
+) -> impl Iterator<Item = (usize, &'a Row)> {
+    let mut skip_below = None;
+    rows.iter().enumerate().filter(move |(_, row)| {
+        if let Some(depth) = skip_below {
+            if row.depth > depth {
+                return false;
+            }
+            skip_below = None;
+        }
+        if row.file.is_none() && collapsed.contains(&row.path) {
+            skip_below = Some(row.depth);
+        }
+        true
+    })
 }
 
 /// The tree in display order, with each file row pointing at its file.
@@ -1846,6 +1901,58 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(files[2].entry.kind, ChangeKind::Modified);
+    }
+
+    #[test]
+    fn folded_review_folder_hides_only_its_descendants_and_keeps_marks() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(
+                vec![
+                    entry("src/nested/a.rs", ChangeKind::Modified),
+                    entry("src/other.rs", ChangeKind::Modified),
+                    entry("top.rs", ChangeKind::Modified),
+                ],
+                vec![remote_file("src/nested/a.rs", true)],
+            ),
+        );
+        let paths = |state: &State| {
+            visible_review_rows(&state.rows, &state.collapsed_directories)
+                .map(|(_, row)| row.path.display().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            paths(&state),
+            [
+                "src",
+                "src/nested",
+                "src/nested/a.rs",
+                "src/other.rs",
+                "top.rs"
+            ]
+        );
+        drop(state.update(Action::ToggleDirectory(
+            RepoPath::parse("src/nested").unwrap(),
+        )));
+        assert_eq!(
+            paths(&state),
+            ["src", "src/nested", "src/other.rs", "top.rs"]
+        );
+        drop(state.update(Action::ToggleDirectory(RepoPath::parse("src").unwrap())));
+        assert_eq!(paths(&state), ["src", "top.rs"]);
+        drop(state.update(Action::ToggleDirectory(RepoPath::parse("src").unwrap())));
+        assert_eq!(
+            paths(&state),
+            ["src", "src/nested", "src/other.rs", "top.rs"]
+        );
+        let tallies = directory_tallies(&state.rows, &state.files);
+        let src = state
+            .rows
+            .iter()
+            .position(|row| row.path == RepoPath::parse("src").unwrap())
+            .unwrap();
+        assert_eq!(tallies[src], (1, 2));
     }
 
     #[test]
