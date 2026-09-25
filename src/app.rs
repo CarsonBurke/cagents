@@ -3139,6 +3139,7 @@ pub enum Message {
     ResizeCardFinished(CardId),
     CyclePaneWidth,
     CloseCard(CardId),
+    CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
     NewWindow,
     NewWindowOpened {
@@ -3817,7 +3818,7 @@ pub struct Cagents {
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
     terminal_close: Option<terminal_close::CloseIntent>,
-    queued_card_closes: VecDeque<CardId>,
+    queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
@@ -11243,6 +11244,7 @@ impl Application for Cagents {
                 self.begin_chat_close(id)
             }
             Message::CloseCard(id) => self.begin_card_close(id),
+            Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
             Message::TerminalCloseDontAskChanged(value) => {
@@ -18810,7 +18812,7 @@ mod tests {
         assert_ne!(app.workspace.focused(), Some(first));
     }
 
-    fn task_app_message(task: Task<Message>) -> Message {
+    pub(super) fn task_app_message(task: Task<Message>) -> Message {
         let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
         let action = tokio::runtime::Builder::new_current_thread()
             .build()

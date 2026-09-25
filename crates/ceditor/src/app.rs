@@ -1339,9 +1339,15 @@ impl Editor {
     /// Shutdown has no later frame to deliver an acknowledgment on, so the
     /// final navigation write is the one place this blocks.
     fn save_session_now(&mut self) {
-        if let Some(save) = self.capture_session_save()
-            && let Err(error) = save.run()
-        {
+        if self.exiting || self.restoring_session || !self.settings_writable {
+            return;
+        }
+        // A matching captured snapshot may still be waiting in the blocking
+        // pool, or its write may have failed. A fresh generation fences both.
+        let session = self.session();
+        self.saved_session = session.clone();
+        let save = self.capture_preference(PreferenceWrite::Session(session));
+        if let Err(error) = save.run() {
             self.notice = Some(error);
         }
     }
@@ -5572,6 +5578,27 @@ mod tests {
         assert_eq!(
             crate::preferences::load_session(&app.settings_path).unwrap(),
             remaining
+        );
+    }
+
+    #[test]
+    fn window_shutdown_retries_a_session_that_was_captured_but_not_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        app.settings_path = directory.path().join("missing/settings.toml");
+        app.settings_writable = true;
+        let _ = add(&mut app, "/workspace", Some("a.rs"));
+        let failed = app.capture_session_save().unwrap();
+        assert!(failed.run().is_err());
+        std::fs::create_dir(directory.path().join("missing")).unwrap();
+
+        drop(app.update(Message::CloseWindow));
+
+        assert_eq!(
+            crate::preferences::load_session(&app.settings_path)
+                .unwrap()
+                .paths,
+            vec![PathBuf::from("/workspace/a.rs")]
         );
     }
 

@@ -58,6 +58,7 @@ ui = [
     "dep:tracing-subscriber",
     "dep:two-face",
     "dep:unicode-linebreak",
+    "dep:unicode-casefold",
 ]
 integrated-browser = [
     "full",
@@ -92,6 +93,7 @@ bench = false
 required-features = ["host"]
 
 [dependencies]
+unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }

@@ -61,6 +61,9 @@ cargo build --locked --release --no-default-features --features development --bi
 cargo build --locked --release --no-default-features --features development,host --bin cagentsd
 cargo build --locked --release --no-default-features --features development,latency-harness --bin cagents-ui
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.target_directory')
+if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+    target=$target/$CARGO_BUILD_TARGET
+fi
 cli=$target/release/cagents
 ui=$target/release/cagents-ui
 sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
