@@ -36,6 +36,30 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 }
 
 impl Cagents {
+    pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
+        while let Some(card) = self.queued_card_closes.pop_front() {
+            if self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+            {
+                return cosmic::task::message(Message::CloseCard(card));
+            }
+        }
+        Task::none()
+    }
+
+    pub(super) fn terminal_close_dialog_visible(&self) -> bool {
+        self.terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.active || intent.detail.is_some())
+    }
+
+    pub(super) fn terminal_close_pending(&self, card: CardId) -> bool {
+        self.terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == card && intent.pending)
+    }
+
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
         self.close_card_as(card, !self.settings.confirm_terminal_close)
     }
@@ -86,7 +110,16 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool) -> Task<Message> {
-        if self.terminal_close.is_some() {
+        if let Some(intent) = &self.terminal_close {
+            // A silent close is still in flight. Preserve subsequent close
+            // clicks until that card is settled, instead of dropping them.
+            if !intent.active
+                && intent.detail.is_none()
+                && intent.card != card
+                && !self.queued_card_closes.contains(&card)
+            {
+                self.queued_card_closes.push_back(card);
+            }
             return Task::none();
         }
         if self.pending_terminal_spawn(card) {
@@ -119,8 +152,8 @@ impl Cagents {
                 focus: 0,
                 restore_keyboard_nav: self.core.keyboard_nav(),
             });
-            self.core.set_keyboard_nav(false);
             if self.terminal_close.as_ref().unwrap().detail.is_some() {
+                self.core.set_keyboard_nav(false);
                 return close_focus(0);
             }
             return self.start_terminal_close(allow_active);
@@ -192,6 +225,7 @@ impl Cagents {
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
         .map(cosmic::Action::App)
+        .chain(self.next_queued_card_close())
     }
 
     pub(super) fn confirm_terminal_close(&mut self) -> Task<Message> {
@@ -224,12 +258,15 @@ impl Cagents {
         if !target_matches(intent, self.card_state(intent.card)) {
             if exited_target_matches(intent, self.card_state(intent.card)) {
                 let intent = self.terminal_close.take().unwrap();
-                self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+                if intent.active || intent.detail.is_some() {
+                    self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+                }
                 self.closed_terminal_cards.insert(intent.card);
                 return self.request_card_removal(intent.card);
             }
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
+            self.core.set_keyboard_nav(false);
             return close_focus(0);
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
@@ -237,6 +274,7 @@ impl Cagents {
                 "A close was already attempted. The card is retained until its outcome is known."
                     .into(),
             );
+            self.core.set_keyboard_nav(false);
             return close_focus(0);
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
@@ -291,7 +329,9 @@ impl Cagents {
             || exited_target_matches(intent, self.card_state(card));
         match outcome {
             CloseOutcome::Closed if identity_matches => {
-                self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+                if intent.active || intent.detail.is_some() {
+                    self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+                }
                 self.terminal_close = None;
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
@@ -301,9 +341,12 @@ impl Cagents {
                 // may issue a fresh, independently fenced request.
                 self.terminal_close_attempts.remove(&terminal);
                 let intent = self.terminal_close.as_mut().unwrap();
+                intent.restore_card = self.workspace.focused();
+                intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
                 intent.focus = 1;
+                self.core.set_keyboard_nav(false);
                 close_focus(1)
             }
             outcome => {
@@ -314,6 +357,8 @@ impl Cagents {
                     self.terminal_close_attempts.remove(&terminal);
                 }
                 let intent = self.terminal_close.as_mut().unwrap();
+                intent.restore_card = self.workspace.focused();
+                intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.focus = 0;
                 intent.detail = Some(match outcome {
@@ -324,6 +369,7 @@ impl Cagents {
                         "Close unconfirmed: {error}. The card was kept; no automatic retry will be sent."
                     ),
                 });
+                self.core.set_keyboard_nav(false);
                 close_focus(0)
             }
         }
@@ -347,7 +393,7 @@ impl Cagents {
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
         let intent = self.terminal_close.as_ref()?;
         // Idle shells never show an active-process confirmation, even briefly.
-        if !intent.active && intent.detail.is_none() {
+        if !self.terminal_close_dialog_visible() {
             return None;
         }
         let mut rows: Vec<Element<'_, Message>> = vec![
@@ -422,6 +468,57 @@ fn close_focus(index: usize) -> Task<Message> {
         _ => "dialog.terminal-close.cancel",
     }))
     .map(cosmic::Action::App)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    #[test]
+    fn an_invisible_pending_close_does_not_block_the_whole_workspace() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        app.core.set_keyboard_nav(true);
+        let _close = app.begin_card_close(card);
+
+        assert!(
+            app.core.keyboard_nav(),
+            "a hidden close keeps keyboard navigation"
+        );
+        assert!(app.terminal_close_pending(card));
+        assert!(!app.modal_is_open());
+        assert!(app.dialog().is_none());
+
+        app.settings_reset_confirm = true;
+        assert!(
+            app.dialog().is_some(),
+            "a hidden close cannot mask another dialog"
+        );
+        app.settings_reset_confirm = false;
+
+        let intent = app.terminal_close.as_ref().unwrap();
+        let (terminal, proof, generation) =
+            (intent.terminal, intent.proof.clone(), intent.generation);
+        app.core.set_keyboard_nav(false);
+        let _dialog =
+            app.terminal_close_finished(card, terminal, proof, generation, CloseOutcome::Active);
+        assert!(app.modal_is_open());
+        assert!(app.dialog().is_some());
+        let _cancel = app.cancel_terminal_close();
+        assert!(
+            !app.core.keyboard_nav(),
+            "dismissal keeps the reader's newer choice"
+        );
+    }
 }
 
 fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {

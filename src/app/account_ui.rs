@@ -606,7 +606,7 @@ pub enum Action {
     /// Opens the popover for an account, or closes it with `None` or by
     /// naming the account whose popover is already open.
     Popover(Option<AccountId>),
-    /// Shows another account in the popover that is already open.
+    /// Shows an account and, when Cagents owns the choice, makes it default.
     ShowAccount(AccountId),
     OpenPane,
     SignIn(AccountId),
@@ -1651,14 +1651,26 @@ impl Cagents {
                     .unwrap_or_else(Task::none)
             }
             Action::ShowAccount(id) => {
-                if self.account_ui.account(&id).is_none() {
+                let Some(account) = self
+                    .account_ui
+                    .account(&id)
+                    .map(|state| state.account.clone())
+                else {
                     return Task::none();
-                }
+                };
                 self.account_ui.popover = Some(id.clone());
                 let now = now_ms();
                 self.account_ui.now_ms = now;
-                self.probe_account(&id, Trigger::Focus, now)
-                    .unwrap_or_else(Task::none)
+                let probe = self
+                    .probe_account(&id, Trigger::Focus, now)
+                    .unwrap_or_else(Task::none);
+                let save = if account.is_brokered() {
+                    // Omp chooses its own account for new conversations.
+                    Task::none()
+                } else {
+                    self.save_registry(move |registry| registry.set_default(&account))
+                };
+                Task::batch([probe, save])
             }
             Action::OpenPane => {
                 self.account_ui.popover = None;
@@ -3093,7 +3105,7 @@ impl Cagents {
     }
 
     /// The popover's list of every account of a provider, each with what it
-    /// has left, to look at another without leaving the status bar.
+    /// has left, to select a Cagents-managed default or inspect an Omp login.
     fn account_switcher<'a>(
         &'a self,
         provider: Provider,
@@ -3146,7 +3158,11 @@ impl Cagents {
                         .spacing(design::GRID_UNIT * 2.0)
                         .align_y(Alignment::Center),
                 )
-                .name(state.display_name(account))
+                .name(if account.account.is_brokered() {
+                    format!("View {} usage", state.display_name(account))
+                } else {
+                    format!("Use {} by default", state.display_name(account))
+                })
                 .selected(selected)
                 .class(crate::ui_controls::control_style(selected, None))
                 .padding([design::GRID_UNIT, design::GRID_UNIT * 2.0])
@@ -4038,13 +4054,15 @@ mod app_tests {
     }
 
     #[test]
-    fn the_popover_shows_another_account_of_the_same_provider() {
+    fn the_popover_selects_another_account_as_the_provider_default() {
         let mut app = context_inspector_test_app(false);
         let system = signed_out(&mut app);
         let managed = app.account_ui.add_managed_fixture(Provider::Claude, 3);
+        assert_eq!(app.default_account(Provider::Claude).id(), system);
         let _ = app.update(Message::AccountUi(Action::Popover(Some(system))));
         let _ = app.update(Message::AccountUi(Action::ShowAccount(managed.clone())));
         assert_eq!(app.account_ui.popover.as_ref(), Some(&managed));
+        assert_eq!(app.default_account(Provider::Claude).id(), managed);
         assert!(app.status_bar().is_some());
     }
 

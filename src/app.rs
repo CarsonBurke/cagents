@@ -3817,6 +3817,7 @@ pub struct Cagents {
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
     terminal_close: Option<terminal_close::CloseIntent>,
+    queued_card_closes: VecDeque<CardId>,
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
@@ -4524,6 +4525,17 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error));
                         tasks.push(cosmic::task::message(Message::LifecycleSweep));
                     }
+                }
+                // The initial focus request ran while this card still held
+                // its loading surface, so it could only reach the title
+                // button. Once the terminal is mounted, move keyboard focus
+                // to its input surface; otherwise that button consumes the
+                // first Enter even though typed characters reach the PTY.
+                if self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
+                    tasks.push(
+                        iced::widget::operation::focus(self.card_keyboard_focus(card))
+                            .map(cosmic::Action::App),
+                    );
                 }
             }
             Err(error) => {
@@ -7056,7 +7068,7 @@ impl Cagents {
             Some(CardRuntime::Chat(_)) => self.chat_view(id),
             Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
                 TerminalWidget::new(handle.clone())
-                    .read_only(ended_terminal(card).is_some())
+                    .read_only(ended_terminal(card).is_some() || self.terminal_close_pending(id))
                     .id(chrome.map_or_else(
                         || workspace_widget::card_focus_id(id),
                         |chrome| chrome.focus_id.clone(),
@@ -7083,7 +7095,9 @@ impl Cagents {
                 // A dialog over the workspace owns the pointer as well as the
                 // keyboard, so a drop aimed through it is refused rather than
                 // typed into a shell the reader cannot see.
-                ended_terminal(card).is_none() && !self.workspace_inputs_blocked(),
+                ended_terminal(card).is_none()
+                    && !self.terminal_close_pending(id)
+                    && !self.workspace_inputs_blocked(),
                 move |payload| Message::TerminalDropped { card: id, payload },
             ),
             #[cfg(feature = "integrated-browser")]
@@ -7206,7 +7220,12 @@ impl Cagents {
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
-        if let Some(session) = ended_terminal(card) {
+        // The PTY may report its final exit before the close receipt comes
+        // back. Keep the closing card visually stable until the owner either
+        // confirms removal or reports that it must stay open.
+        let closing_terminal =
+            self.closed_terminal_cards.contains(&id) || self.terminal_close_pending(id);
+        if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
             let resume = session.agent_resume_recipe().is_some();
             let native = self.completed_terminal_has_native_owner(id);
             let mut controls: Vec<Element<'a, Message>> = vec![
@@ -8317,7 +8336,7 @@ impl Cagents {
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
-            || self.terminal_close.is_some()
+            || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
             || self.channel_ui.modal_open()
@@ -9682,6 +9701,7 @@ impl Application for Cagents {
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             terminal_close: None,
+            queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
@@ -9965,7 +9985,9 @@ impl Application for Cagents {
                 let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                     return Task::none();
                 };
-                if ended_terminal(self.card_state(card)).is_some() {
+                if ended_terminal(self.card_state(card)).is_some()
+                    || self.terminal_close_pending(card)
+                {
                     return Task::none();
                 }
                 let insertion = payload
@@ -11389,6 +11411,7 @@ impl Application for Cagents {
                     self.delete_channels(emptied),
                     reopen,
                 ])
+                .chain(self.next_queued_card_close())
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -11898,7 +11921,7 @@ impl Application for Cagents {
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
                     }
-                    if self.terminal_close.is_some() {
+                    if self.terminal_close_dialog_visible() {
                         return self.cancel_terminal_close();
                     }
                     if self.sidebar_state.pending_discard().is_some() {
@@ -11942,7 +11965,7 @@ impl Application for Cagents {
                     }
                 }
                 if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close.is_some()
+                    && self.terminal_close_dialog_visible()
                 {
                     return self.cycle_terminal_close_focus(backwards);
                 }
@@ -12482,7 +12505,9 @@ impl Application for Cagents {
                 ]).spacing(16), 520.0,
             ), Some(Message::UpdateUi(update_ui::Action::CancelApply)), 1.0));
         }
-        if let Some(intent) = &self.terminal_close {
+        if let Some(intent) = &self.terminal_close
+            && self.terminal_close_dialog_visible()
+        {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
                     surface,
@@ -18294,6 +18319,7 @@ mod tests {
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             terminal_close: None,
+            queued_card_closes: VecDeque::new(),
             terminal_close_attempts: HashSet::new(),
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
