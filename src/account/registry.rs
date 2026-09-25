@@ -19,10 +19,12 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Read, Write},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{Account, AccountHome, AccountId, Identity, home::Homes};
@@ -31,7 +33,7 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -93,8 +95,10 @@ pub struct Registry {
     /// system account.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     defaults: BTreeMap<String, String>,
-    /// A project's explicit provider choice. An absent entry inherits the
-    /// installation-wide default, including later changes to that default.
+    /// A project's explicit provider choice, keyed by the canonical Git
+    /// directory's path bytes. ProjectId is local to one window and cannot
+    /// name the same project in another window. Version 3 entries used that
+    /// local ID and are migrated when the window's project catalog loads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     project_defaults: BTreeMap<String, BTreeMap<String, String>>,
     /// Names the reader gave the system accounts, by provider executable.
@@ -107,6 +111,17 @@ pub struct Registry {
 }
 
 const SYSTEM: &str = "system";
+
+fn project_key(repository: &Path) -> String {
+    let digest = Sha256::digest(repository.as_os_str().as_bytes());
+    let mut key = String::with_capacity(5 + digest.len() * 2);
+    key.push_str("repo:");
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut key, "{byte:02x}");
+    }
+    key
+}
 
 impl Registry {
     pub fn revision(&self) -> u64 {
@@ -154,12 +169,12 @@ impl Registry {
     /// choice when this project has no usable explicit choice.
     pub fn project_default_account(
         &self,
-        project: ProjectId,
+        repository: &Path,
         provider: Provider,
         homes: Option<&Homes>,
     ) -> Account {
         self.project_defaults
-            .get(&project.to_string())
+            .get(&project_key(repository))
             .and_then(|choices| choices.get(provider.executable()))
             .and_then(|chosen| self.chosen_account(provider, Some(chosen), homes))
             .unwrap_or_else(|| self.default_account(provider, homes))
@@ -196,15 +211,15 @@ impl Registry {
         }
     }
 
-    pub fn project_choice(&self, project: ProjectId, provider: Provider) -> Option<&str> {
+    pub fn project_choice(&self, repository: &Path, provider: Provider) -> Option<&str> {
         self.project_defaults
-            .get(&project.to_string())?
+            .get(&project_key(repository))?
             .get(provider.executable())
             .map(String::as_str)
     }
 
-    pub fn is_project_default(&self, project: ProjectId, account: &Account) -> bool {
-        let Some(chosen) = self.project_choice(project, account.provider) else {
+    pub fn is_project_default(&self, repository: &Path, account: &Account) -> bool {
+        let Some(chosen) = self.project_choice(repository, account.provider) else {
             return false;
         };
         match account.registry_key() {
@@ -213,26 +228,46 @@ impl Registry {
         }
     }
 
-    pub fn set_project_default(&mut self, project: ProjectId, account: &Account) {
+    pub fn set_project_default(&mut self, repository: &Path, account: &Account) {
         let chosen = match account.registry_key() {
             Some(key) => key.hyphenated().to_string(),
             None if account.is_system() => SYSTEM.to_owned(),
             None => return,
         };
         self.project_defaults
-            .entry(project.to_string())
+            .entry(project_key(repository))
             .or_default()
             .insert(account.provider.executable().to_owned(), chosen);
     }
 
-    pub fn clear_project_default(&mut self, project: ProjectId, provider: Provider) {
-        let project = project.to_string();
+    pub fn clear_project_default(&mut self, repository: &Path, provider: Provider) {
+        let project = project_key(repository);
         if let Some(choices) = self.project_defaults.get_mut(&project) {
             choices.remove(provider.executable());
             if choices.is_empty() {
                 self.project_defaults.remove(&project);
             }
         }
+    }
+
+    /// Convert version 3 choices once the window knows the repository behind
+    /// each of its old local IDs. A newer path-based choice wins per provider.
+    pub fn migrate_project_ids(&mut self, projects: &[(ProjectId, PathBuf)]) -> bool {
+        let mut changed = false;
+        for (id, repository) in projects {
+            let Some(choices) = self.project_defaults.remove(&id.to_string()) else {
+                continue;
+            };
+            let current = self
+                .project_defaults
+                .entry(project_key(repository))
+                .or_default();
+            for (provider, chosen) in choices {
+                current.entry(provider).or_insert(chosen);
+            }
+            changed = true;
+        }
+        changed
     }
 
     /// Whether new conversations of `account`'s provider start on it. A
@@ -696,8 +731,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("managed"));
-        let project = ProjectId::new();
-        let other = ProjectId::new();
+        let project = Path::new("/projects/redact/.git");
+        let other = Path::new("/projects/other/.git");
         let home = directory.path().join("history");
         fs::create_dir(&home).unwrap();
         let key = Uuid::new_v4();
@@ -728,6 +763,30 @@ mod tests {
         assert_eq!(
             registry.project_default_account(project, Provider::Codex, Some(&homes)),
             Account::system(Provider::Codex)
+        );
+    }
+
+    #[test]
+    fn legacy_window_project_ids_migrate_to_the_shared_repository_identity() {
+        let mut registry = Registry::default();
+        let old_window_id = ProjectId::new();
+        let other_window_id = ProjectId::new();
+        let repository = PathBuf::from("/projects/redact/.git");
+        registry.project_defaults.insert(
+            old_window_id.to_string(),
+            BTreeMap::from([("codex".into(), SYSTEM.into())]),
+        );
+
+        assert!(registry.migrate_project_ids(&[(old_window_id, repository.clone())]));
+        assert!(!registry.migrate_project_ids(&[(other_window_id, repository.clone())]));
+        assert_eq!(
+            registry.project_choice(&repository, Provider::Codex),
+            Some(SYSTEM)
+        );
+        assert!(
+            !registry
+                .project_defaults
+                .contains_key(&old_window_id.to_string())
         );
     }
 
