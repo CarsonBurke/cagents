@@ -24,6 +24,12 @@ pub enum CloseOutcome {
     Unreachable(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct QueuedCardClose {
+    card: CardId,
+    unasked: bool,
+}
+
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
         if session.id == intent.terminal && session.continuity.live_proof().as_ref() == Some(&intent.proof))
@@ -37,12 +43,16 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 
 impl Cagents {
     pub(super) fn next_queued_card_close(&mut self) -> Task<Message> {
-        while let Some(card) = self.queued_card_closes.pop_front() {
+        while let Some(QueuedCardClose { card, unasked }) = self.queued_card_closes.pop_front() {
             if self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
             {
-                return cosmic::task::message(Message::CloseCard(card));
+                return cosmic::task::message(if unasked {
+                    Message::CloseCardUnasked(card)
+                } else {
+                    Message::CloseCard(card)
+                });
             }
         }
         Task::none()
@@ -61,14 +71,14 @@ impl Cagents {
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
-        self.close_card_as(card, !self.settings.confirm_terminal_close)
+        self.close_card_as(card, !self.settings.confirm_terminal_close, false)
     }
 
     /// Closes `card` without asking whether to stop what its terminal is
     /// running, for a close the reader already asked for in so many words -
     /// cancelling a sign-in, say. The daemon's identity checks still apply.
     pub(super) fn close_card_unasked(&mut self, card: CardId) -> Task<Message> {
-        self.close_card_as(card, true)
+        self.close_card_as(card, true, true)
     }
 
     /// Closes `card` from outside the strip on screen, which has no widget
@@ -109,16 +119,21 @@ impl Cagents {
         Task::batch([self.delete_channels(emptied), self.sync_chrome()])
     }
 
-    fn close_card_as(&mut self, card: CardId, allow_active: bool) -> Task<Message> {
+    fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
         if let Some(intent) = &self.terminal_close {
             // A silent close is still in flight. Preserve subsequent close
             // clicks until that card is settled, instead of dropping them.
-            if !intent.active
-                && intent.detail.is_none()
-                && intent.card != card
-                && !self.queued_card_closes.contains(&card)
-            {
-                self.queued_card_closes.push_back(card);
+            if !intent.active && intent.detail.is_none() && intent.card != card {
+                if let Some(queued) = self
+                    .queued_card_closes
+                    .iter_mut()
+                    .find(|queued| queued.card == card)
+                {
+                    queued.unasked |= unasked;
+                } else {
+                    self.queued_card_closes
+                        .push_back(QueuedCardClose { card, unasked });
+                }
             }
             return Task::none();
         }
@@ -518,6 +533,43 @@ mod tests {
             !app.core.keyboard_nav(),
             "dismissal keeps the reader's newer choice"
         );
+    }
+
+    #[test]
+    fn queued_login_cancellation_keeps_its_unasked_intent() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(first).unwrap().kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        app.settings.confirm_terminal_close = true;
+        let _ = app.close_card_unasked(first);
+        assert!(app.terminal_close_pending(first));
+
+        let login_state = super::super::tests::terminal_card_state();
+        let login = login_state.id;
+        Arc::make_mut(&mut app.durable).cards.push(login_state);
+        let _ = app.begin_card_close(login);
+        let _ = app.close_card_unasked(login);
+
+        assert_eq!(
+            app.queued_card_closes.front().copied(),
+            Some(QueuedCardClose {
+                card: login,
+                unasked: true,
+            }),
+            "a later explicit cancellation upgrades a queued ordinary close"
+        );
+        app.terminal_close = None;
+        assert!(matches!(
+            super::super::tests::task_app_message(app.next_queued_card_close()),
+            Message::CloseCardUnasked(card) if card == login
+        ));
     }
 }
 
