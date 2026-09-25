@@ -130,6 +130,7 @@ impl Cagents {
 
     pub(super) fn pending_terminal_spawn(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Loading))
+            && self.terminal_start_in_flight(card)
             && terminal_continuity(self.card_state(card))
                 .is_some_and(|continuity| continuity.live_proof().is_none())
     }

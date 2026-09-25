@@ -299,12 +299,18 @@ impl Cagents {
                 self.delete_channel(id)
             }
             Action::Create(project_id) => {
-                if !self
+                let Some(project) = self
                     .sidebar_model
                     .projects
                     .iter()
-                    .any(|project| project.id == project_id)
+                    .find(|project| project.id == project_id)
+                else {
+                    return Task::none();
+                };
+                if self.project_ui.removing.contains_key(&project.repository)
+                    || self.project_ui.closed.contains(&project.repository)
                 {
+                    self.status = Some(TransientNotice::warning("That project is being removed."));
                     return Task::none();
                 }
                 let id = ChannelId::new();
@@ -597,7 +603,12 @@ impl Cagents {
         self.channel_offsets.remove(&id);
         self.refresh_sidebar_channels();
         self.persist();
-        Task::batch([select, self.lifecycle_sweep(), self.sync_chrome()])
+        Task::batch([
+            select,
+            self.lifecycle_sweep(),
+            self.sync_chrome(),
+            self.complete_closed_projects(),
+        ])
     }
 
     /// The project of the channel at `index`, and the channel the workspace

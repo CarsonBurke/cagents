@@ -11,6 +11,21 @@ pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
+    remove_dialog: Option<ProjectRemoval>,
+    /// A confirmed removal awaiting the daemon's shared-model answer.
+    pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Projects closed by the shared model but still settling their channels.
+    pub(super) closing: HashMap<ProjectId, PathBuf>,
+    close_started: HashMap<ProjectId, Instant>,
+    close_in_flight: HashSet<ProjectId>,
+    close_failed: HashSet<ProjectId>,
+    close_cancellations: HashMap<ProjectId, CancellationToken>,
+    pub(super) close_generation: HashMap<ProjectId, u64>,
+    next_close_generation: u64,
+    /// Prevents an older model read or repository load from reopening a close.
+    pub(super) closed: HashSet<PathBuf>,
+    /// A deliberate reopen outranks a cached close until its model edit lands.
+    pub(super) reopening: HashMap<ProjectId, PathBuf>,
     /// Deletions the user has confirmed, by worktree, until each resolves. A
     /// failed one stays so its row can say why and offer to run it again.
     deletions: HashMap<WorktreeId, Deletion>,
@@ -21,13 +36,18 @@ pub struct State {
 #[derive(Debug, Clone)]
 struct Deletion {
     target: Target,
+    started_at: Instant,
     /// Why the last attempt failed; `None` while one is running.
     failure: Option<String>,
 }
 
 impl State {
+    pub(super) fn is_reopening(&self, repository: &Path) -> bool {
+        self.reopening.values().any(|path| path == repository)
+    }
+
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.remove_dialog.is_some()
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -53,6 +73,7 @@ impl State {
             worktree,
             Deletion {
                 target: target.clone(),
+                started_at: Instant::now(),
                 failure: None,
             },
         );
@@ -96,6 +117,9 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
+        if self.remove_dialog.is_some() {
+            return widget::Id::new("dialog.project.remove.confirm");
+        }
         widget::Id::new(
             if self
                 .dialog
@@ -108,6 +132,15 @@ impl State {
             },
         )
     }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectRemoval {
+    project: ProjectId,
+    repository: PathBuf,
+    name: String,
+    worktrees: Vec<PathBuf>,
+    channels: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +178,13 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
+    ConfirmRemove,
+    RemovedProject {
+        repository: PathBuf,
+        result: Result<crate::workspace_model::WorkspaceModel, String>,
+    },
+    AwaitClosedProject(ProjectId, u64),
+    ProjectSessionsClosed(ProjectId, u64, Result<(), String>),
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
@@ -161,6 +201,266 @@ pub enum Action {
 }
 
 impl Cagents {
+    /// Apply a daemon-owned project close in every window. Channels use their
+    /// existing checked close path; the project stays visible until those
+    /// closes settle, so a refused close remains reachable and retryable.
+    pub(super) fn close_shared_project(&mut self, repository: &Path) -> Task<Message> {
+        if self.project_ui.is_reopening(repository) {
+            return Task::none();
+        }
+        self.project_ui.removing.remove(repository);
+        if !self.project_ui.closed.insert(repository.to_path_buf()) {
+            return self.complete_closed_projects();
+        }
+        let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == repository)
+            .map(|project| project.id)
+        else {
+            return Task::none();
+        };
+        self.project_ui
+            .closing
+            .insert(project, repository.to_path_buf());
+        self.project_ui
+            .close_started
+            .insert(project, Instant::now());
+        self.project_ui.next_close_generation =
+            self.project_ui.next_close_generation.wrapping_add(1);
+        self.project_ui
+            .close_generation
+            .insert(project, self.project_ui.next_close_generation);
+        self.repository_generations.remove(&project);
+        if self.project_has_unsaved_editors(project) {
+            self.status = Some(TransientNotice::warning(
+                "Project closed in another window; save its open editor buffers before removing its local row.",
+            ));
+        }
+        let channels = self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| channel.project_id == project)
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        for channel in Arc::make_mut(&mut self.durable)
+            .channels
+            .iter_mut()
+            .filter(|channel| channel.project_id == project)
+        {
+            // Even an unacknowledged local channel is part of the explicit
+            // close. Registry silence must not publish it back.
+            channel.shared = true;
+        }
+        let close = self.delete_channels(channels);
+        Task::batch([close, self.complete_closed_projects()])
+    }
+
+    pub(super) fn cancel_shared_project_close(&mut self, repository: &Path) {
+        let Some(project) = self
+            .project_ui
+            .closing
+            .iter()
+            .find(|(_, path)| path.as_path() == repository)
+            .map(|(id, _)| *id)
+        else {
+            return;
+        };
+        if let Some(cancellation) = self.project_ui.close_cancellations.remove(&project) {
+            cancellation.cancel();
+        }
+        self.project_ui.closing.remove(&project);
+        self.project_ui.close_started.remove(&project);
+        self.project_ui.close_in_flight.remove(&project);
+        self.project_ui.close_failed.remove(&project);
+        self.project_ui.close_generation.remove(&project);
+        self.project_ui.removing.remove(repository);
+    }
+
+    pub(super) fn complete_closed_projects(&mut self) -> Task<Message> {
+        let ready = self
+            .project_ui
+            .closing
+            .keys()
+            .copied()
+            .filter(|project| {
+                !self.project_has_unsaved_editors(*project)
+                    && !self.project_ui.close_failed.contains(project)
+                    && !self.project_ui.close_in_flight.contains(project)
+                    && !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.project_id == *project)
+            })
+            .collect::<Vec<_>>();
+        Task::batch(ready.into_iter().map(|project| {
+            let Some(row) = self.sidebar_model.project(project) else {
+                return Task::none();
+            };
+            let generation = self.project_ui.close_generation[&project];
+            let repository = row.repository.clone();
+            let roots = project_worktree_roots(row);
+            let pending = self.durable.cards.iter().any(|card| {
+                card.existence.is_open()
+                    && roots.iter().any(|root| card_belongs_to(card, root))
+                    && (self.pending_terminal_spawn(card.id) || self.chat_start_pending(card.id))
+            });
+            if pending {
+                if self.project_ui.close_started[&project].elapsed() > Duration::from_secs(45) {
+                    self.project_ui.close_failed.insert(project);
+                    self.status = Some(TransientNotice::error(
+                        "A project session did not finish starting. Retry removal after resolving its card.",
+                    ));
+                    return Task::none();
+                }
+                self.project_ui.close_in_flight.insert(project);
+                return cosmic::task::future(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Message::ProjectUi(Action::AwaitClosedProject(project, generation))
+                });
+            }
+            self.project_ui.close_in_flight.insert(project);
+            let cancellation = CancellationToken::default();
+            self.project_ui
+                .close_cancellations
+                .insert(project, cancellation.clone());
+            cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    let roots = project_roots_with_git(&repository, roots);
+                    close_sessions_in_worktrees_cancelable(&roots, Some(&cancellation))
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::ProjectUi(Action::ProjectSessionsClosed(project, generation, result))
+            })
+        }))
+    }
+
+    fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
+        let Some(project) = self.sidebar_model.project(project) else {
+            return false;
+        };
+        let roots = project_worktree_roots(project);
+        self.cards.values().any(|runtime| {
+            matches!(runtime, CardRuntime::Repository(editor)
+                if editor.blocks_navigation()
+                    && roots.iter().any(|root| editor.descriptor.worktree.starts_with(root)))
+        })
+    }
+
+    fn finish_closed_project(&mut self, id: ProjectId) -> Task<Message> {
+        let Some(repository) = self.project_ui.closing.remove(&id) else {
+            return Task::none();
+        };
+        self.project_ui.close_started.remove(&id);
+        self.project_ui.close_in_flight.remove(&id);
+        self.project_ui.close_failed.remove(&id);
+        self.project_ui.close_cancellations.remove(&id);
+        self.project_ui.close_generation.remove(&id);
+        let Some(index) = self
+            .sidebar_model
+            .projects
+            .iter()
+            .position(|project| project.id == id)
+        else {
+            return Task::none();
+        };
+        let project = &self.sidebar_model.projects[index];
+        let name = project.name.clone();
+        let worktrees = project.worktrees.clone();
+        let roots = project_worktree_roots(project);
+        // The terminal host was closed before the shared edit. Retire this
+        // window's saved cards too, so reopening the project does not revive
+        // conversations whose processes were deliberately closed.
+        let cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| {
+                card.existence.is_open() && roots.iter().any(|root| card_belongs_to(card, root))
+            })
+            .map(|card| card.id)
+            .collect::<Vec<_>>();
+        for card in cards {
+            self.retire_lsp_card(card);
+            self.sidebar_state.clear_agent_activity(card);
+            self.sidebar_state.acknowledge_agent_update(card);
+            self.chat_discard(card);
+            self.cards.remove(&card);
+            self.lifecycle.remove(card);
+            if let Some(state) = self.card_state_mut(card) {
+                state.existence = removed_existence("project removed by user");
+            }
+            Arc::make_mut(&mut self.durable).card_scopes.remove(&card);
+        }
+        let active_here = self
+            .active_workspace
+            .as_deref()
+            .is_some_and(|active| roots.iter().any(|root| active.starts_with(root)));
+        self.sidebar_model.projects.remove(index);
+        self.github_availability.remove(&id);
+        self.project_ui.projects.remove(&id);
+        self.repository_generations.remove(&id);
+        if let Some(cancellation) = self.repository_pr_cancellations.remove(&id) {
+            cancellation.cancel();
+        }
+        self.workspace_model_opens.remove(&repository);
+        Arc::make_mut(&mut self.durable)
+            .project_order
+            .retain(|project| *project != id);
+        if let Some(session) = &self.session {
+            session.save_project(ProjectState {
+                id,
+                generation: 0,
+                name,
+                repository: repository.clone(),
+                existence: removed_existence("project removed by user"),
+            });
+            session.save_worktrees(worktrees.iter().map(|worktree| WorktreeState {
+                id: worktree.id,
+                project_id: id,
+                generation: 0,
+                path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+                existence: removed_existence("project removed by user"),
+            }));
+        }
+        for root in &roots {
+            self.worktree_offsets.remove(root);
+            self.worktree_focus.remove(root);
+        }
+        let select = if active_here {
+            if let Some(next) = self.sidebar_model.projects.first() {
+                let path = next.worktrees.first().map_or_else(
+                    || {
+                        next.repository
+                            .parent()
+                            .unwrap_or(&next.repository)
+                            .to_path_buf()
+                    },
+                    |worktree| worktree.path.clone(),
+                );
+                self.select_worktree(path, false)
+            } else {
+                Arc::make_mut(&mut self.durable).active_channel = None;
+                self.active_workspace = None;
+                self.set_workspace_surfaces_visible(false);
+                self.workspace = Self::rebuild_workspace(&WorkspaceState::default());
+                Task::none()
+            }
+        } else {
+            Task::none()
+        };
+        self.refresh_sidebar_channels();
+        self.refresh_sidebar_worktree_panes();
+        self.persist();
+        Task::batch([select, self.lifecycle_sweep(), self.sync_chrome()])
+    }
+
     pub(super) fn editor_discovery_task() -> Task<Message> {
         cosmic::task::future(async {
             let result = tokio::task::spawn_blocking(crate::external_editor::installed)
@@ -263,14 +563,54 @@ impl Cagents {
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::AwaitClosedProject(project, generation) => {
+                if self.project_ui.close_generation.get(&project) != Some(&generation) {
+                    return Task::none();
+                }
+                self.project_ui.close_in_flight.remove(&project);
+                return self.complete_closed_projects();
+            }
+            Action::ProjectSessionsClosed(project, generation, result) => {
+                if self.project_ui.close_generation.get(&project) != Some(&generation) {
+                    return Task::none();
+                }
+                self.project_ui.close_in_flight.remove(&project);
+                self.project_ui.close_cancellations.remove(&project);
+                if !self.project_ui.closing.contains_key(&project) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(()) => return self.finish_closed_project(project),
+                    Err(error) => {
+                        self.project_ui.close_failed.insert(project);
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not finish removing project: {error}"
+                        )));
+                    }
+                }
+            }
             Action::AwaitSessions(target) => {
                 let running = target
                     .worktree
                     .and_then(|id| self.project_ui.deletions.get(&id))
-                    .is_some_and(|deletion| {
+                    .filter(|deletion| {
                         deletion.failure.is_none() && deletion.target.path == target.path
                     });
-                if running {
+                if let Some(running) = running {
+                    if running.started_at.elapsed() > Duration::from_secs(45) {
+                        let reason = "A terminal or chat did not finish starting; close or retry its card, then retry deletion.".to_owned();
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not delete {}: {reason}",
+                            target.label
+                        )));
+                        if let Some(id) = target.worktree
+                            && let Some(deletion) = self.project_ui.deletions.get_mut(&id)
+                        {
+                            deletion.failure = Some(reason);
+                        }
+                        self.sync_worktree_operation_rows();
+                        return Task::none();
+                    }
                     return self.run_worktree_deletion(target);
                 }
             }
@@ -336,6 +676,32 @@ impl Cagents {
                         return iced::widget::operation::focus(self.project_ui.focus_target())
                             .map(cosmic::Action::App);
                     }
+                    ProjectCommand::Remove => {
+                        let Some(project) = self.sidebar_model.project(project_id) else {
+                            return Task::none();
+                        };
+                        if self.project_ui.removing.contains_key(&project.repository) {
+                            self.status = Some(TransientNotice::warning(
+                                "Project removal is already in progress.",
+                            ));
+                            return Task::none();
+                        }
+                        let worktrees = project_worktree_roots(project);
+                        self.project_ui.remove_dialog = Some(ProjectRemoval {
+                            project: project_id,
+                            repository: project.repository.clone(),
+                            name: project.name.clone(),
+                            worktrees,
+                            channels: self
+                                .durable
+                                .channels
+                                .iter()
+                                .filter(|channel| channel.project_id == project_id)
+                                .count(),
+                        });
+                        return iced::widget::operation::focus(self.project_ui.focus_target())
+                            .map(cosmic::Action::App);
+                    }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
                         return launch_task(PathBuf::from("xdg-open"), target.path, false);
@@ -380,6 +746,7 @@ impl Cagents {
                 }
             }
             Action::Dismiss => {
+                self.project_ui.remove_dialog = None;
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
                 // it, so its row stops asking.
@@ -395,6 +762,78 @@ impl Cagents {
                 }
                 return self.project_dialog_closed();
             }
+            Action::ConfirmRemove => {
+                let Some(removal) = self.project_ui.remove_dialog.take() else {
+                    return Task::none();
+                };
+                if self
+                    .sidebar_model
+                    .project(removal.project)
+                    .is_none_or(|project| project.repository != removal.repository)
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "The project changed. Try removing it again.",
+                    ));
+                    return self.project_dialog_closed();
+                }
+                if self.project_has_unsaved_editors(removal.project) {
+                    self.status = Some(TransientNotice::warning(
+                        "Save or close this project's unsaved editor buffers before removing it.",
+                    ));
+                    return self.project_dialog_closed();
+                }
+                let repository = removal.repository.clone();
+                self.project_ui.close_failed.remove(&removal.project);
+                self.project_ui
+                    .close_started
+                    .insert(removal.project, Instant::now());
+                self.project_ui
+                    .removing
+                    .insert(repository.clone(), removal.worktrees.clone());
+                let close = cosmic::task::future(async move {
+                    let result =
+                        tokio::task::spawn_blocking(move || remove_project_from_cagents(&removal))
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result);
+                    Message::ProjectUi(Action::RemovedProject { repository, result })
+                });
+                return Task::batch([close, self.project_dialog_closed()]);
+            }
+            Action::RemovedProject { repository, result } => match result {
+                Ok(model) => {
+                    if model.sequence <= self.workspace_model.sequence {
+                        return if self.workspace_model.project(&repository).is_none() {
+                            self.close_shared_project(&repository)
+                        } else {
+                            Task::none()
+                        };
+                    }
+                    // The observer is a different client and may deliver this
+                    // edit before or after the command's own answer.
+                    return self.apply_workspace_model_update(
+                        super::workspace_model_sync::ModelUpdate::Edited {
+                            sequence: model.sequence,
+                            edit: crate::workspace_model::ModelEdit::CloseProject { repository },
+                        },
+                    );
+                }
+                Err(error) => {
+                    self.project_ui.removing.remove(&repository);
+                    if let Some(project) = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .find(|project| project.repository == repository)
+                        .map(|project| project.id)
+                    {
+                        self.project_ui.close_started.remove(&project);
+                    }
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not remove project: {error}"
+                    )));
+                }
+            },
             Action::ConfirmDelete => {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
@@ -582,6 +1021,7 @@ impl Cagents {
             id,
             Deletion {
                 target: target.clone(),
+                started_at: Instant::now(),
                 failure: None,
             },
         );
@@ -643,6 +1083,24 @@ impl Cagents {
     /// Refuses, and says so, to start anything in `directory` while the
     /// worktree it is in is being deleted.
     pub(super) fn refuse_in_deleting_worktree(&mut self, directory: &Path) -> bool {
+        if self
+            .project_ui
+            .removing
+            .values()
+            .flatten()
+            .any(|root| directory.starts_with(root))
+            || self.project_ui.closing.values().any(|repository| {
+                self.sidebar_model.projects.iter().any(|project| {
+                    &project.repository == repository
+                        && project_worktree_roots(project)
+                            .iter()
+                            .any(|root| directory.starts_with(root))
+                })
+            })
+        {
+            self.status = Some(TransientNotice::warning("That project is being removed."));
+            return true;
+        }
         if !self.project_ui.deleting_directory(directory) {
             return false;
         }
@@ -653,6 +1111,16 @@ impl Cagents {
     /// Refuses, and says so, to start a session for `card` while the
     /// worktree it works in is being deleted.
     pub(super) fn refuse_for_deleting_card(&mut self, card: CardId) -> bool {
+        if self.card_state(card).is_some_and(|state| {
+            self.project_ui
+                .removing
+                .values()
+                .flatten()
+                .any(|root| card_belongs_to(state, root))
+        }) {
+            self.status = Some(TransientNotice::warning("That project is being removed."));
+            return true;
+        }
         if !self
             .card_state(card)
             .is_some_and(|state| self.project_ui.deleting_card(state))
@@ -782,6 +1250,42 @@ impl Cagents {
     }
 
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
+        if let Some(removal) = &self.project_ui.remove_dialog {
+            let detail = if removal.channels == 0 {
+                "No channels are attached to this project.".to_owned()
+            } else {
+                format!(
+                    "Its {} channel{} will be removed from every window.",
+                    removal.channels,
+                    if removal.channels == 1 { "" } else { "s" }
+                )
+            };
+            return Some(super::dialog_ui::surface(
+                widget::column::with_children(vec![
+                    widget::text::title3("Remove project from cagents?").into(),
+                    super::notice_body(&removal.name),
+                    super::notice_detail(removal.repository.display().to_string()),
+                    super::notice_body(detail),
+                    super::notice_detail(
+                        "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
+                    ),
+                    widget::row::with_children(vec![
+                        iced::widget::Space::new().width(Length::Fill).into(),
+                        widget::button::standard("Cancel")
+                            .on_press(Message::ProjectUi(Action::Dismiss))
+                            .into(),
+                        widget::button::destructive("Remove project")
+                            .id(widget::Id::new("dialog.project.remove.confirm"))
+                            .on_press(Message::ProjectUi(Action::ConfirmRemove))
+                            .into(),
+                    ])
+                    .spacing(cosmic::theme::spacing().space_xxs)
+                    .into(),
+                ])
+                .spacing(3.0 * design::GRID_UNIT),
+                500.0,
+            ));
+        }
         let dialog = self.project_ui.dialog.as_ref()?;
         let target = &dialog.target;
         let mut rows: Vec<Element<'_, Message>> = vec![
@@ -882,6 +1386,23 @@ pub(super) fn removed_existence(reason: &str) -> Existence {
 
 /// Whether a card lives inside the worktree at `path`: its process runs there,
 /// or it views files there.
+fn project_worktree_roots(project: &SidebarProject) -> Vec<PathBuf> {
+    let mut roots = project
+        .worktrees
+        .iter()
+        .map(|worktree| worktree.path.clone())
+        .collect::<Vec<_>>();
+    if let Some(primary) = project
+        .repository
+        .parent()
+        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+        && !roots.iter().any(|root| root == primary)
+    {
+        roots.push(primary.to_path_buf());
+    }
+    roots
+}
+
 fn card_belongs_to(card: &CardState, path: &Path) -> bool {
     match &card.kind {
         CardKind::Terminal(session) => session.launch.working_directory.starts_with(path),
@@ -901,6 +1422,20 @@ fn card_belongs_to(card: &CardState, path: &Path) -> bool {
 /// confirmed. A close the daemon cannot confirm stops the deletion: the
 /// directory is not removed from under a process whose fate is unknown.
 fn close_worktree_sessions(target: &Target) -> Result<(), String> {
+    close_sessions_in_worktrees(std::slice::from_ref(&target.path))
+}
+
+fn close_sessions_in_worktrees(worktrees: &[PathBuf]) -> Result<(), String> {
+    close_sessions_in_worktrees_cancelable(worktrees, None)
+}
+
+fn close_sessions_in_worktrees_cancelable(
+    worktrees: &[PathBuf],
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), String> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(());
+    }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client = match crate::control::ControlClient::connect(&socket) {
         Ok(client) => client,
@@ -919,20 +1454,56 @@ fn close_worktree_sessions(target: &Target) -> Result<(), String> {
             ));
         }
     };
-    let canonical_target = target
-        .path
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve worktree identity: {error}"))?;
+    let roots = worktrees
+        .iter()
+        .map(|path| (path, path.canonicalize().ok()))
+        .collect::<Vec<_>>();
     let inside = |directory: &Path| {
-        directory.starts_with(&target.path)
-            || directory
-                .canonicalize()
-                .is_ok_and(|directory| directory.starts_with(&canonical_target))
+        if roots.iter().any(|(path, _)| directory.starts_with(path)) {
+            return true;
+        }
+        let Ok(directory) = directory.canonicalize() else {
+            return false;
+        };
+        roots.iter().any(|(_, canonical)| {
+            canonical
+                .as_ref()
+                .is_some_and(|target| directory.starts_with(target))
+        })
     };
+    for session in client
+        .list_chats()
+        .map_err(|error| format!("Cannot list the worktree's chats: {error}"))?
+    {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(());
+        }
+        if !inside(&session.launch.recipe.working_directory) {
+            continue;
+        }
+        let id = session.id;
+        if let Err(error) = client.close_chat(session) {
+            client = crate::control::ControlClient::connect(&socket)
+                .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
+            if client
+                .list_chats()
+                .map_err(|list| format!("Could not verify chat {id}: {list}"))?
+                .iter()
+                .any(|live| live.id == id)
+            {
+                return Err(format!("Could not close chat {id}: {error}"));
+            }
+        }
+    }
+    // A native chat may retain its source PTY. Close the actor first, then
+    // inventory terminals again because that close may have retired the PTY.
     for terminal in client
         .list()
         .map_err(|error| format!("Cannot list the worktree's terminals: {error}"))?
     {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(());
+        }
         if !inside(&terminal.session.launch.working_directory)
             || matches!(
                 terminal.session.continuity,
@@ -946,32 +1517,60 @@ fn close_worktree_sessions(target: &Target) -> Result<(), String> {
             continue;
         }
         let id = terminal.session.id;
-        match client
+        let result = client
             .close_terminal_checked(id, true)
-            .map_err(|error| format!("Could not close terminal {id}: {error}"))?
-        {
-            crate::terminal::ipc::TerminalCloseResult::Closed => {}
-            crate::terminal::ipc::TerminalCloseResult::Active => {
-                return Err(format!("Terminal {id} declined to close while active."));
-            }
-            crate::terminal::ipc::TerminalCloseResult::Unknown(detail) => {
-                return Err(format!("Terminal {id} may still be running: {detail}"));
+            .map_err(|error| error.to_string())
+            .and_then(|outcome| match outcome {
+                crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+            });
+        if let Err(error) = result {
+            // Another window or a natural exit may have won the race. Query a
+            // fresh connection; a failed request can desynchronize this one.
+            client = crate::control::ControlClient::connect(&socket)
+                .map_err(|reconnect| format!("Could not verify terminal {id}: {reconnect}"))?;
+            if client
+                .list()
+                .map_err(|list| format!("Could not verify terminal {id}: {list}"))?
+                .iter()
+                .any(|live| live.session.id == id)
+            {
+                return Err(format!("Could not close terminal {id}: {error}"));
             }
         }
-    }
-    for session in client
-        .list_chats()
-        .map_err(|error| format!("Cannot list the worktree's chats: {error}"))?
-    {
-        if !inside(&session.launch.recipe.working_directory) {
-            continue;
-        }
-        let id = session.id;
-        client
-            .close_chat(session)
-            .map_err(|error| format!("Could not close chat {id}: {error}"))?;
     }
     Ok(())
+}
+
+fn project_roots_with_git(repository: &Path, mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let service = RepositoryService::system("git");
+    // A missing checkout must still be removable using its saved roots.
+    if let Ok(records) = service.list_worktrees(repository, &CancellationToken::default()) {
+        for record in records {
+            if !roots.contains(&record.path) {
+                roots.push(record.path);
+            }
+        }
+    }
+    roots
+}
+
+/// The confirmation covers live and detached sessions in every listed
+/// worktree. Close those first; the shared project edit is the final step and
+/// leaves all Git files and worktree directories untouched.
+fn remove_project_from_cagents(
+    removal: &ProjectRemoval,
+) -> Result<crate::workspace_model::WorkspaceModel, String> {
+    let roots = project_roots_with_git(&removal.repository, removal.worktrees.clone());
+    close_sessions_in_worktrees(&roots)?;
+    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    client
+        .edit_workspace_model(crate::workspace_model::ModelEdit::CloseProject {
+            repository: removal.repository.clone(),
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// Removes the worktree through Git once Git confirms it is the one the user
@@ -1100,6 +1699,83 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn shared_project_close_removes_local_row_and_records_tombstones() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.close_shared_project(&repository));
+        let generation = app.project_ui.close_generation[&project];
+        drop(app.handle_project_action(Action::ProjectSessionsClosed(project, generation, Ok(()))));
+        assert!(app.sidebar_model.project(project).is_none());
+        assert!(app.project_ui.closed.contains(&repository));
+
+        let session = app.session.as_ref().unwrap();
+        session.flush(Duration::from_secs(5)).unwrap();
+        let store = session.operation_store();
+        assert!(
+            !store
+                .load_project(project)
+                .unwrap()
+                .unwrap()
+                .existence
+                .is_open()
+        );
+        for worktree in [primary, linked] {
+            assert!(
+                !store
+                    .load_worktree(worktree.id)
+                    .unwrap()
+                    .unwrap()
+                    .existence
+                    .is_open()
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_worktree_deletion_becomes_retryable() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = Target {
+            project,
+            worktree: Some(linked.id),
+            repository,
+            path: linked.path,
+            label: "feature".into(),
+        };
+        app.project_ui.deletions.insert(
+            linked.id,
+            Deletion {
+                target: target.clone(),
+                started_at: Instant::now() - Duration::from_secs(46),
+                failure: None,
+            },
+        );
+        drop(app.handle_project_action(Action::AwaitSessions(target)));
+        assert!(app.project_ui.deletions[&linked.id].failure.is_some());
+        assert!(!app.project_ui.is_deleting(linked.id));
     }
 
     /// A worktree deleted before the catalog ever stored it is still recorded

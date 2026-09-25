@@ -87,6 +87,10 @@ pub struct WorkspaceModel {
     pub sequence: u64,
     pub projects: Vec<ModelProject>,
     pub channels: Vec<ModelChannel>,
+    /// Explicit removals survive a missed watch edge and a window restart.
+    /// Reopening the repository clears its tombstone.
+    #[serde(default)]
+    pub closed_projects: Vec<PathBuf>,
 }
 
 impl WorkspaceModel {
@@ -110,7 +114,9 @@ impl WorkspaceModel {
     pub fn fold(&mut self, sequence: u64, edit: &ModelEdit) {
         self.sequence = sequence;
         match edit {
-            ModelEdit::OpenProject { repository, name } => {
+            ModelEdit::OpenProject { repository, name }
+            | ModelEdit::ReopenProject { repository, name } => {
+                self.closed_projects.retain(|closed| closed != repository);
                 match self
                     .projects
                     .iter_mut()
@@ -125,6 +131,9 @@ impl WorkspaceModel {
                 }
             }
             ModelEdit::CloseProject { repository } => {
+                if !self.closed_projects.contains(repository) {
+                    self.closed_projects.push(repository.clone());
+                }
                 self.projects
                     .retain(|project| project.repository != *repository);
                 self.channels
@@ -165,6 +174,9 @@ impl WorkspaceModel {
 pub enum ModelEdit {
     /// Upsert by path. A repeat updates the name and keeps the rank.
     OpenProject { repository: PathBuf, name: String },
+    /// A deliberate user open may clear an earlier explicit removal. Routine
+    /// sync upserts cannot, because one may have been queued before the close.
+    ReopenProject { repository: PathBuf, name: String },
     /// Removes the project and every channel inside it. A project nobody has
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
@@ -192,6 +204,10 @@ impl ModelEdit {
     pub fn canonicalized(self) -> Result<Self, String> {
         Ok(match self {
             Self::OpenProject { repository, name } => Self::OpenProject {
+                repository: canonical_repository(&repository)?,
+                name,
+            },
+            Self::ReopenProject { repository, name } => Self::ReopenProject {
                 repository: canonical_repository(&repository)?,
                 name,
             },

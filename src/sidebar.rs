@@ -4988,6 +4988,7 @@ pub enum ProjectCommand {
     RepositoryUrl,
     OpenEditor(String),
     Delete,
+    Remove,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5036,6 +5037,8 @@ fn context_controls<'a>(
         }
         if worktree_id.is_some() {
             commands.push(("Delete worktree…".to_owned(), None, ProjectCommand::Delete));
+        } else {
+            commands.push(("Remove project…".to_owned(), None, ProjectCommand::Remove));
         }
         let entries = commands
             .iter()
