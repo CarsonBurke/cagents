@@ -1440,11 +1440,10 @@ impl Runtime {
             (None, "Ready")
         };
         if let Some(glyph) = glyph {
-            status.push(
-                widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                    .size(12)
-                    .into(),
-            );
+            status.push(crate::ui_controls::passive_icon(
+                crate::ui_controls::symbolic_icon(glyph),
+                12,
+            ));
         }
         status.push(
             design::caption(state)
@@ -1466,9 +1465,7 @@ impl Runtime {
         if let Some(branch) = &place.branch {
             status.push(
                 widget::row::with_children(vec![
-                    widget::icon(crate::sidebar::worktree_icon())
-                        .size(12)
-                        .into(),
+                    crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
                     design::caption(branch.clone())
                         .class(cosmic::theme::Text::Custom(design::muted_text))
                         .wrapping(iced::widget::text::Wrapping::None)
@@ -1495,7 +1492,7 @@ impl Runtime {
             let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
             spend.push(crate::interaction::tooltip(
                 widget::row::with_children(vec![
-                    crate::ui_controls::budget_radial(used, design::budget_tone(used)),
+                    crate::ui_controls::budget_radial(used),
                     design::caption(format!("{:.0}%", used * 100.0))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
@@ -1814,14 +1811,16 @@ impl Runtime {
             .ellipsize(iced::widget::text::Ellipsize::End(
                 iced::advanced::text::EllipsizeHeightLimit::Lines(1),
             ));
-        let icon = widget::icon(crate::ui_controls::symbolic_icon("avatar-default-symbolic"))
-            .size(design::COMPACT_ICON_SIZE);
+        let icon = crate::ui_controls::symbolic_icon("avatar-default-symbolic");
         if transitioning || !self.choosing() {
             // Fixed: stated, not offered.
             return crate::interaction::tooltip(
-                widget::row::with_children(vec![icon.into(), label.into()])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
+                    label.into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
                 format!(
                     "This conversation runs on {}. Start a new one to use another account.",
                     accounts.current
@@ -1830,7 +1829,7 @@ impl Runtime {
         }
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
-                icon.into(),
+                widget::icon(icon).size(design::COMPACT_ICON_SIZE).into(),
                 label.into(),
                 widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
                     .size(design::COMPACT_ICON_SIZE)
@@ -1851,10 +1850,7 @@ impl Runtime {
                     .map(|choice| {
                         let mut row: Vec<Element<'a, Message>> = Vec::new();
                         match choice.used {
-                            Some(used) => row.push(crate::ui_controls::budget_radial(
-                                used,
-                                design::budget_tone(used),
-                            )),
+                            Some(used) => row.push(crate::ui_controls::budget_radial(used)),
                             None => row.push(
                                 iced::widget::Space::new()
                                     .width(design::RADIAL_GAUGE_SIZE)
@@ -2327,9 +2323,10 @@ fn request_view<'a>(
             // The same glyph the status line shows while the agent waits
             // on the reader, so the pane and the panel agree about who is
             // holding the conversation up.
-            widget::icon(crate::ui_controls::symbolic_icon("agent-waiting-symbolic"))
-                .size(design::ROW_ICON_SIZE)
-                .into(),
+            crate::ui_controls::passive_icon(
+                crate::ui_controls::symbolic_icon("agent-waiting-symbolic"),
+                design::ROW_ICON_SIZE,
+            ),
             design::heading(request.title.as_str())
                 .width(Length::Fill)
                 .into(),
