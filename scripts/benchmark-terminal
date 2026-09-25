@@ -1,9 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
+caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+# The example runs from the repository, but path options belong to the
+# directory where the developer invoked this script.
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+        --socket|--summarize-trace)
+            ((i + 1 < ${#args[@]})) && [[ -n ${args[i + 1]} ]] || {
+                printf '%s requires a path\n' "${args[i]}" >&2
+                exit 2
+            }
+            ((i += 1))
+            case ${args[i]} in
+                /*) ;;
+                *) args[i]=$caller_cwd/${args[i]} ;;
+            esac
+            ;;
+    esac
+done
 # Synthetic demand drives real PTY parsing/capture. --socket PATH additionally
 # uses the matched running daemon and production reusable IPC connection.
 # --emit MODE runs only the output generator, including inside the native UI.
 # Enable stage timing separately: RUST_LOG=cagents::terminal_pipeline=trace.
-exec cargo run --release --locked --no-default-features --features host --example terminal-workload -- "$@"
+exec cargo run --release --locked --no-default-features --features host --example terminal-workload -- "${args[@]}"

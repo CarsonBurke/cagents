@@ -87,8 +87,8 @@ scripts/run-development                 # with the embedded browser
 | --- | --- |
 | `--browserless` | Build without Servo and open saved browser URLs in the system browser |
 | `--debug` | Enable Rust backtraces and `cagents=debug,cagentsd=debug,warn` tracing; an explicit `RUST_LOG` or `RUST_BACKTRACE` takes precedence |
-| `--fresh-daemon` | Stop the existing development daemon before launching |
-| `--log-file PATH` | Write UI tracing and panic output to `PATH`; Cargo diagnostics stay in the terminal |
+| `--fresh-daemon` | Stop the existing development daemon after all three builds succeed, before launching |
+| `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -226,3 +226,5 @@ scripts/install-ceditor --prefix /absolute/path
 ```
 
 The development runner uses an isolated application and settings identity.
+The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
+built executable.

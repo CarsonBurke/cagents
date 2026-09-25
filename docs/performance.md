@@ -14,7 +14,8 @@ below.
 sh scripts/run-redraw-latency /tmp/cagents-redraw-reference
 ```
 
-The output directory must not already exist. This `latency-harness` lane builds
+The output directory must not already exist. Relative paths are resolved from
+the directory where the script is invoked. This `latency-harness` lane builds
 the CLI, host, and browserless UI separately in **release** mode, then runs five
 fresh UI processes with private HOME and XDG directories. Each run walks eight
 synthetic unloaded cards with a fixed seed: 32 warmups and 256 recorded
@@ -60,6 +61,7 @@ single- and multi-terminal input probes. Default mode uses real PTYs in process;
 `--socket` uses the matched daemon and the production hosted IPC connection.
 Both drive synthetic 60 Hz snapshot acknowledgements. Daemon mode retains exited
 descriptors, so never point it at a personal or production daemon.
+The script resolves relative socket and trace paths from the calling directory.
 
 Budgets:
 

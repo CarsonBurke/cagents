@@ -15,6 +15,9 @@ cargo build --locked --profile dev-runtime --package ceditor --features developm
 # It does not build or start any cagents binary.
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
+if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+    target=$target/$CARGO_BUILD_TARGET
+fi
 # Wayland task switchers resolve icons through the application ID's desktop entry.
 # Keep development separate without maintaining a second copy of the artwork.
 data_home=${XDG_DATA_HOME:-"${HOME:?HOME must be set}/.local/share"}
@@ -27,8 +30,7 @@ desktop_exec=$(printf '%s' "$target/dev-runtime/ceditor" | sed \
     -e 's/"/\\"/g' \
     -e 's/`/\\`/g' \
     -e 's/\$/\\$/g' \
-    -e 's/%/%%/g' \
-    -e 's/\\/\\\\/g')
+    -e 's/%/%%/g')
 {
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in

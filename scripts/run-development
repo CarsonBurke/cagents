@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
@@ -14,12 +15,16 @@ while [ "$#" -gt 0 ]; do
         --debug) debug=true ;;
         --fresh-daemon) fresh_daemon=true ;;
         --log-file)
-            if [ "$#" -lt 2 ]; then
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "--log-file requires a path" >&2
                 exit 2
             fi
             shift
             log_file=$1
+            case $log_file in
+                /*) ;;
+                *) log_file=$caller_cwd/$log_file ;;
+            esac
             ;;
         --help)
             cat <<'USAGE'
@@ -28,8 +33,8 @@ Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
 Options:
   --browserless    Build without Servo and open saved browser URLs externally
   --debug          Enable cagents debug logs and Rust backtraces
-  --fresh-daemon   Stop the existing development daemon before launching
-  --log-file PATH  Write UI tracing output to PATH
+  --fresh-daemon   Stop the existing development daemon after building
+  --log-file PATH  Write UI tracing output to PATH (relative to caller)
   --help           Show this help
 USAGE
             exit 0
@@ -86,20 +91,6 @@ run_cli() {
     fi
 }
 
-if [ "$fresh_daemon" = true ]; then
-    run_cli daemon stop-for-rebuild >/dev/null
-    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
-    remaining=100
-    while [ -e "$socket" ]; do
-        if [ "$remaining" -eq 0 ]; then
-            printf '%s\n' "development daemon did not stop within 5 seconds" >&2
-            exit 1
-        fi
-        remaining=$((remaining - 1))
-        sleep 0.05
-    done
-fi
-
 # Build each product boundary separately. Cargo features are package-wide, so a
 # single --bins invocation would reunify the UI and host graphs and make the UI
 # compile Ghostty while making the daemon compile libcosmic.
@@ -117,6 +108,22 @@ else
         --features development,host --bin cagentsd
     cargo build --locked --profile dev-runtime \
         --features development,integrated-browser --bin cagents-ui
+fi
+
+# Keep the current development session alive if any part of the matched build
+# fails. Only stop its daemon once the replacement set is ready to launch.
+if [ "$fresh_daemon" = true ]; then
+    run_cli daemon stop-for-rebuild >/dev/null
+    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
+    remaining=100
+    while [ -e "$socket" ]; do
+        if [ "$remaining" -eq 0 ]; then
+            printf '%s\n' "development daemon did not stop within 5 seconds" >&2
+            exit 1
+        fi
+        remaining=$((remaining - 1))
+        sleep 0.05
+    done
 fi
 
 run_ui() {
