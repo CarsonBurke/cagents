@@ -22,6 +22,7 @@ use cosmic::{
     theme,
     widget::{self, button, icon},
 };
+use unicode_casefold::UnicodeCaseFold;
 use url::Url;
 
 use crate::{
@@ -7853,15 +7854,15 @@ fn filtered_projects<'a>(
     compact: bool,
 ) -> Vec<FilteredProject<'a>> {
     let query = if compact && !state.controls_expanded {
-        String::new()
+        fold("")
     } else {
-        state.query.trim().to_ascii_lowercase()
+        fold(state.query.trim())
     };
     model
         .projects
         .iter()
         .filter_map(|project| {
-            let project_matches = query.is_empty() || project.matches(&query);
+            let project_matches = query.is_empty() || project.matches(query.as_ref());
             // An unreachable project draws none of its children, so it must
             // not be matched or counted through them either: an attention or
             // pull-request filter asks which worktrees need looking at, and
@@ -7879,7 +7880,7 @@ fn filtered_projects<'a>(
                 });
             }
             let channels = channels_in_display_order(project.channels.iter().filter(|channel| {
-                (project_matches || channel.folded_title.contains(&query))
+                (project_matches || channel.folded_title.contains(query.as_ref()))
                     && match state.filter {
                         SidebarFilter::All => true,
                         SidebarFilter::Attention => channel.unread,
@@ -7901,7 +7902,7 @@ fn filtered_projects<'a>(
                         }
                         SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
                     })
-                    .filter(|worktree| project_matches || worktree.matches(&query)),
+                    .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
             );
             let visible = match state.filter {
                 SidebarFilter::All => {
@@ -8036,7 +8037,7 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
 /// Case-folds a filter key. Entities store the result so the free-text filter
 /// never folds a candidate while rendering.
 fn fold(value: &str) -> Box<str> {
-    value.to_ascii_lowercase().into_boxed_str()
+    value.case_fold().collect::<String>().into_boxed_str()
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -10881,6 +10882,55 @@ pub(crate) mod tests {
         );
         state.acknowledge_agent_update(second);
         assert!(filtered_projects(&model, &state, false).is_empty());
+    }
+
+    #[test]
+    fn sidebar_search_matches_unicode_case_in_each_row_type() {
+        let worktree = SidebarWorktree::new(
+            WorktreeId::new(),
+            "/repo/equipe".into(),
+            Some("Équipe".into()),
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        let mut project = SidebarProject::new(
+            project_id(1),
+            RepositoryId(Uuid::new_v4()),
+            "Überblick".into(),
+            "/repo/plain".into(),
+            vec![worktree],
+            Vec::new(),
+        );
+        project.channels.push(SidebarChannel::new(
+            ChannelId::new(),
+            "München".into(),
+            false,
+            None,
+            false,
+            0,
+            false,
+            1,
+        ));
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project]);
+        let mut state = SidebarState::default();
+
+        state.apply(&SidebarAction::SearchChanged("überblick".into()));
+        assert_eq!(filtered_projects(&model, &state, false).len(), 1);
+        state.apply(&SidebarAction::SearchChanged("équipe".into()));
+        assert_eq!(
+            filtered_projects(&model, &state, false)[0].worktrees.len(),
+            1
+        );
+        state.apply(&SidebarAction::SearchChanged("münchen".into()));
+        assert_eq!(
+            filtered_projects(&model, &state, false)[0].channels.len(),
+            1
+        );
+        assert_eq!(fold("ΟΣ"), fold("ος"), "final sigma must case-fold");
+        assert_eq!(fold("Straße"), fold("STRASSE"), "full folds can expand");
     }
 
     #[test]
