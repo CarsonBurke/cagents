@@ -2,6 +2,7 @@
 # Dedicated actual-UI release workload; never use workstation timings as CI gates.
 set -eu
 umask 077
+caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 usage() {
@@ -46,8 +47,12 @@ esac
 revision=$(git rev-parse HEAD)
 if git diff --quiet && git diff --cached --quiet; then dirty=false; else dirty=true; fi
 if [ "$#" -eq 1 ]; then
-    mkdir -m 700 -- "$1"
-    output=$(CDPATH= cd -- "$1" && pwd)
+    case $1 in
+        /*) output=$1 ;;
+        *) output=$caller_cwd/$1 ;;
+    esac
+    mkdir -m 700 -- "$output"
+    output=$(CDPATH= cd -- "$output" && pwd)
 else
     output=$(mktemp -d /tmp/cagents-redraw-latency.XXXXXXXX)
 fi

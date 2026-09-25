@@ -15,6 +15,9 @@ case "$prefix" in /*) ;; *) printf '%s\n' '--prefix must be absolute' >&2; exit 
 cargo build --locked --release --package ceditor
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
+if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+    target=$target/$CARGO_BUILD_TARGET
+fi
 install -d "$prefix/bin"
 staged=$(mktemp "$prefix/bin/.ceditor-install.XXXXXX")
 trap 'rm -f -- "$staged"' EXIT
