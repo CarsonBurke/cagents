@@ -149,10 +149,20 @@ impl Cagents {
 
     /// Releases one in-flight terminal start and decides the observations it
     /// held back, then lets the next restored agent attach.
-    pub(super) fn finish_terminal_start(&mut self) -> Task<Message> {
-        let remaining = self.terminal_starts_in_flight().saturating_sub(1);
-        self.terminal_starts
-            .store(remaining, std::sync::atomic::Ordering::Relaxed);
+    pub(super) fn finish_terminal_start(&mut self, card: CardId) -> Task<Message> {
+        let remaining: usize = {
+            let starts = self
+                .terminal_starts
+                .get_mut()
+                .expect("terminal starts lock");
+            if let Some(count) = starts.get_mut(&card) {
+                *count -= 1;
+                if *count == 0 {
+                    starts.remove(&card);
+                }
+            }
+            starts.values().sum()
+        };
         if remaining > 0 {
             return Task::none();
         }
@@ -167,14 +177,27 @@ impl Cagents {
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {
         self.terminal_starts
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .lock()
+            .expect("terminal starts lock")
+            .values()
+            .sum()
+    }
+
+    pub(super) fn terminal_start_in_flight(&self, card: CardId) -> bool {
+        self.terminal_starts
+            .lock()
+            .expect("terminal starts lock")
+            .contains_key(&card)
     }
 
     /// Counts a terminal start from the start path, which only holds `&self`.
-    pub(super) fn begin_terminal_start(&self) {
-        let started = self.terminal_starts_in_flight().saturating_add(1);
+    pub(super) fn begin_terminal_start(&self, card: CardId) {
         self.terminal_starts
-            .store(started, std::sync::atomic::Ordering::Relaxed);
+            .lock()
+            .expect("terminal starts lock")
+            .entry(card)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
     }
 
     fn adoptable(&self, session: &TerminalSession) -> bool {
@@ -458,7 +481,8 @@ mod tests {
             host_incarnation: HostIncarnation::new("replacement"),
         };
         assert!(!app.adoptable(&descendant));
-        drop(app.finish_terminal_start());
+        let card = cards_for(&app, saved.id)[0].id;
+        drop(app.finish_terminal_start(card));
         let cards_before = app.durable.cards.len();
         drop(app.observe_hosted_terminals(vec![descendant.clone()]));
         assert_eq!(app.durable.cards.len(), cards_before);
@@ -506,13 +530,14 @@ mod tests {
         register_worktrees(&mut app, &["/repo"]);
         let _ = app.select_worktree("/repo".into(), false);
         let session = hosted("/repo");
-        app.begin_terminal_start();
+        let card = CardId::new();
+        app.begin_terminal_start(card);
 
         let _ = app.observe_hosted_terminals(vec![session.clone()]);
         assert!(cards_for(&app, session.id).is_empty());
         assert_eq!(app.pending_adoptions.len(), 1);
 
-        let _ = app.finish_terminal_start();
+        let _ = app.finish_terminal_start(card);
         assert_eq!(cards_for(&app, session.id).len(), 1);
         assert!(app.pending_adoptions.is_empty());
     }

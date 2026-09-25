@@ -3727,7 +3727,7 @@ pub struct Cagents {
     /// is to know whether any start is outstanding. The counter is atomic for
     /// interior mutability - the start path holds `&self` - and never for
     /// concurrency: every mutation happens on the update thread.
-    terminal_starts: std::sync::atomic::AtomicUsize,
+    terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
     /// Restored agent terminals that are not on screen, attached one at a
@@ -4070,6 +4070,27 @@ impl Cagents {
         open_cards: bool,
     ) -> Task<Message> {
         let project_id = project_id.unwrap_or_default();
+        if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
+            if self.project_ui.is_reopening(&repository) {
+                self.status = Some(TransientNotice::warning(
+                    "This project is still opening. Try again when it finishes.",
+                ));
+                return Task::none();
+            }
+            if self
+                .project_ui
+                .closing
+                .values()
+                .any(|closing| *closing == repository)
+            {
+                self.status = Some(TransientNotice::warning(
+                    "Wait for this project to finish closing before reopening it.",
+                ));
+                return Task::none();
+            }
+            self.project_ui.closed.remove(&repository);
+            self.project_ui.reopening.insert(project_id, repository);
+        }
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -4305,7 +4326,7 @@ impl Cagents {
     ) -> Task<Message> {
         // Recovery can replace the identity this start ends up with, so
         // adoption has to know a start is outstanding before the task runs.
-        self.begin_terminal_start();
+        self.begin_terminal_start(card);
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
@@ -4330,7 +4351,7 @@ impl Cagents {
     /// terminal the daemon still hosts is attached: launching one again is the
     /// user's decision, made by opening the card.
     fn attach_restored_agent(&self, card: CardId, session: TerminalSession) -> Task<Message> {
-        self.begin_terminal_start();
+        self.begin_terminal_start(card);
         let config = self.terminal_config(false);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
@@ -4411,7 +4432,7 @@ impl Cagents {
             }
             // Nothing will claim this identity, so a held observation
             // is free to decide about it.
-            return self.finish_terminal_start();
+            return self.finish_terminal_start(card);
         }
         // A card still hibernated when its start lands is a restored agent
         // attached only for its row.
@@ -4460,14 +4481,14 @@ impl Cagents {
                     }
                     self.persist();
                     tasks.push(self.commit_terminal_handoffs());
-                    tasks.push(self.finish_terminal_start());
+                    tasks.push(self.finish_terminal_start(card));
                     return Task::batch(tasks);
                 }
                 let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                     tasks.push(cosmic::task::message(Message::LifecycleSweep));
                     self.persist();
                     tasks.push(self.commit_terminal_handoffs());
-                    tasks.push(self.finish_terminal_start());
+                    tasks.push(self.finish_terminal_start(card));
                     return Task::batch(tasks);
                 };
                 if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
@@ -4523,7 +4544,7 @@ impl Cagents {
         tasks.push(self.commit_terminal_handoffs());
         // Released last: until the card holds the identity this start
         // settled on, adoption would see an unclaimed live terminal.
-        tasks.push(self.finish_terminal_start());
+        tasks.push(self.finish_terminal_start(card));
         Task::batch(tasks)
     }
 
@@ -9593,7 +9614,7 @@ impl Application for Cagents {
             terminal_wake_tx,
             terminal_wake_rx,
             hosted_terminals_rx,
-            terminal_starts: std::sync::atomic::AtomicUsize::new(0),
+            terminal_starts: std::sync::Mutex::new(HashMap::new()),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -9910,13 +9931,13 @@ impl Application for Cagents {
             } => {
                 match result {
                     Ok(Some(started)) => self.terminal_started(card, terminal, Ok(started)),
-                    Ok(None) => self.finish_terminal_start(),
+                    Ok(None) => self.finish_terminal_start(card),
                     // Nobody is looking at this card, so its failure is not
                     // reported here. Opening it starts the terminal again and
                     // reports whatever still stands in the way.
                     Err(error) => {
                         tracing::debug!(?card, %error, "restored agent terminal stays detached");
-                        self.finish_terminal_start()
+                        self.finish_terminal_start(card)
                     }
                 }
             }
@@ -10026,6 +10047,10 @@ impl Application for Cagents {
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
+                        if self.project_ui.closed.contains(&loaded.project.repository) {
+                            self.repository_generations.remove(&project_id);
+                            return Task::none();
+                        }
                         let pr_request = if let GitHubAvailability::Ready {
                             repository_key,
                             pull_requests,
@@ -10122,6 +10147,7 @@ impl Application for Cagents {
                                     status.as_ref(),
                                 ));
                             }
+                            let existing_id = existing.id;
                             self.repository_generations.remove(&project_id);
                             if let Some(previous) =
                                 self.repository_pr_cancellations.remove(&project_id)
@@ -10141,6 +10167,17 @@ impl Application for Cagents {
                             // the new row may already hold the pane just opened.
                             self.refresh_sidebar_channels();
                             self.refresh_sidebar_worktree_panes();
+                            if open_cards {
+                                // The picker can resolve to a project already in this
+                                // window. Finish the explicit reopen against that row;
+                                // the provisional id never gets a row of its own.
+                                if let Some(repository) =
+                                    self.project_ui.reopening.remove(&project_id)
+                                {
+                                    self.project_ui.reopening.insert(existing_id, repository);
+                                    self.publish_project_opened(existing_id);
+                                }
+                            }
                             return task;
                         }
                         if let Some(session) = &self.session {
@@ -10310,6 +10347,7 @@ impl Application for Cagents {
                         ]);
                     }
                     Err(error) => {
+                        self.project_ui.reopening.remove(&project_id);
                         let unavailable = GitHubAvailability::Failed {
                             detail: error.clone(),
                         };
@@ -10324,6 +10362,7 @@ impl Application for Cagents {
                         self.github_availability.insert(project_id, unavailable);
                         self.status = Some(TransientNotice::error(error.clone()));
                         finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
+                        task = self.apply_closed_project_tombstones();
                     }
                 }
                 task
@@ -10489,6 +10528,9 @@ impl Application for Cagents {
                 }
                 if save_finished && closing_card == Some(card) {
                     tasks.push(self.advance_dirty_close());
+                }
+                if !self.project_ui.closing.is_empty() {
+                    tasks.push(self.complete_closed_projects());
                 }
                 Task::batch(tasks)
             }
@@ -14424,6 +14466,7 @@ mod tests {
                 sequence: frame as u64 + 1,
                 projects: Vec::new(),
                 channels,
+                closed_projects: Vec::new(),
             };
             match frame {
                 // One adopted row.
@@ -18177,7 +18220,7 @@ mod tests {
             terminal_wake_tx,
             terminal_wake_rx,
             hosted_terminals_rx: async_channel::unbounded().1,
-            terminal_starts: std::sync::atomic::AtomicUsize::new(0),
+            terminal_starts: std::sync::Mutex::new(HashMap::new()),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),

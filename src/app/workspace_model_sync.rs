@@ -33,6 +33,14 @@ pub enum ModelUpdate {
     Connected(WorkspaceModel),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
+    Reopened {
+        repository: PathBuf,
+        model: WorkspaceModel,
+    },
+    ReopenFailed {
+        repository: PathBuf,
+        error: String,
+    },
     Edited {
         sequence: u64,
         edit: ModelEdit,
@@ -151,7 +159,7 @@ fn publish(
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
         *pending = Some(request.clone());
-        match send(&mut client, request, updates) {
+        match send(&mut client, request.clone(), updates) {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -165,6 +173,12 @@ fn publish(
                     }
                 ) {
                     *pending = None;
+                    if let ModelEdit::ReopenProject { repository, .. } = request {
+                        let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
+                            repository,
+                            error: error.to_string(),
+                        });
+                    }
                 }
                 return Err(error.to_string());
             }
@@ -181,6 +195,10 @@ fn send(
         ModelEdit::CreateChannel { id, .. } => Some(*id),
         _ => None,
     };
+    let reopened = match &edit {
+        ModelEdit::ReopenProject { repository, .. } => Some(repository.clone()),
+        _ => None,
+    };
     let model = client.edit_workspace_model(edit)?;
     // The originating client is deliberately not sent its own echo, so this
     // response is how the window that minted the channel learns the rank the
@@ -192,6 +210,9 @@ fn send(
             channel: id,
             ordinal: channel.ordinal,
         });
+    }
+    if let Some(repository) = reopened {
+        let _ = updates.send_blocking(ModelUpdate::Reopened { repository, model });
     }
     Ok(())
 }
@@ -211,15 +232,60 @@ impl Cagents {
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::Connected(model) => {
+                if model.identity == self.workspace_model.identity
+                    && model.sequence < self.workspace_model.sequence
+                {
+                    return Task::none();
+                }
                 self.join_workspace_model(model.identity);
                 self.workspace_model = model;
-                self.reconcile_workspace_model()
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Read(model) => {
+                if model.identity == self.workspace_model.identity
+                    && model.sequence < self.workspace_model.sequence
+                {
+                    return Task::none();
+                }
                 self.workspace_model = model;
-                self.reconcile_workspace_model()
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::Reopened { repository, model } => {
+                if model.identity == self.workspace_model.identity
+                    && model.sequence < self.workspace_model.sequence
+                {
+                    self.project_ui
+                        .reopening
+                        .retain(|_, path| path != &repository);
+                    return self.apply_closed_project_tombstones();
+                }
+                self.join_workspace_model(model.identity);
+                if model.project(&repository).is_some() {
+                    self.cancel_shared_project_close(&repository);
+                    self.project_ui.closed.remove(&repository);
+                    self.project_ui
+                        .reopening
+                        .retain(|_, path| path != &repository);
+                }
+                self.workspace_model = model;
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::ReopenFailed { repository, error } => {
+                self.project_ui
+                    .reopening
+                    .retain(|_, path| path != &repository);
+                self.status = Some(crate::app::TransientNotice::error(format!(
+                    "Could not reopen project: {error}"
+                )));
+                self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
+                if sequence <= self.workspace_model.sequence {
+                    return Task::none();
+                }
                 // An explicit delete is an instruction rather than an absence,
                 // so folding it in retires the channel whether or not this
                 // window had recorded the channel as shared - which is exactly
@@ -228,7 +294,23 @@ impl Cagents {
                     ModelEdit::DeleteChannel { id } => Some(*id),
                     _ => None,
                 };
+                let closing = match &edit {
+                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
+                    ModelEdit::ReopenProject { repository, .. } => {
+                        self.cancel_shared_project_close(repository);
+                        self.project_ui.closed.remove(repository);
+                        // The observer can see a reopen from another window
+                        // before this window's own publish reply. Only that
+                        // reply completes this window's pending intent.
+                        None
+                    }
+                    ModelEdit::OpenProject { .. } => None,
+                    _ => None,
+                };
                 self.workspace_model.fold(sequence, &edit);
+                let removed = closing.map_or_else(Task::none, |repository| {
+                    self.close_shared_project(&repository)
+                });
                 let retired = deleted.map_or_else(Task::none, |id| {
                     // The registry has authoritatively removed this identity,
                     // even if its creation acknowledgment never reached us.
@@ -242,7 +324,7 @@ impl Cagents {
                     }
                     self.delete_channel(id)
                 });
-                Task::batch([retired, self.reconcile_workspace_model()])
+                Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
             ModelUpdate::Ranked { channel, ordinal } => {
                 let Some(index) = self
@@ -277,6 +359,24 @@ impl Cagents {
                 Task::none()
             }
         }
+    }
+
+    pub(super) fn apply_closed_project_tombstones(&mut self) -> Task<Message> {
+        let closed = self
+            .workspace_model
+            .closed_projects
+            .iter()
+            .filter(|repository| {
+                !self.project_ui.closed.contains(*repository)
+                    && !self.project_ui.is_reopening(repository)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Task::batch(
+            closed
+                .into_iter()
+                .map(|repository| self.close_shared_project(&repository)),
+        )
     }
 
     /// Settles what this window has shared with the registry it just reached.
@@ -332,6 +432,9 @@ impl Cagents {
         // Projects first, so a channel's owner exists by the time the channel is
         // considered.
         for shared in &model.projects {
+            if self.project_ui.closed.contains(&shared.repository) {
+                continue;
+            }
             match self.adopt_shared_project(shared) {
                 Adoption::Applied => changed = true,
                 Adoption::Opening(task) => tasks.push(task),
@@ -459,6 +562,9 @@ impl Cagents {
 
     /// Opens a project this window does not have.
     fn adopt_shared_project(&mut self, shared: &ModelProject) -> Adoption {
+        if self.project_ui.closed.contains(&shared.repository) {
+            return Adoption::Retained;
+        }
         if self.project_for_repository(&shared.repository).is_some() {
             return Adoption::Retained;
         }
@@ -586,6 +692,9 @@ impl Cagents {
             return;
         };
         let repository = project.repository.clone();
+        if self.project_ui.closed.contains(&repository) {
+            return;
+        }
         let name = project.name.clone();
         self.publish_model_edit(ModelEdit::OpenProject {
             repository: repository.clone(),
@@ -606,10 +715,17 @@ impl Cagents {
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;
         };
-        self.publish_model_edit(ModelEdit::OpenProject {
-            repository: project.repository.clone(),
-            name: project.name.clone(),
-        });
+        if self.project_ui.closed.contains(&project.repository) {
+            return;
+        }
+        let repository = project.repository.clone();
+        let name = project.name.clone();
+        let edit = if self.project_ui.is_reopening(&repository) {
+            ModelEdit::ReopenProject { repository, name }
+        } else {
+            ModelEdit::OpenProject { repository, name }
+        };
+        self.publish_model_edit(edit);
     }
 
     /// Queues one shared-model edit without waiting for it.
@@ -677,7 +793,79 @@ mod tests {
             sequence: channels.len() as u64,
             projects: Vec::new(),
             channels,
+            closed_projects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_reconnecting_window_applies_a_missed_project_close() {
+        let (mut app, project, repository) = app_with_project();
+        let mut model = registry(Vec::new());
+        model.closed_projects.push(repository.clone());
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(model)));
+        assert!(app.project_ui.closing.contains_key(&project));
+        let generation = app.project_ui.close_generation[&project];
+        drop(
+            app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(()),
+            )),
+        );
+        assert!(app.sidebar_model.project(project).is_none());
+        assert!(app.project_ui.closed.contains(&repository));
+    }
+
+    #[test]
+    fn a_late_close_callback_cannot_override_a_reopen() {
+        let (mut app, project, repository) = app_with_project();
+        let mut model = registry(Vec::new());
+        model.sequence = 1;
+        model.closed_projects.push(repository.clone());
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(model)));
+        assert!(app.project_ui.closing.contains_key(&project));
+        let generation = app.project_ui.close_generation[&project];
+
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 2,
+            edit: ModelEdit::ReopenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+            },
+        }));
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 1,
+            edit: ModelEdit::CloseProject {
+                repository: repository.clone(),
+            },
+        }));
+        drop(
+            app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
+                project,
+                generation,
+                Ok(()),
+            )),
+        );
+        assert!(app.sidebar_model.project(project).is_some());
+        assert!(!app.project_ui.closed.contains(&repository));
+    }
+
+    #[test]
+    fn an_unchanged_explicit_open_acknowledges_the_pending_reopen() {
+        let (mut app, project, repository) = app_with_project();
+        app.project_ui.reopening.insert(project, repository.clone());
+        let mut model = registry(Vec::new());
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            ordinal: 1,
+        });
+        drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
+            repository: repository.clone(),
+            model,
+        }));
+        assert!(!app.project_ui.is_reopening(&repository));
+        assert!(app.sidebar_model.project(project).is_some());
     }
 
     /// Replaces the publish queue with one the test can read, which is how the

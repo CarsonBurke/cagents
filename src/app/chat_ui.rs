@@ -5458,6 +5458,7 @@ mod tests {
     fn a_starting_terminal_opens_no_conversation_beside_it() {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let card = stopped_agent_terminal(&mut app, &[], false);
+        app.begin_terminal_start(card);
         assert!(app.pending_terminal_spawn(card));
         let before = app.durable.clone();
         let _ = app.update(Message::ChatUi(Action::Switch(card)));

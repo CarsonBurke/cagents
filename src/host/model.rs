@@ -122,11 +122,22 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let closed_projects = self
+            .db
+            .prepare("SELECT repository FROM closed_projects ORDER BY repository")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
         Ok(WorkspaceModel {
             identity,
             sequence: sequence as u64,
             projects,
             channels,
+            closed_projects,
         })
     }
 
@@ -138,37 +149,61 @@ impl Registry {
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
-            ModelEdit::OpenProject { repository, name } => {
+            ModelEdit::OpenProject { repository, name }
+            | ModelEdit::ReopenProject { repository, name } => {
                 let key = repository_key(repository)?;
-                let existing: Option<String> = transaction
+                let explicit = matches!(edit, ModelEdit::ReopenProject { .. });
+                let tombstoned: bool = transaction
                     .query_row(
-                        "SELECT name FROM projects WHERE repository = ?1",
+                        "SELECT EXISTS(SELECT 1 FROM closed_projects WHERE repository = ?1)",
                         params![key],
                         |row| row.get(0),
                     )
-                    .optional()
                     .map_err(|error| error.to_string())?;
-                match existing {
-                    Some(current) if current == *name => false,
-                    Some(_) => {
+                if tombstoned && !explicit {
+                    false
+                } else {
+                    let reopened = if explicit {
                         transaction
                             .execute(
-                                "UPDATE projects SET name = ?2 WHERE repository = ?1",
-                                params![key, name],
+                                "DELETE FROM closed_projects WHERE repository = ?1",
+                                params![key],
                             )
-                            .map_err(|error| error.to_string())?;
-                        true
-                    }
-                    None => {
-                        let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
-                        transaction
-                            .execute(
-                                "INSERT INTO projects(repository, name, ordinal) \
+                            .map_err(|error| error.to_string())?
+                            > 0
+                    } else {
+                        false
+                    };
+                    let existing: Option<String> = transaction
+                        .query_row(
+                            "SELECT name FROM projects WHERE repository = ?1",
+                            params![key],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    match existing {
+                        Some(current) if current == *name => reopened,
+                        Some(_) => {
+                            transaction
+                                .execute(
+                                    "UPDATE projects SET name = ?2 WHERE repository = ?1",
+                                    params![key, name],
+                                )
+                                .map_err(|error| error.to_string())?;
+                            true
+                        }
+                        None => {
+                            let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
+                            transaction
+                                .execute(
+                                    "INSERT INTO projects(repository, name, ordinal) \
                                  VALUES (?1, ?2, ?3)",
-                                params![key, name, ordinal],
-                            )
-                            .map_err(|error| error.to_string())?;
-                        true
+                                    params![key, name, ordinal],
+                                )
+                                .map_err(|error| error.to_string())?;
+                            true
+                        }
                     }
                 }
             }
@@ -177,10 +212,18 @@ impl Registry {
             // nobody has open is reachable from no window's sidebar.
             ModelEdit::CloseProject { repository } => {
                 let key = repository_key(repository)?;
-                transaction
+                let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
                     .map_err(|error| error.to_string())?
-                    > 0
+                    > 0;
+                let recorded = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO closed_projects(repository) VALUES (?1)",
+                        params![key],
+                    )
+                    .map_err(|error| error.to_string())?
+                    > 0;
+                removed || recorded
             }
             ModelEdit::CreateChannel {
                 id,
@@ -392,6 +435,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
              ordinal INTEGER NOT NULL
          ) STRICT;
          CREATE INDEX IF NOT EXISTS channels_by_repository ON channels(repository);
+         CREATE TABLE IF NOT EXISTS closed_projects(
+             repository TEXT PRIMARY KEY
+         ) STRICT;
          CREATE TABLE IF NOT EXISTS metadata(
              key INTEGER PRIMARY KEY CHECK(key = 0),
              identity TEXT NOT NULL,
@@ -491,6 +537,23 @@ mod tests {
         assert!(closed.model.channel(doomed).is_none());
         assert!(closed.model.channel(survivor).is_some());
         assert_eq!(closed.model.projects.len(), 1);
+        assert_eq!(closed.model.closed_projects, [PathBuf::from("/tmp/one")]);
+
+        let reopened = Registry::at(&_directory.path().join("model.sqlite3"))
+            .unwrap()
+            .model()
+            .unwrap();
+        assert_eq!(reopened.closed_projects, [PathBuf::from("/tmp/one")]);
+        let stale = registry.apply(&open("/tmp/one")).unwrap();
+        assert!(!stale.changed, "a queued upsert cannot undo a removal");
+        assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
+        let opened = registry
+            .apply(&ModelEdit::ReopenProject {
+                repository: PathBuf::from("/tmp/one"),
+                name: "one".into(),
+            })
+            .unwrap();
+        assert!(opened.model.closed_projects.is_empty());
     }
 
     /// An edit that changes nothing must be indistinguishable from not having

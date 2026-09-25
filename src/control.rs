@@ -1962,7 +1962,7 @@ fn project_output(
             // from a shell and one opened in a window are one row that no
             // sidebar can tell apart.
             let model = client
-                .edit_workspace_model(ModelEdit::OpenProject {
+                .edit_workspace_model(ModelEdit::ReopenProject {
                     repository: repository.clone(),
                     name: repository_display_name(&repository),
                 })
@@ -2612,6 +2612,7 @@ mod tests {
                     title,
                     ordinal: 4,
                 }],
+                closed_projects: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -2806,7 +2807,7 @@ mod tests {
             assert_eq!(
                 opened.request,
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::OpenProject {
+                    edit: ModelEdit::ReopenProject {
                         repository: served.clone(),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
@@ -2824,6 +2825,7 @@ mod tests {
                     ordinal: 2,
                 }],
                 channels: Vec::new(),
+                closed_projects: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -2881,6 +2883,7 @@ mod tests {
                 sequence: 7,
                 projects: served,
                 channels: Vec::new(),
+                closed_projects: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -3001,6 +3004,7 @@ mod tests {
                         sequence: 9,
                         projects: Vec::new(),
                         channels: Vec::new(),
+                        closed_projects: Vec::new(),
                     },
                 ),
             )
@@ -3056,6 +3060,7 @@ mod tests {
                     ordinal: *ordinal,
                 })
                 .collect(),
+            closed_projects: Vec::new(),
         }
     }
 

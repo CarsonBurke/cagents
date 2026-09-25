@@ -305,6 +305,7 @@ fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
     app.context_inspector_open = false;
     let card = app.workspace.focused().unwrap();
     app.cards.insert(card, CardRuntime::Loading);
+    app.begin_terminal_start(card);
     for message in [Message::CloseCard(card), Message::CommitClose(card)] {
         let _ = app.update(message);
         assert!(app.card_state(card).unwrap().existence.is_open());
@@ -325,6 +326,7 @@ fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
     };
     app.cards
         .insert(card, CardRuntime::Failed("previous terminal exited".into()));
+    drop(app.finish_terminal_start(card));
     let _unpolled_spawn = app.update(Message::RetryCard(card));
     let CardKind::Terminal(replacement) = &app.card_state(card).unwrap().kind else {
         unreachable!()
@@ -358,6 +360,15 @@ fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
     let _ = app.update(Message::CloseCard(card));
     assert!(app.terminal_close.is_some());
     assert_eq!(app.terminal_close_attempts.len(), 1);
+}
+
+#[test]
+fn an_unrelated_terminal_start_does_not_hold_a_loading_card_open() {
+    let mut app = tests::context_inspector_test_app(true);
+    let card = app.workspace.focused().unwrap();
+    app.cards.insert(card, CardRuntime::Loading);
+    app.begin_terminal_start(CardId::new());
+    assert!(!app.pending_terminal_spawn(card));
 }
 
 /// The fence exists so one intent cannot submit two concurrent requests, and
