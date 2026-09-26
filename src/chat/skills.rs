@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use yaml_rust::YamlLoader;
+use yaml_rust::scanner::{Scanner, TokenType};
 
 const MAX_ENTRIES: usize = 8192;
 const MAX_DEPTH: usize = 12;
@@ -284,7 +285,29 @@ fn frontmatter(text: &str) -> Option<(yaml_rust::Yaml, &str)> {
     let mut offset = header_start;
     for line in text[header_start..].split_inclusive('\n') {
         if line.trim() == "---" {
-            let documents = YamlLoader::load_from_str(&text[header_start..offset]).ok()?;
+            let header = &text[header_start..offset];
+            // The file-size bound alone does not bound YAML alias expansion.
+            // Skill metadata needs neither aliases nor deeply nested trees.
+            let mut depth = 0usize;
+            for token in Scanner::new(header.chars()) {
+                match token.1 {
+                    TokenType::Alias(_) => return None,
+                    TokenType::BlockSequenceStart
+                    | TokenType::BlockMappingStart
+                    | TokenType::FlowSequenceStart
+                    | TokenType::FlowMappingStart => {
+                        depth += 1;
+                        if depth > 32 {
+                            return None;
+                        }
+                    }
+                    TokenType::BlockEnd
+                    | TokenType::FlowSequenceEnd
+                    | TokenType::FlowMappingEnd => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            let documents = YamlLoader::load_from_str(header).ok()?;
             if documents.len() > 1 {
                 return None;
             }
@@ -367,6 +390,14 @@ fn parse_skill(path: &Path, provider: Provider, require_description: bool) -> Op
 mod tests {
     use super::*;
     use crate::model::LaunchRecipe;
+
+    #[test]
+    fn metadata_cannot_expand_aliases_or_unbounded_nesting() {
+        assert!(frontmatter("---\nname: &name review\ndescription: *name\n---\n").is_none());
+        let nested = format!("---\nextra: {}0{}\n---\n", "[".repeat(33), "]".repeat(33));
+        assert!(frontmatter(&nested).is_none());
+        assert!(frontmatter("---\nname: review\ndescription: 'literal *name'\n---\n").is_some());
+    }
 
     fn write_skill(path: &Path, name: &str, description: &str) {
         fs::create_dir_all(path).unwrap();
