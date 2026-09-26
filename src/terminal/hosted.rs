@@ -1900,6 +1900,13 @@ fn serve_connection(
                 }
             }
             ServerMessage::Error(error) => {
+                if is_committed_daemon_shutdown(&error) {
+                    // In-flight controls can reach the old daemon after its
+                    // checkpoint commits. Keep the runtime alive until the
+                    // reconnect handshake observes the replacement proof and
+                    // hands off to the UI's ownership-checked recovery.
+                    return ConnectionEnd::Retry;
+                }
                 let Some(request_id) = envelope.request_id else {
                     // The daemon severed this connection on its own — it fell
                     // behind its delivery queue, or the daemon is at capacity.
@@ -2128,12 +2135,25 @@ fn accept_server_event(
     Ok(())
 }
 
+fn is_committed_daemon_shutdown(error: &ProtocolError) -> bool {
+    // Installed daemons report this with retryable=false: that incarnation
+    // will never accept controls again. It is nevertheless transient for the
+    // UI. Match only this specific refusal, not other unavailable terminals,
+    // and retain compatibility without changing the wire protocol mid-upgrade.
+    error.code == ProtocolErrorCode::TerminalUnavailable
+        && error.message
+            == "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
+}
+
 fn reject_handshake(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
     stop: &WorkerStop,
     error: ProtocolError,
 ) -> ConnectionEnd {
+    if is_committed_daemon_shutdown(&error) {
+        return ConnectionEnd::Retry;
+    }
     // A reconnect can recover transport failures, but this handle may never
     // target another incarnation, even when the protocol marks it retryable.
     let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
@@ -2766,6 +2786,157 @@ mod tests {
                 resumed: Vec::new(),
             },
         });
+    }
+
+    #[test]
+    fn committed_shutdown_waits_for_replacement_before_requesting_recovery() {
+        for during_attach in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let pinned = proof("old");
+            let session = session();
+            let handle =
+                HostedTerminalHandle::connect_at(socket, session.id, Some(pinned.clone()), |_| {})
+                    .unwrap();
+            let send = |stream: &mut UnixStream, request_id, proof, message| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof,
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let shutdown = || {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "Daemon upgrade/shutdown is committed; no further control mutations are accepted",
+                    false,
+                ))
+            };
+            let mut stream = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            send(
+                &mut stream,
+                connect.request_id,
+                pinned.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: pinned.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(attach.request, ClientRequest::Attach { .. }));
+            let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                visibility.request,
+                ClientRequest::SetVisibility { .. }
+            ));
+            if !during_attach {
+                send(
+                    &mut stream,
+                    attach.request_id,
+                    pinned.clone(),
+                    ServerMessage::Response {
+                        response: ServerResponse::Attached {
+                            terminal: TerminalDescriptor {
+                                session,
+                                generation: 0,
+                                event_sequence: 0,
+                                oldest_event_sequence: 1,
+                                attached: true,
+                                transcript: None,
+                                activity: None,
+                                agent_activity: None,
+                                upgrade_sources: Vec::new(),
+                                upgrade_relaunches: Vec::new(),
+                            },
+                        },
+                    },
+                );
+                handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+            }
+            send(
+                &mut stream,
+                if during_attach {
+                    attach.request_id
+                } else {
+                    visibility.request_id
+                },
+                pinned.clone(),
+                shutdown(),
+            );
+
+            // The old daemon may still own the socket while it drains. Its
+            // handshake refusal must not destroy the UI runtime either.
+            let mut draining = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut draining).unwrap().unwrap();
+            assert!(matches!(connect.request,
+                ClientRequest::Connect { expected_host: Some(ref expected), .. } if expected == &pinned));
+            send(
+                &mut draining,
+                connect.request_id,
+                pinned.clone(),
+                shutdown(),
+            );
+
+            let mut replacement = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut replacement).unwrap().unwrap();
+            assert!(matches!(connect.request,
+                ClientRequest::Connect { expected_host: Some(ref expected), .. } if expected == &pinned));
+            assert!(
+                handle
+                    .events()
+                    .try_iter()
+                    .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+            );
+            // Queued input must never cross into a new incarnation. Recovery
+            // must instead go through the UI's authenticated lineage checks.
+            handle.input(b"must not replay".to_vec()).unwrap();
+            send(
+                &mut replacement,
+                connect.request_id,
+                proof("replacement"),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::ProofMismatch,
+                    "daemon was replaced",
+                    false,
+                )),
+            );
+            assert!(matches!(
+                handle
+                    .events()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap(),
+                TerminalEvent::Error {
+                    operation: "connect to cagents daemon",
+                    ..
+                }
+            ));
+            assert_eq!(
+                handle.events().recv_timeout(Duration::from_secs(2)),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+            );
+            assert_eq!(
+                read_frame::<ClientEnvelope>(&mut replacement).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_terminal_is_not_a_committed_daemon_shutdown() {
+        assert!(!is_committed_daemon_shutdown(&ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "terminal process is unavailable",
+            false,
+        )));
     }
 
     #[test]
