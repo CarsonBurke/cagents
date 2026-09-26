@@ -14844,6 +14844,107 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    #[test]
+    fn real_tab_header_drag_survives_repaint_and_cannot_activate_destination_close() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation::Focusable, tree::NAMED},
+        };
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        struct Bounds(HashMap<String, Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let first = app.workspace.focused().unwrap();
+        let mut second = app.card_state(first).unwrap().clone();
+        second.id = CardId::new();
+        second.title = "Second".into();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        app.cards.insert(second_id, CardRuntime::Loading);
+        assert!(!app.workspace_inputs_blocked());
+        let renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        let mut origin = Point::ORIGIN;
+        let mut destination = Point::ORIGIN;
+        let mut dropped = false;
+        for phase in 0..3 {
+            let mut element = frame(&app);
+            NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+            );
+            NAMED.with(|named| named.borrow_mut().clear());
+            if phase == 0 {
+                let mut bounds = Bounds(HashMap::new());
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut bounds,
+                );
+                origin = bounds.0[&app.card_header_widget_id(first).to_string()].center();
+                destination = bounds.0[&card_control_id(second_id, "close").to_string()].center();
+            }
+            let point = if phase == 0 { origin } else { destination };
+            let event = Event::Mouse(match phase {
+                0 => mouse::Event::ButtonPressed(mouse::Button::Left),
+                1 => mouse::Event::CursorMoved { position: point },
+                _ => mouse::Event::ButtonReleased(mouse::Button::Left),
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(1600.0, 1200.0)),
+            );
+            drop(element);
+            for message in messages {
+                let cosmic::Action::App(message) = message else {
+                    continue;
+                };
+                assert!(
+                    !matches!(message, Message::CloseCard(_)),
+                    "a title drag must not reach the destination close button"
+                );
+                dropped |= matches!(message, Message::Viewport { event: WorkspaceViewportEvent::Reordered { card, before: None }, .. } if card == first);
+                drop(app.update(message));
+            }
+        }
+        assert!(
+            dropped,
+            "actual title/tooltip/header composition must intercept the drag"
+        );
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![second_id, first]
+        );
+    }
+
     /// The custom `widget::Id`s that name more than one node in `element`.
     ///
     /// A custom id may name at most one node per frame: the pinned runtime
