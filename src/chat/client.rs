@@ -980,75 +980,72 @@ impl ClientHandle {
 /// Retire replay evidence only after every durable reference owned by this GUI
 /// has been replaced and saved. This never starts a daemon or a provider process.
 /// Retrying a lost acknowledgement is harmless.
-pub fn acknowledge_terminal_handoff(
-    terminal: &crate::model::TerminalSession,
-) -> Result<(), String> {
-    let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
-    acknowledge_terminal_handoff_on(stream, terminal)
+/// Results correspond to the input order. A rejected terminal does not block
+/// other receipts, and a missing daemon has no in-memory receipts to retire.
+pub fn acknowledge_terminal_handoffs(
+    terminals: &[crate::model::TerminalSession],
+) -> Vec<Result<(), String>> {
+    if terminals.is_empty() {
+        return Vec::new();
+    }
+    let socket = match ipc::daemon_socket_path() {
+        Ok(socket) => socket,
+        Err(error) => return vec![Err(error.to_string()); terminals.len()],
+    };
+    acknowledge_terminal_handoffs_on(crate::control::ControlClient::connect(&socket), terminals)
 }
 
-fn acknowledge_terminal_handoff_on(
-    stream: UnixStream,
-    terminal: &crate::model::TerminalSession,
-) -> Result<(), String> {
-    // Exited/closed durable descriptors no longer carry a live proof. Their
-    // saved UUID can retire only a matching receipt, never authorize execution.
-    let expected = terminal.continuity.live_proof();
-    if expected.as_ref().is_some_and(|proof| !proof.is_complete()) {
-        return Err("Terminal handoff acknowledgement has an incomplete daemon proof".into());
-    }
-    stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| error.to_string())?;
-    let mut wire = Wire {
-        stream,
-        codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+fn acknowledge_terminal_handoffs_on(
+    connection: Result<crate::control::ControlClient, crate::control::ControlError>,
+    terminals: &[crate::model::TerminalSession],
+) -> Vec<Result<(), String>> {
+    use crate::control::ControlError;
+
+    let mut client = match connection {
+        Ok(client) => client,
+        Err(ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return vec![Ok(()); terminals.len()];
+        }
+        Err(error) => return vec![Err(error.to_string()); terminals.len()],
     };
-    wire.codec
-        .write(
-            &mut wire.stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: 1,
-                proof: None,
-                request: ClientRequest::Connect {
-                    expected_host: None,
-                    resume: Vec::new(),
-                },
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let proof = match receive(&mut wire.stream, &mut wire.codec, 1, None)? {
-        ServerResponse::Connected { proof, .. } if proof.is_complete() => proof,
-        _ => return Err("Daemon did not prove terminal handoff ownership".into()),
-    };
-    // A daemon keeps its handoff receipts in memory, so one answering under
-    // another identity than the terminal's never held this one: the daemon
-    // that did is gone, and there is nothing left to acknowledge.
-    if expected.as_ref().is_some_and(|expected| expected != &proof) {
-        return Ok(());
-    }
-    let wire = Mutex::new(wire);
-    transmit(
-        &wire,
-        &proof,
-        2,
-        ClientRequest::ChatCommitTerminal {
-            terminal_id: terminal.id,
-        },
-    )?;
-    let Wire {
-        mut stream,
-        mut codec,
-    } = wire.into_inner().unwrap_or_else(|p| p.into_inner());
-    match receive(&mut stream, &mut codec, 2, Some(&proof))? {
-        ServerResponse::Accepted => Ok(()),
-        _ => Err("Daemon did not acknowledge the durable terminal handoff".into()),
-    }
+    let mut connection_failure: Option<String> = None;
+    terminals
+        .iter()
+        .map(|terminal| {
+            // Exited descriptors have no live proof; their saved UUID retires only
+            // a matching receipt and never authorizes execution.
+            if let Some(expected) = terminal.continuity.live_proof() {
+                if !expected.is_complete() {
+                    return Err(
+                        "Terminal handoff acknowledgement has an incomplete daemon proof".into(),
+                    );
+                }
+                // A different, proven daemon never held this in-memory receipt.
+                if &expected != client.proof() {
+                    return Ok(());
+                }
+            }
+            if let Some(error) = &connection_failure {
+                return Err(error.clone());
+            }
+            match client.commit_terminal_handoff(terminal.id) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // A correlated refusal leaves the stream in step. Transport
+                    // and protocol failures may not; never reuse that connection.
+                    if !matches!(error, ControlError::Remote { .. }) {
+                        connection_failure = Some(error.to_string());
+                    }
+                    Err(error.to_string())
+                }
+            }
+        })
+        .collect()
 }
 
 /// Running and starting daemon chats, including detached sessions. Never starts a daemon.
@@ -1098,6 +1095,253 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handoff_terminal() -> crate::model::TerminalSession {
+        use crate::model::{LaunchRecipe, TerminalContinuity, TerminalSession};
+        let recipe = LaunchRecipe {
+            program: "unused".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        TerminalSession {
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            resume_hint: None,
+            transcript_path: None,
+        }
+    }
+
+    fn handoff_proof() -> HostSessionProof {
+        HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("session"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        }
+    }
+
+    fn handoff_reply(
+        server: &mut UnixStream,
+        codec: &mut FrameCodec,
+        request_id: Option<u64>,
+        proof: &HostSessionProof,
+        message: ServerMessage,
+    ) {
+        codec
+            .write(
+                server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: proof.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+    }
+
+    fn handoff_handshake(server: &mut UnixStream, codec: &mut FrameCodec) {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let connect: ClientEnvelope = codec.read(server).unwrap().unwrap();
+        assert!(matches!(
+            connect.request,
+            ClientRequest::Connect {
+                expected_host: None,
+                ..
+            }
+        ));
+        let proof = handoff_proof();
+        handoff_reply(
+            server,
+            codec,
+            Some(connect.request_id),
+            &proof,
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: Vec::new(),
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn handoff_batch_continues_after_a_refusal_and_an_incomplete_saved_proof() {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let mut terminals = vec![
+            handoff_terminal(),
+            handoff_terminal(),
+            handoff_terminal(),
+            handoff_terminal(),
+        ];
+        terminals[1].continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new(""),
+            boot_id: handoff_proof().boot_id,
+            host_incarnation: handoff_proof().host_incarnation,
+        };
+        let expected = [terminals[0].id, terminals[2].id, terminals[3].id];
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            for (index, terminal_id) in expected.into_iter().enumerate() {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(request.request_id, index as u64 + 2);
+                assert!(
+                    matches!(request.request, ClientRequest::ChatCommitTerminal { terminal_id: actual } if actual == terminal_id)
+                );
+                assert_eq!(request.proof, Some(handoff_proof()));
+                let message = if index == 0 {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "receipt refused",
+                        false,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                };
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &handoff_proof(),
+                    message,
+                );
+            }
+            assert!(codec.read::<ClientEnvelope>(&mut server).unwrap().is_none());
+        });
+        let results = acknowledge_terminal_handoffs_on(
+            crate::control::ControlClient::from_stream(client),
+            &terminals,
+        );
+        worker.join().unwrap();
+        assert!(results[0].as_ref().unwrap_err().contains("receipt refused"));
+        assert!(
+            results[1]
+                .as_ref()
+                .unwrap_err()
+                .contains("incomplete daemon proof")
+        );
+        assert_eq!(&results[2..], &[Ok(()), Ok(())]);
+    }
+
+    #[test]
+    fn handoff_batch_preserves_success_but_stops_using_a_failed_connection() {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        // EOF, proof changes, uncorrelated drop notices, and mismatched request
+        // IDs or unexpected response types must not cause any more requests
+        // on a compromised connection.
+        for failure in 0..5 {
+            let mut terminals = vec![
+                handoff_terminal(),
+                handoff_terminal(),
+                handoff_terminal(),
+                handoff_terminal(),
+            ];
+            terminals[3].continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: handoff_proof().host_session_id,
+                boot_id: handoff_proof().boot_id,
+                host_incarnation: crate::model::HostIncarnation::new("previous"),
+            };
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                handoff_handshake(&mut server, &mut codec);
+                let first: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(first.request_id),
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+                let second: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                if failure == 0 {
+                    return;
+                }
+                let mut proof = handoff_proof();
+                if failure == 1 {
+                    proof.host_incarnation = crate::model::HostIncarnation::new("changed");
+                }
+                let (id, message) = if failure == 2 {
+                    (
+                        None,
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::QueueFull,
+                            "dropping connection",
+                            true,
+                        )),
+                    )
+                } else {
+                    (
+                        Some(second.request_id + u64::from(failure == 3)),
+                        ServerMessage::Response {
+                            response: if failure == 4 {
+                                ServerResponse::Listed {
+                                    terminals: Vec::new(),
+                                }
+                            } else {
+                                ServerResponse::Accepted
+                            },
+                        },
+                    )
+                };
+                handoff_reply(&mut server, &mut codec, id, &proof, message);
+                assert!(codec.read::<ClientEnvelope>(&mut server).unwrap().is_none());
+            });
+            let results = acknowledge_terminal_handoffs_on(
+                crate::control::ControlClient::from_stream(client),
+                &terminals,
+            );
+            worker.join().unwrap();
+            assert_eq!(results[0], Ok(()));
+            assert!(results[1].is_err());
+            assert_eq!(results[1], results[2]);
+            assert_eq!(results[3], Ok(()));
+        }
+    }
+
+    #[test]
+    fn only_missing_or_refused_socket_connections_retire_the_whole_handoff_batch() {
+        use crate::control::{ControlClient, ControlError};
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let terminals = [handoff_terminal(), handoff_terminal()];
+        assert_eq!(
+            acknowledge_terminal_handoffs_on(ControlClient::connect(&socket), &terminals),
+            vec![Ok(()), Ok(())]
+        );
+        let listener = UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        assert_eq!(
+            acknowledge_terminal_handoffs_on(ControlClient::connect(&socket), &terminals),
+            vec![Ok(()), Ok(())]
+        );
+        for error in [
+            ControlError::Connect(io::Error::from(io::ErrorKind::PermissionDenied)),
+            ControlError::Configure(io::Error::from(io::ErrorKind::NotFound)),
+            ControlError::ProofMismatch,
+            ControlError::ConnectionClosed,
+        ] {
+            assert!(
+                acknowledge_terminal_handoffs_on(Err(error), &terminals)
+                    .iter()
+                    .all(Result::is_err)
+            );
+        }
+    }
 
     /// The conversation the live installation's card was showing: a UUIDv7,
     /// which every identifier gate on the restore path has to accept.
@@ -1197,9 +1441,12 @@ mod tests {
                     )
                     .unwrap();
             });
-            let result = acknowledge_terminal_handoff_on(client, &terminal);
+            let result = acknowledge_terminal_handoffs_on(
+                crate::control::ControlClient::from_stream(client),
+                &[terminal],
+            );
             worker.join().unwrap();
-            assert_eq!(result.is_err(), changed);
+            assert_eq!(result[0].is_err(), changed);
         }
     }
 
@@ -1271,7 +1518,13 @@ mod tests {
             // Nothing more is asked of a daemon that never held the receipt.
             codec.read::<ClientEnvelope>(&mut server).unwrap()
         });
-        assert_eq!(acknowledge_terminal_handoff_on(client, &terminal), Ok(()));
+        assert_eq!(
+            acknowledge_terminal_handoffs_on(
+                crate::control::ControlClient::from_stream(client),
+                &[terminal],
+            ),
+            vec![Ok(())]
+        );
         assert!(worker.join().unwrap().is_none());
     }
 
