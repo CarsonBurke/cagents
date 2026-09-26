@@ -721,9 +721,22 @@ fn start(
         }
     }
     // All adapter validation happens before a source terminal can be changed.
-    let owned_socket = session.owned_codex_socket();
-    let owned = source.is_none() && session.claim_owned_codex_listener();
-    if owned {
+    let allocator = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let owned =
+        source.is_none() && session.claim_owned_codex_listener(&std::env::temp_dir(), &allocator);
+    let owned_socket = owned.then(|| {
+        session
+            .owned_codex_listener
+            .as_ref()
+            .unwrap()
+            .socket
+            .clone()
+    });
+    if let Some(owned_socket) = &owned_socket {
         // An unclean daemon exit can leave the owned socket inode behind.
         // Only remove a refused socket inside our private, user-owned directory;
         // a live listener is reused and an arbitrary endpoint is never touched.
@@ -750,12 +763,13 @@ fn start(
             }
         }
     }
-    let (mut spec, mut adapter) = if owned && !owned_socket.exists() {
-        chat::protocol::codex::create_with_listener(&session.launch, owned_socket)
-    } else {
-        chat::protocol::create(&session.launch)
-    }
-    .map_err(error)?;
+    let (mut spec, mut adapter) =
+        if let Some(owned_socket) = owned_socket.filter(|path| !path.exists()) {
+            chat::protocol::codex::create_with_listener(&session.launch, owned_socket)
+        } else {
+            chat::protocol::create(&session.launch)
+        }
+        .map_err(error)?;
     if source.is_none() {
         // A conversation with no proven source has no proven environment to
         // preserve, so it starts from the daemon's own native configuration
@@ -850,7 +864,7 @@ fn start(
         if state
             .chat_spawning
             .values()
-            .any(|launch| same_conversation(launch, &session.launch))
+            .any(|pending| same_conversation(&pending.launch, &session.launch))
         {
             return Err(error("This exact conversation is already starting"));
         }
@@ -902,9 +916,7 @@ fn start(
             retired = state.chats.remove(&session.id);
         }
         session.proof = Some(state.proof().clone());
-        state
-            .chat_spawning
-            .insert(session.id, session.launch.clone());
+        state.chat_spawning.insert(session.id, session.clone());
         state.inventory_generation += 1;
         source_handle
     };
@@ -1094,6 +1106,7 @@ fn codex_terminal_view(
             .returning_terminal = true;
     }
     let terminal = crate::model::TerminalSession {
+        owned_codex_listener: session.owned_codex_listener.clone(),
         recovery_origin: None,
         id: chat_id,
         launch: recipe.clone(),
@@ -1153,6 +1166,57 @@ fn codex_terminal_view(
     })
 }
 
+/// Client descriptors cannot expand allocation authority beyond this daemon's
+/// exact namespace or retained conversation. Checkpoint restore invokes `start`
+/// directly with the daemon-owned durable source instead.
+fn client_session(host: &SharedHost, session: Session) -> Session {
+    client_session_in(host, session, &std::env::temp_dir())
+}
+
+fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::Path) -> Session {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let retained = state
+        .chats
+        .get(&session.id)
+        .filter(|record| {
+            record.session.launch.provider == session.launch.provider
+                && record.handle.session_id() == session.launch.session_id
+                && record
+                    .session
+                    .owned_codex_listener
+                    .as_ref()
+                    .is_some_and(|owned| owned.matches(session.id, &session.launch.recipe))
+        })
+        .and_then(|record| record.session.owned_codex_listener.clone());
+    // The exact allocation namespace already authorizes this daemon to reopen
+    // this endpoint, including legacy recipes. Retain its original allocator
+    // across an unclean restart instead of replacing provenance with today's
+    // host proof. A caller cannot extend that authority to another root.
+    session.owned_codex_listener = retained.or_else(|| {
+        session.owned_codex_listener.take().filter(|owned| {
+            owned.matches(session.id, &session.launch.recipe)
+                && owned.socket
+                    == root
+                        .join(format!("cagents-codex-{}", session.id))
+                        .join("control.sock")
+        })
+    });
+    if let Some(terminal) = &mut session.terminal {
+        terminal.owned_codex_listener = state
+            .terminals
+            .get(&terminal.id)
+            .filter(|record| record.session.launch == terminal.launch)
+            .and_then(|record| record.session.owned_codex_listener.clone())
+            .or_else(|| {
+                session
+                    .owned_codex_listener
+                    .clone()
+                    .filter(|owned| owned.matches(terminal.id, &terminal.launch))
+            });
+    }
+    session
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
@@ -1188,7 +1252,7 @@ pub(super) fn process(
             start(
                 host,
                 client,
-                session,
+                client_session(host, session),
                 Some(source),
                 false,
                 Some(selection),
@@ -1207,12 +1271,7 @@ pub(super) fn process(
                     session
                 })
                 .collect::<Vec<_>>();
-            sessions.extend(state.chat_spawning.iter().map(|(&id, launch)| Session {
-                id,
-                launch: launch.clone(),
-                proof: Some(state.proof().clone()),
-                terminal: None,
-            }));
+            sessions.extend(state.chat_spawning.values().cloned());
             Ok(ServerResponse::ChatListed { sessions })
         }
         ClientRequest::ChatStart {
@@ -1223,7 +1282,7 @@ pub(super) fn process(
         } => start(
             host,
             client,
-            session,
+            client_session(host, session),
             source,
             terminate_source,
             None,
@@ -1407,6 +1466,7 @@ pub(super) fn process(
             }
             let terminal_id = crate::model::TerminalId::new();
             let terminal = crate::model::TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: terminal_id,
                 launch: recipe.clone(),
@@ -2053,6 +2113,7 @@ mod tests {
             .proof()
             .clone();
         let session = Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider: Provider::Codex,
@@ -2142,6 +2203,7 @@ for line in sys.stdin:
             session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
         };
         let source = Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             proof: Some(old),
@@ -2165,6 +2227,7 @@ for line in sys.stdin:
         let recipe = saved.launch.terminal_recipe().unwrap();
         let terminal_id = TerminalId::new();
         let terminal = crate::model::TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: terminal_id,
             launch: recipe.clone(),
@@ -2641,6 +2704,79 @@ for line in sys.stdin:
         }
     }
     #[test]
+    fn client_listener_evidence_cannot_claim_an_unrelated_root() {
+        let allocator = HostSessionProof {
+            host_session_id: "allocator".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "previous".into(),
+        };
+        let current = HostSessionProof {
+            host_incarnation: "current".into(),
+            ..allocator.clone()
+        };
+        let host = Arc::new(Mutex::new(HostState::new(current.clone())));
+        let mut session = Session {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            launch: chat::Launch {
+                provider: Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), "unix://".into()],
+                    working_directory: "/".into(),
+                    environment: BTreeMap::new(),
+                },
+                session_id: None,
+            },
+            proof: Some(current.clone()),
+            terminal: None,
+        };
+        let root = std::path::Path::new("/daemon-root");
+        assert!(session.claim_owned_codex_listener(root, &allocator));
+        session.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        // Inventory must retain allocation evidence while the actor starts.
+        host.lock()
+            .unwrap()
+            .chat_spawning
+            .insert(session.id, session.clone());
+        let ServerResponse::ChatListed { sessions } =
+            process(&host, 2, ClientRequest::ChatList).unwrap()
+        else {
+            panic!("chat inventory")
+        };
+        assert_eq!(sessions, vec![session.clone()]);
+        let validated = client_session_in(&host, session.clone(), root);
+        assert_eq!(validated.owned_codex_listener, session.owned_codex_listener);
+        assert_eq!(
+            validated.owned_codex_listener.as_ref().unwrap().allocator,
+            allocator
+        );
+
+        let untrusted = client_session_in(
+            &host,
+            session.clone(),
+            std::path::Path::new("/another-daemon-root"),
+        );
+        assert!(untrusted.owned_codex_listener.is_none());
+        assert_eq!(untrusted.launch.recipe, session.launch.recipe);
+        assert!(!untrusted.owns_codex_listener());
+
+        // A daemon-owned checkpoint carries the original allocation across
+        // both proof rotation and a changed daemon temporary root.
+        let mut checkpointed: Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert!(
+            checkpointed
+                .claim_owned_codex_listener(std::path::Path::new("/replacement-root"), &current)
+        );
+        assert_eq!(
+            checkpointed.owned_codex_listener,
+            session.owned_codex_listener
+        );
+        assert_eq!(checkpointed.launch.recipe, session.launch.recipe);
+    }
+
+    #[test]
     fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
         let (_directory, host, _) = upgrade_fixture();
         let chat_id = TerminalId::new();
@@ -2670,6 +2806,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let mut session = Session {
+            owned_codex_listener: None,
             id: chat_id,
             proof: None,
             terminal: None,
@@ -2686,6 +2823,9 @@ for line in sys.stdin:
                 std::env::temp_dir().display()
             ),
         ];
+        assert!(
+            session.claim_owned_codex_listener(&std::env::temp_dir(), host.lock().unwrap().proof())
+        );
         {
             let mut state = host.lock().unwrap();
             state.register_client(1);
@@ -2702,6 +2842,15 @@ for line in sys.stdin:
                 },
             );
         }
+        assert_eq!(
+            client_session_in(
+                &host,
+                session.clone(),
+                std::path::Path::new("/another-root")
+            )
+            .owned_codex_listener,
+            session.owned_codex_listener
+        );
         let first =
             codex_terminal_view(&host, 1, chat_id, &handle, session.clone(), recipe.clone())
                 .unwrap();
@@ -2881,6 +3030,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let session = Session {
+            owned_codex_listener: None,
             id: chat_id,
             launch: chat::Launch {
                 provider: Provider::Codex,
@@ -2989,6 +3139,7 @@ for line in sys.stdin:
                 chat_id,
                 Record {
                     session: Session {
+                        owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
                             provider: Provider::Claude,

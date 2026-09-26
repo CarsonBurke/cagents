@@ -69,6 +69,7 @@ impl CloseSafetyShell {
         let (wake, wakes) = crossbeam_channel::unbounded();
         let terminal = TerminalHandle::spawn(
             TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),

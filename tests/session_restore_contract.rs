@@ -103,6 +103,7 @@ impl RestoreFixture {
                     exposure: Exposure::Visible,
                     residency: Residency::Hot,
                     kind: CardKind::Terminal(TerminalSession {
+                        owned_codex_listener: None,
                         recovery_origin: None,
                         id: terminal_id,
                         launch: launch.clone(),

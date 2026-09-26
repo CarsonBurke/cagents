@@ -310,7 +310,49 @@ pub struct Session {
     /// Original terminal identity for an explicit return to the CLI view.
     #[serde(default)]
     pub terminal: Option<crate::model::TerminalSession>,
+    /// Daemon-issued allocation evidence, independent of the reader's TMPDIR.
+    #[serde(default)]
+    pub owned_codex_listener: Option<OwnedCodexListener>,
 }
+
+/// The exact endpoint a daemon allocated for one native Codex conversation.
+/// The allocator remains unchanged when the current host proof rotates.
+/// This is durable provenance, not authority for an arbitrary client to claim
+/// a socket: the daemon also checks its retained/checkpointed state or its exact
+/// allocation namespace before acting on client-supplied evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedCodexListener {
+    pub socket: std::path::PathBuf,
+    pub allocator: crate::model::HostSessionProof,
+}
+
+impl OwnedCodexListener {
+    pub fn matches(&self, id: crate::model::TerminalId, recipe: &LaunchRecipe) -> bool {
+        use std::path::Component;
+        self.allocator.is_complete()
+            && self.socket.is_absolute()
+            && self
+                .socket
+                .components()
+                .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+            && self
+                .socket
+                .file_name()
+                .is_some_and(|name| name == "control.sock")
+            && self
+                .socket
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|name| name == format!("cagents-codex-{id}").as_str())
+            && recipe
+                .arguments
+                .iter()
+                .position(|arg| arg == "--remote")
+                .and_then(|index| recipe.arguments.get(index + 1))
+                .is_some_and(|remote| remote == &format!("unix://{}", self.socket.display()))
+    }
+}
+
 impl Session {
     /// Whether no daemon has ever held this conversation: it has no provider
     /// identity, no proof of a host that ran it, and no terminal it came
@@ -318,72 +360,113 @@ impl Session {
     /// is before anything can be sent to it, so nothing a reader wrote can be
     /// in one that is still unstarted.
     pub fn is_unstarted(&self) -> bool {
-        self.launch.session_id.is_none() && self.proof.is_none() && self.terminal.is_none()
-    }
-
-    /// The socket of the Codex listener allocated for this exact cagents
-    /// thread, retained in both views.
-    ///
-    /// It lives under the process temporary directory, so the UI and the
-    /// daemon agree on it only while they share `TMPDIR`; the daemon inherits
-    /// the environment of the UI that spawned it.
-    pub fn owned_codex_socket(&self) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join(format!("cagents-codex-{}", self.id))
-            .join("control.sock")
-    }
-
-    /// The `--remote` endpoint naming [`Self::owned_codex_socket`].
-    pub fn owned_codex_remote(&self) -> String {
-        format!("unix://{}", self.owned_codex_socket().display())
+        self.launch.session_id.is_none()
+            && self.proof.is_none()
+            && self.terminal.is_none()
+            && self.owned_codex_listener.is_none()
     }
 
     /// An endpoint allocated for this exact cagents thread, retained in both views.
     pub fn owns_codex_listener(&self) -> bool {
-        let remote = self.owned_codex_remote();
         self.launch.provider == Provider::Codex
             && self
+                .owned_codex_listener
+                .as_ref()
+                .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
+    }
+
+    /// Give up the allocation when an unnamed, lost conversation returns to a
+    /// draft. Its next start receives a fresh identity and asks the daemon for
+    /// a new listener rather than reusing the abandoned conversation's socket.
+    pub fn reset_owned_codex_listener(&mut self) {
+        if self.owns_codex_listener() {
+            let index = self
                 .launch
                 .recipe
                 .arguments
-                .windows(2)
-                .any(|pair| pair[0] == "--remote" && pair[1] == remote)
+                .iter()
+                .position(|argument| argument == "--remote")
+                .expect("owned listener has a remote argument");
+            self.launch.recipe.arguments[index + 1] = "unix://".into();
+        }
+        self.owned_codex_listener = None;
     }
 
     /// Whether `started` is this new Codex thread as the daemon started it.
     ///
     /// A new thread asks for a listener of its own with a bare `unix://`
-    /// remote, which the daemon resolves to [`Self::owned_codex_remote`]
+    /// remote, which the daemon resolves to its reported owned endpoint
     /// before it launches anything; that resolution is the one change the
     /// launch undergoes, and the rest of the recipe is exactly as asked.
     pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
-        if self.launch.session_id.is_some() || self.terminal.is_some() || started.id != self.id {
+        if self.launch.session_id.is_some()
+            || self.terminal.is_some()
+            || started.id != self.id
+            || !started.owns_codex_listener()
+            || !started
+                .proof
+                .as_ref()
+                .is_some_and(crate::model::HostSessionProof::is_complete)
+        {
             return false;
         }
-        let mut resolved = self.clone();
-        resolved.claim_owned_codex_listener() && resolved.launch.recipe == started.launch.recipe
+        let mut recipe = self.launch.recipe.clone();
+        let Some(index) = recipe.arguments.iter().position(|arg| arg == "--remote") else {
+            return false;
+        };
+        let Some(remote) = recipe.arguments.get_mut(index + 1) else {
+            return false;
+        };
+        if self.launch.provider != Provider::Codex || remote != "unix://" {
+            return false;
+        }
+        *remote = format!(
+            "unix://{}",
+            started
+                .owned_codex_listener
+                .as_ref()
+                .unwrap()
+                .socket
+                .display()
+        );
+        recipe == started.launch.recipe
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
     ///
-    /// Only a new thread asking with a bare `unix://`, or a thread already on
-    /// [`Self::owned_codex_remote`], is claimed; any other endpoint is left
-    /// alone and `false` is returned. The daemon applies this to every chat it
-    /// starts without a source terminal.
-    pub fn claim_owned_codex_listener(&mut self) -> bool {
+    /// Only the daemon chooses `root`. Existing evidence must have come from
+    /// trusted retained/checkpointed state before invoking this method. Legacy
+    /// recipes can be promoted only at this daemon's exact allocation path.
+    pub fn claim_owned_codex_listener(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
         if self.launch.provider != Provider::Codex {
             return false;
         }
-        let owned = self.owned_codex_remote();
+        if self.owns_codex_listener() {
+            return true;
+        }
+        if !root.is_absolute() || !allocator.is_complete() {
+            return false;
+        }
+        let socket = root
+            .join(format!("cagents-codex-{}", self.id))
+            .join("control.sock");
+        let owned = format!("unix://{}", socket.display());
         let new_thread = self.launch.session_id.is_none();
         let arguments = &mut self.launch.recipe.arguments;
         let Some(index) = arguments.iter().position(|argument| argument == "--remote") else {
             return false;
         };
         match arguments.get_mut(index + 1) {
-            Some(remote) if *remote == owned => true,
-            Some(remote) if new_thread && remote == "unix://" => {
+            Some(remote) if *remote == owned || (new_thread && remote == "unix://") => {
                 *remote = owned;
+                self.owned_codex_listener = Some(OwnedCodexListener {
+                    socket,
+                    allocator: allocator.clone(),
+                });
                 true
             }
             _ => false,
@@ -1052,6 +1135,7 @@ mod tests {
     #[test]
     fn only_a_new_thread_asking_for_its_own_listener_is_claimed() {
         let session = |arguments: &[&str], session_id: Option<&str>| Session {
+            owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: Launch {
                 provider: crate::agent::Provider::Codex,
@@ -1067,12 +1151,24 @@ mod tests {
             terminal: None,
         };
 
+        let root = std::path::Path::new("/daemon-temporary-root");
+        let allocator = crate::model::HostSessionProof {
+            host_session_id: "daemon".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
+        };
         let mut asked = session(&["--remote", "unix://"], None);
-        assert!(asked.claim_owned_codex_listener());
+        let unstarted = asked.clone();
+        assert!(asked.claim_owned_codex_listener(root, &allocator));
+        asked.proof = Some(allocator.clone());
         assert!(asked.owns_codex_listener());
+        assert!(unstarted.resolved_to_owned_codex_listener(&asked));
         let claimed = asked.clone();
         assert!(
-            asked.claim_owned_codex_listener(),
+            asked.claim_owned_codex_listener(
+                std::path::Path::new("/different-ui-temp-root"),
+                &allocator
+            ),
             "an owned listener stays claimed"
         );
         assert_eq!(asked, claimed);
@@ -1087,8 +1183,49 @@ mod tests {
         ] {
             let mut other = session(arguments, session_id);
             let before = other.clone();
-            assert!(!other.claim_owned_codex_listener(), "{arguments:?}");
+            assert!(
+                !other.claim_owned_codex_listener(root, &allocator),
+                "{arguments:?}"
+            );
             assert_eq!(other, before);
         }
+
+        // Proof rotation does not rewrite the allocator or the saved endpoint.
+        let mut restored: Session =
+            serde_json::from_str(&serde_json::to_string(&asked).unwrap()).unwrap();
+        restored.proof.as_mut().unwrap().host_incarnation = "replacement".into();
+        assert!(restored.owns_codex_listener());
+        assert_eq!(restored.owned_codex_listener, claimed.owned_codex_listener);
+
+        // Legacy descriptors retain their exact recipe, but the path suffix
+        // alone supplies no ownership evidence to an unrelated reader.
+        let mut legacy = serde_json::to_value(&asked).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("owned_codex_listener");
+        let mut legacy: Session = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.owns_codex_listener());
+        assert!(
+            !legacy.claim_owned_codex_listener(std::path::Path::new("/unrelated-root"), &allocator)
+        );
+        assert_eq!(legacy.launch.recipe, asked.launch.recipe);
+        assert!(legacy.claim_owned_codex_listener(root, &allocator));
+
+        let mut unrelated = asked.clone();
+        unrelated.launch.recipe.arguments[1] = format!(
+            "unix:///unrelated/cagents-codex-{}/control.sock",
+            unrelated.id
+        );
+        assert!(!unrelated.owns_codex_listener());
+        assert!(!unstarted.resolved_to_owned_codex_listener(&unrelated));
+        unrelated = asked.clone();
+        unrelated
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .host_incarnation = "".into();
+        assert!(!unrelated.owns_codex_listener());
     }
 }

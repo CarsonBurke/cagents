@@ -320,6 +320,7 @@ mod tests {
 
     fn hosted(directory: &str) -> TerminalSession {
         TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
@@ -503,6 +504,7 @@ mod tests {
         drop(app.observe_hosted_terminals(vec![saved.clone()]));
         let card = cards_for(&app, saved.id)[0].id;
         app.card_state_mut(card).unwrap().kind = CardKind::Chat(crate::chat::Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

@@ -1829,6 +1829,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             .map(|pair| pair[1].clone())
     });
     Ok(chat::Session {
+        owned_codex_listener: session.owned_codex_listener.clone(),
         id: session.id,
         launch: chat::Launch {
             provider,
@@ -1854,6 +1855,7 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
         .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())?;
     let id = TerminalId::new();
     let mut terminal = session.terminal.clone().unwrap_or_else(|| TerminalSession {
+        owned_codex_listener: None,
         recovery_origin: None,
         id,
         launch: recipe.clone(),
@@ -2000,6 +2002,7 @@ fn fresh_chat_session(
         Provider::Claude => {}
     }
     Ok(chat::Session {
+        owned_codex_listener: None,
         id,
         launch: chat::Launch {
             provider,
@@ -3673,6 +3676,7 @@ impl Cagents {
                             }
                             let unrestricted = bypasses_approvals(&recipe);
                             let fresh = chat::Session {
+                                owned_codex_listener: None,
                                 id: crate::model::TerminalId::new(),
                                 launch: chat::Launch {
                                     recipe,
@@ -3911,6 +3915,7 @@ impl Cagents {
                         // first message started anything come back this way
                         // after an update.
                         let mut draft = attempt.session.clone();
+                        draft.reset_owned_codex_listener();
                         draft.proof = None;
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_forget(target.card);
@@ -5380,7 +5385,13 @@ mod tests {
         let mut session = app.chat_ui.attempts.get(&card).unwrap().session.clone();
         // The daemon starts a new Codex thread on a listener of its own and
         // hands the thread back naming it.
-        session.claim_owned_codex_listener();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        };
+        session.claim_owned_codex_listener(std::path::Path::new("/daemon-temp-root"), &proof);
+        session.proof = Some(proof);
         Arc::new(ClientHandle::fixture(
             session,
             Snapshot {
@@ -7163,6 +7174,10 @@ mod tests {
         assert!(runtime.choosing());
         assert_eq!(runtime.error, None, "nothing was lost, so nothing is said");
         assert!(runtime.session.is_unstarted());
+        assert_eq!(
+            runtime.session.launch.recipe.arguments,
+            ["--remote", "unix://"]
+        );
         assert!(!app.chat_offers_fresh_conversation(card));
         retired(&mut app, card);
         let CardKind::Chat(saved) = &app.card_state(card).unwrap().kind else {

@@ -874,6 +874,9 @@ pub mod agent_recovery;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
+    /// Native Codex listener provenance retained while this is its CLI view.
+    #[serde(default)]
+    pub owned_codex_listener: Option<crate::chat::OwnedCodexListener>,
     /// Stable provenance across replacement daemon incarnations. Unlike the
     /// current terminal ID, this remains unchanged through repeated recovery.
     #[serde(default)]
@@ -885,6 +888,15 @@ pub struct TerminalSession {
 }
 
 impl TerminalSession {
+    pub fn owns_codex_listener(&self) -> bool {
+        crate::agent::Provider::from_program(&self.launch.program)
+            == Some(crate::agent::Provider::Codex)
+            && self
+                .owned_codex_listener
+                .as_ref()
+                .is_some_and(|owned| owned.matches(self.id, &self.launch))
+    }
+
     /// An exact saved agent identity, never a newest-session guess.
     pub fn agent_resume_recipe(&self) -> Option<LaunchRecipe> {
         self.resume_hint
@@ -1210,6 +1222,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Chat(crate::chat::Session {
+                    owned_codex_listener: None,
                     id: TerminalId::new(),
                     launch: crate::chat::Launch {
                         provider: crate::agent::Provider::Omp,

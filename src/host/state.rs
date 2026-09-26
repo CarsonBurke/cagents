@@ -229,7 +229,7 @@ pub(crate) struct HostState {
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
-    pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
+    pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
@@ -1858,6 +1858,7 @@ fn restore_upgrade_from(
     }
     for chat in &checkpoint.chats {
         let terminal = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: chat.source.id,
             launch: chat
@@ -2152,9 +2153,12 @@ fn close_failed_restore(
 pub(crate) fn spawn_terminal(
     shared: &SharedHost,
     client_id: ClientId,
-    session: TerminalSession,
+    mut session: TerminalSession,
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    // Only a native actor's paired view or a trusted checkpoint can issue
+    // allocation evidence. A generic client spawn is an ordinary terminal.
+    session.owned_codex_listener = None;
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
@@ -2669,6 +2673,7 @@ mod tests {
             )]),
         };
         let source = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -2792,6 +2797,7 @@ for line in sys.stdin:
         }
         let host = Arc::new(Mutex::new(test_host()));
         let source = Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
                 provider: Provider::Claude,
@@ -2886,6 +2892,7 @@ for line in sys.stdin:
         assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
         changed = source.clone();
         changed.terminal = Some(TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: source.id,
             launch: source.launch.recipe.clone(),
@@ -3074,6 +3081,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
                 provider: Provider::Omp,
@@ -3089,6 +3097,7 @@ for line in sys.stdin:
             terminal: None,
         };
         let replacement = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3156,6 +3165,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3217,6 +3227,7 @@ for line in sys.stdin:
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         failing.terminals.push(crate::upgrade::handoff::Terminal {
             source: TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
@@ -3299,6 +3310,7 @@ for line in sys.stdin:
         fs::create_dir(&empty_proc).unwrap();
         let old = test_host().proof().clone();
         let source = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap(),
@@ -3353,6 +3365,7 @@ for line in sys.stdin:
         let old = test_host().proof().clone();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let source = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3458,6 +3471,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3552,6 +3566,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3669,6 +3684,7 @@ for line in sys.stdin:
         let directory = tempfile::tempdir().unwrap();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3754,12 +3770,19 @@ for line in sys.stdin:
             (true, ShutdownOutcome::EmptyRequired { current_count: 1 }),
         ] {
             let mut state = test_host();
+            let id = TerminalId::new();
             state.chat_spawning.insert(
-                TerminalId::new(),
-                crate::chat::Launch {
-                    provider: crate::agent::Provider::Claude,
-                    recipe: recipe.clone(),
-                    session_id: None,
+                id,
+                crate::chat::Session {
+                    id,
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Claude,
+                        recipe: recipe.clone(),
+                        session_id: None,
+                    },
+                    owned_codex_listener: None,
+                    proof: Some(state.proof().clone()),
+                    terminal: None,
                 },
             );
             assert_eq!(
@@ -3786,6 +3809,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3902,6 +3926,7 @@ for line in sys.stdin:
         let mut handles = Vec::new();
         for count in 1..=3 {
             let session = TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
@@ -3925,6 +3950,7 @@ for line in sys.stdin:
             );
         }
         let pending = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),

@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -1884,6 +1884,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                 "ALTER TABLE projects ADD COLUMN kind_json TEXT NOT NULL DEFAULT '\"Git\"';",
             )?;
         }
+        if current < 8 {
+            transaction.execute_batch(
+                "ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+            )?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -2244,8 +2249,8 @@ const INVALIDATE_CARD_HASH_BY_TERMINAL: &str = "UPDATE cards SET content_hash = 
 
 const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-        updated_at_unix_ms, recovery_origin
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        updated_at_unix_ms, recovery_origin, owned_codex_listener
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
      ON CONFLICT(terminal_id) DO UPDATE SET
         card_id = excluded.card_id,
         generation = excluded.generation,
@@ -2253,7 +2258,8 @@ const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         continuity_json = excluded.continuity_json,
         resume_hint = excluded.resume_hint,
         updated_at_unix_ms = excluded.updated_at_unix_ms,
-        recovery_origin = excluded.recovery_origin";
+        recovery_origin = excluded.recovery_origin,
+        owned_codex_listener = excluded.owned_codex_listener";
 
 const UPSERT_TRANSCRIPT_PATH: &str = "INSERT INTO transcript_metadata (
         terminal_id, generation, path_json, byte_len, durable_offset, updated_at_unix_ms
@@ -2709,6 +2715,7 @@ fn codex_cli_view(session: &crate::chat::Session, view: &TerminalSession) -> boo
     let proof = view.continuity.live_proof();
     session.launch.provider == crate::agent::Provider::Codex
         && view.id == session.id
+        && view.owned_codex_listener == session.owned_codex_listener
         && exact_chat_resume(session).as_ref() == Some(&view.launch)
         && proof.is_some()
         && proof == session.proof
@@ -2720,6 +2727,11 @@ fn validate_chat_identity(
     session: &crate::chat::Session,
     previous: Option<PersistedCardKind>,
 ) -> Result<()> {
+    if session.owned_codex_listener.is_some() && !session.owns_codex_listener() {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card} has invalid owned listener evidence"
+        )));
+    }
     if session
         .terminal
         .as_ref()
@@ -2740,6 +2752,15 @@ fn validate_chat_identity(
             Some("identity")
         } else if stored.launch.provider != session.launch.provider {
             Some("provider")
+        } else if stored.owned_codex_listener != session.owned_codex_listener
+            && !(stored.owned_codex_listener.is_none()
+                && session.owns_codex_listener()
+                && session
+                    .proof
+                    .as_ref()
+                    .is_some_and(HostSessionProof::is_complete))
+        {
+            Some("owned listener")
         } else if stored.launch.recipe != session.launch.recipe
             // The daemon gives a new Codex thread its own listener as it
             // starts it, so the started thread comes back naming that
@@ -2794,6 +2815,7 @@ enum CardPayloadWrite<'card> {
     Terminal {
         terminal_id: String,
         recovery_origin: Option<String>,
+        owned_codex_listener: Option<String>,
         recipe_json: String,
         continuity_json: String,
         resume_hint: Option<&'card str>,
@@ -2823,6 +2845,14 @@ impl<'card> CardWrite<'card> {
         kind: PersistedCardKind,
     ) -> Result<Self> {
         let ordinal = usize_to_i64(ordinal, "card ordinal")?;
+        if let CardKind::Terminal(terminal) = &card.kind
+            && terminal.owned_codex_listener.is_some()
+            && !terminal.owns_codex_listener()
+        {
+            return Err(StoreError::InvalidState(format!(
+                "terminal card {card_id} has invalid owned listener evidence"
+            )));
+        }
         let existence_json = to_json(&card.existence)?;
         let content_json = match &card.kind {
             CardKind::Chat(session) => Some(to_json(session)?),
@@ -2837,6 +2867,11 @@ impl<'card> CardWrite<'card> {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
                 terminal_id: terminal.id.to_string(),
                 recovery_origin: terminal.recovery_origin.map(|id| id.to_string()),
+                owned_codex_listener: terminal
+                    .owned_codex_listener
+                    .as_ref()
+                    .map(to_json)
+                    .transpose()?,
                 recipe_json: to_json(&terminal.launch)?,
                 continuity_json: to_json(&terminal.continuity)?,
                 resume_hint: terminal.resume_hint.as_deref(),
@@ -2884,6 +2919,7 @@ impl<'card> CardWrite<'card> {
             CardPayloadWrite::Terminal {
                 terminal_id,
                 recovery_origin,
+                owned_codex_listener,
                 recipe_json,
                 continuity_json,
                 resume_hint,
@@ -2893,6 +2929,7 @@ impl<'card> CardWrite<'card> {
                     .text("terminal")
                     .text(terminal_id)
                     .optional_text(recovery_origin.as_deref())
+                    .optional_text(owned_codex_listener.as_deref())
                     .text(recipe_json)
                     .text(continuity_json)
                     .optional_text(*resume_hint)
@@ -3004,6 +3041,7 @@ fn save_card_payload(
         CardPayloadWrite::Terminal {
             terminal_id,
             recovery_origin,
+            owned_codex_listener,
             recipe_json,
             continuity_json,
             resume_hint,
@@ -3026,6 +3064,7 @@ fn save_card_payload(
                     resume_hint,
                     timestamp,
                     recovery_origin,
+                    owned_codex_listener,
                 ])?;
             if let Some(path_json) = transcript_path_json {
                 transaction
@@ -3223,8 +3262,8 @@ fn replace_terminal_identity_transaction(
     transaction.execute(
         "INSERT INTO terminal_recipes (
             terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-            updated_at_unix_ms, recovery_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            updated_at_unix_ms, recovery_origin, owned_codex_listener
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             replacement.id.to_string(),
             card_id.to_string(),
@@ -3234,6 +3273,11 @@ fn replace_terminal_identity_transaction(
             replacement.resume_hint,
             timestamp,
             replacement.recovery_origin.map(|id| id.to_string()),
+            replacement
+                .owned_codex_listener
+                .as_ref()
+                .map(to_json)
+                .transpose()?,
         ],
     )?;
     if let Some(path) = &replacement.transcript_path {
@@ -3634,7 +3678,7 @@ fn load_terminal(
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
     let recipe = connection
         .query_row(
-            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin
+            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin, owned_codex_listener
              FROM terminal_recipes WHERE card_id = ?1",
             [card_id.to_string()],
             |row| {
@@ -3644,11 +3688,19 @@ fn load_terminal(
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin)) = recipe
+    let Some((
+        terminal_id,
+        recipe_json,
+        continuity_json,
+        resume_hint,
+        recovery_origin,
+        owned_codex_listener,
+    )) = recipe
     else {
         return Err(StoreError::InvalidState(format!(
             "terminal card {card_id} has no stored launch recipe"
@@ -3668,7 +3720,10 @@ fn load_terminal(
         .map(|path| from_json("transcript path", &path))
         .transpose()?;
 
-    Ok(TerminalSession {
+    let terminal = TerminalSession {
+        owned_codex_listener: owned_codex_listener
+            .map(|value| from_json("owned Codex listener", &value))
+            .transpose()?,
         recovery_origin: recovery_origin
             .map(|id| parse_id("terminal recovery origin", &id))
             .transpose()?,
@@ -3677,7 +3732,13 @@ fn load_terminal(
         transcript_path,
         resume_hint,
         continuity,
-    })
+    };
+    if terminal.owned_codex_listener.is_some() && !terminal.owns_codex_listener() {
+        return Err(StoreError::InvalidState(format!(
+            "terminal card {card_id} has invalid owned listener evidence"
+        )));
+    }
+    Ok(terminal)
 }
 
 fn continuity_for_restore(
@@ -4076,6 +4137,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
+                    owned_codex_listener: None,
                     recovery_origin: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
@@ -4140,6 +4202,7 @@ mod tests {
         ];
         source.resume_hint = crate::model::agent_recovery::hint_from_launch(&source.launch);
         let chat = crate::chat::Session {
+            owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
                 provider,
@@ -4417,6 +4480,7 @@ mod tests {
                     .insert("CLAUDE_CONFIG_DIR".into(), home.into());
             }
             crate::chat::Session {
+                owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
                     provider,
@@ -4540,6 +4604,12 @@ mod tests {
             session.proof = proof.clone();
             session
         };
+        let daemon_root = directory.path().join("daemon-tmp");
+        assert_ne!(daemon_root, std::env::temp_dir());
+        let mut own = asked.clone();
+        assert!(own.claim_owned_codex_listener(&daemon_root, proof.as_ref().unwrap()));
+        own.proof = proof.clone();
+        own.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
         let mut save = |session: &crate::chat::Session| {
             let mut workspace = workspace.clone();
             workspace.cards[0].kind = CardKind::Chat(session.clone());
@@ -4548,26 +4618,30 @@ mod tests {
 
         // Any other endpoint is a different launch.
         let elsewhere = crate::chat::Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             ..asked.clone()
         };
         for remote in [
             "unix:///tmp/elsewhere/control.sock".to_owned(),
-            elsewhere.owned_codex_remote(),
+            format!(
+                "unix://{}/cagents-codex-{}/control.sock",
+                daemon_root.display(),
+                elsewhere.id
+            ),
         ] {
             assert!(matches!(
                 card_refusal(save(&started(remote)), workspace.cards[0].id),
                 StoreError::InvalidState(message) if message.contains("launch recipe")
             ));
         }
-        let mut other_option = started(asked.owned_codex_remote());
+        let mut other_option = own.clone();
         other_option.launch.recipe.arguments.push("--search".into());
         assert!(matches!(
             card_refusal(save(&other_option), workspace.cards[0].id),
             StoreError::InvalidState(_)
         ));
 
-        let own = started(asked.owned_codex_remote());
         assert!(own.owns_codex_listener());
         save(&own).unwrap();
         let reopened =
@@ -4586,6 +4660,71 @@ mod tests {
             card_refusal(save(&rewound), workspace.cards[0].id),
             StoreError::InvalidState(_)
         ));
+        let mut changed_allocator = own.clone();
+        changed_allocator
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .host_incarnation = "unrelated".into();
+        assert!(matches!(
+            card_refusal(save(&changed_allocator), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        let mut next_host = own.clone();
+        next_host.proof.as_mut().unwrap().host_incarnation = "next-host".into();
+        save(&next_host).unwrap();
+    }
+
+    #[test]
+    fn terminal_listener_evidence_survives_legacy_migration_and_restore() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("terminal.sqlite3");
+        let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+        let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Codex);
+        let card = workspace.cards[0].id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(connection);
+        let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+        let restored = store.load_card(card, None).unwrap().unwrap();
+        let CardKind::Terminal(legacy) = restored.kind else {
+            panic!("terminal")
+        };
+        assert!(legacy.owned_codex_listener.is_none());
+        let CardKind::Terminal(original) = &workspace.cards[0].kind else {
+            panic!("terminal")
+        };
+        assert_eq!(legacy.launch, original.launch);
+
+        let proof = original.continuity.live_proof().unwrap();
+        chat.terminal = None;
+        chat.launch.session_id = None;
+        chat.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        assert!(chat.claim_owned_codex_listener(&directory.path().join("daemon-tmp"), &proof));
+        chat.launch.session_id = Some("77777777-1111-4111-8111-111111111111".into());
+        let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+            panic!("terminal")
+        };
+        terminal.launch = chat.launch.terminal_recipe().unwrap();
+        terminal.resume_hint = None;
+        terminal.owned_codex_listener = chat.owned_codex_listener.clone();
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_card(card, None).unwrap().unwrap();
+        let CardKind::Terminal(restored) = restored.kind else {
+            panic!("terminal")
+        };
+        assert!(restored.owns_codex_listener());
+        assert_eq!(restored.owned_codex_listener, chat.owned_codex_listener);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -4641,17 +4780,24 @@ mod tests {
             let source = paired.terminal.unwrap();
             let proof = source.continuity.live_proof().unwrap();
             let mut native = crate::chat::Session {
+                owned_codex_listener: None,
                 id: TerminalId::new(),
                 launch: paired.launch,
                 proof: Some(proof.clone()),
                 terminal: None,
             };
             native.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            let conversation = native.launch.session_id.take();
+            assert!(
+                native.claim_owned_codex_listener(&directory.path().join("daemon-tmp"), &proof)
+            );
+            native.launch.session_id = conversation;
             workspace.cards[0].kind = CardKind::Chat(native.clone());
             let mut lane = SaveLane::default();
             lane.save(&store, &workspace).unwrap();
 
             let view = TerminalSession {
+                owned_codex_listener: native.owned_codex_listener.clone(),
                 recovery_origin: None,
                 id: native.id,
                 launch: native.launch.terminal_recipe().unwrap(),
@@ -4705,8 +4851,13 @@ mod tests {
             // And the CLI switches back to the chat it came from.
             let mut paired = native.clone();
             paired.terminal = Some(view);
-            workspace.cards[0].kind = CardKind::Chat(paired);
+            workspace.cards[0].kind = CardKind::Chat(paired.clone());
             lane.save(&store, &workspace).unwrap();
+            let restored = store
+                .load_card(workspace.cards[0].id, Some(&proof))
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.kind, CardKind::Chat(paired));
         }
     }
 
@@ -4723,7 +4874,10 @@ mod tests {
         // Use the current writer to populate the fixture, then restore the
         // historical schema before exercising the real migration chain.
         transaction
-            .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")
+            .execute_batch(
+                "ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;
+                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+            )
             .unwrap();
         let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
         let mut browser = workspace.cards[0].clone();
@@ -4750,7 +4904,10 @@ mod tests {
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
         transaction
-            .execute_batch("ALTER TABLE terminal_recipes DROP COLUMN recovery_origin;")
+            .execute_batch(
+                "ALTER TABLE terminal_recipes DROP COLUMN recovery_origin;
+                 ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;",
+            )
             .unwrap();
         transaction.commit().unwrap();
         drop(connection);
@@ -4799,7 +4956,10 @@ mod tests {
         migrate_to_v3(&transaction).unwrap();
         migrate_to_v4(&transaction).unwrap();
         transaction
-            .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")
+            .execute_batch(
+                "ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;
+                 ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+            )
             .unwrap();
         let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
         let mut browser = workspace.cards[0].clone();
@@ -4834,6 +4994,9 @@ mod tests {
                 .is_err()
         );
         transaction.pragma_update(None, "user_version", 5).unwrap();
+        transaction
+            .execute_batch("ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;")
+            .unwrap();
         transaction.commit().unwrap();
         drop(connection);
 
@@ -4955,7 +5118,11 @@ mod tests {
         drop(store);
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("ALTER TABLE projects DROP COLUMN kind_json; PRAGMA user_version = 6;")
+            .execute_batch(
+                "ALTER TABLE projects DROP COLUMN kind_json;
+                 ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 PRAGMA user_version = 6;",
+            )
             .unwrap();
         drop(connection);
 
@@ -5478,6 +5645,7 @@ mod tests {
         let replacement_id = TerminalId::new();
         let launch = recipe();
         let replacement = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: Some(original_id),
             id: replacement_id,
             launch: launch.clone(),
@@ -5542,6 +5710,7 @@ mod tests {
 
         let launch = recipe();
         let replacement = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),

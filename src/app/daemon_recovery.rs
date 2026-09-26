@@ -306,6 +306,7 @@ mod tests {
 
     fn session(path: &Path, proof: &HostSessionProof) -> TerminalSession {
         TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe::shell(path.to_owned()).unwrap(),
@@ -792,6 +793,7 @@ mod tests {
         fs::write(pid_directory.join("stat"), b"unreadable process identity").unwrap();
         let launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
@@ -810,6 +812,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let launch = LaunchRecipe::shell(directory.path().join("old-directory")).unwrap();
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
