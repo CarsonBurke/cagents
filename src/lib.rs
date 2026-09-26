@@ -56,6 +56,8 @@ pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
+pub mod reorder;
+#[cfg(feature = "ui")]
 pub mod repository;
 #[cfg(feature = "ui")]
 pub mod repository_widget;

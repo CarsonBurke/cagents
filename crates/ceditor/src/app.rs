@@ -133,6 +133,10 @@ pub enum Message {
     SessionOpened(u64, Vec<(bool, Result<Opened, String>)>),
     FileResolved(CardId, u64, Result<PathBuf, String>),
     Select(CardId),
+    ReorderTab {
+        card: CardId,
+        before: Option<CardId>,
+    },
     CloseTab(CardId),
     CloseWindow,
     SaveClose,
@@ -2685,31 +2689,33 @@ impl Editor {
 }
 
 fn tab_strip(editor: &Editor) -> Element<'_, Message> {
-    let tabs: Vec<Element<'_, Message>> = editor
-        .tabs
-        .iter()
-        .map(|tab| {
-            let selected = editor.active == Some(tab.id);
-            let title = format!(
-                "{}{}",
-                if tab.runtime.is_dirty() { "• " } else { "" },
-                tab.title
-            );
-            let icon = tab
-                .pending_file
-                .as_ref()
-                .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
-                .or(tab.owned_file.as_ref())
-                .map_or_else(
-                    || cagents::file_icon::folder(true),
-                    |path| cagents::file_icon::icon(path),
+    let tabs: Vec<Element<'_, Message>> =
+        editor
+            .tabs
+            .iter()
+            .map(|tab| {
+                let selected = editor.active == Some(tab.id);
+                let title = format!(
+                    "{}{}",
+                    if tab.runtime.is_dirty() { "• " } else { "" },
+                    tab.title
                 );
-            cagents::interaction::hover(cagents::tab_strip::middle_click_close(
-                widget::container(
-                    widget::row::with_children(vec![
-                        cagents::interaction::tooltip(
-                            widget::button::custom(
-                                widget::row::with_children(vec![
+                let icon = tab
+                    .pending_file
+                    .as_ref()
+                    .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
+                    .or(tab.owned_file.as_ref())
+                    .map_or_else(
+                        || cagents::file_icon::folder(true),
+                        |path| cagents::file_icon::icon(path),
+                    );
+                cagents::interaction::hover(cagents::tab_strip::middle_click_close(
+                    widget::container(
+                        widget::row::with_children(vec![
+                            cagents::interaction::tooltip(
+                                cagents::reorder::handle(
+                                    widget::button::custom(
+                                        widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
                                     design::body(title.clone())
                                         .wrapping(iced::widget::text::Wrapping::None)
@@ -2719,56 +2725,60 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                                         .width(Length::Fill)
                                         .into(),
                                 ])
-                                .spacing(6)
-                                .align_y(iced::Alignment::Center)
-                                .height(Length::Fill)
-                                .width(Length::Fill),
+                                        .spacing(6)
+                                        .align_y(iced::Alignment::Center)
+                                        .height(Length::Fill)
+                                        .width(Length::Fill),
+                                    )
+                                    .id(widget::Id::new(format!("ceditor.tab.{}.title", tab.id)))
+                                    .name(title.clone())
+                                    .class(tab_title_style())
+                                    .padding([0, 8])
+                                    .width(Length::Fill)
+                                    .height(Length::Fill)
+                                    .on_press(Message::Select(tab.id)),
+                                    tab.id,
+                                ),
+                                title,
+                            ),
+                            icon_control(
+                                symbolic_icon("window-close-symbolic"),
+                                "Close tab",
+                                false,
+                                !editor.modal_open(),
+                                Some(Message::CloseTab(tab.id)),
                             )
-                            .name(title.clone())
-                            .class(tab_title_style())
-                            .padding([0, 8])
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .on_press(Message::Select(tab.id)),
-                            title,
-                        ),
-                        icon_control(
-                            symbolic_icon("window-close-symbolic"),
-                            "Close tab",
-                            false,
-                            !editor.modal_open(),
-                            Some(Message::CloseTab(tab.id)),
-                        )
-                        .into(),
-                    ])
-                    .align_y(iced::Alignment::Center)
-                    .spacing(2)
-                    .height(Length::Fill),
-                )
-                .width(184)
-                .height(design::PRIMARY_CONTROL_SIZE)
-                .class(cosmic::theme::Container::custom(move |theme| {
-                    iced::widget::container::Style {
-                        background: selected.then(|| {
-                            iced::Background::Color(
-                                theme
-                                    .current_container()
-                                    .component
-                                    .selected_state_color()
-                                    .into(),
-                            )
-                        }),
-                        border: iced::Border {
-                            radius: theme.cosmic().corner_radii.radius_s.into(),
+                            .id(widget::Id::new(format!("ceditor.tab.{}.close", tab.id)))
+                            .into(),
+                        ])
+                        .align_y(iced::Alignment::Center)
+                        .spacing(2)
+                        .height(Length::Fill),
+                    )
+                    .width(184)
+                    .height(design::PRIMARY_CONTROL_SIZE)
+                    .class(cosmic::theme::Container::custom(move |theme| {
+                        iced::widget::container::Style {
+                            background: selected.then(|| {
+                                iced::Background::Color(
+                                    theme
+                                        .current_container()
+                                        .component
+                                        .selected_state_color()
+                                        .into(),
+                                )
+                            }),
+                            border: iced::Border {
+                                radius: theme.cosmic().corner_radii.radius_s.into(),
+                                ..Default::default()
+                            },
                             ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                })),
-                Message::CloseTab(tab.id),
-            ))
-        })
-        .collect();
+                        }
+                    })),
+                    Message::CloseTab(tab.id),
+                ))
+            })
+            .collect();
     // Keep the tab strip on the same fixed baseline as the app header.
     let mut tab_row = tabs;
     tab_row.push(
@@ -2782,11 +2792,19 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
         .id(widget::Id::new("ceditor.tabs.new"))
         .into(),
     );
-    cagents::tab_strip::horizontal(
+    cagents::tab_strip::reorderable(
         widget::Id::new("ceditor.tabs"),
         tab_row,
         design::PRIMARY_CONTROL_SIZE,
         design::HEADER_HEIGHT,
+        None,
+        cagents::tab_strip::Reordering {
+            order: editor.tabs.iter().map(|tab| tab.id).collect(),
+            tab_width: 184.0,
+            enabled: !editor.modal_open(),
+            select: Box::new(Message::Select),
+            dropped: Box::new(|card, before| Message::ReorderTab { card, before }),
+        },
     )
     .into()
 }
@@ -3006,6 +3024,7 @@ impl Application for Editor {
                     &message,
                     Message::Choose(_)
                         | Message::Select(_)
+                        | Message::ReorderTab { .. }
                         | Message::CloseTab(_)
                         | Message::Complete
                         | Message::Hover
@@ -3160,6 +3179,20 @@ impl Application for Editor {
                     self.resume_pending_files()
                 }
                 Message::Select(id) => self.select_tab(id),
+                Message::ReorderTab { card, before } => {
+                    let order: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+                    let Some(destination) = cagents::reorder::destination(&order, card, before)
+                    else {
+                        return Task::none();
+                    };
+                    let source = order.iter().position(|id| *id == card).unwrap();
+                    if source == destination {
+                        return Task::none();
+                    }
+                    let tab = self.tabs.remove(source);
+                    self.tabs.insert(destination, tab);
+                    self.save_session()
+                }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
                     // Shutdown removes runtime tabs to honor dirty-buffer guards;
@@ -5649,6 +5682,65 @@ mod tests {
         app.settings_open = true;
         drop(app.update(next()));
         assert_eq!(app.active, Some(third));
+    }
+
+    #[test]
+    fn reordered_tabs_preserve_dirty_documents_focus_and_saved_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        app.settings.editor_auto_save = false;
+        let mut ids = Vec::new();
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.join(file), file).unwrap();
+            let id = add(&mut app, root.to_str().unwrap(), Some(file));
+            load_selected(&mut app, id);
+            ids.push(id);
+        }
+        let active = ids[2];
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: active,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("unsaved".into()),
+                )),
+            })),
+        );
+        let text = app.tab(active).unwrap().runtime.editor_text();
+        drop(app.update(Message::ReorderTab {
+            card: active,
+            before: Some(ids[0]),
+        }));
+        assert_eq!(
+            app.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            [ids[2], ids[0], ids[1]]
+        );
+        assert_eq!(app.active, Some(active));
+        assert_eq!(app.tab(active).unwrap().runtime.editor_text(), text);
+        assert!(app.tab(active).unwrap().runtime.is_dirty());
+        flush_session(&mut app);
+        let restored = crate::preferences::load_session(&app.settings_path).unwrap();
+        assert_eq!(
+            restored.paths,
+            [root.join("c.rs"), root.join("a.rs"), root.join("b.rs")]
+        );
+        assert_eq!(restored.active, Some(0));
+        drop(app.update(Message::CloseTab(ids[0])));
+        assert_eq!(
+            app.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            [ids[2], ids[1]]
+        );
+        let order = app.session();
+        drop(app.update(Message::ReorderTab {
+            card: ids[1],
+            before: Some(ids[0]),
+        }));
+        assert_eq!(
+            app.session(),
+            order,
+            "a removed destination cannot turn into an append"
+        );
     }
 
     #[test]

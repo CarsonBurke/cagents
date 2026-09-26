@@ -47,6 +47,10 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
   use their OMP, Claude, or Codex provider mark.
+- Drag a tab title to reorder panes, or hold **Alt** and drag a pane. The
+  insertion line previews its new position; releasing the mouse saves the
+  order without changing the active pane. Scroll the wheel while dragging to
+  reach offscreen panes, or press **Escape** to cancel.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first, and the sort control orders the rest by newest, oldest, or name.
@@ -311,6 +315,8 @@ scripts/run-ceditor-development /path/to/project   # isolated development identi
 - Open tabs, their order, and the active tab restore on launch; explicit paths
   are also opened, and a new session with no paths browses the current
   directory.
+- Drag a tab title to change its saved order. Scroll the wheel while dragging
+  to reach offscreen tabs; **Escape** cancels the drag.
 - **Ctrl+T** or the plus control creates an untitled note in a scratch folder
   next to the editor settings; **Ctrl+S** then chooses where it lives.
 - Its settings, including file-list mode, are stored separately from cagents.

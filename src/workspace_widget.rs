@@ -31,6 +31,11 @@ pub enum WorkspaceViewportEvent {
     Resized(f32),
     PointerFocused(CardId),
     PointerEntered(CardId),
+    Reordered {
+        card: CardId,
+        before: Option<CardId>,
+    },
+    DragScrolled(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +532,29 @@ where
                 .collect(),
         );
     let on_viewport_for_scroll = on_viewport.clone();
+    let on_select = on_viewport.clone();
+    let on_drop = on_viewport.clone();
+    let on_drag_scroll = on_viewport.clone();
+    let strip = crate::reorder::strip(
+        strip,
+        workspace
+            .presentation_geometry()
+            .cards()
+            .iter()
+            .map(|card| crate::reorder::Item {
+                id: card.id,
+                start: card.start,
+                width: card.width(),
+            })
+            .collect(),
+        true,
+        true,
+        Some(Box::new(move |offset| {
+            on_drag_scroll(WorkspaceViewportEvent::DragScrolled(offset))
+        })),
+        move |id| on_select(WorkspaceViewportEvent::PointerFocused(id)),
+        move |card, before| on_drop(WorkspaceViewportEvent::Reordered { card, before }),
+    );
     let scrollable = cosmic::widget::scrollable::horizontal(strip)
         .direction(widget::scrollable::Direction::Horizontal(
             widget::scrollable::Scrollbar::hidden(),

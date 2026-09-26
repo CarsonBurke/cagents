@@ -1637,6 +1637,12 @@ fn update_workspace_viewport(
             workspace.take_widget_focus_request();
             (update, true)
         }
+        // Reordering also updates the durable order, so the application owns it.
+        WorkspaceViewportEvent::Reordered { .. } => (ViewportUpdate::unchanged(), false),
+        WorkspaceViewportEvent::DragScrolled(offset) => (
+            workspace.native_scroll(offset, workspace.viewport_width()),
+            true,
+        ),
     }
 }
 
@@ -6355,6 +6361,54 @@ impl Cagents {
         self.workspace.record_programmatic_scroll(offset);
         workspace_widget::scroll_to(self.workspace_scroll_id.clone(), offset)
             .map(cosmic::Action::App)
+    }
+
+    fn reorder_pane(&mut self, card: CardId, before: Option<CardId>) -> Task<Message> {
+        if self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        let order: Vec<_> = self.workspace.order().collect();
+        let Some(destination) = crate::reorder::destination(&order, card, before) else {
+            return Task::none();
+        };
+        if order.get(destination) == Some(&card) {
+            return Task::none();
+        }
+        let Ok(update) = self.workspace.reorder(card, destination) else {
+            return Task::none();
+        };
+        let order: Vec<_> = self.workspace.order().collect();
+        let durable = Arc::make_mut(&mut self.durable);
+        if let Some(source) = durable.cards.iter().position(|state| state.id == card) {
+            let moved = durable.cards.remove(source);
+            let insertion = before
+                .and_then(|id| durable.cards.iter().position(|state| state.id == id))
+                .or_else(|| {
+                    order.iter().rev().find(|id| **id != card).and_then(|id| {
+                        durable
+                            .cards
+                            .iter()
+                            .position(|state| state.id == *id)
+                            .map(|index| index + 1)
+                    })
+                })
+                .unwrap_or(durable.cards.len());
+            durable.cards.insert(insertion, moved);
+        }
+        if let Some(channel) = durable
+            .channels
+            .iter_mut()
+            .find(|channel| Some(channel.id) == durable.active_channel)
+        {
+            channel.cards.sort_by_key(|id| {
+                order
+                    .iter()
+                    .position(|candidate| candidate == id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        // Runtime objects and focus never move out of their ID-indexed maps.
+        self.apply_viewport(update, true, true)
     }
 
     fn apply_viewport(
@@ -11705,6 +11759,14 @@ impl Application for Cagents {
                 if generation != self.workspace_view_generation {
                     return Task::none();
                 }
+                if let WorkspaceViewportEvent::Reordered { card, before } = event {
+                    return self.reorder_pane(card, before);
+                }
+                if matches!(event, WorkspaceViewportEvent::DragScrolled(_))
+                    && self.workspace_inputs_blocked()
+                {
+                    return Task::none();
+                }
                 if matches!(
                     event,
                     WorkspaceViewportEvent::PointerFocused(_)
@@ -14782,6 +14844,107 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    #[test]
+    fn real_tab_header_drag_survives_repaint_and_cannot_activate_destination_close() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Operation, Tree, operation::Focusable, tree::NAMED},
+        };
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        struct Bounds(HashMap<String, Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.to_string(), bounds);
+                }
+            }
+        }
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let first = app.workspace.focused().unwrap();
+        let mut second = app.card_state(first).unwrap().clone();
+        second.id = CardId::new();
+        second.title = "Second".into();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        app.cards.insert(second_id, CardRuntime::Loading);
+        assert!(!app.workspace_inputs_blocked());
+        let renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        let mut origin = Point::ORIGIN;
+        let mut destination = Point::ORIGIN;
+        let mut dropped = false;
+        for phase in 0..3 {
+            let mut element = frame(&app);
+            NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+            tree.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+            );
+            NAMED.with(|named| named.borrow_mut().clear());
+            if phase == 0 {
+                let mut bounds = Bounds(HashMap::new());
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut bounds,
+                );
+                origin = bounds.0[&app.card_header_widget_id(first).to_string()].center();
+                destination = bounds.0[&card_control_id(second_id, "close").to_string()].center();
+            }
+            let point = if phase == 0 { origin } else { destination };
+            let event = Event::Mouse(match phase {
+                0 => mouse::Event::ButtonPressed(mouse::Button::Left),
+                1 => mouse::Event::CursorMoved { position: point },
+                _ => mouse::Event::ButtonReleased(mouse::Button::Left),
+            });
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::with_size(Size::new(1600.0, 1200.0)),
+            );
+            drop(element);
+            for message in messages {
+                let cosmic::Action::App(message) = message else {
+                    continue;
+                };
+                assert!(
+                    !matches!(message, Message::CloseCard(_)),
+                    "a title drag must not reach the destination close button"
+                );
+                dropped |= matches!(message, Message::Viewport { event: WorkspaceViewportEvent::Reordered { card, before: None }, .. } if card == first);
+                drop(app.update(message));
+            }
+        }
+        assert!(
+            dropped,
+            "actual title/tooltip/header composition must intercept the drag"
+        );
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![second_id, first]
+        );
+    }
+
     /// The custom `widget::Id`s that name more than one node in `element`.
     ///
     /// A custom id may name at most one node per frame: the pinned runtime
@@ -15745,6 +15908,63 @@ mod tests {
         state.diagnostics_version = Some(0);
         app.lsp_documents.insert(LspDocumentId(1), card);
         (app, card)
+    }
+
+    #[test]
+    fn reordered_panes_keep_runtime_focus_and_restore_the_saved_order() {
+        let (mut app, editor) = editing_repository_app();
+        let mut order = vec![editor];
+        for _ in 0..2 {
+            let card = terminal_card_state();
+            order.push(card.id);
+            app.workspace
+                .add_card(
+                    WorkspaceCard::new(
+                        card.id,
+                        &card.title,
+                        CardWidth::Fraction(card.width_fraction),
+                    )
+                    .unwrap(),
+                    order.len() - 1,
+                    false,
+                )
+                .unwrap();
+            app.cards.insert(card.id, CardRuntime::Loading);
+            Arc::make_mut(&mut app.durable).cards.push(card);
+        }
+        let runtime = match &app.cards[&editor] {
+            CardRuntime::Repository(runtime) => &**runtime as *const RepositoryRuntime,
+            _ => unreachable!(),
+        };
+        let event = WorkspaceViewportEvent::Reordered {
+            card: editor,
+            before: None,
+        };
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation + 1,
+            event,
+        }));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order);
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event,
+        }));
+        let expected = vec![order[1], order[2], editor];
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
+        assert_eq!(app.workspace.focused(), Some(editor));
+        let CardRuntime::Repository(current) = &app.cards[&editor] else {
+            panic!("editor retained")
+        };
+        assert_eq!(&**current as *const RepositoryRuntime, runtime);
+        assert!(current.is_dirty());
+        let saved: WorkspaceState =
+            serde_json::from_slice(&serde_json::to_vec(&*app.persistent_workspace()).unwrap())
+                .unwrap();
+        let restored = Cagents::rebuild_workspace(&saved);
+        assert_eq!(restored.order().collect::<Vec<_>>(), expected);
+        assert_eq!(restored.focused(), Some(editor));
+        drop(app.reorder_pane(editor, Some(CardId::new())));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), expected);
     }
 
     #[test]
