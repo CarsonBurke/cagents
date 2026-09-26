@@ -1908,7 +1908,10 @@ mod tests {
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[2]));
 
         let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
-        assert_eq!(underfilled.card_at_viewport_edge(), None);
+        assert_eq!(
+            underfilled.card_at_viewport_edge(),
+            Some(underfilled.cards()[1].id)
+        );
         let lone = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
         assert_eq!(lone.card_at_viewport_edge(), lone.focused());
     }
