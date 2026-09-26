@@ -6078,6 +6078,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Hot,
             kind: CardKind::Repository(crate::model::RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo"),
                 worktree: PathBuf::from("/repo"),

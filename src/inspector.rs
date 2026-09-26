@@ -2063,6 +2063,7 @@ mod tests {
             title: "Repository".into(),
             width_fraction: 0.7,
             kind: CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo/.git"),
                 worktree: PathBuf::from("/repo"),
@@ -2173,6 +2174,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Hot,
             kind: CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: project_id,
                 repository,
                 worktree: worktree_path.clone(),

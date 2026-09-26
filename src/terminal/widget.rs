@@ -1239,9 +1239,10 @@ impl ShapeCache {
 type ErrorMapper<Message> = dyn Fn(TerminalSendError) -> Message + Send + Sync + 'static;
 type LinkMapper<Message> = dyn Fn(url::Url, crate::settings::LinkOpenGesture) -> Message + 'static;
 
-/// Resolve a printed web address at a cell without confusing byte offsets with
-/// terminal columns. Restrict activation to web URLs; terminal output is untrusted.
-fn web_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
+/// Resolve a printed link without confusing byte offsets with terminal columns.
+/// Only web addresses and local file URLs are activatable; arbitrary schemes
+/// from terminal output must not invoke external handlers.
+fn printed_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
     let column = usize::from(column);
     let cell = row.cells.get(column)?;
     let boundary = |cell: &CellSnapshot| {
@@ -1279,7 +1280,11 @@ fn web_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
         }
     }
     let url = url::Url::parse(text).ok()?;
-    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
+    match url.scheme() {
+        "http" | "https" if url.host_str().is_some() => Some(url),
+        "file" if url.to_file_path().is_ok() => Some(url),
+        _ => None,
+    }
 }
 
 /// A lock-free iced view over a single immutable terminal snapshot.
@@ -1914,7 +1919,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         && state.modifiers.control
                         && let Some(open) = &self.on_open_link
                         && let Some(row) = self.snapshot.lines.get(usize::from(cell.1))
-                        && let Some(url) = web_link_at(row, cell.0)
+                        && let Some(url) = printed_link_at(row, cell.0)
                     {
                         shell.publish(open(
                             url,
@@ -2483,7 +2488,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     .snapshot
                     .lines
                     .get(usize::from(cell.1))
-                    .and_then(|row| web_link_at(row, cell.0))
+                    .and_then(|row| printed_link_at(row, cell.0))
                     .is_some()
             {
                 return mouse::Interaction::Pointer;
@@ -4174,14 +4179,21 @@ mod tests {
     fn printed_links_use_cell_columns_and_preserve_balanced_url_punctuation() {
         let line = row("é (https://example.org/a_(b)). next");
         assert_eq!(
-            web_link_at(&line, 8).unwrap().as_str(),
+            printed_link_at(&line, 8).unwrap().as_str(),
             "https://example.org/a_(b)"
         );
-        assert!(web_link_at(&line, 1).is_none());
-        assert!(web_link_at(&row("javascript:alert(1)"), 5).is_none());
-        assert!(web_link_at(&row("file:///etc/passwd"), 5).is_none());
+        assert!(printed_link_at(&line, 1).is_none());
+        assert!(printed_link_at(&row("javascript:alert(1)"), 5).is_none());
         assert_eq!(
-            web_link_at(&row("https://example.org/a?b=1&c=2"), 10)
+            printed_link_at(&row("(file:///tmp/report%20one.html)."), 8)
+                .unwrap()
+                .to_file_path()
+                .unwrap(),
+            std::path::PathBuf::from("/tmp/report one.html")
+        );
+        assert!(printed_link_at(&row("file://remote/etc/passwd"), 5).is_none());
+        assert_eq!(
+            printed_link_at(&row("https://example.org/a?b=1&c=2"), 10)
                 .unwrap()
                 .query(),
             Some("b=1&c=2")

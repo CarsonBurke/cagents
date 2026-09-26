@@ -894,6 +894,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Cold,
             kind: CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: path.into(),
                 worktree: path.into(),
