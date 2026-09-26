@@ -1164,7 +1164,10 @@ impl Cagents {
                     .width(Length::Fill)
                     .into()
                 },
-                |model| inspector::view(model, width).map(Message::ContextInspector),
+                |model| {
+                    let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
+                    inspector::view(model, width, diagnostics_open).map(Message::ContextInspector)
+                },
             ),
         };
         widget::container(

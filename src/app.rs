@@ -3888,6 +3888,7 @@ pub struct Cagents {
     latency_fixture_started: bool,
     context_inspector_open: bool,
     context_inspector_transition: Option<InspectorTransition>,
+    inspector_diagnostics_card: Option<CardId>,
     context_tab: ContextTab,
     /// The overlay state whose focus and native-surface transition has already
     /// been applied. The rendered mount also depends on workspace focus, so it
@@ -8560,6 +8561,13 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Close => self.set_context_inspector_open(false),
+            InspectorAction::ToggleDiagnostics(card) => {
+                if self.workspace.focused() == Some(card) {
+                    self.inspector_diagnostics_card =
+                        (self.inspector_diagnostics_card != Some(card)).then_some(card);
+                }
+                Task::none()
+            }
             InspectorAction::Resize { width } => {
                 self.settings.inspector_width =
                     width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
@@ -8705,6 +8713,7 @@ impl Cagents {
                             cosmic::task::message(Message::CloseCard(card))
                         }
                         InspectorAction::Close
+                        | InspectorAction::ToggleDiagnostics(_)
                         | InspectorAction::Resize { .. }
                         | InspectorAction::ResizeFinished
                         | InspectorAction::JumpToLspDiagnostic { .. }
@@ -9780,6 +9789,7 @@ impl Application for Cagents {
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
             context_inspector_transition: None,
+            inspector_diagnostics_card: None,
             context_inspector_open: window_view
                 .as_ref()
                 .is_none_or(|view| view.context_inspector_open),
@@ -17387,6 +17397,23 @@ mod tests {
         assert_eq!(names(&app, FocusDirection::Left), "/repo/feature");
     }
 
+    #[test]
+    fn pane_diagnostics_toggle_keeps_the_inspector_open_and_ignores_stale_cards() {
+        let mut app = context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        app.context_inspector_open = true;
+        drop(app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(id)));
+        assert_eq!(app.inspector_diagnostics_card, Some(id));
+        assert!(app.context_inspector_open);
+        drop(
+            app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(CardId::new())),
+        );
+        assert_eq!(app.inspector_diagnostics_card, Some(id));
+        drop(app.handle_context_inspector_action(InspectorAction::ToggleDiagnostics(id)));
+        assert_eq!(app.inspector_diagnostics_card, None);
+        assert!(app.context_inspector_open);
+    }
+
     /// A killed session used to take its pane with it: `fail_runtime` replaced
     /// the terminal runtime with a failure surface, so the scrollback that said
     /// why the process died was discarded along with it.
@@ -18585,6 +18612,7 @@ mod tests {
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
             context_inspector_transition: None,
+            inspector_diagnostics_card: None,
             context_inspector_open: true,
             context_tab: ContextTab::default(),
             context_inspector_overlay_active: false,
