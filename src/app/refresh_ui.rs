@@ -19,6 +19,7 @@ const MIN_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 pub(super) struct State {
+    pub(super) git: git_ui::State,
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
@@ -30,6 +31,7 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            git: git_ui::State::default(),
             focused: false,
             source_generation: 0,
             source_cancel: None,
@@ -124,6 +126,9 @@ impl ProjectSchedule {
 }
 
 impl State {
+    pub(super) fn started(&mut self, project: ProjectId) {
+        self.schedule.started(project, Instant::now());
+    }
     /// Something that usually changes a project's pull requests happened, such
     /// as an agent finishing a turn, so its rows are read sooner.
     pub(super) fn mark_stale(&mut self, project: ProjectId) {
@@ -187,6 +192,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
+        tasks.push(self.git_fallback_tick());
         tasks.push(self.commit_terminal_handoffs());
         for (&card, runtime) in &mut self.cards {
             if self.workspace.visibility(card) == Some(VisibilityClass::Visible)
@@ -236,15 +242,18 @@ impl Cagents {
         }
         // A project whose checkout could not be read is retried from its row
         // rather than in the background, unless it is selected.
-        if let Some((id, path)) = self
+        if let Some(id) = self
             .refresh_ui
             .schedule
             .next(
                 sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
+                    .filter(|project| project.kind == ProjectKind::Git)
                     .map(|project| project.id),
                 projects
                     .iter()
-                    .filter(|project| project.unreachable.is_none())
+                    .filter(|project| {
+                        project.kind == ProjectKind::Git && project.unreachable.is_none()
+                    })
                     .map(|project| {
                         let interval = if project.has_open_pull_request() {
                             ACTIVE_PROJECT_INTERVAL
@@ -258,9 +267,9 @@ impl Cagents {
                 now,
             )
             .and_then(|id| self.sidebar_model.project(id))
-            .map(|project| (project.id, project.repository.clone()))
+            .map(|project| project.id)
         {
-            tasks.push(self.repository_load_task(path, Some(id), false));
+            tasks.push(self.github_read_task(id));
         }
         Task::batch(tasks)
     }
@@ -281,6 +290,7 @@ impl Cagents {
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
         self.refresh_ui.schedule.started(project_id, Instant::now());
+        self.refresh_ui.git.forget(project_id);
         let cancellation = CancellationToken::default();
         if let Some(previous) = self
             .refresh_ui

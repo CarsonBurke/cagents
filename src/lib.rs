@@ -33,6 +33,8 @@ pub mod file_drop;
 pub mod file_icon;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
+pub(crate) mod git_watch;
+#[cfg(feature = "ui")]
 pub mod github;
 #[cfg(feature = "host")]
 pub mod host;

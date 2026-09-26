@@ -125,6 +125,13 @@ additions, while binary, unsafe, oversized, or budget-limited files keep
 unknown counts. Visible repository views refresh automatically while the
 application is focused.
 
+Sidebar branch names and tracked-change counts follow local filesystem events,
+independently of GitHub's refresh schedule. Changes to one worktree refresh that
+worktree; shared Git refs refresh the project's worktrees. If local watching is
+unavailable, cagents shows a notice and checks once a minute until watching
+recovers. Network filesystems and submodules retain this fallback because their
+changes may not produce local filesystem events.
+
 If pull-request creation fails, cagents restores the submitted title,
 description, branches, and draft setting. If the remote outcome is uncertain,
 the form stays editable but another attempt is blocked until you check GitHub

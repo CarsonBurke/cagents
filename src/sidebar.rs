@@ -535,6 +535,27 @@ impl SidebarProject {
         })
     }
 
+    pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
+        self.pull_requests = pull_requests;
+        self.cached_display = None;
+        self.refresh_worktree_pull_requests();
+    }
+
+    pub fn refresh_worktree_pull_requests(&mut self) {
+        for row in &mut self.worktrees {
+            if let Some(pr) = matching_pull_request(row, &self.pull_requests) {
+                row.set_pull_request(pr.clone());
+            } else if row.pull_request().is_some_and(|pr| {
+                !matches!(
+                    pr.state,
+                    Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
+                )
+            }) {
+                row.clear_pull_request();
+            }
+        }
+    }
+
     pub fn display_pull_requests(&self) -> &[SidebarPullRequest] {
         self.cached_display
             .as_ref()
@@ -717,6 +738,28 @@ impl SidebarWorktree {
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
+    }
+
+    /// Apply each authoritative read, including the transition back to clean.
+    pub fn apply_repository(&mut self, record: &WorktreeRecord, status: Option<&StatusSnapshot>) {
+        let branch = record.branch.as_deref().map(|branch| {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch)
+                .to_owned()
+        });
+        if self.branch != branch || self.detached != record.detached {
+            self.clear_pull_request();
+            self.branch = branch;
+            self.detached = record.detached;
+            self.chrome.folded_branch = self.branch.as_deref().map(fold);
+        }
+        self.locked = record.lock.locked;
+        self.created_at_unix_ms = record.created_at_unix_ms;
+        if let Some(status) = status {
+            self.apply_status(status);
+        }
+        self.refresh_status_chrome();
     }
 
     /// Apply each authoritative read, including the transition back to clean.

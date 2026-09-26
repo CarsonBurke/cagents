@@ -7,6 +7,7 @@ mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
 pub(crate) mod dialog_ui;
+mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
@@ -3376,6 +3377,7 @@ pub enum Message {
     BranchUi(branch_ui::Action),
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
+    GitUi(git_ui::Action),
     AccountUi(account_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -10672,6 +10674,7 @@ impl Application for Cagents {
                         // pull request until this project's GitHub state and
                         // sidebar entry both existed.
                         let pending = Task::batch([
+                            self.observe_git_repository(&loaded, generation),
                             self.open_pending_pull_requests(project_id),
                             self.prune_pull_request_refs(project_id),
                         ]);
@@ -10762,6 +10765,9 @@ impl Application for Cagents {
                         })
                         .collect::<Vec<_>>();
                     apply_attached_worktree_prs(project, &worktrees, &recent, &archived);
+                    self.refresh_ui
+                        .git
+                        .remember_archived(project_id, generation, &archived);
                 }
                 Task::none()
             }
@@ -12520,6 +12526,7 @@ impl Application for Cagents {
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
+            Message::GitUi(action) => self.update_git(action),
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
@@ -12793,6 +12800,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.refresh_subscription(),
+            self.git_subscription(),
             self.account_subscription(),
             self.document_tone_subscription(),
             self.terminal_agent_activity_subscription(),
@@ -13694,7 +13702,6 @@ fn load_repository(
             (worktree, status)
         })
         .collect::<Vec<_>>();
-    let github = GitHubService::system("gh");
     let head_repositories = worktrees
         .iter()
         .filter_map(|(record, _)| {
@@ -13703,7 +13710,35 @@ fn load_repository(
             Some((record.id, key))
         })
         .collect();
-    let github_availability = (|| {
+    let github_availability = load_repository_github(&repository, &cancellation);
+    // The shared model's own derivation, not a second copy of it: a project
+    // this window opened and one the CLI opened are one row in the registry,
+    // and two rules for its name would make the sidebar show whichever of them
+    // wrote last.
+    let name = crate::workspace_model::repository_display_name(&repository.common_dir);
+    Ok(LoadedRepository {
+        project: ProjectState {
+            kind: Default::default(),
+            id: project_id.unwrap_or_default(),
+            generation: 0,
+            name,
+            repository: repository.common_dir.clone(),
+            existence: Existence::Open,
+        },
+        repository: Some(repository),
+        worktrees,
+        github: github_availability,
+        head_repositories,
+    })
+}
+
+fn load_repository_github(
+    repository: &RepositoryInfo,
+    cancellation: &CancellationToken,
+) -> GitHubAvailability {
+    let service = RepositoryService::system("git");
+    let github = GitHubService::system("gh");
+    (|| {
         let remotes = service
             .remotes(&repository.selected_path, &cancellation)
             .map_err(|error| GitHubAvailability::Failed {
@@ -13767,26 +13802,7 @@ fn load_repository(
             refreshed_at: unix_millis(),
         })
     })()
-    .unwrap_or_else(|unavailable| unavailable);
-    // The shared model's own derivation, not a second copy of it: a project
-    // this window opened and one the CLI opened are one row in the registry,
-    // and two rules for its name would make the sidebar show whichever of them
-    // wrote last.
-    let name = crate::workspace_model::repository_display_name(&repository.common_dir);
-    Ok(LoadedRepository {
-        project: ProjectState {
-            kind: Default::default(),
-            id: project_id.unwrap_or_default(),
-            generation: 0,
-            name,
-            repository: repository.common_dir.clone(),
-            existence: Existence::Open,
-        },
-        repository: Some(repository),
-        worktrees,
-        github: github_availability,
-        head_repositories,
-    })
+    .unwrap_or_else(|unavailable| unavailable)
 }
 
 /// Finds the terminal a start should attach to, or the launch it should make.

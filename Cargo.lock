@@ -1185,6 +1185,7 @@ dependencies = [
  "libcosmic",
  "libghostty-vt",
  "lsp-types",
+ "notify",
  "portable-pty",
  "postcard",
  "raw-window-handle",
