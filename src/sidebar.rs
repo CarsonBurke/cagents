@@ -3756,7 +3756,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
             SidebarFilter::All => (
                 "folder-open-symbolic",
                 "No projects yet",
-                "Open a repository to add its worktrees.",
+                "Open a folder to add a project.",
                 "Open folder",
                 SidebarAction::OpenRepositoryPicker,
             ),
