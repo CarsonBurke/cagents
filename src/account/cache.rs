@@ -20,7 +20,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{self, Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -225,7 +225,10 @@ impl Cache {
     /// without waiting, so two windows never probe the same account at once.
     /// `None` means another window holds it and its answer will reach this
     /// one through the cache.
-    pub fn try_probe_lock(&self, name: &str) -> io::Result<Option<File>> {
+    pub(crate) fn try_probe_lock(
+        &self,
+        name: &str,
+    ) -> io::Result<Option<crate::instance::OwnedLock>> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         match crate::instance::owned_lock(
             &self.directory.join(format!("account-probe.{name}.lock")),
@@ -237,7 +240,7 @@ impl Cache {
         }
     }
 
-    fn lock(&self, operation: i32) -> io::Result<File> {
+    fn lock(&self, operation: i32) -> io::Result<crate::instance::OwnedLock> {
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), operation)
     }
 }

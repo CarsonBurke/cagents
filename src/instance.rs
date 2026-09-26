@@ -110,7 +110,26 @@ fn slot_socket_name(slot: &str) -> String {
     }
 }
 
-pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<File> {
+/// A lock ends with its owning scope, even if a concurrent fork inherited the
+/// file description and has not reached exec yet. Closing a File alone does
+/// not release flock until every inherited descriptor has also closed.
+pub(crate) struct OwnedLock(File);
+
+impl std::ops::Deref for OwnedLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -131,27 +150,15 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<File> {
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(lock)
+    Ok(OwnedLock(lock))
 }
 
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
 /// the one shared daemon. The old global lock remains held shared, so older
 /// exclusive-lease binaries cannot open any of these stores concurrently.
 pub struct WindowLease {
-    _legacy_fence: File,
-    _slot: File,
-}
-
-impl Drop for WindowLease {
-    fn drop(&mut self) {
-        // A concurrent fork may still hold the description before exec. Release
-        // ownership explicitly, as ApplicationLease does, rather than waiting
-        // for every inherited descriptor to close.
-        for lock in [&self._slot, &self._legacy_fence] {
-            // SAFETY: both owned descriptors remain live throughout Drop.
-            let _ = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
+    _legacy_fence: OwnedLock,
+    _slot: OwnedLock,
 }
 
 impl WindowLease {
@@ -685,9 +692,9 @@ fn update_window(runtime: &Path, slot: &str, action: &str, timeout: Duration) ->
 /// No signal is sent to UI processes. Preparation is reversible; a dirty editor
 /// or failed durable save cancels the entire update before any commit is sent.
 pub struct UiUpdateGuard {
-    lock: Option<File>,
+    lock: Option<OwnedLock>,
     runtime: PathBuf,
-    _legacy_fence: File,
+    _legacy_fence: OwnedLock,
     prepared: Vec<String>,
     closed: Vec<String>,
 }
@@ -1344,6 +1351,23 @@ mod tests {
         let link = directory.path().join("link.log");
         symlink(&target, &link).unwrap();
         assert!(RotatingFile::open(link, 64).is_err());
+    }
+
+    #[test]
+    fn scoped_locks_release_inherited_descriptions_on_early_error() {
+        let runtime = tempdir().unwrap();
+        let path = runtime.path().join("early-error.lock");
+        let mut inherited = None;
+        let mut acquire_then_fail = || -> io::Result<()> {
+            let lock = owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB)?;
+            inherited = Some(lock.try_clone()?);
+            Err(io::Error::other("a later acquisition failed"))
+        };
+        assert!(acquire_then_fail().is_err());
+        // The duplicated description models a child between fork and exec.
+        // It remains open, but must no longer hold the abandoned shared lock.
+        assert!(inherited.is_some());
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
     }
 
     #[test]
