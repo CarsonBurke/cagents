@@ -234,6 +234,7 @@ pub(crate) struct HostState {
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
+    pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     upgrade: Option<PreparedUpgrade>,
@@ -273,6 +274,7 @@ impl HostState {
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
+            agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
@@ -2333,6 +2335,13 @@ fn start_terminal_view(
     // that edge after insertion; the Spawn response carries the same snapshot,
     // and later generations can now produce a fresh wake.
     redraw_handle.acknowledge_redraw(redraw_handle.generation());
+    let activity_wake = Arc::clone(
+        &shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_activity_wake,
+    );
+    redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
     let completion_handle = redraw_handle.clone();
     let event_thread = thread::Builder::new()

@@ -74,7 +74,7 @@ struct Entry {
     census: Option<Inventory>,
 }
 
-/// Lazily invoked by terminal activity requests; no background thread or timer.
+/// Shared account census cache used by the daemon's bounded activity workers.
 pub(crate) struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
     rollouts: rollout::Rollouts,
@@ -86,6 +86,11 @@ pub(crate) struct Observation {
     pub title: Option<String>,
 }
 
+pub(crate) enum ObserveError {
+    Busy,
+    Unavailable,
+}
+
 impl Observer {
     pub fn new() -> Self {
         Self {
@@ -94,18 +99,14 @@ impl Observer {
         }
     }
 
-    pub fn observe(&self, process: &crate::model::agent_recovery::AgentProcess) -> Observation {
-        self.try_observe(process).unwrap_or_default()
-    }
-
-    fn try_observe(
+    pub(crate) fn try_observe(
         &self,
         process: &crate::model::agent_recovery::AgentProcess,
-    ) -> Option<Observation> {
+    ) -> Result<Observation, ObserveError> {
         let provider = process.provider;
         let recipe = &process.launch;
         if provider == Provider::Omp || !recipe.working_directory.is_absolute() {
-            return None;
+            return Err(ObserveError::Unavailable);
         }
         // A Codex CLI that keeps its own threads says what they are doing in
         // the rollouts it holds open; only one that holds none can be a client
@@ -118,20 +119,24 @@ impl Observer {
                     .map(|started| started.as_secs()),
             )
         {
-            return Some(Observation {
+            return Ok(Observation {
                 activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
                 title: None,
             });
         }
-        let key = key(provider, recipe).ok()?;
+        let key = key(provider, recipe).map_err(|_| ObserveError::Unavailable)?;
         let entry = {
-            let mut accounts = self.accounts.lock().ok()?;
+            let mut accounts = self
+                .accounts
+                .lock()
+                .map_err(|_| ObserveError::Unavailable)?;
             if !accounts.contains_key(&key) && accounts.len() >= MAX_ACCOUNTS {
                 // Do not evict an in-flight query and accidentally duplicate it.
                 let unused = accounts
                     .iter()
                     .find(|(_, entry)| Arc::strong_count(entry) == 1)
-                    .map(|(key, _)| key.clone())?;
+                    .map(|(key, _)| key.clone())
+                    .ok_or(ObserveError::Busy)?;
                 accounts.remove(&unused);
             }
             accounts
@@ -145,7 +150,12 @@ impl Observer {
                 .clone()
         };
         // Only the account lock spans I/O, never HostState or the registry lock.
-        let mut entry = entry.lock().ok()?;
+        // A slow account must not occupy every daemon worker with duplicate
+        // waiters. Another terminal can retry its cached census next time.
+        let mut entry = entry.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ObserveError::Busy,
+            std::sync::TryLockError::Poisoned(_) => ObserveError::Unavailable,
+        })?;
         if entry.updated.is_none_or(|updated| updated.elapsed() >= TTL) {
             entry.census = match provider {
                 Provider::Claude => claude::census(recipe).map(Inventory::Claude),
@@ -156,21 +166,23 @@ impl Observer {
             // Failure is cached too, replacing (not retaining) previous Working.
             entry.updated = Some(Instant::now());
         }
-        let state = match entry.census.as_ref()? {
+        let census = entry.census.as_ref().ok_or(ObserveError::Unavailable)?;
+        let state = match census {
             Inventory::Claude(census) => {
-                claude::activity(census, process.pid, &recipe.working_directory)?
+                claude::activity(census, process.pid, &recipe.working_directory)
+                    .ok_or(ObserveError::Unavailable)?
             }
             Inventory::Codex(census) => *census
                 .get(&recipe.working_directory)
                 .unwrap_or(&ActivityState::Idle),
         };
-        let title = match entry.census.as_ref()? {
+        let title = match census {
             Inventory::Claude(census) => {
                 claude::title(census, process.pid, &recipe.working_directory)
             }
             Inventory::Codex(_) => None,
         };
-        Some(Observation {
+        Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
         })
@@ -249,4 +261,48 @@ fn add(census: &mut Census, cwd: &str, state: ActivityState) -> ProbeResult<()> 
         *current = state;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_account_defers_without_waiting_or_publishing_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let launch = LaunchRecipe {
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), directory.path().to_str().unwrap().into()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory.path().to_str().unwrap().into(),
+                ),
+            ]),
+        };
+        let process = crate::model::agent_recovery::AgentProcess {
+            pid: 123,
+            start: 456,
+            provider: Provider::Claude,
+            launch: launch.clone(),
+            recovery: launch.clone(),
+        };
+        let observer = Observer::new();
+        let entry = Arc::new(Mutex::new(Entry {
+            updated: None,
+            census: None,
+        }));
+        observer
+            .accounts
+            .lock()
+            .unwrap()
+            .insert(key(Provider::Claude, &launch).unwrap(), Arc::clone(&entry));
+        let _held = entry.lock().unwrap();
+        assert!(matches!(
+            observer.try_observe(&process),
+            Err(ObserveError::Busy)
+        ));
+    }
 }

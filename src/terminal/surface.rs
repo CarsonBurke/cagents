@@ -25,10 +25,6 @@ impl TerminalSurface {
         self.0.activity()
     }
 
-    pub fn refresh_agent_activity(&self) -> Result<(), TerminalSendError> {
-        self.0.refresh_agent_activity()
-    }
-
     pub fn agent_activity(&self) -> Option<crate::agent::Activity> {
         self.0.agent_activity()
     }

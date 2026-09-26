@@ -1,3 +1,4 @@
+mod activity;
 mod chat;
 mod client;
 mod delivery;
@@ -189,6 +190,7 @@ pub fn run() -> Result<(), HostError> {
         }
     }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
+    let _agent_activity = activity::Monitor::start(&host)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
