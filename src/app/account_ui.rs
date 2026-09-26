@@ -3729,72 +3729,6 @@ mod tests {
         assert!(check_browser_login_host(&path).is_ok());
     }
 
-    #[test]
-    fn browser_add_is_fenced_before_async_home_creation_and_errors_release_it() {
-        let mut app = context_inspector_test_app(false);
-        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
-        let _first = app.add_account(Provider::Codex, false);
-        assert!(app.account_ui.browser_preparing);
-        let _second = app.add_account(Provider::Codex, false);
-        assert!(app.account_ui.logins.is_empty());
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|notice| notice.message == account::login::BUSY)
-        );
-        // A device-code request is independent and cannot clear the browser fence.
-        let _ = app.open_account_login(Provider::Codex, true, Err("fixture".into()));
-        assert!(app.account_ui.browser_preparing);
-        let _ = app.open_account_login(Provider::Codex, false, Err("fixture".into()));
-        assert!(!app.account_ui.browser_preparing);
-    }
-
-    #[test]
-    fn callback_spawn_failure_retains_pending_row_and_device_choice() {
-        let mut app = context_inspector_test_app(false);
-        let key = uuid::Uuid::from_u128(511);
-        let home = PathBuf::from("/cagents-fixture/accounts/codex").join(key.to_string());
-        let _ = app.open_account_login(
-            Provider::Codex,
-            false,
-            Ok((key, home, "/tools/codex".into())),
-        );
-        let card = app
-            .sign_in_card(Provider::Codex, &app.account_ui.logins[0].home)
-            .unwrap();
-        assert!(app.codex_browser_busy());
-        app.cards
-            .insert(card, CardRuntime::Failed(account::login::PORT_BUSY.into()));
-        let _ = app.check_logins();
-        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
-        assert!(!app.codex_browser_busy());
-        let _ = app.check_logins();
-        assert_eq!(
-            app.account_ui.logins.len(),
-            1,
-            "failure is not silently discarded as signed out"
-        );
-        let launch = login_launch(
-            &app.account_ui.logins[0].account(),
-            Path::new("/tools/codex"),
-            "/fixture".into(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(launch.arguments, ["login", "--device-auth"]);
-    }
-
-    #[test]
-    fn callback_bind_race_answer_retains_row_until_dismissed() {
-        let mut app = context_inspector_test_app(false);
-        let key = pending_login(&mut app, 512);
-        app.account_ui.logins[0].phase = LoginPhase::Verifying;
-        let _ = app.update(Message::AccountUi(Action::LoginCallbackBlocked(key)));
-        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
-        let _ = app.update(Message::AccountUi(Action::LoginTick));
-        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
-    }
-
     fn state_with(snapshot: Option<UsageSnapshot>) -> AccountState {
         let mut state = AccountState::new(Account::system(Provider::Claude));
         state.present = true;
@@ -4025,6 +3959,72 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    #[test]
+    fn browser_add_is_fenced_before_async_home_creation_and_errors_release_it() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let _first = app.add_account(Provider::Codex, false);
+        assert!(app.account_ui.browser_preparing);
+        let _second = app.add_account(Provider::Codex, false);
+        assert!(app.account_ui.logins.is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message == account::login::BUSY)
+        );
+        // A device-code request is independent and cannot clear the browser fence.
+        let _ = app.open_account_login(Provider::Codex, true, Err("fixture".into()));
+        assert!(app.account_ui.browser_preparing);
+        let _ = app.open_account_login(Provider::Codex, false, Err("fixture".into()));
+        assert!(!app.account_ui.browser_preparing);
+    }
+
+    #[test]
+    fn callback_spawn_failure_retains_pending_row_and_device_choice() {
+        let mut app = context_inspector_test_app(false);
+        let key = uuid::Uuid::from_u128(511);
+        let home = PathBuf::from("/cagents-fixture/accounts/codex").join(key.to_string());
+        let _ = app.open_account_login(
+            Provider::Codex,
+            false,
+            Ok((key, home, "/tools/codex".into())),
+        );
+        let card = app
+            .sign_in_card(Provider::Codex, &app.account_ui.logins[0].home)
+            .unwrap();
+        assert!(app.codex_browser_busy());
+        app.cards
+            .insert(card, CardRuntime::Failed(account::login::PORT_BUSY.into()));
+        let _ = app.check_logins();
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        assert!(!app.codex_browser_busy());
+        let _ = app.check_logins();
+        assert_eq!(
+            app.account_ui.logins.len(),
+            1,
+            "failure is not silently discarded as signed out"
+        );
+        let launch = login_launch(
+            &app.account_ui.logins[0].account(),
+            Path::new("/tools/codex"),
+            "/fixture".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(launch.arguments, ["login", "--device-auth"]);
+    }
+
+    #[test]
+    fn callback_bind_race_answer_retains_row_until_dismissed() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 512);
+        app.account_ui.logins[0].phase = LoginPhase::Verifying;
+        let _ = app.update(Message::AccountUi(Action::LoginCallbackBlocked(key)));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+    }
+
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;
