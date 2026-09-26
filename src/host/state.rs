@@ -4018,6 +4018,7 @@ for line in sys.stdin:
         };
         let session = TerminalSession {
             recovery_origin: None,
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

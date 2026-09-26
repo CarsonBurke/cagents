@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    model::{HostSessionProof, TerminalId},
+    model::HostSessionProof,
     terminal_ipc::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_CLIENT_FRAME_BYTES,
         MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
@@ -912,6 +912,7 @@ fn write_failure(error: &FrameError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TerminalId;
     use std::sync::Mutex;
 
     #[test]
