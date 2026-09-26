@@ -740,15 +740,23 @@ mod tests {
 
     #[test]
     fn orphaned_terminal_process_blocks_recovery_without_being_killed() {
+        use std::io::Read;
+        use std::process::Stdio;
+
         let directory = tempfile::tempdir().unwrap();
         let original = session(directory.path(), &proof("old"));
         for marker in [
             None,
             Some(recovery_terminal_id(original.id, &proof("intermediate")).to_string()),
         ] {
-            let mut command = std::process::Command::new("/bin/sleep");
+            let mut command = std::process::Command::new("/bin/sh");
             command
-                .arg("30")
+                // Publish readiness from the executed child before scanning its
+                // proc files. Keep it alive on an open input pipe: neither a
+                // scheduling delay nor the suite's duration ends the fixture.
+                .args(["-c", "printf ready; read -r release"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .current_dir(directory.path())
                 .env("CAGENTS_RECOVERY_ORIGIN", original.id.to_string())
                 .env("TERM_PROGRAM", "cagents");
@@ -758,6 +766,9 @@ mod tests {
                 command.env_remove("CAGENTS_TERMINAL_ID");
             }
             let mut child = command.spawn().unwrap();
+            let mut ready = [0; 5];
+            child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
             std::os::unix::fs::symlink(
                 format!("/proc/{}", child.id()),
                 directory.path().join(child.id().to_string()),
