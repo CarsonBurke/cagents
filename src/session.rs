@@ -100,7 +100,9 @@ impl SaveFailureCategory {
             Self::StorageUnavailable => {
                 "Restore the database directory or mounted storage, then retry."
             }
-            Self::Corrupt => "Back up the database and restart cagents before making more changes.",
+            Self::Corrupt => {
+                "Back up the database, then repair it or restore a healthy backup before retrying. Editing the item cannot repair stored data."
+            }
             // Restarting is no longer the remedy: the writer re-reads the
             // stored generations and retries the same snapshot itself, so a
             // conflict only reaches the reader when the write was rejected
@@ -1669,6 +1671,14 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
             ErrorCode::ConstraintViolation => SaveFailureCategory::InvalidData,
             _ => SaveFailureCategory::Database,
         },
+        StoreError::CorruptRow { .. }
+        | StoreError::InvalidUuid { .. }
+        | StoreError::Sqlite(
+            rusqlite::Error::QueryReturnedNoRows
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..),
+        ) => SaveFailureCategory::Corrupt,
         StoreError::Sqlite(_) => SaveFailureCategory::Database,
         StoreError::Serialization(_) => SaveFailureCategory::Serialization,
         StoreError::Io(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
@@ -1685,10 +1695,9 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
         StoreError::UnsupportedSchema { .. } | StoreError::InvalidState(_) => {
             SaveFailureCategory::InvalidData
         }
-        StoreError::InvalidUuid { .. }
-        | StoreError::InvalidBusyTimeout { .. }
-        | StoreError::MutexPoisoned
-        | StoreError::Closed => SaveFailureCategory::Database,
+        StoreError::InvalidBusyTimeout { .. } | StoreError::MutexPoisoned | StoreError::Closed => {
+            SaveFailureCategory::Database
+        }
     }
 }
 
@@ -3566,7 +3575,6 @@ mod tests {
         for permanent in [
             StoreError::InvalidState("tombstoned card cannot be resurrected".into()),
             StoreError::Serialization(serde_json::from_str::<u8>("x").unwrap_err()),
-            StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
             constraint(rusqlite::ffi::SQLITE_TOOBIG),
@@ -3579,6 +3587,11 @@ mod tests {
             assert!(permanent.refuses_content(), "{permanent:?}");
         }
         for transient in [
+            StoreError::CorruptRow {
+                field: "card existence".into(),
+                reason: "malformed JSON".into(),
+            },
+            StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
             constraint(rusqlite::ffi::SQLITE_BUSY),
             constraint(rusqlite::ffi::SQLITE_READONLY),
             constraint(rusqlite::ffi::SQLITE_FULL),
@@ -3609,6 +3622,69 @@ mod tests {
             save_failure_category(&foreign_key_violation()),
             SaveFailureCategory::InvalidData
         );
+    }
+
+    #[test]
+    fn corrupt_stored_rows_keep_valid_edits_pending_for_recovery() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("corrupt-row.sqlite3");
+        let store = StateStore::open(&path, BootId::new("corrupt-row")).unwrap();
+        let mut state = workspace();
+        let mut writes = empty_writes();
+        writes.workspace = Some(Arc::new(state.clone()));
+        assert!(writes.flush(&store).is_empty());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute("UPDATE cards SET existence_json = 'broken-json'", [])
+            .unwrap();
+        state.cards[0].title = "valid edit waiting for repair".into();
+        writes.workspace = Some(Arc::new(state.clone()));
+        let errors = writes.flush(&store);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            save_failure_category(&errors[0]),
+            SaveFailureCategory::Corrupt
+        );
+        assert!(!errors[0].refuses_content());
+        assert!(writes.workspace.is_some(), "valid edits remain queued");
+        assert!(
+            writes.quarantine.workspace.is_none(),
+            "corruption is not blamed on the edited card"
+        );
+        connection
+            .execute(
+                "UPDATE cards SET existence_json = ?1",
+                [serde_json::to_string(&Existence::Open).unwrap()],
+            )
+            .unwrap();
+        assert!(writes.flush(&store).is_empty());
+        assert!(writes.workspace.is_none());
+        assert_eq!(
+            store.load_workspace(state.id, None).unwrap().unwrap().cards[0].title,
+            state.cards[0].title
+        );
+        assert!(SaveFailureCategory::Corrupt.guidance().contains("repair"));
+    }
+
+    #[test]
+    fn missing_or_undecodable_stored_values_are_corruption_not_refused_content() {
+        let bad_id = "not-a-uuid";
+        for error in [
+            StoreError::InvalidUuid {
+                kind: "card",
+                value: bad_id.into(),
+                source: bad_id.parse::<uuid::Uuid>().unwrap_err(),
+            },
+            StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+            StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
+                0,
+                "card_id".into(),
+                rusqlite::types::Type::Blob,
+            )),
+        ] {
+            assert!(!error.refuses_content());
+            assert_eq!(save_failure_category(&error), SaveFailureCategory::Corrupt);
+        }
     }
 
     /// #268: a write storage refuses by construction used to exhaust the
