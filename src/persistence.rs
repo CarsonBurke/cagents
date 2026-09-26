@@ -3749,9 +3749,10 @@ fn load_terminal(
         continuity,
     };
     if terminal.owned_codex_listener.is_some() && !terminal.owns_codex_listener() {
-        return Err(StoreError::InvalidState(format!(
-            "terminal card {card_id} has invalid owned listener evidence"
-        )));
+        return Err(StoreError::corrupt_row(
+            format!("terminal card {card_id}"),
+            "invalid owned listener evidence",
+        ));
     }
     Ok(terminal)
 }
@@ -4742,6 +4743,20 @@ mod tests {
         assert!(restored.owns_codex_listener());
         assert_eq!(restored.owned_codex_listener, chat.owned_codex_listener);
         assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let mut corrupt = chat.owned_codex_listener.unwrap();
+        corrupt.socket = PathBuf::from("relative.sock");
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE terminal_recipes SET owned_codex_listener = ?1 WHERE card_id = ?2",
+                [serde_json::to_string(&corrupt).unwrap(), card.to_string()],
+            )
+            .unwrap();
+        let error = store.load_card(card, None).unwrap_err();
+        assert!(matches!(error, StoreError::CorruptRow { .. }));
+        assert!(!error.refuses_content());
     }
 
     #[test]
