@@ -199,3 +199,7 @@ debug = "line-tables-only"
 
 [patch."https://github.com/pop-os/winit.git"]
 winit-wayland = { path = "vendor/winit-wayland" }
+
+# Preserve pointer positions while Iced dispatches a queued event batch.
+[patch."https://github.com/pop-os/libcosmic.git"]
+iced_runtime = { path = "vendor/iced-runtime" }
