@@ -199,12 +199,12 @@ impl Installation {
 
     fn from_executable(executable: &Path) -> Result<Self, UpdateError> {
         let layout = locate(executable)?;
-        stable_version(&layout.version)?;
+        installed_version(&layout.version)?;
         if layout.prefix.join("current").canonicalize()? != layout.version_root {
             return Err(unsupported_install());
         }
         // Source builds copied into an old release tree must not impersonate it.
-        if layout.version != env!("CARGO_PKG_VERSION") {
+        if layout.version != crate::VERSION {
             return Err(invalid(
                 "installed directory and running binary versions differ; reinstall manually",
             ));
@@ -248,6 +248,19 @@ fn stable_version(text: &str) -> Result<Version, UpdateError> {
     Ok(version)
 }
 
+/// Build metadata identifies a local package but has no release precedence.
+/// Keep release tags themselves under `stable_version`'s stricter contract.
+fn installed_version(text: &str) -> Result<Version, UpdateError> {
+    let mut version = Version::parse(text).map_err(|_| invalid("invalid installed version"))?;
+    if !version.pre.is_empty() || version.to_string() != text {
+        return Err(invalid(
+            "only canonical release-based installations are supported",
+        ));
+    }
+    version.build = semver::BuildMetadata::EMPTY;
+    Ok(version)
+}
+
 /// Blocking, bounded network discovery. Run on an async runtime's blocking pool.
 /// No installation or updater files are created by this call.
 pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateError> {
@@ -276,7 +289,7 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
 }
 
 fn select_release(releases: Vec<GitHubRelease>, current: &str) -> Result<UpdateState, UpdateError> {
-    let current_version = stable_version(current)?;
+    let current_version = installed_version(current)?;
     let newest = releases
         .into_iter()
         .filter_map(|release| {
@@ -345,7 +358,7 @@ struct UpdateRequest {
 
 pub fn apply(release: &Release, allow_interruptions: bool) -> Result<UpdateJob, UpdateError> {
     let installation = Installation::detect()?;
-    if stable_version(&release.version)? <= stable_version(&installation.version)? {
+    if stable_version(&release.version)? <= installed_version(&installation.version)? {
         return Err(invalid(
             "selected release is not newer than the running installation",
         ));
@@ -602,7 +615,7 @@ fn perform_update(
         &cancellation,
     )?)?)?;
     if release != selected
-        || stable_version(&release.version)? <= stable_version(&installation.version)?
+        || stable_version(&release.version)? <= installed_version(&installation.version)?
     {
         return Err(invalid(
             "selected release changed or is no longer an upgrade; check again",
@@ -1087,6 +1100,20 @@ mod tests {
     }
 
     #[test]
+    fn local_install_updates_only_to_a_newer_stable_release() {
+        assert!(matches!(
+            select_release(vec![release("0.1.3")], "0.1.3+local.937921c").unwrap(),
+            UpdateState::Current { .. }
+        ));
+        assert!(matches!(
+            select_release(vec![release("0.1.4")], "0.1.3+local.937921c").unwrap(),
+            UpdateState::Available { release } if release.version == "0.1.4"
+        ));
+        assert!(select_release(vec![release("0.1.4")], "0.1.3-rc.1").is_err());
+        assert!(stable_version("0.1.4+local.abc").is_err());
+    }
+
+    #[test]
     fn missing_wrong_duplicate_and_oversized_assets_never_fallback() {
         let mut wrong = release("2.0.0");
         wrong.assets[0].name = "cagents-2.0.0-aarch64-apple-darwin.tar.gz".into();
@@ -1145,6 +1172,35 @@ mod tests {
             fs::write(&path, b"binary").unwrap();
             assert!(Installation::from_executable(&path).is_err());
         }
+    }
+
+    #[test]
+    fn installed_version_must_match_the_running_binary_including_build_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        install_tree(root, &[crate::VERSION], crate::VERSION);
+        let executable = root
+            .join("versions")
+            .join(crate::VERSION)
+            .join("bin/cagents-ui");
+        assert_eq!(
+            Installation::from_executable(&executable).unwrap().version,
+            crate::VERSION
+        );
+
+        let impostor = format!("{}+local.impostor", env!("CARGO_PKG_VERSION"));
+        let another = tempfile::tempdir().unwrap();
+        let another = another.path();
+        install_tree(another, &[&impostor], &impostor);
+        assert!(
+            Installation::from_executable(
+                &another
+                    .join("versions")
+                    .join(&impostor)
+                    .join("bin/cagents-ui")
+            )
+            .is_err()
+        );
     }
 
     /// Builds `<root>/{.cagents-install-root,versions/<v>/bin/{cagents,cagents-ui,cagentsd}}`

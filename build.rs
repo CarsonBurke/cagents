@@ -16,9 +16,8 @@
 //!    for uncommitted changes.
 //! 3. Nothing, for a source export with no `.git` - a release build.
 //!
-//! The self-updater keeps comparing `CARGO_PKG_VERSION`, because a version
-//! carrying metadata is exactly what it must refuse to update: the metadata
-//! is for diagnostics, never for choosing a release.
+//! The self-updater verifies the complete installed version against this
+//! stamp, then ignores build metadata when comparing it with stable releases.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

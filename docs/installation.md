@@ -203,10 +203,12 @@ upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
 
 ### In-app updates
 
-Full self-managed (`install.sh`) installations check authenticated GitHub
-releases at startup and every six hours. When a newer stable version is
-available, an update icon appears in the top-right application controls; its
-tooltip names the version.
+Full self-managed (`install.sh`) installations, including packages built
+locally with a `+local` version, check authenticated GitHub releases at startup
+and every six hours. When a newer stable version is available, an update icon
+appears in the top-right application controls; its tooltip names the version.
+Build metadata identifies the installed binaries but does not make a published
+release with the same base version count as an upgrade.
 
 Clicking it checks the impact first. If the daemon has live sessions, one
 confirmation explains that agent conversations resume where supported, shells
