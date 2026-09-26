@@ -10226,6 +10226,9 @@ impl Application for Cagents {
                 | Message::WorkspaceModelObserved(_)
                 | Message::ProjectUi(_)
                 | Message::ChannelUi(_)
+                | Message::Sidebar(_)
+                | Message::FocusCard(_)
+                | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
         let task = match message {
