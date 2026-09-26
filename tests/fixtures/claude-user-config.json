@@ -1,0 +1,7 @@
+{
+  "oauthAccount": { "token": "fixture-do-not-copy" },
+  "projects": { "/repo": { "hasTrustDialogAccepted": true } },
+  "mcpServers": {
+    "example": { "command": "example-mcp", "args": ["serve"] }
+  }
+}

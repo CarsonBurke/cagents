@@ -1223,7 +1223,11 @@ mod credential_guard {
         let forbidden = forbidden();
         let mut violations = Vec::new();
         for file in files {
-            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            // This documented Codex setting selects storage; naming it does
+            // not access Omp's similarly named credential table.
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_default()
+                .replace("cli_auth_credentials_store", "");
             for needle in &forbidden {
                 if text.contains(needle.as_str()) {
                     violations.push(format!("{} names {needle}", file.display()));

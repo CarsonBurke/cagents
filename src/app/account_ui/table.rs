@@ -53,6 +53,7 @@ pub(in crate::app) struct Table {
     /// How many open cards run on the account being removed.
     pub(in crate::app) confirm_in_use: usize,
     pub(in crate::app) add_menu: bool,
+    pub(in crate::app) own_codex_config: bool,
     /// The row being renamed, and the name typed so far.
     pub(in crate::app) rename: Option<(AccountId, String)>,
     /// A provider home to link, and the path entered so far.
@@ -383,6 +384,16 @@ fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
         state.table.add_menu.then(|| {
             widget::container(
                 widget::column::with_children(vec![
+                    widget::checkbox(state.table.own_codex_config)
+                        .label("Give new Codex accounts their own config copy")
+                        .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
+                        .into(),
+                    design::caption("Otherwise Codex shares config.toml, including forced_login_method and cli_auth_credentials_store. Changes affect every linked account; each home has its own keyring identity.")
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into(),
+                    design::caption("New Claude accounts copy settings.json and user MCP servers once. Later edits stay separate; login and project trust state are not copied.")
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into(),
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Claude),
                         "Claude",
