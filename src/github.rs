@@ -147,6 +147,13 @@ pub struct GitHubRepoKey {
 }
 
 impl GitHubRepoKey {
+    pub fn same_repository(&self, other: &Self) -> bool {
+        self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+            && self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
     pub fn new(
         host: impl Into<String>,
         port: Option<u16>,
@@ -308,6 +315,40 @@ pub struct GitHubActor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubHeadRepository {
     pub name: String,
+}
+
+/// Source identity is never inferred from the PR's base repository or author.
+impl PullRequest {
+    pub fn head_repository_key(&self) -> Option<GitHubRepoKey> {
+        GitHubRepoKey::new(
+            self.url.host_str()?,
+            self.url.port(),
+            &self.head_repository_owner.as_ref()?.login,
+            &self.head_repository.as_ref()?.name,
+        )
+        .ok()
+    }
+
+    pub fn belongs_to_head(&self, repository: &GitHubRepoKey) -> bool {
+        self.head_repository_key()
+            .is_some_and(|head| head.same_repository(repository))
+    }
+}
+
+pub fn worktree_head_repository(
+    worktree: &Path,
+    branch: &str,
+    cancellation: &CancellationToken,
+) -> Option<GitHubRepoKey> {
+    let branch = crate::repository::ValidatedBranchName::parse(branch).ok()?;
+    let remote = crate::repository::RepositoryService::system("git")
+        .branch_remote(worktree, &branch, cancellation)
+        .ok()??;
+    remote
+        .push_url
+        .as_deref()
+        .or(remote.fetch_url.as_deref())
+        .and_then(remote_repository_key)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1530,19 +1571,21 @@ impl<E: ProcessExecutor> GitHubService<E> {
     pub fn resolve_branch(
         &self,
         repository: &GitHubRepoKey,
+        head_repository: &GitHubRepoKey,
         branch: &str,
         head_oid: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Option<PullRequest>, GitHubError> {
         let candidates = self.branch_candidates(repository, branch, cancellation)?;
-        Ok(select_branch_pull_request(&candidates, branch, head_oid)?.cloned())
+        Ok(select_branch_pull_request(&candidates, head_repository, branch, head_oid)?.cloned())
     }
 
     /// Resolve an attached checkout's PR. Exact commits win; a unique PR from
-    /// this repository also matches after a local branch tip has moved.
+    /// the proven source repository also matches after a local tip has moved.
     pub fn resolve_branch_head(
         &self,
         repository: &GitHubRepoKey,
+        head_repository: &GitHubRepoKey,
         branch: &str,
         head_oid: &str,
         cancellation: &CancellationToken,
@@ -1555,7 +1598,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         }
         let matching = candidates
             .into_iter()
-            .filter(|pr| pr.head_ref_name == branch)
+            .filter(|pr| pr.head_ref_name == branch && pr.belongs_to_head(head_repository))
             .collect::<Vec<_>>();
         let mut exact = matching.iter().filter(|pr| pr.head_ref_oid == head_oid);
         let first = exact.next();
@@ -1567,21 +1610,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         if let Some(first) = first {
             return Ok(Some(first.clone()));
         }
-        if matching.len() == 1 {
-            let pr = &matching[0];
-            if pr
-                .head_repository
-                .as_ref()
-                .is_some_and(|head| head.name.eq_ignore_ascii_case(&repository.name))
-                && pr
-                    .head_repository_owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.login.eq_ignore_ascii_case(&repository.owner))
-            {
-                return Ok(Some(pr.clone()));
-            }
-        }
-        Ok(None)
+        Ok((matching.len() == 1).then(|| matching[0].clone()))
     }
 
     fn branch_candidates(
@@ -2620,6 +2649,7 @@ pub fn pull_request_number(
 
 fn select_branch_pull_request<'a>(
     candidates: &'a [PullRequest],
+    head_repository: &GitHubRepoKey,
     branch: &str,
     head_oid: Option<&str>,
 ) -> Result<Option<&'a PullRequest>, GitHubError> {
@@ -2630,7 +2660,7 @@ fn select_branch_pull_request<'a>(
     }
     let matching: Vec<_> = candidates
         .iter()
-        .filter(|pr| pr.head_ref_name == branch)
+        .filter(|pr| pr.head_ref_name == branch && pr.belongs_to_head(head_repository))
         .collect();
     let open: Vec<_> = matching
         .iter()
@@ -2879,7 +2909,7 @@ mod tests {
 
     #[test]
     fn list_parser_accepts_unknown_remote_enum_values() {
-        let output = br#"[{"number":7,"title":"Title","state":"FUTURE_STATE","isDraft":false,"headRefName":"feature","headRefOid":"abc","baseRefName":"main","author":null,"updatedAt":"2026-01-01T00:00:00Z","url":"https://github.com/owner/repo/pull/7","mergeable":"FUTURE","mergeStateStatus":null,"reviewDecision":null,"labels":[]}]"#;
+        let output = br#"[{"number":7,"title":"Title","state":"FUTURE_STATE","isDraft":false,"headRefName":"feature","headRefOid":"abc","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","author":null,"updatedAt":"2026-01-01T00:00:00Z","url":"https://github.com/owner/repo/pull/7","mergeable":"FUTURE","mergeStateStatus":null,"reviewDecision":null,"labels":[]}]"#;
         let pull_requests = parse_pull_request_list(output, &repository()).unwrap();
         assert_eq!(pull_requests[0].state.0, "FUTURE_STATE");
         assert_eq!(pull_requests[0].mergeable.as_ref().unwrap().0, "FUTURE");
@@ -2974,7 +3004,7 @@ mod tests {
     #[test]
     fn create_normalizes_the_returned_url_with_pr_view_json() {
         let created = b"https://github.com/owner/repo/pull/7\n";
-        let detail = br#"{"number":7,"title":"Title","body":"Body","state":"OPEN","isDraft":false,"headRefName":"feature","headRefOid":"abc","baseRefName":"main","author":null,"createdAt":"now","updatedAt":"now","url":"https://github.com/owner/repo/pull/7","labels":[]}"#;
+        let detail = br#"{"number":7,"title":"Title","body":"Body","state":"OPEN","isDraft":false,"headRefName":"feature","headRefOid":"abc","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","author":null,"createdAt":"now","updatedAt":"now","url":"https://github.com/owner/repo/pull/7","labels":[]}"#;
         let fake = Arc::new(FakeExecutor::with_outputs(vec![
             success(created),
             success(detail),
@@ -3128,25 +3158,105 @@ mod tests {
     }
 
     #[test]
+    fn local_head_identity_uses_git_configuration_and_push_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/CarsonBurke/cleanrl.git",
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/vwxyzjn/cleanrl.git",
+        ]);
+        git(&["config", "branch.Feature/Case.remote", "upstream"]);
+        git(&["config", "branch.Feature/Case.pushRemote", "origin"]);
+        git(&[
+            "config",
+            "remote.origin.pushurl",
+            "git@github.com:ActualPublisher/cleanrl.git",
+        ]);
+        let key = worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
+            .unwrap();
+        assert_eq!(key.owner, "ActualPublisher");
+        assert_eq!(key.name, "cleanrl");
+        git(&["config", "branch.Feature/Case.pushRemote", "unknown"]);
+        assert!(
+            worktree_head_repository(temp.path(), "Feature/Case", &CancellationToken::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn branch_lookup_requires_source_repository_even_for_identical_commits() {
+        let own = repository();
+        let pr: PullRequest = serde_json::from_value(serde_json::json!({
+            "number":466,"title":"Unrelated master","state":"OPEN",
+            "headRefName":"master","headRefOid":"abc","baseRefName":"master",
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"another-fork"},
+            "updatedAt":"now","url":"https://github.com/owner/repo/pull/466"
+        }))
+        .unwrap();
+        assert!(
+            select_branch_pull_request(&[pr.clone()], &own, "master", Some("abc"))
+                .unwrap()
+                .is_none()
+        );
+        let mut ours = pr.clone();
+        ours.head_repository_owner.as_mut().unwrap().login = own.owner.to_ascii_uppercase();
+        ours.number = 7;
+        assert_eq!(
+            select_branch_pull_request(&[pr, ours.clone()], &own, "master", Some("abc"))
+                .unwrap()
+                .unwrap()
+                .number,
+            7
+        );
+        ours.head_repository = None;
+        assert!(
+            select_branch_pull_request(&[ours], &own, "master", Some("abc"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn branch_lookup_never_chooses_an_ambiguous_fork_by_list_order() {
         let first = parse_pull_request(
-            br#"{"number":7,"title":"Title","state":"OPEN","headRefName":"feature","headRefOid":"abc","baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7"}"#,
+            br#"{"number":7,"title":"Title","state":"OPEN","headRefName":"feature","headRefOid":"abc","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7"}"#,
             &repository(),
         ).unwrap();
         let mut second = first.clone();
         second.number = 8;
         second.head_ref_oid = "def".into();
         let candidates = [first, second];
-        assert!(select_branch_pull_request(&candidates, "feature", None).is_err());
+        assert!(select_branch_pull_request(&candidates, &repository(), "feature", None).is_err());
         assert_eq!(
-            select_branch_pull_request(&candidates, "feature", Some("def"))
+            select_branch_pull_request(&candidates, &repository(), "feature", Some("def"))
                 .unwrap()
                 .unwrap()
                 .number,
             8
         );
         assert!(
-            select_branch_pull_request(&candidates, "unrelated", Some("def"))
+            select_branch_pull_request(&candidates, &repository(), "unrelated", Some("def"))
                 .unwrap()
                 .is_none()
         );
@@ -3155,11 +3265,17 @@ mod tests {
     #[test]
     fn exact_head_lookup_finds_older_merged_pr_on_reused_branch() {
         let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
-            br#"[{"number":9,"title":"New","state":"OPEN","headRefName":"feature","headRefOid":"new","baseRefName":"main","updatedAt":"2026-09-01","url":"https://github.com/owner/repo/pull/9"},{"number":7,"title":"Old","state":"MERGED","headRefName":"feature","headRefOid":"old","baseRefName":"main","updatedAt":"2026-01-01","url":"https://github.com/owner/repo/pull/7"}]"#,
+            br#"[{"number":9,"title":"New","state":"OPEN","headRefName":"feature","headRefOid":"new","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-09-01","url":"https://github.com/owner/repo/pull/9"},{"number":7,"title":"Old","state":"MERGED","headRefName":"feature","headRefOid":"old","headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-01-01","url":"https://github.com/owner/repo/pull/7"}]"#,
         )]));
         let service = GitHubService::new("gh", fake);
         let pr = service
-            .resolve_branch_head(&repository(), "feature", "old", &CancellationToken::new())
+            .resolve_branch_head(
+                &repository(),
+                &repository(),
+                "feature",
+                "old",
+                &CancellationToken::new(),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(pr.number, 7);
@@ -3181,6 +3297,7 @@ mod tests {
             service
                 .resolve_branch_head(
                     &repository(),
+                    &repository(),
                     "feature",
                     "local-tip",
                     &CancellationToken::new()
@@ -3193,6 +3310,7 @@ mod tests {
         assert!(
             service
                 .resolve_branch_head(
+                    &repository(),
                     &repository(),
                     "feature",
                     "local-tip",

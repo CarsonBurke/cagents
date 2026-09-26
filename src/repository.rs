@@ -5872,6 +5872,46 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }))
     }
 
+    /// The repository a local branch publishes to, independent of the forge's
+    /// default base repository (which can be the upstream of a fork).
+    pub fn branch_remote(
+        &self,
+        worktree: &Path,
+        branch: &ValidatedBranchName,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RemoteRecord>, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            ["config", "-z", "--get-regexp", r"^(remote|branch)\."],
+        );
+        let output = self.run(&command, cancellation)?;
+        if !output.success {
+            return if output.exit_code == Some(1) {
+                Ok(None)
+            } else {
+                Err(git_failure(&command, output).into())
+            };
+        }
+        let config = String::from_utf8_lossy(&output.stdout).into_owned();
+        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
+        let values: BTreeMap<_, _> = config
+            .split('\0')
+            .filter_map(|entry| entry.split_once('\n'))
+            .collect();
+        let selected = values
+            .get(format!("branch.{}.pushremote", branch.as_str()).as_str())
+            .or_else(|| values.get("remote.pushdefault"))
+            .or_else(|| values.get(format!("branch.{}.remote", branch.as_str()).as_str()));
+        Ok(match selected {
+            Some(name) => remotes.into_iter().find(|remote| remote.name == *name),
+            None => remotes
+                .iter()
+                .find(|remote| remote.name == "origin")
+                .cloned()
+                .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone())),
+        })
+    }
+
     fn branch_config(
         &self,
         worktree: &Path,
@@ -9805,6 +9845,48 @@ mod tests {
                 failure: MutationFailure::Rejected { .. }
             }
         ));
+    }
+
+    #[test]
+    fn branch_publication_remote_honors_explicit_targets_and_never_guesses_between_forks() {
+        let branch = ValidatedBranchName::parse("master").unwrap();
+        let remote_config = b"remote.origin.url\nhttps://github.com/local/repo.git\0remote.upstream.url\nhttps://github.com/upstream/repo.git\0";
+        for (push, default, tracking, expected) in [
+            (
+                Some("origin"),
+                Some("upstream"),
+                Some("upstream"),
+                Some("origin"),
+            ),
+            (None, Some("origin"), Some("upstream"), Some("origin")),
+            (None, None, Some("upstream"), Some("upstream")),
+            (None, None, None, Some("origin")),
+            (Some("missing"), None, Some("origin"), None),
+            (None, None, Some("."), None),
+        ] {
+            let mut config = remote_config.to_vec();
+            for (key, value) in [
+                ("branch.master.pushremote", push),
+                ("remote.pushdefault", default),
+                ("branch.master.remote", tracking),
+            ] {
+                if let Some(value) = value {
+                    config.extend_from_slice(format!("{key}\n{value}\0").as_bytes());
+                }
+            }
+            let service = fake_service(vec![success(&config)]);
+            let remote = service
+                .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(remote.as_ref().map(|remote| remote.name.as_str()), expected);
+        }
+        let service = fake_service(vec![success(b"remote.one.url\nhttps://github.com/one/repo.git\0remote.two.url\nhttps://github.com/two/repo.git\0")]);
+        assert!(
+            service
+                .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

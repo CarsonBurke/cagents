@@ -1696,23 +1696,25 @@ pub struct LoadedRepository {
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     github: GitHubAvailability,
+    head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
 }
 
-type WorktreePrCacheKey = (GitHubRepoKey, String, String);
+type WorktreePrCacheKey = (GitHubRepoKey, GitHubRepoKey, String, String);
 static WORKTREE_PR_CACHE: LazyLock<
     Mutex<HashMap<WorktreePrCacheKey, (Instant, Option<crate::github::PullRequest>)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 static WORKTREE_PR_LOOKUP_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_PR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Resolve only branches missing from the recent PR page. Every result must
-/// name the checkout's exact head; branch names alone are shared by forks and
-/// can be reused after a PR has closed.
+/// Resolve branches missing from the recent PR page within their source
+/// repository. Historical results must name this head or an ancestor of it;
+/// branch names alone are shared by forks and can be reused after closure.
 fn attached_worktree_pull_requests(
     github: &GitHubService,
     key: &GitHubRepoKey,
     worktrees: &[(WorktreeRecord, Option<StatusSnapshot>)],
     recent: &[crate::github::PullRequest],
+    head_repositories: &HashMap<crate::model::WorktreeId, GitHubRepoKey>,
     cancellation: &CancellationToken,
 ) -> Vec<crate::github::PullRequest> {
     // One repository lookup wave at a time keeps a global refresh from
@@ -1732,15 +1734,14 @@ fn attached_worktree_pull_requests(
             }
             let branch = record.branch.as_deref()?.strip_prefix("refs/heads/")?;
             let oid = record.head_oid.as_deref()?.to_owned();
-            if matching_attached_pr(record, recent).is_some() {
+            let head_repository = head_repositories.get(&record.id)?;
+            if matching_attached_pr(record, head_repository, recent).is_some() {
                 return None;
             }
             let branch = branch.to_owned();
-            unique.insert((branch.clone(), oid.clone())).then_some((
-                branch,
-                oid,
-                record.path.clone(),
-            ))
+            unique
+                .insert((head_repository.clone(), branch.clone(), oid.clone()))
+                .then_some((branch, oid, record.path.clone(), head_repository.clone()))
         })
         .collect();
     if missing.is_empty() {
@@ -1763,11 +1764,16 @@ fn attached_worktree_pull_requests(
             let missing = &missing;
             let found = &found;
             scope.spawn(move || {
-                for (branch, oid, path) in missing.iter().skip(shard).step_by(8) {
+                for (branch, oid, path, head_repository) in missing.iter().skip(shard).step_by(8) {
                     if cancellation.is_cancelled() {
                         break;
                     }
-                    let cache_key = (key.clone(), branch.clone(), oid.clone());
+                    let cache_key = (
+                        key.clone(),
+                        head_repository.clone(),
+                        branch.clone(),
+                        oid.clone(),
+                    );
                     let cached = WORKTREE_PR_CACHE
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -1783,7 +1789,13 @@ fn attached_worktree_pull_requests(
                         .map(|(_, pr)| pr.clone());
                     let resolved = match cached {
                         Some(result) => result,
-                        None => match github.resolve_branch_head(key, branch, oid, cancellation) {
+                        None => match github.resolve_branch_head(
+                            key,
+                            head_repository,
+                            branch,
+                            oid,
+                            cancellation,
+                        ) {
                             Ok(result) => {
                                 let result = result.filter(|pr| {
                                     pr.head_ref_oid == *oid
@@ -1813,6 +1825,7 @@ fn attached_worktree_pull_requests(
 
 fn matching_attached_pr<'a>(
     record: &WorktreeRecord,
+    head_repository: &GitHubRepoKey,
     pull_requests: &'a [crate::github::PullRequest],
 ) -> Option<&'a crate::github::PullRequest> {
     if record.detached || record.bare {
@@ -1820,9 +1833,9 @@ fn matching_attached_pr<'a>(
     }
     let branch = record.branch.as_deref()?.strip_prefix("refs/heads/")?;
     let oid = record.head_oid.as_deref()?;
-    let mut exact = pull_requests
-        .iter()
-        .filter(|pr| pr.head_ref_name == branch && pr.head_ref_oid == oid);
+    let mut exact = pull_requests.iter().filter(|pr| {
+        pr.head_ref_name == branch && pr.head_ref_oid == oid && pr.belongs_to_head(head_repository)
+    });
     let first = exact.next()?;
     exact.next().is_none().then_some(first)
 }
@@ -1861,6 +1874,10 @@ fn apply_attached_worktree_prs(
             row.clear_pull_request();
             continue;
         }
+        let Some(head_repository) = row.head_repository.as_ref() else {
+            row.clear_pull_request();
+            continue;
+        };
         let mut exact = recent.iter().chain(archived).filter(|pr| {
             record
                 .branch
@@ -1868,6 +1885,7 @@ fn apply_attached_worktree_prs(
                 .and_then(|branch| branch.strip_prefix("refs/heads/"))
                 == Some(pr.head_ref_name.as_str())
                 && record.head_oid.as_deref() == Some(pr.head_ref_oid.as_str())
+                && pr.belongs_to_head(head_repository)
         });
         let first = exact.next();
         let ambiguous = first.is_some_and(|first| exact.any(|pr| pr.number != first.number));
@@ -1883,10 +1901,12 @@ fn apply_attached_worktree_prs(
             .branch
             .as_deref()
             .and_then(|branch| branch.strip_prefix("refs/heads/"))
-            && let Some(pr) = archived.iter().find(|pr| pr.head_ref_name == branch)
+            && let Some(pr) = archived
+                .iter()
+                .find(|pr| pr.head_ref_name == branch && pr.belongs_to_head(head_repository))
         {
             // This fallback was already checked by resolve_branch_head: it is
-            // the sole PR for a branch in this same repository. Its old head
+            // the sole PR for a branch in this same source repository. Its old head
             // may differ from the checkout after later local commits.
             row.set_pull_request(SidebarPullRequest::from_github(
                 project.id,
@@ -10090,7 +10110,7 @@ impl Application for Cagents {
                                 .iter()
                                 .map(|(pr, _)| pr.clone())
                                 .collect::<Vec<_>>();
-                            Some((key, worktrees, recent))
+                            Some((key, worktrees, recent, loaded.head_repositories.clone()))
                         } else {
                             None
                         };
@@ -10225,7 +10245,11 @@ impl Application for Cagents {
                             .worktrees
                             .iter()
                             .map(|(record, status)| {
-                                SidebarWorktree::from_repository(record, status.as_ref())
+                                let mut row =
+                                    SidebarWorktree::from_repository(record, status.as_ref());
+                                row.head_repository =
+                                    loaded.head_repositories.get(&record.id).cloned();
+                                row
                             })
                             .collect();
                         let pull_requests = match &loaded.github {
@@ -10288,51 +10312,53 @@ impl Application for Cagents {
                             .apply_project_order(&self.durable.project_order);
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
-                        let pr_enrichment = if let Some((key, worktrees, recent)) = pr_request {
-                            let expected = self
-                                .sidebar_model
-                                .projects
-                                .iter()
-                                .find(|project| project.id == project_id)
-                                .map(|project| {
-                                    project
-                                        .worktrees
-                                        .iter()
-                                        .map(|row| (row.id, row.pull_request().cloned()))
-                                        .collect::<HashMap<_, _>>()
+                        let pr_enrichment =
+                            if let Some((key, worktrees, recent, head_repositories)) = pr_request {
+                                let expected = self
+                                    .sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.id == project_id)
+                                    .map(|project| {
+                                        project
+                                            .worktrees
+                                            .iter()
+                                            .map(|row| (row.id, row.pull_request().cloned()))
+                                            .collect::<HashMap<_, _>>()
+                                    })
+                                    .unwrap_or_default();
+                                let cancellation = self
+                                    .repository_pr_cancellations
+                                    .get(&project_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let request_worktrees = worktrees.clone();
+                                let request_recent = recent.clone();
+                                cosmic::task::future(async move {
+                                    let archived = tokio::task::spawn_blocking(move || {
+                                        attached_worktree_pull_requests(
+                                            &GitHubService::system("gh"),
+                                            &key,
+                                            &request_worktrees,
+                                            &request_recent,
+                                            &head_repositories,
+                                            &cancellation,
+                                        )
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                    Message::AttachedWorktreePrsResolved {
+                                        project_id,
+                                        generation,
+                                        worktrees,
+                                        recent,
+                                        archived,
+                                        expected,
+                                    }
                                 })
-                                .unwrap_or_default();
-                            let cancellation = self
-                                .repository_pr_cancellations
-                                .get(&project_id)
-                                .cloned()
-                                .unwrap_or_default();
-                            let request_worktrees = worktrees.clone();
-                            let request_recent = recent.clone();
-                            cosmic::task::future(async move {
-                                let archived = tokio::task::spawn_blocking(move || {
-                                    attached_worktree_pull_requests(
-                                        &GitHubService::system("gh"),
-                                        &key,
-                                        &request_worktrees,
-                                        &request_recent,
-                                        &cancellation,
-                                    )
-                                })
-                                .await
-                                .unwrap_or_default();
-                                Message::AttachedWorktreePrsResolved {
-                                    project_id,
-                                    generation,
-                                    worktrees,
-                                    recent,
-                                    archived,
-                                    expected,
-                                }
-                            })
-                        } else {
-                            Task::none()
-                        };
+                            } else {
+                                Task::none()
+                            };
                         // Restored pull request cards could not name their
                         // pull request until this project's GitHub state and
                         // sidebar entry both existed.
@@ -13256,6 +13282,14 @@ fn load_repository(
         })
         .collect::<Vec<_>>();
     let github = GitHubService::system("gh");
+    let head_repositories = worktrees
+        .iter()
+        .filter_map(|(record, _)| {
+            let branch = record.branch.as_deref()?.strip_prefix("refs/heads/")?;
+            let key = crate::github::worktree_head_repository(&record.path, branch, &cancellation)?;
+            Some((record.id, key))
+        })
+        .collect();
     let github_availability = (|| {
         let remotes = service
             .remotes(&repository.selected_path, &cancellation)
@@ -13337,6 +13371,7 @@ fn load_repository(
         repository,
         worktrees,
         github: github_availability,
+        head_repositories,
     })
 }
 
@@ -13543,6 +13578,7 @@ mod tests {
 
     #[test]
     fn archived_worktree_pr_requires_exact_branch_and_head() {
+        let head = GitHubRepoKey::new("github.com", None, "acme", "repo").unwrap();
         let record = WorktreeRecord {
             id: WorktreeId::new(),
             path: PathBuf::from("/repo/worktrees/old"),
@@ -13556,23 +13592,25 @@ mod tests {
         };
         let pr: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
             "number": 7, "title": "Old feature", "state": "MERGED",
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"acme"},
             "headRefName": "old-feature", "headRefOid": "abc", "baseRefName": "main",
             "updatedAt": "2026-01-01T00:00:00Z", "url": "https://github.com/acme/repo/pull/7"
         }))
         .unwrap();
         assert_eq!(
-            matching_attached_pr(&record, &[pr.clone()]).map(|pr| pr.number),
+            matching_attached_pr(&record, &head, &[pr.clone()]).map(|pr| pr.number),
             Some(7)
         );
         let mut duplicate = pr.clone();
         duplicate.number = 8;
-        assert!(matching_attached_pr(&record, &[pr.clone(), duplicate]).is_none());
+        assert!(matching_attached_pr(&record, &head, &[pr.clone(), duplicate]).is_none());
         assert!(
             matching_attached_pr(
                 &WorktreeRecord {
                     head_oid: Some("def".into()),
                     ..record.clone()
                 },
+                &head,
                 &[pr.clone()]
             )
             .is_none()
@@ -13583,6 +13621,7 @@ mod tests {
                     branch: Some("refs/heads/other".into()),
                     ..record.clone()
                 },
+                &head,
                 &[pr.clone()]
             )
             .is_none()
@@ -13593,6 +13632,7 @@ mod tests {
                     detached: true,
                     ..record
                 },
+                &head,
                 &[pr]
             )
             .is_none()
@@ -13615,19 +13655,23 @@ mod tests {
         };
         let open: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
             "number": 9, "title": "New", "state": "OPEN", "headRefName": "feature", "headRefOid": "new",
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"acme"},
             "baseRefName": "main", "updatedAt": "2026-09-01", "url": "https://github.com/acme/repo/pull/9"
         })).unwrap();
         let merged: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
             "number": 7, "title": "Old", "state": "MERGED", "headRefName": "feature", "headRefOid": "old",
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"acme"},
             "baseRefName": "main", "updatedAt": "2026-01-01", "url": "https://github.com/acme/repo/pull/7"
         })).unwrap();
         let make_project = |record: &WorktreeRecord| {
+            let mut row = SidebarWorktree::from_repository(record, None);
+            row.head_repository = open.head_repository_key();
             SidebarProject::new(
                 project_id,
                 RepositoryId::new(),
                 "repo".into(),
                 "/repo".into(),
-                vec![SidebarWorktree::from_repository(record, None)],
+                vec![row],
                 vec![SidebarPullRequest::from_github(project_id, &open, &[])],
             )
         };
@@ -17326,6 +17370,7 @@ mod tests {
             },
             worktrees: Vec::new(),
             github: GitHubAvailability::NotAssociated,
+            head_repositories: HashMap::new(),
         };
 
         // The failure lands last on purpose. A failure followed by a success
@@ -19626,7 +19671,7 @@ mod tests {
         let project = ProjectId::new();
         let worktree = WorktreeId::new();
         let path = PathBuf::from("/repo/feature");
-        let row = sidebar::SidebarWorktree::new(
+        let mut row = sidebar::SidebarWorktree::new(
             worktree,
             path.clone(),
             Some("feature".into()),
@@ -19642,6 +19687,19 @@ mod tests {
             None,
             None,
         );
+        row.head_repository =
+            Some(GitHubRepoKey::new("github.com", None, "example", "cagents").unwrap());
+        let mut pull_request = SidebarPullRequest::new(
+            project,
+            42,
+            "Polish the rail".into(),
+            Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
+            "feature".into(),
+            None,
+            false,
+            sidebar::CheckStatus::Pending,
+        );
+        pull_request.head_repository = row.head_repository.clone();
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
             RepositoryId::new(),
@@ -19655,16 +19713,7 @@ mod tests {
                 ),
                 row,
             ],
-            vec![SidebarPullRequest::new(
-                project,
-                42,
-                "Polish the rail".into(),
-                Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
-                "feature".into(),
-                None,
-                false,
-                sidebar::CheckStatus::Pending,
-            )],
+            vec![pull_request],
         ));
         app.sidebar_state.sync_active_worktree(
             &app.sidebar_model,
