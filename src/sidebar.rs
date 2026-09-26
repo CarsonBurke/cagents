@@ -8920,10 +8920,8 @@ mod row_interaction {
                         ..
                     }) if state.focused && modifiers.is_empty() => match key {
                         keyboard::key::Named::Delete | keyboard::key::Named::Backspace => {
-                            shell.publish(SidebarAction::SelectRows {
-                                row,
-                                intent: super::SelectionIntent::Context,
-                            });
+                            // A Ctrl-click can leave focus on a deselected row.
+                            // Delete acts on the current selection, not that row.
                             shell.publish(SidebarAction::DeleteSelectedRows);
                             shell.capture_event();
                             return;
@@ -9604,13 +9602,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             dispatch(&mut element, &mut tree, key()),
-            vec![
-                SidebarAction::SelectRows {
-                    row,
-                    intent: SelectionIntent::Context
-                },
-                SidebarAction::DeleteSelectedRows
-            ]
+            vec![SidebarAction::DeleteSelectedRows],
+            "keyboard deletion must not reselect a focused row that Ctrl-click deselected"
         );
     }
 

@@ -326,22 +326,30 @@ impl Cagents {
     pub(super) fn sidebar_selection_dialog(&self) -> Option<Element<'_, Message>> {
         let dialog = self.sidebar_selection_ui.dialog.as_ref()?;
         let first = dialog.targets.first()?;
-        let (verb, kind, effect) = match first.row {
+        let (verb, singular, plural, effect) = match first.row {
             SelectionRow::Project(_) => (
                 "Remove",
+                "project",
                 "projects",
                 "Close their sessions and remove them from cagents. Folders and files stay on disk.",
             ),
             SelectionRow::Worktree(..) => (
                 "Delete",
+                "worktree",
                 "worktrees",
                 "Close their sessions and delete these Git worktree directories.",
             ),
             SelectionRow::Channel(_) => (
                 "Delete",
+                "channel",
                 "channels",
                 "Close and remove the conversations in these channels.",
             ),
+        };
+        let kind = if dialog.targets.len() == 1 {
+            singular
+        } else {
+            plural
         };
         let mut rows = vec![
             widget::text::title3(format!("{verb} {} selected {kind}?", dialog.targets.len()))
