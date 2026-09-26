@@ -279,6 +279,12 @@ pub enum ControlError {
         message: String,
         retryable: bool,
     },
+    #[error("the daemon is dropping the connection ({code:?}): {message}")]
+    ConnectionRejected {
+        code: ProtocolErrorCode,
+        message: String,
+        retryable: bool,
+    },
     #[error("daemon returned terminal {actual} for requested terminal {expected}")]
     TerminalMismatch {
         expected: TerminalId,
@@ -328,7 +334,7 @@ impl ControlClient {
         Self::from_stream(stream)
     }
 
-    fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
+    pub(crate) fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)?;
@@ -352,6 +358,21 @@ impl ControlClient {
 
     pub fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    /// Release a native-to-terminal replay receipt after its replacement is durable.
+    #[cfg(feature = "ui")]
+    pub(crate) fn commit_terminal_handoff(
+        &mut self,
+        terminal_id: TerminalId,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::ChatCommitTerminal { terminal_id })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "a terminal handoff acknowledgement",
+                &response,
+            )),
+        }
     }
 
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
@@ -979,8 +1000,12 @@ impl ControlClient {
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
                     // The daemon's notice that it is dropping this connection,
                     // such as an overflowing delivery queue, says why.
-                    Err(message @ ServerMessage::Error(_)) => {
-                        return response_from_message(message);
+                    Err(ServerMessage::Error(error)) => {
+                        return Err(ControlError::ConnectionRejected {
+                            code: error.code,
+                            message: error.message,
+                            retryable: error.retryable,
+                        });
                     }
                     Err(message) => {
                         return Err(ControlError::UnexpectedMessage {
@@ -1885,11 +1910,15 @@ fn protocol_error(error: ControlError) -> AppError {
         ControlError::Connect(_)
         | ControlError::Configure(_)
         | ControlError::Frame(_)
-        | ControlError::ConnectionClosed => "connection",
+        | ControlError::ConnectionClosed
+        | ControlError::ConnectionRejected { .. } => "connection",
         _ => "protocol",
     };
     let details = match &error {
         ControlError::Remote {
+            code, retryable, ..
+        }
+        | ControlError::ConnectionRejected {
             code, retryable, ..
         } => Some(json!({ "code": code, "retryable": retryable })),
         ControlError::WaitTimeout { terminal_id, text } => {
@@ -3662,7 +3691,7 @@ mod tests {
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         assert!(matches!(
             client.list_chats(),
-            Err(ControlError::Remote {
+            Err(ControlError::ConnectionRejected {
                 code: ProtocolErrorCode::QueueFull,
                 retryable: true,
                 ..

@@ -3130,8 +3130,7 @@ pub enum Message {
         result: Result<Option<StartedTerminal>, String>,
     },
     TerminalHandoffsCommitted {
-        terminals: Vec<TerminalSession>,
-        result: Result<(), String>,
+        result: Result<Vec<(TerminalSession, Result<(), String>)>, String>,
     },
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
@@ -5654,25 +5653,16 @@ impl Cagents {
         self.terminal_handoff_commit_inflight = true;
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
-                let result: Result<(), String> = (|| {
-                    flush
-                        .recv_timeout(Duration::from_secs(30))
-                        .map_err(|error| format!("session flush: {error}"))??;
-                    for terminal in &terminals {
-                        crate::chat::client::acknowledge_terminal_handoff(terminal)?;
-                    }
-                    Ok(())
-                })();
-                (terminals, result)
+                flush
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(|error| format!("session flush: {error}"))??;
+                let results = crate::chat::client::acknowledge_terminal_handoffs(&terminals);
+                Ok(terminals.into_iter().zip(results).collect())
             })
             .await;
-            let (terminals, result) = joined.unwrap_or_else(|error| {
-                (
-                    Vec::new(),
-                    Err(format!("handoff acknowledgement worker: {error}")),
-                )
-            });
-            Message::TerminalHandoffsCommitted { terminals, result }
+            let result = joined
+                .unwrap_or_else(|error| Err(format!("handoff acknowledgement worker: {error}")));
+            Message::TerminalHandoffsCommitted { result }
         })
     }
 
@@ -9968,23 +9958,38 @@ impl Application for Cagents {
                 Some(directory) => self.add_terminal(directory),
                 None => cosmic::task::message(Message::OpenRepository),
             },
-            Message::TerminalHandoffsCommitted { terminals, result } => {
+            Message::TerminalHandoffsCommitted { result } => {
                 self.terminal_handoff_commit_inflight = false;
-                match result {
-                    Ok(()) => {
-                        for terminal in terminals {
-                            if self.pending_terminal_handoffs.get(&terminal.id) == Some(&terminal) {
-                                self.pending_terminal_handoffs.remove(&terminal.id);
+                let failure = match result {
+                    Ok(results) => {
+                        let mut failures = Vec::new();
+                        for (terminal, result) in results {
+                            if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) {
+                                continue;
+                            }
+                            match result {
+                                Ok(()) => {
+                                    self.pending_terminal_handoffs.remove(&terminal.id);
+                                }
+                                Err(error) => failures.push((terminal.id, error)),
                             }
                         }
-                        self.commit_terminal_handoffs()
+                        failures.first().map(|(id, error)| {
+                            format!(
+                                "{} terminal(s) remain pending; terminal {id}: {error}",
+                                failures.len()
+                            )
+                        })
                     }
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(format!(
-                            "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
-                        )));
-                        Task::none()
-                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = failure {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
+                    )));
+                    Task::none()
+                } else {
+                    self.commit_terminal_handoffs()
                 }
             }
             Message::HostedTerminalsObserved(terminals) => {
@@ -14047,6 +14052,92 @@ mod tests {
         assert!(state.apply(health_event(6, SessionSaveHealth::WriterUnavailable, None,)));
         assert_eq!(state.last_successful_flush_at_unix_ms, Some(40));
         assert!(state.is_visible());
+    }
+
+    #[test]
+    fn terminal_handoff_completion_retires_only_exact_successes_and_reports_only_failures() {
+        let mut app = context_inspector_test_app(false);
+        let terminal = || {
+            let CardKind::Terminal(terminal) = terminal_card_state().kind else {
+                unreachable!()
+            };
+            terminal
+        };
+        let accepted = terminal();
+        let refused = terminal();
+        let superseded_success = terminal();
+        let superseded_failure = terminal();
+        for terminal in [
+            &accepted,
+            &refused,
+            &superseded_success,
+            &superseded_failure,
+        ] {
+            app.pending_terminal_handoffs
+                .insert(terminal.id, terminal.clone());
+        }
+        for terminal in [&superseded_success, &superseded_failure] {
+            app.pending_terminal_handoffs
+                .get_mut(&terminal.id)
+                .unwrap()
+                .resume_hint = Some("new descriptor".into());
+        }
+        app.terminal_handoff_commit_inflight = true;
+        let _ = app.update(Message::TerminalHandoffsCommitted {
+            result: Ok(vec![
+                (accepted.clone(), Ok(())),
+                (refused.clone(), Err("receipt refused".into())),
+                (superseded_success.clone(), Ok(())),
+                (superseded_failure.clone(), Err("obsolete failure".into())),
+            ]),
+        });
+        assert!(!app.terminal_handoff_commit_inflight);
+        assert!(!app.pending_terminal_handoffs.contains_key(&accepted.id));
+        assert_eq!(app.pending_terminal_handoffs.len(), 3);
+        let notices = app
+            .notices
+            .entries
+            .iter()
+            .map(|entry| entry.notice.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("1 terminal(s) remain pending")
+                    && notice.contains(&refused.id.to_string()))
+        );
+        assert!(
+            notices
+                .iter()
+                .all(|notice| !notice.contains("obsolete failure"))
+        );
+
+        // A successful retry removes only the previously failed descriptor;
+        // newer receipts that arrived during the batch still need a save.
+        let _ = app.update(Message::TerminalHandoffsCommitted {
+            result: Ok(vec![(refused.clone(), Ok(()))]),
+        });
+        assert!(!app.pending_terminal_handoffs.contains_key(&refused.id));
+        assert_eq!(app.pending_terminal_handoffs.len(), 2);
+    }
+
+    #[test]
+    fn terminal_handoff_flush_failure_keeps_all_receipts_pending() {
+        let mut app = context_inspector_test_app(false);
+        let CardKind::Terminal(terminal) = terminal_card_state().kind else {
+            unreachable!()
+        };
+        app.pending_terminal_handoffs
+            .insert(terminal.id, terminal.clone());
+        app.terminal_handoff_commit_inflight = true;
+        let _ = app.update(Message::TerminalHandoffsCommitted {
+            result: Err("session flush: unavailable".into()),
+        });
+        assert!(!app.terminal_handoff_commit_inflight);
+        assert_eq!(
+            app.pending_terminal_handoffs.get(&terminal.id),
+            Some(&terminal)
+        );
     }
 
     #[test]
