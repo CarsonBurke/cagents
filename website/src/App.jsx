@@ -1,12 +1,5 @@
 import { useState } from "react";
-
-const installCommand = `(
-  installer="$(mktemp)" || exit 1
-  trap 'rm -f "$installer"' 0
-  url="https://github.com/CarsonBurke/cagents/releases/latest/download/install.sh"
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "$url" --output "$installer" &&
-    sh "$installer"
-)`;
+import installCommand from "./install-command.sh?raw";
 
 const features = [
   {
@@ -196,10 +189,11 @@ function App() {
         <section className="install-section" id="install" aria-labelledby="install-heading">
           <div className="install-copy">
             <p className="eyebrow"><span /> Get cagents</p>
-            <h2 id="install-heading">One command. No root required.</h2>
+            <h2 id="install-heading">Install with your GitHub account.</h2>
             <p>
-              Installs the latest release for your user and adds the launcher and
-              desktop metadata. Existing installs update atomically.
+              Sign in with <code>gh auth login</code> using an account with access
+              to the private repository. The command installs the latest release
+              for your user. No root required.
             </p>
           </div>
 
@@ -212,9 +206,12 @@ function App() {
             </div>
             <pre><code><span>$</span> {installCommand}</code></pre>
             <p>
-              Repository access is required while cagents is private. This
-              downloads the release installer before running it; review the
-              source first if your environment requires it.
+              Pins one release and verifies the installer and archive against
+              its SHA-256 manifest before running anything. See the{" "}
+              <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md#install-with-the-verified-installer">
+                installation guide
+              </a>{" "}
+              for requirements and source inspection.
             </p>
           </div>
         </section>
