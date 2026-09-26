@@ -423,6 +423,8 @@ pub struct SidebarChannel {
     pub deletion: Option<RowDeletion>,
     folded_title: Box<str>,
     open_id: Id,
+    delete_id: Id,
+    delete_name: Box<str>,
     accessible_name: Box<str>,
     tooltip: Box<str>,
 }
@@ -454,6 +456,8 @@ impl SidebarChannel {
             deletion: None,
             folded_title: fold(&title),
             open_id: entity_id("channel.open", id),
+            delete_id: entity_id("channel.delete", id),
+            delete_name: format!("Delete channel {title}").into_boxed_str(),
             accessible_name: format!(
                 "Open channel {title}, {contents}{}{}",
                 if has_panes { "" } else { ", no open panes" },
@@ -684,6 +688,8 @@ impl SidebarWorktree {
             folded_branch: branch.as_deref().map(fold),
             folded_path: fold(&path.to_string_lossy()),
             open_id: entity_id("worktree.open", id),
+            delete_id: entity_id("worktree.delete", id),
+            delete_name: format!("Delete merged worktree {label}").into_boxed_str(),
             paneless_accessible_name: paneless_name(&accessible_name),
             accessible_name: accessible_name.into_boxed_str(),
             tooltip: format!(
@@ -836,6 +842,7 @@ impl SidebarWorktree {
             );
         if label != self.chrome.label.as_ref() {
             self.chrome.folded_label = fold(&label);
+            self.chrome.delete_name = format!("Delete merged worktree {label}").into_boxed_str();
             self.chrome.label = label.into();
         }
         self.chrome.dirty_badge =
@@ -949,6 +956,8 @@ struct WorktreeChrome {
     folded_branch: Option<Box<str>>,
     folded_path: Box<str>,
     open_id: Id,
+    delete_id: Id,
+    delete_name: Box<str>,
     label: Box<str>,
     accessible_name: Box<str>,
     /// `accessible_name` for the row with nothing open, which is most rows in
@@ -4978,13 +4987,20 @@ fn channel_view(
             },
             inert,
         ));
-    grid.mount(with_deletion_retry(
-        channel_context_controls(
-            crate::interaction::tooltip(action, &*channel.tooltip),
-            channel.id,
+    let action = row_quick_delete(
+        crate::interaction::tooltip(action, &*channel.tooltip),
+        &channel.delete_name,
+        gated(
+            SidebarAction::DeleteChannel {
+                channel_id: channel.id,
+            },
             inert,
-            selection_count,
         ),
+        channel.delete_id.clone(),
+        compact,
+    );
+    grid.mount(with_deletion_retry(
+        channel_context_controls(action, channel.id, inert, selection_count),
         deletion,
         compact,
         &channel.title,
@@ -4996,6 +5012,40 @@ fn channel_view(
         ),
         entity_id("channel.retry-delete", channel.id),
     ))
+}
+
+/// Keep the row's primary button and its destructive quick action separate.
+/// The compact rail reuses its indicator slot while hovered; an expanded row
+/// reserves the button width so the label continues to ellipsize correctly.
+fn row_quick_delete<'a>(
+    content: Element<'a, SidebarAction>,
+    label: &'a str,
+    action: Option<SidebarAction>,
+    id: Id,
+    compact: bool,
+) -> Element<'a, SidebarAction> {
+    let width = if compact {
+        ROW_STATUS_WIDTH
+    } else {
+        ICON_CONTROL_SIZE
+    };
+    let control = button::icon(crate::ui_controls::symbolic_icon("edit-delete-symbolic"))
+        .class(sidebar_button_style(false))
+        .id(id)
+        .name(label)
+        .width(width)
+        .height(WORKTREE_ROW_HEIGHT)
+        .padding(0)
+        .on_press_maybe(action);
+    let controls = widget::container(
+        widget::container(crate::interaction::tooltip(control, label))
+            .class(theme::Container::Primary)
+            .width(width)
+            .height(WORKTREE_ROW_HEIGHT),
+    )
+    .align_right(Length::Fill)
+    .into();
+    RowInteraction::actions(content, controls, if compact { 0.0 } else { width })
 }
 
 /// The commands a channel row offers on right-click.
@@ -5258,9 +5308,32 @@ fn worktree_view<'a>(
     } else {
         crate::interaction::hover(action)
     };
+    let action = crate::interaction::tooltip(action, &*chrome.tooltip);
+    let action = if !primary
+        && worktree
+            .pull_request()
+            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged))
+    {
+        row_quick_delete(
+            action,
+            &chrome.delete_name,
+            gated(
+                SidebarAction::ProjectCommand {
+                    project_id,
+                    worktree_id: Some(worktree.id),
+                    command: ProjectCommand::Delete,
+                },
+                inert,
+            ),
+            chrome.delete_id.clone(),
+            compact,
+        )
+    } else {
+        action
+    };
     grid.mount(with_deletion_retry(
         context_controls(
-            crate::interaction::tooltip(action, &*chrome.tooltip),
+            action,
             project_id,
             Some(worktree.id),
             inert,
@@ -9510,6 +9583,126 @@ pub(crate) mod tests {
         );
         state.apply(&SidebarAction::SearchChanged("not-present".into()));
         assert!(visible_selection_rows(&model, &state, false).is_empty());
+    }
+
+    #[test]
+    fn channel_hover_delete_targets_its_row_without_opening_it_in_both_densities() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "Investigation".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        );
+        for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
+            let renderer = headless_renderer();
+            let mut element = channel_view(&channel, modal, compact, Some(1));
+            let mut tree = Tree::new(&element);
+            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
+            let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
+            let limits = layout::Limits::new(Size::ZERO, viewport.size());
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let cursor = mouse::Cursor::Available(Point::new(width - 8.0, 16.0));
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: cursor.position().unwrap(),
+                }),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(
+                messages,
+                if modal {
+                    Vec::new()
+                } else {
+                    vec![SidebarAction::DeleteChannel {
+                        channel_id: channel.id,
+                    }]
+                },
+                "compact={compact}, modal={modal}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
+        let renderer = headless_renderer();
+        let mut worktree = worktree(3, "feature", false);
+        let mut pr = project().pull_requests.remove(0);
+        for (state, primary, expected) in [
+            (WorktreePullRequestState::Open, false, false),
+            (WorktreePullRequestState::Closed, false, false),
+            (WorktreePullRequestState::Merged, true, false),
+            (WorktreePullRequestState::Merged, false, true),
+        ] {
+            pr.state = Some(state);
+            worktree.set_pull_request(pr.clone());
+            let mut element = worktree_view(
+                project_id(1),
+                &worktree,
+                primary,
+                None,
+                false,
+                true,
+                &[],
+                false,
+                None,
+                false,
+                false,
+                Some(1),
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(240.0, WORKTREE_ROW_HEIGHT)),
+            );
+            let nodes = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                cosmic::iced::mouse::Cursor::Unavailable,
+            );
+            let has_delete = nodes.root().iter().chain(nodes.children()).any(|node| {
+                node.node()
+                    .label()
+                    .is_some_and(|name| name == "Delete merged worktree Polish sidebar")
+            });
+            assert_eq!(has_delete, expected, "{state:?}, primary={primary}");
+        }
     }
 
     #[test]
