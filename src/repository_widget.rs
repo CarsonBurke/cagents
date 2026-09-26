@@ -13101,6 +13101,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: root.path().to_path_buf(),
             worktree: root.path().to_path_buf(),

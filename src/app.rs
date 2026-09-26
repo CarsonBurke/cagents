@@ -19699,6 +19699,7 @@ mod tests {
         assert_eq!(key.project_id, project);
         assert!(
             app.repository_runtime(RepositoryView {
+                selected_file: None,
                 project,
                 repository: root.clone(),
                 worktree: root.clone(),
