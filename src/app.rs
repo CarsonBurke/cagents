@@ -17,6 +17,7 @@ mod refresh_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
+mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
@@ -2364,6 +2365,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
+        Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
@@ -2426,6 +2428,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                         | channel_ui::Action::ConfirmDelete
                         | channel_ui::Action::Dismiss
                 )
+                | Message::SidebarSelection(_)
         )
 }
 
@@ -3374,6 +3377,7 @@ pub enum Message {
     UpdateUi(update_ui::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
+    SidebarSelection(sidebar_selection_ui::Action),
     BranchUi(branch_ui::Action),
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
@@ -3859,6 +3863,7 @@ pub struct Cagents {
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
     channel_ui: channel_ui::State,
+    sidebar_selection_ui: sidebar_selection_ui::State,
     chat_ui: chat_ui::State,
     update_ui: update_ui::State,
     branch_ui: branch_ui::State,
@@ -8624,6 +8629,7 @@ impl Cagents {
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
             || self.channel_ui.modal_open()
+            || self.sidebar_selection_ui.dialog.is_some()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -9094,7 +9100,9 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.sidebar_state.pending_discard().is_some() {
+        if self.sidebar_selection_ui.dialog.is_some() {
+            Some(sidebar_selection_ui::focus_id())
+        } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
@@ -9967,6 +9975,7 @@ impl Application for Cagents {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             channel_ui: channel_ui::State::default(),
+            sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
@@ -10209,6 +10218,15 @@ impl Application for Cagents {
                     event: WorkspaceViewportEvent::Scrolled(_) | WorkspaceViewportEvent::Resized(_),
                     ..
                 }
+        );
+        let reconcile_row_selection = matches!(
+            &message,
+            Message::RepositoryLoaded { .. }
+                | Message::AttachedWorktreePrsResolved { .. }
+                | Message::WorkspaceModelObserved(_)
+                | Message::ProjectUi(_)
+                | Message::ChannelUi(_)
+                | Message::WindowResized(..)
         );
         let task = match message {
             Message::PollTerminalAgentActivity { hibernated } => {
@@ -10927,7 +10945,36 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.sidebar_state.apply(&action);
+                let activated = match &action {
+                    SidebarAction::OpenRepository { project_id, .. } => {
+                        Some(sidebar::SelectionRow::Project(*project_id))
+                    }
+                    SidebarAction::OpenWorktree {
+                        project_id,
+                        worktree_id,
+                        ..
+                    } => Some(sidebar::SelectionRow::Worktree(*project_id, *worktree_id)),
+                    SidebarAction::OpenChannel { channel_id } => {
+                        Some(sidebar::SelectionRow::Channel(*channel_id))
+                    }
+                    _ => None,
+                };
+                if let Some(row) = activated {
+                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Replace);
+                }
+                self.prune_sidebar_row_selection();
                 match action {
+                    SidebarAction::SelectRows { row, intent } => {
+                        self.select_sidebar_rows(row, intent);
+                        if matches!(intent, sidebar::SelectionIntent::Toggle | sidebar::SelectionIntent::Range { .. }) {
+                            iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
+                        } else { Task::none() }
+                    }
+                    SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
+                    SidebarAction::ClearRowSelection => {
+                        self.sidebar_state.clear_row_selection();
+                        Task::none()
+                    }
                     SidebarAction::DragWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Drag)),
                     SidebarAction::MaximizeWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Maximize)),
                     SidebarAction::WindowMenu => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ShowWindowMenu)),
@@ -12303,6 +12350,10 @@ impl Application for Cagents {
                     if self.project_ui.modal_open() {
                         return self.handle_project_action(project_ui::Action::Dismiss);
                     }
+                    if self.sidebar_selection_ui.dialog.is_some() {
+                        return self
+                            .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
+                    }
                     if self.dirty_repository_close.is_some() {
                         if self.dirty_repository_close.as_ref().is_some_and(|close| {
                             matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
@@ -12524,6 +12575,7 @@ impl Application for Cagents {
             Message::CommitUi(action) => self.update_commit_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
+            Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
             Message::GitUi(action) => self.update_git(action),
@@ -12772,6 +12824,9 @@ impl Application for Cagents {
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
+        if reconcile_row_selection {
+            self.prune_sidebar_row_selection();
+        }
         self.refresh_sidebar_worktree_panes();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
@@ -13052,6 +13107,15 @@ impl Application for Cagents {
                     560.0,
                 ),
                 (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                1.0,
+            ));
+        }
+        if let Some(surface) = self.sidebar_selection_dialog() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::SidebarSelection(
+                    sidebar_selection_ui::Action::Dismiss,
+                )),
                 1.0,
             ));
         }
@@ -19144,6 +19208,7 @@ mod tests {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             channel_ui: channel_ui::State::default(),
+            sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
             chrome_ui: chrome_ui::State::default(),
