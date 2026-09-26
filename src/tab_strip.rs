@@ -33,7 +33,7 @@ pub fn horizontal<'a, Message: 'a>(
     row_height: f32,
     header_height: f32,
 ) -> Element<'a, Message> {
-    strip(id, tab_row, row_height, header_height, None)
+    strip(id, tab_row, row_height, header_height, None, None)
 }
 
 /// [`horizontal`], plus the scroll offset reported back on every change.
@@ -54,10 +54,37 @@ pub fn horizontal_with_scroll<'a, Message: 'a>(
         row_height,
         header_height,
         Some(Box::new(on_scroll)),
+        None,
     )
 }
 
 type OnScroll<'a, Message> = Box<dyn Fn(scrollable::Viewport) -> Message + 'a>;
+
+pub struct Reordering<'a, Message> {
+    pub order: Vec<crate::model::CardId>,
+    pub tab_width: f32,
+    pub enabled: bool,
+    pub select: Box<dyn Fn(crate::model::CardId) -> Message + 'a>,
+    pub dropped: Box<dyn Fn(crate::model::CardId, Option<crate::model::CardId>) -> Message + 'a>,
+}
+
+pub fn reorderable<'a, Message: 'a>(
+    id: widget::Id,
+    tab_row: Vec<Element<'a, Message>>,
+    row_height: f32,
+    header_height: f32,
+    on_scroll: Option<OnScroll<'a, Message>>,
+    reordering: Reordering<'a, Message>,
+) -> Element<'a, Message> {
+    strip(
+        id,
+        tab_row,
+        row_height,
+        header_height,
+        on_scroll,
+        Some(reordering),
+    )
+}
 
 fn strip<'a, Message: 'a>(
     id: widget::Id,
@@ -65,23 +92,44 @@ fn strip<'a, Message: 'a>(
     row_height: f32,
     header_height: f32,
     on_scroll: Option<OnScroll<'a, Message>>,
+    reordering: Option<Reordering<'a, Message>>,
 ) -> Element<'a, Message> {
-    let mut tabs = widget::scrollable::horizontal(
-        widget::row::with_children(tab_row)
-            .spacing(SPACING)
-            .align_y(cosmic::iced::Alignment::Center)
-            .height(row_height),
-    )
-    .id(id)
-    // No scrollbar rail: the thumb is suppressed outright, so there is nothing
-    // for a tab to be overlapped by. `overflow_fade_x` is what tells the
-    // reader that the strip continues past the edge, and it needs the tabs to
-    // reach that edge to fade them.
-    .direction(scrollable::Direction::Horizontal(
-        scrollable::Scrollbar::hidden(),
-    ))
-    .width(Length::Fill)
-    .height(row_height);
+    let row = widget::row::with_children(tab_row)
+        .spacing(SPACING)
+        .align_y(cosmic::iced::Alignment::Center)
+        .height(row_height);
+    let row = match reordering {
+        Some(config) => crate::reorder::strip(
+            row,
+            config
+                .order
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| crate::reorder::Item {
+                    id,
+                    start: index as f32 * (config.tab_width + SPACING),
+                    width: config.tab_width,
+                })
+                .collect(),
+            false,
+            config.enabled,
+            None,
+            config.select,
+            config.dropped,
+        ),
+        None => row.into(),
+    };
+    let mut tabs = widget::scrollable::horizontal(row)
+        .id(id)
+        // No scrollbar rail: the thumb is suppressed outright, so there is nothing
+        // for a tab to be overlapped by. `overflow_fade_x` is what tells the
+        // reader that the strip continues past the edge, and it needs the tabs to
+        // reach that edge to fade them.
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::hidden(),
+        ))
+        .width(Length::Fill)
+        .height(row_height);
     if let Some(on_scroll) = on_scroll {
         tabs = tabs.on_scroll(on_scroll);
     }

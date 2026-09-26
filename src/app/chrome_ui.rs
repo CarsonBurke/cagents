@@ -740,12 +740,25 @@ impl Cagents {
             .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
             .chain(std::iter::once(self.new_tab_control()))
             .collect();
-        let tabs = crate::tab_strip::horizontal_with_scroll(
+        let generation = self.workspace_view_generation;
+        let tabs = crate::tab_strip::reorderable(
             widget::Id::new("workspace.tabs"),
             tabs,
             design::PRIMARY_CONTROL_SIZE,
             design::HEADER_HEIGHT,
-            |viewport| Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x)),
+            Some(Box::new(|viewport| {
+                Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
+            })),
+            crate::tab_strip::Reordering {
+                order: self.workspace.order().collect(),
+                tab_width,
+                enabled: !self.workspace_inputs_blocked(),
+                select: Box::new(Message::FocusCard),
+                dropped: Box::new(move |card, before| Message::Viewport {
+                    generation,
+                    event: WorkspaceViewportEvent::Reordered { card, before },
+                }),
+            },
         );
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
@@ -918,7 +931,7 @@ impl Cagents {
             Some(caption) => format!("{title}\n{caption}"),
             None => title.to_owned(),
         };
-        let mut children = vec![tooltip(title_control, tip)];
+        let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
