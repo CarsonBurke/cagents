@@ -590,6 +590,7 @@ pub struct SidebarWorktree {
     pub id: WorktreeId,
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub head_repository: Option<crate::github::GitHubRepoKey>,
     pub detached: bool,
     pub locked: bool,
     pub dirty: Option<DirtyState>,
@@ -654,6 +655,7 @@ impl SidebarWorktree {
             ahead,
             behind,
             created_at_unix_ms: None,
+            head_repository: None,
             pull_request_state: None,
             deletion: None,
             chrome,
@@ -830,8 +832,8 @@ pub(crate) fn worktree_display_name(path: &Path, branch: Option<&str>, detached:
 }
 
 /// Branch names are case-sensitive and only attached worktrees can own a PR.
-/// Restricting this lookup to the containing project prevents same-named
-/// branches in another repository from lending this row their CI status.
+/// A project's PR list includes other forks. Match source repository as well
+/// as branch, and refuse ambiguous associations instead of using list order.
 fn matching_pull_request<'a>(
     worktree: &SidebarWorktree,
     pull_requests: &'a [SidebarPullRequest],
@@ -840,9 +842,26 @@ fn matching_pull_request<'a>(
         return None;
     }
     let branch = worktree.branch.as_deref()?;
-    pull_requests
-        .iter()
-        .find(|pull_request| pull_request.head_ref == branch)
+    let repository = worktree.head_repository.as_ref()?;
+    let matching = || {
+        pull_requests.iter().filter(|pr| {
+            pr.head_ref == branch
+                && pr
+                    .head_repository
+                    .as_ref()
+                    .is_some_and(|head| head.same_repository(repository))
+        })
+    };
+    let is_open = |pr: &SidebarPullRequest| {
+        matches!(
+            pr.state,
+            Some(WorktreePullRequestState::Open | WorktreePullRequestState::Draft)
+        )
+    };
+    let has_open = matching().any(is_open);
+    let mut matching = matching().filter(|pr| !has_open || is_open(pr));
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
 }
 
 /// Presentation strings and widget identities a worktree determines, built
@@ -930,6 +949,7 @@ pub struct SidebarPullRequest {
     pub title: String,
     pub url: Url,
     pub head_ref: String,
+    pub head_repository: Option<crate::github::GitHubRepoKey>,
     pub author: Option<String>,
     pub draft: bool,
     pub checks: CheckStatus,
@@ -955,6 +975,7 @@ impl SidebarPullRequest {
             title,
             url,
             head_ref,
+            head_repository: None,
             author,
             draft,
             checks,
@@ -987,6 +1008,7 @@ impl SidebarPullRequest {
             },
         );
         row.state = WorktreePullRequestState::from_github(pull_request);
+        row.head_repository = pull_request.head_repository_key();
         row.head_oid = Some(pull_request.head_ref_oid.clone());
         row.needs_review = pull_request
             .review_decision
@@ -7886,11 +7908,7 @@ fn filtered_projects<'a>(
                     .iter()
                     .filter(|worktree| match state.filter {
                         SidebarFilter::All => true,
-                        SidebarFilter::PullRequests => {
-                            worktree.pull_request_state.is_some()
-                                || matching_pull_request(worktree, project.display_pull_requests())
-                                    .is_some()
-                        }
+                        SidebarFilter::PullRequests => worktree.pull_request().is_some(),
                         SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
                     })
                     .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
@@ -8928,7 +8946,7 @@ pub(crate) mod tests {
     }
 
     fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {
-        SidebarWorktree::from_repository(
+        let mut row = SidebarWorktree::from_repository(
             &WorktreeRecord {
                 id: WorktreeId::from_uuid(Uuid::from_u128(id)),
                 path: PathBuf::from(format!("/repo/{branch}")),
@@ -8966,11 +8984,15 @@ pub(crate) mod tests {
                     Vec::new()
                 },
             }),
-        )
+        );
+        row.head_repository = Some(
+            crate::github::GitHubRepoKey::new("github.com", None, "example", "cagents").unwrap(),
+        );
+        row
     }
 
     fn project() -> SidebarProject {
-        SidebarProject::new(
+        let mut project = SidebarProject::new(
             project_id(1),
             RepositoryId(Uuid::from_u128(10)),
             "Cagents".into(),
@@ -8986,7 +9008,11 @@ pub(crate) mod tests {
                 false,
                 CheckStatus::Failing,
             )],
-        )
+        );
+        project.pull_requests[0].head_repository = project.worktrees[0].head_repository.clone();
+        let pr = project.pull_requests[0].clone();
+        project.worktrees[1].set_pull_request(pr);
+        project
     }
 
     /// Cycling with Alt+Tab has to visit rows in the order the reader sees
@@ -11433,6 +11459,49 @@ pub(crate) mod tests {
         detached.detached = true;
         assert!(matching_pull_request(&detached, &project.pull_requests).is_none());
         assert!(matching_pull_request(&attached, &[]).is_none());
+    }
+
+    #[test]
+    fn fork_branch_collisions_and_missing_identity_never_supply_a_title() {
+        let mut project = project();
+        let mut row = worktree(7, "fix-sidebar", false);
+        let mut foreign = project.pull_requests[0].clone();
+        foreign.head_repository.as_mut().unwrap().owner = "another-fork".into();
+        assert!(matching_pull_request(&row, &[foreign.clone()]).is_none());
+        assert!(matching_pull_request(&row, &project.pull_requests).is_some());
+        project.pull_requests[0].head_repository = None;
+        assert!(matching_pull_request(&row, &project.pull_requests).is_none());
+        // Rebuilding from refreshed data must drop an old incorrect title.
+        row.set_pull_request(foreign.clone());
+        let rebuilt = SidebarProject::new(
+            project.id,
+            project.repository_id,
+            project.name,
+            project.repository,
+            vec![row],
+            vec![foreign],
+        );
+        assert!(rebuilt.worktrees[0].pull_request().is_none());
+    }
+
+    #[test]
+    fn a_unique_open_pr_survives_same_repository_closed_branch_history() {
+        let project = project();
+        let row = worktree(7, "fix-sidebar", false);
+        let mut open = project.pull_requests[0].clone();
+        open.state = Some(WorktreePullRequestState::Open);
+        let mut merged = open.clone();
+        merged.number += 1;
+        merged.state = Some(WorktreePullRequestState::Merged);
+        assert_eq!(
+            matching_pull_request(&row, &[merged, open.clone()])
+                .unwrap()
+                .number,
+            open.number
+        );
+        let mut other = open.clone();
+        other.number += 2;
+        assert!(matching_pull_request(&row, &[other, open]).is_none());
     }
 
     #[test]

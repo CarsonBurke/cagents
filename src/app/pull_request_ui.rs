@@ -113,9 +113,17 @@ impl State {
                 let work = target.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     verify_local_head(&work, &cancellation)?;
+                    let Some(head_repository) = crate::github::worktree_head_repository(
+                        &work.worktree,
+                        &work.branch,
+                        &cancellation,
+                    ) else {
+                        return Ok(None);
+                    };
                     let result = GitHubService::system("gh")
                         .resolve_branch(
                             &work.repository,
+                            &head_repository,
                             &work.branch,
                             work.head_oid.as_deref(),
                             &cancellation,
@@ -1036,9 +1044,6 @@ impl Cagents {
                 {
                     let Some(pr) = self.pull_request_inspector.pull_request.as_ref() else {
                         worktree.clear_pull_request();
-                        project
-                            .pull_requests
-                            .retain(|pr| pr.head_ref != target.branch);
                         continue;
                     };
                     let checks = self
@@ -1157,12 +1162,11 @@ impl Cagents {
                     == Some(repository)
             })
             .and_then(|project| {
-                let mut candidates = project
-                    .pull_requests
+                project
+                    .worktrees
                     .iter()
-                    .filter(|pr| pr.head_ref == branch);
-                let candidate = candidates.next()?;
-                candidates.next().is_none().then(|| candidate.clone())
+                    .find(|row| row.path == *worktree && row.branch.as_deref() == Some(branch))
+                    .and_then(|row| row.pull_request().cloned())
             });
         let task = self.pull_request_inspector.synchronize(Some(target), None);
         self.pull_request_inspector.preview = preview;
