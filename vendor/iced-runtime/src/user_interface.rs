@@ -230,6 +230,12 @@ where
                     Event::Mouse(mouse::Event::CursorLeft) => {
                         event_cursor = mouse::Cursor::Unavailable;
                     }
+                    Event::Mouse(mouse::Event::CursorEntered) if !has_motion => {
+                        // Enter has no position of its own. The supplied
+                        // position is safe only when no later motion/leave
+                        // can have changed it within this batch.
+                        event_cursor = cursor;
+                    }
                     _ => {}
                 }
                 event_cursor

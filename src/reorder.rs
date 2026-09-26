@@ -762,6 +762,30 @@ mod tests {
                 &mut messages,
             );
             assert!(messages.is_empty());
+
+            // Some backends report enter without a separate motion. Recover
+            // the supplied position at the enter itself, after the cached
+            // leave has already protected the preceding stale click.
+            ui = UserInterface::build(
+                tabs(&ids, false),
+                Size::new(160.0, 30.0),
+                ui.into_cache(),
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::CursorEntered),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(Point::new(70.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages, vec![Action::Close(ids[0])]);
         }
     }
 
