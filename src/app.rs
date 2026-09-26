@@ -11098,7 +11098,7 @@ impl Application for Cagents {
                 if viewport <= f32::EPSILON {
                     return Task::none();
                 }
-                let limits = self.workspace.card_resize_limits(card);
+                let limits = self.workspace.begin_card_resize(card);
                 let maximum = limits.maximum;
                 let minimum = limits.minimum;
                 let width = width.clamp(minimum, maximum);
@@ -11152,6 +11152,7 @@ impl Application for Cagents {
                 }
             }
             Message::ResizeCardFinished(card) => {
+                self.workspace.finish_card_resize(card);
                 if self.card_state(card).is_some() {
                     self.persist();
                 }

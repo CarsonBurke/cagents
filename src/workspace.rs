@@ -665,6 +665,7 @@ pub struct Workspace {
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
+    resize_limits: Option<(CardId, WidthLimits)>,
     config: WorkspaceConfig,
 }
 
@@ -684,6 +685,7 @@ impl Workspace {
             visibility_bands: None,
             pending_widget_focus: None,
             pending_close: None,
+            resize_limits: None,
             config,
         })
     }
@@ -793,11 +795,31 @@ impl Workspace {
     /// viewport. Let a gesture grow from that size without jumping to the
     /// minimum, while refusing to shrink it further.
     pub fn card_resize_limits(&self, id: CardId) -> WidthLimits {
+        if let Some((resizing, limits)) = self.resize_limits
+            && resizing == id
+        {
+            return limits;
+        }
         let limits = self.fractional_width_limits();
         self.geometry.card(id).map_or(limits, |card| WidthLimits {
             minimum: limits.minimum.min(card.width()),
             maximum: limits.maximum.max(card.width()),
         })
+    }
+
+    pub fn begin_card_resize(&mut self, id: CardId) -> WidthLimits {
+        let limits = self.card_resize_limits(id);
+        self.resize_limits = Some((id, limits));
+        limits
+    }
+
+    pub fn finish_card_resize(&mut self, id: CardId) {
+        if self
+            .resize_limits
+            .is_some_and(|(resizing, _)| resizing == id)
+        {
+            self.resize_limits = None;
+        }
     }
 
     pub fn visibility(&self, id: CardId) -> Option<VisibilityClass> {
@@ -1032,6 +1054,7 @@ impl Workspace {
     }
 
     pub fn commit_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+        self.finish_card_resize(id);
         let pending = self.pending_close.ok_or(WorkspaceError::NoClosePending)?;
         if pending.id != id {
             return Err(WorkspaceError::WrongPendingClose {
@@ -2041,6 +2064,26 @@ mod tests {
                 .unwrap();
             assert!((workspace.geometry().card(id).unwrap().width() - target).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn compact_resize_can_backtrack_within_the_same_gesture() {
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(0.1), CardWidth::Fraction(0.2)], 800.0);
+        let id = workspace.cards()[0].id;
+        let origin = workspace.geometry().card(id).unwrap().width();
+        for target in [300.0, 280.0, 500.0, 290.0, origin] {
+            let bounds = workspace.begin_card_resize(id);
+            assert_eq!(bounds.minimum, origin);
+            let preferred = workspace
+                .preferred_width_for_resize(id, target.clamp(bounds.minimum, bounds.maximum));
+            workspace
+                .set_card_width(id, CardWidth::Fraction(preferred / 800.0))
+                .unwrap();
+            assert!((workspace.geometry().card(id).unwrap().width() - target).abs() < 0.001);
+        }
+        workspace.finish_card_resize(id);
+        assert!(workspace.resize_limits.is_none());
     }
 
     #[test]
