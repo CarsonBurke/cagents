@@ -224,6 +224,17 @@ impl Provider {
         (id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()).then(|| id.to_owned())
     }
 
+    /// Authored skills and commands belong to configuration, which OMP may
+    /// keep separately from its session data under XDG.
+    #[cfg(feature = "ui")]
+    pub fn authored_content_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
+        if self == Self::Omp {
+            omp::config_root(launch, Path::new(launch.environment.get("HOME")?))
+        } else {
+            self.session_root(launch)
+        }
+    }
+
     /// Resolve account/profile roots exclusively from the preserved launch.
     pub fn session_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
         let home = Path::new(launch.environment.get("HOME")?);

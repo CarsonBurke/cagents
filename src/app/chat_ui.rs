@@ -105,6 +105,8 @@ pub enum Action {
     DraftModel(Target, Provider, Option<String>),
     /// Points a draft at another account of its provider.
     ChooseAccount(Target, AccountId),
+    /// Installed skills read without starting the draft's provider.
+    DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
     /// Opens or closes the account choice.
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
@@ -2021,6 +2023,11 @@ fn draft_snapshot(
             attachments: provider != Provider::Codex,
             model_selection: true,
             reasoning_selection: true,
+            skill_reach: match provider {
+                Provider::Codex => chat::SkillReach::Anywhere,
+                Provider::Claude => chat::SkillReach::Leading,
+                Provider::Omp => chat::SkillReach::First,
+            },
             ..chat::Capabilities::default()
         },
         models,
@@ -2094,22 +2101,28 @@ impl Cagents {
                 Some(&candidate.id) == model.as_ref() && candidate.reasoning.contains(reasoning)
             })
         });
-        runtime.snapshot = Arc::new(draft_snapshot(
-            provider,
-            models,
-            model.clone(),
-            reasoning.clone(),
-        ));
+        let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
+        if moved.is_none() {
+            snapshot.skills.clone_from(&runtime.snapshot.skills);
+        }
+        runtime.snapshot = Arc::new(snapshot);
+        runtime.completion.restart(true);
         if let Some(session) = &moved {
             runtime.session = session.clone();
             runtime.error = None;
         }
         self.remember_chat_model(provider, model, reasoning);
-        if let Some(session) = moved {
+        let skills = if let Some(session) = moved {
             self.replace_chat_conversation(target.card, session);
-        }
-        iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
-            .map(cosmic::Action::App)
+            self.load_draft_skills(target)
+        } else {
+            Task::none()
+        };
+        Task::batch([
+            skills,
+            iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                .map(cosmic::Action::App),
+        ])
     }
 
     /// Starts the next conversation of `provider` on `model` at `reasoning`,
@@ -2190,8 +2203,30 @@ impl Cagents {
             return Task::none();
         }
         runtime.session = session.clone();
+        Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
-        Task::none()
+        self.load_draft_skills(target)
+    }
+
+    /// Read authored skills on the blocking pool. No daemon or provider is
+    /// involved, and a late result cannot replace a different account's list
+    /// or the authoritative catalog of a conversation that has started.
+    fn load_draft_skills(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.is_draft() {
+            return Task::none();
+        }
+        let launch = runtime.session.launch.clone();
+        cosmic::task::future(async move {
+            let source = launch.clone();
+            let skills = tokio::task::spawn_blocking(move || chat::skills::discover(&source))
+                .await
+                .unwrap_or_default();
+            Message::ChatUi(Action::DraftSkills(target, launch, skills))
+        })
     }
 
     /// Brings the models every draft offers up to date with the catalog.
@@ -2388,9 +2423,10 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 ViewportUpdate::unchanged()
             });
-        self.open_chat_draft(card_id, session);
+        let skills = self.open_chat_draft(card_id, session);
         self.persist();
         Task::batch([
+            skills,
             self.apply_viewport(update, true, false),
             iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
                 .map(cosmic::Action::App),
@@ -2419,13 +2455,13 @@ impl Cagents {
         } else {
             Task::none()
         };
-        self.open_chat_draft(card, session);
-        retire
+        let skills = self.open_chat_draft(card, session);
+        Task::batch([retire, skills])
     }
 
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
-    fn open_chat_draft(&mut self, card: CardId, session: chat::Session) {
+    fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         let snapshot = self.chat_draft_snapshot(session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
@@ -2450,6 +2486,7 @@ impl Cagents {
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
+        self.load_draft_skills(target)
     }
 
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
@@ -3230,7 +3267,10 @@ impl Cagents {
         runtime.refresh();
         self.replace_chat_conversation(target.card, draft.clone());
         self.observe_agent_activity_for_card(target.card, None);
-        self.retire_chat(target.card, handle, Some(draft))
+        Task::batch([
+            self.retire_chat(target.card, handle, Some(draft)),
+            self.load_draft_skills(target),
+        ])
     }
 
     /// Takes back a first message its conversation does not have yet.
@@ -3393,6 +3433,15 @@ impl Cagents {
             }
             Action::ChooseAccount(target, id) => {
                 return self.choose_chat_account(target, id);
+            }
+            Action::DraftSkills(target, launch, skills) => {
+                if let Some(runtime) = self.chat_card_runtime_mut(target)
+                    && runtime.is_draft()
+                    && runtime.session.launch == launch
+                {
+                    Arc::make_mut(&mut runtime.snapshot).skills = skills;
+                    runtime.completion.restart(true);
+                }
             }
             Action::AccountPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -3716,8 +3765,11 @@ impl Cagents {
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_forget(target.card);
                         self.replace_chat_conversation(target.card, draft.clone());
-                        self.open_chat_draft(target.card, draft);
-                        return self.retire_chat(target.card, None, Some(attempt.session));
+                        let skills = self.open_chat_draft(target.card, draft);
+                        return Task::batch([
+                            skills,
+                            self.retire_chat(target.card, None, Some(attempt.session)),
+                        ]);
                     }
                     Err(failure) => {
                         // A card that cannot resume has to say what refused it
@@ -4922,6 +4974,146 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn a_draft_completes_a_skill_and_queues_it_without_starting_early() {
+        const INVOCATION: &str = "[$review](/skills/review/SKILL.md)";
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let launch = runtime.session.launch.clone();
+        let _ = app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            launch,
+            vec![chat::Skill {
+                name: "review".into(),
+                description: "Review the change".into(),
+                invocation: INVOCATION.into(),
+            }],
+        )));
+        write(&mut app, card, "/rev");
+        let runtime = chat_runtime(&app, card);
+        let (_, rows) = runtime
+            .completion()
+            .expect("skills are offered before startup");
+        assert_eq!(rows.len(), 1);
+        assert!(runtime.is_draft());
+        assert!(runtime.handle().is_none());
+        assert!(!app.chat_start_pending(card));
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .complete(INVOCATION, false)
+        );
+        write(&mut app, card, "this change");
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            format!("{INVOCATION} this change")
+        );
+        submit(&mut app, card);
+        assert!(app.chat_start_pending(card));
+        assert_eq!(
+            chat_runtime(&app, card)
+                .queued
+                .as_ref()
+                .unwrap()
+                .text
+                .trim(),
+            format!("{INVOCATION} this change")
+        );
+    }
+
+    #[test]
+    fn draft_skill_results_are_scoped_to_the_current_launch_and_card_generation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let launch = runtime.session.launch.clone();
+        let skill = chat::Skill {
+            name: "review".into(),
+            description: String::new(),
+            invocation: "$review".into(),
+        };
+        let mut other_account = launch.clone();
+        other_account
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/another/account".into());
+        for (recipient, source) in [
+            (target, other_account),
+            (
+                Target {
+                    generation: target.generation + 1,
+                    ..target
+                },
+                launch.clone(),
+            ),
+        ] {
+            let _ = app.update(Message::ChatUi(Action::DraftSkills(
+                recipient,
+                source,
+                vec![skill.clone()],
+            )));
+            assert!(chat_runtime(&app, card).snapshot.skills.is_empty());
+        }
+        let _ = app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            launch.clone(),
+            vec![skill.clone()],
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.skills,
+            vec![skill.clone()]
+        );
+        let _ = app.update(Message::ChatUi(Action::DraftModel(
+            target,
+            Provider::Codex,
+            None,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.skills,
+            vec![skill.clone()]
+        );
+        let _ = app.update(Message::ChatUi(Action::DraftModel(
+            target,
+            Provider::Claude,
+            None,
+        )));
+        assert!(chat_runtime(&app, card).snapshot.skills.is_empty());
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.capabilities.skill_reach,
+            chat::SkillReach::Leading
+        );
+        let _ = app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            launch,
+            vec![skill],
+        )));
+        assert!(chat_runtime(&app, card).snapshot.skills.is_empty());
+        assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn a_running_chat_ignores_late_draft_skill_discovery() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let launch = runtime.session.launch.clone();
+        let skills = runtime.snapshot.skills.clone();
+        let _ = app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            launch,
+            vec![chat::Skill {
+                name: "late".into(),
+                description: String::new(),
+                invocation: "$late".into(),
+            }],
+        )));
+        assert_eq!(chat_runtime(&app, card).snapshot.skills, skills);
     }
 
     /// Types `text` into the composer of `card`.

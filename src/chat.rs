@@ -10,6 +10,8 @@ pub mod client;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
+#[cfg(feature = "ui")]
+pub mod skills;
 
 /// Local wall-clock time for a conversation stamp, as `14:32`.
 ///

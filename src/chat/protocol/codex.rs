@@ -279,6 +279,7 @@ fn create_inner(
             turn: None,
             busy: false,
             ready: false,
+            attached: false,
             direct_input: false,
             cursor: None,
             history_loading: false,
@@ -337,6 +338,7 @@ struct Codex {
     turn: Option<String>,
     busy: bool,
     ready: bool,
+    attached: bool,
     direct_input: bool,
     cursor: Option<String>,
     history_loading: bool,
@@ -357,6 +359,23 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    /// The first queued prompt needs the catalog to resolve skill mentions
+    /// into typed inputs. Attachment and catalog responses can arrive in
+    /// either order; subsequent catalog refreshes leave the session usable.
+    fn finish_setup(&mut self, step: &mut Step) {
+        if self.attached
+            && !self.ready
+            && !self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Skills))
+        {
+            self.ready = true;
+            self.model_events(step);
+            step.events.push(Event::Ready(true));
+        }
+    }
+
     fn call(
         &mut self,
         step: &mut Step,
@@ -794,6 +813,8 @@ impl Codex {
 impl Adapter for Codex {
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = Step::default();
+        self.ready = false;
+        self.attached = false;
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
@@ -877,6 +898,7 @@ impl Adapter for Codex {
                     // An app-server without a skills catalog answers with an
                     // error, and a composer that offers no completions is not
                     // worth putting a failure in the transcript over.
+                    self.finish_setup(&mut step);
                     return Ok(step);
                 }
                 if matches!(pending, Pending::Models) && !self.listing.is_empty() {
@@ -934,8 +956,7 @@ impl Adapter for Codex {
                         );
                     }
                     self.thread = Some(id.into());
-                    self.ready = true;
-                    step.events.push(Event::Ready(true));
+                    self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
@@ -957,6 +978,7 @@ impl Adapter for Codex {
                     } else {
                         self.history(&mut step, None)?;
                     }
+                    self.finish_setup(&mut step);
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
@@ -1086,6 +1108,7 @@ impl Adapter for Codex {
                         .filter_map(|(skill, path, _)| Some((skill.name, path?)))
                         .collect();
                     step.events.push(Event::Skills(skills));
+                    self.finish_setup(&mut step);
                     if std::mem::take(&mut self.skills_stale) {
                         self.skills(&mut step)?;
                     }
@@ -1309,6 +1332,7 @@ impl Adapter for Codex {
             }
             "thread/closed" | "thread/deleted" => {
                 self.ready = false;
+                self.attached = false;
                 step.events.push(Event::Ready(false));
                 self.busy = false;
                 self.invalidate(&mut step);
@@ -2160,6 +2184,7 @@ mod tests {
             turn: None,
             busy: false,
             ready: true,
+            attached: true,
             direct_input: true,
             cursor: None,
             history_loading: false,
@@ -2437,6 +2462,73 @@ mod tests {
     }
 
     #[test]
+    fn first_prompt_waits_for_skill_paths_in_either_response_order() {
+        const PROMPT: &str = "[$review](/skills/review/SKILL.md) this change";
+        for skills_first in [false, true] {
+            for catalog_supported in [false, true] {
+                let mut adapter = adapter();
+                adapter.thread = None;
+                adapter.materialized = false;
+                let initialize = adapter.initialize().unwrap();
+                let setup = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":"/tmp"}})).unwrap();
+                let id = |method| {
+                    setup
+                        .writes
+                        .iter()
+                        .find(|frame| frame["method"] == method)
+                        .unwrap()["id"]
+                        .clone()
+                };
+                let attach = json!({"id":id("thread/start"),"result":{"thread":{"id":"fresh","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"model"}});
+                let skills = if catalog_supported {
+                    json!({"id":id("skills/list"),"result":{"data":[{"skills":[
+                        {"name":"review","path":"/skills/review/SKILL.md"},
+                        {"name":"review","path":"/plugins/review/SKILL.md"}
+                    ]}]}})
+                } else {
+                    json!({"id":id("skills/list"),"error":{"code":-32601,"message":"Method not found"}})
+                };
+                let responses = if skills_first {
+                    [skills, attach]
+                } else {
+                    [attach, skills]
+                };
+                let first = adapter.receive(responses[0].clone()).unwrap();
+                assert!(!first.events.contains(&Event::Ready(true)));
+                let prompt = || Command::Prompt {
+                    text: PROMPT.into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                };
+                assert!(adapter.command(prompt()).is_err());
+                let second = adapter.receive(responses[1].clone()).unwrap();
+                assert!(second.events.contains(&Event::Ready(true)));
+                let sent = adapter.command(prompt()).unwrap();
+                let input = sent.writes[0]["params"]["input"].as_array().unwrap();
+                assert_eq!(input[0], json!({"type":"text","text":PROMPT}));
+                if catalog_supported {
+                    assert_eq!(
+                        input[1],
+                        json!({"type":"skill","name":"review","path":"/skills/review/SKILL.md"})
+                    );
+                } else {
+                    assert_eq!(input.len(), 1);
+                }
+                let refresh = adapter
+                    .receive(json!({"method":"skills/changed","params":{}}))
+                    .unwrap();
+                assert!(
+                    refresh
+                        .writes
+                        .iter()
+                        .any(|frame| frame["method"] == "skills/list")
+                );
+                assert!(adapter.ready);
+            }
+        }
+    }
+
+    #[test]
     fn new_thread_defers_history_until_its_first_turn_materializes() {
         let mut adapter = adapter();
         adapter.thread = None;
@@ -2451,8 +2543,8 @@ mod tests {
             .find(|frame| frame["method"] == "thread/start")
             .unwrap();
         let attached = adapter.receive(json!({"id":start["id"],"result":{"thread":{"id":"fresh","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"gpt-test"}})).unwrap();
-        // A sender waits for this rather than for a refusal.
-        assert!(attached.events.contains(&Event::Ready(true)));
+        // The first sender also waits for the skill catalog.
+        assert!(!attached.events.contains(&Event::Ready(true)));
         assert!(
             attached
                 .events
@@ -2465,6 +2557,15 @@ mod tests {
                 .iter()
                 .any(|frame| frame["method"] == "thread/turns/list")
         );
+        let skills = setup
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let catalog = adapter
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(catalog.events.contains(&Event::Ready(true)));
         adapter.receive(json!({"method":"turn/started","params":{"threadId":"fresh","turn":{"id":"turn","status":"inProgress","items":[]}}})).unwrap();
         let refreshed = adapter.command(Command::Refresh).unwrap();
         assert!(
