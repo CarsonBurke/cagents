@@ -3970,6 +3970,7 @@ impl Application for Editor {
                         && let Some(backwards) = cagents::tab_history::step_direction(&event)
                     {
                         let available: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+                        self.tab_history.retain(|id| available.contains(&id));
                         if let Some(id) = self.tab_history.step(&available, self.active, backwards)
                         {
                             let select = self.select_tab(id);

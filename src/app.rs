@@ -3728,6 +3728,22 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceDestination {
+    Worktree(crate::model::WorktreeId),
+    Channel(crate::model::ChannelId),
+}
+
+impl WorkspaceDestination {
+    fn from_action(action: &SidebarAction) -> Option<Self> {
+        match action {
+            SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
+            SidebarAction::OpenChannel { channel_id } => Some(Self::Channel(*channel_id)),
+            _ => None,
+        }
+    }
+}
+
 pub struct Cagents {
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -3898,6 +3914,8 @@ pub struct Cagents {
     settings_category: SettingsCategory,
     settings_search: String,
     tab_history: crate::tab_history::TabHistory<CardId>,
+    workspace_history: crate::tab_history::TabHistory<WorkspaceDestination>,
+    workspace_cycle_modifiers: keyboard::Modifiers,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
     settings_feedback: Option<SettingsFeedback>,
@@ -7486,41 +7504,83 @@ impl Cagents {
         }
     }
 
-    /// Moves to the workspace before or after this one: a worktree or a
-    /// channel, in sidebar order, wrapping at both ends.
-    ///
-    /// Nothing open means the cycle starts at the end the reader is heading
-    /// for, so the first press already lands somewhere rather than priming an
-    /// invisible cursor.
-    fn cycle_workspace(&self, direction: crate::workspace::FocusDirection) -> Task<Message> {
-        match self.next_workspace(direction) {
-            Some(action) => cosmic::task::message(Message::Sidebar(action)),
-            None => Task::none(),
+    fn active_workspace_destination(&self) -> Option<WorkspaceDestination> {
+        if let Some(id) = self.durable.active_channel {
+            return Some(WorkspaceDestination::Channel(id));
         }
+        let path = self.active_workspace.as_deref()?;
+        self.sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| &project.worktrees)
+            .find(|worktree| worktree.path == path)
+            .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
     }
 
-    fn next_workspace(&self, direction: crate::workspace::FocusDirection) -> Option<SidebarAction> {
-        let mut destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
-        let last = destinations.len().checked_sub(1)?;
-        let channel = self.durable.active_channel;
-        let worktree = self.active_workspace.clone();
-        let current = destinations.iter().position(|action| match action {
-            SidebarAction::OpenChannel { channel_id } => channel == Some(*channel_id),
-            SidebarAction::OpenWorktree { path, .. } => {
-                channel.is_none() && worktree.as_deref() == Some(path.as_path())
-            }
-            _ => false,
-        });
-        let index = match (current, direction) {
-            (Some(current), crate::workspace::FocusDirection::Right) => {
-                (current + 1) % destinations.len()
-            }
-            (Some(current), crate::workspace::FocusDirection::Left) => {
-                (current + last) % destinations.len()
-            }
-            (None, crate::workspace::FocusDirection::Right) => 0,
-            (None, crate::workspace::FocusDirection::Left) => last,
+    /// Preview workspaces in a frozen MRU order, committing on modifier release.
+    fn cycle_workspace(
+        &mut self,
+        direction: crate::workspace::FocusDirection,
+        modifiers: keyboard::Modifiers,
+    ) -> Task<Message> {
+        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
+            return Task::none();
+        }
+        let previous_history = self.workspace_history.clone();
+        let Some(action) = self.next_workspace(direction) else {
+            return Task::none();
         };
+        if self
+            .sidebar_entered_directory(&action)
+            .is_some_and(|directory| self.refuse_in_deleting_worktree(&directory))
+        {
+            self.workspace_history = previous_history;
+            return Task::none();
+        }
+        let destination = WorkspaceDestination::from_action(&action);
+        let previous_pane = self.workspace.focused();
+        self.sidebar_state.apply(&action);
+        // Select synchronously: the next key event must see this preview,
+        // rather than queue another selection against an unchanged workspace.
+        let task = match action {
+            SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
+            SidebarAction::OpenChannel { channel_id } => {
+                self.handle_channel_ui(channel_ui::Action::Open(channel_id))
+            }
+            _ => unreachable!("workspace destinations only contain worktrees and channels"),
+        };
+        if self.active_workspace_destination() != destination {
+            self.workspace_history = previous_history;
+            return task;
+        }
+        self.tab_history.finish(previous_pane);
+        self.workspace_cycle_modifiers = modifiers
+            & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
+        if self.workspace_cycle_modifiers.is_empty() {
+            self.workspace_history
+                .finish(self.active_workspace_destination());
+        }
+        task
+    }
+
+    fn next_workspace(
+        &mut self,
+        direction: crate::workspace::FocusDirection,
+    ) -> Option<SidebarAction> {
+        let mut destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
+        let available: Vec<_> = destinations
+            .iter()
+            .filter_map(WorkspaceDestination::from_action)
+            .collect();
+        self.workspace_history.retain(|id| available.contains(&id));
+        let selected = self.workspace_history.step(
+            &available,
+            self.active_workspace_destination(),
+            direction == crate::workspace::FocusDirection::Left,
+        )?;
+        let index = destinations
+            .iter()
+            .position(|action| WorkspaceDestination::from_action(action) == Some(selected))?;
         Some(destinations.swap_remove(index))
     }
 
@@ -9804,6 +9864,8 @@ impl Application for Cagents {
             settings_category: SettingsCategory::Appearance,
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
+            workspace_history: crate::tab_history::TabHistory::default(),
+            workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
             settings_feedback: None,
@@ -9938,6 +10000,8 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.tab_history.observe(self.workspace.focused());
+        self.workspace_history
+            .observe(self.active_workspace_destination());
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
@@ -11984,10 +12048,22 @@ impl Application for Cagents {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
+                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers) {
+                    self.workspace_history
+                        .finish(self.active_workspace_destination());
+                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                }
                 if !self.workspace_inputs_blocked()
+                    && !self.focused_repository_is_saving()
                     && let Some(backwards) = crate::tab_history::step_direction(&event)
                 {
                     let available: Vec<_> = self.workspace.order().collect();
+                    self.tab_history.retain(|id| {
+                        self.durable
+                            .cards
+                            .iter()
+                            .any(|card| card.id == id && card.existence.is_open())
+                    });
                     if let Some(id) =
                         self.tab_history
                             .step(&available, self.workspace.focused(), backwards)
@@ -12127,7 +12203,10 @@ impl Application for Cagents {
                         cosmic::task::message(Message::CyclePaneWidth)
                     }
                     Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
-                        self.cycle_workspace(direction)
+                        let keyboard::Event::KeyPressed { modifiers, .. } = event else {
+                            unreachable!("shortcuts come from key presses")
+                        };
+                        self.cycle_workspace(direction, modifiers)
                     }
                     Some(
                         shortcut @ (workspace_widget::GlobalShortcut::ReviewToggleViewed
@@ -12246,6 +12325,9 @@ impl Application for Cagents {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
                     self.tab_history.finish(self.workspace.focused());
+                    self.workspace_history
+                        .finish(self.active_workspace_destination());
+                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
                 }
                 let account_focus = match action {
                     refresh_ui::Action::Focused(id, focused)
@@ -17328,26 +17410,38 @@ mod tests {
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
     }
 
-    /// Alt+Tab moves between the top-level workspaces, wrapping at both ends,
-    /// and starts at the end the reader is heading for when nothing is open.
+    /// Workspace previews freeze visit order until Alt is released, including
+    /// channel identities that share their project's worktree directory.
     #[test]
-    fn cycling_workspaces_wraps_through_every_worktree_and_channel() {
+    fn alt_tab_previews_workspace_history_and_commits_on_release_or_blur() {
         use crate::model::{ChannelId, ProjectChannel, WorktreeId};
         use crate::sidebar::{SidebarProject, SidebarWorktree};
-        use crate::workspace::FocusDirection;
 
         let mut app = context_inspector_test_app(false);
         let project = ProjectId::new();
         let channel = ChannelId::new();
+        let cards: Vec<_> = ["/repo", "/repo/feature", "/repo"]
+            .into_iter()
+            .map(|path| {
+                let mut card = terminal_card_state();
+                let CardKind::Terminal(session) = &mut card.kind else {
+                    unreachable!()
+                };
+                session.launch.working_directory = path.into();
+                card
+            })
+            .collect();
+        let channel_card = cards[2].id;
         let durable = Arc::make_mut(&mut app.durable);
+        durable.cards = cards;
         durable.channels.push(ProjectChannel {
             id: channel,
             project_id: project,
             title: "Migration".into(),
             ordinal: 0,
             shared: false,
-            cards: Vec::new(),
-            focused: None,
+            cards: vec![channel_card],
+            focused: Some(channel_card),
         });
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
@@ -17370,31 +17464,56 @@ mod tests {
         ));
         app.refresh_sidebar_channels();
 
-        let names = |app: &Cagents, direction| match app.next_workspace(direction) {
-            Some(SidebarAction::OpenWorktree { path, .. }) => path.display().to_string(),
-            Some(SidebarAction::OpenChannel { channel_id }) => format!("channel {channel_id:?}"),
-            other => panic!("unexpected destination: {other:?}"),
+        let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
+        let root = WorkspaceDestination::from_action(&destinations[0]).unwrap();
+        let feature = WorkspaceDestination::from_action(&destinations[1]).unwrap();
+        let channel = WorkspaceDestination::Channel(channel);
+        // Sidebar order is root, feature, channel; visit order deliberately differs.
+        for index in [0, 1, 2, 0] {
+            drop(app.update(Message::Sidebar(destinations[index].clone())));
+        }
+        let next = |modifiers| Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
         };
-
-        // Nothing open yet: each direction enters from its own end.
-        assert_eq!(names(&app, FocusDirection::Right), "/repo");
-        assert_eq!(
-            names(&app, FocusDirection::Left),
-            format!("channel {channel:?}")
-        );
-
-        app.active_workspace = Some("/repo".into());
-        assert_eq!(names(&app, FocusDirection::Right), "/repo/feature");
-        // The first worktree wraps backwards onto the last channel.
-        assert_eq!(
-            names(&app, FocusDirection::Left),
-            format!("channel {channel:?}")
-        );
-
-        // A channel is the active workspace even while a worktree path stands.
-        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
-        assert_eq!(names(&app, FocusDirection::Right), "/repo");
-        assert_eq!(names(&app, FocusDirection::Left), "/repo/feature");
+        let alt = keyboard::Modifiers::ALT;
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(alt | keyboard::Modifiers::SHIFT),
+            captured: false,
+        }));
+        drop(app.update(next(alt | keyboard::Modifiers::SHIFT)));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            captured: false,
+        }));
+        // Intermediate feature preview did not become more recent than root.
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        app.settings_reset_confirm = true;
+        drop(app.update(next(alt)));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
     }
 
     #[test]
@@ -18620,6 +18739,8 @@ mod tests {
             settings_category: SettingsCategory::Appearance,
             settings_search: String::new(),
             tab_history: crate::tab_history::TabHistory::default(),
+            workspace_history: crate::tab_history::TabHistory::default(),
+            workspace_cycle_modifiers: keyboard::Modifiers::empty(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
             settings_pane_focused: false,
