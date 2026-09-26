@@ -10223,6 +10223,7 @@ impl Application for Cagents {
             &message,
             Message::RepositoryLoaded { .. }
                 | Message::AttachedWorktreePrsResolved { .. }
+                | Message::GitUi(_)
                 | Message::WorkspaceModelObserved(_)
                 | Message::ProjectUi(_)
                 | Message::ChannelUi(_)

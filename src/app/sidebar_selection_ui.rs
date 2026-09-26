@@ -122,7 +122,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .retain(|channel| channel.id != ids[0]);
-        drop(app.update(Message::WindowResized(1440.0, 900.0)));
+        drop(app.update(Message::GitUi(git_ui::Action::Changed)));
         assert_eq!(
             app.sidebar_state.selected_rows(&app.visible_sidebar_rows()),
             vec![SelectionRow::Channel(ids[1])]
