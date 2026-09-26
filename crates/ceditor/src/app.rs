@@ -989,7 +989,6 @@ impl Editor {
                 self.closing.is_none() && self.file_dialog.is_none(),
                 Some(Message::Settings),
             )
-            .prominent()
             .into(),
         ])
         .padding(cosmic::theme::spacing().space_xxxs)
