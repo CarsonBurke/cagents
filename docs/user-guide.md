@@ -216,6 +216,47 @@ copies, Codex's independent configuration option, and keyring isolation.
 
 ## Native agent chat
 
+### Account credential isolation
+
+Choosing a managed or linked Claude/Codex account uses that home's stored login.
+Cagents removes inherited credential overrides from its account probes, sign-in
+commands, new chats and terminals, and preserves those removals on resume and
+daemon upgrade. **System default** keeps the environment behavior of the provider
+CLI. Only variable names are saved; cagents does not inspect credential values.
+Older saved recipes that name a managed home inside this installation's account
+directory receive the same protection when a child is restarted. Older recipes
+for linked directories need an explicit account selection to record the policy;
+an arbitrary external directory cannot safely be inferred to be a managed login.
+
+For Claude, the removed variables are `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`,
+`CLAUDE_CODE_USE_ANTHROPIC_AWS`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_MANTLE`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `ANTHROPIC_PROFILE`,
+`ANTHROPIC_FEDERATION_RULE_ID`, and `ANTHROPIC_ORGANIZATION_ID`. These select
+credentials ahead of a stored `/login` according to Claude's
+[authentication precedence](https://code.claude.com/docs/en/iam#authentication-precedence)
+and [environment reference](https://code.claude.com/docs/en/env-vars).
+The refresh-token pair also bypasses browser account selection during sign-in.
+
+For Codex, the removed variables are `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`CODEX_ACCESS_TOKEN`, `OPENAI_FEDERATION_RULE_ID`, `OPENAI_IDENTITY_TOKEN_FILE`,
+and `OPENAI_WORKLOAD_IDENTITY_CONTEXT`. Codex's
+[authentication implementation](https://github.com/openai/codex/blob/7b7d934408e6df20950a7a2501a669650279ab06/codex-rs/login/src/auth/manager.rs)
+checks supported process tokens before persistent credentials; its
+[workload identity implementation](https://github.com/openai/codex/blob/7b7d934408e6df20950a7a2501a669650279ab06/codex-rs/login/src/auth/workload_identity.rs)
+selects process authentication using the federation markers. `OPENAI_API_KEY`
+is also removed for provider/version compatibility.
+
+Proxy, certificate, and generic cloud variables remain available to the agent's
+tools. Provider settings files, credential helpers, and administrator policies
+remain user-controlled. This policy does not rewrite those settings or an
+already-running conversation. If a terminal later exports an excluded variable,
+switching it to native chat refuses before stopping the CLI. Recovery retains
+the recorded account selection; choose **System default** to inherit credentials.
+
+### Switching between terminal and chat
+
 Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**,
 and the New tab menu starts a native conversation without a terminal.
 

@@ -859,6 +859,9 @@ impl Worker {
             }
             None => command_from_recipe(&session.launch),
         };
+        for name in crate::account::launch_credential_overrides(&session.launch) {
+            command.env_remove(name);
+        }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         command.env(
             "CAGENTS_RECOVERY_ORIGIN",
@@ -2163,6 +2166,9 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     for (name, value) in &recipe.environment {
         command.env(name, value);
     }
+    for name in crate::account::launch_credential_overrides(recipe) {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -2678,6 +2684,7 @@ mod tests {
 
     fn shell_session(script: &str) -> TerminalSession {
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), script.into()],
             working_directory: PathBuf::from("/"),
@@ -2857,6 +2864,7 @@ mod tests {
 
     fn capture_worker() -> (Worker, Receiver<TerminalEvent>) {
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/true".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/"),
@@ -2902,6 +2910,7 @@ mod tests {
         let executable = directory.path().join("omp");
         symlink("/bin/sleep", &executable).unwrap();
         let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
             program: executable.to_str().unwrap().into(),
             arguments: vec!["10".into()],
             working_directory: directory.path().into(),
@@ -2988,6 +2997,7 @@ mod tests {
         // A harmless native executable with recognizable argv; no provider I/O.
         symlink("/bin/sleep", &executable).unwrap();
         let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
             program: executable.to_str().unwrap().into(),
             arguments: vec!["10".into()],
             working_directory: directory.path().into(),
@@ -3183,6 +3193,7 @@ mod tests {
         // A long-lived child keeps the foreground group stable for the whole
         // test, so every tick below takes its "nothing changed" path.
         let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sleep".into(),
             arguments: vec!["10".into()],
             working_directory: PathBuf::from("/"),
@@ -3355,6 +3366,7 @@ mod tests {
     #[test]
     fn a_paste_reaches_the_child_framed_once_it_asks_for_brackets() {
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec![
                 "-c".into(),
@@ -3975,6 +3987,7 @@ mod tests {
 
     fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
         LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".to_owned(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/"),
@@ -4099,6 +4112,41 @@ mod tests {
         assert_eq!(command.get_env("COLORFGBG"), Some(OsStr::new("0;15")));
     }
 
+    #[test]
+    fn selected_account_removals_win_in_fresh_and_returned_pty_children() {
+        let directory = tempfile::tempdir().unwrap();
+        for returned in [false, true] {
+            let mut recipe = env_recipe(BTreeMap::from([
+                ("CODEX_API_KEY".into(), "fixture-key".into()),
+                ("CODEX_HOME".into(), "/selected".into()),
+            ]));
+            recipe.working_directory = directory.path().into();
+            recipe.unset_environment.insert("CODEX_API_KEY".into());
+            recipe.arguments = vec![
+                "-c".into(),
+                "[ -z \"${CODEX_API_KEY+x}\" ] && [ \"$CODEX_HOME\" = /selected ] && : > isolated"
+                    .into(),
+            ];
+            let config = TerminalConfig {
+                execution_environment: returned.then(|| {
+                    crate::terminal_ipc::ChatExecutionEnvironment(recipe.environment.clone())
+                }),
+                ..TerminalConfig::default()
+            };
+            let (worker, _) = capture_worker_with(recipe, config);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !directory.path().join("isolated").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PTY did not enforce selected account environment"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.run();
+            std::fs::remove_file(directory.path().join("isolated")).unwrap();
+        }
+    }
+
     const SCROLLBACK_LINES: usize = 2000;
     /// A 0.67s flick at 60 Hz presentation.
     const FRAMES: usize = 40;
@@ -4133,6 +4181,7 @@ mod tests {
         // then checks that it never reached a bound by accident.
         let (mut worker, _events) = capture_worker_with(
             LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "/bin/true".into(),
                 arguments: Vec::new(),
                 working_directory: PathBuf::from("/"),

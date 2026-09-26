@@ -806,6 +806,7 @@ fn start(
     if let Some(environment) = &source_execution {
         spec.environment = environment.clone();
     }
+    spec.remove_unset_environment();
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -1777,11 +1778,13 @@ fn upgrade_environment(
     daemon: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, String> {
     let (spec, _) = chat::protocol::create(launch)?;
-    Ok(if hosted_source {
+    let mut environment = if hosted_source {
         spec.environment
     } else {
         sourceless_environment(daemon, BTreeMap::new(), spec.environment)
-    })
+    };
+    launch.recipe.remove_unset_environment(&mut environment);
+    Ok(environment)
 }
 
 pub(super) fn validate_upgrade_environment(
@@ -1978,6 +1981,7 @@ mod tests {
         let launch = chat::Launch {
             provider: Provider::Omp,
             recipe: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "omp".into(),
                 arguments: vec!["--model".into(), "model".into()],
                 working_directory: "/project".into(),
@@ -2012,11 +2016,68 @@ mod tests {
     }
 
     #[test]
+    fn selected_account_removals_survive_daemon_environment_and_upgrade() {
+        let account = crate::account::Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            "/selected".into(),
+        );
+        let launch = chat::Launch {
+            provider: Provider::Claude,
+            recipe: LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: "/project".into(),
+                environment: BTreeMap::from([
+                    ("CLAUDE_CONFIG_DIR".into(), "/selected".into()),
+                    ("ANTHROPIC_API_KEY".into(), "recipe-fixture".into()),
+                ]),
+                unset_environment: account
+                    .credential_overrides()
+                    .iter()
+                    .map(|name| (*name).into())
+                    .collect(),
+            },
+            session_id: None,
+        };
+        let daemon = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".into(), "daemon-fixture".into()),
+            ("HTTPS_PROXY".into(), "http://fixture".into()),
+        ]);
+        let selected = BTreeMap::from([("CLAUDE_CODE_OAUTH_TOKEN".into(), "gui-fixture".into())]);
+        let (mut spec, _) = chat::protocol::create(&launch).unwrap();
+        spec.environment = sourceless_environment(daemon.clone(), selected, spec.environment);
+        spec.remove_unset_environment();
+        assert_eq!(
+            spec.environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(String::as_str),
+            Some("/selected")
+        );
+        assert!(!spec.environment.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!spec.environment.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(
+            spec.environment.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://fixture")
+        );
+        assert_eq!(
+            upgrade_environment(&launch, false, daemon).unwrap(),
+            spec.environment
+        );
+        assert!(
+            !upgrade_environment(&launch, true, BTreeMap::new())
+                .unwrap()
+                .contains_key("ANTHROPIC_API_KEY")
+        );
+    }
+
+    #[test]
     fn paired_codex_upgrade_preserves_confirmed_fresh_or_switched_thread() {
         use crate::model::agent_recovery::{AgentProcess, bind_session};
         const SELECTED: &str = "12345678-1234-4234-8234-123456789abc";
         const ORIGINAL: &str = "98765432-1234-4234-8234-123456789abc";
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "codex".into(),
             arguments: vec!["--profile".into(), "work".into()],
             working_directory: "/project".into(),
@@ -2068,6 +2129,7 @@ mod tests {
         let now = Instant::now();
         let id = "12345678-1234-4234-8234-123456789abc";
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "codex".into(),
             arguments: Vec::new(),
             working_directory: "/same".into(),
@@ -2118,6 +2180,7 @@ mod tests {
             launch: chat::Launch {
                 provider: Provider::Codex,
                 recipe: LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: "codex".into(),
                     arguments: Vec::new(),
                     working_directory: "/project".into(),
@@ -2195,6 +2258,7 @@ for line in sys.stdin:
         let launch = chat::Launch {
             provider: Provider::Omp,
             recipe: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: executable.to_string_lossy().into_owned(),
                 arguments: Vec::new(),
                 working_directory: directory.path().to_owned(),
@@ -2721,6 +2785,7 @@ for line in sys.stdin:
             launch: chat::Launch {
                 provider: Provider::Codex,
                 recipe: LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: "codex".into(),
                     arguments: vec!["--remote".into(), "unix://".into()],
                     working_directory: "/".into(),
@@ -2781,6 +2846,7 @@ for line in sys.stdin:
         let (_directory, host, _) = upgrade_fixture();
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: std::env::temp_dir(),
@@ -2994,6 +3060,7 @@ for line in sys.stdin:
         let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: if slow { "/bin/sh" } else { "/bin/cat" }.into(),
             arguments: if slow {
                 vec![
@@ -3092,6 +3159,7 @@ for line in sys.stdin:
         let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: std::env::temp_dir(),

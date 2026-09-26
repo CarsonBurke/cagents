@@ -193,11 +193,16 @@ fn receive(
 /// The daemon's own native configuration, which is what a conversation with no
 /// proven source terminal has to start from.
 fn native_environment(session: &Session, standalone: bool) -> ipc::ChatExecutionEnvironment {
-    ipc::ChatExecutionEnvironment(if standalone && session.terminal.is_none() {
+    let mut environment = if standalone && session.terminal.is_none() {
         crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
     } else {
         BTreeMap::new()
-    })
+    };
+    session
+        .launch
+        .recipe
+        .remove_unset_environment(&mut environment);
+    ipc::ChatExecutionEnvironment(environment)
 }
 
 /// Works out how a saved card rejoins its conversation, and returns the request
@@ -1099,6 +1104,7 @@ mod tests {
     fn handoff_terminal() -> crate::model::TerminalSession {
         use crate::model::{LaunchRecipe, TerminalContinuity, TerminalSession};
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "unused".into(),
             arguments: Vec::new(),
             working_directory: "/".into(),
@@ -1360,6 +1366,7 @@ mod tests {
             host_incarnation: HostIncarnation::new("incarnation"),
         };
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "unused".into(),
             arguments: Vec::new(),
             working_directory: "/".into(),
@@ -1474,6 +1481,7 @@ mod tests {
             recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "unused".into(),
                 arguments: Vec::new(),
                 working_directory: "/".into(),
@@ -1612,6 +1620,7 @@ mod tests {
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,
                 recipe: crate::model::LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: "omp".into(),
                     arguments: vec![
                         "--session-dir".into(),

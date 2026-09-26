@@ -178,6 +178,7 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "omp".into(),
             arguments: Vec::new(),
             working_directory: home.into(),

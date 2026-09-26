@@ -82,7 +82,8 @@ use crate::{
 /// Version 21 carries an explicit project kind in the shared workspace model.
 /// Version 22 carries daemon-issued owned Codex listener evidence in chat and
 /// terminal descriptors; postcard fields require a matched daemon and UI.
-pub const PROTOCOL_VERSION: u16 = 22;
+/// Version 23 carries explicit environment removals in launch recipes.
+pub const PROTOCOL_VERSION: u16 = 23;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

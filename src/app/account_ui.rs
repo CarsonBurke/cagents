@@ -993,6 +993,11 @@ fn login_launch(
         environment.insert("PATH".into(), path.to_owned());
     }
     Some(LaunchRecipe {
+        unset_environment: account
+            .credential_overrides()
+            .iter()
+            .map(|name| (*name).into())
+            .collect(),
         program: program.to_str()?.to_owned(),
         arguments: command
             .iter()
@@ -3714,6 +3719,7 @@ mod tests {
     #[test]
     fn only_a_providers_sign_in_is_kept_off_the_disk() {
         let recipe = |program: &str, arguments: &[&str]| LaunchRecipe {
+            unset_environment: Default::default(),
             program: program.to_owned(),
             arguments: arguments
                 .iter()
@@ -3750,6 +3756,7 @@ mod tests {
             .resolved_home()
             .unwrap();
         let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "claude".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/w"),
@@ -4158,6 +4165,7 @@ mod app_tests {
     fn recipe_on(app: &Cagents, account: &AccountId) -> LaunchRecipe {
         let state = app.account_ui.account(account).unwrap();
         let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: state.account.provider.executable().into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/w"),
@@ -4513,6 +4521,7 @@ mod app_tests {
         assert_eq!(app.account_ui.display_name(state), "Work");
 
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "codex".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/w"),
@@ -4555,6 +4564,22 @@ mod app_tests {
             )
             .unwrap();
         let linked = Account::linked(Provider::Codex, key, home.clone());
+        let login = login_launch(
+            &linked,
+            Path::new("/usr/bin/codex"),
+            directory.path().into(),
+            false,
+        )
+        .unwrap();
+        assert!(login.unset_environment.contains("CODEX_API_KEY"));
+        let system_login = login_launch(
+            &Account::system(Provider::Codex),
+            Path::new("/usr/bin/codex"),
+            directory.path().into(),
+            false,
+        )
+        .unwrap();
+        assert!(system_login.unset_environment.is_empty());
         registry.set_default(&linked);
         app.account_ui.set_registry(registry);
         let _ = app.add_terminal(directory.path().to_path_buf());
@@ -4571,6 +4596,9 @@ mod app_tests {
             launch.environment.get("CODEX_HOME"),
             Some(&home.display().to_string())
         );
+        assert!(launch.unset_environment.contains("CODEX_API_KEY"));
+        assert!(launch.unset_environment.contains("OPENAI_API_KEY"));
+        assert!(!launch.unset_environment.contains("ANTHROPIC_API_KEY"));
         let mut registry = app.account_ui.registry.clone();
         registry.set_default(&Account::system(Provider::Codex));
         app.account_ui.set_registry(registry);
@@ -4809,6 +4837,7 @@ mod app_tests {
             .and_then(|state| state.account.resolved_home())
             .expect("a managed account has a home");
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/"),
@@ -4827,6 +4856,7 @@ mod app_tests {
         let mut app = context_inspector_test_app(false);
         app.account_ui.add_managed_fixture(Provider::Claude, 6);
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "omp".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/w"),

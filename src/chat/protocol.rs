@@ -29,6 +29,7 @@ pub struct ProcessSpec {
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
     pub environment: BTreeMap<String, String>,
+    pub unset_environment: std::collections::BTreeSet<String>,
 }
 impl std::fmt::Debug for ProcessSpec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,7 +51,14 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
             arguments: recipe.arguments.clone(),
             working_directory: recipe.working_directory.clone(),
             environment: recipe.environment.clone(),
+            unset_environment: crate::account::launch_credential_overrides(recipe),
         }
+    }
+}
+impl ProcessSpec {
+    pub(crate) fn remove_unset_environment(&mut self) {
+        self.environment
+            .retain(|name, _| !self.unset_environment.contains(name));
     }
 }
 #[derive(Debug, Default)]

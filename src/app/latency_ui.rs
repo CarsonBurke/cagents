@@ -186,6 +186,7 @@ impl Cagents {
         let mut state = WorkspaceState::default();
         for index in 0..crate::latency_fixture::CARD_COUNT {
             let launch = LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "/bin/false".into(),
                 arguments: Vec::new(),
                 working_directory: PathBuf::from("/"),

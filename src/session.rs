@@ -2272,6 +2272,7 @@ mod tests {
 
     fn workspace() -> WorkspaceState {
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-l".into()],
             working_directory: PathBuf::from("/tmp"),
@@ -2576,6 +2577,7 @@ mod tests {
         let middle_id = TerminalId::new();
         let final_id = TerminalId::new();
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-l".into()],
             working_directory: PathBuf::from("/tmp"),

@@ -1226,6 +1226,7 @@ fn validate_terminal_upgrade_environment(
     })?;
     let mut restored = crate::model::agent_recovery::fresh_native_environment(provider, false);
     restored.extend(recipe.environment.clone());
+    recipe.remove_unset_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
             "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this terminal before upgrading; no source was stopped",
@@ -2205,12 +2206,15 @@ fn start_terminal_view(
     client_id: ClientId,
     session: TerminalSession,
     options: TerminalSpawnOptions,
-    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     adoption: Option<std::path::PathBuf>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    if let Some(environment) = &mut execution_environment {
+        session.launch.remove_unset_environment(&mut environment.0);
+    }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
@@ -2664,6 +2668,7 @@ mod tests {
         )
         .unwrap();
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: executable.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
@@ -2802,6 +2807,7 @@ for line in sys.stdin:
             launch: Launch {
                 provider: Provider::Claude,
                 recipe: LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: executable.to_string_lossy().into_owned(),
                     arguments: vec!["--resume".into(), A.into()],
                     working_directory: cwd.clone(),
@@ -3075,6 +3081,7 @@ for line in sys.stdin:
         let directory = tempfile::tempdir().unwrap();
         let host = Arc::new(Mutex::new(test_host()));
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "omp".into(),
             arguments: Vec::new(),
             working_directory: directory.path().to_owned(),
@@ -3156,6 +3163,7 @@ for line in sys.stdin:
         fs::create_dir(&empty_proc).unwrap();
         let pid_file = directory.path().join("pid");
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec![
                 "-c".into(),
@@ -3465,6 +3473,7 @@ for line in sys.stdin:
     fn hidden_output_is_per_subscriber_and_rearms_without_revealing() {
         let shared = Arc::new(Mutex::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: std::path::PathBuf::from("/tmp"),
@@ -3555,6 +3564,7 @@ for line in sys.stdin:
         let directory = tempfile::tempdir().unwrap();
         let starts = directory.path().join("starts");
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec![
                 "-c".into(),
@@ -3803,6 +3813,7 @@ for line in sys.stdin:
     fn leader_exit_preserves_consumption_credit_but_not_process_authority() {
         let shared = Arc::new(Mutex::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: std::path::PathBuf::from("/tmp"),
@@ -3918,6 +3929,7 @@ for line in sys.stdin:
         let now = Instant::now();
         let mut state = test_host();
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: std::path::PathBuf::from("/tmp"),

@@ -1942,6 +1942,7 @@ fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> 
     if session.launch.session_id.is_none() {
         let mut shell = LaunchRecipe::shell(session.launch.recipe.working_directory.clone())
             .map_err(|error| format!("Could not open a terminal here: {error}"))?;
+        shell.unset_environment = session.launch.recipe.unset_environment.clone();
         if let Some(variable) = account::home_variable(session.launch.provider)
             && let Some(home) = session.launch.recipe.environment.get(variable)
         {
@@ -1970,6 +1971,11 @@ fn fresh_chat_session(
     account: &Account,
 ) -> Result<chat::Session, String> {
     let mut recipe = LaunchRecipe {
+        unset_environment: account
+            .credential_overrides()
+            .iter()
+            .map(|name| (*name).into())
+            .collect(),
         program: provider.executable().into(),
         arguments: Vec::new(),
         working_directory,
@@ -1985,6 +1991,9 @@ fn fresh_chat_session(
             .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
         recipe.environment.insert(variable.to_owned(), home);
     }
+    recipe
+        .environment
+        .retain(|name, _| !recipe.unset_environment.contains(name));
     match provider {
         // A shared listener lets CLI and native views use the same thread.
         Provider::Codex => recipe
@@ -5001,6 +5010,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_chat_pins_selected_home_credential_policy_and_system_inherits() {
+        for provider in Account::PROVIDERS {
+            for account in [
+                Account::system(provider),
+                Account::managed(provider, uuid::Uuid::new_v4(), "/selected".into()),
+                Account::linked(provider, uuid::Uuid::new_v4(), "/linked".into()),
+            ] {
+                let session =
+                    fresh_chat_session(provider, TerminalId::new(), "/project".into(), &account)
+                        .unwrap();
+                let expected = account
+                    .credential_overrides()
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect();
+                assert_eq!(session.launch.recipe.unset_environment, expected);
+                for name in account.credential_overrides() {
+                    assert!(!session.launch.recipe.environment.contains_key(*name));
+                }
+                if !account.is_system() {
+                    let home = account.resolved_home().unwrap();
+                    assert_eq!(
+                        session.launch.recipe.environment
+                            [account::home_variable(provider).unwrap()],
+                        home.to_str().unwrap()
+                    );
+                }
+                let returned = local_return_launch(&session).unwrap();
+                assert_eq!(
+                    returned.unset_environment,
+                    session.launch.recipe.unset_environment
+                );
+            }
+        }
+    }
+
+    #[test]
     fn resumed_and_cli_paired_snapshots_supply_channel_names() {
         let mut snapshot = Snapshot::default();
         assert_eq!(snapshot_channel_name(&snapshot), None);
@@ -5736,6 +5782,7 @@ mod tests {
     fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -> CardId {
         let card = app.workspace.focused().unwrap();
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "claude".into(),
             arguments: arguments.iter().map(|&argument| argument.into()).collect(),
             working_directory: PathBuf::from(FIXTURE_DIRECTORY),
@@ -5893,6 +5940,7 @@ mod tests {
     #[test]
     fn a_bypass_is_recognised_in_every_form_it_is_carried() {
         let recipe = |arguments: &[&str], environment: &[(&str, &str)]| LaunchRecipe {
+            unset_environment: Default::default(),
             program: "agent".into(),
             arguments: arguments.iter().map(|&argument| argument.into()).collect(),
             working_directory: PathBuf::from(FIXTURE_DIRECTORY),
@@ -6249,6 +6297,12 @@ mod tests {
             let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
             assert!(!plan.resumes);
             let mut shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+            shell.unset_environment = app
+                .default_account(Provider::Codex)
+                .credential_overrides()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
             shell
                 .environment
                 .insert("CODEX_HOME".into(), home.display().to_string());
@@ -7191,6 +7245,7 @@ mod tests {
         let card = live_chat(&mut app, None);
         let mut session = chat_runtime(&app, card).session.clone();
         session.terminal = Some(crate::app::fresh_terminal_session(LaunchRecipe {
+            unset_environment: Default::default(),
             program: "codex".into(),
             arguments: Vec::new(),
             working_directory: session.launch.recipe.working_directory.clone(),

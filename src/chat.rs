@@ -1105,6 +1105,7 @@ mod tests {
         let launch = Launch {
             provider: crate::agent::Provider::Omp,
             recipe: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "omp".into(),
                 arguments: vec![
                     "--session-dir".into(),
@@ -1140,6 +1141,7 @@ mod tests {
             launch: Launch {
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: "codex".into(),
                     arguments: arguments.iter().map(|&argument| argument.into()).collect(),
                     working_directory: "/home/user".into(),

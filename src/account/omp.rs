@@ -359,6 +359,7 @@ pub fn database(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf>
     ];
     let home = PathBuf::from(environment("HOME").filter(|home| !home.is_empty())?);
     let launch = LaunchRecipe {
+        unset_environment: Default::default(),
         program: "omp".into(),
         arguments: Vec::new(),
         working_directory: home.clone(),

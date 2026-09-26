@@ -235,6 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mode
             };
             let recipe = LaunchRecipe {
+                unset_environment: Default::default(),
                 program: std::env::current_exe()?.to_string_lossy().into_owned(),
                 arguments: vec!["--emit".into(), emitted_mode.into()],
                 working_directory: std::env::current_dir()?,

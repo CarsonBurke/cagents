@@ -2603,6 +2603,7 @@ mod tests {
         TerminalDescriptor::relaunchable(
             TerminalId::new(),
             LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "/bin/sh".to_owned(),
                 arguments: Vec::new(),
                 working_directory: PathBuf::from("/"),

@@ -324,6 +324,7 @@ mod tests {
             recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "/bin/sh".into(),
                 arguments: Vec::new(),
                 working_directory: directory.into(),

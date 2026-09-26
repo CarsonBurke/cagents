@@ -377,6 +377,7 @@ mod tests {
 
     fn launch(program: &str, arguments: &[&str]) -> LaunchRecipe {
         LaunchRecipe {
+            unset_environment: Default::default(),
             program: program.into(),
             arguments: arguments.iter().map(|arg| (*arg).into()).collect(),
             working_directory: "/tmp".into(),

@@ -3981,6 +3981,7 @@ mod tests {
             provider: Provider::Claude,
             session_id: Some(id.into()),
             recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "claude".into(),
                 arguments: vec![
                     "--model".into(),
