@@ -1582,7 +1582,7 @@ mod tests {
         let envelope = response(&mut stream, &proof);
         assert_eq!(envelope.request_id, Some(3));
         assert!(matches!(envelope.message, ServerMessage::Response {
-            response: ServerResponse::AgentActivity { terminal_id: id, activity: None },
+            response: ServerResponse::AgentActivity { terminal_id: id, activity: Some(crate::agent::Activity { provider: crate::agent::Provider::Claude, state: crate::agent::ActivityState::Unknown }) },
         } if id == terminal_id));
         assert_eq!(
             unsafe { libc::kill(probe_pid, 0) },
@@ -1600,7 +1600,7 @@ mod tests {
         let envelope = response(&mut stream, &proof);
         assert_eq!(envelope.request_id, Some(16));
         assert!(matches!(envelope.message, ServerMessage::Response {
-            response: ServerResponse::AgentActivity { terminal_id: id, activity: None },
+            response: ServerResponse::AgentActivity { terminal_id: id, activity: Some(crate::agent::Activity { provider: crate::agent::Provider::Claude, state: crate::agent::ActivityState::Unknown }) },
         } if id == terminal_id));
         // Reap the first connection before exercising in-flight cancellation on
         // a fresh one, rather than racing its post-response thread epilogue.

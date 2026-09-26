@@ -1219,7 +1219,16 @@ impl Worker {
             } => {
                 let current = self.observe_agent_process();
                 let valid = std::time::Instant::now() < deadline && current == Some(&process);
-                let activity = if valid { activity } else { None };
+                let activity = if valid {
+                    // Process identity is known even when the provider cannot
+                    // report a state (for example, before its first message).
+                    Some(activity.unwrap_or(crate::agent::Activity {
+                        provider: process.provider,
+                        state: crate::agent::ActivityState::Unknown,
+                    }))
+                } else {
+                    None
+                };
                 self.set_agent_activity(activity);
                 if valid && let Some(title) = title {
                     self.emit(TerminalEvent::ConversationTitleChanged(
@@ -1756,7 +1765,10 @@ impl Worker {
 
     fn adopt_agent_process(&mut self, process: Option<AgentProcess>) {
         if process.is_none() || process != self.agent_process {
-            self.set_agent_activity(None);
+            self.set_agent_activity(process.as_ref().map(|process| crate::agent::Activity {
+                provider: process.provider,
+                state: crate::agent::ActivityState::Unknown,
+            }));
         }
         self.agent_process = process;
     }
@@ -2948,6 +2960,7 @@ mod tests {
         assert_eq!(
             activity,
             [
+                ActivityState::Unknown,
                 ActivityState::Working,
                 ActivityState::Waiting,
                 ActivityState::Idle
@@ -2989,6 +3002,28 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         };
+        let unknown = Some(Activity {
+            provider: Provider::Claude,
+            state: ActivityState::Unknown,
+        });
+        assert_eq!(
+            *worker.published.agent_activity.lock().unwrap(),
+            unknown,
+            "a fresh foreground agent has identity before it reports activity"
+        );
+        let (reply, result) = crossbeam_channel::bounded(1);
+        worker.handle_command(Command::ApplyAgentActivity {
+            process: process.clone(),
+            activity: None,
+            title: None,
+            reply,
+            deadline: Instant::now() + Duration::from_secs(3),
+        });
+        assert_eq!(
+            result.recv().unwrap(),
+            unknown,
+            "unavailable provider state must not erase a confirmed live identity"
+        );
         let working = Some(Activity {
             provider: Provider::Claude,
             state: ActivityState::Working,
@@ -3022,7 +3057,18 @@ mod tests {
         other_process.pid += 1;
         assert_eq!(apply(&mut worker, other_process, deadline()), None);
         assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
-        assert_eq!(apply(&mut worker, process, std::time::Instant::now()), None);
+        assert_eq!(
+            apply(&mut worker, process.clone(), std::time::Instant::now()),
+            None
+        );
+        worker.adopt_agent_process(Some(process));
+        worker.set_agent_activity(working);
+        worker.adopt_agent_process(None);
+        assert_eq!(
+            *worker.published.agent_activity.lock().unwrap(),
+            None,
+            "a shell cannot retain the previous agent identity"
+        );
         // The disconnected command channel drives normal kill/reap teardown.
         worker.run();
     }

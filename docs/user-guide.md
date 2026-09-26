@@ -261,6 +261,11 @@ the source for resumed history.
 
 ## Terminals and agent status
 
+- Drag over terminal output to select text, then press `Ctrl+Shift+C` to copy.
+  Agent terminals keep ordinary clicks available to the CLI while drags select
+  text. Hold Alt to send a drag to the agent, or Shift to select text in other
+  mouse-aware terminal applications. Empty rows and right-side padding do not
+  start selections.
 - Ctrl-click an HTTP or HTTPS address in a terminal to open it using the
   configured link behavior.
 - Closing an idle shell needs no confirmation. A running agent, foreground

@@ -60,6 +60,7 @@ ui = [
     "dep:unicode-linebreak",
     "dep:unicode-casefold",
     "dep:yaml-rust",
+    "dep:unicode-width",
 ]
 integrated-browser = [
     "full",
@@ -95,6 +96,7 @@ required-features = ["host"]
 
 [dependencies]
 yaml-rust = { version = "0.4.5", optional = true }
+unicode-width = { version = "0.2.2", optional = true }
 unicode-casefold = { version = "0.2", optional = true }
 unicode-linebreak = { version = "0.1", optional = true }
 arc-swap = "1.7"
