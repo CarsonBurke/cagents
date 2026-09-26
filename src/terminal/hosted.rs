@@ -2256,21 +2256,24 @@ mod tests {
         assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
     }
 
-    fn hold_startup_lease(socket: &Path) -> std::fs::File {
-        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    fn hold_startup_lease(socket: &Path) -> crate::daemon::HostLease {
+        use std::os::unix::fs::OpenOptionsExt;
 
-        let lock = std::fs::OpenOptions::new()
+        let paths = crate::daemon::RuntimePaths {
+            #[cfg(feature = "host")]
+            directory: socket.parent().unwrap().to_owned(),
+            socket: socket.to_owned(),
+            lock: socket.with_file_name("cagentsd.lock"),
+        };
+        std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
-            .open(socket.with_file_name("cagentsd.lock"))
+            .open(&paths.lock)
             .unwrap();
-        // SAFETY: the fixture owns this live descriptor until the file drops.
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        lock
+        // Match the daemon's explicit unlock: a concurrent fork can still own
+        // a copy of the descriptor after this thread drops its copy.
+        crate::daemon::HostLease::acquire_for_maintenance(&paths).unwrap()
     }
 
     #[test]
@@ -2317,6 +2320,92 @@ mod tests {
             daemon_startup_ready(&socket, DAEMON_READY_TIMEOUT, DAEMON_READY_TIMEOUT, None,),
             Err(HostedTerminalStartError::HostReadyTimeout { .. })
         ));
+    }
+
+    #[test]
+    fn startup_lease_release_does_not_wait_for_concurrent_pre_exec() {
+        use std::io::{Read, Write};
+        use std::os::{fd::AsRawFd, unix::process::ExitStatusExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let lease = hold_startup_lease(&socket);
+        let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
+        let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
+        ready_read
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the forked child uses only async-signal-safe syscalls and
+        // initialized stack buffers until exec. Bound its wait even if the
+        // parent test fails before releasing it.
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = [1_u8];
+                loop {
+                    if libc::write(ready_write.as_raw_fd(), byte.as_ptr().cast(), 1) == 1 {
+                        break;
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                let mut gate = libc::pollfd {
+                    fd: gate_read.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Instant uses the async-signal-safe monotonic clock on Unix.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+                    match libc::poll(&mut gate, 1, remaining.as_millis().max(1) as i32) {
+                        1 => break,
+                        0 => return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+                        _ => {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::Interrupted {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                loop {
+                    match libc::read(gate.fd, byte.as_mut_ptr().cast(), 1) {
+                        1 => break,
+                        0 => return Err(io::Error::from_raw_os_error(libc::EPIPE)),
+                        _ => {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::Interrupted {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = thread::spawn(move || command.status().unwrap());
+        ready_read.read_exact(&mut [0_u8]).unwrap();
+        drop(lease);
+        // The child still holds the inherited descriptor here. A bare File
+        // drop would leave the lease locked and incorrectly keep startup alive.
+        let result = daemon_startup_ready(
+            &socket,
+            Duration::from_secs(35),
+            Duration::from_secs(1),
+            Some(ExitStatus::from_raw(1 << 8)),
+        );
+        gate_write.write_all(&[1]).unwrap();
+        assert!(child.join().unwrap().success());
+        assert!(
+            matches!(result, Err(HostedTerminalStartError::HostExited { .. })),
+            "{result:?}"
+        );
     }
 
     fn published_state(visible: bool) -> (HostedPublishedState, Arc<AtomicUsize>) {
