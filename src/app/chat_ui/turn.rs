@@ -82,10 +82,9 @@ pub(super) struct Turn {
     /// The key is the id of the item that started the group, taken when the
     /// group is created and never revised. A group has no identity of its own
     /// - it is derived from item order on every snapshot - and the reader's
-    /// choice to open its steps has to survive being rederived. Keying it on
-    /// whichever item happens to be first *now* did not: a group opened by a
-    /// narration line was rekeyed the moment its first step arrived, and the
-    /// choice stored under the old key was dropped as a stale entry.
+    /// choice to open its steps survives ordinary appended items and status
+    /// updates. A tool after narration opens its own group, keyed by that tool,
+    /// so adding more prose never moves an existing tool strip's identity.
     pub(super) key: String,
     pub(super) summary: String,
 }
@@ -212,8 +211,8 @@ impl Turn {
 /// Whether the agent is addressing the reader with this item.
 ///
 /// The answer, not its narration and not its reasoning: those are part of the
-/// work rather than a report on it, and a group that broke on either would
-/// break several times a second.
+/// work rather than a report on it. Their consecutive text chunks stay
+/// together; a later tool starts a new chronological group.
 fn speaks(item: &Item) -> bool {
     matches!(
         (item.role, &item.content),
@@ -248,7 +247,8 @@ enum Open {
 /// A user message opens a group, and so does the first activity after the
 /// agent last handed control back. The group runs until the agent says
 /// something to the reader or asks them something; tool calls, commands,
-/// reasoning and narration all join the group that is open.
+/// reasoning and narration join the group that is open. A tool after prose
+/// opens another group, so the tool strip never jumps ahead of earlier text.
 ///
 /// The item that closes a group is the last item *in* that group rather than
 /// the first item of the next one, because that is the order the view draws:
@@ -292,13 +292,18 @@ pub(super) fn group(items: &[Item], asked_after: &HashSet<String>) -> Vec<Turn> 
             continue;
         }
         let speech = speaks(item);
-        if state == Open::Closed || (state == Open::Spoke && !speech) {
+        let slot = slot_of(item);
+        // Each rendered group is prompt, contiguous tools, then prose. A tool
+        // arriving after any visible prose must start another group; otherwise
+        // the view would move it ahead of that earlier reasoning or narration.
+        let resumes_tools =
+            slot == Slot::Step && turns.last().is_some_and(|turn| !turn.prose.is_empty());
+        if state == Open::Closed || (state == Open::Spoke && !speech) || resumes_tools {
             turns.push(Turn::opened(items, index, false));
         }
         // `turns` is non-empty: the branch above pushes when it would be, and
         // the states that skip it only occur once a group exists.
         let turn = turns.last_mut().expect("a group is open");
-        let slot = slot_of(item);
         turn.observe(item.content.status());
         turn.spans(item.at);
         match slot {
@@ -787,8 +792,7 @@ mod tests {
 
     /// A notice used to be dropped from the transcript and the newest one
     /// pinned above it as a heading. It belongs in the conversation, reading
-    /// as the aside it is, and it must not break the stretch of work it lands
-    /// in the middle of.
+    /// as the aside it is, between the work that preceded and followed it.
     #[test]
     fn a_notice_is_narration_inside_the_work_it_lands_in() {
         let items = vec![
@@ -800,8 +804,8 @@ mod tests {
         let turns = group(&items, &unasked());
         assert_eq!(
             turns.len(),
-            1,
-            "a notice is not the agent handing control back, so it closes nothing"
+            2,
+            "later tools must not move ahead of the notice"
         );
         assert_eq!(
             slots(&turns[0]),
@@ -810,8 +814,8 @@ mod tests {
         );
         assert_eq!(
             steps(&turns[0]),
-            [1, 3],
-            "and it is not counted as work the agent did"
+            [1],
+            "the notice is not counted as work the agent did"
         );
     }
 
@@ -823,18 +827,16 @@ mod tests {
             command("c1", ToolStatus::Succeeded),
         ];
         let turns = group(&items, &unasked());
-        assert_eq!(
-            steps(&turns[0]),
-            [2],
-            "reasoning is not filed behind a disclosure row"
-        );
+        assert_eq!(turns.len(), 2);
+        assert!(steps(&turns[0]).is_empty());
+        assert_eq!(steps(&turns[1]), [2]);
         assert_eq!(
             slots(&turns[0]),
             [(1, Slot::Thinking)],
             "it is rendered in the transcript, in its own slot"
         );
         assert_eq!(
-            turns[0].summary, "Ran cargo check",
+            turns[1].summary, "Ran cargo check",
             "and it does not count toward what the strip says was done"
         );
     }
@@ -869,6 +871,66 @@ mod tests {
             [(2, Slot::Prose)],
             "only the item with a body occupies a slot"
         );
+    }
+
+    /// The view renders prompt, tools, prose for each group. Every streaming
+    /// prefix must reproduce arrival order, including system notices, images,
+    /// and empty text that gains its first bytes after later items arrive.
+    #[test]
+    fn interleaved_transcript_groups_render_in_arrival_order() {
+        let mut items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            text("reasoning", Role::Assistant, Phase::Final, true),
+            command("tool1", ToolStatus::Succeeded),
+            command("tool2", ToolStatus::Running),
+            text("progress", Role::Assistant, Phase::Commentary, false),
+            command("tool3", ToolStatus::Succeeded),
+            text("notice", Role::System, Phase::Final, false),
+            Item {
+                id: "image".into(),
+                role: Role::Assistant,
+                content: ItemContent::Image {
+                    path: "/fixture.png".into(),
+                    description: "Preview".into(),
+                },
+                at: None,
+            },
+            command("tool4", ToolStatus::Succeeded),
+            text("answer", Role::Assistant, Phase::Final, false),
+        ];
+        let rendered = |items: &[Item]| {
+            group(items, &unasked())
+                .into_iter()
+                .flat_map(|turn| {
+                    turn.prompt
+                        .into_iter()
+                        .chain(turn.steps.into_iter().map(|placed| placed.index))
+                        .chain(turn.prose.into_iter().map(|placed| placed.index))
+                })
+                .collect::<Vec<_>>()
+        };
+        for end in 0..=items.len() {
+            assert_eq!(rendered(&items[..end]), (0..end).collect::<Vec<_>>());
+        }
+        let ItemContent::Text { text, .. } = &mut items[4].content else {
+            unreachable!()
+        };
+        text.clear();
+        assert_eq!(
+            rendered(&items),
+            (0..items.len())
+                .filter(|index| *index != 4)
+                .collect::<Vec<_>>()
+        );
+        let ItemContent::Text { text, .. } = &mut items[4].content else {
+            unreachable!()
+        };
+        *text = "Progress before tool3".into();
+        assert_eq!(rendered(&items), (0..items.len()).collect::<Vec<_>>());
+        let turns = group(&items, &unasked());
+        let tools = turns.iter().find(|turn| steps(turn) == [2, 3]).unwrap();
+        assert_eq!(tools.key, "tool1");
+        assert!(tools.running);
     }
 
     #[test]
