@@ -2563,6 +2563,62 @@ mod tests {
     }
 
     #[test]
+    fn focus_regain_does_not_hide_a_new_worktree_opened_through_the_picker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        git(&root, &["init", "-b", "main", "checkout"]);
+        let checkout = root.join("checkout");
+        git(&checkout, &["commit", "--allow-empty", "-m", "initial"]);
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let first =
+            super::super::load_repository(&checkout, None, CancellationToken::default()).unwrap();
+        let project = first.project.id;
+        app.repository_generations.insert(project, 0);
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 0,
+            result: Ok(Box::new(first)),
+        }));
+        drop(app.select_worktree(checkout.clone(), false));
+        let linked = root.join("linked");
+        git(
+            &checkout,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let picked = ProjectId::new();
+        drop(app.repository_load_task(linked.clone(), Some(picked), true));
+        let generation = app.repository_generations[&picked];
+        let listing =
+            super::super::load_repository(&linked, Some(picked), CancellationToken::default())
+                .unwrap();
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert_eq!(
+            app.repository_generations[&project], 0,
+            "focus must not start a newer canonical read"
+        );
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: true,
+            project_id: picked,
+            generation,
+            result: Ok(Box::new(listing)),
+        }));
+        assert_eq!(app.sidebar_model.projects.len(), 1);
+        assert!(
+            app.sidebar_model.projects[0]
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == linked)
+        );
+        assert_eq!(app.active_workspace.as_ref(), Some(&linked));
+        assert!(!app.refresh_ui.projects.contains_key(&picked));
+    }
+
+    #[test]
     fn a_listing_older_than_a_deletion_cannot_bring_the_worktree_back() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();

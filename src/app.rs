@@ -19052,6 +19052,58 @@ mod tests {
     /// A refresh tick reads one project at a time, only while the window is
     /// focused, and leaves a project whose checkout failed to its retry.
     #[test]
+    fn explicit_picker_reads_prevent_focus_refresh_until_failure_or_cancellation() {
+        for cancelled in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let repository = directory.path().canonicalize().unwrap();
+            let project = ProjectId::new();
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model.projects.push(restored_sidebar_project(
+                project,
+                "Existing",
+                &repository,
+            ));
+            app.sidebar_state.apply(&SidebarAction::OpenRepository {
+                project_id: project,
+                repository: repository.clone(),
+            });
+            app.core.set_main_window_id(Some(window::Id::RESERVED));
+            let picked = ProjectId::new();
+            drop(app.repository_load_task(repository.clone(), Some(picked), true));
+            let generation = app.repository_generations[&picked];
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                window::Id::RESERVED,
+                true,
+            ))));
+            assert!(
+                !app.repository_generations.contains_key(&project),
+                "focus must not outrank the unresolved picker"
+            );
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+            assert!(
+                !app.repository_generations.contains_key(&project),
+                "periodic polling must also defer during a slow picker read"
+            );
+            if cancelled {
+                app.refresh_ui.projects[&picked].cancel();
+            } else {
+                drop(app.update(Message::RepositoryLoaded {
+                    open_cards: true,
+                    project_id: picked,
+                    generation,
+                    result: Err("picker failed".into()),
+                }));
+            }
+            drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+            assert!(
+                app.repository_generations.contains_key(&project),
+                "normal refresh must resume after the open settles"
+            );
+            assert!(!app.refresh_ui.projects.contains_key(&picked));
+        }
+    }
+
+    #[test]
     fn refresh_ticks_read_one_reachable_project_at_a_time_while_focused() {
         use crate::model::WorktreeId;
         use crate::sidebar::{SidebarProject, SidebarWorktree};

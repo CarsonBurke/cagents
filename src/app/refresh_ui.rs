@@ -218,6 +218,22 @@ impl Cagents {
         self.refresh_ui
             .schedule
             .retain(|id| projects.iter().any(|project| project.id == id));
+        self.refresh_ui.projects.retain(|id, cancellation| {
+            self.repository_generations.contains_key(id) && !cancellation.is_cancelled()
+        });
+        // A picker read has a provisional ID until discovery identifies its
+        // repository. Prioritize that explicit intent: a focus-regain poll of
+        // the existing row must not supersede its listing under another ID.
+        // Only live reads block polling; failed, cancelled, and retired opens
+        // cannot leave automatic refresh waiting for an acknowledgement.
+        if self
+            .refresh_ui
+            .projects
+            .keys()
+            .any(|id| self.project_ui.reopening.contains_key(id))
+        {
+            return Task::batch(tasks);
+        }
         // A project whose checkout could not be read is retried from its row
         // rather than in the background, unless it is selected.
         if let Some((id, path)) = self
