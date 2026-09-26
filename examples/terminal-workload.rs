@@ -241,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 environment: BTreeMap::new(),
             };
             let session = TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),

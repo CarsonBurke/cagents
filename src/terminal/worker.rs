@@ -2684,6 +2684,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
@@ -2873,6 +2874,7 @@ mod tests {
         config: TerminalConfig,
     ) -> (Worker, Receiver<TerminalEvent>) {
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
@@ -3366,6 +3368,7 @@ mod tests {
         };
         let terminal = TerminalHandle::spawn(
             TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: crate::model::TerminalId::new(),
                 launch: recipe.clone(),

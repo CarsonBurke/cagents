@@ -1448,6 +1448,7 @@ static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
 pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
     let id = TerminalId::new();
     TerminalSession {
+        owned_codex_listener: None,
         recovery_origin: None,
         id,
         transcript_path: transcript_path_for(&launch, id),
@@ -1514,6 +1515,7 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
     let recipe = resume_recipe.unwrap_or(recipe);
     let id = TerminalId::new();
     TerminalSession {
+        owned_codex_listener: None,
         recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
         id,
         launch: recipe.clone(),
@@ -16966,6 +16968,7 @@ mod tests {
 
         let launch = launch_recipe("/tmp");
         let mut session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
@@ -17120,6 +17123,7 @@ mod tests {
 
         let launch = launch_recipe("/worktree");
         let mut session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
@@ -17171,6 +17175,7 @@ mod tests {
     fn restored_child_exit_stays_retryable_without_starting_the_stale_identity() {
         let launch = launch_recipe("/worktree");
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
@@ -17806,11 +17811,19 @@ mod tests {
         };
         let identity = session.id;
         session.launch.program = "codex".into();
-        let endpoint = std::env::temp_dir()
+        let endpoint = std::path::PathBuf::from("/daemon-temporary-root")
             .join(format!("cagents-codex-{identity}"))
             .join("control.sock");
         session.launch.arguments =
             vec!["--remote".into(), format!("unix://{}", endpoint.display())];
+        session.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+            socket: endpoint,
+            allocator: HostSessionProof {
+                host_session_id: "allocator".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "previous-host".into(),
+            },
+        });
         transition_terminal_to_relaunchable(session, terminal_exit(0, None));
         // The fixture starts a card mid-hydration; this one has finished.
         app.card_state_mut(card).unwrap().residency = Residency::Hibernated;
@@ -18001,6 +18014,7 @@ mod tests {
                 epoch: INITIAL_HYDRATION_EPOCH,
             },
             kind: CardKind::Terminal(TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
@@ -18050,6 +18064,7 @@ mod tests {
         let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
         recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
         let original = crate::chat::Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

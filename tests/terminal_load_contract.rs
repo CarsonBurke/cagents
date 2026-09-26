@@ -50,6 +50,7 @@ fn terminal_session(script: &str) -> TerminalSession {
     };
 
     TerminalSession {
+        owned_codex_listener: None,
         recovery_origin: None,
         id: TerminalId::new(),
         launch: launch.clone(),

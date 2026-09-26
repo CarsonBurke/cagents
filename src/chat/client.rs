@@ -1105,6 +1105,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -1365,6 +1366,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let terminal = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -1468,6 +1470,7 @@ mod tests {
         // A closed card saved before its daemon was replaced still carries the
         // previous daemon's identity; its receipt went away with that daemon.
         let terminal = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
@@ -1604,6 +1607,7 @@ mod tests {
     /// persisted launch names its session directory and nothing else.
     fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,
@@ -1725,6 +1729,7 @@ mod tests {
         // terminal, and a refused start is a card that does not come back.
         let mut converted = omp_card(Some(CONVERSATION), Some(stale));
         converted.terminal = Some(crate::model::TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: converted.id,
             launch: converted.launch.recipe.clone(),

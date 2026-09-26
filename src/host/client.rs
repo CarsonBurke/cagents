@@ -1245,6 +1245,7 @@ mod tests {
                 chat_id,
                 super::super::chat::Record {
                     session: chat::Session {
+                        owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {
                             provider: Provider::Claude,
@@ -1436,6 +1437,7 @@ mod tests {
         };
         let terminal_id = TerminalId::new();
         let session = crate::model::TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: terminal_id,
             launch: launch.clone(),
@@ -1727,6 +1729,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = crate::model::TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),

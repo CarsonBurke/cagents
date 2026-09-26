@@ -1967,6 +1967,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Hot,
             kind: CardKind::Terminal(TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
@@ -1992,6 +1993,7 @@ mod tests {
             .environment
             .insert("API_KEY".into(), "private-secret".into());
         card.kind = CardKind::Chat(crate::chat::Session {
+            owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Claude,

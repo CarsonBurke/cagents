@@ -1899,6 +1899,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
                 }
             };
             let session = TerminalSession {
+                owned_codex_listener: None,
                 recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
@@ -3535,6 +3536,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
@@ -3637,6 +3639,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = |id| crate::chat::Session {
+            owned_codex_listener: None,
             id,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,

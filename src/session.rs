@@ -2290,6 +2290,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
+                    owned_codex_listener: None,
                     recovery_origin: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
@@ -2572,6 +2573,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let terminal = |id| TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id,
             launch: launch.clone(),
@@ -2718,6 +2720,7 @@ mod tests {
                 unreachable!()
             };
             let chat = |provider: crate::agent::Provider, id: TerminalId| crate::chat::Session {
+                owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
                     provider,
@@ -2777,6 +2780,7 @@ mod tests {
         terminal.launch.arguments.clear();
         terminal.transcript_path = None;
         let mut chat = crate::chat::Session {
+            owned_codex_listener: None,
             id: terminal.id,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,
@@ -2839,6 +2843,7 @@ mod tests {
         let new_id = TerminalId::new();
         let recipe = session.launch.clone();
         let replacement = TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: new_id,
             launch: recipe.clone(),
@@ -3950,6 +3955,7 @@ mod tests {
             unreachable!()
         };
         let relaunch = |id| TerminalSession {
+            owned_codex_listener: None,
             id,
             continuity: TerminalContinuity::RelaunchAvailable {
                 recipe: original.launch.clone(),
@@ -4011,6 +4017,7 @@ mod tests {
         };
         // Storage refuses a relaunch whose recipe does not match its launch.
         let refused = TerminalSession {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             continuity: TerminalContinuity::RelaunchAvailable {
                 recipe: LaunchRecipe {
@@ -4099,6 +4106,7 @@ mod tests {
             card_id,
             original.id,
             TerminalSession {
+                owned_codex_listener: None,
                 id: fresh_id,
                 continuity: TerminalContinuity::RelaunchAvailable {
                     recipe: LaunchRecipe {
@@ -4116,6 +4124,7 @@ mod tests {
         // The first snapshot stores the card at the fresh identity, which
         // leaves the refused relaunch nothing to replace.
         state.cards[0].kind = CardKind::Terminal(TerminalSession {
+            owned_codex_listener: None,
             id: fresh_id,
             ..original
         });
@@ -4142,6 +4151,7 @@ mod tests {
             unreachable!()
         };
         let chat = |session_id: Option<&str>| crate::chat::Session {
+            owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,

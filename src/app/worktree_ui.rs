@@ -910,6 +910,7 @@ mod tests {
             environment: Default::default(),
         };
         card.kind = CardKind::Terminal(TerminalSession {
+            owned_codex_listener: None,
             recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
@@ -1264,6 +1265,7 @@ mod tests {
             unreachable!()
         };
         card.kind = CardKind::Chat(crate::chat::Session {
+            owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,

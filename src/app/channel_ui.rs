@@ -1019,6 +1019,7 @@ mod tests {
 
     fn chat_session() -> crate::chat::Session {
         crate::chat::Session {
+            owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,
