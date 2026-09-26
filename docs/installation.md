@@ -45,36 +45,46 @@ token itself.
 
 ## Install with the verified installer
 
-This flow pins an exact release, verifies the installer and archive against the
-release checksum manifest, lets you read the installer before running it, and
-hands the verified archive back to the installer:
+This flow resolves the latest release once, pins that exact tag for every
+download, verifies both the installer and archive against the release checksum
+manifest, and hands the verified archive back to the installer. It is also the
+command shown on the website:
 
 ```sh
-REPOSITORY='CarsonBurke/cagents'
-VERSION='0.1.2'
 (
-set -eu
-download_dir="$(mktemp -d)"
-trap 'rm -rf "$download_dir"' 0
-trap 'exit 1' HUP INT TERM
-archive="cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+  set -eu
+  repository='github.com/CarsonBurke/cagents'
+  gh auth status --hostname github.com
+  tag="$(gh release view --repo "$repository" --json tagName --jq .tagName)"
+  case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
+  version="${tag#v}"
+  download_dir="$(mktemp -d)"
+  trap 'rm -rf "$download_dir"' 0
+  trap 'exit 1' HUP INT TERM
+  archive="cagents-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
-gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
-  --pattern install.sh --pattern SHA256SUMS --pattern "$archive" \
-  --dir "$download_dir"
+  gh release download "$tag" --repo "$repository" \
+    --pattern install.sh --pattern SHA256SUMS --pattern "$archive" \
+    --dir "$download_dir"
+  (
+    cd "$download_dir"
+    awk -v archive="$archive" \
+      '$2 == "install.sh" { print; installer++ } $2 == archive { print; payload++ }
+       END { exit(installer != 1 || payload != 1) }' \
+      SHA256SUMS > selected-checksums
+    sha256sum --strict --check selected-checksums
+  )
 
-(
-  cd "$download_dir"
-  sha256sum --ignore-missing --strict --check SHA256SUMS
-)
-less "${download_dir}/install.sh"
-
-CAGENTS_REPOSITORY="$REPOSITORY" \
-CAGENTS_ARCHIVE="${download_dir}/${archive}" \
-CAGENTS_CHECKSUMS="${download_dir}/SHA256SUMS" \
-  sh "${download_dir}/install.sh" --version "$VERSION"
+  CAGENTS_REPOSITORY='CarsonBurke/cagents' \
+  CAGENTS_ARCHIVE="$download_dir/$archive" \
+  CAGENTS_CHECKSUMS="$download_dir/SHA256SUMS" \
+    sh "$download_dir/install.sh" --version "$version"
 )
 ```
+
+To inspect the installer first, add `less "$download_dir/install.sh"` just
+before the `CAGENTS_REPOSITORY` line. To pin a particular version, replace the
+`tag=` lookup with that exact tag, for example `tag=v0.1.2`.
 
 SHA-256 confirms that the files match the release manifest. It does not protect
 against a compromised repository or release, so inspect the tag, release, and
