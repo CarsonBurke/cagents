@@ -500,7 +500,7 @@ impl Store {
         self.directory.join(FILE_NAME)
     }
 
-    fn lock(&self) -> io::Result<fs::File> {
+    fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
     }
