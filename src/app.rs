@@ -7370,7 +7370,7 @@ impl Cagents {
         .into();
         let edge: Element<'a, Message> = if card.is_some() {
             if show_resize_splitter {
-                let limits = self.workspace.fractional_width_limits();
+                let limits = self.workspace.card_resize_limits(id);
                 let width = self
                     .workspace
                     .geometry()
@@ -11098,11 +11098,11 @@ impl Application for Cagents {
                 if viewport <= f32::EPSILON {
                     return Task::none();
                 }
-                let limits = self.workspace.fractional_width_limits();
+                let limits = self.workspace.card_resize_limits(card);
                 let maximum = limits.maximum;
                 let minimum = limits.minimum;
                 let width = width.clamp(minimum, maximum);
-                let fraction = width / viewport;
+                let fraction = self.workspace.preferred_width_for_resize(card, width) / viewport;
                 if self.workspace.focused() != Some(card)
                     && let Err(error) = self.workspace.focus(card)
                 {
@@ -19091,7 +19091,11 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 768.0);
+        assert_eq!(
+            workspace.card(card_id).unwrap().width,
+            CardWidth::Fraction(0.125)
+        );
     }
     #[test]
 
@@ -19117,10 +19121,7 @@ mod tests {
             app.workspace.geometry().card(card).unwrap().width(),
             limits.minimum
         );
-        assert_eq!(
-            app.card_state(card).unwrap().width_fraction,
-            limits.minimum / 1_000.0
-        );
+        assert!((app.card_state(card).unwrap().width_fraction - 0.461_538_46).abs() < 0.000_001);
 
         let _ = app.update(Message::ResizeCard {
             card,
