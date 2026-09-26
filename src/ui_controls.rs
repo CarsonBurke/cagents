@@ -240,7 +240,6 @@ pub struct IconControl<'a, Message> {
     selected: bool,
     enabled: bool,
     tone: Option<crate::design::Tone>,
-    prominent: bool,
 }
 
 /// A centered, fixed-size icon target with a quiet surface selected state.
@@ -273,7 +272,6 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         selected: selected && enabled,
         enabled,
         tone: None,
-        prominent: false,
     }
 }
 
@@ -302,7 +300,6 @@ pub fn compact_icon_control<'a, Message: Clone + 'a>(
         selected: false,
         enabled: true,
         tone: None,
-        prominent: false,
     }
 }
 
@@ -320,23 +317,7 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     /// builder never locks the process-global theme to name a color.
     pub fn icon_tone(mut self, tone: crate::design::Tone) -> Self {
         self.tone = Some(tone);
-        self.button = self.button.class(control_style_variant(
-            self.selected,
-            self.tone,
-            self.prominent,
-        ));
-        self
-    }
-
-    /// A persistent, lightly outlined target for a utility that anchors a
-    /// whole workspace rather than a transient row action.
-    pub fn prominent(mut self) -> Self {
-        self.prominent = true;
-        self.button = self
-            .button
-            .class(control_style_variant(self.selected, self.tone, true))
-            .width(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT)
-            .height(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT);
+        self.button = self.button.class(control_style(self.selected, self.tone));
         self
     }
 }
@@ -593,14 +574,6 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
 /// navigation entry - presses the same treatment as the icon controls beside
 /// it instead of reaching for a stock button class.
 pub fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
-    control_style_variant(selected, tone, false)
-}
-
-fn control_style_variant(
-    selected: bool,
-    tone: Option<crate::design::Tone>,
-    prominent: bool,
-) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
         background: if selected || focused {
             Some(iced::Background::Color(
@@ -611,19 +584,11 @@ fn control_style_variant(
                     .into(),
             ))
         } else {
-            prominent.then(|| iced::Background::Color(crate::design::raised(theme)))
+            None
         },
         border_radius: theme.cosmic().corner_radii.radius_s.into(),
-        border_width: if prominent {
-            crate::design::BORDER_WIDTH
-        } else {
-            0.0
-        },
-        border_color: if prominent {
-            crate::design::hairline(theme)
-        } else {
-            theme.current_container().component.on_disabled.into()
-        },
+        border_width: 0.0,
+        border_color: theme.current_container().component.on_disabled.into(),
         icon_color: Some(tone.map_or_else(
             || {
                 if selected || focused {
@@ -642,7 +607,7 @@ fn control_style_variant(
             // Symbolic SVG recoloring ignores alpha, so mix against the
             // surface instead of relying on `on_disabled` transparency.
             icon_color: Some(muted_icon_color(theme)),
-            background: prominent.then(|| iced::Background::Color(crate::design::raised(theme))),
+            background: None,
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
