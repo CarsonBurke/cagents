@@ -247,6 +247,16 @@ impl StripGeometry {
         let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
         let mut prefix_ends = Vec::with_capacity(cards.len());
+        let available = (viewport_width
+            - config.leading_padding
+            - config.trailing_padding
+            - config.gap * cards.len().saturating_sub(1) as f32)
+            .max(0.0);
+        let preferred_total = cards
+            .iter()
+            .map(|card| card.width.resolve(viewport_width, config.width_limits))
+            .sum::<f32>();
+        let expand = cards.len() > 1 && preferred_total > 0.0 && preferred_total < available;
 
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
@@ -264,10 +274,21 @@ impl StripGeometry {
                     / config.width_limits.minimum)
                     .clamp(0.0, 1.0);
                 available + (preferred - available) * wide
+            } else if expand {
+                // Fill spare space proportionally without changing the user's
+                // preferences. Adding another pane can restore those widths.
+                card.width.resolve(viewport_width, config.width_limits) / preferred_total
+                    * available
             } else {
                 card.width.resolve(viewport_width, config.width_limits)
             };
-            let end = start + width;
+            let end = if expand && index + 1 == cards.len() {
+                // Absorb rounding at the outer edge, avoiding a fractional
+                // scroll range when the panes exactly fill the viewport.
+                viewport_width - config.trailing_padding
+            } else {
+                start + width
+            };
             geometry.push(CardGeometry {
                 id: card.id,
                 index,
@@ -644,6 +665,7 @@ pub struct Workspace {
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
+    resize_limits: Option<(CardId, WidthLimits)>,
     config: WorkspaceConfig,
 }
 
@@ -663,6 +685,7 @@ impl Workspace {
             visibility_bands: None,
             pending_widget_focus: None,
             pending_close: None,
+            resize_limits: None,
             config,
         })
     }
@@ -725,19 +748,77 @@ impl Workspace {
     pub fn viewport_width(&self) -> f32 {
         self.viewport_width
     }
-    pub fn fractional_width_limits(&self) -> WidthLimits {
-        let available = self.viewport_width
+
+    /// Convert a drag's rendered width back into a preference. Underfilled
+    /// strips expand proportionally, so storing the visible width directly
+    /// would expand it again and make the divider jump ahead of the pointer.
+    pub fn preferred_width_for_resize(&self, id: CardId, visible_width: f32) -> f32 {
+        if self.cards.len() < 2 {
+            return visible_width;
+        }
+        let available = (self.viewport_width
             - self.config.leading_padding
-            - self.config.gap
-            - self.config.reveal_margin;
+            - self.config.trailing_padding
+            - self.config.gap * self.cards.len().saturating_sub(1) as f32)
+            .max(0.0);
+        let others = self
+            .cards
+            .iter()
+            .filter(|card| card.id != id)
+            .map(|card| {
+                card.width
+                    .resolve(self.viewport_width, self.config.width_limits)
+            })
+            .sum::<f32>();
+        if others > 0.0 && visible_width + others < available {
+            visible_width * (others / (available - visible_width))
+        } else {
+            visible_width
+        }
+    }
+    pub fn fractional_width_limits(&self) -> WidthLimits {
+        let available = self.viewport_width;
         let maximum = if available > 0.0 {
-            available.min(self.config.width_limits.maximum)
+            // Fractional panes can exceed the fixed-card maximum on wide
+            // screens. Keep their rendered width reachable by the splitter.
+            available
         } else {
             self.config.width_limits.minimum
         };
         WidthLimits {
             minimum: self.config.width_limits.minimum.min(maximum),
             maximum,
+        }
+    }
+
+    /// Existing presets can render below the drag minimum on a compact
+    /// viewport. Let a gesture grow from that size without jumping to the
+    /// minimum, while refusing to shrink it further.
+    pub fn card_resize_limits(&self, id: CardId) -> WidthLimits {
+        if let Some((resizing, limits)) = self.resize_limits
+            && resizing == id
+        {
+            return limits;
+        }
+        let limits = self.fractional_width_limits();
+        self.geometry.card(id).map_or(limits, |card| WidthLimits {
+            minimum: limits.minimum.min(card.width()),
+            maximum: limits.maximum.max(card.width()),
+        })
+    }
+
+    pub fn begin_card_resize(&mut self, id: CardId) -> WidthLimits {
+        let limits = self.card_resize_limits(id);
+        self.resize_limits = Some((id, limits));
+        limits
+    }
+
+    pub fn finish_card_resize(&mut self, id: CardId) {
+        if self
+            .resize_limits
+            .is_some_and(|(resizing, _)| resizing == id)
+        {
+            self.resize_limits = None;
         }
     }
 
@@ -973,6 +1054,7 @@ impl Workspace {
     }
 
     pub fn commit_close(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+        self.finish_card_resize(id);
         let pending = self.pending_close.ok_or(WorkspaceError::NoClosePending)?;
         if pending.id != id {
             return Err(WorkspaceError::WrongPendingClose {
@@ -1826,7 +1908,10 @@ mod tests {
         assert_eq!(filled.card_at_viewport_edge(), Some(cards[2]));
 
         let underfilled = workspace_with_widths(&[CardWidth::Fraction(0.3); 2], 800.0);
-        assert_eq!(underfilled.card_at_viewport_edge(), None);
+        assert_eq!(
+            underfilled.card_at_viewport_edge(),
+            Some(underfilled.cards()[1].id)
+        );
         let lone = workspace_with_widths(&[CardWidth::Fraction(0.5)], 800.0);
         assert_eq!(lone.card_at_viewport_edge(), lone.focused());
     }
@@ -1875,7 +1960,7 @@ mod tests {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.61)], 320.0);
         let id = workspace.focused().unwrap();
         workspace
-            .add_card(card(CardWidth::Fraction(0.5)), 1, false)
+            .add_card(card(CardWidth::Fraction(1.0)), 1, false)
             .unwrap();
         for viewport in [320.0, 800.0, 3_840.0] {
             workspace.resize_viewport(viewport);
@@ -1892,6 +1977,116 @@ mod tests {
                 assert_eq!(workspace.focused(), Some(id));
             }
         }
+    }
+
+    #[test]
+    fn multiple_panes_fill_available_width_in_proportion_without_changing_preferences() {
+        let config = WorkspaceConfig {
+            leading_padding: 12.0,
+            trailing_padding: 18.0,
+            gap: 6.0,
+            ..WorkspaceConfig::default()
+        };
+        let mut workspace = Workspace::new(config).unwrap();
+        workspace.resize_viewport(1_200.0);
+        for (index, fraction) in [0.2, 0.1, 0.1].into_iter().enumerate() {
+            workspace
+                .add_card(card(CardWidth::Fraction(fraction)), index, false)
+                .unwrap();
+        }
+        let widths = workspace
+            .geometry()
+            .cards()
+            .iter()
+            .map(|card| card.width())
+            .collect::<Vec<_>>();
+        assert_eq!(widths, vec![579.0, 289.5, 289.5]);
+        assert_eq!(workspace.geometry().cards()[0].start, 12.0);
+        assert_eq!(workspace.geometry().cards()[2].end, 1_182.0);
+        assert_eq!(workspace.geometry().max_offset(1_200.0), 0.0);
+        assert_eq!(workspace.cards()[0].width, CardWidth::Fraction(0.2));
+        workspace
+            .add_card(card(CardWidth::Fraction(1.0)), 3, false)
+            .unwrap();
+        assert_eq!(workspace.geometry().cards()[0].width(), 240.0);
+        assert!(workspace.geometry().max_offset(1_200.0) > 0.0);
+        workspace.resize_viewport(0.0);
+        assert!(
+            workspace
+                .geometry()
+                .cards()
+                .iter()
+                .all(|card| card.width().is_finite() && card.width() > 0.0)
+        );
+    }
+
+    #[test]
+    fn dragging_expanded_panes_tracks_the_rendered_width_through_overflow() {
+        let mut workspace = workspace_with_widths(
+            &[CardWidth::Fraction(0.35), CardWidth::Fraction(0.35)],
+            1_440.0,
+        );
+        let id = workspace.cards()[0].id;
+        for visible in [720.0, 800.0, 900.0, 936.0, 1_000.0, 700.0] {
+            let preferred = workspace.preferred_width_for_resize(id, visible);
+            workspace
+                .set_card_width(id, CardWidth::Fraction(preferred / 1_440.0))
+                .unwrap();
+            assert!((workspace.geometry().card(id).unwrap().width() - visible).abs() < 0.001);
+            assert_eq!(workspace.cards()[1].width, CardWidth::Fraction(0.35));
+        }
+        workspace.resize_viewport(7_680.0);
+        let rendered = workspace.geometry().card(id).unwrap().width();
+        let limits = workspace.fractional_width_limits();
+        assert!(rendered <= limits.maximum);
+        let preferred = workspace.preferred_width_for_resize(id, rendered + 16.0);
+        workspace
+            .set_card_width(id, CardWidth::Fraction(preferred / 7_680.0))
+            .unwrap();
+        assert!((workspace.geometry().card(id).unwrap().width() - rendered - 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn resize_bounds_preserve_compact_and_full_width_gesture_origins() {
+        for (fractions, viewport) in [([0.1, 0.2], 800.0), ([1.0, 0.5], 1_440.0)] {
+            let mut workspace =
+                workspace_with_widths(&fractions.map(CardWidth::Fraction), viewport);
+            let id = workspace.cards()[0].id;
+            let width = workspace.geometry().card(id).unwrap().width();
+            let bounds = workspace.card_resize_limits(id);
+            assert_eq!(width.clamp(bounds.minimum, bounds.maximum), width);
+            let target = if width < 480.0 {
+                width + 1.0
+            } else {
+                width - 1.0
+            };
+            let preferred = workspace
+                .preferred_width_for_resize(id, target.clamp(bounds.minimum, bounds.maximum));
+            workspace
+                .set_card_width(id, CardWidth::Fraction(preferred / viewport))
+                .unwrap();
+            assert!((workspace.geometry().card(id).unwrap().width() - target).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn compact_resize_can_backtrack_within_the_same_gesture() {
+        let mut workspace =
+            workspace_with_widths(&[CardWidth::Fraction(0.1), CardWidth::Fraction(0.2)], 800.0);
+        let id = workspace.cards()[0].id;
+        let origin = workspace.geometry().card(id).unwrap().width();
+        for target in [300.0, 280.0, 500.0, 290.0, origin] {
+            let bounds = workspace.begin_card_resize(id);
+            assert_eq!(bounds.minimum, origin);
+            let preferred = workspace
+                .preferred_width_for_resize(id, target.clamp(bounds.minimum, bounds.maximum));
+            workspace
+                .set_card_width(id, CardWidth::Fraction(preferred / 800.0))
+                .unwrap();
+            assert!((workspace.geometry().card(id).unwrap().width() - target).abs() < 0.001);
+        }
+        workspace.finish_card_resize(id);
+        assert!(workspace.resize_limits.is_none());
     }
 
     #[test]
@@ -1917,7 +2112,11 @@ mod tests {
             geometry.card(first).unwrap().start,
             workspace.config.leading_padding
         );
-        assert!((geometry.card(first).unwrap().width() - 1_440.0 * 0.35).abs() < 0.001);
+        assert!((geometry.card(first).unwrap().width() - 720.0).abs() < 0.001);
+        assert_eq!(
+            workspace.card(first).unwrap().width,
+            CardWidth::Fraction(0.35)
+        );
         assert_eq!(geometry.max_offset(workspace.viewport_width()), 0.0);
         assert_eq!(
             geometry.card_at(1).unwrap().start,
