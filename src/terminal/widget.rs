@@ -638,6 +638,87 @@ impl<'a> SelectionGrid<'a> {
         Some(&cells[..cells.len().min(usize::from(self.columns))])
     }
 
+    /// Last occupied display cell, including the tail of a wide grapheme.
+    fn content_end(self, row: u64) -> Option<u16> {
+        let cells = self.cells(row)?;
+        let (column, cell) = cells
+            .iter()
+            .enumerate()
+            .rfind(|(_, cell)| !cell.text.as_str().trim().is_empty())?;
+        Some(
+            (column + unicode_width::UnicodeWidthStr::width(cell.text.as_str()).max(1) - 1)
+                .min(cells.len().saturating_sub(1)) as u16,
+        )
+    }
+
+    fn cluster_start(self, cell: SelectionCell) -> u16 {
+        let Some(cells) = self.cells(cell.row) else {
+            return cell.column;
+        };
+        let Some((column, glyph)) = cells
+            .iter()
+            .enumerate()
+            .take(usize::from(cell.column) + 1)
+            .rfind(|(_, glyph)| !glyph.text.is_empty())
+        else {
+            return cell.column;
+        };
+        if column + unicode_width::UnicodeWidthStr::width(glyph.text.as_str())
+            > usize::from(cell.column)
+        {
+            column as u16
+        } else {
+            cell.column
+        }
+    }
+
+    /// Blank rows and padding beyond the last glyph are not selectable text.
+    /// Indentation and spaces within a row's output remain valid anchors.
+    fn selection_start(self, cell: SelectionCell) -> Option<SelectionCell> {
+        // Keep the pointed cell as the gesture anchor. Snapping a wide tail
+        // to its lead here would mistake a leftward drag across that glyph
+        // for a click; drawing and copying expand clusters separately.
+        (cell.column <= self.content_end(cell.row)?).then_some(cell)
+    }
+
+    /// The selected part of a row, excluding unused cells beyond its output.
+    fn selected_columns(
+        self,
+        span: (SelectionCell, SelectionCell),
+        row: u64,
+    ) -> Option<(u16, u16)> {
+        let (first, last) = selection_columns(span, row, self.columns)?;
+        let first = self.cluster_start(SelectionCell { row, column: first });
+        let end = self.content_end(row)?;
+        let cluster = self.cluster_start(SelectionCell { row, column: last });
+        let width = self
+            .cells(row)?
+            .get(usize::from(cluster))
+            .map_or(1, |cell| {
+                unicode_width::UnicodeWidthStr::width(cell.text.as_str()).max(1)
+            }) as u16;
+        let last = last.max(cluster.saturating_add(width - 1)).min(end);
+        (first <= last).then_some((first, last))
+    }
+
+    /// Bound copied output to captured rows with selected text. Blank lines
+    /// between them are preserved; unused rows above or below are not copied.
+    fn text_span(
+        self,
+        span: (SelectionCell, SelectionCell),
+    ) -> Option<(SelectionCell, SelectionCell)> {
+        let mut first = None;
+        let mut last = None;
+        for index in 0..self.rows.len() {
+            let row = self.offset.saturating_add(index as u64);
+            if let Some((start, end)) = self.selected_columns(span, row) {
+                first.get_or_insert(SelectionCell { row, column: start });
+                last = Some(SelectionCell { row, column: end });
+            }
+        }
+        Some((first?, last?))
+    }
+
     /// The run of like cells around `cell`: the word under a double click, or
     /// the blanks between two words.
     fn word_bounds(self, cell: SelectionCell) -> (u16, u16) {
@@ -693,6 +774,36 @@ fn word_class(cell: &CellSnapshot) -> Option<WordClass> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionRouting {
+    Local,
+    /// Preserve agent clicks, while ordinary drags select its output locally.
+    ClickOrSelect,
+    Application,
+}
+
+/// Keep motion in the same layout coordinates as the initial press. Containers
+/// may translate the cursor while preserving the raw window-space event.
+fn drag_position(cursor: mouse::Cursor, raw: Point) -> Point {
+    cursor.position().unwrap_or(raw)
+}
+
+fn selection_routing(
+    read_only: bool,
+    mouse_tracking: bool,
+    agent: bool,
+    modifiers: KeyModifiers,
+) -> SelectionRouting {
+    let unmodified = !modifiers.control && !modifiers.alt && !modifiers.super_key;
+    if read_only || modifiers.shift || (!mouse_tracking && unmodified) {
+        SelectionRouting::Local
+    } else if agent && unmodified {
+        SelectionRouting::ClickOrSelect
+    } else {
+        SelectionRouting::Application
+    }
+}
+
 /// The first and last column a selection covers on one absolute row, or `None`
 /// when the row falls outside it.
 ///
@@ -726,27 +837,37 @@ fn selection_columns(
 /// row is space-padded to its full width, and a copied command carrying sixty
 /// trailing blanks is useless wherever it is pasted.
 fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell)) -> String {
+    let Some(span) = grid.text_span(span) else {
+        return String::new();
+    };
     let mut text = String::new();
     for row in span.0.row..=span.1.row {
         if row > span.0.row {
             text.push('\n');
         }
-        let Some((first, last)) = selection_columns(span, row, grid.columns) else {
+        let Some((first, last)) = grid.selected_columns(span, row) else {
             continue;
         };
         let Some(cells) = grid.cells(row) else {
             continue;
         };
         let line = text.len();
-        for cell in cells
+        let mut covered_until = usize::from(first);
+        for (column, cell) in cells
             .iter()
+            .enumerate()
             .take(usize::from(last) + 1)
             .skip(usize::from(first))
         {
-            // The trailing cell of a wide cluster holds no text; appending it
-            // would repeat the glyph its first cell already contributed.
             if !cell.text.is_empty() {
                 text.push_str(cell.text.as_str());
+                covered_until =
+                    column + unicode_width::UnicodeWidthStr::width(cell.text.as_str()).max(1);
+            } else if column >= covered_until {
+                // Cursor-addressed TUIs can leave untouched cells between
+                // words. Those are spaces; only wide-grapheme tails are
+                // omitted, otherwise copying would join separate words.
+                text.push(' ');
             }
         }
         text.truncate(line + text[line..].trim_end().len());
@@ -787,6 +908,10 @@ struct WidgetState {
     selection: Option<Selection>,
     /// Whether the pointer is currently extending `selection`.
     selecting: bool,
+    /// An agent receives an ordinary click, but a drag belongs to local text
+    /// selection. Defer its press until release so a selection never also
+    /// moves the agent's cursor or activates a control.
+    selection_click: Option<Point>,
     /// The previous left press, so that a second and third one in the same
     /// place count as a double and triple click.
     last_click: Option<mouse::Click>,
@@ -816,6 +941,37 @@ impl operation::Focusable for WidgetState {
 }
 
 impl WidgetState {
+    fn begin_selection(
+        &mut self,
+        grid: SelectionGrid<'_>,
+        cell: SelectionCell,
+        position: Point,
+        defer_click: bool,
+    ) {
+        let click = mouse::Click::new(position, IcedMouseButton::Left, self.last_click);
+        self.selection = grid.selection_start(cell).map(|cell| {
+            Selection::new(
+                cell,
+                match click.kind() {
+                    mouse::click::Kind::Single => SelectionMode::Character,
+                    mouse::click::Kind::Double => SelectionMode::Word,
+                    mouse::click::Kind::Triple => SelectionMode::Line,
+                },
+            )
+        });
+        self.selection_click =
+            (defer_click && click.kind() == mouse::click::Kind::Single).then_some(position);
+        self.last_click = self.selection.is_some().then_some(click);
+        self.selecting = self.selection.is_some() || self.selection_click.is_some();
+    }
+
+    fn extend_selection(&mut self, cell: SelectionCell) {
+        self.selection_click = None;
+        if let Some(selection) = &mut self.selection {
+            selection.head = cell;
+        }
+    }
+
     /// Advances the cursor-blink phase to the frame instant `now` and returns
     /// the instant the next phase begins.
     ///
@@ -1379,6 +1535,7 @@ impl<Message> TerminalWidget<Message> {
                     // would advertise a copy whose chord now lands elsewhere.
                     state.selection = None;
                     state.selecting = false;
+                    state.selection_click = None;
                 }
             }
             Err(error) => self.publish_error(error, shell),
@@ -1402,6 +1559,7 @@ impl<Message> TerminalWidget<Message> {
             if state.last_size.is_some() {
                 state.selection = None;
                 state.selecting = false;
+                state.selection_click = None;
             }
             match self.handle.resize(size) {
                 Ok(()) => state.last_size = Some(size),
@@ -1464,7 +1622,7 @@ impl<Message> TerminalWidget<Message> {
         let selection = state.selection?;
         let grid = self.selection_grid();
         let text = selection_text(grid, selection.span(grid));
-        (!text.is_empty()).then_some(text)
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Sends pasted text to the child. The terminal's owner encodes it, since
@@ -1588,6 +1746,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             state.alternate_screen = self.snapshot.scroll.alternate_screen;
             state.selection = None;
             state.selecting = false;
+            state.selection_click = None;
         }
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
@@ -1614,7 +1773,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 Event::Mouse(mouse::Event::CursorMoved { position })
                     if state.scrollbar_drag.is_some() =>
                 {
-                    Some(bar.row_at(position.y, state.scrollbar_drag.unwrap()))
+                    Some(bar.row_at(
+                        drag_position(cursor, *position).y,
+                        state.scrollbar_drag.unwrap(),
+                    ))
                 }
                 Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left))
                     if state.scrollbar_drag.take().is_some() =>
@@ -1664,6 +1826,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if state.selection.is_some() && is_escape(key) {
                     state.selection = None;
                     state.selecting = false;
+                    state.selection_click = None;
                     state.escape_cleared = true;
                     shell.capture_event();
                     shell.request_redraw();
@@ -1768,30 +1931,25 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // child is not reading the mouse itself, and shift takes
                     // them back from a child that is. Without that override a
                     // full-screen application's own output could never be
-                    // copied, which is why every terminal binds it.
-                    let ours = self.read_only
-                        || state.modifiers.shift
-                        || (!self.snapshot.scroll.mouse_tracking
-                            && !state.modifiers.control
-                            && !state.modifiers.alt
-                            && !state.modifiers.super_key);
+                    // copied, which is why every terminal binds it. For an
+                    // observed agent, defer an ordinary click until release:
+                    // its controls still get clicks while drags select text.
+                    let routing = selection_routing(
+                        self.read_only,
+                        self.snapshot.scroll.mouse_tracking,
+                        self.handle.agent_activity().is_some(),
+                        state.modifiers,
+                    );
+                    let ours = routing == SelectionRouting::Local;
+                    let agent_drag = routing == SelectionRouting::ClickOrSelect;
                     match button {
-                        IcedMouseButton::Left if ours => {
-                            let click = mouse::Click::new(
-                                position,
-                                IcedMouseButton::Left,
-                                state.last_click,
-                            );
-                            state.selection = Some(Selection::new(
+                        IcedMouseButton::Left if ours || agent_drag => {
+                            state.begin_selection(
+                                self.selection_grid(),
                                 self.selection_cell(cell),
-                                match click.kind() {
-                                    mouse::click::Kind::Single => SelectionMode::Character,
-                                    mouse::click::Kind::Double => SelectionMode::Word,
-                                    mouse::click::Kind::Triple => SelectionMode::Line,
-                                },
-                            ));
-                            state.last_click = Some(click);
-                            state.selecting = true;
+                                position,
+                                agent_drag,
+                            );
                             shell.request_redraw();
                         }
                         IcedMouseButton::Middle if ours => {
@@ -1831,6 +1989,28 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // Release is the gesture a middle-click paste consumes, so
                     // it is where the primary selection is written.
                     clipboard.write(clipboard::Kind::Primary, text);
+                } else {
+                    state.selection = None;
+                }
+                if let Some(position) = state.selection_click.take() {
+                    state.pressed_buttons = state.pressed_buttons.saturating_add(1);
+                    self.send_mouse(
+                        state,
+                        geometry,
+                        position,
+                        MouseAction::Press,
+                        Some(MouseButton::Left),
+                        shell,
+                    );
+                    state.pressed_buttons = state.pressed_buttons.saturating_sub(1);
+                    self.send_mouse(
+                        state,
+                        geometry,
+                        position,
+                        MouseAction::Release,
+                        Some(MouseButton::Left),
+                        shell,
+                    );
                 }
                 shell.request_redraw();
                 shell.capture_event();
@@ -1851,6 +2031,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.selecting => {
+                // Ancestor containers translate the cursor into this layout's
+                // coordinates but leave the raw motion event in window space.
+                let position = drag_position(cursor, *position);
                 let grid = geometry.grid_bounds;
                 // Dragging past an edge keeps the selection growing into
                 // history: one line per motion event, which is the pointer's
@@ -1873,9 +2056,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // unchanged cell, so that case may not be deduplicated away.
                 if scrolled || state.last_motion_cell != Some(cell) {
                     state.last_motion_cell = Some(cell);
-                    if let Some(selection) = &mut state.selection {
-                        selection.head = self.selection_cell(cell);
-                    }
+                    state.extend_selection(self.selection_cell(cell));
                     shell.request_redraw();
                 }
                 shell.capture_event();
@@ -2109,7 +2290,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     for row_index in 0..rows.len() {
                         let row = row_index as u16;
                         let absolute = self.snapshot.scroll.offset + u64::from(row);
-                        let Some((first, last)) = selection_columns(span, absolute, columns) else {
+                        let Some((first, last)) = self
+                            .selection_grid()
+                            .selected_columns(span, absolute)
+                            .map(|(first, last)| (first, last.min(columns.saturating_sub(1))))
+                            .filter(|(first, last)| first <= last)
+                        else {
                             continue;
                         };
                         let Some(bounds) = geometry.run_bounds(first, last - first + 1, row) else {
@@ -3181,6 +3367,44 @@ mod tests {
     }
 
     #[test]
+    fn drag_uses_translated_cursor_coordinates_and_clamps_outside_the_grid() {
+        let geometry = TerminalGeometry::new(
+            Rectangle {
+                x: 900.0,
+                y: 40.0,
+                width: 400.0,
+                height: 300.0,
+            },
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let cell = geometry.cell_bounds(9, 2).unwrap();
+        let translated = Point::new(cell.center_x(), cell.center_y());
+        let raw = Point::new(translated.x - 100.0, translated.y);
+        let position = drag_position(mouse::Cursor::Available(translated), raw);
+        assert_eq!(
+            geometry.cell_at(Point::new(
+                position.x - geometry.grid_bounds.x,
+                position.y - geometry.grid_bounds.y,
+            )),
+            (9, 2)
+        );
+        let outside = Point::new(geometry.grid_bounds.x - 10.0, translated.y);
+        let position = drag_position(mouse::Cursor::Available(outside), raw);
+        assert_eq!(
+            geometry.cell_at(Point::new(
+                position.x - geometry.grid_bounds.x,
+                position.y - geometry.grid_bounds.y,
+            )),
+            (0, 2)
+        );
+        assert_eq!(drag_position(mouse::Cursor::Unavailable, raw), raw);
+    }
+
+    #[test]
     fn pointer_positions_inside_one_cell_share_a_motion_key() {
         let bounds = Rectangle {
             x: 12.0,
@@ -4227,6 +4451,218 @@ mod tests {
         assert_eq!(
             selection_text(selection_grid(&rows, 3), (at(7, 0), at(7, 2))),
             "日x"
+        );
+    }
+
+    #[test]
+    fn copying_cursor_addressed_output_preserves_unwritten_spaces() {
+        let rows = vec![Arc::new(RowSnapshot {
+            cells: vec![
+                CellSnapshot {
+                    text: CellText::new("a"),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+                CellSnapshot {
+                    text: CellText::new("日"),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+                CellSnapshot::default(),
+                CellSnapshot {
+                    text: CellText::new("b"),
+                    ..CellSnapshot::default()
+                },
+            ],
+        })];
+        assert_eq!(
+            selection_text(selection_grid(&rows, 6), (at(7, 0), at(7, 5))),
+            "a 日 b"
+        );
+    }
+
+    #[test]
+    fn blank_terminal_rows_and_right_padding_do_not_start_selection() {
+        let rows = vec![
+            row("  prompt   "),
+            row("           "),
+            Arc::new(RowSnapshot::default()),
+        ];
+        let grid = selection_grid(&rows, 11);
+        assert_eq!(
+            grid.selection_start(at(7, 0)),
+            Some(at(7, 0)),
+            "indentation belongs to output"
+        );
+        assert_eq!(grid.selection_start(at(7, 7)), Some(at(7, 7)));
+        assert_eq!(
+            grid.selection_start(at(7, 8)),
+            None,
+            "right padding is not text"
+        );
+        assert_eq!(grid.selection_start(at(8, 0)), None);
+        assert_eq!(grid.selection_start(at(9, 0)), None);
+        assert_eq!(grid.selection_start(at(10, 0)), None);
+        assert_eq!(grid.selected_columns((at(7, 8), at(9, 10)), 7), None);
+        assert_eq!(selection_text(grid, (at(8, 0), at(9, 10))), "");
+    }
+
+    #[test]
+    fn selection_ends_at_output_but_preserves_interior_blank_lines_and_spaces() {
+        let rows = vec![
+            row("first line    "),
+            row("              "),
+            row("last   line   "),
+            row("              "),
+        ];
+        let grid = selection_grid(&rows, 14);
+        let span = (at(7, 0), at(10, 13));
+        assert_eq!(selection_text(grid, span), "first line\n\nlast   line");
+        assert_eq!(grid.selected_columns(span, 7), Some((0, 9)));
+        assert_eq!(grid.selected_columns(span, 8), None);
+        assert_eq!(grid.selected_columns(span, 9), Some((0, 10)));
+        assert_eq!(grid.selected_columns(span, 10), None);
+        assert_eq!(
+            grid.selected_columns((at(9, 4), at(9, 6)), 9),
+            Some((4, 6)),
+            "interior spaces can be selected"
+        );
+        assert_eq!(
+            selection_text(grid, (at(0, 0), at(u64::MAX, 13))),
+            "first line\n\nlast   line",
+            "capture bounds limit old scrollback selections"
+        );
+    }
+
+    #[test]
+    fn selections_cover_whole_wide_and_combining_graphemes() {
+        let rows = vec![Arc::new(RowSnapshot {
+            cells: vec![
+                CellSnapshot {
+                    text: CellText::new("e\u{301}"),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot {
+                    text: CellText::new("日"),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+                CellSnapshot::default(),
+            ],
+        })];
+        let grid = selection_grid(&rows, 4);
+        assert_eq!(
+            grid.selection_start(at(7, 2)),
+            Some(at(7, 2)),
+            "wide tail remains a distinct gesture anchor"
+        );
+        assert_eq!(grid.selection_start(at(7, 3)), None);
+        assert_eq!(grid.selected_columns((at(7, 1), at(7, 1)), 7), Some((1, 2)));
+        assert_eq!(selection_text(grid, (at(7, 2), at(7, 2))), "日");
+        assert_eq!(selection_text(grid, (at(7, 0), at(7, 3))), "e\u{301}日");
+        let mut drag = WidgetState::default();
+        drag.begin_selection(grid, at(7, 2), Point::new(20.0, 0.0), false);
+        drag.extend_selection(at(7, 1));
+        let selection = drag.selection.unwrap();
+        assert_ne!(
+            selection.anchor, selection.head,
+            "dragging left over one wide glyph is not a click"
+        );
+        assert_eq!(selection_text(grid, selection.span(grid)), "日");
+    }
+
+    #[test]
+    fn agent_clicks_are_deferred_but_drags_never_reach_the_child() {
+        let rows = vec![row("agent output"), row("            ")];
+        let grid = selection_grid(&rows, 12);
+        let position = Point::new(30.0, 10.0);
+        let mut clicked = WidgetState::default();
+        clicked.begin_selection(grid, at(7, 2), position, true);
+        assert!(clicked.selecting);
+        assert_eq!(
+            clicked.selection_click.take(),
+            Some(position),
+            "release can forward one intact click"
+        );
+        let mut dragged = WidgetState::default();
+        dragged.begin_selection(grid, at(7, 2), position, true);
+        dragged.extend_selection(at(7, 6));
+        assert_eq!(
+            dragged.selection_click.take(),
+            None,
+            "a text drag cannot also click the application"
+        );
+        assert_eq!(
+            selection_text(grid, dragged.selection.unwrap().span(grid)),
+            "ent o"
+        );
+        let mut blank = WidgetState::default();
+        blank.begin_selection(grid, at(8, 2), position, false);
+        assert!(!blank.selecting);
+        assert!(blank.selection.is_none());
+        blank.begin_selection(grid, at(8, 2), position, true);
+        assert!(
+            blank.selection.is_none(),
+            "agent blank-space clicks do not invent a selection"
+        );
+        assert_eq!(
+            blank.selection_click.take(),
+            Some(position),
+            "blank-space clicks still reach agent controls"
+        );
+    }
+
+    #[test]
+    fn mouse_routing_preserves_generic_tuis_and_explicit_agent_mouse_input() {
+        let plain = KeyModifiers::default();
+        assert_eq!(
+            selection_routing(false, false, false, plain),
+            SelectionRouting::Local
+        );
+        assert_eq!(
+            selection_routing(false, true, false, plain),
+            SelectionRouting::Application,
+            "ordinary TUIs retain mouse reporting"
+        );
+        assert_eq!(
+            selection_routing(false, true, true, plain),
+            SelectionRouting::ClickOrSelect,
+            "confirmed idle or active agents allow local drags"
+        );
+        for agent in [false, true] {
+            assert_eq!(
+                selection_routing(
+                    false,
+                    true,
+                    agent,
+                    KeyModifiers {
+                        shift: true,
+                        ..plain
+                    }
+                ),
+                SelectionRouting::Local
+            );
+            assert_eq!(
+                selection_routing(false, true, agent, KeyModifiers { alt: true, ..plain }),
+                SelectionRouting::Application
+            );
+            assert_eq!(
+                selection_routing(
+                    false,
+                    true,
+                    agent,
+                    KeyModifiers {
+                        control: true,
+                        ..plain
+                    }
+                ),
+                SelectionRouting::Application
+            );
+        }
+        assert_eq!(
+            selection_routing(true, true, false, plain),
+            SelectionRouting::Local,
+            "retained output stays selectable after exit"
         );
     }
 

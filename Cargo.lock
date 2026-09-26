@@ -1210,6 +1210,7 @@ dependencies = [
  "two-face",
  "unicode-casefold",
  "unicode-linebreak",
+ "unicode-width",
  "url",
  "uuid",
  "wayland-client",
