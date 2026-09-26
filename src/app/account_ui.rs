@@ -79,6 +79,8 @@ pub(super) struct State {
     popover: Option<AccountId>,
     cache: Option<Cache>,
     logins: Vec<Login>,
+    /// Set before asynchronous CLI discovery/home creation, not after it.
+    browser_preparing: bool,
     /// Whether the daemon is being asked which sign-ins have ended.
     asking_host: bool,
     /// Not before this is the daemon asked again.
@@ -157,6 +159,7 @@ impl State {
             popover: None,
             cache,
             logins: Vec::new(),
+            browser_preparing: false,
             asking_host: false,
             next_host_check: 0,
             table: table::Table::default(),
@@ -540,6 +543,8 @@ enum LoginPhase {
     Verifying,
     /// The answer is in, and the home is being registered or deleted.
     Settling,
+    /// The callback could not be acquired; retain the row until dismissed.
+    CallbackBlocked,
 }
 
 impl Login {
@@ -610,10 +615,11 @@ pub enum Action {
     ShowAccount(AccountId),
     OpenPane,
     SignIn(AccountId),
-    /// The CLI to sign in with was looked for; `None` when it is missing.
+    /// The CLI and browser callback were checked off the interface thread.
     LoginReady {
         id: AccountId,
-        program: Option<PathBuf>,
+        provider: Provider,
+        program: Result<PathBuf, String>,
     },
     /// The registry was read again, as another window may have changed it.
     RegistryLoaded(Result<Registry, String>),
@@ -640,6 +646,7 @@ pub enum Action {
         result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
     },
     LoginTick,
+    LoginCallbackBlocked(uuid::Uuid),
     /// The daemon's answer for sign-ins whose terminals this window is not
     /// watching: the ones whose terminals have ended.
     LoginsEnded(Result<Vec<(uuid::Uuid, TerminalId)>, String>),
@@ -1686,7 +1693,11 @@ impl Cagents {
                 Task::batch([open, self.accounts_surface_changed()])
             }
             Action::SignIn(id) => self.sign_in(id),
-            Action::LoginReady { id, program } => self.open_login(&id, program),
+            Action::LoginReady {
+                id,
+                provider,
+                program,
+            } => self.open_login(&id, provider, program),
             Action::RegistryLoaded(result) => {
                 if let Ok(mut registry) = result {
                     let projects = self
@@ -1777,6 +1788,18 @@ impl Cagents {
                 result,
             } => self.open_account_login(provider, device, result),
             Action::LoginTick => self.check_logins(),
+            Action::LoginCallbackBlocked(key) => {
+                if let Some(login) = self
+                    .account_ui
+                    .logins
+                    .iter_mut()
+                    .find(|login| login.key == key)
+                    && login.phase == LoginPhase::Verifying
+                {
+                    login.phase = LoginPhase::CallbackBlocked;
+                }
+                Task::none()
+            }
             Action::LoginsEnded(result) => {
                 self.account_ui.asking_host = false;
                 match result {
@@ -1825,6 +1848,9 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if login.phase == LoginPhase::CallbackBlocked {
+                    return self.discard_home(key, login.provider);
+                }
                 match self.sign_in_card(login.provider, &login.home) {
                     // Closing the terminal ends the login; the next check
                     // finds it ended and deletes the home. Cancelling is
@@ -2066,8 +2092,17 @@ impl Cagents {
         Task::batch([remember, self.probe_queued(provider)])
     }
 
-    /// Finds the CLI to sign in with off the interface thread, the same way
-    /// the probes find it.
+    /// A synchronous fence covering discovery and terminals awaiting spawn.
+    fn codex_browser_busy(&self) -> bool {
+        self.account_ui.browser_preparing || self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
+                && matches!(&card.kind, CardKind::Terminal(session)
+                    if account::login::is_codex_browser(&session.launch) && !terminal_ended(session))
+        })
+    }
+
+    /// Finds the CLI to sign in with off the interface thread, as probes do.
     fn sign_in(&mut self, id: AccountId) -> Task<Message> {
         let Some(account) = self
             .account_ui
@@ -2076,21 +2111,54 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if account.provider == Provider::Codex {
+            if self.codex_browser_busy() {
+                self.status = Some(TransientNotice::warning(account::login::BUSY));
+                return Task::none();
+            }
+            self.account_ui.browser_preparing = true;
+        }
         self.account_ui.popover = None;
         self.account_ui.table.close_popups();
+        let provider = account.provider;
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
             let program = tokio::task::spawn_blocking(move || {
+                if account.provider == Provider::Codex {
+                    browser_login_available()?;
+                }
                 probe::find_executable(account.provider.executable(), search_path.as_deref())
+                    .ok_or_else(|| {
+                        format!("{} is not installed", probe::cli_name(account.provider))
+                    })
             })
             .await
-            .ok()
-            .flatten();
-            Message::AccountUi(Action::LoginReady { id, program })
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::AccountUi(Action::LoginReady {
+                id,
+                provider,
+                program,
+            })
         })
     }
 
-    fn open_login(&mut self, id: &AccountId, program: Option<PathBuf>) -> Task<Message> {
+    fn open_login(
+        &mut self,
+        id: &AccountId,
+        provider: Provider,
+        program: Result<PathBuf, String>,
+    ) -> Task<Message> {
+        if provider == Provider::Codex {
+            self.account_ui.browser_preparing = false;
+        }
+        let program = match program {
+            Ok(program) => Some(program),
+            Err(error) => {
+                self.status = Some(TransientNotice::warning(error));
+                return Task::none();
+            }
+        };
         let Some(state) = self.account_ui.account(id) else {
             return Task::none();
         };
@@ -2293,10 +2361,20 @@ impl Cagents {
             ));
             return Task::none();
         };
+        if provider == Provider::Codex && !device {
+            if self.codex_browser_busy() {
+                self.status = Some(TransientNotice::warning(account::login::BUSY));
+                return Task::none();
+            }
+            self.account_ui.browser_preparing = true;
+        }
         let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
             let result = tokio::task::spawn_blocking(move || {
+                if provider == Provider::Codex && !device {
+                    browser_login_available()?;
+                }
                 let program = probe::find_executable(provider.executable(), search_path.as_deref())
                     .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
                 let system = Account::system(provider).resolved_home();
@@ -2331,6 +2409,9 @@ impl Cagents {
         device: bool,
         result: Result<(uuid::Uuid, PathBuf, PathBuf), String>,
     ) -> Task<Message> {
+        if provider == Provider::Codex && !device {
+            self.account_ui.browser_preparing = false;
+        }
         let (key, home, program) = match result {
             Ok(ready) => ready,
             Err(error) => {
@@ -2489,7 +2570,10 @@ impl Cagents {
             Some(card) if !self.workspace.order().any(|id| id == card) => {
                 self.close_offstrip_sign_in(card)
             }
-            Some(card) if ended_terminal(self.card_state(card)).is_some() => {
+            Some(card)
+                if ended_terminal(self.card_state(card)).is_some()
+                    || matches!(self.cards.get(&card), Some(CardRuntime::Failed(_))) =>
+            {
                 cosmic::task::message(Message::CloseCard(card))
             }
             _ => Task::none(),
@@ -2497,6 +2581,16 @@ impl Cagents {
     }
 
     fn verify_login(&mut self, key: uuid::Uuid) -> Task<Message> {
+        let browser_terminal = self.account_ui.logins.iter()
+            .find(|login| login.key == key)
+            .and_then(|login| self.sign_in_card(login.provider, &login.home))
+            .and_then(|card| match self.card_state(card).map(|state| &state.kind) {
+                Some(CardKind::Terminal(session)) if account::login::is_codex_browser(&session.launch) => {
+                    let blocked = matches!(self.cards.get(&card), Some(CardRuntime::Failed(error)) if account::login::callback_failed(error));
+                    Some((session.id, blocked))
+                }
+                _ => None,
+            });
         let Some(login) = self
             .account_ui
             .logins
@@ -2506,9 +2600,30 @@ impl Cagents {
             return Task::none();
         };
         login.phase = LoginPhase::Verifying;
+        if browser_terminal.is_some_and(|(_, blocked)| blocked) {
+            login.phase = LoginPhase::CallbackBlocked;
+            return Task::none();
+        }
         login.attempts += 1;
         let account = login.account();
         cosmic::task::future(async move {
+            if let Some((terminal, _)) = browser_terminal {
+                let blocked =
+                    tokio::task::spawn_blocking(move || callback_failed_on_host(terminal))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                match blocked {
+                    Ok(true) => return Message::AccountUi(Action::LoginCallbackBlocked(key)),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Message::AccountUi(Action::LoginVerified {
+                            key,
+                            outcome: Outcome::Failed(error),
+                        });
+                    }
+                }
+            }
             // No cache: the answer is about a home no other window knows.
             let outcome = probe::run(account, None, true).await;
             Message::AccountUi(Action::LoginVerified { key, outcome })
@@ -3356,6 +3471,59 @@ impl Cagents {
     }
 }
 
+fn browser_login_available() -> Result<(), String> {
+    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    check_browser_login_host(&path)?;
+    account::login::check_callback_port()
+}
+
+fn check_browser_login_host(path: &Path) -> Result<(), String> {
+    // The daemon may not have started yet. Its atomic spawn reservation is
+    // authoritative; this earlier check avoids creating a needless home.
+    let mut client = match crate::control::ControlClient::connect(path) {
+        Ok(client) => client,
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("Cannot check existing sign-ins: {error}")),
+    };
+    if client
+        .list()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|descriptor| {
+            account::login::is_codex_browser(&descriptor.session.launch)
+                && !terminal_ended(&descriptor.session)
+        })
+    {
+        return Err(account::login::BUSY.into());
+    }
+    Ok(())
+}
+
+fn callback_failed_on_host(terminal: TerminalId) -> Result<bool, String> {
+    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+    let hosted = client.list().map_err(|error| error.to_string())?;
+    // A cancelled and already removed terminal has no failure left to read.
+    if !hosted
+        .iter()
+        .any(|descriptor| descriptor.session.id == terminal)
+    {
+        return Ok(false);
+    }
+    client
+        .snapshot(terminal)
+        .map(|snapshot| account::login::callback_failed(&snapshot.text))
+        .map_err(|error| error.to_string())
+}
+
 /// The terminal a sign-in card runs.
 fn sign_in_terminal(state: Option<&CardState>) -> Option<TerminalId> {
     match &state?.kind {
@@ -3549,6 +3717,17 @@ mod tests {
     use crate::account::WindowKind;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn browser_login_preflight_allows_normal_startup_after_a_stale_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        assert!(check_browser_login_host(&path).is_ok());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+        assert!(path.exists());
+        assert!(check_browser_login_host(&path).is_ok());
+    }
 
     fn state_with(snapshot: Option<UsageSnapshot>) -> AccountState {
         let mut state = AccountState::new(Account::system(Provider::Claude));
@@ -3780,6 +3959,72 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    #[test]
+    fn browser_add_is_fenced_before_async_home_creation_and_errors_release_it() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.homes = Some(Homes::at("/cagents-fixture/accounts"));
+        let _first = app.add_account(Provider::Codex, false);
+        assert!(app.account_ui.browser_preparing);
+        let _second = app.add_account(Provider::Codex, false);
+        assert!(app.account_ui.logins.is_empty());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message == account::login::BUSY)
+        );
+        // A device-code request is independent and cannot clear the browser fence.
+        let _ = app.open_account_login(Provider::Codex, true, Err("fixture".into()));
+        assert!(app.account_ui.browser_preparing);
+        let _ = app.open_account_login(Provider::Codex, false, Err("fixture".into()));
+        assert!(!app.account_ui.browser_preparing);
+    }
+
+    #[test]
+    fn callback_spawn_failure_retains_pending_row_and_device_choice() {
+        let mut app = context_inspector_test_app(false);
+        let key = uuid::Uuid::from_u128(511);
+        let home = PathBuf::from("/cagents-fixture/accounts/codex").join(key.to_string());
+        let _ = app.open_account_login(
+            Provider::Codex,
+            false,
+            Ok((key, home, "/tools/codex".into())),
+        );
+        let card = app
+            .sign_in_card(Provider::Codex, &app.account_ui.logins[0].home)
+            .unwrap();
+        assert!(app.codex_browser_busy());
+        app.cards
+            .insert(card, CardRuntime::Failed(account::login::PORT_BUSY.into()));
+        let _ = app.check_logins();
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        assert!(!app.codex_browser_busy());
+        let _ = app.check_logins();
+        assert_eq!(
+            app.account_ui.logins.len(),
+            1,
+            "failure is not silently discarded as signed out"
+        );
+        let launch = login_launch(
+            &app.account_ui.logins[0].account(),
+            Path::new("/tools/codex"),
+            "/fixture".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(launch.arguments, ["login", "--device-auth"]);
+    }
+
+    #[test]
+    fn callback_bind_race_answer_retains_row_until_dismissed() {
+        let mut app = context_inspector_test_app(false);
+        let key = pending_login(&mut app, 512);
+        app.account_ui.logins[0].phase = LoginPhase::Verifying;
+        let _ = app.update(Message::AccountUi(Action::LoginCallbackBlocked(key)));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        let _ = app.update(Message::AccountUi(Action::LoginTick));
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+    }
+
     use super::*;
     use crate::account::WindowKind;
     use crate::app::tests::context_inspector_test_app;

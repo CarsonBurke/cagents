@@ -289,7 +289,8 @@ pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
 fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
     let layout = layout(width);
-    let mut sections: Vec<Element<'_, Message>> = vec![toolbar(state, &layout)];
+    let mut sections: Vec<Element<'_, Message>> =
+        vec![toolbar(state, &layout, app.codex_browser_busy())];
     let project = app.accounts_project();
     if let Some((_, name, _)) = project {
         sections.push(
@@ -328,7 +329,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     .into()
 }
 
-fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
+fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element<'a, Message> {
     let action = |action| Message::AccountUi(action);
     let sort = crate::ui_controls::segmented_controls(
         Sort::ALL
@@ -407,12 +408,22 @@ fn toolbar<'a>(state: &'a State, layout: &Layout) -> Element<'a, Message> {
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Codex),
                         "ChatGPT (Codex)",
-                        "Sign in through your browser",
+                        if browser_busy {
+                            "A browser sign-in is pending; finish it or use a code"
+                        } else {
+                            "Sign in through your browser"
+                        },
                         action(Action::Add {
                             provider: Provider::Codex,
                             device: false,
                         }),
                     )
+                    .on_press_maybe((!browser_busy).then(|| {
+                        action(Action::Add {
+                            provider: Provider::Codex,
+                            device: false,
+                        })
+                    }))
                     .into(),
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Codex),
@@ -1135,20 +1146,29 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
         LoginPhase::Waiting => "Finish signing in in the terminal. Closing it cancels.",
         LoginPhase::Verifying => "Checking which account signed in…",
         LoginPhase::Settling => "Saving…",
+        LoginPhase::CallbackBlocked => account::login::PORT_BUSY,
     };
     let account = widget::row::with_children(vec![
-        crate::ui_controls::activity_spinner_tone(
-            f32::from(design::ROW_ICON_SIZE),
-            design::accent_color,
-        ),
+        if login.phase == LoginPhase::CallbackBlocked {
+            widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
+                .size(design::ROW_ICON_SIZE)
+                .into()
+        } else {
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(design::ROW_ICON_SIZE),
+                design::accent_color,
+            )
+        },
         widget::column::with_children(vec![
             design::body(format!("New {} account", login.provider.label())).into(),
-            design::caption(phase)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .into(),
+            crate::interaction::tooltip(
+                design::caption(phase)
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    )),
+                phase,
+            ),
         ])
         .spacing(1)
         .width(Length::Fill)
@@ -1157,7 +1177,23 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     .spacing(design::GRID_UNIT * 2.5)
     .align_y(Alignment::Center)
     .into();
-    let cancel: Element<'a, Message> = if login.phase == LoginPhase::Waiting {
+    let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
+        widget::row::with_children(vec![
+            widget::button::text("Use code")
+                .on_press(Message::AccountUi(Action::Add {
+                    provider: Provider::Codex,
+                    device: true,
+                }))
+                .into(),
+            crate::ui_controls::compact_icon_control(
+                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                "Dismiss failed sign-in",
+                Some(Message::AccountUi(Action::CancelLogin(login.key))),
+            )
+            .into(),
+        ])
+        .into()
+    } else if login.phase == LoginPhase::Waiting {
         crate::ui_controls::compact_icon_control(
             crate::ui_controls::symbolic_icon("window-close-symbolic"),
             "Cancel sign-in",

@@ -204,6 +204,8 @@ pub(crate) struct HostState {
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
+    /// Covers the interval before a login's live TerminalRecord exists.
+    browser_logins_spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
     /// Connections that asked for terminal-inventory edges. A client that never
     /// asked receives none, which is what keeps every strict request/response
@@ -256,6 +258,7 @@ impl HostState {
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
+            browser_logins_spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
@@ -753,9 +756,27 @@ impl HostState {
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
+        self.browser_logins_spawning.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
             self.inventory_generation += 1;
         }
+    }
+
+    fn reserve_browser_login(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
+        if !self.browser_logins_spawning.is_empty()
+            || self.terminals.values().any(|record| {
+                crate::account::login::is_codex_browser(&record.session.launch)
+                    && !record.handle.is_completed()
+            })
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                crate::account::login::BUSY,
+                false,
+            ));
+        }
+        self.browser_logins_spawning.insert(terminal_id);
+        Ok(())
     }
 
     /// Records that a restored terminal continues `source`, so clients that
@@ -2223,6 +2244,21 @@ fn start_terminal_view(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.reserve_spawn_for_view(terminal_id, paired)?;
+        if crate::account::login::is_codex_browser(&session.launch) {
+            let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
+                // An adopted process already owns its callback listener.
+                if adoption.is_some() {
+                    return Ok(());
+                }
+                crate::account::login::check_callback_port().map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false)
+                })
+            });
+            if let Err(error) = reserved {
+                state.cancel_spawn(terminal_id);
+                return Err(error);
+            }
+        }
     }
 
     let weak = Arc::downgrade(shared);
@@ -2651,6 +2687,135 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn browser_login_claim_is_atomic_across_windows_and_released_after_failed_spawn() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let shared = shared.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let id = TerminalId::new();
+                    barrier.wait();
+                    let mut state = shared.lock().unwrap();
+                    state.reserve_spawn(id).unwrap();
+                    match state.reserve_browser_login(id) {
+                        Ok(()) => Some(id),
+                        Err(error) => {
+                            assert_eq!(error.message, crate::account::login::BUSY);
+                            state.cancel_spawn(id);
+                            None
+                        }
+                    }
+                })
+            })
+            .collect();
+        let winners: Vec<_> = attempts
+            .into_iter()
+            .filter_map(|attempt| attempt.join().unwrap())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        let mut state = shared.lock().unwrap();
+        state.cancel_spawn(winners[0]);
+        assert!(state.reserve_browser_login(TerminalId::new()).is_ok());
+    }
+
+    #[test]
+    fn browser_login_claim_survives_ui_disconnect_until_actual_worker_teardown() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("codex");
+        fs::write(&program, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().into()).unwrap();
+        recipe.program = program.to_str().unwrap().into();
+        recipe.arguments = vec!["login".into()];
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let mut state = test_host();
+        state.register_client(1);
+        state.reserve_spawn(session.id).unwrap();
+        state.reserve_browser_login(session.id).unwrap();
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        state
+            .finish_spawn(1, session, handle.clone(), true)
+            .unwrap();
+        state.unregister_client(1);
+        state.register_client(2);
+        let blocked = state.reserve_browser_login(TerminalId::new()).is_err();
+        handle.shutdown().unwrap();
+        assert!(blocked, "a UI restart must not release its running login");
+        assert!(handle.is_completed());
+        assert!(state.reserve_browser_login(TerminalId::new()).is_ok());
+    }
+
+    #[test]
+    fn browser_callback_failure_survives_hidden_terminal_completion() {
+        let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec![
+            "-c".into(),
+            "printf '%s\\n' 'Error: Port 127.0.0.1:1455 is already in use' >&2; exit 1".into(),
+        ];
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = TerminalHandle::spawn(
+            session,
+            TerminalConfig {
+                initially_visible: false,
+                ..TerminalConfig::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !handle.is_completed() {
+            let _ = handle.shutdown();
+            panic!("fixture login did not finish");
+        }
+        let text = handle
+            .snapshot()
+            .lines
+            .iter()
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            crate::account::login::callback_failed(&text),
+            "a hibernated login must retain its callback failure"
+        );
     }
 
     #[test]
