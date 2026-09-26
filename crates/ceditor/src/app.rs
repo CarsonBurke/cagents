@@ -9,8 +9,9 @@ use cagents::{
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     pull_request_review::{self, ReviewSource},
     repository::{
-        CancellationToken, DiffBasis, MutationOutcome, PathSelection, RepoPath, RepositoryId,
-        RepositoryService, RepositorySnapshot, StageRequest, UnstageRequest,
+        CancellationToken, CommitOutcome, CommitRequest, DiffBasis, MutationOutcome, PathSelection,
+        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryService, RepositorySnapshot,
+        StageRequest, UnstageRequest,
     },
     repository_widget::{
         self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
@@ -18,9 +19,9 @@ use cagents::{
     },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
-        self, ActiveWorktreeKey, FileCommand, FileSearch, SidebarAction, SidebarFocus, SidebarMode,
-        SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
-        WorktreePanel,
+        self, ActiveWorktreeKey, FileCommand, FileSearch, MutationKind, SidebarAction,
+        SidebarFocus, SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
+        SourceControlModel, WorktreePanel,
     },
     splitter::{self, Splitter},
     ui_controls::{icon_control, popover, symbolic_icon, toolbar_actions},
@@ -80,7 +81,7 @@ struct Tab {
     completions: Vec<LspCompletionItem>,
     hover: Option<String>,
     lsp_error: Option<String>,
-    mutation: bool,
+    mutation: Option<MutationKind>,
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
     /// The pull request review behind the sidebar's Pull requests panel. It
@@ -155,6 +156,9 @@ pub enum Message {
     PullRequestReview(CardId, pull_request_review::Action),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
+    Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
+    Committed(CardId, String, Result<CommitOutcome, String>),
+    Pushed(CardId, Result<PushOutcome, String>),
     FileNameChanged(String),
     SubmitFileOperation,
     CancelFileOperation,
@@ -972,12 +976,17 @@ fn tab_title_style() -> cosmic::theme::Button {
 }
 
 impl Editor {
+    fn pending_discard(&self) -> Option<&sidebar::DiscardConfirmation> {
+        self.current()?.navigation.pending_discard()
+    }
+
     fn modal_open(&self) -> bool {
         self.settings_open
             || self.quick_open
             || self.closing.is_some()
             || self.file_dialog.is_some()
             || self.notices_open
+            || self.pending_discard().is_some()
     }
 
     fn settings_footer(&self) -> Element<'_, Message> {
@@ -1001,7 +1010,7 @@ impl Editor {
             if !absolute.starts_with(&tab.runtime.descriptor.worktree) {
                 return false;
             }
-            tab.mutation
+            tab.mutation.is_some()
                 || tab.pending_file.is_some()
                 || (tab.owned_file.as_deref() == Some(absolute) && tab.runtime.blocks_navigation())
         })
@@ -1423,6 +1432,14 @@ impl Editor {
             Some(snapshot) => SourceControlModel::ready(key, snapshot),
             None => SourceControlModel::loading(key),
         });
+        let mutation = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.runtime.descriptor.worktree == opened.root)
+            .find_map(|tab| tab.mutation);
+        if let Some(source) = sidebar.source_control.as_mut() {
+            source.set_mutation(mutation);
+        }
         let mut navigation = SidebarState::default();
         let pending_file = opened.file.map(|path| PendingFile {
             canonical: Some(opened.root.join(&path)),
@@ -1470,7 +1487,7 @@ impl Editor {
             completions: Vec::new(),
             hover: None,
             lsp_error: None,
-            mutation: false,
+            mutation,
             snapshot_loading: false,
             snapshot_refresh_pending: false,
             review,
@@ -1969,7 +1986,7 @@ impl Editor {
             && !self.exiting;
         if self
             .tab(id)
-            .is_some_and(|tab| tab.runtime.blocks_navigation() || tab.mutation)
+            .is_some_and(|tab| tab.runtime.blocks_navigation() || tab.mutation.is_some())
             || (untitled_note && !self.close_confirmed)
         {
             self.active = Some(id);
@@ -1978,7 +1995,7 @@ impl Editor {
             let tab = self.tab(id).unwrap();
             let focus = if untitled_note || tab.runtime.can_save() {
                 "ceditor.close.save"
-            } else if tab.runtime.can_abandon_unsaved_changes() && !tab.mutation {
+            } else if tab.runtime.can_abandon_unsaved_changes() && tab.mutation.is_none() {
                 "ceditor.close.discard"
             } else {
                 "ceditor.close.cancel"
@@ -2553,44 +2570,72 @@ impl Editor {
     }
 
     fn stage(&mut self, id: CardId, stage: bool) -> Task<Message> {
-        let Some(tab) = self.tab_mut(id) else {
+        let Some(tab) = self.tab(id) else {
             return Task::none();
         };
-        if tab.mutation || tab.runtime.blocks_navigation() {
-            return Task::none();
-        }
         let Some(selection) = tab.runtime.selected_staging_selection(stage) else {
             return Task::none();
         };
+        self.stage_selection(id, stage, vec![selection])
+    }
+
+    /// A worktree may have several file tabs. Guard and refresh all of them,
+    /// including unsaved buffers that are not currently visible.
+    fn begin_mutation(&mut self, id: CardId, kind: MutationKind) -> Option<PathBuf> {
+        let tab = self.tab(id)?;
+        if !tab.git {
+            return None;
+        }
         let root = tab.runtime.descriptor.worktree.clone();
-        tab.mutation = true;
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git");
-                let token = CancellationToken::default();
-                if stage {
-                    service.stage(
-                        &StageRequest {
-                            worktree: root,
-                            selection: vec![selection],
-                        },
-                        &token,
-                    )
-                } else {
-                    service.unstage(
-                        &UnstageRequest {
-                            worktree: root,
-                            selection: vec![selection],
-                        },
-                        &token,
-                    )
+        if self.tabs.iter().any(|tab| {
+            tab.runtime.descriptor.worktree == root
+                && (tab.mutation.is_some() || tab.runtime.blocks_navigation())
+        }) {
+            self.notice = Some("Save open files and wait for pending Git operations before changing this worktree.".into());
+            return None;
+        }
+        for tab in &mut self.tabs {
+            if tab.runtime.descriptor.worktree == root {
+                tab.mutation = Some(kind);
+                if let Some(source) = tab.sidebar.source_control.as_mut() {
+                    source.set_mutation(Some(kind));
                 }
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            Message::Mutation(id, result)
-        })
+            }
+        }
+        Some(root)
+    }
+
+    fn finish_mutation(&mut self, id: CardId, notice: Option<String>) -> Task<Message> {
+        self.notice = notice;
+        let Some(root) = self
+            .tab(id)
+            .map(|tab| tab.runtime.descriptor.worktree.clone())
+        else {
+            return Task::none();
+        };
+        let mut affected = Vec::new();
+        for tab in &mut self.tabs {
+            if tab.runtime.descriptor.worktree == root {
+                tab.mutation = None;
+                if let Some(source) = tab.sidebar.source_control.as_mut() {
+                    source.set_mutation(None);
+                }
+                affected.push(tab.id);
+            }
+        }
+        let mut tasks = affected
+            .into_iter()
+            .map(|id| self.refresh(id))
+            .collect::<Vec<_>>();
+        if self.close_confirmed
+            && let Some(closing) = self.closing
+            && self
+                .tab(closing)
+                .is_some_and(|tab| tab.mutation.is_none() && !tab.runtime.blocks_navigation())
+        {
+            tasks.push(self.request_close(closing));
+        }
+        Task::batch(tasks)
     }
     fn stage_selection(
         &mut self,
@@ -2598,14 +2643,17 @@ impl Editor {
         stage: bool,
         selection: Vec<PathSelection>,
     ) -> Task<Message> {
-        let Some(tab) = self.tab_mut(id) else {
-            return Task::none();
-        };
-        if tab.mutation || tab.runtime.blocks_navigation() || selection.is_empty() {
+        if selection.is_empty() {
             return Task::none();
         }
-        let root = tab.runtime.descriptor.worktree.clone();
-        tab.mutation = true;
+        let kind = if stage {
+            MutationKind::Stage
+        } else {
+            MutationKind::Unstage
+        };
+        let Some(root) = self.begin_mutation(id, kind) else {
+            return Task::none();
+        };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
@@ -2899,6 +2947,13 @@ impl Application for Editor {
                 | Message::SavedAs(..)
         );
         let task = (|| {
+            if self
+                .current()
+                .is_some_and(|tab| tab.mutation == Some(MutationKind::Discard))
+                && matches!(&message, Message::Completion(..))
+            {
+                return Task::none();
+            }
             if self.settings_open
                 && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) = &message
                 && modifiers.control()
@@ -2915,6 +2970,9 @@ impl Application for Editor {
                 ..
             }) = &message
             {
+                if self.pending_discard().is_some() {
+                    return self.update(Message::Sidebar(SidebarAction::CancelDiscard));
+                }
                 if self.notices_open {
                     return self.close_notices();
                 }
@@ -2938,6 +2996,12 @@ impl Application for Editor {
                 return task;
             }
             if self.modal_open()
+                && !matches!(
+                    &message,
+                    Message::Sidebar(
+                        SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+                    )
+                )
                 && matches!(
                     &message,
                     Message::Choose(_)
@@ -3106,6 +3170,9 @@ impl Application for Editor {
                         return Task::none();
                     }
                     self.file_dialog = None;
+                    for tab in &mut self.tabs {
+                        tab.navigation.apply(&SidebarAction::CancelDiscard);
+                    }
                     self.settings_open = false;
                     self.notices_open = false;
                     self.exiting = true;
@@ -3132,7 +3199,7 @@ impl Application for Editor {
                         let untitled = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab));
                         if untitled {
                             if let Some(tab) = self.tab_mut(id) {
-                                if !tab.mutation {
+                                if tab.mutation.is_none() {
                                     let _ = tab.runtime.abandon_unsaved_changes();
                                 }
                             }
@@ -3140,7 +3207,7 @@ impl Application for Editor {
                             return self.request_close(id);
                         }
                         if self.tab_mut(id).is_some_and(|tab| {
-                            !tab.mutation && tab.runtime.abandon_unsaved_changes()
+                            tab.mutation.is_none() && tab.runtime.abandon_unsaved_changes()
                         }) {
                             return self.request_close(id);
                         }
@@ -3149,8 +3216,9 @@ impl Application for Editor {
                 }
                 Message::ConfirmClose => {
                     if let Some(id) = self.closing.filter(|id| {
-                        self.tab(*id)
-                            .is_some_and(|tab| !tab.mutation && !tab.runtime.blocks_navigation())
+                        self.tab(*id).is_some_and(|tab| {
+                            tab.mutation.is_none() && !tab.runtime.blocks_navigation()
+                        })
                     }) {
                         return self.request_close(id);
                     }
@@ -3174,7 +3242,12 @@ impl Application for Editor {
                 }
                 Message::Repository(action) => {
                     let id = action.card();
-                    if self.modal_open() && !repository_action_allowed_while_modal(&action) {
+                    if (self.modal_open()
+                        || self
+                            .tab(id)
+                            .is_some_and(|tab| tab.mutation == Some(MutationKind::Discard)))
+                        && !repository_action_allowed_while_modal(&action)
+                    {
                         return Task::none();
                     }
                     if let RepositoryAction::Save { card, .. } = &action {
@@ -3339,7 +3412,7 @@ impl Application for Editor {
                         if self.close_confirmed
                             && self.closing == Some(id)
                             && self.tab(id).is_some_and(|tab| {
-                                !tab.mutation && !tab.runtime.blocks_navigation()
+                                tab.mutation.is_none() && !tab.runtime.blocks_navigation()
                             })
                         {
                             tasks.push(self.request_close(id));
@@ -3356,7 +3429,12 @@ impl Application for Editor {
                     if matches!(action, SidebarAction::OpenSettings) {
                         return self.update(Message::Settings);
                     }
-                    if self.modal_open() {
+                    if self.modal_open()
+                        && !matches!(
+                            action,
+                            SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+                        )
+                    {
                         return Task::none();
                     }
                     if let Some(id) = self.active {
@@ -3415,15 +3493,106 @@ impl Application for Editor {
                         | SidebarAction::FilesQueryChanged { key, .. }
                         | SidebarAction::ToggleFilesFilter { key }
                         | SidebarAction::ToggleDirectory { key, .. }
-                        | SidebarAction::ToggleSection { key, .. } => Some(key),
+                        | SidebarAction::ToggleSection { key, .. }
+                        | SidebarAction::RequestDiscard { key, .. }
+                        | SidebarAction::ConfirmDiscard { key, .. }
+                        | SidebarAction::CommitMessageChanged { key, .. }
+                        | SidebarAction::Commit { key, .. }
+                        | SidebarAction::Push { key, .. }
+                        | SidebarAction::OpenPublish { key, .. }
+                        | SidebarAction::PublishRemoteChanged { key, .. }
+                        | SidebarAction::PublishBranchChanged { key, .. } => Some(key),
                         _ => None,
                     };
                     if key.is_some_and(|key| tab.navigation.active_worktree() != Some(key)) {
                         return Task::none();
                     }
+                    if let SidebarAction::ConfirmDiscard { key, request } = &action {
+                        // Only the exact request displayed by the mounted dialog
+                        // may destroy files; stale or forged confirmations do nothing.
+                        if !request.confirmed
+                            || !tab.navigation.pending_discard().is_some_and(|pending| {
+                                pending.key == *key
+                                    && pending.request.worktree == request.worktree
+                                    && pending.request.tracked == request.tracked
+                                    && pending.request.untracked == request.untracked
+                            })
+                        {
+                            return Task::none();
+                        }
+                    }
+                    if let SidebarAction::RequestDiscard { request, .. } = &action
+                        && (request.worktree != tab.runtime.descriptor.worktree
+                            || tab.mutation.is_some())
+                    {
+                        return Task::none();
+                    }
                     tab.navigation.apply(&action);
                     let persist_expansion = matches!(action, SidebarAction::ToggleDirectory { .. });
                     let task = match action {
+                        SidebarAction::RequestDiscard { .. } => {
+                            widget::text_input::focus(sidebar::discard_cancel_id())
+                                .map(cosmic::Action::App)
+                        }
+                        SidebarAction::CancelDiscard => self.resume_pending_files(),
+                        SidebarAction::ConfirmDiscard { request, .. } => {
+                            if self.begin_mutation(id, MutationKind::Discard).is_none() {
+                                return Task::none();
+                            }
+                            cosmic::task::future(async move {
+                                let mut paths =
+                                    cagents::repository::selection_pathspecs(&request.tracked);
+                                paths.extend(request.untracked.iter().cloned());
+                                let result = tokio::task::spawn_blocking(move || {
+                                    RepositoryService::system("git")
+                                        .discard(&request, &CancellationToken::default())
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::Discarded(id, paths, result)
+                            })
+                        }
+                        SidebarAction::Commit { message, .. } => {
+                            let Some(worktree) = self.begin_mutation(id, MutationKind::Commit)
+                            else {
+                                return Task::none();
+                            };
+                            cosmic::task::future(async move {
+                                let submitted = message.clone();
+                                let result = tokio::task::spawn_blocking(move || {
+                                    RepositoryService::system("git").commit(
+                                        &CommitRequest { worktree, message },
+                                        &CancellationToken::default(),
+                                    )
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::Committed(id, submitted, result)
+                            })
+                        }
+                        SidebarAction::Push { branch, target, .. } => {
+                            let Some(worktree) = self.begin_mutation(id, MutationKind::Push) else {
+                                return Task::none();
+                            };
+                            cosmic::task::future(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    RepositoryService::system("git").push(
+                                        &PushRequest {
+                                            worktree,
+                                            branch,
+                                            target,
+                                        },
+                                        &CancellationToken::default(),
+                                    )
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
+                                Message::Pushed(id, result)
+                            })
+                        }
                         SidebarAction::FileCommand { path, command, .. } => match command {
                             FileCommand::CopyPath => iced::clipboard::write(
                                 tab.runtime
@@ -3539,8 +3708,9 @@ impl Application for Editor {
                         match result {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
-                                    tab.sidebar.source_control =
-                                        Some(SourceControlModel::ready(key, &snapshot));
+                                    let mut source = SourceControlModel::ready(key, &snapshot);
+                                    source.set_mutation(tab.mutation);
+                                    tab.sidebar.source_control = Some(source);
                                 }
                                 // A remote added or retargeted since the last
                                 // read changes which repository is reviewed.
@@ -3557,11 +3727,36 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::Mutation(id, result) => {
-                    if let Some(tab) = self.tab_mut(id) {
-                        tab.mutation = false;
+                Message::Discarded(id, paths, result) => {
+                    // Status refresh deliberately preserves buffers. Discard is
+                    // different: the selected files were restored or removed on
+                    // disk, so reload their clean buffers in every sibling tab.
+                    // Do this even for an uncertain outcome; disk is authoritative.
+                    let root = self
+                        .tab(id)
+                        .map(|tab| tab.runtime.descriptor.worktree.clone());
+                    let affected = self
+                        .tabs
+                        .iter()
+                        .filter(|tab| {
+                            Some(&tab.runtime.descriptor.worktree) == root.as_ref()
+                                && !tab.runtime.blocks_navigation()
+                                && tab.runtime.selected_path().is_some_and(|selected| {
+                                    paths.iter().any(|path| path.as_path() == selected)
+                                })
+                        })
+                        .map(|tab| tab.id)
+                        .collect::<Vec<_>>();
+                    let mut tasks = vec![self.update(Message::Mutation(id, result))];
+                    for id in affected {
+                        tasks.push(
+                            self.update(Message::Repository(RepositoryAction::Reload { card: id })),
+                        );
                     }
-                    self.notice = match result {
+                    Task::batch(tasks)
+                }
+                Message::Mutation(id, result) => {
+                    let notice = match result {
                         Ok(MutationOutcome::Applied { .. }) => None,
                         Ok(MutationOutcome::NotApplied { failure }) => Some(failure.to_string()),
                         Ok(MutationOutcome::OutcomeUnknown { failure }) => {
@@ -3577,19 +3772,55 @@ impl Application for Editor {
                         )),
                         Err(error) => Some(error),
                     };
-                    if self.close_confirmed
-                        && self.closing == Some(id)
-                        && self
-                            .tab(id)
-                            .is_some_and(|tab| !tab.runtime.blocks_navigation())
-                    {
-                        self.request_close(id)
-                    } else {
-                        self.refresh(id)
-                    }
+                    self.finish_mutation(id, notice)
+                }
+                Message::Committed(id, submitted, result) => {
+                    let notice = match result {
+                        Ok(CommitOutcome::Created { warnings, .. }) => {
+                            if let Some(tab) = self.tab_mut(id)
+                                && tab.navigation.commit_message() == submitted
+                            {
+                                tab.navigation.clear_commit_message();
+                            }
+                            (!warnings.is_empty()).then(|| {
+                                format!(
+                                    "Commit created, but {}",
+                                    warnings
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                )
+                            })
+                        }
+                        Ok(CommitOutcome::NotCreated { failure }) => {
+                            Some(format!("Commit failed: {failure}"))
+                        }
+                        Ok(CommitOutcome::OutcomeUnknown { failure }) => Some(format!(
+                            "Commit may or may not have been created: {failure}. Refresh to see what Git holds."
+                        )),
+                        Err(error) => Some(format!("Commit could not run: {error}")),
+                    };
+                    self.finish_mutation(id, notice)
+                }
+                Message::Pushed(id, result) => {
+                    let notice = match result {
+                        Ok(PushOutcome::Pushed { .. }) => None,
+                        Ok(PushOutcome::NotPushed { failure }) => {
+                            Some(format!("Push failed: {failure}"))
+                        }
+                        Ok(PushOutcome::OutcomeUnknown { failure }) => Some(format!(
+                            "Push may or may not have reached the remote: {failure}. Refresh to see what Git holds."
+                        )),
+                        Err(error) => Some(format!("Push could not run: {error}")),
+                    };
+                    self.finish_mutation(id, notice)
                 }
                 Message::Settings => {
-                    if self.closing.is_none() && self.file_dialog.is_none() {
+                    if self.closing.is_none()
+                        && self.file_dialog.is_none()
+                        && self.pending_discard().is_none()
+                    {
                         self.notices_open = false;
                         self.settings_open = !self.settings_open;
                         if self.settings_open {
@@ -4344,6 +4575,12 @@ impl Application for Editor {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(pending) = self.pending_discard() {
+            return Some(dialog_overlay(
+                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                Message::Sidebar(SidebarAction::CancelDiscard),
+            ));
+        }
         if let Some(dialog) = &self.file_dialog {
             let title = if dialog.duplicate {
                 "Duplicate file"
@@ -4390,7 +4627,8 @@ impl Application for Editor {
         if let Some(id) = self.closing {
             let tab = self.tab(id)?;
             let untitled_note = self.tab_is_untitled(tab) && self.untitled_has_content(id);
-            let ready = !tab.runtime.blocks_navigation() && !tab.mutation && !untitled_note;
+            let ready =
+                !tab.runtime.blocks_navigation() && tab.mutation.is_none() && !untitled_note;
             let mut controls = vec![
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("ceditor.close.cancel"))
@@ -4405,7 +4643,9 @@ impl Application for Editor {
                         .into(),
                 );
             } else {
-                if (tab.runtime.can_abandon_unsaved_changes() || untitled_note) && !tab.mutation {
+                if (tab.runtime.can_abandon_unsaved_changes() || untitled_note)
+                    && tab.mutation.is_none()
+                {
                     controls.push(
                         widget::button::destructive("Discard and close")
                             .id(widget::Id::new("ceditor.close.discard"))
@@ -4437,15 +4677,17 @@ impl Application for Editor {
                             "Finish saving before closing"
                         })
                         .into(),
-                        widget::text::body(tab.runtime.save_error().unwrap_or(if tab.mutation {
-                            "A Git operation is still running."
-                        } else if untitled_note {
-                            "This note has not been saved to a file yet."
-                        } else if ready {
-                            "The tab is ready to close."
-                        } else {
-                            "This file has unsaved changes or an unfinished save."
-                        }))
+                        widget::text::body(tab.runtime.save_error().unwrap_or(
+                            if tab.mutation.is_some() {
+                                "A Git operation is still running."
+                            } else if untitled_note {
+                                "This note has not been saved to a file yet."
+                            } else if ready {
+                                "The tab is ready to close."
+                            } else {
+                                "This file has unsaved changes or an unfinished save."
+                            },
+                        ))
                         .into(),
                         widget::row::with_children(controls).spacing(8).into(),
                     ])
@@ -4820,6 +5062,459 @@ impl Editor {
 mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn git_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        git(
+            root,
+            &[
+                "config",
+                "core.hooksPath",
+                root.join("hooks").to_str().unwrap(),
+            ],
+        );
+        std::fs::write(root.join("tracked.txt"), "original\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        git(root, &["commit", "-m", "Initial"]);
+        directory
+    }
+
+    /// Execute actual application tasks, including mutation completion and
+    /// subsequent snapshot/file refreshes, without a window or network remote.
+    fn run_tasks(app: &mut Editor, task: Task<Message>) {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut pending = vec![task];
+                while let Some(task) = pending.pop() {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                                action
+                            {
+                                pending.push(app.update(message));
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    fn open_real_git(app: &mut Editor, root: &Path, file: Option<&str>) -> CardId {
+        let snapshot = RepositoryService::system("git")
+            .snapshot(root, &CancellationToken::default())
+            .unwrap();
+        let task = app.add(
+            Opened {
+                root: root.to_path_buf(),
+                file: file.map(PathBuf::from),
+                snapshot: Some(snapshot),
+            },
+            true,
+        );
+        run_tasks(app, task);
+        app.active.unwrap()
+    }
+
+    fn sidebar_action(app: &mut Editor, action: SidebarAction) {
+        let task = app.update(Message::Sidebar(action));
+        run_tasks(app, task);
+    }
+
+    #[test]
+    fn git_actions_commit_publish_and_push_through_the_sidebar() {
+        let directory = git_fixture();
+        let root = directory.path();
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare"]);
+        git(
+            root,
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        );
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Keep my message".into(),
+            },
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::Commit {
+                key: key.clone(),
+                message: "Keep my message".into(),
+            },
+        );
+        assert!(app.notice.as_deref().unwrap().contains("Commit failed"));
+        assert_eq!(
+            app.tab(id).unwrap().navigation.commit_message(),
+            "Keep my message"
+        );
+
+        std::fs::write(root.join("tracked.txt"), "committed\n").unwrap();
+        sidebar_action(
+            &mut app,
+            SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+            },
+        );
+        let task = app.update(Message::Sidebar(SidebarAction::Commit {
+            key: key.clone(),
+            message: "Keep my message".into(),
+        }));
+        assert!(app.tab(id).unwrap().mutation.is_some());
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .sidebar
+                .source_control
+                .as_ref()
+                .unwrap()
+                .busy()
+        );
+        run_tasks(&mut app, task);
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Keep my message");
+        assert!(app.tab(id).unwrap().navigation.commit_message().is_empty());
+        assert!(app.tab(id).unwrap().mutation.is_none());
+
+        let branch = cagents::repository::ValidatedBranchName::parse("main").unwrap();
+        sidebar_action(
+            &mut app,
+            SidebarAction::OpenPublish {
+                key: key.clone(),
+                branch: branch.clone(),
+                remotes: vec!["origin".into()],
+            },
+        );
+        let publish = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .publish_draft()
+            .unwrap()
+            .push_action()
+            .unwrap();
+        sidebar_action(&mut app, publish);
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/main"]),
+            git(root, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            git(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+            "origin/main"
+        );
+
+        std::fs::write(root.join("tracked.txt"), "pushed again\n").unwrap();
+        sidebar_action(
+            &mut app,
+            SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+            },
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::Commit {
+                key: key.clone(),
+                message: "Second".into(),
+            },
+        );
+        let target = app
+            .tab(id)
+            .unwrap()
+            .sidebar
+            .source_control
+            .as_ref()
+            .unwrap()
+            .upstream
+            .clone()
+            .unwrap();
+        sidebar_action(
+            &mut app,
+            SidebarAction::Push {
+                key,
+                branch,
+                target,
+            },
+        );
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/main"]),
+            git(root, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[test]
+    fn git_actions_discard_requires_the_mounted_confirmation_and_escape_cancels() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        let request = cagents::repository::DiscardRequest {
+            worktree: root.to_path_buf(),
+            tracked: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+            untracked: vec![RepoPath::parse("new.txt").unwrap()],
+            confirmed: false,
+        };
+        sidebar_action(
+            &mut app,
+            SidebarAction::ConfirmDiscard {
+                key: key.clone(),
+                request: cagents::repository::DiscardRequest {
+                    confirmed: true,
+                    ..request.clone()
+                },
+            },
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "changed\n"
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: request.clone(),
+            },
+        );
+        assert!(app.modal_open());
+        assert!(app.dialog().is_some());
+        drop(app.update(Message::NewTab));
+        drop(app.update(Message::Settings));
+        assert_eq!(app.tabs.len(), 1);
+        assert!(!app.settings_open);
+        drop(app.update(Message::Key(named_key(
+            keyboard::key::Named::Escape,
+            keyboard::Modifiers::empty(),
+        ))));
+        assert!(!app.modal_open());
+        assert!(root.join("new.txt").exists());
+
+        sidebar_action(&mut app, SidebarAction::RequestDiscard { key, request });
+        let confirm = app.pending_discard().unwrap().confirm_action();
+        sidebar_action(&mut app, confirm);
+        assert!(!app.modal_open());
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!root.join("new.txt").exists());
+        assert!(
+            !app.tab(id)
+                .unwrap()
+                .sidebar
+                .source_control
+                .as_ref()
+                .unwrap()
+                .has_changes()
+        );
+    }
+
+    #[test]
+    fn git_actions_reject_stale_keys_and_dirty_buffers_in_other_tabs() {
+        let directory = git_fixture();
+        let root = directory.path();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let dirty = open_real_git(&mut app, root, Some("tracked.txt"));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: dirty,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("unsaved".into()),
+                )),
+            })),
+        );
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        let other = open_real_git(&mut app, root, None);
+        assert_ne!(dirty, other);
+        let stale = app
+            .tab(dirty)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        let key = app
+            .tab(other)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::CommitMessageChanged {
+                key: stale,
+                message: "wrong tab".into(),
+            },
+        );
+        assert!(
+            app.tab(other)
+                .unwrap()
+                .navigation
+                .commit_message()
+                .is_empty()
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::Commit {
+                key,
+                message: "blocked".into(),
+            },
+        );
+        assert!(app.notice.as_deref().unwrap().contains("Save open files"));
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Initial");
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        let key = app
+            .tab(other)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::RequestDiscard {
+                key,
+                request: cagents::repository::DiscardRequest {
+                    worktree: root.to_path_buf(),
+                    tracked: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+                    untracked: Vec::new(),
+                    confirmed: false,
+                },
+            },
+        );
+        let confirm = app.pending_discard().unwrap().confirm_action();
+        sidebar_action(&mut app, confirm);
+        assert!(app.notice.as_deref().unwrap().contains("Save open files"));
+        assert!(app.tab(dirty).unwrap().runtime.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
+    #[test]
+    fn git_actions_discard_serializes_sibling_tabs_and_refreshes_their_buffers() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let file = open_real_git(&mut app, root, Some("tracked.txt"));
+        let folder = open_real_git(&mut app, root, None);
+        let key = app
+            .tab(folder)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: cagents::repository::DiscardRequest {
+                    worktree: root.to_path_buf(),
+                    tracked: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+                    untracked: Vec::new(),
+                    confirmed: false,
+                },
+            },
+        );
+        let confirm = app.pending_discard().unwrap().confirm_action();
+        let task = app.update(Message::Sidebar(confirm));
+        assert!(
+            app.tabs
+                .iter()
+                .all(|tab| tab.mutation == Some(MutationKind::Discard))
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: file,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("racing edit".into()),
+                )),
+            })),
+        );
+        assert!(!app.tab(file).unwrap().runtime.is_dirty());
+        sidebar_action(
+            &mut app,
+            SidebarAction::Stage {
+                key,
+                selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
+            },
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("pending Git operations")
+        );
+        let arriving = open_real_git(&mut app, root, None);
+        assert_eq!(
+            app.tab(arriving).unwrap().mutation,
+            Some(MutationKind::Discard)
+        );
+        run_tasks(&mut app, task);
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+        assert_eq!(
+            app.tab(file).unwrap().runtime.editor_text().as_deref(),
+            Some("original\n")
+        );
+        assert!(
+            app.tabs
+                .iter()
+                .all(|tab| !tab.sidebar.source_control.as_ref().unwrap().has_changes())
+        );
+    }
 
     fn editor() -> Editor {
         Editor {
@@ -6051,7 +6746,7 @@ mod tests {
     fn background_completion_requires_an_explicit_close_confirmation() {
         let mut app = editor();
         let id = add(&mut app, "/workspace", None);
-        app.tab_mut(id).unwrap().mutation = true;
+        app.tab_mut(id).unwrap().mutation = Some(MutationKind::Stage);
         drop(app.request_close(id));
         drop(app.update(Message::ConfirmClose));
         assert!(app.tab(id).is_some());
