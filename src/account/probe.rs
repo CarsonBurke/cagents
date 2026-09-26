@@ -185,7 +185,7 @@ enum Prepared {
     Probe {
         program: PathBuf,
         key: Option<String>,
-        lock: Option<std::fs::File>,
+        lock: Option<crate::instance::OwnedLock>,
     },
 }
 
