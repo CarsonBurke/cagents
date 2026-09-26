@@ -212,6 +212,25 @@ fn settings_category_controls<'a>(
                     SettingsField::ManagedWorktreeDirectory,
                 ),
                 settings_choice(
+                    "Default worktree pane",
+                    "Open this pane in an empty worktree. An unused native chat is removed when you switch worktrees.",
+                    SettingsField::DefaultWorktreePane,
+                    settings::DefaultPane::ALL.map(|pane| {
+                        (
+                            pane.label(),
+                            pane.key(),
+                            draft.default_worktree_pane == pane,
+                        )
+                    }),
+                ),
+                settings_choice(
+                    "Default channel pane",
+                    "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
+                    SettingsField::DefaultChannelPane,
+                    settings::DefaultPane::ALL
+                        .map(|pane| (pane.label(), pane.key(), draft.default_channel_pane == pane)),
+                ),
+                settings_choice(
                     "Worktree order",
                     "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
                     SettingsField::WorktreeSort,

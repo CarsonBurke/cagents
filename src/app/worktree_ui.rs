@@ -248,6 +248,11 @@ impl Cagents {
             return Task::none();
         }
         self.snapshot_workspace_scope();
+        let discarded = if self.durable.active_channel != Some(id) {
+            self.discard_unused_default_chats()
+        } else {
+            false
+        };
         Arc::make_mut(&mut self.durable).active_channel = Some(id);
         let focused = self
             .durable
@@ -257,7 +262,11 @@ impl Cagents {
             .and_then(|channel| channel.focused);
         let scoped = scope_descriptor(&self.durable, &path, &[], &self.worktree_owners, focused);
         let offset = self.channel_offsets.get(&id).copied();
-        self.install_workspace_scope(scoped, path, offset)
+        let scope = self.install_workspace_scope(scoped, path, offset);
+        if discarded {
+            self.persist();
+        }
+        scope
     }
 
     /// Resolve filesystem aliases only when changing/restoring scope, never in
@@ -447,6 +456,11 @@ impl Cagents {
         let has_terminal = self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                && !self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&card.id))
                 && self
                     .card_worktree(card)
                     .is_some_and(|directory| directory == path)
@@ -472,19 +486,23 @@ impl Cagents {
                 return Task::none();
             }
             return if !has_terminal {
-                self.add_terminal(path)
+                self.add_default_pane(path, self.settings.default_worktree_pane)
             } else {
                 Task::none()
             };
         }
+        let promoted = !was_channel
+            && self.active_workspace.as_ref().is_some_and(|previous| {
+                previous != &path
+                    && self.durable.cards.iter().any(|card| {
+                        card.existence.is_open()
+                            && card_directory(card) == Some(previous.as_path())
+                            && self.card_worktree(card) == Some(path.as_path())
+                    })
+            });
         if !was_channel && let Some(previous) = &self.active_workspace {
             // Repository discovery can promote an unregistered launch directory
             // into its parent root. Carry its camera/focus into that same scope.
-            let promoted = previous != &path
-                && self.durable.cards.iter().any(|card| {
-                    card_directory(card) == Some(previous.as_path())
-                        && self.card_worktree(card) == Some(path.as_path())
-                });
             let key = if promoted { &path } else { previous };
             self.worktree_offsets
                 .insert(key.clone(), self.workspace.camera().offset());
@@ -498,6 +516,12 @@ impl Cagents {
         if was_channel {
             self.snapshot_workspace_scope();
         }
+        let discarded =
+            if !promoted && (was_channel || self.active_workspace.as_ref() != Some(&path)) {
+                self.discard_unused_default_chats()
+            } else {
+                false
+            };
         Arc::make_mut(&mut self.durable).active_channel = None;
         let roots = self
             .known_worktree_roots
@@ -511,13 +535,20 @@ impl Cagents {
             &self.worktree_owners,
             self.worktree_focus.get(&path).copied(),
         );
+        let has_terminal = scoped
+            .cards
+            .iter()
+            .any(|card| matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_)));
         let offset = self.worktree_offsets.get(&path).copied();
         let scope = self.install_workspace_scope(scoped, path.clone(), offset);
         let terminal = if create_if_empty && !has_terminal {
-            self.add_terminal(path)
+            self.add_default_pane(path, self.settings.default_worktree_pane)
         } else {
             Task::none()
         };
+        if discarded {
+            self.persist();
+        }
         Task::batch([scope, terminal])
     }
 
@@ -1114,6 +1145,110 @@ mod tests {
     }
 
     #[test]
+    fn default_pane_is_recreated_when_its_empty_scope_is_restored() {
+        for channel in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            register_worktrees(&mut app, &["/repo"]);
+            if channel {
+                let project = app.sidebar_model.projects[0].id;
+                let _ = app.handle_channel_ui(channel_ui::Action::Create(project));
+            } else {
+                let _ = app.select_worktree("/repo".into(), true);
+            }
+            let previous = app.workspace.focused().unwrap();
+            let saved = app.persistent_workspace();
+            assert!(!saved.cards.iter().any(|card| card.id == previous));
+            assert!(
+                !saved
+                    .channels
+                    .iter()
+                    .any(|channel| channel.cards.contains(&previous))
+            );
+            let mut restored = super::super::tests::context_inspector_test_app(false);
+            restored.sidebar_model = app.sidebar_model.clone();
+            restored.durable = saved;
+            let _ = restored.restore_worktree_scope();
+            let _ = restored.initialize_runtimes();
+            let _ = restored.ensure_default_pane();
+            let fresh = restored.workspace.focused().unwrap();
+            assert_ne!(fresh, previous);
+            assert!(matches!(
+                restored.card_state(fresh).unwrap().kind,
+                CardKind::Chat(_)
+            ));
+            assert_eq!(restored.durable.active_channel.is_some(), channel);
+        }
+    }
+
+    #[test]
+    fn default_pane_survives_discovery_promoting_its_directory() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let _ = app.select_worktree("/repo/src".into(), true);
+        let card = app.workspace.focused().unwrap();
+        register_worktrees(&mut app, &["/repo"]);
+        let _ = app.select_worktree("/repo".into(), true);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn default_panes_for_channels_and_worktrees_are_independent() {
+        for (worktree, channel) in [
+            (
+                settings::DefaultPane::NativeChat,
+                settings::DefaultPane::Terminal,
+            ),
+            (
+                settings::DefaultPane::Terminal,
+                settings::DefaultPane::NativeChat,
+            ),
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            register_worktrees(&mut app, &["/repo"]);
+            app.settings.default_worktree_pane = worktree;
+            app.settings.default_channel_pane = channel;
+            let project = app.sidebar_model.projects[0].id;
+            let _ = app.handle_channel_ui(channel_ui::Action::Create(project));
+            let channel_id = app.durable.active_channel.unwrap();
+            let channel_card = app.workspace.focused().unwrap();
+            assert_eq!(
+                matches!(
+                    app.card_state(channel_card).unwrap().kind,
+                    CardKind::Chat(_)
+                ),
+                channel == settings::DefaultPane::NativeChat
+            );
+            let _ = app.select_worktree("/repo".into(), true);
+            let worktree_card = app.workspace.focused().unwrap();
+            assert_ne!(worktree_card, channel_card);
+            assert_eq!(
+                matches!(
+                    app.card_state(worktree_card).unwrap().kind,
+                    CardKind::Chat(_)
+                ),
+                worktree == settings::DefaultPane::NativeChat
+            );
+            let _ = app.handle_channel_ui(channel_ui::Action::Open(channel_id));
+            let reopened = app.workspace.focused().unwrap();
+            assert_eq!(
+                matches!(app.card_state(reopened).unwrap().kind, CardKind::Chat(_)),
+                channel == settings::DefaultPane::NativeChat
+            );
+            if channel == settings::DefaultPane::NativeChat {
+                assert!(app.card_state(channel_card).is_none());
+                assert_ne!(reopened, channel_card);
+            } else {
+                assert_eq!(reopened, channel_card);
+            }
+            assert_eq!(
+                app.durable.channels.len(),
+                1,
+                "leaving an unused pane keeps its channel"
+            );
+        }
+    }
+
+    #[test]
     fn chat_owns_nested_scope_and_prevents_duplicate_terminal_creation() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         register_worktrees(&mut app, &["/repo", "/repo/nested", "/other"]);
@@ -1389,6 +1524,7 @@ mod tests {
     #[test]
     fn legacy_unscoped_terminals_remain_accessible_without_owning_new_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let legacy = terminal("/home/user");
         let owned = terminal("/repo");
         app.durable = Arc::new(WorkspaceState {
@@ -1743,6 +1879,7 @@ mod tests {
         let nested = root.path().join("worktrees/topic");
         let project = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let parent_terminal = terminal(root.path().to_str().unwrap());
         app.durable = Arc::new(WorkspaceState {
             cards: vec![parent_terminal.clone()],

@@ -304,6 +304,9 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, so the
     /// refusal is only needed where the process itself is about to restart.
     drafts: HashMap<CardId, String>,
+    /// Automatically opened placeholders, discarded when their scope is left
+    /// until the reader puts work into them or starts their conversation.
+    default_chats: HashSet<CardId>,
     parked: HashMap<CardId, Box<Runtime>>,
     /// The cards whose saved conversation cannot be resumed by trying again.
     ///
@@ -337,6 +340,7 @@ impl Default for State {
             local_returns: HashMap::new(),
             replacements: HashMap::new(),
             drafts: HashMap::new(),
+            default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             last_models: HashMap::new(),
@@ -2291,8 +2295,11 @@ impl Cagents {
     }
 
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
-        let provider = self
-            .workspace
+        self.new_native_chat(self.preferred_chat_provider(), None)
+    }
+
+    fn preferred_chat_provider(&self) -> Provider {
+        self.workspace
             .focused()
             .and_then(|card| self.card_state(card))
             .into_iter()
@@ -2307,8 +2314,126 @@ impl Cagents {
                 CardKind::Chat(session) => Some(session.launch.provider),
                 _ => None,
             })
-            .unwrap_or(Provider::Codex);
-        self.new_native_chat(provider, None)
+            .unwrap_or(Provider::Codex)
+    }
+
+    pub(super) fn add_default_pane(
+        &mut self,
+        directory: PathBuf,
+        pane: settings::DefaultPane,
+    ) -> Task<Message> {
+        match pane {
+            settings::DefaultPane::Terminal => self.add_terminal(directory),
+            settings::DefaultPane::NativeChat => self.new_native_chat_with_lifetime(
+                self.preferred_chat_provider(),
+                Some(directory),
+                true,
+            ),
+        }
+    }
+
+    pub(super) fn ensure_default_pane(&mut self) -> Task<Message> {
+        let Some(directory) = self.active_workspace.clone() else {
+            return Task::none();
+        };
+        if self.workspace.order().any(|card| {
+            self.card_state(card).is_some_and(|state| {
+                state.existence.is_open()
+                    && matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+            })
+        }) {
+            return Task::none();
+        }
+        let pane = if self.durable.active_channel.is_some() {
+            self.settings.default_channel_pane
+        } else {
+            self.settings.default_worktree_pane
+        };
+        self.add_default_pane(directory, pane)
+    }
+
+    fn default_chat_is_unused(&self, card: CardId) -> bool {
+        matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+            if runtime.session.is_unstarted()
+                && runtime.choosing()
+                && runtime.composer.is_empty()
+                && runtime.attachments.is_empty()
+                && runtime.pending.is_none())
+            && !self.chat_start_pending(card)
+    }
+
+    /// Placeholders never reach storage. Once a pane contains work, promote
+    /// it before saving so later snapshots cannot silently drop a saved card.
+    pub(super) fn persistent_workspace(&mut self) -> Arc<WorkspaceState> {
+        let used = self
+            .chat_ui
+            .default_chats
+            .iter()
+            .copied()
+            .filter(|card| !self.default_chat_is_unused(*card))
+            .collect::<Vec<_>>();
+        for card in used {
+            self.chat_ui.default_chats.remove(&card);
+        }
+        if self.chat_ui.default_chats.is_empty() {
+            return Arc::clone(&self.durable);
+        }
+        let defaults = &self.chat_ui.default_chats;
+        let mut saved = (*self.durable).clone();
+        saved.cards.retain(|card| !defaults.contains(&card.id));
+        saved.card_scopes.retain(|card, _| !defaults.contains(card));
+        saved
+            .worktree_focus
+            .retain(|_, card| !defaults.contains(card));
+        saved.focused = saved.focused.filter(|card| !defaults.contains(card));
+        for channel in &mut saved.channels {
+            channel.cards.retain(|card| !defaults.contains(card));
+            channel.focused = channel.focused.filter(|card| !defaults.contains(card));
+        }
+        Arc::new(saved)
+    }
+
+    /// Remove only automatic placeholders in the scope being left. This is
+    /// synchronous: a delayed close message would target the replacement strip
+    /// and could delete the channel rather than just its unused placeholder.
+    pub(super) fn discard_unused_default_chats(&mut self) -> bool {
+        let defaults = self
+            .workspace
+            .order()
+            .filter(|card| self.chat_ui.default_chats.contains(card))
+            .collect::<Vec<_>>();
+        let mut removed = false;
+        for card in defaults {
+            self.chat_ui.default_chats.remove(&card);
+            let unused = self.default_chat_is_unused(card);
+            if !unused {
+                removed = true;
+                continue;
+            }
+            self.chat_discard(card);
+            self.cards.remove(&card);
+            self.card_chrome.remove(&card);
+            self.lifecycle.remove(card);
+            self.worktree_owners.remove(&card);
+            self.worktree_focus.retain(|_, focused| *focused != card);
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.card_scopes.remove(&card);
+            durable.worktree_focus.retain(|_, focused| *focused != card);
+            if durable.focused == Some(card) {
+                durable.focused = None;
+            }
+            // These cards were excluded from every saved snapshot, so there
+            // is no durable identity needing a tombstone or daemon retirement.
+            durable.cards.retain(|state| state.id != card);
+            for channel in &mut durable.channels {
+                channel.cards.retain(|id| *id != card);
+                if channel.focused == Some(card) {
+                    channel.focused = channel.cards.first().copied();
+                }
+            }
+            removed = true;
+        }
+        removed
     }
 
     pub(super) fn dismiss_chat_picker(&mut self) -> bool {
@@ -2336,6 +2461,15 @@ impl Cagents {
         provider: Provider,
         directory: Option<PathBuf>,
     ) -> Task<Message> {
+        self.new_native_chat_with_lifetime(provider, directory, false)
+    }
+
+    fn new_native_chat_with_lifetime(
+        &mut self,
+        provider: Provider,
+        directory: Option<PathBuf>,
+        ephemeral: bool,
+    ) -> Task<Message> {
         let Some(working_directory) = directory.or_else(|| self.terminal_directory()) else {
             return cosmic::task::message(Message::OpenRepository);
         };
@@ -2360,7 +2494,10 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([scope, self.insert_chat_card(session, None)])
+        Task::batch([
+            scope,
+            self.insert_chat_card_with_lifetime(session, None, ephemeral),
+        ])
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first
@@ -2370,6 +2507,15 @@ impl Cagents {
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
+    ) -> Task<Message> {
+        self.insert_chat_card_with_lifetime(session, beside, false)
+    }
+
+    fn insert_chat_card_with_lifetime(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -2381,6 +2527,9 @@ impl Cagents {
             Some((source, (index + 1, durable + 1)))
         });
         let card_id = CardId::new();
+        if ephemeral {
+            self.chat_ui.default_chats.insert(card_id);
+        }
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -2521,6 +2670,7 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
         if let Some(attempt) = self.chat_ui.attempts.remove(&card) {
@@ -4974,6 +5124,75 @@ mod tests {
             Some(CardRuntime::Chat(runtime)) => runtime,
             _ => panic!("the card holds a chat"),
         }
+    }
+
+    #[test]
+    fn default_pane_is_ephemeral_but_explicit_chats_are_not() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+        let automatic = app.workspace.focused().unwrap();
+        assert!(chat_runtime(&app, automatic).is_draft());
+        assert!(!app.chat_start_pending(automatic));
+        assert!(
+            !app.persistent_workspace()
+                .cards
+                .iter()
+                .any(|card| card.id == automatic)
+        );
+        let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+        assert_eq!(app.workspace.focused(), Some(automatic));
+        let explicit = draft_chat(&mut app);
+        let _ = app.select_worktree("/workspace/elsewhere".into(), false);
+        assert!(app.card_state(automatic).is_none());
+        assert!(!app.cards.contains_key(&automatic));
+        assert!(app.card_state(explicit).unwrap().existence.is_open());
+        let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+        assert_eq!(app.workspace.focused(), Some(explicit));
+    }
+
+    #[test]
+    fn default_pane_keeps_unsent_work_and_in_flight_starts() {
+        for send in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+            let card = app.workspace.focused().unwrap();
+            write(&mut app, card, "keep this message");
+            if send {
+                submit(&mut app, card);
+                assert!(app.chat_start_pending(card));
+            }
+            let _ = app.select_worktree("/workspace/elsewhere".into(), false);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(
+                app.persistent_workspace()
+                    .cards
+                    .iter()
+                    .any(|state| state.id == card)
+            );
+            let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+            assert_eq!(app.workspace.focused(), Some(card));
+            if !send {
+                assert_eq!(
+                    chat_runtime(&app, card).composer.text(),
+                    "keep this message"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_pane_keeps_attached_files() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("chat")
+        };
+        runtime.attachments.push(Attachment {
+            path: "/workspace/example.txt".into(),
+        });
+        let _ = app.select_worktree("/workspace/elsewhere".into(), false);
+        assert!(app.card_state(card).unwrap().existence.is_open());
     }
 
     #[test]

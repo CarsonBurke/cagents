@@ -225,6 +225,14 @@ impl State {
 }
 
 impl Cagents {
+    fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
+        let scope = self.select_channel(id);
+        if self.durable.active_channel != Some(id) {
+            return scope;
+        }
+        Task::batch([scope, self.ensure_default_pane()])
+    }
+
     pub(super) fn new_project_channel(&mut self) -> Task<Message> {
         let project = self
             .durable
@@ -338,15 +346,14 @@ impl Cagents {
                     });
                 self.publish_channel_creation(id, project_id);
                 self.sidebar_state.reveal_project(project_id);
-                let scope = self.select_channel(id);
-                let chat = self.new_native_thread();
+                let scope = self.open_channel_with_default(id);
                 self.persist();
-                Task::batch([scope, chat])
+                scope
             }
             // A channel being deleted is not somewhere to go; its row offers
             // nothing, and this refuses anything that raced it.
             Action::Open(id) if self.channel_ui.is_deleting(id) => Task::none(),
-            Action::Open(id) => self.select_channel(id),
+            Action::Open(id) => self.open_channel_with_default(id),
             Action::Delete(id) => {
                 if self.channel_ui.is_deleting(id) {
                     return Task::none();
@@ -948,7 +955,8 @@ mod tests {
             app.durable
                 .channels
                 .iter()
-                .all(|channel| channel.cards.len() == 1)
+                .all(|channel| { channel.cards.len() == usize::from(channel.id == third) }),
+            "only the active channel retains its unused default pane"
         );
         assert!(
             !app.modal_is_open(),

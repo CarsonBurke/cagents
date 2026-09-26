@@ -2560,6 +2560,8 @@ pub enum SettingsField {
     TerminalScrollbackLines,
     ManagedWorktreeDirectory,
     WorktreeSort,
+    DefaultWorktreePane,
+    DefaultChannelPane,
     DefaultColumnFraction,
     LinkOpenDestination,
     EditorAutoSave,
@@ -2655,6 +2657,8 @@ struct SettingsDraft {
     terminal_scrollback_lines: String,
     managed_worktree_directory: String,
     worktree_sort: String,
+    default_worktree_pane: settings::DefaultPane,
+    default_channel_pane: settings::DefaultPane,
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
@@ -2701,6 +2705,8 @@ impl SettingsDraft {
             }
             .into(),
             default_column_fraction: settings.default_column_fraction.to_string(),
+            default_worktree_pane: settings.default_worktree_pane,
+            default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
@@ -2733,6 +2739,16 @@ impl SettingsDraft {
             SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::WorktreeSort => self.worktree_sort = value,
+            SettingsField::DefaultWorktreePane => {
+                if let Some(pane) = settings::DefaultPane::from_key(&value) {
+                    self.default_worktree_pane = pane;
+                }
+            }
+            SettingsField::DefaultChannelPane => {
+                if let Some(pane) = settings::DefaultPane::from_key(&value) {
+                    self.default_channel_pane = pane;
+                }
+            }
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
@@ -2855,6 +2871,12 @@ fn settings_update(
             }
             _ => Err("Choose Newest, Oldest, or Alphabetical.".into()),
         },
+        SettingsField::DefaultWorktreePane => settings::DefaultPane::from_key(value)
+            .map(|pane| next.default_worktree_pane = pane)
+            .ok_or_else(|| "Choose Native chat or Terminal.".to_owned()),
+        SettingsField::DefaultChannelPane => settings::DefaultPane::from_key(value)
+            .map(|pane| next.default_channel_pane = pane)
+            .ok_or_else(|| "Choose Native chat or Terminal.".to_owned()),
         SettingsField::EditorAutoSave => value
             .parse::<bool>()
             .map(|enabled| next.editor_auto_save = enabled)
@@ -5486,15 +5508,17 @@ impl Cagents {
 
     fn persist(&mut self) {
         self.snapshot_workspace_scope();
+        let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
-            session.snapshot(Arc::clone(&self.durable));
+            session.snapshot(saved);
         }
     }
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
+                let saved = self.persistent_workspace();
                 if let Some(writer) = &self.session {
-                    writer.snapshot_conversion(Arc::clone(&self.durable));
+                    writer.snapshot_conversion(saved);
                 }
             }
             Some(false) => self.persist(),
@@ -5556,8 +5580,9 @@ impl Cagents {
             return;
         }
         self.snapshot_workspace_scope();
+        let saved = self.persistent_workspace();
         if let Some(writer) = &self.session {
-            writer.replace_chat_identity(card, expected, session, Arc::clone(&self.durable));
+            writer.replace_chat_identity(card, expected, session, saved);
         }
     }
 
@@ -5585,8 +5610,9 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
+        let saved = self.persistent_workspace();
         if let Some(writer) = &self.session {
-            writer.snapshot_conversion(Arc::clone(&self.durable));
+            writer.snapshot_conversion(saved);
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
@@ -9415,6 +9441,8 @@ impl Cagents {
                     | SettingsField::ChatEnterSends
                     | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
+                    | SettingsField::DefaultWorktreePane
+                    | SettingsField::DefaultChannelPane
                     | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
@@ -9857,6 +9885,9 @@ impl Application for Cagents {
             app.update_update_ui(update_ui::Action::Check),
             app.load_accounts(),
         ];
+        // Unused default chats are never saved. Recreate the active scope's
+        // placeholder only after restored runtimes have been initialized.
+        tasks.push(app.ensure_default_pane());
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
@@ -19300,6 +19331,52 @@ mod tests {
         };
         assert_eq!(updated.terminal_font_size, 16.0);
         assert_eq!(updated.sidebar_width, settings.sidebar_width);
+    }
+
+    #[test]
+    fn default_pane_preferences_update_independently_and_reject_invalid_choices() {
+        let settings = AppSettings::default();
+        for field in [
+            SettingsField::DefaultWorktreePane,
+            SettingsField::DefaultChannelPane,
+        ] {
+            assert_eq!(
+                settings_update(&settings, field, "native_chat"),
+                SettingsDecision::Unchanged
+            );
+            let SettingsDecision::Persist(updated) = settings_update(&settings, field, "terminal")
+            else {
+                panic!("changing the default pane must request persistence");
+            };
+            let mut draft = SettingsDraft::from_settings(&settings);
+            draft.set(field, "terminal".into());
+            assert_eq!(draft, SettingsDraft::from_settings(&updated));
+            if field == SettingsField::DefaultWorktreePane {
+                assert_eq!(
+                    updated.default_worktree_pane,
+                    settings::DefaultPane::Terminal
+                );
+                assert_eq!(
+                    updated.default_channel_pane,
+                    settings::DefaultPane::NativeChat
+                );
+            } else {
+                assert_eq!(
+                    updated.default_worktree_pane,
+                    settings::DefaultPane::NativeChat
+                );
+                assert_eq!(
+                    updated.default_channel_pane,
+                    settings::DefaultPane::Terminal
+                );
+            }
+            assert!(matches!(
+                settings_update(&updated, field, "unknown"),
+                SettingsDecision::Invalid(_)
+            ));
+            draft.set(field, "unknown".into());
+            assert_eq!(draft, SettingsDraft::from_settings(&updated));
+        }
     }
 
     #[test]

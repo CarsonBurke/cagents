@@ -584,6 +584,37 @@ impl EditorSyntaxTheme {
     }
 }
 
+/// The pane opened when visiting an empty worktree or channel.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultPane {
+    #[default]
+    NativeChat,
+    Terminal,
+}
+
+impl DefaultPane {
+    pub const ALL: [Self; 2] = [Self::NativeChat, Self::Terminal];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NativeChat => "Native chat",
+            Self::Terminal => "Terminal",
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::NativeChat => "native_chat",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|pane| pane.key() == key)
+    }
+}
+
 /// Settings are forward compatible, because mixed builds share one file and an
 /// older one must neither refuse to start nor erase what a newer one wrote. A
 /// key this build does not know is ignored, and a value it cannot read - a
@@ -636,6 +667,10 @@ pub struct AppSettings {
     pub managed_worktree_directory: String,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
+    #[serde(default)]
+    pub default_worktree_pane: DefaultPane,
+    #[serde(default)]
+    pub default_channel_pane: DefaultPane,
     #[serde(default = "default_editor_auto_save")]
     pub editor_auto_save: bool,
     #[serde(default)]
@@ -707,6 +742,8 @@ impl Default for AppSettings {
             pull_request_open_target: PullRequestOpenTarget::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
             worktree_sort: WorktreeSort::default(),
+            default_worktree_pane: DefaultPane::default(),
+            default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
             editor_wrap_lines: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
@@ -2224,6 +2261,37 @@ mod tests {
 
     fn path_in(directory: &tempfile::TempDir) -> PathBuf {
         directory.path().join("settings.toml")
+    }
+
+    #[test]
+    fn default_panes_are_independent_and_roundtrip_with_stable_keys() {
+        for worktree in DefaultPane::ALL {
+            for channel in DefaultPane::ALL {
+                let settings = AppSettings {
+                    default_worktree_pane: worktree,
+                    default_channel_pane: channel,
+                    ..AppSettings::default()
+                };
+                let written = toml::to_string(&settings).unwrap();
+                assert!(
+                    written.contains(&format!("default_worktree_pane = \"{}\"", worktree.key()))
+                );
+                assert!(written.contains(&format!("default_channel_pane = \"{}\"", channel.key())));
+                assert_eq!(toml::from_str::<AppSettings>(&written).unwrap(), settings);
+                assert_eq!(DefaultPane::from_key(worktree.key()), Some(worktree));
+            }
+        }
+    }
+
+    #[test]
+    fn settings_without_default_panes_open_native_chat_in_both_contexts() {
+        let mut previous = toml::Value::try_from(AppSettings::default()).unwrap();
+        let table = previous.as_table_mut().unwrap();
+        table.remove("default_worktree_pane");
+        table.remove("default_channel_pane");
+        let restored: AppSettings = previous.try_into().unwrap();
+        assert_eq!(restored.default_worktree_pane, DefaultPane::NativeChat);
+        assert_eq!(restored.default_channel_pane, DefaultPane::NativeChat);
     }
 
     #[test]
