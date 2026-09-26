@@ -456,7 +456,12 @@ impl Cagents {
                         changed = true;
                     }
                 }
-                None => match self.adopt_shared_channel(shared) {
+                None => match self.adopt_shared_channel(
+                    shared,
+                    model
+                        .project(&shared.repository)
+                        .map(|project| project.kind),
+                ) {
                     Adoption::Applied => changed = true,
                     Adoption::Opening(task) => tasks.push(task),
                     Adoption::Retained => {}
@@ -535,9 +540,13 @@ impl Cagents {
     }
 
     /// Shows a channel this window does not have.
-    fn adopt_shared_channel(&mut self, shared: &ModelChannel) -> Adoption {
+    fn adopt_shared_channel(
+        &mut self,
+        shared: &ModelChannel,
+        kind: Option<ProjectKind>,
+    ) -> Adoption {
         let Some(project_id) = self.project_for_repository(&shared.repository) else {
-            return self.open_shared_repository(&shared.repository);
+            return self.open_shared_repository(&shared.repository, kind);
         };
         Arc::make_mut(&mut self.durable)
             .channels
@@ -568,11 +577,11 @@ impl Cagents {
         if self.project_for_repository(&shared.repository).is_some() {
             return Adoption::Retained;
         }
-        self.open_shared_repository(&shared.repository)
+        self.open_shared_repository(&shared.repository, Some(shared.kind))
     }
 
     /// Reads a repository the shared model names and this window has not opened.
-    fn open_shared_repository(&mut self, repository: &Path) -> Adoption {
+    fn open_shared_repository(&mut self, repository: &Path, kind: Option<ProjectKind>) -> Adoption {
         // Once per path. `repository_load_task` mints a fresh `ProjectId` when
         // given none, so asking twice for one repository would leave the window
         // with two projects on one checkout.
@@ -597,7 +606,7 @@ impl Cagents {
         // terminal they never started - in every window at once. The project
         // still reaches the sidebar, because that is the load's own result
         // rather than a card's.
-        Adoption::Opening(self.repository_load_task(repository.to_path_buf(), None, false))
+        Adoption::Opening(self.project_load_task(repository.to_path_buf(), None, false, kind))
     }
 
     /// The local project that is the face of `repository`.
@@ -665,10 +674,12 @@ impl Cagents {
         };
         let repository = project.repository.clone();
         let name = project.name.clone();
+        let kind = project.kind;
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
         self.publish_model_edit(ModelEdit::OpenProject {
+            kind,
             repository: repository.clone(),
             name,
         });
@@ -696,7 +707,9 @@ impl Cagents {
             return;
         }
         let name = project.name.clone();
+        let kind = project.kind;
         self.publish_model_edit(ModelEdit::OpenProject {
+            kind,
             repository: repository.clone(),
             name,
         });
@@ -720,10 +733,19 @@ impl Cagents {
         }
         let repository = project.repository.clone();
         let name = project.name.clone();
+        let kind = project.kind;
         let edit = if self.project_ui.is_reopening(&repository) {
-            ModelEdit::ReopenProject { repository, name }
+            ModelEdit::ReopenProject {
+                repository,
+                name,
+                kind,
+            }
         } else {
-            ModelEdit::OpenProject { repository, name }
+            ModelEdit::OpenProject {
+                repository,
+                name,
+                kind,
+            }
         };
         self.publish_model_edit(edit);
     }
@@ -809,7 +831,9 @@ mod tests {
             app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
                 project,
                 generation,
-                Ok(()),
+                Ok(super::super::project_ui::ProjectSessionClosure::for_roots(
+                    vec![repository.clone()],
+                )),
             )),
         );
         assert!(app.sidebar_model.project(project).is_none());
@@ -829,6 +853,7 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 2,
             edit: ModelEdit::ReopenProject {
+                kind: Default::default(),
                 repository: repository.clone(),
                 name: "repo".into(),
             },
@@ -843,7 +868,9 @@ mod tests {
             app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
                 project,
                 generation,
-                Ok(()),
+                Ok(super::super::project_ui::ProjectSessionClosure::for_roots(
+                    vec![repository.clone()],
+                )),
             )),
         );
         assert!(app.sidebar_model.project(project).is_some());
@@ -856,6 +883,7 @@ mod tests {
         app.project_ui.reopening.insert(project, repository.clone());
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
+            kind: Default::default(),
             repository: repository.clone(),
             name: "repo".into(),
             ordinal: 1,
@@ -938,6 +966,30 @@ mod tests {
     /// started appeared in it. A project the registry names is news, not an
     /// instruction.
     #[test]
+    fn a_fresh_window_adopts_the_shared_folder_kind_without_git_rediscovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap();
+        std::fs::create_dir(repository.join(".git")).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.workspace_model = WorkspaceModel {
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "Folder".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            }],
+            ..registry(Vec::new())
+        };
+        let message = first_message(app.reconcile_workspace_model()).unwrap();
+        drop(app.update(message));
+        let project = app.sidebar_model.projects.first().unwrap();
+        assert_eq!(project.repository, repository);
+        assert_eq!(project.kind, ProjectKind::Folder);
+        assert!(project.worktrees.is_empty());
+        assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
     fn an_adopted_project_is_a_sidebar_row_and_takes_neither_a_card_nor_the_place() {
         let Some(checkout) = git_checkout() else {
             eprintln!("skipping: `git` is not available on PATH");
@@ -951,6 +1003,7 @@ mod tests {
             canonical_repository(&checkout.path().join(".git")).expect("an absolute key");
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                kind: Default::default(),
                 repository: repository.clone(),
                 name: "opened elsewhere".into(),
                 ordinal: 1,
@@ -1165,6 +1218,7 @@ mod tests {
             drain(&published),
             vec![
                 ModelEdit::OpenProject {
+                    kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),
                 },

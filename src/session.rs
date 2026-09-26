@@ -2876,6 +2876,7 @@ mod tests {
         let boot = BootId::new("boot-catalog");
         let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
         let project = ProjectState {
+            kind: Default::default(),
             id: ProjectId::new(),
             generation: 0,
             name: "cagents".into(),
@@ -2924,6 +2925,7 @@ mod tests {
         let boot = BootId::new("boot-recreate");
         let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
         let project = ProjectState {
+            kind: Default::default(),
             id: ProjectId::new(),
             generation: 0,
             name: "cagents".into(),
@@ -3353,6 +3355,7 @@ mod tests {
 
     fn project(name: &str) -> ProjectState {
         ProjectState {
+            kind: Default::default(),
             id: ProjectId::new(),
             generation: 0,
             name: name.into(),

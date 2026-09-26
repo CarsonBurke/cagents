@@ -262,6 +262,7 @@ impl Cagents {
         project_id: ProjectId,
         generation: u64,
         open_cards: bool,
+        kind: Option<ProjectKind>,
     ) -> Task<Message> {
         self.refresh_ui.schedule.started(project_id, Instant::now());
         let cancellation = CancellationToken::default();
@@ -272,9 +273,23 @@ impl Cagents {
         {
             previous.cancel();
         }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let kind = kind
+            .or_else(|| {
+                self.sidebar_model
+                    .projects
+                    .iter()
+                    .find(|project| project.id == project_id || project.repository == canonical)
+                    .map(|project| project.kind)
+            })
+            .or_else(|| {
+                self.workspace_model
+                    .project(&canonical)
+                    .map(|project| project.kind)
+            });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                load_repository(&path, Some(project_id), cancellation)
+                load_project(&path, Some(project_id), cancellation, kind)
             })
             .await
             .map_err(|error| format!("repository loader join failed: {error}"))

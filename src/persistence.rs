@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -619,12 +619,13 @@ impl StateStore {
             .prepare_cached(
                 "INSERT INTO projects (
                     project_id, generation, name, repository_json, existence_json,
-                    updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    updated_at_unix_ms, kind_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(project_id) DO UPDATE SET
                     generation = excluded.generation,
                     name = excluded.name,
                     repository_json = excluded.repository_json,
+                    kind_json = excluded.kind_json,
                     existence_json = excluded.existence_json,
                     updated_at_unix_ms = excluded.updated_at_unix_ms",
             )?
@@ -635,6 +636,7 @@ impl StateStore {
                 to_json(&project.repository)?,
                 to_json(&project.existence)?,
                 now_unix_ms(),
+                to_json(&project.kind)?,
             ])?;
         transaction.commit()?;
         Ok(next)
@@ -646,7 +648,7 @@ impl StateStore {
         inner
             .connection
             .query_row(
-                "SELECT generation, name, repository_json, existence_json
+                "SELECT generation, name, repository_json, existence_json, kind_json
                  FROM projects WHERE project_id = ?1",
                 [id.to_string()],
                 |row| {
@@ -654,16 +656,18 @@ impl StateStore {
                     let name: String = row.get(1)?;
                     let repository: String = row.get(2)?;
                     let existence: String = row.get(3)?;
-                    Ok((generation, name, repository, existence))
+                    let kind: String = row.get(4)?;
+                    Ok((generation, name, repository, existence, kind))
                 },
             )
             .optional()?
-            .map(|(generation, name, repository, existence)| {
+            .map(|(generation, name, repository, existence, kind)| {
                 Ok(ProjectState {
                     id,
                     generation: i64_to_u64(generation, "project generation")?,
                     name,
                     repository: from_json("project repository", &repository)?,
+                    kind: from_json("project kind", &kind)?,
                     existence: from_json("project existence", &existence)?,
                 })
             })
@@ -674,7 +678,7 @@ impl StateStore {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let mut statement = inner.connection.prepare(
-            "SELECT project_id, generation, name, repository_json, existence_json
+            "SELECT project_id, generation, name, repository_json, existence_json, kind_json
              FROM projects
              ORDER BY updated_at_unix_ms DESC, project_id",
         )?;
@@ -685,16 +689,18 @@ impl StateStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut projects = Vec::new();
         for row in rows {
-            let (id, generation, name, repository, existence) = row?;
+            let (id, generation, name, repository, existence, kind) = row?;
             projects.push(ProjectState {
                 id: parse_id("project", &id)?,
                 generation: i64_to_u64(generation, "project generation")?,
                 name,
                 repository: from_json("project repository", &repository)?,
+                kind: from_json("project kind", &kind)?,
                 existence: from_json("project existence", &existence)?,
             });
         }
@@ -1414,6 +1420,132 @@ pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(live)
 }
 
+/// Saved ownership evidence from another window. Directory scopes are not
+/// project identities: callers must classify them against current shared roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedSessionOwner {
+    Project(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Read one consistent snapshot without migrating or writing another window's
+/// database. Only open cards with explicit navigation ownership contribute.
+pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let transaction = connection.transaction()?;
+    let mut projects = HashMap::<ProjectId, PathBuf>::new();
+    let mut statement = transaction.prepare("SELECT project_id, repository_json FROM projects")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, path) = row?;
+        projects.insert(
+            parse_id("project", &id)?,
+            from_json("project repository", &path)?,
+        );
+    }
+    let mut statement = transaction.prepare("SELECT workspace_id FROM workspaces")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut owners = Vec::new();
+    for id in ids {
+        let Some(manifest) =
+            load_workspace_manifest_connection(&transaction, parse_id("workspace", &id)?)?
+        else {
+            continue;
+        };
+        if !manifest.existence.is_open() {
+            continue;
+        }
+        // Keep conflicting saved memberships visible. UI restore normalizes
+        // them, but removal must retain every foreign ownership claim.
+        let channels: Vec<ProjectChannel> = metadata(
+            &transaction,
+            &format!("workspace:{id}:navigation:{CHANNELS_FIELD}"),
+        )?
+        .map(|value| from_json("workspace channels", &value))
+        .transpose()?
+        .unwrap_or_default();
+        for card in manifest.cards.iter().filter(|card| {
+            card.existence.is_open()
+                && matches!(
+                    card.kind,
+                    PersistedCardKind::Terminal | PersistedCardKind::Chat
+                )
+        }) {
+            let mut card_owners = Vec::new();
+            for channel in channels
+                .iter()
+                .filter(|channel| channel.cards.contains(&card.id))
+            {
+                card_owners.push(SavedSessionOwner::Project(
+                    projects
+                        .get(&channel.project_id)
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(format!(
+                                "channel {} refers to missing project {}",
+                                channel.id, channel.project_id
+                            ))
+                        })?
+                        .clone(),
+                ));
+            }
+            if card_owners.is_empty()
+                && let Some(directory) = manifest.card_scopes.get(&card.id)
+            {
+                card_owners.push(SavedSessionOwner::Directory(directory.clone()));
+            }
+            if card_owners.is_empty() {
+                continue;
+            }
+            // Identity-only reads keep unopened older window schemas readable
+            // when terminal recipes gain new fields in a later migration.
+            let ids = match card.kind {
+                PersistedCardKind::Terminal => {
+                    let id: String = transaction.query_row(
+                        "SELECT terminal_id FROM terminal_recipes WHERE card_id = ?1",
+                        [card.id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    vec![parse_id("terminal", &id)?]
+                }
+                PersistedCardKind::Chat => {
+                    #[derive(serde::Deserialize)]
+                    struct Identity {
+                        id: TerminalId,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct ChatIdentity {
+                        id: TerminalId,
+                        terminal: Option<Identity>,
+                    }
+                    let content: String = transaction.query_row(
+                        "SELECT content_json FROM cards WHERE card_id = ?1",
+                        [card.id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    let chat: ChatIdentity = from_json("chat ownership", &content)?;
+                    let mut ids = vec![chat.id];
+                    if let Some(terminal) = chat.terminal {
+                        ids.push(terminal.id);
+                    }
+                    ids
+                }
+                _ => unreachable!("only terminal and chat summaries were selected"),
+            };
+            for id in ids {
+                owners.extend(card_owners.iter().cloned().map(|owner| (id, owner)));
+            }
+        }
+    }
+    Ok(owners)
+}
+
 fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>) -> Result<()> {
     for sql in [
         "SELECT terminal_id FROM terminal_recipes",
@@ -1746,6 +1878,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         if current < 6 {
             migrate_to_v6(&transaction)?;
+        }
+        if current < 7 {
+            transaction.execute_batch(
+                "ALTER TABLE projects ADD COLUMN kind_json TEXT NOT NULL DEFAULT '\"Git\"';",
+            )?;
         }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
@@ -4016,6 +4153,104 @@ mod tests {
     }
 
     #[test]
+    fn saved_session_ownership_reads_channels_and_scopes_without_changing_the_window() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("other-window.sqlite3");
+        let store = StateStore::open(&path, boot("owner")).unwrap();
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Child".into(),
+            repository: directory.path().join("parent/child"),
+            kind: crate::model::ProjectKind::Folder,
+            existence: Existence::Open,
+        };
+        store.save_project(&project).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("owner"));
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+            unreachable!()
+        };
+        let terminal_id = terminal.id;
+        workspace.channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Owned outside cwd".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let before = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![(
+                terminal_id,
+                SavedSessionOwner::Project(project.repository.clone())
+            )]
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            before.generation
+        );
+        let mut channels = workspace.channels.clone();
+        workspace.channels.clear();
+        workspace
+            .card_scopes
+            .insert(card, directory.path().join("parent/child"));
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![(
+                terminal_id,
+                SavedSessionOwner::Directory(directory.path().join("parent/child"))
+            )]
+        );
+        let other = ProjectState {
+            id: ProjectId::new(),
+            repository: directory.path().join("parent"),
+            ..project.clone()
+        };
+        store.save_project(&other).unwrap();
+        channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: other.id,
+            ..channels[0].clone()
+        });
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                params![
+                    to_json(&channels).unwrap(),
+                    format!("workspace:{}:navigation:{CHANNELS_FIELD}", workspace.id)
+                ],
+            )
+            .unwrap();
+        // Ownership must not need to restore a recipe or normalize away a
+        // contradictory claim in an older or damaged saved window.
+        connection
+            .execute("UPDATE terminal_recipes SET recipe_json = 'invalid'", [])
+            .unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![
+                (terminal_id, SavedSessionOwner::Project(project.repository)),
+                (terminal_id, SavedSessionOwner::Project(other.repository)),
+            ]
+        );
+    }
+
+    #[test]
     fn project_channels_round_trip_and_invalid_ownership_is_atomic() {
         let directory = tempdir().unwrap();
         let store =
@@ -4603,7 +4838,7 @@ mod tests {
         drop(connection);
 
         let store = StateStore::open(&path, boot("v6-boot")).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(
             restored
@@ -4701,6 +4936,55 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn project_kind_migration_preserves_git_and_round_trips_folders() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Existing repository".into(),
+            repository: directory.path().join("repository/.git"),
+            kind: crate::model::ProjectKind::Git,
+            existence: Existence::Open,
+        };
+        let store = StateStore::open(&path, boot("before")).unwrap();
+        store.save_project(&project).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("ALTER TABLE projects DROP COLUMN kind_json; PRAGMA user_version = 6;")
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open(&path, boot("after")).unwrap();
+        let restored = store.load_project(project.id).unwrap().unwrap();
+        assert_eq!(restored.kind, crate::model::ProjectKind::Git);
+        assert_eq!(restored.repository, project.repository);
+        let folder = ProjectState {
+            id: ProjectId::new(),
+            name: "Folder".into(),
+            repository: directory.path().join("plain"),
+            kind: crate::model::ProjectKind::Folder,
+            ..project
+        };
+        store.save_project(&folder).unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot("restored")).unwrap();
+        assert_eq!(
+            store.load_project(folder.id).unwrap().unwrap().kind,
+            crate::model::ProjectKind::Folder
+        );
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == folder.id
+                    && project.kind == crate::model::ProjectKind::Folder)
+        );
     }
 
     #[test]

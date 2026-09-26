@@ -16,10 +16,17 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 
 ## Workspace
 
-- **Projects** on the left lists repositories and their worktrees. Opening an
+- **Projects** on the left lists folders, repositories, and their worktrees. Opening an
   already registered repository selects it without duplicating the project or
   disturbing existing sessions. Selecting a worktree restores its panes;
   selecting it again does not create another terminal.
+- **Open folder** also accepts folders without Git. Select the project row to
+  work there with terminals, chats, channels, and the editor. The Files panel
+  lists children as you expand directories; Git actions appear only for Git
+  projects. Folder projects survive restarts. If you later run `git init`,
+  remove and reopen the project to enable Git features; existing open folder
+  projects keep their identity and channels. `cagents project open PATH` and
+  `cagents channel spawn --repository PATH` accept the same folders.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
   selected worktree or channel. Some settings and shortcut labels call a pane

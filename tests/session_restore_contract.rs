@@ -66,6 +66,7 @@ impl RestoreFixture {
             Url::parse("https://example.test/projects/cagents/activity").unwrap(),
         ];
         let project = ProjectState {
+            kind: Default::default(),
             id: project_id,
             generation: 0,
             name: "cagents".into(),

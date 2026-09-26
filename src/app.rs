@@ -67,8 +67,9 @@ use crate::{
     lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
         CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectState, RepositoryView, Residency, RuntimeError, TerminalContinuity,
-        TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
+        ProjectId, ProjectKind, ProjectState, RepositoryView, Residency, RuntimeError,
+        TerminalContinuity, TerminalExit, TerminalId, TerminalSession, WorkspaceState,
+        WorktreeState,
     },
     pull_request_review,
     repository::{
@@ -1692,7 +1693,7 @@ fn proven_pull_request_base(changes: &sidebar::BranchChanges, remotes: &[String]
 #[derive(Debug, Clone)]
 pub struct LoadedRepository {
     project: ProjectState,
-    repository: RepositoryInfo,
+    repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     github: GitHubAvailability,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
@@ -3090,6 +3091,12 @@ pub enum Message {
         request: u64,
         result: Result<Box<RepositorySnapshot>, String>,
     },
+    DirectoryFilesLoaded {
+        key: ActiveWorktreeKey,
+        request: u64,
+        query: String,
+        result: Result<Vec<repository_widget::RepositoryFile>, String>,
+    },
     /// One page of the bound worktree's history.
     SourceControlHistory {
         generation: u64,
@@ -3730,6 +3737,7 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceDestination {
+    Folder(ProjectId),
     Worktree(crate::model::WorktreeId),
     Channel(crate::model::ChannelId),
 }
@@ -3737,6 +3745,7 @@ enum WorkspaceDestination {
 impl WorkspaceDestination {
     fn from_action(action: &SidebarAction) -> Option<Self> {
         match action {
+            SidebarAction::OpenRepository { project_id, .. } => Some(Self::Folder(*project_id)),
             SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
             SidebarAction::OpenChannel { channel_id } => Some(Self::Channel(*channel_id)),
             _ => None,
@@ -4133,6 +4142,16 @@ impl Cagents {
         project_id: Option<ProjectId>,
         open_cards: bool,
     ) -> Task<Message> {
+        self.project_load_task(path, project_id, open_cards, None)
+    }
+
+    fn project_load_task(
+        &mut self,
+        path: PathBuf,
+        project_id: Option<ProjectId>,
+        open_cards: bool,
+        kind: Option<ProjectKind>,
+    ) -> Task<Message> {
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
@@ -4185,7 +4204,7 @@ impl Cagents {
             project.reloading = true;
         }
         self.github_availability.insert(project_id, availability);
-        self.repository_read_task(path, project_id, generation, open_cards)
+        self.repository_read_task(path, project_id, generation, open_cards, kind)
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -4347,7 +4366,7 @@ impl Cagents {
                     );
                 }
                 CardKind::Repository(view) => {
-                    let mut runtime = RepositoryRuntime::new(view);
+                    let mut runtime = self.repository_runtime(view);
                     runtime.set_auto_save(self.settings.editor_auto_save);
                     runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                     runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -4843,7 +4862,7 @@ impl Cagents {
             #[cfg(not(feature = "integrated-browser"))]
             CardKind::Browser(_) => unreachable!("browserless clones open externally"),
             CardKind::Repository(view) => {
-                let mut runtime = RepositoryRuntime::new(view);
+                let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -5351,6 +5370,30 @@ impl Cagents {
         .into()
     }
 
+    fn repository_runtime(&self, view: RepositoryView) -> RepositoryRuntime {
+        if self
+            .sidebar_model
+            .project(view.project)
+            .is_some_and(|project| project.kind == ProjectKind::Folder)
+        {
+            RepositoryRuntime::new_directory(view)
+        } else {
+            RepositoryRuntime::new(view)
+        }
+    }
+
+    fn folder_scope(&self, key: &ActiveWorktreeKey) -> bool {
+        self.sidebar_model
+            .project(key.project_id)
+            .is_some_and(|project| project.folder_key().as_ref() == Some(key))
+    }
+
+    fn active_folder_scope(&self) -> bool {
+        self.sidebar_state
+            .active_worktree()
+            .is_some_and(|key| self.folder_scope(key))
+    }
+
     fn add_repository_card(
         &mut self,
         project: ProjectId,
@@ -5381,7 +5424,7 @@ impl Cagents {
         durable.cards.push(card);
         durable.focused = Some(card_id);
         self.register_channel_card(card_id);
-        let mut runtime = RepositoryRuntime::new(view);
+        let mut runtime = self.repository_runtime(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -6153,7 +6196,7 @@ impl Cagents {
                 unreachable!("browserless retries return before mutating durable state")
             }
             CardKind::Repository(view) => {
-                let mut runtime = RepositoryRuntime::new(view);
+                let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -7509,12 +7552,17 @@ impl Cagents {
             return Some(WorkspaceDestination::Channel(id));
         }
         let path = self.active_workspace.as_deref()?;
-        self.sidebar_model
-            .projects
-            .iter()
-            .flat_map(|project| &project.worktrees)
-            .find(|worktree| worktree.path == path)
-            .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
+        self.sidebar_model.projects.iter().find_map(|project| {
+            if project.kind == ProjectKind::Folder && project.repository == path {
+                Some(WorkspaceDestination::Folder(project.id))
+            } else {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.path == path)
+                    .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
+            }
+        })
     }
 
     /// Preview workspaces in a frozen MRU order, committing on modifier release.
@@ -7543,11 +7591,16 @@ impl Cagents {
         // Select synchronously: the next key event must see this preview,
         // rather than queue another selection against an unchanged workspace.
         let task = match action {
+            SidebarAction::OpenRepository { repository, .. } => {
+                self.select_worktree(repository, true)
+            }
             SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
             SidebarAction::OpenChannel { channel_id } => {
                 self.handle_channel_ui(channel_ui::Action::Open(channel_id))
             }
-            _ => unreachable!("workspace destinations only contain worktrees and channels"),
+            _ => {
+                unreachable!("workspace destinations only contain folders, worktrees and channels")
+            }
         };
         if self.active_workspace_destination() != destination {
             self.workspace_history = previous_history;
@@ -7637,6 +7690,14 @@ impl Cagents {
             self.sidebar_model.source_control = None;
             return Task::none();
         };
+        if self.folder_scope(&key)
+            && matches!(
+                self.context_tab,
+                ContextTab::Changes | ContextTab::PullRequest
+            )
+        {
+            self.context_tab = ContextTab::Files;
+        }
         self.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
         self.source_control_snapshot_task(key)
     }
@@ -7645,6 +7706,9 @@ impl Cagents {
     /// tab is showing: a page is a `git log` walk, and a view nobody opened is
     /// not worth one.
     fn load_pending_history(&mut self) -> Task<Message> {
+        if self.active_folder_scope() {
+            return Task::none();
+        }
         if self.sidebar_state.changes_tab() != sidebar::ChangesTab::History {
             return Task::none();
         }
@@ -8267,6 +8331,44 @@ impl Cagents {
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
+        if self.folder_scope(&key) {
+            let directory = key.canonical_path.clone();
+            let expanded = self
+                .sidebar_state
+                .expanded_directory_paths()
+                .map(|path| path.as_path().to_path_buf())
+                .collect::<Vec<_>>();
+            let query = self.sidebar_state.files_query().to_owned();
+            let search = query.clone();
+            return cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    if !search.is_empty() {
+                        return repository_widget::search_directory_files_for_quick_open_cancellable(
+                            &directory, &search, &cancellation,
+                        );
+                    }
+                    let mut files = repository_widget::load_directory_files(&directory)?;
+                    for path in expanded {
+                        if cancellation.is_cancelled() {
+                            return Err("folder read cancelled".into());
+                        }
+                        files.extend(repository_widget::load_directory_listing(
+                            &directory, &path,
+                        )?);
+                    }
+                    Ok(files)
+                })
+                .await
+                .map_err(|error| format!("folder reader failed: {error}"))
+                .and_then(|result| result);
+                Message::DirectoryFilesLoaded {
+                    key,
+                    request,
+                    query,
+                    result,
+                }
+            });
+        }
         let worktree = key.canonical_path.clone();
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
         let options = crate::repository::SnapshotOptions {
@@ -8332,7 +8434,7 @@ impl Cagents {
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
     fn begin_mutation(&mut self, key: &ActiveWorktreeKey, kind: MutationKind) -> bool {
-        if !self.source_control_is_bound(key) {
+        if !self.source_control_is_bound(key) || self.folder_scope(key) {
             return false;
         }
         let Some(source) = self.sidebar_model.source_control.as_mut() else {
@@ -9721,6 +9823,7 @@ impl Application for Cagents {
                         .collect(),
                     Vec::new(),
                 )
+                .with_kind(project.kind)
             })
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
@@ -10171,7 +10274,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::OpenRepository => cosmic::task::future(async {
-                let dialog = file_chooser::open::Dialog::new().title("Open Git repository");
+                let dialog = file_chooser::open::Dialog::new().title("Open project folder");
                 let result = dialog
                     .open_folder()
                     .await
@@ -10247,15 +10350,15 @@ impl Application for Cagents {
                         };
                         let worktree = loaded
                             .repository
-                            .worktree_root
-                            .clone()
+                            .as_ref()
+                            .and_then(|repository| repository.worktree_root.clone())
                             .or_else(|| {
                                 loaded
                                     .worktrees
                                     .first()
                                     .map(|(record, _)| record.path.clone())
                             })
-                            .unwrap_or_else(|| loaded.repository.selected_path.clone());
+                            .unwrap_or_else(|| loaded.project.repository.clone());
                         // Reconcile before publishing either durable records or
                         // widget IDs. Concurrent adds have independent request
                         // IDs but still describe the same repository.
@@ -10263,7 +10366,9 @@ impl Application for Cagents {
                             self.sidebar_model.projects.iter_mut().find(|project| {
                                 project.id != project_id
                                     && (project.repository == loaded.project.repository
-                                        || project.repository_id == loaded.repository.id
+                                        || loaded.repository.as_ref().is_some_and(|repository| {
+                                            project.repository_id == repository.id
+                                        })
                                         || project.worktrees.iter().any(|known| {
                                             loaded
                                                 .worktrees
@@ -10402,12 +10507,19 @@ impl Application for Cagents {
                                 .map(|project| project.display_pull_requests().to_vec())
                                 .unwrap_or_default(),
                         };
-                        let mut sidebar_project = SidebarProject::from_repository(
-                            &loaded.project,
-                            &loaded.repository,
-                            worktrees,
-                            pull_requests,
-                        );
+                        let mut sidebar_project =
+                            SidebarProject::new(
+                                loaded.project.id,
+                                loaded.repository.as_ref().map_or(
+                                    RepositoryId(loaded.project.id.as_uuid()),
+                                    |repository| repository.id,
+                                ),
+                                loaded.project.name.clone(),
+                                loaded.project.repository.clone(),
+                                worktrees,
+                                pull_requests,
+                            )
+                            .with_kind(loaded.project.kind);
                         if let GitHubAvailability::Ready {
                             pull_requests: recent,
                             ..
@@ -10426,7 +10538,12 @@ impl Application for Cagents {
                         if !sidebar_project.github_ready {
                             sidebar_project.revoke_github();
                         }
-                        sidebar_project.github_status = loaded.github.label().into();
+                        sidebar_project.github_status =
+                            if loaded.project.kind == ProjectKind::Folder {
+                                "Folder project".into()
+                            } else {
+                                loaded.github.label().into()
+                            };
                         self.github_availability
                             .insert(project_id, loaded.github.clone());
                         if let Some(existing) = self
@@ -10797,6 +10914,9 @@ impl Application for Cagents {
                         project_id,
                         repository,
                     } => {
+                        if self.sidebar_model.project(project_id).is_some_and(|project| project.kind == ProjectKind::Folder) {
+                            return Task::none();
+                        }
                         self.worktree_dialog = Some(WorktreeDialog {
                             project_id,
                             repository,
@@ -10924,6 +11044,10 @@ impl Application for Cagents {
                         Task::none()
                     }
                     SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
+                    SidebarAction::ToggleDirectory { key, .. }
+                    | SidebarAction::FilesQueryChanged { key, .. } if self.folder_scope(&key) => {
+                        self.reload_source_control(&key)
+                    }
                     SidebarAction::ToggleSection { .. }
                     | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
@@ -12285,6 +12409,11 @@ impl Application for Cagents {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::SelectContextTab(tab) => {
+                if self.active_folder_scope()
+                    && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                {
+                    return Task::none();
+                }
                 let changed = self.context_tab != tab;
                 self.context_tab = tab;
                 if changed && let Some(key) = self.sidebar_state.active_worktree().cloned() {
@@ -12394,6 +12523,33 @@ impl Application for Cagents {
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
                 self.reconcile_notice_popup()
+            }
+            Message::DirectoryFilesLoaded {
+                key,
+                request,
+                query,
+                result,
+            } => {
+                if request != self.refresh_ui.source_generation
+                    || !self.source_control_is_bound(&key)
+                    || !self.folder_scope(&key)
+                {
+                    return Task::none();
+                }
+                self.refresh_ui.source_cancel = None;
+                self.sidebar_model.source_control = Some(match result {
+                    Ok(files) => {
+                        let mut source = SourceControlModel::directory_listing(key, &files);
+                        if !query.is_empty() {
+                            source.set_file_search(SourceControlModel::file_search_results(
+                                query, &files, 0,
+                            ));
+                        }
+                        source
+                    }
+                    Err(error) => SourceControlModel::failed(key, error),
+                });
+                Task::none()
             }
             Message::SourceControlLoaded {
                 key,
@@ -13055,9 +13211,9 @@ impl Application for Cagents {
                         )
                         .on_press(Message::NewTerminal)
                         .into(),
-                    widget::button::standard("Open repository")
+                    widget::button::standard("Open folder")
                         .id(widget::Id::new("empty.open-repository"))
-                        .name("Open repository")
+                        .name("Open folder")
                         .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
                         .on_press(Message::OpenRepository)
                         .into(),
@@ -13091,7 +13247,7 @@ impl Application for Cagents {
                         .into(),
                     widget::text::title2("Start a workspace").into(),
                     widget::text::body(
-                        "Open a repository for project context, or start a standalone terminal.",
+                        "Open a folder for project context, or start a standalone terminal.",
                     )
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                     .into(),
@@ -13400,6 +13556,44 @@ fn browser_command(
     Task::none()
 }
 
+fn load_project(
+    path: &Path,
+    project_id: Option<ProjectId>,
+    cancellation: CancellationToken,
+    kind: Option<ProjectKind>,
+) -> Result<LoadedRepository, String> {
+    let directory = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve project {}: {error}", path.display()))?;
+    let folder = match kind {
+        Some(ProjectKind::Folder) => true,
+        Some(ProjectKind::Git) => false,
+        None => {
+            let location = crate::project_location::discover(&directory)?;
+            location.kind == ProjectKind::Folder
+        }
+    };
+    if !folder {
+        return load_repository(&directory, project_id, cancellation);
+    }
+    std::fs::read_dir(&directory)
+        .map_err(|error| format!("could not read folder {}: {error}", directory.display()))?;
+    Ok(LoadedRepository {
+        project: ProjectState {
+            id: project_id.unwrap_or_default(),
+            generation: 0,
+            name: crate::workspace_model::repository_display_name(&directory),
+            repository: directory,
+            kind: ProjectKind::Folder,
+            existence: Existence::Open,
+        },
+        repository: None,
+        worktrees: Vec::new(),
+        github: GitHubAvailability::NotAssociated,
+        head_repositories: HashMap::new(),
+    })
+}
+
 fn load_repository(
     path: &Path,
     project_id: Option<ProjectId>,
@@ -13511,13 +13705,14 @@ fn load_repository(
     let name = crate::workspace_model::repository_display_name(&repository.common_dir);
     Ok(LoadedRepository {
         project: ProjectState {
+            kind: Default::default(),
             id: project_id.unwrap_or_default(),
             generation: 0,
             name,
             repository: repository.common_dir.clone(),
             existence: Existence::Open,
         },
-        repository,
+        repository: Some(repository),
         worktrees,
         github: github_availability,
         head_repositories,
@@ -17704,20 +17899,21 @@ mod tests {
         app.repository_generations.insert(healthy, 1);
         let loaded = LoadedRepository {
             project: ProjectState {
+                kind: Default::default(),
                 id: healthy,
                 generation: 0,
                 name: "healthy".into(),
                 repository: healthy_path.clone(),
                 existence: Existence::Open,
             },
-            repository: RepositoryInfo {
+            repository: Some(RepositoryInfo {
                 id: RepositoryId::new(),
                 selected_path: healthy_path.clone(),
                 common_dir: healthy_path.join(".git"),
                 git_dir: healthy_path.join(".git"),
                 worktree_root: Some(healthy_path.clone()),
                 is_bare: false,
-            },
+            }),
             worktrees: Vec::new(),
             github: GitHubAvailability::NotAssociated,
             head_repositories: HashMap::new(),
@@ -18918,6 +19114,7 @@ mod tests {
         std::fs::create_dir(&common).unwrap();
         std::os::unix::fs::symlink(&common, &alias).unwrap();
         let original = ProjectState {
+            kind: Default::default(),
             id: ProjectId::new(),
             generation: 7,
             name: "original".into(),
@@ -18925,6 +19122,7 @@ mod tests {
             existence: Existence::Open,
         };
         let duplicate = ProjectState {
+            kind: Default::default(),
             id: ProjectId::new(),
             generation: 3,
             repository: alias,
@@ -18946,6 +19144,130 @@ mod tests {
         reconcile_restored_projects(&mut projects, &mut worktrees, &[original.id]);
         assert_eq!(projects, vec![original]);
         assert_eq!(worktrees, expected);
+    }
+
+    #[test]
+    fn folder_projects_participate_in_workspace_history_alongside_git_and_channels() {
+        let mut app = context_inspector_test_app(false);
+        let folder = ProjectId::new();
+        let git = ProjectId::new();
+        let worktree = crate::model::WorktreeId::new();
+        let channel = crate::model::ChannelId::new();
+        app.sidebar_model.projects = vec![
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "Folder".into(),
+                "/folder".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+            SidebarProject::new(
+                git,
+                RepositoryId::new(),
+                "Git".into(),
+                "/git/.git".into(),
+                vec![SidebarWorktree::from_durable(
+                    worktree,
+                    "/git".into(),
+                    Some("main".into()),
+                )],
+                Vec::new(),
+            ),
+        ];
+        app.sidebar_model.projects[0]
+            .channels
+            .push(sidebar::SidebarChannel::new(
+                channel,
+                "Channel".into(),
+                false,
+                None,
+                false,
+                1,
+                true,
+                1,
+            ));
+        let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
+        let kinds: Vec<_> = destinations
+            .iter()
+            .filter_map(WorkspaceDestination::from_action)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WorkspaceDestination::Folder(folder),
+                WorkspaceDestination::Channel(channel),
+                WorkspaceDestination::Worktree(worktree)
+            ]
+        );
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Channel(channel)));
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Folder(folder)));
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Worktree(worktree)));
+        app.active_workspace = Some("/git".into());
+        let previous = app
+            .next_workspace(crate::workspace::FocusDirection::Right)
+            .unwrap();
+        assert_eq!(
+            WorkspaceDestination::from_action(&previous),
+            Some(WorkspaceDestination::Folder(folder))
+        );
+        app.active_workspace = Some("/folder".into());
+        assert_eq!(
+            app.active_workspace_destination(),
+            Some(WorkspaceDestination::Folder(folder))
+        );
+        app.sidebar_model.projects.remove(0);
+        assert!(
+            app.next_workspace(crate::workspace::FocusDirection::Right)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn folder_projects_select_a_directory_scope_and_keep_their_mode_on_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let loaded = load_project(&root, None, CancellationToken::default(), None).unwrap();
+        assert_eq!(loaded.project.kind, ProjectKind::Folder);
+        assert!(loaded.repository.is_none());
+        assert!(loaded.worktrees.is_empty());
+        let project = loaded.project.id;
+        let mut app = context_inspector_test_app(false);
+        app.repository_generations.insert(project, 1);
+        drop(app.update(repository_load_result(project, Ok(loaded))));
+        drop(app.select_worktree(root.clone(), false));
+        assert_eq!(app.active_workspace.as_ref(), Some(&root));
+        assert!(app.active_folder_scope());
+        assert_eq!(app.context_tab, ContextTab::Files);
+        let key = app.sidebar_model.worktree_at(&root).unwrap();
+        assert!(app.sidebar_model.contains_worktree(&key));
+        assert_eq!(key.project_id, project);
+        assert!(
+            app.repository_runtime(RepositoryView {
+                project,
+                repository: root.clone(),
+                worktree: root.clone(),
+            })
+            .is_directory_only()
+        );
+        drop(app.update(Message::SelectContextTab(ContextTab::Changes)));
+        assert_eq!(app.context_tab, ContextTab::Files);
+
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let refreshed = load_project(
+            &root,
+            Some(project),
+            CancellationToken::default(),
+            Some(ProjectKind::Folder),
+        )
+        .unwrap();
+        assert_eq!(refreshed.project.kind, ProjectKind::Folder);
+        assert_eq!(refreshed.project.repository, root);
+        assert!(load_project(&root, None, CancellationToken::default(), None).is_err());
     }
 
     #[test]
@@ -18983,16 +19305,27 @@ mod tests {
         let aliased =
             load_repository(&alias.join("subdir"), None, CancellationToken::default()).unwrap();
         let linked_load = load_repository(&linked, None, CancellationToken::default()).unwrap();
-        assert_eq!(first.repository.id, aliased.repository.id);
-        assert_eq!(first.repository.id, linked_load.repository.id);
+        assert_eq!(
+            first.repository.as_ref().unwrap().id,
+            aliased.repository.as_ref().unwrap().id
+        );
+        assert_eq!(
+            first.repository.as_ref().unwrap().id,
+            linked_load.repository.as_ref().unwrap().id
+        );
         let canonical_root = root.canonicalize().unwrap();
         let canonical_linked = linked.canonicalize().unwrap();
         assert_eq!(
-            aliased.repository.worktree_root.as_ref(),
+            aliased.repository.as_ref().unwrap().worktree_root.as_ref(),
             Some(&canonical_root)
         );
         assert_eq!(
-            linked_load.repository.worktree_root.as_ref(),
+            linked_load
+                .repository
+                .as_ref()
+                .unwrap()
+                .worktree_root
+                .as_ref(),
             Some(&canonical_linked)
         );
 

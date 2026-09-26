@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::ChannelId;
+use crate::model::{ChannelId, ProjectKind};
 
 /// The rank a channel carries before the registry has answered.
 ///
@@ -36,6 +36,8 @@ pub const PENDING_ORDINAL: u32 = u32::MAX;
 pub struct ModelProject {
     pub repository: PathBuf,
     pub name: String,
+    #[serde(default)]
+    pub kind: ProjectKind,
     /// Creation rank, assigned by the registry: strictly increasing, never
     /// reused.
     pub ordinal: u32,
@@ -114,8 +116,16 @@ impl WorkspaceModel {
     pub fn fold(&mut self, sequence: u64, edit: &ModelEdit) {
         self.sequence = sequence;
         match edit {
-            ModelEdit::OpenProject { repository, name }
-            | ModelEdit::ReopenProject { repository, name } => {
+            ModelEdit::OpenProject {
+                repository,
+                name,
+                kind,
+            }
+            | ModelEdit::ReopenProject {
+                repository,
+                name,
+                kind,
+            } => {
                 self.closed_projects.retain(|closed| closed != repository);
                 match self
                     .projects
@@ -126,6 +136,7 @@ impl WorkspaceModel {
                     None => self.projects.push(ModelProject {
                         repository: repository.clone(),
                         name: name.clone(),
+                        kind: *kind,
                         ordinal: PENDING_ORDINAL,
                     }),
                 }
@@ -172,11 +183,21 @@ impl WorkspaceModel {
 /// a window resynchronising against a registry that already has it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelEdit {
-    /// Upsert by path. A repeat updates the name and keeps the rank.
-    OpenProject { repository: PathBuf, name: String },
+    /// Upsert by path. A repeat updates the name and keeps the kind and rank.
+    OpenProject {
+        repository: PathBuf,
+        name: String,
+        #[serde(default)]
+        kind: ProjectKind,
+    },
     /// A deliberate user open may clear an earlier explicit removal. Routine
     /// sync upserts cannot, because one may have been queued before the close.
-    ReopenProject { repository: PathBuf, name: String },
+    ReopenProject {
+        repository: PathBuf,
+        name: String,
+        #[serde(default)]
+        kind: ProjectKind,
+    },
     /// Removes the project and every channel inside it. A project nobody has
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
@@ -203,13 +224,23 @@ impl ModelEdit {
     /// them or one project becomes two.
     pub fn canonicalized(self) -> Result<Self, String> {
         Ok(match self {
-            Self::OpenProject { repository, name } => Self::OpenProject {
+            Self::OpenProject {
+                repository,
+                name,
+                kind,
+            } => Self::OpenProject {
                 repository: canonical_repository(&repository)?,
                 name,
+                kind,
             },
-            Self::ReopenProject { repository, name } => Self::ReopenProject {
+            Self::ReopenProject {
+                repository,
+                name,
+                kind,
+            } => Self::ReopenProject {
                 repository: canonical_repository(&repository)?,
                 name,
+                kind,
             },
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,

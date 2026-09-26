@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
-    model::ChannelId,
+    model::{ChannelId, ProjectKind},
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
@@ -84,7 +84,7 @@ impl Registry {
         })?;
         let mut projects = self
             .db
-            .prepare("SELECT repository, name, ordinal FROM projects ORDER BY ordinal")
+            .prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let projects = projects
             .query_map([], |row| {
@@ -92,6 +92,17 @@ impl Registry {
                     repository: PathBuf::from(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     ordinal: row.get::<_, i64>(2)? as u32,
+                    kind: match row.get::<_, String>(3)?.as_str() {
+                        "git" => ProjectKind::Git,
+                        "folder" => ProjectKind::Folder,
+                        value => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                format!("unknown project kind {value}").into(),
+                            ));
+                        }
+                    },
                 })
             })
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
@@ -149,8 +160,16 @@ impl Registry {
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
-            ModelEdit::OpenProject { repository, name }
-            | ModelEdit::ReopenProject { repository, name } => {
+            ModelEdit::OpenProject {
+                repository,
+                name,
+                kind,
+            }
+            | ModelEdit::ReopenProject {
+                repository,
+                name,
+                kind,
+            } => {
                 let key = repository_key(repository)?;
                 let explicit = matches!(edit, ModelEdit::ReopenProject { .. });
                 let tombstoned: bool = transaction
@@ -197,9 +216,17 @@ impl Registry {
                             let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
                             transaction
                                 .execute(
-                                    "INSERT INTO projects(repository, name, ordinal) \
-                                 VALUES (?1, ?2, ?3)",
-                                    params![key, name, ordinal],
+                                    "INSERT INTO projects(repository, name, ordinal, kind) \
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                    params![
+                                        key,
+                                        name,
+                                        ordinal,
+                                        match kind {
+                                            ProjectKind::Git => "git",
+                                            ProjectKind::Folder => "folder",
+                                        }
+                                    ],
                                 )
                                 .map_err(|error| error.to_string())?;
                             true
@@ -447,6 +474,17 @@ fn migrate(db: &Connection) -> Result<(), String> {
          ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
+    let has_kind: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'kind')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_kind {
+        db.execute_batch("ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'));")
+            .map_err(|error| error.to_string())?;
+    }
     // The identity is minted here rather than in `at`, because this is the only
     // place that can tell a store being created from one being reopened: the
     // ignored insert is what makes minting happen exactly once, and a reopened
@@ -473,6 +511,7 @@ mod tests {
 
     fn open(repository: &str) -> ModelEdit {
         ModelEdit::OpenProject {
+            kind: Default::default(),
             repository: PathBuf::from(repository),
             name: repository.rsplit('/').next().unwrap().to_owned(),
         }
@@ -489,6 +528,52 @@ mod tests {
     /// Every real edit advances the sequence a watcher orders edges by, and
     /// creating a channel that already exists is not a real edit: the CLI, the
     /// window that made it and a reconnecting window all send the same create.
+    #[test]
+    fn project_kind_survives_registry_reopen_and_upserts_until_explicit_removal() {
+        let (mut registry, directory) = registry();
+        let path = directory.path().join("model.sqlite3");
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: "/folder".into(),
+                name: "Folder".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&path).unwrap();
+        let mut observed = registry.model().unwrap();
+        assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
+        let repeat = ModelEdit::ReopenProject {
+            repository: "/folder".into(),
+            name: "Renamed".into(),
+            kind: ProjectKind::Git,
+        };
+        let applied = registry.apply(&repeat).unwrap();
+        observed.fold(applied.model.sequence, &repeat);
+        assert_eq!(applied.model.projects[0].kind, ProjectKind::Folder);
+        assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/folder".into(),
+            })
+            .unwrap();
+        let reopened = registry.apply(&repeat).unwrap();
+        assert_eq!(reopened.model.projects[0].kind, ProjectKind::Git);
+    }
+
+    #[test]
+    fn registry_project_kind_migration_defaults_existing_rows_to_git() {
+        let (mut registry, directory) = registry();
+        registry.apply(&open("/old/.git")).unwrap();
+        registry
+            .db
+            .execute_batch("ALTER TABLE projects DROP COLUMN kind;")
+            .unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(registry.model().unwrap().projects[0].kind, ProjectKind::Git);
+    }
+
     #[test]
     fn sequence_advances_once_per_real_edit_and_a_repeated_create_is_not_one() {
         let (mut registry, _directory) = registry();
@@ -549,6 +634,7 @@ mod tests {
         assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
         let opened = registry
             .apply(&ModelEdit::ReopenProject {
+                kind: Default::default(),
                 repository: PathBuf::from("/tmp/one"),
                 name: "one".into(),
             })

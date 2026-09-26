@@ -2768,7 +2768,10 @@ impl RepositoryRuntime {
     /// has to know that before it waits for something that will never happen.
     #[must_use]
     pub fn can_open_file(&self, path: &Path) -> bool {
-        self.file(path).is_some_and(|file| !file.directory)
+        self.file(path).map_or_else(
+            || self.directory_only && crate::repository::RepoPath::parse(path).is_ok(),
+            |file| !file.directory,
+        )
     }
 
     pub fn listed_files(&self) -> &[RepositoryFile] {
@@ -4753,7 +4756,9 @@ impl RepositoryRuntime {
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
-            None if self.standalone && crate::repository::RepoPath::parse(&path).is_ok() => {
+            None if (self.standalone || self.directory_only)
+                && crate::repository::RepoPath::parse(&path).is_ok() =>
+            {
                 RepositoryFile {
                     path: path.clone(),
                     staged_old_path: None,
@@ -5296,7 +5301,10 @@ pub fn search_directory_files_for_quick_open_cancellable(
     search_directory_files(root, query, token).map(|(files, _)| files)
 }
 
-fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
+pub(crate) fn load_directory_listing(
+    root: &Path,
+    relative: &Path,
+) -> Result<Vec<RepositoryFile>, String> {
     use std::os::fd::AsRawFd;
     let handle_root = crate::fs_safety::Root::open(root).map_err(|error| error.to_string())?;
     let handle = if relative.as_os_str().is_empty() {
@@ -12983,6 +12991,26 @@ mod tests {
             runtime.editor_focus_target(card).is_none(),
             "the file list has no buffer for a caret to be in"
         );
+    }
+
+    #[test]
+    fn directory_editor_accepts_unlisted_nested_files_but_not_escaping_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+        });
+        let nested = Path::new("nested/child.txt");
+        assert!(runtime.can_open_file(nested));
+        assert!(!runtime.can_open_file(Path::new("../outside.txt")));
+        assert!(!runtime.can_open_file(Path::new("/outside.txt")));
+        drop(runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: nested.to_path_buf(),
+        }));
+        assert_eq!(runtime.selected_path(), Some(nested));
     }
 
     #[test]
