@@ -340,6 +340,7 @@ impl RuntimeStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectorAction {
     Close,
+    ToggleDiagnostics(CardId),
     Resize {
         width: f32,
     },
@@ -413,9 +414,11 @@ pub enum InspectorAction {
 /// A fact is inert unless it carries an `action`: the language-server sections
 /// need rows the reader can press, and only a footer [`Action`] could carry a
 /// message before. Every fact built by [`model_for_card`] leaves `action`
-/// unset and renders exactly as it did.
+/// unset. Internal facts are kept behind the pane diagnostics disclosure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
+    /// Internal state, shown only in the pane diagnostics disclosure.
+    diagnostic: bool,
     pub label: Cow<'static, str>,
     pub value: String,
     /// Rendered as Markdown instead of plain selectable text.
@@ -427,11 +430,17 @@ pub struct Fact {
 impl Fact {
     fn new(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Self {
         Self {
+            diagnostic: false,
             label: label.into(),
             value: value.into(),
             markdown: false,
             action: None,
         }
+    }
+
+    fn diagnostic(mut self) -> Self {
+        self.diagnostic = true;
+        self
     }
 
     fn markdown(mut self) -> Self {
@@ -527,15 +536,17 @@ pub fn model_for_card(
                         "Working directory",
                         session.launch.working_directory.display().to_string(),
                     ),
-                    Fact::new("Continuity", terminal_continuity_label(&session.continuity)),
+                    Fact::new("Continuity", terminal_continuity_label(&session.continuity))
+                        .diagnostic(),
                     Fact::new(
                         "Transcript",
                         session.transcript_path.as_ref().map_or_else(
                             || "Not recorded".into(),
                             |path| path.display().to_string(),
                         ),
-                    ),
-                    Fact::new("Session ID", session.id.to_string()),
+                    )
+                    .diagnostic(),
+                    Fact::new("Session ID", session.id.to_string()).diagnostic(),
                 ],
             ));
             actions.push(
@@ -560,7 +571,8 @@ pub fn model_for_card(
                             .as_deref()
                             .and_then(crate::workspace::normalize_card_name)
                             .unwrap_or_else(|| "Not established".into()),
-                    ),
+                    )
+                    .diagnostic(),
                     Fact::new(
                         "Working directory",
                         crate::workspace::normalize_card_name(
@@ -573,7 +585,7 @@ pub fn model_for_card(
                         )
                         .unwrap_or_else(|| "Unavailable".into()),
                     ),
-                    Fact::new("Session ID", session.id.to_string()),
+                    Fact::new("Session ID", session.id.to_string()).diagnostic(),
                 ],
             ));
             actions.push(Action::new(
@@ -587,7 +599,7 @@ pub fn model_for_card(
             sections.push(Section::new(
                 "Browser",
                 vec![
-                    Fact::new("Browser ID", session.id.to_string()),
+                    Fact::new("Browser ID", session.id.to_string()).diagnostic(),
                     Fact::new("URL", presented_location.into_inner()),
                     Fact::new(
                         "History",
@@ -597,7 +609,7 @@ pub fn model_for_card(
                             session.history.len()
                         ),
                     ),
-                    Fact::new("Restore", browser_fidelity_label(session.fidelity)),
+                    Fact::new("Restore", browser_fidelity_label(session.fidelity)).diagnostic(),
                 ],
             ));
             #[cfg(feature = "integrated-browser")]
@@ -631,7 +643,7 @@ pub fn model_for_card(
                 "Repository",
                 vec![
                     Fact::new("Worktree", view.worktree.display().to_string()),
-                    Fact::new("Git directory", view.repository.display().to_string()),
+                    Fact::new("Git directory", view.repository.display().to_string()).diagnostic(),
                 ],
             ));
             actions.push(
@@ -664,7 +676,7 @@ pub fn model_for_card(
                         "File status",
                         source.selected_status.as_deref().unwrap_or("Clean"),
                     ));
-                    facts.push(Fact::new("Document", source.document));
+                    facts.push(Fact::new("Document", source.document).diagnostic());
                 }
                 if let Some(error) = &source.document_error {
                     facts.push(Fact::new("Document error", error));
@@ -673,13 +685,13 @@ pub fn model_for_card(
                     facts.push(Fact::new("Markdown", mode));
                 }
                 if let Some(basis) = source.diff_basis {
-                    facts.push(Fact::new("Diff basis", basis));
+                    facts.push(Fact::new("Diff basis", basis).diagnostic());
                 }
                 if let Some(mode) = source.diff_mode {
-                    facts.push(Fact::new("Diff layout", mode));
+                    facts.push(Fact::new("Diff layout", mode).diagnostic());
                 }
                 if let Some(state) = source.diff_state {
-                    facts.push(Fact::new("Diff", state));
+                    facts.push(Fact::new("Diff", state).diagnostic());
                 }
                 if let Some(error) = &source.diff_error {
                     facts.push(Fact::new("Diff error", error));
@@ -854,7 +866,7 @@ pub fn model_for_card(
         "Status",
         vec![
             Fact::new("Runtime", runtime.label()),
-            Fact::new("Lifecycle", residency_label(&card.residency)),
+            Fact::new("Lifecycle", residency_label(&card.residency)).diagnostic(),
         ],
     ));
 
@@ -1813,7 +1825,11 @@ fn markdown_text(
     rich.into()
 }
 
-pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorAction> {
+pub fn view(
+    model: InspectorModel,
+    width: f32,
+    diagnostics_open: bool,
+) -> Element<'static, InspectorAction> {
     let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
         widget::icon::from_name(model.icon).size(16).into(),
@@ -1834,23 +1850,58 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     .align_y(Alignment::Center)
     .spacing(spacing.space_xxs);
 
-    let mut sections = Vec::with_capacity(model.sections.len() * 2);
-    for (index, section) in model.sections.into_iter().enumerate() {
-        if index > 0 {
+    // Commands stay within reach, before potentially long source and LSP results.
+    let mut sections = vec![SegmentedActions::new(model.actions).view()];
+    let mut diagnostics = Vec::new();
+    for section in model.sections {
+        let (internal, visible): (Vec<_>, Vec<_>) =
+            section.facts.into_iter().partition(|fact| fact.diagnostic);
+        if !visible.is_empty() {
             sections.push(crate::design::horizontal_rule().into());
+            sections.push(
+                InspectorSection::new(
+                    section.title.clone(),
+                    visible
+                        .into_iter()
+                        .map(|fact| fact_element(fact, spacing))
+                        .collect(),
+                )
+                .view(),
+            );
         }
-        let facts = section
-            .facts
-            .into_iter()
-            .map(|fact| fact_element(fact, spacing))
-            .collect();
-        sections.push(InspectorSection::new(section.title, facts).view());
+        if !internal.is_empty() {
+            diagnostics.push(
+                InspectorSection::new(
+                    section.title,
+                    internal
+                        .into_iter()
+                        .map(|fact| fact_element(fact, spacing))
+                        .collect(),
+                )
+                .view(),
+            );
+        }
     }
-    // Keep actions in the same scroll surface as details. A rich editor or
-    // language server can offer many actions; a fixed footer used to consume
-    // all available height and make the document details unreachable.
-    sections.push(crate::design::horizontal_rule().into());
-    sections.push(SegmentedActions::new(model.actions).view());
+    if !diagnostics.is_empty() {
+        sections.push(crate::design::horizontal_rule().into());
+        sections.push(
+            widget::button::text("Pane diagnostics")
+                .leading_icon(
+                    widget::icon::from_name(if diagnostics_open {
+                        "pan-down-symbolic"
+                    } else {
+                        "pan-end-symbolic"
+                    })
+                    .size(16),
+                )
+                .on_press(InspectorAction::ToggleDiagnostics(model.card_id))
+                .width(Length::Fill)
+                .into(),
+        );
+        if diagnostics_open {
+            sections.extend(diagnostics);
+        }
+    }
     let content = widget::scrollable(
         widget::container(
             widget::column::with_children(sections)
