@@ -38,6 +38,11 @@ use crate::{
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+// Close is acknowledged only after interruption and process teardown. Allow
+// those grace periods plus time to schedule the worker and deliver its reply.
+const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
+    .saturating_add(crate::chat::TERMINATE_GRACE)
+    .saturating_add(Duration::from_secs(8));
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -485,6 +490,8 @@ impl ControlClient {
     /// attaches first with the session as the inventory reported it. Closing
     /// interrupts the provider's work and frees the conversation; it is what
     /// worktree deletion does to the chats still running inside the directory.
+    /// Its response deadline covers the provider's interruption and process
+    /// termination grace periods; success still requires confirmed teardown.
     ///
     /// Attached, this connection is sent the chat's notifications until the
     /// close removes it - the interrupt the close delivers is itself reported
@@ -497,7 +504,10 @@ impl ControlClient {
         self.attached_chats.insert(chat_id);
         let closed = match self.request_strict(ClientRequest::ChatAttach { session }) {
             Ok(ServerResponse::ChatAttached { .. }) => self
-                .request_strict(ClientRequest::ChatClose { chat_id })
+                .request_with_deadline(
+                    ClientRequest::ChatClose { chat_id },
+                    Instant::now() + CHAT_CLOSE_TIMEOUT,
+                )
                 .and_then(|response| match response {
                     ServerResponse::ChatClosed { .. } => Ok(()),
                     response => Err(unexpected_response("a native chat close", &response)),
@@ -947,6 +957,26 @@ impl ControlClient {
         request: ClientRequest,
         streaming_terminal: Option<TerminalId>,
     ) -> Result<ServerResponse, ControlError> {
+        self.request_inner(request, streaming_terminal, None)
+    }
+
+    fn request_with_deadline(
+        &mut self,
+        request: ClientRequest,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        let result = self.request_inner(request, None, Some(deadline));
+        let restored = self.restore_read_timeout();
+        // Preserve the actual teardown/transport error if restoring also fails.
+        result.and_then(|response| restored.map(|()| response))
+    }
+
+    fn request_inner(
+        &mut self,
+        request: ClientRequest,
+        streaming_terminal: Option<TerminalId>,
+        deadline: Option<Instant>,
+    ) -> Result<ServerResponse, ControlError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         if self.next_request_id == 0 {
@@ -963,7 +993,14 @@ impl ControlClient {
         )?;
 
         loop {
-            let envelope = self.read_envelope()?;
+            let envelope = match deadline {
+                Some(deadline) => read_frame(&mut DeadlineReader {
+                    stream: &mut self.stream,
+                    deadline,
+                })?
+                .ok_or(ControlError::ConnectionClosed)?,
+                None => self.read_envelope()?,
+            };
             self.validate_pinned_envelope(&envelope)?;
             match envelope.request_id {
                 Some(actual) if actual != request_id => {
@@ -1046,6 +1083,27 @@ impl ControlClient {
         self.stream
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)
+    }
+}
+
+/// Bound the complete response, including unsolicited notifications and every
+/// partial frame read. A socket timeout alone restarts on each successful read.
+struct DeadlineReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daemon response deadline expired",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
     }
 }
 
@@ -3602,6 +3660,7 @@ mod tests {
 
         let mut client = ControlClient::from_stream(client_stream).unwrap();
         client.close_chat(session(closed)).unwrap();
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert!(matches!(
             client.close_chat(session(refused)),
             Err(ControlError::Remote {
@@ -3609,6 +3668,7 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         assert!(matches!(
             client.close_chat(session(elsewhere)),
             Err(ControlError::Remote {
@@ -3625,6 +3685,79 @@ mod tests {
                 ..
             })
         ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chat_close_deadline_bounds_notifications_and_restores_read_timeout() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let chat_id = TerminalId::new();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(close.request, ClientRequest::ChatClose { chat_id });
+            // Traffic continues longer than the complete request's budget.
+            for _ in 0..100 {
+                if write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: pinned.clone(),
+                        message: ServerMessage::ChatChanged { chat_id },
+                    },
+                )
+                .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client.attached_chats.insert(chat_id);
+        let started = Instant::now();
+        let error = client
+            .request_with_deadline(
+                ClientRequest::ChatClose { chat_id },
+                started + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ControlError::Frame(FrameError::Io(error))
+            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_deadline_bounds_partial_frame_reads() {
+        let (mut client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            for byte in 100_u32.to_be_bytes().into_iter().chain([0; 100]) {
+                if server_stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let error = read_frame::<ServerEnvelope>(&mut DeadlineReader {
+            stream: &mut client_stream,
+            deadline: started + Duration::from_millis(100),
+        })
+        .unwrap_err();
+        assert!(matches!(error, FrameError::Io(error)
+            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(client_stream);
         server.join().unwrap();
     }
 

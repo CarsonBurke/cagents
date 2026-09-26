@@ -4,6 +4,10 @@ use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 
+/// Grace periods shared with clients that must wait for confirmed teardown.
+pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(feature = "ui")]
 pub mod client;
 #[cfg(feature = "host")]

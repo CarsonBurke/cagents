@@ -232,7 +232,7 @@ impl Actor {
                     self.write_started.get_or_insert_with(Instant::now);
                 }
             }
-            if closing.is_some_and(|at: Instant| at.elapsed() > IO_TIMEOUT) {
+            if closing.is_some_and(|at: Instant| at.elapsed() > crate::chat::INTERRUPT_TIMEOUT) {
                 return Err(format!(
                     "Codex interruption/close was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
                 ));
