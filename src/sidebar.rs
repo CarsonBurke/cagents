@@ -54,9 +54,10 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-// `ROW_ICON_SIZE`/`STATUS_ICON_SIZE` are `crate::design`'s: the in-row icon
-// role is shared with the workspace chrome, and a second definition here is
-// how the two drifted apart.
+// Child navigation rows use smaller ink while retaining the shared hit targets.
+const CHILD_ROW_ICON_SIZE: u16 = 14;
+const CHILD_ROW_TEXT_SIZE: f32 = 12.0;
+// Controls and status indicators retain the shared workspace chrome sizes.
 
 /// Horizontal step between one row slot and the next, and the unit the rest of
 /// the grid is built from. A compile-time number rather than the theme's
@@ -4490,10 +4491,9 @@ impl RowInk {
 
 /// The color a navigation row's leading glyph takes.
 ///
-/// A state color always wins over the row's ink: it is news about the row,
-/// and muting it because nothing is open there would hide exactly what the
-/// user needs to see. Small and `Copy` so the style closure can carry it and
-/// resolve the color against the theme it draws with.
+/// Worktree pull requests retain their state colors; channel identity stays
+/// neutral, with activity shown separately in the indicator slot. Small and
+/// `Copy` so the style closure resolves it against the drawing theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlyphTone {
     Ink(RowInk),
@@ -4501,8 +4501,6 @@ enum GlyphTone {
     /// which no fixed color can say beside rows that are themselves either
     /// full or muted, so it stays one step below whatever the row's ink is.
     Draft(RowInk),
-    Danger,
-    Warning,
     PullRequest(PullRequestTone),
 }
 
@@ -4512,8 +4510,6 @@ impl GlyphTone {
             Self::Ink(ink) => ink.icon_color(theme),
             Self::Draft(RowInk::Full) => design::muted_icon_color(theme),
             Self::Draft(RowInk::Muted) => PullRequestTone::Draft.color(theme),
-            Self::Danger => theme.cosmic().destructive.base.into(),
-            Self::Warning => theme.cosmic().warning.base.into(),
             Self::PullRequest(tone) => tone.color(theme),
         }
     }
@@ -4527,15 +4523,7 @@ fn channel_ink(channel: &SidebarChannel) -> RowInk {
 }
 
 fn channel_glyph_tone(channel: &SidebarChannel) -> GlyphTone {
-    if channel.deletion == Some(RowDeletion::Deleting) {
-        GlyphTone::Ink(RowInk::Muted)
-    } else if channel.unread {
-        GlyphTone::Danger
-    } else if channel.activity == Some(crate::agent::ActivityState::Working) {
-        GlyphTone::Warning
-    } else {
-        GlyphTone::Ink(channel_ink(channel))
-    }
+    GlyphTone::Ink(channel_ink(channel))
 }
 
 /// A neutral pull request carries no news, so its glyph follows the row's ink
@@ -4573,7 +4561,7 @@ fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarActi
         return Some(status_icon(
             "agent-waiting-symbolic",
             "Channel needs attention",
-            BadgeTone::Danger,
+            BadgeTone::Neutral,
         ));
     }
     // A channel holds conversations rather than being one, and the count is
@@ -4660,7 +4648,8 @@ fn channel_view(
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let tone = channel_glyph_tone(channel);
     let glyph = widget::container(
-        widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic")).size(ROW_ICON_SIZE),
+        widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic"))
+            .size(CHILD_ROW_ICON_SIZE),
     )
     .class(theme::Container::custom(move |theme| {
         cosmic::iced::widget::container::Style {
@@ -4670,6 +4659,7 @@ fn channel_view(
     }));
     let label = (!compact).then(|| {
         design::body(&channel.title)
+            .size(CHILD_ROW_TEXT_SIZE)
             .class(channel_ink(channel).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -4875,6 +4865,7 @@ fn worktree_view<'a>(
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let label = (!compact).then(|| {
         design::body(&*chrome.label)
+            .size(CHILD_ROW_TEXT_SIZE)
             .class(deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -4889,7 +4880,7 @@ fn worktree_view<'a>(
         _ => worktree_indicator(worktree, agent_update, activity, compact),
     };
     let glyph = if deleting {
-        widget::container(widget::icon(worktree_icon()).size(ROW_ICON_SIZE))
+        widget::container(widget::icon(worktree_icon()).size(CHILD_ROW_ICON_SIZE))
             .class(theme::Container::custom(|theme| {
                 cosmic::iced::widget::container::Style {
                     icon_color: Some(design::muted_icon_color(theme)),
@@ -5231,7 +5222,7 @@ fn worktree_status_icon(
         .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
         .unwrap_or_else(|| (worktree_icon(), None));
     let tone = worktree_glyph_tone(pull_request, update, has_panes);
-    let glyph = widget::container(widget::icon(handle).size(ROW_ICON_SIZE)).class(
+    let glyph = widget::container(widget::icon(handle).size(CHILD_ROW_ICON_SIZE)).class(
         theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
             // Resolved here, against the theme this frame is drawing with: this
             // builder runs once per visible worktree row, and reaching for
@@ -9431,11 +9422,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// Rows with open panes keep full strength and the rest recede, but a
-    /// state color always wins: muting news because nothing is open there
-    /// would hide exactly what the user needs to see.
+    /// Rows with open panes keep full strength and the rest recede. Channel
+    /// activity never colors the identity glyph; pull requests retain their
+    /// meaningful state colors.
     #[test]
-    fn rows_without_panes_mute_unless_a_state_color_claims_the_glyph() {
+    fn rows_without_panes_mute_and_channel_glyphs_stay_neutral() {
         use crate::agent::ActivityState;
         assert_eq!(RowInk::of(true, false), RowInk::Full);
         assert_eq!(RowInk::of(false, true), RowInk::Full);
@@ -9468,11 +9459,13 @@ pub(crate) mod tests {
         );
         assert_eq!(
             channel_glyph_tone(&channel(Some(ActivityState::Working), false, true)),
-            GlyphTone::Warning
+            GlyphTone::Ink(RowInk::Full),
+            "working is shown by the indicator, not the glyph"
         );
         assert_eq!(
             channel_glyph_tone(&channel(None, true, false)),
-            GlyphTone::Danger
+            GlyphTone::Ink(RowInk::Full),
+            "unread channels keep neutral identity glyphs"
         );
         assert!(
             channel(None, false, false)
