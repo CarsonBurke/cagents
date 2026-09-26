@@ -174,8 +174,6 @@ struct HostedPublishedState {
     event_sequence: AtomicU64,
     activity: Mutex<Option<crate::model::TerminalOutputActivity>>,
     agent_activity: Mutex<Option<crate::agent::Activity>>,
-    agent_refresh_pending: AtomicBool,
-    agent_revision: AtomicU64,
     activity_current: AtomicBool,
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
@@ -214,8 +212,6 @@ impl HostedPublishedState {
             event_sequence: AtomicU64::new(0),
             activity: Mutex::new(None),
             agent_activity: Mutex::new(None),
-            agent_refresh_pending: AtomicBool::new(false),
-            agent_revision: AtomicU64::new(0),
             activity_current: AtomicBool::new(false),
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
@@ -599,7 +595,6 @@ enum ClientCommand {
     Resume { visible: bool },
     ShutdownTerminal(Sender<()>),
     Stop,
-    RefreshAgentActivity,
 }
 
 impl ClientCommand {
@@ -619,7 +614,6 @@ impl ClientCommand {
             Self::Resume { .. } => "resume terminal",
             Self::ShutdownTerminal(_) => "shutdown terminal",
             Self::Stop => "detach terminal",
-            Self::RefreshAgentActivity => "refresh terminal agent activity",
         }
     }
 
@@ -660,7 +654,6 @@ impl ClientCommand {
             },
             Self::ShutdownTerminal(_) => ClientRequest::ShutdownTerminal { terminal_id },
             Self::Stop => ClientRequest::Detach { terminal_id },
-            Self::RefreshAgentActivity => ClientRequest::RefreshAgentActivity { terminal_id },
         }
     }
 }
@@ -855,18 +848,6 @@ impl HostedTerminalHandle {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    pub fn refresh_agent_activity(&self) -> Result<(), TerminalSendError> {
-        let pending = &self.inner.published.agent_refresh_pending;
-        if pending.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        if let Err(error) = self.try_command(ClientCommand::RefreshAgentActivity) {
-            pending.store(false, Ordering::Release);
-            return Err(error);
-        }
-        Ok(())
-    }
-
     pub fn generation(&self) -> u64 {
         self.inner.published.generation.load(Ordering::Acquire)
     }
@@ -1034,7 +1015,6 @@ enum PendingRequest {
     Command(&'static str),
     Hibernate,
     Shutdown(Sender<()>),
-    AgentActivity(u64),
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
@@ -1321,9 +1301,6 @@ fn client_loop(
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         });
         published.invalidate_activity();
-        published
-            .agent_refresh_pending
-            .store(false, Ordering::Release);
         let _ = published.observe_agent_activity(&events, None);
         match end {
             ConnectionEnd::Stop => break,
@@ -1689,20 +1666,6 @@ fn serve_connection(
             }
             let operation = command.operation();
             let pending_kind = match &command {
-                ClientCommand::RefreshAgentActivity => {
-                    // A reconnect can retain one queued command while a poll
-                    // is racing it; keep only one request on this connection.
-                    if pending
-                        .values()
-                        .any(|kind| matches!(kind, PendingRequest::AgentActivity(_)))
-                    {
-                        continue;
-                    }
-                    published
-                        .agent_refresh_pending
-                        .store(true, Ordering::Release);
-                    PendingRequest::AgentActivity(published.agent_revision.load(Ordering::Acquire))
-                }
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -1785,22 +1748,6 @@ fn serve_connection(
                     return ConnectionEnd::Retry;
                 };
                 match (kind, response) {
-                    (
-                        PendingRequest::AgentActivity(revision),
-                        ServerResponse::AgentActivity {
-                            terminal_id: response_id,
-                            activity,
-                        },
-                    ) if response_id == terminal_id => {
-                        published
-                            .agent_refresh_pending
-                            .store(false, Ordering::Release);
-                        if revision == published.agent_revision.load(Ordering::Acquire)
-                            && published.observe_agent_activity(events, activity).is_err()
-                        {
-                            return ConnectionEnd::Retry;
-                        }
-                    }
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
@@ -1925,15 +1872,6 @@ fn serve_connection(
                 };
                 let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {
-                    Some(PendingRequest::AgentActivity(_)) => {
-                        published
-                            .agent_refresh_pending
-                            .store(false, Ordering::Release);
-                        if published.observe_agent_activity(events, None).is_err() {
-                            return ConnectionEnd::Retry;
-                        }
-                        "refresh terminal agent activity"
-                    }
                     Some(PendingRequest::Attach) => {
                         attachment_failed = true;
                         published.mark_detached();
@@ -2113,18 +2051,19 @@ fn accept_server_event(
     }
     match event {
         TerminalEvent::AgentActivityChanged(activity) => {
-            published.agent_revision.fetch_add(1, Ordering::AcqRel);
             published.observe_agent_activity(events, activity)?;
         }
         event => {
+            // Recovery metadata can change without an activity transition.
+            // The daemon independently emits identity/activity clears. Clearing
+            // here would lose a stable Working state until its next change,
+            // since clients no longer poll to repair it.
             if matches!(
                 event,
-                TerminalEvent::ResumeHintChanged(_)
-                    | TerminalEvent::Exited { .. }
+                TerminalEvent::Exited { .. }
                     | TerminalEvent::Completed { .. }
                     | TerminalEvent::Error { .. }
             ) {
-                published.agent_revision.fetch_add(1, Ordering::AcqRel);
                 published.observe_agent_activity(events, None)?;
             }
             events.try_send(event)?;
@@ -2460,6 +2399,41 @@ mod tests {
             state: ActivityState::Working,
         });
         assert!(published.observe_agent_activity(&events, None).is_err());
+        assert_eq!(*published.agent_activity.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_metadata_does_not_erase_pushed_activity() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let (published, _) = published_state(false);
+        let (events, received) = crossbeam_channel::bounded(8);
+        let working = Some(Activity {
+            provider: Provider::Claude,
+            state: ActivityState::Working,
+        });
+        accept_server_event(
+            &events,
+            &published,
+            1,
+            TerminalEvent::AgentActivityChanged(working),
+        )
+        .unwrap();
+        accept_server_event(
+            &events,
+            &published,
+            2,
+            TerminalEvent::ResumeHintChanged(Some("new recovery evidence".into())),
+        )
+        .unwrap();
+        assert_eq!(*published.agent_activity.lock().unwrap(), working);
+        assert_eq!(received.try_iter().count(), 2, "no invented activity clear");
+        accept_server_event(
+            &events,
+            &published,
+            3,
+            TerminalEvent::AgentActivityChanged(None),
+        )
+        .unwrap();
         assert_eq!(*published.agent_activity.lock().unwrap(), None);
     }
 

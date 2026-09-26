@@ -14,7 +14,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -187,6 +187,10 @@ struct PublishedState {
     capture_rx: Receiver<()>,
     activity: Mutex<Option<TerminalOutputActivity>>,
     agent_activity: Mutex<Option<crate::agent::Activity>>,
+    agent_process: Mutex<Option<AgentProcess>>,
+    agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
+    conversation_title: Mutex<Option<String>>,
     completed: AtomicBool,
     /// The newest generation a wake has already announced to the subscriber
     /// side of this protocol.
@@ -216,12 +220,32 @@ impl PublishedState {
             capture_rx,
             activity: Mutex::new(None),
             agent_activity: Mutex::new(None),
+            agent_process: Mutex::new(None),
+            agent_observer: OnceLock::new(),
+            semantic_events: OnceLock::new(),
+            conversation_title: Mutex::new(None),
             completed: AtomicBool::new(false),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
             wake,
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
+        }
+    }
+
+    fn set_agent_activity(&self, activity: Option<crate::agent::Activity>) {
+        let mut current = self
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if *current != activity {
+            *current = activity;
+            // Serialize metadata and its edge, including timeout invalidation
+            // from another thread. The weak sender cannot keep a dead worker's
+            // semantic stream open through its host event receiver.
+            if let Some(events) = self.semantic_events.get().and_then(Weak::upgrade) {
+                let _ = events.send(TerminalEvent::AgentActivityChanged(activity));
+            }
         }
     }
 
@@ -414,6 +438,23 @@ impl TerminalHandle {
         process
     }
 
+    /// Process discovery belongs to the PTY owner, independently of GUI clients.
+    pub(crate) fn cached_agent_process(&self) -> Option<AgentProcess> {
+        self.inner
+            .published
+            .agent_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_agent_process_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
+        let _ = self.inner.published.agent_observer.set(Arc::new(observer));
+        if let Some(observer) = self.inner.published.agent_observer.get() {
+            observer();
+        }
+    }
+
     pub(crate) fn apply_agent_activity(
         &self,
         process: AgentProcess,
@@ -442,13 +483,7 @@ impl TerminalHandle {
 
     fn invalidate_agent_activity(&self) {
         // A failed owner request cannot leave attach descriptors claiming work.
-        // Its hosted response independently publishes the scalar clear.
-        *self
-            .inner
-            .published
-            .agent_activity
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.inner.published.set_agent_activity(None);
     }
 
     /// True only after final capture, PTY teardown and reader/reaper cleanup.
@@ -686,6 +721,7 @@ struct Worker {
     /// Current timer interval for foreground observation. Grows while the
     /// foreground process group is unchanged and no agent was found.
     foreground_poll: Duration,
+    last_foreground_observation: std::time::Instant,
     agent_provider: Option<crate::agent::Provider>,
     agent_process: Option<AgentProcess>,
     display_title: String,
@@ -712,7 +748,7 @@ struct Worker {
     applied_parser_size: TerminalSize,
     commands: Receiver<Command>,
     pty_rx: Receiver<PtyMessage>,
-    events: Sender<TerminalEvent>,
+    events: Arc<Sender<TerminalEvent>>,
     transcript: Option<TranscriptWriter>,
     published: Arc<PublishedState>,
     master: holder::PtyMaster,
@@ -929,11 +965,15 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
 
+        let events = Arc::new(events);
+        let _ = published.semantic_events.set(Arc::downgrade(&events));
+
         Ok(Self {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
             resume_foreground: None,
             foreground_poll: FOREGROUND_POLL_MIN,
+            last_foreground_observation: std::time::Instant::now(),
             agent_provider: None,
             agent_process: None,
             display_title: String::new(),
@@ -985,6 +1025,11 @@ impl Worker {
         let mut shutting_down = false;
         let mut carried_command = None;
         while !shutting_down && (pty_open || !exited) {
+            // Output or a busy input queue must not keep resetting discovery's
+            // timeout: an agent can start in an existing shell's process group.
+            if self.last_foreground_observation.elapsed() >= self.foreground_poll {
+                self.observe_foreground();
+            }
             let event = carried_command
                 .take()
                 .map(|command| WorkerEvent::Command(Some(command)))
@@ -996,7 +1041,8 @@ impl Worker {
                         &self.published.capture_rx,
                         pty_open,
                         !exited,
-                        self.foreground_poll,
+                        self.foreground_poll
+                            .saturating_sub(self.last_foreground_observation.elapsed()),
                     )
                 });
             match event {
@@ -1117,8 +1163,7 @@ impl Worker {
             self.root_exit = Some(event.clone());
             self.agent_exited = true;
             self.agent_provider = None;
-            self.agent_process = None;
-            self.set_agent_activity(None);
+            self.adopt_agent_process(None);
             self.emit(event);
         }
     }
@@ -1234,9 +1279,7 @@ impl Worker {
                 };
                 self.set_agent_activity(activity);
                 if valid && let Some(title) = title {
-                    self.emit(TerminalEvent::ConversationTitleChanged(
-                        title.chars().take(256).collect(),
-                    ));
+                    self.set_conversation_title(title);
                 }
                 let _ = reply.send(
                     *self
@@ -1643,9 +1686,7 @@ impl Worker {
                                 .provider
                                 .conversation_title(&title, &process.launch.working_directory)
                         {
-                            self.emit(TerminalEvent::ConversationTitleChanged(
-                                name.chars().take(256).collect(),
-                            ));
+                            self.set_conversation_title(name.into());
                         }
                         let display = canonical_agent_title(&title, observed);
                         if display != self.display_title {
@@ -1767,24 +1808,37 @@ impl Worker {
     }
 
     fn adopt_agent_process(&mut self, process: Option<AgentProcess>) {
+        let changed = process != self.agent_process;
         if process.is_none() || process != self.agent_process {
             self.set_agent_activity(process.as_ref().map(|process| crate::agent::Activity {
                 provider: process.provider,
                 state: crate::agent::ActivityState::Unknown,
             }));
         }
-        self.agent_process = process;
+        self.agent_process = process.clone();
+        if changed {
+            *self
+                .published
+                .agent_process
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = process;
+            if let Some(observer) = self.published.agent_observer.get() {
+                observer();
+            }
+        }
     }
 
     /// Timer-driven observation. The descent is only worth its cost while the
     /// foreground group is moving, so an unchanged group backs the interval
-    /// off and skips the walk outright once it has found no agent to track.
+    /// off. It must still be sampled: `exec claude` or a child without shell job
+    /// control can become an agent without changing the foreground group.
     ///
     /// A hidden terminal is still observed, at the longest interval: its saved
     /// resume hint is what recovery relies on when the daemon goes away, and
     /// an agent can `/resume` or `/clear` into another conversation without
     /// ever leaving the foreground or drawing a title anyone sees.
     fn observe_foreground(&mut self) {
+        self.last_foreground_observation = std::time::Instant::now();
         if self.agent_exited {
             // Nothing here can change again, so let the timer settle to its
             // longest interval rather than waking for the rest of its life.
@@ -1793,9 +1847,6 @@ impl Worker {
         }
         if self.foreground_group() == self.resume_foreground {
             self.foreground_poll = (self.foreground_poll * 2).min(FOREGROUND_POLL_MAX);
-            if self.agent_process.is_none() {
-                return;
-            }
         }
         self.refresh_resume_hint(true);
         if self.visibility != Visibility::Visible {
@@ -1808,6 +1859,7 @@ impl Worker {
         if !force && self.resume_foreground == foreground {
             return;
         }
+        self.last_foreground_observation = std::time::Instant::now();
         if self.resume_foreground != foreground {
             // The group moved: observe promptly again until it settles.
             self.foreground_poll = FOREGROUND_POLL_MIN;
@@ -1838,17 +1890,20 @@ impl Worker {
     }
 
     fn set_agent_activity(&self, activity: Option<crate::agent::Activity>) {
+        self.published.set_agent_activity(activity);
+    }
+
+    fn set_conversation_title(&self, title: String) {
+        let title: String = title.chars().take(256).collect();
         let mut current = self
             .published
-            .agent_activity
+            .conversation_title
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if *current == activity {
-            return;
+            .unwrap_or_else(|p| p.into_inner());
+        if current.as_ref() != Some(&title) {
+            *current = Some(title.clone());
+            self.emit(TerminalEvent::ConversationTitleChanged(title));
         }
-        *current = activity;
-        drop(current);
-        self.emit(TerminalEvent::AgentActivityChanged(activity));
     }
 
     fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
@@ -3189,6 +3244,104 @@ mod tests {
     }
 
     #[test]
+    fn agent_process_edges_wake_even_when_the_activity_scalar_is_unchanged() {
+        let (mut worker, events) = capture_worker();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        assert!(
+            worker
+                .published
+                .agent_observer
+                .set(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                }))
+                .is_ok()
+        );
+        let mut process = AgentProcess {
+            pid: 1,
+            start: 2,
+            provider: crate::agent::Provider::Claude,
+            launch: worker.launch.clone(),
+            recovery: worker.launch.clone(),
+        };
+        worker.adopt_agent_process(Some(process.clone()));
+        worker.adopt_agent_process(Some(process.clone()));
+        assert_eq!(wakes.load(Ordering::Acquire), 1);
+        process.start += 1;
+        worker.adopt_agent_process(Some(process.clone()));
+        assert_eq!(wakes.load(Ordering::Acquire), 2);
+        assert_eq!(
+            *worker.published.agent_process.lock().unwrap(),
+            Some(process)
+        );
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, TerminalEvent::AgentActivityChanged(_)))
+                .count(),
+            1,
+            "replacing Unknown with Unknown wakes discovery, not subscribers"
+        );
+        worker.published.set_agent_activity(None);
+        worker.published.set_agent_activity(None);
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, TerminalEvent::AgentActivityChanged(None)))
+                .count(),
+            1,
+            "owner timeout clears are pushed exactly once"
+        );
+        worker.set_conversation_title("Same conversation".into());
+        worker.set_conversation_title("Same conversation".into());
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, TerminalEvent::ConversationTitleChanged(_)))
+                .count(),
+            1
+        );
+        worker.adopt_agent_process(None);
+        assert_eq!(wakes.load(Ordering::Acquire), 3);
+        assert!(worker.published.agent_process.lock().unwrap().is_none());
+        worker.run();
+    }
+
+    #[test]
+    fn foreground_sampling_discovers_shell_exec_without_a_process_group_change() {
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        symlink("/bin/sleep", &executable).unwrap();
+        let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; exec \"$AGENT\" 10".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([("AGENT".into(), executable.to_str().unwrap().into())]),
+        });
+        worker.observe_foreground();
+        let original_group = worker.foreground_group();
+        assert!(original_group.is_some());
+        assert!(worker.agent_process.is_none());
+        worker.write_pty(b"start\n", "fixture input");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while worker.agent_process.is_none() {
+            worker.observe_foreground();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unchanged foreground group hid shell exec"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.foreground_group(), original_group);
+        assert_eq!(
+            worker.agent_process.as_ref().unwrap().provider,
+            crate::agent::Provider::Claude
+        );
+        assert!(worker.published.agent_process.lock().unwrap().is_some());
+        worker.run();
+    }
+
+    #[test]
     fn foreground_observation_backs_off_and_slows_for_unwatched_terminals() {
         // A long-lived child keeps the foreground group stable for the whole
         // test, so every tick below takes its "nothing changed" path.
@@ -3202,8 +3355,7 @@ mod tests {
         worker.resume_foreground = worker.foreground_group();
         assert!(worker.agent_process.is_none());
 
-        // With the same group and no agent to track, the walk is skipped and
-        // the interval stretches instead of descending /proc every 2s forever.
+        // With the same group and no agent to track, the interval stretches instead of descending /proc every 2s forever.
         worker.observe_foreground();
         assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN * 2);
         worker.observe_foreground();

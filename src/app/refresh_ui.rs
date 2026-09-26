@@ -183,7 +183,6 @@ impl Cagents {
                 if !regained {
                     return Task::none();
                 }
-                self.poll_terminal_agent_activity(None);
                 true
             }
             Action::Tick => false,

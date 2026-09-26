@@ -3128,10 +3128,6 @@ pub enum Message {
         committed: bool,
     },
     NewTerminal,
-    /// Polls the agents whose hibernation matches, or every agent for `None`.
-    PollTerminalAgentActivity {
-        hibernated: Option<bool>,
-    },
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -10211,10 +10207,6 @@ impl Application for Cagents {
                 }
         );
         let task = match message {
-            Message::PollTerminalAgentActivity { hibernated } => {
-                self.poll_terminal_agent_activity(hibernated);
-                Task::none()
-            }
             Message::NewTerminal => self.add_terminal(
                 self.terminal_directory()
                     .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
@@ -12803,7 +12795,6 @@ impl Application for Cagents {
             self.git_subscription(),
             self.account_subscription(),
             self.document_tone_subscription(),
-            self.terminal_agent_activity_subscription(),
             self.update_subscription(),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
