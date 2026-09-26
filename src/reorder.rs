@@ -623,6 +623,149 @@ mod tests {
     }
 
     #[test]
+    fn queued_pointer_events_keep_their_targets_across_view_rebuilds() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        let ids = [CardId::new(), CardId::new()];
+        let mut renderer = Surface::new(&ids, false).renderer;
+        let moved = |x| {
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, 15.0),
+            })
+        };
+        let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+
+        for rebuild in [false, true] {
+            let mut ui = UserInterface::build(
+                tabs(&ids, false),
+                Size::new(160.0, 30.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let events = if rebuild {
+                let _ = ui.update(
+                    &[moved(10.0)],
+                    mouse::Cursor::Available(Point::new(10.0, 15.0)),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                ui = UserInterface::build(
+                    tabs(&ids, false),
+                    Size::new(160.0, 30.0),
+                    ui.into_cache(),
+                    &mut renderer,
+                );
+                // Winit may redraw at the batch's final pointer position before
+                // draining the queued press/move/release at AboutToWait.
+                let _ = ui.update(
+                    &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    ))],
+                    mouse::Cursor::Available(Point::new(150.0, 15.0)),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+                vec![press.clone(), moved(150.0), release.clone()]
+            } else {
+                vec![moved(10.0), press.clone(), moved(150.0), release.clone()]
+            };
+            let (_, statuses) = ui.update(
+                &events,
+                mouse::Cursor::Available(Point::new(150.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses.len(), events.len());
+            assert_eq!(
+                messages,
+                vec![Action::Drop(ids[0], None)],
+                "rebuild={rebuild}"
+            );
+        }
+
+        // A complete click must also retain its target when the pointer moves
+        // elsewhere before the window dispatches the pending input.
+        let mut ui = UserInterface::build(
+            tabs(&ids, false),
+            Size::new(160.0, 30.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[moved(70.0), press, release, moved(150.0)],
+            mouse::Cursor::Available(Point::new(150.0, 15.0)),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, vec![Action::Close(ids[0])]);
+
+        // Leaving the window after a completed click must not erase that
+        // click's position; a release after leaving must not close anything.
+        for (events, expected) in [
+            (
+                vec![
+                    moved(70.0),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::CursorLeft),
+                ],
+                vec![Action::Close(ids[0])],
+            ),
+            (
+                vec![
+                    moved(70.0),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::CursorLeft),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                vec![],
+            ),
+        ] {
+            let mut ui = UserInterface::build(
+                tabs(&ids, false),
+                Size::new(160.0, 30.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &events,
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages, expected);
+            messages.clear();
+            ui = UserInterface::build(
+                tabs(&ids, false),
+                Size::new(160.0, 30.0),
+                ui.into_cache(),
+                &mut renderer,
+            );
+            // Wayland can retain a stale backend position after CursorLeft.
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(Point::new(70.0, 15.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+        }
+    }
+
+    #[test]
     fn clicks_below_threshold_select_and_close_controls_do_not_arm_a_drag() {
         let ids = [CardId::new(), CardId::new(), CardId::new()];
         let mut surface = Surface::new(&ids, false);

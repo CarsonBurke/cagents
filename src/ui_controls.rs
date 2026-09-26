@@ -1042,6 +1042,56 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn queued_overlay_clicks_use_the_position_before_later_motion() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum Action {
+            Press,
+            Close,
+        }
+
+        let mut renderer = headless_renderer();
+        let inside = Point::new(60.0, 60.0);
+        let outside = Point::new(180.0, 160.0);
+        for (start, finish, expected_press) in [(inside, outside, false), (outside, inside, true)] {
+            let base = iced::widget::mouse_area(iced::widget::Space::new().width(200).height(200))
+                .on_press(Action::Press);
+            let element = popover(
+                base,
+                Some(iced::widget::Space::new().width(100).height(60).into()),
+                widget::popover::Position::Point(Point::new(40.0, 40.0)),
+                Action::Close,
+            );
+            let mut ui = UserInterface::build(
+                element,
+                Size::new(200.0, 200.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: start }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::CursorMoved { position: finish }),
+                ],
+                mouse::Cursor::Available(finish),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(
+                messages.contains(&Action::Press),
+                expected_press,
+                "{start:?} to {finish:?}"
+            );
+        }
+    }
+
+    #[test]
     fn popover_inert_surface_blocks_underlying_hover_and_clicks() {
         use cosmic::iced::advanced::clipboard;
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
