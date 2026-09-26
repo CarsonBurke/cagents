@@ -14,7 +14,8 @@
 //! the first in every conversation. A fixed list of entries the reader
 //! authors is therefore linked from the system home into each new managed
 //! home ([`shared_entries`]); everything else - the login above all, but also
-//! history, caches and per-account state - stays the account's own.
+//! history, caches and per-account state - stays the account's own. Claude
+//! settings and user MCP definitions are seeded as independent copies.
 //!
 //! An entry is only on the list once the CLI has been seen to keep the link:
 //!
@@ -24,7 +25,8 @@
 //! - Claude Code 2.1.280 refuses to write its settings through a link (its
 //!   atomic writer opens the destination with `O_NOFOLLOW` and does not fall
 //!   back), so `settings.json` is *not* linked: a linked copy would make every
-//!   settings change in that account fail. Its instruction file and
+//!   settings change in that account fail. A new home instead gets a copy.
+//!   Its instruction file and
 //!   extension directories are linked, because the CLI only ever writes
 //!   inside those directories, which a link to a directory does not affect.
 //!
@@ -45,6 +47,7 @@
 
 use std::{
     fs, io,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -57,6 +60,14 @@ use crate::agent::Provider;
 /// interrupted leaves a name nothing else uses, and the next start finishes
 /// it.
 const REMOVING_PREFIX: &str = ".removing-";
+const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodexConfig {
+    #[default]
+    Shared,
+    Copy,
+}
 /// How long a pending sign-in is left alone before a home that turns out to
 /// be signed in to nothing is taken for the remains of one that never
 /// finished. Long enough that no sign-in in progress - in this window or
@@ -114,6 +125,15 @@ impl Homes {
         provider: Provider,
         system_home: Option<&Path>,
     ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_with_config(provider, system_home, CodexConfig::Shared)
+    }
+
+    pub fn create_with_config(
+        &self,
+        provider: Provider,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
+    ) -> io::Result<(Uuid, PathBuf)> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let parent = self.provider_directory(provider);
         crate::secure_file::prepare_private_directory(&self.root)?;
@@ -127,6 +147,17 @@ impl Homes {
         // setting it again states it exactly.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         if let Some(system_home) = system_home {
+            let seeded = match provider {
+                Provider::Claude => seed_claude(system_home, &path),
+                Provider::Codex if codex_config == CodexConfig::Copy => {
+                    copy_configuration(&system_home.join("config.toml"), &path.join("config.toml"))
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = seeded {
+                let _ = self.remove(provider, key);
+                return Err(error);
+            }
             link_shared(provider, system_home, &path);
         }
         Ok((key, path))
@@ -183,6 +214,115 @@ impl Homes {
             }
         }
     }
+}
+
+/// Configuration is user-authored and can contain MCP environment/header
+/// values. It is copied only into the new private home, never logged.
+fn open_configuration(path: &Path) -> io::Result<Option<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Configuration must be a regular file",
+        ));
+    }
+    if metadata.len() > CONFIG_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Configuration exceeds the 8 MiB limit",
+        ));
+    }
+    Ok(Some(file))
+}
+
+fn read_configuration(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_configuration(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(CONFIG_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CONFIG_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Configuration exceeds the 8 MiB limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn write_configuration(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+fn copy_configuration(source: &Path, destination: &Path) -> io::Result<()> {
+    if let Some(bytes) = read_configuration(source)? {
+        write_configuration(destination, &bytes)?;
+    }
+    Ok(())
+}
+
+fn seed_claude(system_home: &Path, home: &Path) -> io::Result<()> {
+    copy_configuration(
+        &system_home.join("settings.json"),
+        &home.join("settings.json"),
+    )?;
+    let global = claude_global_path(
+        system_home,
+        std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|value| !value.is_empty()),
+    );
+    seed_claude_mcp(&global, home)
+}
+
+fn claude_global_path(system_home: &Path, overridden: bool) -> PathBuf {
+    if overridden {
+        system_home.join(".claude.json")
+    } else {
+        system_home
+            .parent()
+            .unwrap_or(system_home)
+            .join(".claude.json")
+    }
+}
+
+fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
+    // Deserialize only user-scoped server definitions. Serde skips every
+    // other field, including login and project trust state; none is copied.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct UserServers {
+        #[serde(rename = "mcpServers", default)]
+        servers: serde_json::Map<String, serde_json::Value>,
+    }
+    let Some(file) = open_configuration(source)? else {
+        return Ok(());
+    };
+    let servers: UserServers =
+        serde_json::from_reader(io::BufReader::new(file.take(CONFIG_LIMIT + 1))).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Claude user configuration is not valid JSON with an MCP server map",
+            )
+        })?;
+    if !servers.servers.is_empty() {
+        let bytes = serde_json::to_vec(&servers).map_err(io::Error::other)?;
+        write_configuration(&home.join(".claude.json"), &bytes)?;
+    }
+    Ok(())
 }
 
 /// Deletes a home that has been renamed aside, after checking it is still a
@@ -242,9 +382,18 @@ mod tests {
             fs::read_link(home.join("skills")).unwrap(),
             system.join("skills")
         );
-        // Claude refuses to write settings through a link, so they are not
-        // shared, and nothing the system home lacks is linked.
-        assert!(fs::symlink_metadata(home.join("settings.json")).is_err());
+        // Claude can atomically replace its independent settings copy.
+        assert!(
+            !fs::symlink_metadata(home.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(home.join("settings.json"), "{\"theme\":\"dark\"}").unwrap();
+        assert_eq!(
+            fs::read_to_string(system.join("settings.json")).unwrap(),
+            "{}"
+        );
         assert!(fs::symlink_metadata(home.join("agents")).is_err());
         // Nothing that holds a login is ever on the list.
         for provider in Provider::ALL {
@@ -255,6 +404,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn claude_mcp_seed_excludes_account_and_project_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.json");
+        let home = directory.path().join("managed");
+        fs::create_dir(&home).unwrap();
+        fs::write(
+            &source,
+            include_str!("../../tests/fixtures/claude-user-config.json"),
+        )
+        .unwrap();
+        seed_claude_mcp(&source, &home).unwrap();
+        let copied = fs::read_to_string(home.join(".claude.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&copied).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 1);
+        assert_eq!(parsed["mcpServers"]["example"]["command"], "example-mcp");
+        assert!(!copied.contains("fixture-do-not-copy"));
+        assert_eq!(
+            fs::metadata(home.join(".claude.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            seed_claude_mcp(&source, &home).is_err(),
+            "never overwrite an existing provider file"
+        );
+    }
+
+    #[test]
+    fn claude_mcp_source_matches_default_and_overridden_homes() {
+        assert_eq!(
+            claude_global_path(Path::new("/user/.claude"), false),
+            Path::new("/user/.claude.json")
+        );
+        assert_eq!(
+            claude_global_path(Path::new("/custom"), true),
+            Path::new("/custom/.claude.json")
+        );
+        assert_eq!(
+            claude_global_path(Path::new("/user/.claude"), true),
+            Path::new("/user/.claude/.claude.json")
+        );
+    }
+
+    #[test]
+    fn codex_copy_is_independent_and_shared_remains_a_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir(&system).unwrap();
+        fs::write(
+            system.join("config.toml"),
+            "cli_auth_credentials_store = \"keyring\"\n",
+        )
+        .unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, copied) = homes
+            .create_with_config(Provider::Codex, Some(&system), CodexConfig::Copy)
+            .unwrap();
+        let (_, shared) = homes.create(Provider::Codex, Some(&system)).unwrap();
+        assert!(
+            !fs::symlink_metadata(copied.join("config.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(shared.join("config.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(copied.join("config.toml"), "model = \"fixture\"\n").unwrap();
+        assert!(
+            fs::read_to_string(system.join("config.toml"))
+                .unwrap()
+                .contains("keyring")
+        );
+        assert_ne!(
+            fs::canonicalize(copied).unwrap(),
+            fs::canonicalize(shared).unwrap(),
+            "Codex derives its keyring key from each canonical home"
+        );
+    }
+
+    #[test]
+    fn invalid_mcp_source_does_not_write_partial_or_leak_its_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.json");
+        fs::write(&source, r#"{"mcpServers":"private-fixture"}"#).unwrap();
+        let error = seed_claude_mcp(&source, directory.path()).unwrap_err();
+        assert!(!error.to_string().contains("private-fixture"));
+        assert!(!directory.path().join(".claude.json").exists());
+    }
+
+    #[test]
+    fn a_failed_seed_removes_the_unregistered_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system");
+        fs::create_dir_all(system.join("settings.json")).unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        assert!(homes.create(Provider::Claude, Some(&system)).is_err());
+        assert_eq!(
+            fs::read_dir(directory.path().join("accounts/claude"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

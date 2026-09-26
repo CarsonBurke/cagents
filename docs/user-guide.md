@@ -192,6 +192,10 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
+The Accounts pane also explains which settings new provider homes share or copy.
+See [Account configuration](account-configuration.md) for Claude settings and MCP
+copies, Codex's independent configuration option, and keyring isolation.
+
 ## Editor
 
 - Files save automatically after a pause. Conflicts, save errors, and

@@ -679,6 +679,7 @@ pub enum Action {
     /// Opens a row's menu, or closes it with `None`.
     Menu(Option<AccountId>),
     AddMenu(bool),
+    OwnCodexConfig(bool),
     Sort(Sort),
 }
 
@@ -706,6 +707,7 @@ impl Action {
                 | Self::RemoveConfirm(_)
                 | Self::Menu(Some(_))
                 | Self::AddMenu(true)
+                | Self::OwnCodexConfig(_)
                 | Self::Sort(_)
         )
     }
@@ -1958,6 +1960,10 @@ impl Cagents {
                 self.account_ui.table.add_menu = false;
                 Task::none()
             }
+            Action::OwnCodexConfig(own) => {
+                self.account_ui.table.own_codex_config = own;
+                Task::none()
+            }
             Action::AddMenu(open) => {
                 self.account_ui.table.add_menu = open;
                 if open {
@@ -2266,6 +2272,11 @@ impl Cagents {
     /// Creates the new account's home off the interface thread, with the
     /// reader's shared entries linked in, and finds its CLI.
     fn add_account(&mut self, provider: Provider, device: bool) -> Task<Message> {
+        let codex_config = if self.account_ui.table.own_codex_config {
+            account::home::CodexConfig::Copy
+        } else {
+            account::home::CodexConfig::Shared
+        };
         self.account_ui.table.close_popups();
         self.account_ui.popover = None;
         if login_arguments(provider, device).is_none() {
@@ -2285,7 +2296,7 @@ impl Cagents {
                     .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
                 let system = Account::system(provider).resolved_home();
                 let (key, home) = homes
-                    .create(provider, system.as_deref())
+                    .create_with_config(provider, system.as_deref(), codex_config)
                     .map_err(|error| format!("Its home could not be created: {error}"))?;
                 // Recorded before any login can land in it, so the home is
                 // never one nothing knows about.
