@@ -271,6 +271,7 @@ mod tests {
     fn busy_account_defers_without_waiting_or_publishing_failure() {
         let directory = tempfile::tempdir().unwrap();
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/true".into(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
