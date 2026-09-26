@@ -513,6 +513,7 @@ impl Cagents {
             .as_deref()
             .is_some_and(|active| scope.contains(active));
         self.sidebar_model.projects.remove(index);
+        self.refresh_ui.git.forget(id);
         self.github_availability.remove(&id);
         self.project_ui.projects.remove(&id);
         self.repository_generations.remove(&id);

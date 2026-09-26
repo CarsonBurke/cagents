@@ -4421,6 +4421,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         self.git_read(worktree, ["ls-files", "-tco", "--exclude-standard", "-z"])
     }
 
+    /// Tracked paths alone are sufficient to watch the sidebar's tracked-only
+    /// status without enumerating ignored build trees or untracked files.
+    pub fn tracked_files(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"]),
+            cancellation,
+        )?;
+        let parsed = parse_working_files(&output.stdout);
+        invalid_output(parsed, output)
+    }
+
     /// Reads remote URLs from configuration rather than parsing `git remote
     /// -v`, whose columns are ambiguous for a URL containing whitespace.
     pub fn remotes_command(&self, worktree: &Path) -> CommandSpec {
