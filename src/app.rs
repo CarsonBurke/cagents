@@ -1438,10 +1438,10 @@ fn display_path(path: &Path) -> Cow<'_, str> {
 /// change while the process runs. The empty-workspace surface is the default
 /// first-run view and `view` re-runs on every redraw, so resolving this there
 /// cost a blocking `getcwd` plus three allocations per frame.
-static STARTING_DIRECTORY_CAPTION: LazyLock<String> = LazyLock::new(|| {
-    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    format!("Starting directory: {}", display_path(&directory))
-});
+static STARTING_DIRECTORY: LazyLock<PathBuf> =
+    LazyLock::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+static STARTING_DIRECTORY_CAPTION: LazyLock<String> =
+    LazyLock::new(|| format!("Starting directory: {}", display_path(&STARTING_DIRECTORY)));
 
 /// A terminal that has never run, under a new identity, waiting to launch `launch`.
 pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
@@ -9975,10 +9975,10 @@ impl Application for Cagents {
                 self.poll_terminal_agent_activity(hibernated);
                 Task::none()
             }
-            Message::NewTerminal => match self.terminal_directory() {
-                Some(directory) => self.add_terminal(directory),
-                None => cosmic::task::message(Message::OpenRepository),
-            },
+            Message::NewTerminal => self.add_terminal(
+                self.terminal_directory()
+                    .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
+            ),
             Message::TerminalHandoffsCommitted { result } => {
                 self.terminal_handoff_commit_inflight = false;
                 let failure = match result {
@@ -13536,6 +13536,26 @@ mod tests {
     use super::*;
     use crate::model::WorktreeId;
     use cosmic::iced::futures::StreamExt;
+
+    #[test]
+    fn empty_workspace_new_terminal_uses_the_presented_starting_directory() {
+        let mut app = context_inspector_test_app(false);
+        assert!(app.terminal_directory().is_none());
+        let _ = app.update(Message::NewTerminal);
+        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        let CardKind::Terminal(terminal) = &card.kind else {
+            panic!("New terminal must create a terminal without a project");
+        };
+        assert_eq!(terminal.launch.working_directory, *STARTING_DIRECTORY);
+        assert_eq!(
+            *STARTING_DIRECTORY_CAPTION,
+            format!(
+                "Starting directory: {}",
+                display_path(&terminal.launch.working_directory)
+            ),
+        );
+        assert!(app.sidebar_model.projects.is_empty());
+    }
 
     #[test]
     fn update_prepare_vetoes_dirty_editor_without_closing_or_freezing() {
