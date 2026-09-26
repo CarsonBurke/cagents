@@ -30,6 +30,8 @@ pub mod claude;
 pub mod codex;
 #[cfg(feature = "ui")]
 pub mod home;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod login;
 pub mod omp;
 #[cfg(feature = "ui")]
 pub mod probe;
