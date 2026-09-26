@@ -3737,6 +3737,7 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspaceDestination {
+    Folder(ProjectId),
     Worktree(crate::model::WorktreeId),
     Channel(crate::model::ChannelId),
 }
@@ -3744,6 +3745,7 @@ enum WorkspaceDestination {
 impl WorkspaceDestination {
     fn from_action(action: &SidebarAction) -> Option<Self> {
         match action {
+            SidebarAction::OpenRepository { project_id, .. } => Some(Self::Folder(*project_id)),
             SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
             SidebarAction::OpenChannel { channel_id } => Some(Self::Channel(*channel_id)),
             _ => None,
@@ -4140,6 +4142,16 @@ impl Cagents {
         project_id: Option<ProjectId>,
         open_cards: bool,
     ) -> Task<Message> {
+        self.project_load_task(path, project_id, open_cards, None)
+    }
+
+    fn project_load_task(
+        &mut self,
+        path: PathBuf,
+        project_id: Option<ProjectId>,
+        open_cards: bool,
+        kind: Option<ProjectKind>,
+    ) -> Task<Message> {
         let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
@@ -4192,7 +4204,7 @@ impl Cagents {
             project.reloading = true;
         }
         self.github_availability.insert(project_id, availability);
-        self.repository_read_task(path, project_id, generation, open_cards)
+        self.repository_read_task(path, project_id, generation, open_cards, kind)
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -7540,12 +7552,17 @@ impl Cagents {
             return Some(WorkspaceDestination::Channel(id));
         }
         let path = self.active_workspace.as_deref()?;
-        self.sidebar_model
-            .projects
-            .iter()
-            .flat_map(|project| &project.worktrees)
-            .find(|worktree| worktree.path == path)
-            .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
+        self.sidebar_model.projects.iter().find_map(|project| {
+            if project.kind == ProjectKind::Folder && project.repository == path {
+                Some(WorkspaceDestination::Folder(project.id))
+            } else {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.path == path)
+                    .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
+            }
+        })
     }
 
     /// Preview workspaces in a frozen MRU order, committing on modifier release.
@@ -7574,11 +7591,16 @@ impl Cagents {
         // Select synchronously: the next key event must see this preview,
         // rather than queue another selection against an unchanged workspace.
         let task = match action {
+            SidebarAction::OpenRepository { repository, .. } => {
+                self.select_worktree(repository, true)
+            }
             SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
             SidebarAction::OpenChannel { channel_id } => {
                 self.handle_channel_ui(channel_ui::Action::Open(channel_id))
             }
-            _ => unreachable!("workspace destinations only contain worktrees and channels"),
+            _ => {
+                unreachable!("workspace destinations only contain folders, worktrees and channels")
+            }
         };
         if self.active_workspace_destination() != destination {
             self.workspace_history = previous_history;
@@ -13539,7 +13561,6 @@ fn load_project(
     project_id: Option<ProjectId>,
     cancellation: CancellationToken,
     kind: Option<ProjectKind>,
-    shared_key: bool,
 ) -> Result<LoadedRepository, String> {
     let directory = path
         .canonicalize()
@@ -13549,7 +13570,7 @@ fn load_project(
         Some(ProjectKind::Git) => false,
         None => {
             let location = crate::project_location::discover(&directory)?;
-            location.kind == ProjectKind::Folder || (shared_key && location.key != directory)
+            location.kind == ProjectKind::Folder
         }
     };
     if !folder {
@@ -19126,10 +19147,91 @@ mod tests {
     }
 
     #[test]
+    fn folder_projects_participate_in_workspace_history_alongside_git_and_channels() {
+        let mut app = context_inspector_test_app(false);
+        let folder = ProjectId::new();
+        let git = ProjectId::new();
+        let worktree = crate::model::WorktreeId::new();
+        let channel = crate::model::ChannelId::new();
+        app.sidebar_model.projects = vec![
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "Folder".into(),
+                "/folder".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+            SidebarProject::new(
+                git,
+                RepositoryId::new(),
+                "Git".into(),
+                "/git/.git".into(),
+                vec![SidebarWorktree::from_durable(
+                    worktree,
+                    "/git".into(),
+                    Some("main".into()),
+                )],
+                Vec::new(),
+            ),
+        ];
+        app.sidebar_model.projects[0]
+            .channels
+            .push(sidebar::SidebarChannel::new(
+                channel,
+                "Channel".into(),
+                false,
+                None,
+                false,
+                1,
+                true,
+                1,
+            ));
+        let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
+        let kinds: Vec<_> = destinations
+            .iter()
+            .filter_map(WorkspaceDestination::from_action)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WorkspaceDestination::Folder(folder),
+                WorkspaceDestination::Channel(channel),
+                WorkspaceDestination::Worktree(worktree)
+            ]
+        );
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Channel(channel)));
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Folder(folder)));
+        app.workspace_history
+            .observe(Some(WorkspaceDestination::Worktree(worktree)));
+        app.active_workspace = Some("/git".into());
+        let previous = app
+            .next_workspace(crate::workspace::FocusDirection::Right)
+            .unwrap();
+        assert_eq!(
+            WorkspaceDestination::from_action(&previous),
+            Some(WorkspaceDestination::Folder(folder))
+        );
+        app.active_workspace = Some("/folder".into());
+        assert_eq!(
+            app.active_workspace_destination(),
+            Some(WorkspaceDestination::Folder(folder))
+        );
+        app.sidebar_model.projects.remove(0);
+        assert!(
+            app.next_workspace(crate::workspace::FocusDirection::Right)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn folder_projects_select_a_directory_scope_and_keep_their_mode_on_refresh() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let loaded = load_project(&root, None, CancellationToken::default(), None, false).unwrap();
+        let loaded = load_project(&root, None, CancellationToken::default(), None).unwrap();
         assert_eq!(loaded.project.kind, ProjectKind::Folder);
         assert!(loaded.repository.is_none());
         assert!(loaded.worktrees.is_empty());
@@ -19161,12 +19263,11 @@ mod tests {
             Some(project),
             CancellationToken::default(),
             Some(ProjectKind::Folder),
-            false,
         )
         .unwrap();
         assert_eq!(refreshed.project.kind, ProjectKind::Folder);
         assert_eq!(refreshed.project.repository, root);
-        assert!(load_project(&root, None, CancellationToken::default(), None, false).is_err());
+        assert!(load_project(&root, None, CancellationToken::default(), None).is_err());
     }
 
     #[test]

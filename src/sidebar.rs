@@ -4488,18 +4488,20 @@ fn compact_project<'a>(
         ),
         chrome.new_channel_id.clone(),
     ));
-    column = column.push(new_row_action(
-        "worktree-add-symbolic",
-        &*chrome.new_worktree_name,
-        gated(
-            SidebarAction::NewWorktree {
-                project_id: entity.id,
-                repository: entity.repository.clone(),
-            },
-            modal_open,
-        ),
-        chrome.new_worktree_id.clone(),
-    ));
+    if entity.kind == ProjectKind::Git {
+        column = column.push(new_row_action(
+            "worktree-add-symbolic",
+            &*chrome.new_worktree_name,
+            gated(
+                SidebarAction::NewWorktree {
+                    project_id: entity.id,
+                    repository: entity.repository.clone(),
+                },
+                modal_open,
+            ),
+            chrome.new_worktree_id.clone(),
+        ));
+    }
     widget::container(RowInteraction::group(
         header,
         column.into(),
@@ -8058,6 +8060,12 @@ pub(crate) fn channels_in_display_order<'a>(
 pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<SidebarAction> {
     let mut destinations = Vec::new();
     for project in &model.projects {
+        if project.kind == ProjectKind::Folder {
+            destinations.push(SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            });
+        }
         destinations.extend(
             worktrees_in_display_order(
                 &project.repository,
@@ -11052,6 +11060,31 @@ pub(crate) mod tests {
     /// offers exactly one thing: reading it again. Its worktrees, channels and
     /// pull requests came from the read that failed, so nothing built from
     /// them may be pressable.
+    #[test]
+    fn folder_projects_remain_selectable_without_git_actions_in_both_sidebar_modes() {
+        let renderer = headless_renderer();
+        let mut entry = project().with_kind(ProjectKind::Folder);
+        entry.worktrees.clear();
+        entry.revoke_github();
+        let open = SidebarAction::OpenRepository {
+            project_id: entry.id,
+            repository: entry.repository.clone(),
+        };
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        for compact in [false, true] {
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
+            assert!(actions.contains(&open));
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::NewWorktree { .. }))
+            );
+            let names = accessible_names(&renderer, body(&model, &state, compact, false));
+            assert!(!names.iter().any(|name| name.starts_with("New worktree")));
+        }
+    }
+
     #[test]
     fn an_unreadable_project_keeps_its_row_and_offers_only_a_reload() {
         let renderer = headless_renderer();

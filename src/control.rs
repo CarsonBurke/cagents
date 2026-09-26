@@ -2024,6 +2024,7 @@ fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
 enum ResolvedProject {
     Open {
         repository: PathBuf,
+        kind: crate::model::ProjectKind,
     },
     List,
     Close {
@@ -2043,9 +2044,13 @@ impl ProjectCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedProject, AppError> {
         Ok(match self {
-            Self::Open { path } => ResolvedProject::Open {
-                repository: resolve_repository(path, model)?,
-            },
+            Self::Open { path } => {
+                let location = resolve_project_location(path, model)?;
+                ResolvedProject::Open {
+                    repository: location.key,
+                    kind: location.kind,
+                }
+            }
             Self::List => ResolvedProject::List,
             Self::Close { path, yes } => ResolvedProject::Close {
                 repository: resolve_repository(path, model)?,
@@ -2060,13 +2065,14 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository } => {
+        ResolvedProject::Open { repository, kind } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
             // sidebar can tell apart.
             let model = client
                 .edit_workspace_model(ModelEdit::ReopenProject {
+                    kind,
                     repository: repository.clone(),
                     name: repository_display_name(&repository),
                 })
@@ -2217,9 +2223,17 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
 /// The output path consumes resolved keys; it never rediscovers a project or
 /// changes an open folder's identity.
 enum ResolvedChannel {
-    Spawn { repository: PathBuf, title: String },
-    List { repository: Option<PathBuf> },
-    Close { channel_id: ChannelId },
+    Spawn {
+        repository: PathBuf,
+        title: String,
+        kind: crate::model::ProjectKind,
+    },
+    List {
+        repository: Option<PathBuf>,
+    },
+    Close {
+        channel_id: ChannelId,
+    },
 }
 
 impl ChannelCommand {
@@ -2233,10 +2247,14 @@ impl ChannelCommand {
         model: Option<&WorkspaceModel>,
     ) -> Result<ResolvedChannel, AppError> {
         Ok(match self {
-            Self::Spawn { repository, title } => ResolvedChannel::Spawn {
-                repository: resolve_repository(repository, model)?,
-                title,
-            },
+            Self::Spawn { repository, title } => {
+                let location = resolve_project_location(repository, model)?;
+                ResolvedChannel::Spawn {
+                    repository: location.key,
+                    kind: location.kind,
+                    title,
+                }
+            }
             // Only an explicit filter is resolved: no `--repository` means every
             // repository, so defaulting to the one containing the current
             // directory would silently hide channels the user asked to see.
@@ -2255,12 +2273,17 @@ fn channel_output(
     command: ResolvedChannel,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedChannel::Spawn { repository, title } => {
+        ResolvedChannel::Spawn {
+            repository,
+            title,
+            kind,
+        } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
             // so this is a no-op when a window already has the project open.
             client
                 .edit_workspace_model(ModelEdit::OpenProject {
+                    kind,
                     repository: repository.clone(),
                     name: repository_display_name(&repository),
                 })
@@ -2365,13 +2388,21 @@ fn resolve_repository(
     repository: Option<PathBuf>,
     model: Option<&WorkspaceModel>,
 ) -> Result<PathBuf, AppError> {
+    resolve_project_location(repository, model).map(|location| location.key)
+}
+
+fn resolve_project_location(
+    repository: Option<PathBuf>,
+    model: Option<&WorkspaceModel>,
+) -> Result<crate::project_location::ProjectLocation, AppError> {
     let from = project_directory(repository)?;
-    if model.is_some_and(|model| model.project(&from).is_some()) {
-        return Ok(from);
+    if let Some(project) = model.and_then(|model| model.project(&from)) {
+        return Ok(crate::project_location::ProjectLocation {
+            key: from,
+            kind: project.kind,
+        });
     }
-    crate::project_location::discover(&from)
-        .map(|location| location.key)
-        .map_err(|error| AppError::new("repository", error))
+    crate::project_location::discover(&from).map_err(|error| AppError::new("repository", error))
 }
 
 /// The shared project key for the repository containing `directory`, asked of
@@ -2711,6 +2742,7 @@ mod tests {
                 opened.request,
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::OpenProject {
+                        kind: Default::default(),
                         repository: server_repository.clone(),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
@@ -2855,7 +2887,7 @@ mod tests {
         );
 
         let key = |path: &Path| {
-            let ResolvedProject::Open { repository } = ProjectCommand::Open {
+            let ResolvedProject::Open { repository, .. } = ProjectCommand::Open {
                 path: Some(path.to_path_buf()),
             }
             .resolved()
@@ -2885,6 +2917,7 @@ mod tests {
         let root = directory.path().canonicalize().unwrap();
         let mut model = WorkspaceModel::default();
         model.projects.push(ModelProject {
+            kind: crate::model::ProjectKind::Folder,
             repository: root.clone(),
             name: "Folder".into(),
             ordinal: 0,
@@ -2892,7 +2925,7 @@ mod tests {
         // Broken metadata deliberately proves the existing key is consulted
         // before attempting Git rediscovery, not only corrected afterwards.
         std::fs::create_dir(root.join(".git")).unwrap();
-        let ResolvedProject::Open { repository } = (ProjectCommand::Open {
+        let ResolvedProject::Open { repository, .. } = (ProjectCommand::Open {
             path: Some(root.clone()),
         })
         .resolved_with_model(Some(&model))
@@ -2900,6 +2933,12 @@ mod tests {
             panic!("expected open");
         };
         assert_eq!(repository, root);
+        assert_eq!(
+            resolve_project_location(Some(root.clone()), Some(&model))
+                .unwrap()
+                .kind,
+            crate::model::ProjectKind::Folder
+        );
         let ResolvedChannel::Spawn { repository, .. } = (ChannelCommand::Spawn {
             repository: Some(root.clone()),
             title: "Work".into(),
@@ -2977,6 +3016,7 @@ mod tests {
                 opened.request,
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::ReopenProject {
+                        kind: Default::default(),
                         repository: served.clone(),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
@@ -2989,6 +3029,7 @@ mod tests {
                 identity: uuid::Uuid::new_v4(),
                 sequence: 4,
                 projects: vec![ModelProject {
+                    kind: Default::default(),
                     repository: served,
                     name: served_name,
                     ordinal: 2,
@@ -3028,11 +3069,13 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
         let window_opened = ModelProject {
+            kind: Default::default(),
             repository: PathBuf::from("/window/.git"),
             name: "window".into(),
             ordinal: 1,
         };
         let cli_opened = ModelProject {
+            kind: Default::default(),
             repository: PathBuf::from("/shell/.git"),
             name: "shell".into(),
             ordinal: 2,
@@ -3216,6 +3259,7 @@ mod tests {
             identity: uuid::Uuid::new_v4(),
             sequence: 8,
             projects: vec![ModelProject {
+                kind: Default::default(),
                 repository: repository.to_path_buf(),
                 name: repository_display_name(repository),
                 ordinal: 1,
