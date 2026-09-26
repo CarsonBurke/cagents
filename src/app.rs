@@ -5839,6 +5839,7 @@ impl Cagents {
     fn sync_chrome(&mut self) -> Task<Message> {
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
+            let (title, file_caption) = self.repository_chrome(card);
             let caption = match &card.kind {
                 CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
                     Cow::Owned(format!(
@@ -5846,23 +5847,21 @@ impl Cagents {
                         card_kind_caption(&card.kind)
                     ))
                 }
-                _ => card_kind_caption(&card.kind),
+                _ => file_caption.unwrap_or_else(|| card_kind_caption(&card.kind)),
             };
             if self
                 .card_chrome
                 .get(&card.id)
-                .is_none_or(|chrome| !chrome.describes(type_label, &card.title, &caption))
+                .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
             {
-                self.card_chrome.insert(
+                let chrome = CardChrome::new(
                     card.id,
-                    CardChrome::new(
-                        card.id,
-                        type_label,
-                        &card.title,
-                        &caption,
-                        &self.settings.keyboard_shortcuts,
-                    ),
+                    type_label,
+                    &title,
+                    &caption,
+                    &self.settings.keyboard_shortcuts,
                 );
+                self.card_chrome.insert(card.id, chrome);
             }
         }
         if self.card_chrome.len() != self.durable.cards.len() {
@@ -5870,6 +5869,26 @@ impl Cagents {
                 .retain(|id, _| self.durable.cards.iter().any(|card| card.id == *id));
         }
         self.sync_window_title()
+    }
+
+    /// Present the current editor file without overwriting a saved pane name.
+    /// The full path in the tooltip distinguishes files sharing a basename.
+    fn repository_chrome<'a>(
+        &'a self,
+        card: &'a CardState,
+    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
+            && let Some(path) = runtime.selected_path()
+            && let Some(name) = path.file_name()
+        {
+            return (
+                name.to_string_lossy(),
+                Some(Cow::Owned(
+                    display_path(&runtime.descriptor.worktree.join(path)).into_owned(),
+                )),
+            );
+        }
+        (Cow::Borrowed(&card.title), None)
     }
 
     /// Names the window and its header bar after whatever the window is showing.
@@ -15319,6 +15338,43 @@ mod tests {
         state.diagnostics_version = Some(0);
         app.lsp_documents.insert(LspDocumentId(1), card);
         (app, card)
+    }
+
+    #[test]
+    fn repository_tab_chrome_tracks_the_selected_file_and_restores_the_pane_name() {
+        let (mut app, card) = editing_repository_app();
+        app.card_state_mut(card).unwrap().title = "My editor".into();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "src/main.rs", "fn main() {}\n");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let _ = app.sync_chrome();
+
+        let chrome = app.card_chrome.get(&card).unwrap();
+        assert_eq!(chrome.title, "main.rs");
+        assert_eq!(chrome.caption, "/repo/src/main.rs");
+        assert!(chrome.accessible_name(true).contains("main.rs"));
+        assert!(chrome.close_name.contains("main.rs"));
+        assert_eq!(app.card_state(card).unwrap().title, "My editor");
+
+        let _ = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: PathBuf::from("other.txt"),
+        }));
+        let chrome = app.card_chrome.get(&card).unwrap();
+        assert_eq!(chrome.title, "other.txt");
+        assert_eq!(chrome.caption, "/repo/other.txt");
+        assert!(chrome.accessible_name(false).contains("other.txt"));
+        assert!(chrome.close_name.contains("other.txt"));
+
+        let _ = app.update(Message::Repository(RepositoryAction::BackToFiles { card }));
+        let chrome = app.card_chrome.get(&card).unwrap();
+        assert_eq!(chrome.title, "My editor");
+        assert_eq!(
+            chrome.caption,
+            card_kind_caption(&app.card_state(card).unwrap().kind)
+        );
+        assert!(chrome.close_name.contains("My editor"));
+        assert_eq!(app.card_state(card).unwrap().title, "My editor");
     }
 
     /// Discarding retires the Discard and Save commands and offers Back to

@@ -3493,7 +3493,6 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
         Some(SidebarAction::OpenSettings),
     )
     .id(stable_id("settings"))
-    .prominent()
     .into();
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![settings];

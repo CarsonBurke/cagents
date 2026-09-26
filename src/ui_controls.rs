@@ -240,7 +240,6 @@ pub struct IconControl<'a, Message> {
     selected: bool,
     enabled: bool,
     tone: Option<crate::design::Tone>,
-    prominent: bool,
 }
 
 /// A centered, fixed-size icon target with a quiet surface selected state.
@@ -273,7 +272,6 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         selected: selected && enabled,
         enabled,
         tone: None,
-        prominent: false,
     }
 }
 
@@ -302,7 +300,6 @@ pub fn compact_icon_control<'a, Message: Clone + 'a>(
         selected: false,
         enabled: true,
         tone: None,
-        prominent: false,
     }
 }
 
@@ -320,23 +317,7 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     /// builder never locks the process-global theme to name a color.
     pub fn icon_tone(mut self, tone: crate::design::Tone) -> Self {
         self.tone = Some(tone);
-        self.button = self.button.class(control_style_variant(
-            self.selected,
-            self.tone,
-            self.prominent,
-        ));
-        self
-    }
-
-    /// A persistent, lightly outlined target for a utility that anchors a
-    /// whole workspace rather than a transient row action.
-    pub fn prominent(mut self) -> Self {
-        self.prominent = true;
-        self.button = self
-            .button
-            .class(control_style_variant(self.selected, self.tone, true))
-            .width(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT)
-            .height(crate::design::PRIMARY_CONTROL_SIZE + crate::design::GRID_UNIT);
+        self.button = self.button.class(control_style(self.selected, self.tone));
         self
     }
 }
@@ -370,23 +351,30 @@ pub fn popover<'a, Message: Clone + 'static>(
         .position(position)
         .on_close(on_close);
     if let Some(content) = content {
-        popup = popup.popup(widget::container(content).padding(6).class(
-            cosmic::theme::Container::custom(|theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(
-                    theme.current_container().component.base.into(),
-                )),
-                border: iced::Border {
-                    color: crate::design::component_rule(theme),
-                    width: crate::design::BORDER_WIDTH,
-                    radius: theme.cosmic().corner_radii.radius_s.into(),
-                },
-                shadow: iced::Shadow {
-                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.24),
-                    offset: iced::Vector::new(0.0, 4.0),
-                    blur_radius: 16.0,
-                },
-                ..Default::default()
-            }),
+        // iced masks the cursor beneath an overlay only when its surface
+        // reports a mouse interaction. Include the frame's padding and inert
+        // content, which otherwise report None and expose controls beneath.
+        popup = popup.popup(crate::interaction::opaque(
+            widget::container(content)
+                .padding(6)
+                .class(cosmic::theme::Container::custom(|theme| {
+                    iced::widget::container::Style {
+                        background: Some(iced::Background::Color(
+                            theme.current_container().component.base.into(),
+                        )),
+                        border: iced::Border {
+                            color: crate::design::component_rule(theme),
+                            width: crate::design::BORDER_WIDTH,
+                            radius: theme.cosmic().corner_radii.radius_s.into(),
+                        },
+                        shadow: iced::Shadow {
+                            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.24),
+                            offset: iced::Vector::new(0.0, 4.0),
+                            blur_radius: 16.0,
+                        },
+                        ..Default::default()
+                    }
+                })),
         ));
     }
     popup.into()
@@ -593,14 +581,6 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
 /// navigation entry - presses the same treatment as the icon controls beside
 /// it instead of reaching for a stock button class.
 pub fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
-    control_style_variant(selected, tone, false)
-}
-
-fn control_style_variant(
-    selected: bool,
-    tone: Option<crate::design::Tone>,
-    prominent: bool,
-) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
         background: if selected || focused {
             Some(iced::Background::Color(
@@ -611,19 +591,11 @@ fn control_style_variant(
                     .into(),
             ))
         } else {
-            prominent.then(|| iced::Background::Color(crate::design::raised(theme)))
+            None
         },
         border_radius: theme.cosmic().corner_radii.radius_s.into(),
-        border_width: if prominent {
-            crate::design::BORDER_WIDTH
-        } else {
-            0.0
-        },
-        border_color: if prominent {
-            crate::design::hairline(theme)
-        } else {
-            theme.current_container().component.on_disabled.into()
-        },
+        border_width: 0.0,
+        border_color: theme.current_container().component.on_disabled.into(),
         icon_color: Some(tone.map_or_else(
             || {
                 if selected || focused {
@@ -642,7 +614,7 @@ fn control_style_variant(
             // Symbolic SVG recoloring ignores alpha, so mix against the
             // surface instead of relying on `on_disabled` transparency.
             icon_color: Some(muted_icon_color(theme)),
-            background: prominent.then(|| iced::Background::Color(crate::design::raised(theme))),
+            background: None,
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
@@ -1068,6 +1040,99 @@ mod tests {
     use super::*;
     use std::f32::consts::TAU;
     use std::time::Duration;
+
+    #[test]
+    fn popover_inert_surface_blocks_underlying_hover_and_clicks() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+
+        #[derive(Clone, Debug, PartialEq)]
+        enum Action {
+            Hover,
+            Press,
+            Close,
+        }
+
+        let mut renderer = headless_renderer();
+        // The popup covers x=40..152, y=40..112. Probe its padding,
+        // disabled control and empty area, then the exposed background.
+        for (point, covered) in [
+            (Point::new(42.0, 42.0), true),
+            (Point::new(60.0, 55.0), true),
+            (Point::new(60.0, 95.0), true),
+            (Point::new(180.0, 160.0), false),
+        ] {
+            let base = iced::widget::mouse_area(iced::widget::Space::new().width(200).height(200))
+                .on_enter(Action::Hover)
+                .on_press(Action::Press);
+            let content = widget::column::with_children(vec![
+                widget::button::text("Disabled")
+                    .width(100)
+                    .height(30)
+                    .into(),
+                iced::widget::Space::new().width(100).height(30).into(),
+            ]);
+            let element = popover(
+                base,
+                Some(content.into()),
+                widget::popover::Position::Point(Point::new(40.0, 40.0)),
+                Action::Close,
+            );
+            let mut ui = UserInterface::build(
+                element,
+                Size::new(200.0, 200.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[
+                    Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                ],
+                mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(messages.contains(&Action::Hover), !covered, "{point:?}");
+            assert_eq!(messages.contains(&Action::Press), !covered, "{point:?}");
+            assert!(!messages.contains(&Action::Close));
+        }
+    }
+
+    #[test]
+    fn popover_dismisses_when_clicking_outside_its_anchor_and_surface() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+
+        let mut renderer = headless_renderer();
+        let element = popover(
+            iced::widget::Space::new().width(20).height(20),
+            Some(iced::widget::Space::new().width(100).height(60).into()),
+            widget::popover::Position::Bottom,
+            (),
+        );
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(200.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            ))],
+            mouse::Cursor::Available(Point::new(180.0, 160.0)),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, vec![()]);
+    }
 
     /// The defect the spinner replaced was an arc that grew and shrank while
     /// it turned, so both halves of "constant span, constant rate" are worth
