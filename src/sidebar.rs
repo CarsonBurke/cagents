@@ -8008,8 +8008,8 @@ pub(crate) fn channels_in_display_order<'a>(
 /// Every top-level destination the sidebar lists -- each project's worktrees
 /// and then its channels -- in the order the reader sees them.
 ///
-/// Cycling has to agree with the rows on screen, so it reuses the same
-/// ordering those rows are built from rather than the model's storage order.
+/// This supplies candidates for workspace history. Unvisited destinations use
+/// the same fallback ordering as the rows rather than model storage order.
 /// The active filter is deliberately not applied: a transient search must not
 /// silently shrink what a keyboard shortcut can reach. A row being deleted is
 /// passed over: it is on its way out and cannot be opened meanwhile.
@@ -9014,9 +9014,8 @@ pub(crate) mod tests {
         project
     }
 
-    /// Cycling with Alt+Tab has to visit rows in the order the reader sees
-    /// them, worktrees before channels, and it must not be narrowed by a
-    /// transient filter.
+    /// Unvisited history candidates follow sidebar order, worktrees before
+    /// channels, and are not narrowed by a transient filter.
     #[test]
     fn the_workspace_cycle_follows_the_order_the_sidebar_lists() {
         let mut entry = project();
