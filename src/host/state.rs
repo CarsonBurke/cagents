@@ -59,6 +59,8 @@ pub(crate) struct TerminalRecord {
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
+    /// Stable provider metadata must survive eviction from the transition log.
+    conversation_title: Option<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -832,6 +834,7 @@ impl HostState {
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
+                conversation_title: None,
             },
         );
         let visibility = if initially_visible {
@@ -976,12 +979,30 @@ impl HostState {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
-        Ok(record
+        let title = record
+            .conversation_title
+            .iter()
+            .filter(|(sequence, _)| {
+                *sequence > after_sequence
+                    && record
+                        .events
+                        .front()
+                        .is_none_or(|(first, _)| sequence < first)
+            })
+            .map(|(sequence, title)| {
+                (
+                    *sequence,
+                    WireTerminalEvent::ConversationTitleChanged {
+                        title: title.clone(),
+                    },
+                )
+            });
+        let events = record
             .events
             .iter()
             .filter(|(sequence, _)| *sequence > after_sequence)
-            .cloned()
-            .collect())
+            .cloned();
+        Ok(title.chain(events).collect())
     }
 
     fn inventory_count(&mut self) -> u64 {
@@ -2612,6 +2633,9 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
+        if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
+            record.conversation_title = Some((sequence, title.clone()));
+        }
         if let WireTerminalEvent::Exited {
             exit_code, signal, ..
         } = &wire_event
@@ -3981,6 +4005,75 @@ for line in sys.stdin:
             );
             assert!(!state.shutting_down);
         }
+    }
+
+    #[test]
+    fn stable_conversation_title_survives_replay_eviction_without_duplicate_edges() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .finish_spawn(1, session, handle.clone(), false)
+            .unwrap();
+        let weak = Arc::downgrade(&shared);
+        record_event(
+            &weak,
+            id,
+            TerminalEvent::ConversationTitleChanged("Stable title".into()),
+        );
+        assert_eq!(
+            shared.lock().unwrap().replay_events(id, 0).unwrap().len(),
+            1
+        );
+        for _ in 0..EVENT_REPLAY_CAPACITY {
+            record_event(&weak, id, TerminalEvent::Bell);
+        }
+        let replay = shared.lock().unwrap().replay_events(id, 0).unwrap();
+        assert_eq!(replay.len(), EVENT_REPLAY_CAPACITY + 1);
+        assert!(
+            matches!(&replay[0], (1, WireTerminalEvent::ConversationTitleChanged { title }) if title == "Stable title")
+        );
+        assert_eq!(
+            shared.lock().unwrap().replay_events(id, 1).unwrap().len(),
+            EVENT_REPLAY_CAPACITY
+        );
+        record_event(
+            &weak,
+            id,
+            TerminalEvent::ConversationTitleChanged("Renamed".into()),
+        );
+        let replay = shared.lock().unwrap().replay_events(id, 0).unwrap();
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    WireTerminalEvent::ConversationTitleChanged { .. }
+                ))
+                .count(),
+            1
+        );
+        let _ = handle.shutdown();
     }
 
     #[test]
