@@ -71,6 +71,9 @@ pub enum StoreError {
     },
     #[error("invalid state: {0}")]
     InvalidState(String),
+    /// Data decoded from storage, rather than content supplied by a writer.
+    #[error("corrupt stored {field}: {reason}")]
+    CorruptRow { field: String, reason: String },
     /// Storage failed on `card` within a larger write, such as a workspace
     /// snapshot, so the caller can say which card the failure concerns.
     #[error("card {card}: {error}")]
@@ -87,6 +90,13 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    fn corrupt_row(field: impl Into<String>, reason: impl std::fmt::Display) -> Self {
+        Self::CorruptRow {
+            field: field.into(),
+            reason: reason.to_string(),
+        }
+    }
+
     /// Whether storage refuses a write because of what the write contains, so
     /// offering the same content again can only fail the same way.
     ///
@@ -104,15 +114,14 @@ impl StoreError {
 
         match self {
             Self::Card { error, .. } => error.refuses_content(),
-            Self::InvalidState(_) | Self::Serialization(_) | Self::InvalidUuid { .. } => true,
+            Self::InvalidState(_) | Self::Serialization(_) => true,
             Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
                 error.code,
                 ErrorCode::ConstraintViolation | ErrorCode::TooBig | ErrorCode::TypeMismatch
             ),
-            // The remaining SQLite errors are deterministic outcomes of a
-            // statement and the rows it read: a missing row, a value that does
-            // not convert. None of them is a condition that clears.
-            Self::Sqlite(_) => true,
+            // Decode/missing-row failures describe storage, not this write's
+            // content. Quarantining the write would silently strand valid edits.
+            Self::Sqlite(_) | Self::CorruptRow { .. } | Self::InvalidUuid { .. } => false,
             Self::Io(_)
             | Self::UnsupportedSchema { .. }
             | Self::StaleGeneration { .. }
@@ -191,9 +200,10 @@ impl PersistedCardKind {
             "repository" => Ok(Self::Repository),
             "settings" => Ok(Self::Settings),
             "accounts" => Ok(Self::Accounts),
-            other => Err(StoreError::InvalidState(format!(
-                "unknown persisted card kind `{other}`"
-            ))),
+            other => Err(StoreError::corrupt_row(
+                "card kind",
+                format!("unknown kind `{other}`"),
+            )),
         }
     }
 }
@@ -273,9 +283,10 @@ impl PendingOperationStatus {
             "needs_reconciliation" => Ok(Self::NeedsReconciliation),
             "applied" => Ok(Self::Applied),
             "rolled_back" => Ok(Self::RolledBack),
-            other => Err(StoreError::InvalidState(format!(
-                "unknown pending-operation status `{other}`"
-            ))),
+            other => Err(StoreError::corrupt_row(
+                "pending-operation status",
+                format!("unknown status `{other}`"),
+            )),
         }
     }
 }
@@ -3125,8 +3136,9 @@ fn replace_chat_identity_transaction(
             "card {card_id} is not a chat card"
         )));
     }
-    let content = content
-        .ok_or_else(|| StoreError::InvalidState(format!("chat card {card_id} has no payload")))?;
+    let content = content.ok_or_else(|| {
+        StoreError::corrupt_row("chat payload", format!("card {card_id} has no payload"))
+    })?;
     let stored: crate::chat::Session = from_json("chat card", &content)?;
     if &stored == replacement {
         return Ok(());
@@ -3233,7 +3245,10 @@ fn replace_terminal_identity_transaction(
         )
         .optional()?
         .ok_or_else(|| {
-            StoreError::InvalidState(format!("terminal card {card_id} has no terminal payload"))
+            StoreError::corrupt_row(
+                "terminal payload",
+                format!("card {card_id} has no terminal payload"),
+            )
         })?;
     if actual_terminal_id == replacement.id.to_string() {
         return Ok(());
@@ -3552,9 +3567,8 @@ fn load_workspace_manifest_connection(
     Ok(Some(WorkspaceManifest {
         id,
         generation: i64_to_u64(generation, "workspace generation")?,
-        schema_version: u32::try_from(schema_version).map_err(|_| {
-            StoreError::InvalidState(format!("invalid workspace schema version {schema_version}"))
-        })?,
+        schema_version: u32::try_from(schema_version)
+            .map_err(|_| StoreError::corrupt_row("workspace schema version", schema_version))?,
         existence: from_json("workspace existence", &existence)?,
         focused: focused
             .as_deref()
@@ -3635,20 +3649,20 @@ fn load_card_connection(
         PersistedCardKind::Chat => CardKind::Chat(from_json(
             "chat card",
             content.as_deref().ok_or_else(|| {
-                StoreError::InvalidState(format!("chat card {id} has no payload"))
+                StoreError::corrupt_row(format!("chat card {id}"), "missing payload")
             })?,
         )?),
         PersistedCardKind::Browser => CardKind::Browser(load_browser(connection, id)?),
         PersistedCardKind::PullRequests => CardKind::PullRequests(from_json(
             "pull request card",
             content.as_deref().ok_or_else(|| {
-                StoreError::InvalidState(format!("pull request card {id} has no payload"))
+                StoreError::corrupt_row(format!("pull request card {id}"), "missing payload")
             })?,
         )?),
         PersistedCardKind::Repository => CardKind::Repository(from_json(
             "repository card",
             content.as_deref().ok_or_else(|| {
-                StoreError::InvalidState(format!("repository card {id} has no payload"))
+                StoreError::corrupt_row(format!("repository card {id}"), "missing payload")
             })?,
         )?),
         PersistedCardKind::Settings => CardKind::Settings,
@@ -3702,9 +3716,10 @@ fn load_terminal(
         owned_codex_listener,
     )) = recipe
     else {
-        return Err(StoreError::InvalidState(format!(
-            "terminal card {card_id} has no stored launch recipe"
-        )));
+        return Err(StoreError::corrupt_row(
+            format!("terminal card {card_id}"),
+            "missing launch recipe",
+        ));
     };
     let terminal_id: TerminalId = parse_id("terminal", &terminal_id)?;
     let launch = from_json("terminal recipe", &recipe_json)?;
@@ -3734,9 +3749,10 @@ fn load_terminal(
         continuity,
     };
     if terminal.owned_codex_listener.is_some() && !terminal.owns_codex_listener() {
-        return Err(StoreError::InvalidState(format!(
-            "terminal card {card_id} has invalid owned listener evidence"
-        )));
+        return Err(StoreError::corrupt_row(
+            format!("terminal card {card_id}"),
+            "invalid owned listener evidence",
+        ));
     }
     Ok(terminal)
 }
@@ -3819,17 +3835,19 @@ fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSessi
     let Some((browser_id, current_url, history_json, history_index, scroll_x, scroll_y, fidelity)) =
         row
     else {
-        return Err(StoreError::InvalidState(format!(
-            "browser card {card_id} has no stored restore state"
-        )));
+        return Err(StoreError::corrupt_row(
+            format!("browser card {card_id}"),
+            "missing restore state",
+        ));
     };
     let fidelity = match fidelity.as_str() {
         "history_and_scroll" => BrowserRestoreFidelity::HistoryAndScroll,
         "url_only" => BrowserRestoreFidelity::UrlOnly,
         other => {
-            return Err(StoreError::InvalidState(format!(
-                "invalid browser restore fidelity `{other}`"
-            )));
+            return Err(StoreError::corrupt_row(
+                "browser restore fidelity",
+                format!("invalid value `{other}`"),
+            ));
         }
     };
     let mut history: Vec<url::Url> = from_json("browser history", &history_json)?;
@@ -3839,16 +3857,16 @@ fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSessi
     crate::model::trim_browser_history(&mut history, &mut history_index);
     let browser = BrowserSession {
         id: parse_id("browser", &browser_id)?,
-        current_url: url::Url::parse(&current_url).map_err(|error| {
-            StoreError::InvalidState(format!("invalid persisted browser URL: {error}"))
-        })?,
+        current_url: url::Url::parse(&current_url)
+            .map_err(|error| StoreError::corrupt_row("browser URL", error))?,
         history,
         history_index,
         scroll_x,
         scroll_y,
         fidelity,
     };
-    validate_browser_descriptor(&browser)?;
+    validate_browser_descriptor(&browser)
+        .map_err(|error| StoreError::corrupt_row(format!("browser card {card_id}"), error))?;
     Ok(browser)
 }
 
@@ -3974,8 +3992,7 @@ fn to_json(value: &impl Serialize) -> Result<String> {
 }
 
 fn from_json<T: DeserializeOwned>(kind: &str, value: &str) -> Result<T> {
-    serde_json::from_str(value)
-        .map_err(|error| StoreError::InvalidState(format!("invalid persisted {kind}: {error}")))
+    serde_json::from_str(value).map_err(|error| StoreError::corrupt_row(kind, error))
 }
 
 fn parse_id<T>(kind: &'static str, value: &str) -> Result<T>
@@ -4008,11 +4025,12 @@ fn usize_to_i64(value: usize, kind: &str) -> Result<i64> {
 }
 
 fn i64_to_u64(value: i64, kind: &str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| StoreError::InvalidState(format!("negative {kind}")))
+    u64::try_from(value).map_err(|_| StoreError::corrupt_row(kind, "negative stored value"))
 }
 
 fn i64_to_usize(value: i64, kind: &str) -> Result<usize> {
-    usize::try_from(value).map_err(|_| StoreError::InvalidState(format!("invalid {kind}")))
+    usize::try_from(value)
+        .map_err(|_| StoreError::corrupt_row(kind, "stored value outside supported range"))
 }
 
 #[cfg(test)]
@@ -4725,6 +4743,20 @@ mod tests {
         assert!(restored.owns_codex_listener());
         assert_eq!(restored.owned_codex_listener, chat.owned_codex_listener);
         assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let mut corrupt = chat.owned_codex_listener.unwrap();
+        corrupt.socket = PathBuf::from("relative.sock");
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE terminal_recipes SET owned_codex_listener = ?1 WHERE card_id = ?2",
+                [serde_json::to_string(&corrupt).unwrap(), card.to_string()],
+            )
+            .unwrap();
+        let error = store.load_card(card, None).unwrap_err();
+        assert!(matches!(error, StoreError::CorruptRow { .. }));
+        assert!(!error.refuses_content());
     }
 
     #[test]
@@ -5514,7 +5546,7 @@ mod tests {
             }
             assert!(matches!(
                 store.load_workspace(workspace.id, None),
-                Err(StoreError::InvalidState(_))
+                Err(StoreError::CorruptRow { .. })
             ));
         }
     }
@@ -5735,6 +5767,41 @@ mod tests {
             loaded_terminal.transcript_path,
             Some(PathBuf::from("/tmp/transcript"))
         );
+    }
+
+    #[test]
+    fn missing_terminal_payload_does_not_refuse_identity_replacement() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let workspace = workspace_with_terminal(&boot_id);
+        let card_id = workspace.cards[0].id;
+        let CardKind::Terminal(original) = &workspace.cards[0].kind else {
+            panic!("expected terminal card");
+        };
+        SaveLane::default().save(&store, &workspace).unwrap();
+        // Simulate damage outside the validated writer, including the now
+        // orphaned transcript row, which normal foreign-key checks forbid.
+        let damaged = Connection::open(&path).unwrap();
+        damaged.pragma_update(None, "foreign_keys", false).unwrap();
+        damaged
+            .execute(
+                "DELETE FROM terminal_recipes WHERE card_id = ?1",
+                [card_id.to_string()],
+            )
+            .unwrap();
+        let mut replacement = original.clone();
+        replacement.id = TerminalId::new();
+        replacement.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: replacement.launch.clone(),
+            last_exit: None,
+        };
+        let error = store
+            .replace_terminal_identity(card_id, original.id, &replacement)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::CorruptRow { .. }));
+        assert!(!error.refuses_content());
     }
 
     #[test]
