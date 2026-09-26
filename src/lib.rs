@@ -52,6 +52,7 @@ pub mod model;
 pub mod performance;
 #[cfg(feature = "ui")]
 pub mod persistence;
+pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]

@@ -1049,59 +1049,67 @@ impl Cagents {
         width: f32,
     ) -> Element<'_, Message> {
         let indicators = self.context_rail_indicators();
-        let tabs = widget::row::with_children(ContextTab::ALL.into_iter().map(|tab| {
-            let selected = self.context_tab == tab;
-            let enabled = !self.modal_is_open()
-                && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
-            let icon = match tab {
-                ContextTab::Files => "folder-symbolic",
-                ContextTab::Changes => "document-edit-symbolic",
-                ContextTab::PullRequest => "pull-request-symbolic",
-                ContextTab::Details => "dialog-information-symbolic",
-            };
-            let visual = (tab == ContextTab::PullRequest)
-                .then_some(indicators.pull_request)
-                .flatten()
-                .map(sidebar::pull_request_visual);
-            let dirty = (tab == ContextTab::Changes)
-                .then_some(indicators.dirty)
-                .flatten();
-            // The tab's one icon carries the worktree's state: the pull
-            // request's own glyph and tone, the changes tab tinted while the
-            // tree is dirty. What the tint means is said by the tab's name,
-            // which is the tooltip and the accessible name; a second icon
-            // beside the tab was the same fact drawn twice.
-            let mut name = format!("{} panel tab", tab.label());
-            match tab {
-                ContextTab::Changes => {
-                    if let Some(label) = dirty {
-                        name.push_str(": ");
-                        name.push_str(label);
+        let tabs = widget::row::with_children(
+            ContextTab::ALL
+                .into_iter()
+                .filter(|tab| {
+                    !self.active_folder_scope()
+                        || !matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                })
+                .map(|tab| {
+                    let selected = self.context_tab == tab;
+                    let enabled = !self.modal_is_open()
+                        && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
+                    let icon = match tab {
+                        ContextTab::Files => "folder-symbolic",
+                        ContextTab::Changes => "document-edit-symbolic",
+                        ContextTab::PullRequest => "pull-request-symbolic",
+                        ContextTab::Details => "dialog-information-symbolic",
+                    };
+                    let visual = (tab == ContextTab::PullRequest)
+                        .then_some(indicators.pull_request)
+                        .flatten()
+                        .map(sidebar::pull_request_visual);
+                    let dirty = (tab == ContextTab::Changes)
+                        .then_some(indicators.dirty)
+                        .flatten();
+                    // The tab's one icon carries the worktree's state: the pull
+                    // request's own glyph and tone, the changes tab tinted while the
+                    // tree is dirty. What the tint means is said by the tab's name,
+                    // which is the tooltip and the accessible name; a second icon
+                    // beside the tab was the same fact drawn twice.
+                    let mut name = format!("{} panel tab", tab.label());
+                    match tab {
+                        ContextTab::Changes => {
+                            if let Some(label) = dirty {
+                                name.push_str(": ");
+                                name.push_str(label);
+                            }
+                        }
+                        ContextTab::PullRequest if indicators.pending_checks => {
+                            name.push_str(": checks pending");
+                        }
+                        _ => {}
                     }
-                }
-                ContextTab::PullRequest if indicators.pending_checks => {
-                    name.push_str(": checks pending");
-                }
-                _ => {}
-            }
-            let control = crate::ui_controls::icon_control(
-                visual.as_ref().map_or_else(
-                    || crate::ui_controls::symbolic_icon(icon),
-                    |(icon, _)| icon.clone(),
-                ),
-                name,
-                selected,
-                enabled,
-                enabled.then_some(Message::SelectContextTab(tab)),
-            );
-            match (&visual, dirty) {
-                (Some((_, color)), _) => control.icon_color(*color).into(),
-                (None, Some(_)) => control
-                    .icon_tone(design::Tone::Themed(design::warning_color))
-                    .into(),
-                (None, None) => control.into(),
-            }
-        }))
+                    let control = crate::ui_controls::icon_control(
+                        visual.as_ref().map_or_else(
+                            || crate::ui_controls::symbolic_icon(icon),
+                            |(icon, _)| icon.clone(),
+                        ),
+                        name,
+                        selected,
+                        enabled,
+                        enabled.then_some(Message::SelectContextTab(tab)),
+                    );
+                    match (&visual, dirty) {
+                        (Some((_, color)), _) => control.icon_color(*color).into(),
+                        (None, Some(_)) => control
+                            .icon_tone(design::Tone::Themed(design::warning_color))
+                            .into(),
+                        (None, None) => control.into(),
+                    }
+                }),
+        )
         .spacing(2)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.

@@ -281,6 +281,13 @@ impl Cagents {
                     .iter()
                     .map(|worktree| worktree.path.clone())
             }));
+        self.known_worktree_roots.extend(
+            self.sidebar_model
+                .projects
+                .iter()
+                .filter(|project| project.kind == ProjectKind::Folder)
+                .map(|project| project.repository.clone()),
+        );
         self.known_worktree_roots
             .extend(
                 self.durable

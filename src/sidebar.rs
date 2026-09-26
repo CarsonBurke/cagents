@@ -28,7 +28,7 @@ use url::Url;
 use crate::{
     design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
-    model::{CardId, ChannelId, ProjectId, ProjectState, WorktreeId},
+    model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
         ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
@@ -272,6 +272,11 @@ impl SidebarModel {
     /// and resolving symlinks here would be filesystem I/O inside the view.
     pub fn worktree_at(&self, path: &Path) -> Option<ActiveWorktreeKey> {
         self.projects.iter().find_map(|project| {
+            if project.repository == path
+                && let Some(key) = project.folder_key()
+            {
+                return Some(key);
+            }
             project
                 .worktrees
                 .iter()
@@ -287,9 +292,10 @@ impl SidebarModel {
     /// True while `key` still names a worktree this model knows about.
     pub fn contains_worktree(&self, key: &ActiveWorktreeKey) -> bool {
         self.project(key.project_id).is_some_and(|project| {
-            project.worktrees.iter().any(|worktree| {
-                worktree.id == key.worktree_id && worktree.path == key.canonical_path
-            })
+            project.folder_key().as_ref() == Some(key)
+                || project.worktrees.iter().any(|worktree| {
+                    worktree.id == key.worktree_id && worktree.path == key.canonical_path
+                })
         })
     }
 
@@ -360,6 +366,7 @@ pub struct SidebarProject {
     pub repository_id: RepositoryId,
     pub name: String,
     pub repository: PathBuf,
+    pub kind: ProjectKind,
     pub worktrees: Vec<SidebarWorktree>,
     pub channels: Vec<SidebarChannel>,
     pub pull_requests: Vec<SidebarPullRequest>,
@@ -470,6 +477,7 @@ impl SidebarProject {
             repository_id,
             name,
             repository,
+            kind: ProjectKind::Git,
             worktrees,
             channels: Vec::new(),
             pull_requests,
@@ -498,6 +506,21 @@ impl SidebarProject {
             worktrees,
             pull_requests,
         )
+    }
+
+    pub fn with_kind(mut self, kind: ProjectKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// The folder browser reuses the existing directory binding key without
+    /// manufacturing a Git worktree row or durable WorktreeState.
+    pub fn folder_key(&self) -> Option<ActiveWorktreeKey> {
+        (self.kind == ProjectKind::Folder).then(|| ActiveWorktreeKey {
+            project_id: self.id,
+            worktree_id: WorktreeId::from_uuid(self.id.as_uuid()),
+            canonical_path: self.repository.clone(),
+        })
     }
 
     /// Whether one of this project's worktrees has a pull request still
@@ -2776,9 +2799,18 @@ impl SidebarState {
                 .clone()
                 .filter(|key| model.contains_worktree(key)),
         };
-        self.selection = next.as_ref().map(|key| SidebarSelection::Worktree {
-            project_id: key.project_id,
-            worktree_id: key.worktree_id,
+        self.selection = next.as_ref().map(|key| {
+            if model
+                .project(key.project_id)
+                .is_some_and(|project| project.kind == ProjectKind::Folder)
+            {
+                SidebarSelection::Project(key.project_id)
+            } else {
+                SidebarSelection::Worktree {
+                    project_id: key.project_id,
+                    worktree_id: key.worktree_id,
+                }
+            }
         });
         if self.active_worktree == next {
             return false;
@@ -3725,7 +3757,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 "folder-open-symbolic",
                 "No projects yet",
                 "Open a repository to add its worktrees.",
-                "Open repository",
+                "Open folder",
                 SidebarAction::OpenRepositoryPicker,
             ),
             SidebarFilter::Attention => (
@@ -4341,13 +4373,18 @@ fn project_view<'a>(
     );
     let header = project_header_row(
         project_identity,
-        vec![disclosure, add_channel, add_worktree],
+        if entity.kind == ProjectKind::Git {
+            vec![disclosure, add_channel, add_worktree]
+        } else {
+            vec![disclosure, add_channel]
+        },
     );
     let header = context_controls(
         header,
         project_id,
         None,
         modal_open,
+        entity.kind == ProjectKind::Git,
         entity.github_ready,
         project.editors,
     );
@@ -4406,6 +4443,7 @@ fn compact_project<'a>(
         entity.id,
         None,
         modal_open,
+        entity.kind == ProjectKind::Git,
         entity.github_ready,
         project.editors,
     );
@@ -4997,6 +5035,7 @@ fn worktree_view<'a>(
             project_id,
             Some(worktree.id),
             inert,
+            true,
             github_ready,
             editors,
         ),
@@ -5062,6 +5101,7 @@ fn context_controls<'a>(
     project_id: ProjectId,
     worktree_id: Option<WorktreeId>,
     modal_open: bool,
+    git: bool,
     github_ready: bool,
     editors: &'a [SidebarEditor],
 ) -> Element<'a, SidebarAction> {
@@ -5070,8 +5110,10 @@ fn context_controls<'a>(
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            ("New worktree".to_owned(), None, ProjectCommand::NewWorktree),
         ];
+        if git {
+            commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
+        }
         commands.extend(editors.iter().map(|editor| {
             (
                 editor.name.clone(),
@@ -5577,7 +5619,7 @@ fn worktree_panel<'a>(
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .width(Length::Fill)
                 .into(),
-                button::standard("Open repository")
+                button::standard("Open folder")
                     .on_press_maybe(gated(SidebarAction::OpenRepositoryPicker, modal_open))
                     .into(),
             ])
@@ -10015,7 +10057,7 @@ pub(crate) mod tests {
                 .height(32)
                 .into(),
         ]);
-        let mut element = context_controls(content, project_id(1), None, false, false, &[]);
+        let mut element = context_controls(content, project_id(1), None, false, true, false, &[]);
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
         let node = element.as_widget_mut().layout(
@@ -10700,6 +10742,7 @@ pub(crate) mod tests {
                 project_id(1),
                 Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
                 modal,
+                true,
                 true,
                 &[],
             )
@@ -11623,7 +11666,7 @@ pub(crate) mod tests {
         );
 
         for (query, filter, expected) in [
-            (String::new(), SidebarFilter::All, "Open repository"),
+            (String::new(), SidebarFilter::All, "Open folder"),
             (String::new(), SidebarFilter::Attention, "Show all"),
             ("nothing".to_owned(), SidebarFilter::All, "Clear search"),
         ] {

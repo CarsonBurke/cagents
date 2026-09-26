@@ -993,7 +993,17 @@ pub struct ProjectState {
     pub generation: u64,
     pub name: String,
     pub repository: PathBuf,
+    #[serde(default)]
+    pub kind: ProjectKind,
     pub existence: Existence,
+}
+
+/// A folder keeps its identity when Git metadata appears or disappears later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectKind {
+    #[default]
+    Git,
+    Folder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

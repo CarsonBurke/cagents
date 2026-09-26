@@ -272,9 +272,17 @@ impl Cagents {
         {
             previous.cancel();
         }
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let kind = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == project_id || project.repository == canonical)
+            .map(|project| project.kind);
+        let shared_key = self.workspace_model.project(&canonical).is_some();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                load_repository(&path, Some(project_id), cancellation)
+                load_project(&path, Some(project_id), cancellation, kind, shared_key)
             })
             .await
             .map_err(|error| format!("repository loader join failed: {error}"))

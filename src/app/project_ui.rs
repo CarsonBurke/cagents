@@ -371,6 +371,7 @@ impl Cagents {
         };
         let project = &self.sidebar_model.projects[index];
         let name = project.name.clone();
+        let kind = project.kind;
         let worktrees = project.worktrees.clone();
         let roots = project_worktree_roots(project);
         // The terminal host was closed before the shared edit. Retire this
@@ -414,6 +415,7 @@ impl Cagents {
             .retain(|project| *project != id);
         if let Some(session) = &self.session {
             session.save_project(ProjectState {
+                kind,
                 id,
                 generation: 0,
                 name,
@@ -647,6 +649,19 @@ impl Cagents {
                 let Some(target) = self.project_target(project_id, worktree_id) else {
                     return Task::none();
                 };
+                if self
+                    .sidebar_model
+                    .project(project_id)
+                    .is_some_and(|project| project.kind == ProjectKind::Folder)
+                    && matches!(
+                        command,
+                        ProjectCommand::NewWorktree
+                            | ProjectCommand::Delete
+                            | ProjectCommand::RepositoryUrl
+                    )
+                {
+                    return Task::none();
+                }
                 // The row offers nothing while its worktree is being deleted;
                 // a command that raced the deletion is refused the same way,
                 // even once a read has moved the row to another path.
@@ -1387,6 +1402,9 @@ pub(super) fn removed_existence(reason: &str) -> Existence {
 /// Whether a card lives inside the worktree at `path`: its process runs there,
 /// or it views files there.
 fn project_worktree_roots(project: &SidebarProject) -> Vec<PathBuf> {
+    if project.kind == ProjectKind::Folder {
+        return vec![project.repository.clone()];
+    }
     let mut roots = project
         .worktrees
         .iter()
@@ -1675,6 +1693,7 @@ mod tests {
         .unwrap();
         let project = ProjectId::new();
         session.save_project(ProjectState {
+            kind: Default::default(),
             id: project,
             generation: 0,
             name: "repo".into(),

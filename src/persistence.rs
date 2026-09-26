@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -619,12 +619,13 @@ impl StateStore {
             .prepare_cached(
                 "INSERT INTO projects (
                     project_id, generation, name, repository_json, existence_json,
-                    updated_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    updated_at_unix_ms, kind_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(project_id) DO UPDATE SET
                     generation = excluded.generation,
                     name = excluded.name,
                     repository_json = excluded.repository_json,
+                    kind_json = excluded.kind_json,
                     existence_json = excluded.existence_json,
                     updated_at_unix_ms = excluded.updated_at_unix_ms",
             )?
@@ -635,6 +636,7 @@ impl StateStore {
                 to_json(&project.repository)?,
                 to_json(&project.existence)?,
                 now_unix_ms(),
+                to_json(&project.kind)?,
             ])?;
         transaction.commit()?;
         Ok(next)
@@ -646,7 +648,7 @@ impl StateStore {
         inner
             .connection
             .query_row(
-                "SELECT generation, name, repository_json, existence_json
+                "SELECT generation, name, repository_json, existence_json, kind_json
                  FROM projects WHERE project_id = ?1",
                 [id.to_string()],
                 |row| {
@@ -654,16 +656,18 @@ impl StateStore {
                     let name: String = row.get(1)?;
                     let repository: String = row.get(2)?;
                     let existence: String = row.get(3)?;
-                    Ok((generation, name, repository, existence))
+                    let kind: String = row.get(4)?;
+                    Ok((generation, name, repository, existence, kind))
                 },
             )
             .optional()?
-            .map(|(generation, name, repository, existence)| {
+            .map(|(generation, name, repository, existence, kind)| {
                 Ok(ProjectState {
                     id,
                     generation: i64_to_u64(generation, "project generation")?,
                     name,
                     repository: from_json("project repository", &repository)?,
+                    kind: from_json("project kind", &kind)?,
                     existence: from_json("project existence", &existence)?,
                 })
             })
@@ -674,7 +678,7 @@ impl StateStore {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let mut statement = inner.connection.prepare(
-            "SELECT project_id, generation, name, repository_json, existence_json
+            "SELECT project_id, generation, name, repository_json, existence_json, kind_json
              FROM projects
              ORDER BY updated_at_unix_ms DESC, project_id",
         )?;
@@ -685,16 +689,18 @@ impl StateStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut projects = Vec::new();
         for row in rows {
-            let (id, generation, name, repository, existence) = row?;
+            let (id, generation, name, repository, existence, kind) = row?;
             projects.push(ProjectState {
                 id: parse_id("project", &id)?,
                 generation: i64_to_u64(generation, "project generation")?,
                 name,
                 repository: from_json("project repository", &repository)?,
+                kind: from_json("project kind", &kind)?,
                 existence: from_json("project existence", &existence)?,
             });
         }
@@ -1746,6 +1752,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         if current < 6 {
             migrate_to_v6(&transaction)?;
+        }
+        if current < 7 {
+            transaction.execute_batch(
+                "ALTER TABLE projects ADD COLUMN kind_json TEXT NOT NULL DEFAULT '\"Git\"';",
+            )?;
         }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
@@ -4603,7 +4614,7 @@ mod tests {
         drop(connection);
 
         let store = StateStore::open(&path, boot("v6-boot")).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(
             restored
@@ -4701,6 +4712,55 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn project_kind_migration_preserves_git_and_round_trips_folders() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Existing repository".into(),
+            repository: directory.path().join("repository/.git"),
+            kind: crate::model::ProjectKind::Git,
+            existence: Existence::Open,
+        };
+        let store = StateStore::open(&path, boot("before")).unwrap();
+        store.save_project(&project).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("ALTER TABLE projects DROP COLUMN kind_json; PRAGMA user_version = 6;")
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open(&path, boot("after")).unwrap();
+        let restored = store.load_project(project.id).unwrap().unwrap();
+        assert_eq!(restored.kind, crate::model::ProjectKind::Git);
+        assert_eq!(restored.repository, project.repository);
+        let folder = ProjectState {
+            id: ProjectId::new(),
+            name: "Folder".into(),
+            repository: directory.path().join("plain"),
+            kind: crate::model::ProjectKind::Folder,
+            ..project
+        };
+        store.save_project(&folder).unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot("restored")).unwrap();
+        assert_eq!(
+            store.load_project(folder.id).unwrap().unwrap().kind,
+            crate::model::ProjectKind::Folder
+        );
+        assert!(
+            store
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == folder.id
+                    && project.kind == crate::model::ProjectKind::Folder)
+        );
     }
 
     #[test]
