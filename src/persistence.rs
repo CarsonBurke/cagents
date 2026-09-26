@@ -5781,10 +5781,11 @@ mod tests {
             panic!("expected terminal card");
         };
         SaveLane::default().save(&store, &workspace).unwrap();
-        store
-            .lock_inner()
-            .unwrap()
-            .connection
+        // Simulate damage outside the validated writer, including the now
+        // orphaned transcript row, which normal foreign-key checks forbid.
+        let damaged = Connection::open(&path).unwrap();
+        damaged.pragma_update(None, "foreign_keys", false).unwrap();
+        damaged
             .execute(
                 "DELETE FROM terminal_recipes WHERE card_id = ?1",
                 [card_id.to_string()],
