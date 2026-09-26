@@ -1388,9 +1388,10 @@ impl Cagents {
                     super::notice_body(&removal.name),
                     super::notice_detail(removal.repository.display().to_string()),
                     super::notice_body(detail),
-                    super::notice_detail(
-                        "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
-                    ),
+                    super::notice_detail(match removal.kind {
+                        ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
+                        ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
+                    }),
                     widget::row::with_children(vec![
                         iced::widget::Space::new().width(Length::Fill).into(),
                         widget::button::standard("Cancel")
