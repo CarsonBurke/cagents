@@ -52,6 +52,7 @@ impl RestoreFixture {
         let repository_path = PathBuf::from("/srv/cagents");
         let worktree_path = repository_path.join(".worktrees/session-restore");
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/usr/bin/env".into(),
             arguments: vec!["bash".into(), "--noprofile".into()],
             working_directory: worktree_path.clone(),

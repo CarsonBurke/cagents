@@ -2117,6 +2117,7 @@ mod tests {
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "codex".into(),
                 arguments: vec!["--remote".into(), "unix://".into()],
                 working_directory: home.path().into(),
@@ -2239,6 +2240,7 @@ mod tests {
             provider: crate::agent::Provider::Codex,
             session_id: Some("thread-exact".into()),
             recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "codex".into(),
                 arguments: [
                     "resume",
@@ -2292,6 +2294,7 @@ mod tests {
             provider: crate::agent::Provider::Codex,
             session_id: None,
             recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "codex".into(),
                 arguments: ["--dangerously-bypass-approvals-and-sandbox"]
                     .into_iter()

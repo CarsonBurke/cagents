@@ -43,6 +43,7 @@ impl Drop for RunningTerminal {
 
 fn terminal_session(script: &str) -> TerminalSession {
     let launch = LaunchRecipe {
+        unset_environment: Default::default(),
         program: "/bin/sh".into(),
         arguments: vec!["-c".into(), script.into()],
         working_directory: std::env::temp_dir(),

@@ -1892,6 +1892,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
                 LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?
             } else {
                 LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: argv[0].clone(),
                     arguments: argv[1..].to_vec(),
                     working_directory: cwd,
@@ -3530,6 +3531,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/tmp"),
@@ -3633,6 +3635,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: Vec::new(),
             working_directory: PathBuf::from("/tmp"),

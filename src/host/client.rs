@@ -1214,6 +1214,7 @@ mod tests {
             proof.clone(),
         )));
         let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: directory.path().to_path_buf(),
@@ -1423,6 +1424,7 @@ mod tests {
         )
         .unwrap();
         let launch = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: executable.to_string_lossy().into_owned(),
             arguments: vec![
                 "-c".into(),

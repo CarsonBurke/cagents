@@ -99,6 +99,7 @@ impl Handle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        spec.remove_unset_environment();
         let mut owned_socket = None;
         if let TransportSpec::OwnedUnixWebSocket { socket } = &spec.transport {
             use std::os::unix::fs::DirBuilderExt;
@@ -1760,6 +1761,7 @@ mod tests {
             ("LC_ALL".into(), "C.UTF-8".into()),
         ]);
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/python3".into(),
             arguments: vec!["-c".into(), "import json,os,sys; sys.stdin.readline(); print(json.dumps({'text':json.dumps(dict(os.environ))}),flush=True); sys.stdin.read()".into()],
@@ -1781,10 +1783,100 @@ mod tests {
         handle.close().unwrap();
     }
     #[test]
+    fn selected_account_removals_win_at_the_native_child_boundary() {
+        let spec = ProcessSpec {
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read line; [ -z \"${ANTHROPIC_API_KEY+x}\" ] && [ \"$CLAUDE_CONFIG_DIR\" = /selected ] && printf '%s\\n' '{\"text\":\"isolated\"}'; cat >/dev/null".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::from([
+                ("ANTHROPIC_API_KEY".into(), "fixture-merged-credential".into()),
+                ("CLAUDE_CONFIG_DIR".into(), "/selected".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ]),
+            unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
+        assert!(
+            matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
+        );
+        assert!(
+            !handle
+                .execution_environment()
+                .0
+                .contains_key("ANTHROPIC_API_KEY")
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_managed_recipe_removes_daemon_credentials_when_restarted() {
+        const CHILD: &str = "CAGENTS_LEGACY_ACCOUNT_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::runtime::tests::legacy_managed_recipe_removes_daemon_credentials_when_restarted", "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("PATH", "/usr/bin:/bin").env("ANTHROPIC_API_KEY", "daemon-fixture")
+                .status().unwrap().success());
+            return;
+        }
+        let home = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("accounts/claude/12345678-1234-4234-8234-123456789abc");
+        let legacy = serde_json::json!({
+            "program": "/bin/sh",
+            "arguments": ["-c", "read line; [ -z \"${ANTHROPIC_API_KEY+x}\" ] && printf '%s\\n' '{\"text\":\"isolated\"}'; cat >/dev/null"],
+            "working_directory": std::env::temp_dir(),
+            "environment": {"CLAUDE_CONFIG_DIR": home}
+        });
+        let recipe: crate::model::LaunchRecipe = serde_json::from_value(legacy).unwrap();
+        assert!(
+            recipe.unset_environment.is_empty(),
+            "fixture must predate explicit policy"
+        );
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.environment = crate::model::agent_recovery::fresh_native_environment(
+            crate::agent::Provider::Claude,
+            false,
+        );
+        spec.environment.extend(recipe.environment.clone());
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
+        assert!(
+            matches!(&snapshot.items[0].content, ItemContent::Text { text, .. } if text == "isolated")
+        );
+        assert_eq!(
+            handle.execution_environment().0["CLAUDE_CONFIG_DIR"],
+            home.to_str().unwrap()
+        );
+        assert!(
+            !handle
+                .execution_environment()
+                .0
+                .contains_key("ANTHROPIC_API_KEY")
+        );
+        assert!(
+            recipe.unset_environment.is_empty(),
+            "spawn must not rewrite live descriptor evidence"
+        );
+        handle.close().unwrap();
+    }
+    #[test]
     fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("server").join("control.sock");
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::OwnedUnixWebSocket {
                 socket: socket.clone(),
             },
@@ -1835,6 +1927,7 @@ mod tests {
             })
         }
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
             arguments: Vec::new(),
@@ -1877,6 +1970,7 @@ mod tests {
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
             arguments: Vec::new(),
@@ -2003,6 +2097,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
                 device: metadata.dev(),
@@ -2126,6 +2221,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
                 device: metadata.dev(),
@@ -2177,6 +2273,7 @@ mod tests {
     #[test]
     fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
             arguments: vec!["not-json\\n".into()],
@@ -2207,6 +2304,7 @@ mod tests {
     #[test]
     fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
         let spec = ProcessSpec {
+            unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
             arguments: vec!["not-json\\n".into()],

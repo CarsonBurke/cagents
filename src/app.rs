@@ -4673,11 +4673,16 @@ impl Cagents {
         // homes as native conversations, and persist those choices in its
         // launch recipe so a restored terminal never silently changes login.
         for provider in Account::PROVIDERS {
-            if let (Some(variable), Some(home)) = (
-                account::home_variable(provider),
-                self.default_account_for_directory(provider, &working_directory)
-                    .resolved_home(),
-            ) {
+            let account = self.default_account_for_directory(provider, &working_directory);
+            launch.unset_environment.extend(
+                account
+                    .credential_overrides()
+                    .iter()
+                    .map(|name| (*name).to_owned()),
+            );
+            if let (Some(variable), Some(home)) =
+                (account::home_variable(provider), account.resolved_home())
+            {
                 launch
                     .environment
                     .insert(variable.to_owned(), home.display().to_string());
@@ -14632,6 +14637,7 @@ mod tests {
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
         LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: Vec::new(),
             working_directory: working_directory.into(),

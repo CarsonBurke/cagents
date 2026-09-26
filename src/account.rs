@@ -142,7 +142,97 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     }
 }
 
+/// Documented process credentials and provider selectors that outrank a CLI's
+/// stored login. Keep this list explicit: cloud credentials may still be needed
+/// by the agent's tools, and account-local configuration remains user-owned.
+/// See docs/user-guide.md, "Account credential isolation", for provider sources.
+fn credential_overrides(provider: Provider) -> &'static [&'static str] {
+    match provider {
+        Provider::Claude => &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+            "CLAUDE_CODE_OAUTH_SCOPES",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "ANTHROPIC_PROFILE",
+            "ANTHROPIC_FEDERATION_RULE_ID",
+            "ANTHROPIC_ORGANIZATION_ID",
+        ],
+        Provider::Codex => &[
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+            "OPENAI_FEDERATION_RULE_ID",
+            "OPENAI_IDENTITY_TOKEN_FILE",
+            "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+        ],
+        Provider::Omp => &[],
+    }
+}
+
+/// Recognize only the canonical home namespace owned by this installation.
+/// Merely pointing a system account at an arbitrary directory is not isolation.
+pub fn managed_home_identity(root: &Path, path: &Path) -> Option<(Provider, uuid::Uuid)> {
+    let mut components = path.strip_prefix(root).ok()?.components();
+    let provider = components.next()?.as_os_str().to_str()?;
+    let provider = Account::PROVIDERS
+        .into_iter()
+        .find(|candidate| candidate.executable() == provider)?;
+    let key = uuid::Uuid::parse_str(components.next()?.as_os_str().to_str()?).ok()?;
+    (components.next().is_none()
+        && root
+            .join(provider.executable())
+            .join(key.hyphenated().to_string())
+            == path)
+        .then_some((provider, key))
+}
+
+/// Effective spawn policy also protects recipes saved before explicit removals
+/// existed. Do not rewrite a live descriptor: its identity is daemon evidence.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn launch_credential_overrides(
+    recipe: &crate::model::LaunchRecipe,
+) -> std::collections::BTreeSet<String> {
+    let mut names = recipe.unset_environment.clone();
+    if let Some(dirs) = crate::instance::project_dirs() {
+        let root = dirs.data_dir().join("accounts");
+        for provider in Account::PROVIDERS {
+            if recipe
+                .environment
+                .get(home_variable(provider).unwrap())
+                .is_some_and(|home| {
+                    managed_home_identity(&root, Path::new(home))
+                        .is_some_and(|(owner, _)| owner == provider)
+                })
+            {
+                names.extend(
+                    credential_overrides(provider)
+                        .iter()
+                        .map(|name| (*name).to_owned()),
+                );
+            }
+        }
+    }
+    names
+}
+
 impl Account {
+    /// Selecting a home selects its login, for both owned and linked homes.
+    /// The system account deliberately retains the caller's credential policy.
+    pub fn credential_overrides(&self) -> &'static [&'static str] {
+        match self.home {
+            AccountHome::Managed { .. } | AccountHome::Linked { .. } => {
+                credential_overrides(self.provider)
+            }
+            AccountHome::System | AccountHome::Brokered { .. } => &[],
+        }
+    }
+
     /// The account a provider's CLI uses when nothing chooses another.
     pub fn system(provider: Provider) -> Self {
         Self {
@@ -837,6 +927,46 @@ pub fn format_local_moment(unix_seconds: i64, now_seconds: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn managed_identity_requires_exact_provider_and_canonical_uuid_path() {
+        let root = Path::new("/installation/accounts");
+        let key = uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap();
+        let valid = root.join("claude").join(key.hyphenated().to_string());
+        assert_eq!(
+            managed_home_identity(root, &valid),
+            Some((Provider::Claude, key))
+        );
+        for path in [
+            PathBuf::from("/elsewhere/claude/12345678-1234-4234-8234-123456789abc"),
+            root.join("omp").join(key.hyphenated().to_string()),
+            root.join("claude").join(key.simple().to_string()),
+            root.join("claude/not-an-account"),
+            valid.join("nested"),
+        ] {
+            assert_eq!(managed_home_identity(root, &path), None);
+        }
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn legacy_isolation_does_not_treat_an_external_system_home_as_managed() {
+        let mut recipe = crate::model::LaunchRecipe::shell("/fixture".into()).unwrap();
+        recipe.environment.insert(
+            "CLAUDE_CONFIG_DIR".into(),
+            "/external/claude/12345678-1234-4234-8234-123456789abc".into(),
+        );
+        assert!(launch_credential_overrides(&recipe).is_empty());
+        let home = crate::instance::project_dirs()
+            .unwrap()
+            .data_dir()
+            .join("accounts/claude/12345678-1234-4234-8234-123456789abc");
+        recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), home.to_string_lossy().into());
+        assert!(launch_credential_overrides(&recipe).contains("ANTHROPIC_API_KEY"));
+        assert!(!launch_credential_overrides(&recipe).contains("CODEX_API_KEY"));
+    }
+
     fn window(key: &str, kind: WindowKind, used: f32, resets_at: Option<i64>) -> UsageWindow {
         UsageWindow {
             key: key.into(),
@@ -1225,9 +1355,17 @@ mod credential_guard {
         for file in files {
             // This documented Codex setting selects storage; naming it does
             // not access Omp's similarly named credential table.
-            let text = std::fs::read_to_string(&file)
+            let mut text = std::fs::read_to_string(&file)
                 .unwrap_or_default()
                 .replace("cli_auth_credentials_store", "");
+            // Exact quoted environment names are needed to remove inherited
+            // credentials. This does not allow credential file fields, values,
+            // endpoints, or arbitrary strings containing those names.
+            for provider in crate::account::Account::PROVIDERS {
+                for name in super::credential_overrides(provider) {
+                    text = text.replace(&format!("\"{name}\""), "\"credential-variable-name\"");
+                }
+            }
             for needle in &forbidden {
                 if text.contains(needle.as_str()) {
                     violations.push(format!("{} names {needle}", file.display()));

@@ -934,6 +934,22 @@ fn native_environment_parts(
 }
 
 #[cfg(feature = "host")]
+fn check_environment_removals(bytes: &[u8], recipe: &LaunchRecipe) -> Result<(), String> {
+    for name in crate::account::launch_credential_overrides(recipe) {
+        if bytes.split(|byte| *byte == 0).any(|entry| {
+            entry
+                .strip_prefix(name.as_bytes())
+                .is_some_and(|rest| rest.starts_with(b"="))
+        }) {
+            return Err(format!(
+                "The source reintroduced {name}, which overrides its selected account. Remove that override or choose the system account before switching to chat; the source has not been stopped."
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host")]
 pub(crate) fn native_environment(
     process: &AgentProcess,
     explicit: &std::collections::BTreeMap<String, String>,
@@ -952,6 +968,8 @@ pub(crate) fn native_environment(
         .ok_or("The source process changed before reading its execution environment")?;
     let bytes = bounded_read(root.join("environ"), 128 * 1024)
         .ok_or("Cannot read the exact source execution environment; no source was stopped")?;
+    check_environment_removals(&bytes, &process.recovery)?;
+    let unset_environment = crate::account::launch_credential_overrides(&process.recovery);
     let (durable, environment) =
         native_environment_parts(&bytes, process.provider, explicit, transient)?;
     // A host-owned return clears daemon inheritance and carries its proven
@@ -960,7 +978,10 @@ pub(crate) fn native_environment(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if transient.is_some() || !return_environment_key(process.provider, name) {
+        if transient.is_some()
+            || unset_environment.contains(name)
+            || !return_environment_key(process.provider, name)
+        {
             continue;
         }
         let value = value
@@ -1037,13 +1058,22 @@ fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<Fo
             }
         }
     }
+    // A terminal export cannot implicitly change its recorded account policy.
+    // Native handoff checks that the actual process still respects this policy;
+    // recovery keeps it even when /proc is temporarily unreadable.
+    let unset_environment = request
+        .hint
+        .map(|base| base.unset_environment.clone())
+        .unwrap_or_default();
     let inherited = inherited.map(|environment| LaunchRecipe {
+        unset_environment: unset_environment.clone(),
         program: program.clone(),
         arguments: arguments.clone(),
         working_directory: working_directory.clone(),
         environment,
     });
     let exact = exact.map(|environment| LaunchRecipe {
+        unset_environment,
         program,
         arguments,
         working_directory,
@@ -1840,6 +1870,113 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
+    fn observed_child_retains_selected_account_policy_even_when_environment_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut base = launch(
+            "claude",
+            &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+        );
+        base.unset_environment =
+            ["ANTHROPIC_API_KEY".into(), "CLAUDE_CODE_USE_BEDROCK".into()].into();
+        assert!(check_environment_removals(b"HOME=/fixture\0", &base).is_ok());
+        assert!(check_environment_removals(b"CLAUDE_CODE_USE_BEDROCK=1\0", &base).is_err());
+        assert!(check_environment_removals(b"ANTHROPIC_API_KEY=fixture-only\0", &base).is_err());
+        assert!(
+            check_environment_removals(b"ANTHROPIC_API_KEY_SUFFIX=fixture-only\0", &base).is_ok()
+        );
+        process_fixture(directory.path(), 100, &base, &[]);
+        let root = directory.path().join("100");
+        for (bytes, expected) in [
+            (
+                b"HOME=/fixture\0".as_slice(),
+                base.unset_environment.clone(),
+            ),
+            (
+                b"HOME=/fixture\0CLAUDE_CODE_USE_BEDROCK=1\0".as_slice(),
+                base.unset_environment.clone(),
+            ),
+        ] {
+            fs::write(root.join("environ"), bytes).unwrap();
+            let observed = read_process_launch(
+                &root,
+                ForegroundRequest {
+                    hint: Some(&base),
+                    agent: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(observed.inherited.unwrap().unset_environment, expected);
+            assert_eq!(observed.exact.unwrap().unset_environment, expected);
+        }
+        fs::remove_file(root.join("environ")).unwrap();
+        let observed = read_process_launch(
+            &root,
+            ForegroundRequest {
+                hint: Some(&base),
+                agent: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            observed.inherited.unwrap().unset_environment,
+            base.unset_environment
+        );
+        assert!(
+            observed.exact.is_none(),
+            "unreadable environment cannot authorize a native handoff"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn native_handoff_represents_selected_account_absence_despite_daemon_credentials() {
+        const CHILD: &str = "CAGENTS_ENV_REMOVAL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "model::agent_recovery::tests::native_handoff_represents_selected_account_absence_despite_daemon_credentials", "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", "/fixture")
+                .env("PATH", "/usr/bin:/bin").env("ANTHROPIC_API_KEY", "daemon-fixture")
+                .status().unwrap().success());
+            return;
+        }
+        let mut recipe = launch("claude", &[]);
+        recipe.environment = [
+            ("HOME".into(), "/fixture".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CLAUDE_CONFIG_DIR".into(), "/selected".into()),
+        ]
+        .into();
+        recipe.unset_environment.insert("ANTHROPIC_API_KEY".into());
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .env_clear()
+            .envs(&recipe.environment)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = process_identity(&fs::read(format!("/proc/{pid}/stat")).unwrap())
+            .unwrap()
+            .1;
+        let process = AgentProcess {
+            pid,
+            start,
+            provider: Provider::Claude,
+            launch: recipe.clone(),
+            recovery: recipe.clone(),
+        };
+        let result = native_environment(&process, &recipe.environment, None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let (durable, execution) = result.unwrap();
+        assert_eq!(
+            durable.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/selected")
+        );
+        assert!(!execution.contains_key("ANTHROPIC_API_KEY"));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
     fn activity_retains_actual_interpreter_and_only_the_process_account_environment() {
         let directory = tempfile::tempdir().unwrap();
         let script = "/opt/node_modules/@anthropic-ai/claude-code/cli.js";
@@ -2025,12 +2162,32 @@ mod tests {
 
     fn launch(program: &str, arguments: &[&str]) -> LaunchRecipe {
         LaunchRecipe {
+            unset_environment: Default::default(),
             program: program.into(),
             arguments: arguments.iter().map(|arg| (*arg).into()).collect(),
             working_directory: "/tmp".into(),
             environment: BTreeMap::new(),
         }
     }
+    #[test]
+    fn selected_account_removals_survive_all_resume_paths() {
+        let mut original = launch(
+            "claude",
+            &["--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+        );
+        original.unset_environment =
+            ["ANTHROPIC_API_KEY".into(), "CLAUDE_CODE_OAUTH_TOKEN".into()].into();
+        for recipe in [
+            resume_recipe(&original).unwrap(),
+            fresh_recipe(&original).unwrap(),
+            picker_recipe(&original).unwrap(),
+            bind_session(&original, "a1b2c3d4-1111-4111-8111-987654321abc").unwrap(),
+            recipe_from_hint(&hint_from_launch(&original).unwrap()).unwrap(),
+        ] {
+            assert_eq!(recipe.unset_environment, original.unset_environment);
+        }
+    }
+
     #[test]
     fn picker_recipe_drops_every_selector_and_opens_the_provider_picker() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";

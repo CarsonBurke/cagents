@@ -40,6 +40,7 @@ impl CloseSafetyShell {
         )
         .unwrap();
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: program.to_string_lossy().into_owned(),
             arguments: arguments
                 .iter()

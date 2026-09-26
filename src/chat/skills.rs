@@ -417,6 +417,7 @@ mod tests {
         Launch {
             provider,
             recipe: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: provider.executable().into(),
                 arguments: vec![],
                 working_directory: cwd.into(),

@@ -1953,6 +1953,7 @@ mod tests {
 
     fn terminal_card() -> CardState {
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-l".into()],
             working_directory: PathBuf::from("/repo/worktree"),

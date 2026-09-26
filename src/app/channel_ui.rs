@@ -1024,6 +1024,7 @@ mod tests {
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Omp,
                 recipe: crate::model::LaunchRecipe {
+                    unset_environment: Default::default(),
                     program: "/bin/sh".into(),
                     arguments: Vec::new(),
                     working_directory: std::path::PathBuf::from("/tmp"),

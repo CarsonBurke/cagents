@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{CStr, CString},
     fmt,
     mem::MaybeUninit,
@@ -232,6 +232,10 @@ pub struct LaunchRecipe {
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
     pub environment: BTreeMap<String, String>,
+    /// Removed after every inherited and explicit environment layer. Names only;
+    /// selected accounts must survive daemon restarts without saving credentials.
+    #[serde(default)]
+    pub unset_environment: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -249,7 +253,15 @@ impl LaunchRecipe {
             arguments: Vec::new(),
             working_directory,
             environment: BTreeMap::new(),
+            unset_environment: BTreeSet::new(),
         })
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    /// Apply explicit removals and the equivalent policy for legacy managed homes.
+    pub(crate) fn remove_unset_environment(&self, environment: &mut BTreeMap<String, String>) {
+        let names = crate::account::launch_credential_overrides(self);
+        environment.retain(|name, _| !names.contains(name));
     }
 }
 
@@ -1227,6 +1239,7 @@ mod tests {
                     launch: crate::chat::Launch {
                         provider: crate::agent::Provider::Omp,
                         recipe: LaunchRecipe {
+                            unset_environment: Default::default(),
                             program: "/usr/bin/omp".into(),
                             arguments: Vec::new(),
                             working_directory: PathBuf::from("/repo"),
@@ -1386,6 +1399,7 @@ mod tests {
     #[test]
     fn explicit_launch_recipe_round_trip_is_unchanged() {
         let recipe = LaunchRecipe {
+            unset_environment: BTreeSet::from(["ANTHROPIC_API_KEY".into()]),
             program: "/usr/bin/env".into(),
             arguments: vec!["printf".into(), "%s".into(), "unchanged".into()],
             working_directory: PathBuf::from("/tmp/worktree"),
@@ -1397,6 +1411,16 @@ mod tests {
             serde_json::from_slice::<LaunchRecipe>(&encoded).unwrap(),
             recipe
         );
+        let mut legacy = serde_json::to_value(&recipe).unwrap();
+        legacy.as_object_mut().unwrap().remove("unset_environment");
+        assert!(
+            serde_json::from_value::<LaunchRecipe>(legacy)
+                .unwrap()
+                .unset_environment
+                .is_empty()
+        );
+        let wire = postcard::to_allocvec(&recipe).unwrap();
+        assert_eq!(postcard::from_bytes::<LaunchRecipe>(&wire).unwrap(), recipe);
     }
 
     #[test]

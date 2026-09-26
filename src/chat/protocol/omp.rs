@@ -1504,6 +1504,7 @@ mod tests {
         let launch = Launch {
             provider: Provider::Omp,
             recipe: LaunchRecipe {
+                unset_environment: Default::default(),
                 program: "omp".into(),
                 arguments: vec![
                     "--session-dir".into(),

@@ -605,6 +605,7 @@ mod tests {
         // The shell's argv names nothing; the observation saw Claude inside it
         // without establishing which conversation it held.
         let agent = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "claude".into(),
             arguments: vec![
                 "--model".into(),

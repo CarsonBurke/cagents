@@ -4131,6 +4131,7 @@ mod tests {
 
     fn recipe() -> LaunchRecipe {
         LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/usr/bin/fish".into(),
             arguments: vec!["--login".into()],
             working_directory: PathBuf::from("/tmp/project"),

@@ -451,6 +451,9 @@ fn command(account: &Account, program: &Path) -> Command {
     if let Some(path) = shell_search_path() {
         command.env("PATH", path);
     }
+    for variable in account.credential_overrides() {
+        command.env_remove(variable);
+    }
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }
@@ -1005,6 +1008,49 @@ fn rpc_result(mut frame: Value) -> RpcResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn selected_home_probes_remove_inherited_credentials_but_system_keeps_them() {
+        const CHILD: &str = "CAGENTS_ACCOUNT_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "account::probe::tests::selected_home_probes_remove_inherited_credentials_but_system_keeps_them", "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
+            for provider in Account::PROVIDERS {
+                for name in super::super::credential_overrides(provider) {
+                    child.env(name, "fixture-only");
+                }
+            }
+            assert!(child.status().unwrap().success());
+            return;
+        }
+        for provider in Account::PROVIDERS {
+            let home = std::env::temp_dir();
+            for account in [
+                Account::system(provider),
+                Account::managed(provider, uuid::Uuid::new_v4(), home.clone()),
+                Account::linked(provider, uuid::Uuid::new_v4(), home.clone()),
+            ] {
+                let expected = if account.is_system() { "x" } else { "" };
+                let script = super::super::credential_overrides(provider)
+                    .iter()
+                    .map(|name| format!("[ \"${{{name}+x}}\" = '{expected}' ] || exit 17"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let output = command(&account, Path::new("/bin/sh"))
+                    .args(["-c", &script])
+                    .output()
+                    .await
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{provider:?} selected={} leaked a credential override",
+                    !account.is_system()
+                );
+            }
+        }
+    }
 
     #[test]
     fn only_the_matching_control_response_answers() {

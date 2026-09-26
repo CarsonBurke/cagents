@@ -76,6 +76,9 @@ fn listing(recipe: &LaunchRecipe) -> ProbeResult<Vec<Value>> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in crate::account::launch_credential_overrides(recipe) {
+        command.env_remove(name);
+    }
     let mut child = ChildGuard(command.spawn().map_err(|_| ())?);
     let mut stdout = child.0.stdout.take().ok_or(())?;
     let mut stderr = child.0.stderr.take().ok_or(())?;
