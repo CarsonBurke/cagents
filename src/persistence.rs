@@ -5792,6 +5792,10 @@ mod tests {
             .unwrap();
         let mut replacement = original.clone();
         replacement.id = TerminalId::new();
+        replacement.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: replacement.launch.clone(),
+            last_exit: None,
+        };
         let error = store
             .replace_terminal_identity(card_id, original.id, &replacement)
             .unwrap_err();
