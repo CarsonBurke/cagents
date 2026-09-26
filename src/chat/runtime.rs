@@ -137,6 +137,8 @@ impl Handle {
                     .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
                     .process_group(0);
                 crate::host::descriptor_limit::inherit(&mut process);
+                let _account = crate::account::registry::authorize_command(&process)
+                    .map_err(|error| error.to_string())?;
                 Some(ChildGuard(
                     process
                         .spawn()
@@ -1830,6 +1832,16 @@ mod tests {
             .unwrap()
             .data_dir()
             .join("accounts/claude/12345678-1234-4234-8234-123456789abc");
+        crate::account::registry::Store::installation()
+            .unwrap()
+            .update(|registry| {
+                registry.begin(
+                    crate::agent::Provider::Claude,
+                    uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap(),
+                    1,
+                );
+            })
+            .unwrap();
         let legacy = serde_json::json!({
             "program": "/bin/sh",
             "arguments": ["-c", "read line; [ -z \"${ANTHROPIC_API_KEY+x}\" ] && printf '%s\\n' '{\"text\":\"isolated\"}'; cat >/dev/null"],

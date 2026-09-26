@@ -7372,6 +7372,8 @@ impl Cagents {
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
+                        self.account_recovery_controls(id)
+                            .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
                             let mut controls = vec![
                                 widget::button::suggested(retry_label)

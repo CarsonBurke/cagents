@@ -336,6 +336,7 @@ fn process_request(
             ))
         }
         request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }
         | ClientRequest::ChatStartSelected { .. }

@@ -105,6 +105,7 @@ pub enum Action {
     DraftModel(Target, Provider, Option<String>),
     /// Points a draft at another account of its provider.
     ChooseAccount(Target, AccountId),
+    RecoverAccount(CardId, AccountId),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
     /// Opens or closes the account choice.
@@ -116,6 +117,7 @@ pub enum Action {
     CancelQueued(Target),
     Switch(CardId),
     Ready(Target, Ready),
+    AccountCommitted(Target, Ready, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -198,6 +200,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::AccountCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -215,7 +218,9 @@ impl Action {
     fn starts_session(&self) -> Option<CardId> {
         match self {
             Self::Reconnect(target) => Some(target.card),
-            Self::Switch(card) | Self::StartFresh(card) => Some(*card),
+            Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
+                Some(*card)
+            }
             _ => None,
         }
     }
@@ -246,6 +251,11 @@ impl Action {
             _ => None,
         }
     }
+}
+
+struct AccountRecovery {
+    source: chat::Session,
+    committed: bool,
 }
 
 struct Attempt {
@@ -313,6 +323,9 @@ pub(super) struct State {
     /// A card in this set has no chat runtime to hold the offer, because its
     /// start never produced one, so the failed card itself has to carry it.
     fresh_offers: HashSet<CardId>,
+    removed_accounts: HashSet<CardId>,
+    /// The durable source stays unchanged until this candidate is confirmed.
+    account_recoveries: HashMap<Target, AccountRecovery>,
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
@@ -343,6 +356,8 @@ impl Default for State {
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
+            removed_accounts: HashSet::new(),
+            account_recoveries: HashMap::new(),
             last_models: HashMap::new(),
             restarting: HashMap::new(),
         }
@@ -2225,6 +2240,141 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
+    fn recover_chat_account(&mut self, card: CardId, id: AccountId) -> Task<Message> {
+        if !self.chat_ui.removed_accounts.contains(&card) || self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
+            return Task::none();
+        };
+        let Some(account) = self
+            .known_account(&id)
+            .filter(|account| account.provider == source.launch.provider)
+        else {
+            return Task::none();
+        };
+        let source = source.clone();
+        let mut replacement = source.clone();
+        replacement.reset_owned_codex_listener();
+        replacement.id = TerminalId::new();
+        replacement.proof = None;
+        replacement.terminal = None;
+        let variable = account::home_variable(account.provider).unwrap();
+        let names = account::credential_overrides(account.provider);
+        replacement.launch.recipe.environment.remove(variable);
+        replacement
+            .launch
+            .recipe
+            .environment
+            .retain(|name, _| !names.contains(&name.as_str()));
+        replacement
+            .launch
+            .recipe
+            .unset_environment
+            .retain(|name| !names.contains(&name.as_str()));
+        replacement.launch.recipe.unset_environment.extend(
+            account
+                .credential_overrides()
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        if let Some(home) = account.resolved_home() {
+            let Some(home) = home.to_str() else {
+                return Task::none();
+            };
+            replacement
+                .launch
+                .recipe
+                .environment
+                .insert(variable.into(), home.into());
+        }
+        if !chat::is_account_recovery(&source, &replacement) {
+            return Task::none();
+        }
+        let target = self.chat_ui.next_target(card);
+        self.chat_ui.account_recoveries.insert(
+            target,
+            AccountRecovery {
+                source: source.clone(),
+                committed: false,
+            },
+        );
+        self.chat_ui.attempts.insert(
+            card,
+            Attempt {
+                target,
+                session: replacement.clone(),
+            },
+        );
+        let sender = self.chat_ui.sender.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        ClientHandle::recover_account(source, replacement, move |wake| {
+                            let _ = sender.try_send((target, wake));
+                        })
+                        .map(Arc::new)
+                    },
+                )))
+            })
+            .await
+            .map_err(|error| chat::StartFailure::retry(error.to_string()))
+            .and_then(|result| result);
+            Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(result)))),
+            ))
+        })
+    }
+
+    pub(super) fn account_recovery_controls(&self, card: CardId) -> Option<Element<'_, Message>> {
+        if !self.chat_ui.removed_accounts.contains(&card) {
+            return None;
+        }
+        let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
+            return None;
+        };
+        if source.launch.session_id.is_none() {
+            return None;
+        }
+        let choices = self.chat_accounts(source.launch.provider, &source.launch.recipe)?;
+        let pending = self.chat_start_pending(card);
+        let mut content: Vec<Element<'_, Message>> = vec![design::caption(if pending {
+            "Checking the saved conversation on the selected account…"
+        } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into()];
+        for choice in choices
+            .choices
+            .into_iter()
+            .filter(|choice| !choice.selected)
+        {
+            content.push(
+                widget::button::standard(format!(
+                    "{}{}",
+                    choice.label,
+                    if choice.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", choice.detail)
+                    }
+                ))
+                .on_press_maybe(
+                    (!pending).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
+                )
+                .into(),
+            );
+        }
+        Some(
+            widget::container(
+                widget::scrollable(widget::column::with_children(content).spacing(6))
+                    .height(Length::Shrink),
+            )
+            .max_height(180)
+            .padding(8)
+            .into(),
+        )
+    }
+
     /// Read authored skills on the blocking pool. No daemon or provider is
     /// involved, and a late result cannot replace a different account's list
     /// or the authoritative catalog of a conversation that has started.
@@ -2694,6 +2844,10 @@ impl Cagents {
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
+        self.chat_ui.removed_accounts.remove(&card);
+        self.chat_ui
+            .account_recoveries
+            .retain(|target, _| target.card != card);
         self.chat_ui.closed.remove(&card);
         self.chat_ui.close_after_handoff.remove(&card);
         self.chat_ui.replacements.remove(&card);
@@ -3596,6 +3750,7 @@ impl Cagents {
             Action::ChooseAccount(target, id) => {
                 return self.choose_chat_account(target, id);
             }
+            Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -3771,11 +3926,32 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::AccountCommitted(target, ready, result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(recovery) = self.chat_ui.account_recoveries.get_mut(&target) {
+                            recovery.committed = true;
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut reply) = ready.0.lock() {
+                            *reply = Some(Err(chat::StartFailure::retry(format!(
+                                "The account change was not saved: {error}. The original conversation is retained."
+                            ))));
+                        }
+                    }
+                }
+                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+            }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
                 let Some(result) = result else {
                     return Task::none();
                 };
+                let recovery = self.chat_ui.account_recoveries.remove(&target);
+                let account_committed =
+                    recovery.as_ref().is_some_and(|recovery| recovery.committed);
+                let account_source = recovery.map(|recovery| recovery.source);
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // The card was closed while this start was in flight.
                     // Whatever the start produced is given up now; a failed
@@ -3795,7 +3971,11 @@ impl Cagents {
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
-                            CardKind::Chat(session) => session.id == attempt.session.id,
+                            CardKind::Chat(session) => account_source
+                                .as_ref()
+                                .map_or(session.id == attempt.session.id, |source| {
+                                    session == source
+                                }),
                             CardKind::Terminal(session) => {
                                 attempt.session.terminal.as_ref().is_some_and(|source| {
                                     source.id == session.id && source.launch == session.launch
@@ -3815,7 +3995,58 @@ impl Cagents {
                 }
                 match result {
                     Ok(handle) => {
+                        if let Some(source) = &account_source {
+                            let replacement = handle.session();
+                            if !chat::is_account_recovery(source, &replacement)
+                                || handle.snapshot().session_id != source.launch.session_id
+                            {
+                                self.status = Some(TransientNotice::error(
+                                    "The provider did not confirm the saved conversation. Its original account and identity are retained.",
+                                ));
+                                return self.retire_chat(target.card, Some(handle), None);
+                            }
+                            if !account_committed {
+                                self.chat_ui.attempts.insert(target.card, attempt);
+                                self.chat_ui.account_recoveries.insert(
+                                    target,
+                                    AccountRecovery {
+                                        source: source.clone(),
+                                        committed: false,
+                                    },
+                                );
+                                let receipt = self
+                                    .session
+                                    .as_ref()
+                                    .ok_or_else(|| "Session storage is unavailable".to_owned())
+                                    .and_then(|writer| {
+                                        writer.rebind_chat_account(
+                                            target.card,
+                                            source.clone(),
+                                            replacement,
+                                        )
+                                    });
+                                let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result = match receipt {
+                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
+                                            receipt
+                                                .recv()
+                                                .map_err(|error| {
+                                                    format!("Session writer disconnected: {error}")
+                                                })
+                                                .and_then(|result| result)
+                                        })
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|result| result),
+                                        Err(error) => Err(error),
+                                    };
+                                    Message::ChatUi(Action::AccountCommitted(target, ready, result))
+                                });
+                            }
+                        }
                         self.chat_ui.fresh_offers.remove(&target.card);
+                        self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
@@ -3865,7 +4096,12 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
                             session = runtime.session.clone();
                         }
-                        self.commit_chat_session(target.card, session);
+                        if account_source.is_some() {
+                            self.install_chat_session(target.card, session.clone());
+                            self.persist();
+                        } else {
+                            self.commit_chat_session(target.card, session);
+                        }
                         if let Some(title) = title
                             && self.apply_reported_title(target.card, title)
                         {
@@ -3936,6 +4172,11 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        let account_removed =
+                            failure.recovery == chat::Recovery::Account || account_source.is_some();
+                        if account_removed {
+                            self.chat_ui.removed_accounts.insert(target.card);
+                        }
                         // A card that cannot resume has to say what refused it
                         // and offer the action that answers that refusal, so
                         // the classification travels with the message rather
@@ -3961,7 +4202,20 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                             self.status = Some(TransientNotice::error(failure.message));
                         }
-                        return self.drain_terminal(target.card, 0);
+                        let cleanup = if account_source.is_some() {
+                            self.retire_chat(target.card, None, Some(attempt.session))
+                        } else {
+                            Task::none()
+                        };
+                        return Task::batch([
+                            self.drain_terminal(target.card, 0),
+                            cleanup,
+                            if account_removed {
+                                self.reload_registry()
+                            } else {
+                                Task::none()
+                            },
+                        ]);
                     }
                 }
             }
@@ -5425,6 +5679,26 @@ mod tests {
             target,
             Ready(Arc::new(Mutex::new(Some(result)))),
         )));
+    }
+
+    fn account_commit_reply(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::ChatUi(Action::AccountCommitted(..)),
+                    )) = action
+                    {
+                        return message;
+                    }
+                }
+                panic!("account commit produced no acknowledgment");
+            })
     }
 
     fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
@@ -7204,6 +7478,198 @@ mod tests {
             app.chat_ui.last_models.get(&Provider::Codex),
             Some(&("gpt-b".to_owned(), None))
         );
+    }
+
+    #[test]
+    fn account_recovery_keeps_the_saved_identity_until_exact_confirmation() {
+        for close_before_ack in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let mut source = chat_runtime(&app, card).session.clone();
+            source
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), "/removed-account".into());
+            app.install_chat_session(card, source.clone());
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            let saved = |app: &Cagents| {
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(writer.last_error(), None);
+                writer
+                    .operation_store()
+                    .load_card(card, None)
+                    .unwrap()
+                    .unwrap()
+                    .kind
+            };
+            assert_eq!(saved(&app), CardKind::Chat(source.clone()));
+            app.chat_forget(card);
+            app.cards.insert(card, CardRuntime::Loading);
+            let _ = app.open_chat(card, source.clone(), chat::Intent::Restore);
+            let target = chat_runtime_attempt(&app, card);
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure {
+                    message: "The saved account was removed".into(),
+                    recovery: chat::Recovery::Account,
+                }),
+            );
+            assert!(app.chat_ui.removed_accounts.contains(&card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            let system = Account::system(Provider::Codex).id();
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            )));
+            let target = chat_runtime_attempt(&app, card);
+            assert_ne!(app.chat_ui.attempts[&card].session.id, source.id);
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            )));
+            assert_eq!(
+                chat_runtime_attempt(&app, card),
+                target,
+                "double click does not create another candidate"
+            );
+            answer_start(
+                &mut app,
+                target,
+                Err(chat::StartFailure::retry(
+                    "Conversation unavailable on this account",
+                )),
+            );
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert!(app.chat_ui.removed_accounts.contains(&card));
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            assert_eq!(saved(&app), CardKind::Chat(source.clone()));
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            )));
+            let target = chat_runtime_attempt(&app, card);
+            let handle = fixture_handle(&app, card, Some("different-conversation"));
+            answer_start(&mut app, target, Ok(handle));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(
+                card,
+                system.clone(),
+            )));
+            let target = chat_runtime_attempt(&app, card);
+            let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+            let mut competing = handle.session();
+            competing.reset_owned_codex_listener();
+            competing.id = TerminalId::new();
+            // A different durable owner wins before this candidate can commit.
+            let store = app.session.as_ref().unwrap().operation_store();
+            store
+                .rebind_chat_account(card, &source, &competing)
+                .unwrap();
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            let reply = account_commit_reply(task);
+            assert!(matches!(
+                &reply,
+                Message::ChatUi(Action::AccountCommitted(_, _, Err(_)))
+            ));
+            let _ = app.update(reply);
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert_eq!(
+                store.load_card(card, None).unwrap().unwrap().kind,
+                CardKind::Chat(competing.clone())
+            );
+            assert!(app.chat_ui.removed_accounts.contains(&card));
+            let retirement = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
+            store
+                .rebind_chat_account(card, &competing, &source)
+                .unwrap();
+
+            let _ = app.update(Message::ChatUi(Action::RecoverAccount(card, system)));
+            let target = chat_runtime_attempt(&app, card);
+            let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            // An unrelated save while acknowledgment is pending still contains
+            // the old descriptor; only that descriptor is translated by the lane.
+            app.card_state_mut(card).unwrap().title = "Title edited while committing".into();
+            app.persist();
+            if close_before_ack {
+                app.notices.entries.clear();
+                close_chat(&mut app, card);
+                let reply = account_commit_reply(task);
+                let _ = app.update(reply);
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(10))
+                    .unwrap();
+                let stored = store.load_card(card, None).unwrap().unwrap();
+                assert!(
+                    !stored.existence.is_open(),
+                    "commit acknowledgment cannot resurrect a closed card"
+                );
+                assert!(!app.cards.contains_key(&card));
+                retired(&mut app, card);
+                continue;
+            }
+            let reply = account_commit_reply(task);
+            let _ = app.update(reply);
+            let CardKind::Chat(recovered) = &app.card_state(card).unwrap().kind else {
+                panic!("chat retained");
+            };
+            assert_ne!(recovered.id, source.id);
+            assert_eq!(recovered.launch.session_id, source.launch.session_id);
+            assert_eq!(saved(&app), CardKind::Chat(recovered.clone()));
+            assert_eq!(
+                store.load_card(card, None).unwrap().unwrap().title,
+                "Title edited while committing"
+            );
+            assert!(!app.chat_ui.removed_accounts.contains(&card));
+        }
     }
 
     /// A conversation an earlier version started for a chat nobody wrote in

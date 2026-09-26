@@ -28,14 +28,14 @@ use crate::chat::local_time;
 pub mod cache;
 pub mod claude;
 pub mod codex;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod home;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod login;
 pub mod omp;
 #[cfg(feature = "ui")]
 pub mod probe;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod registry;
 pub mod schedule;
 
@@ -148,7 +148,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
 /// stored login. Keep this list explicit: cloud credentials may still be needed
 /// by the agent's tools, and account-local configuration remains user-owned.
 /// See docs/user-guide.md, "Account credential isolation", for provider sources.
-fn credential_overrides(provider: Provider) -> &'static [&'static str] {
+pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &[
             "ANTHROPIC_API_KEY",

@@ -322,6 +322,15 @@ impl IdentityReplacement {
 enum ConversionCheckpoint {
     Snapshot(Arc<WorkspaceState>),
     IdentityReplacement(IdentityReplacement),
+    AccountRecovery(AccountRecoveryWrite),
+}
+
+#[derive(Debug)]
+struct AccountRecoveryWrite {
+    card: CardId,
+    source: crate::chat::Session,
+    replacement: crate::chat::Session,
+    reply: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
 }
 
 fn merge_identity_replacement(
@@ -597,6 +606,47 @@ impl SessionRuntime {
         );
     }
 
+    /// Commit an exact account transition once, in order with queued snapshots.
+    /// The caller keeps its candidate inactive until this receipt succeeds;
+    /// failures are returned without retaining an automatic retry.
+    pub fn rebind_chat_account(
+        &self,
+        card_id: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
+        if queue.shutdown {
+            return Err("Session writer is shutting down".into());
+        }
+        queue.ordered_identities = true;
+        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(snapshot) = queue.latest.take() {
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::Snapshot(snapshot));
+        }
+        queue
+            .conversions
+            .push_back(ConversionCheckpoint::AccountRecovery(
+                AccountRecoveryWrite {
+                    card: card_id,
+                    source,
+                    replacement,
+                    reply,
+                },
+            ));
+        changed.notify_one();
+        Ok(receiver)
+    }
+
     /// Queues `replacement`, then `state` as the newest snapshot when given.
     fn replace_identity(
         &self,
@@ -800,6 +850,10 @@ struct PendingWrites {
     project_generations: HashMap<ProjectId, u64>,
     worktree_generations: HashMap<WorktreeId, u64>,
     quarantine: Quarantine,
+    /// Successful, explicit account transitions translate only old snapshots
+    /// queued while the UI awaited acknowledgment. Other card fields, including
+    /// tombstones, remain exactly as submitted.
+    account_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
 }
 
 /// When storage first refused a subject, and why it refuses it now.
@@ -1096,6 +1150,16 @@ impl Quarantine {
 }
 
 trait SessionStore {
+    fn rebind_chat_account(
+        &self,
+        _card_id: CardId,
+        _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support account recovery".into(),
+        ))
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1128,6 +1192,14 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn rebind_chat_account(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1184,6 +1256,14 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn rebind_chat_account(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_account(self, card_id, source, replacement)
+    }
     fn replace_terminal_identity(
         &self,
         card_id: CardId,
@@ -1258,6 +1338,7 @@ impl PendingWrites {
             project_generations,
             worktree_generations,
             quarantine: Quarantine::default(),
+            account_rebindings: HashMap::new(),
         }
     }
 
@@ -1336,7 +1417,8 @@ impl PendingWrites {
             .iter()
             .find_map(|checkpoint| match checkpoint {
                 ConversionCheckpoint::Snapshot(snapshot) => Some(snapshot.id),
-                ConversionCheckpoint::IdentityReplacement(_) => None,
+                ConversionCheckpoint::IdentityReplacement(_)
+                | ConversionCheckpoint::AccountRecovery(_) => None,
             })
             .or_else(|| self.workspace.as_ref().map(|snapshot| snapshot.id))
     }
@@ -1431,6 +1513,23 @@ impl PendingWrites {
                 return Ok(());
             };
             match checkpoint {
+                ConversionCheckpoint::AccountRecovery(recovery) => {
+                    let result = store.rebind_chat_account(
+                        recovery.card,
+                        &recovery.source,
+                        &recovery.replacement,
+                    );
+                    if result.is_ok() {
+                        self.account_rebindings
+                            .insert(recovery.card, (recovery.source, recovery.replacement));
+                    }
+                    // An explicit account change is one-shot. In particular an
+                    // I/O failure must not silently commit after the UI has
+                    // refused activation and retired its candidate.
+                    let _ = recovery
+                        .reply
+                        .send(result.map_err(|error| error.to_string()));
+                }
                 ConversionCheckpoint::IdentityReplacement(mut replacement) => {
                     self.quarantine.continue_refused(&mut replacement);
                     match replacement.apply(store) {
@@ -1445,7 +1544,22 @@ impl PendingWrites {
                         }
                     }
                 }
-                ConversionCheckpoint::Snapshot(snapshot) => {
+                ConversionCheckpoint::Snapshot(mut snapshot) => {
+                    let needs_translation = |state: &crate::model::CardState| {
+                        self.account_rebindings.get(&state.id).is_some_and(|(source, _)| {
+                            matches!(&state.kind, CardKind::Chat(session) if session == source)
+                        })
+                    };
+                    if !self.account_rebindings.is_empty()
+                        && snapshot.cards.iter().any(needs_translation)
+                    {
+                        for state in &mut Arc::make_mut(&mut snapshot).cards {
+                            if needs_translation(state) {
+                                state.kind =
+                                    CardKind::Chat(self.account_rebindings[&state.id].1.clone());
+                            }
+                        }
+                    }
                     match store.save_workspace(
                         &snapshot,
                         SnapshotBase {
@@ -2189,6 +2303,15 @@ mod tests {
     }
 
     impl SessionStore for FakeStore {
+        fn rebind_chat_account(
+            &self,
+            _card_id: CardId,
+            _source: &crate::chat::Session,
+            _replacement: &crate::chat::Session,
+        ) -> Result<(), StoreError> {
+            self.write()
+        }
+
         fn replace_terminal_identity(
             &self,
             _card_id: CardId,
@@ -3564,6 +3687,61 @@ mod tests {
 
     fn empty_writes() -> PendingWrites {
         PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new())
+    }
+
+    #[test]
+    fn account_recovery_io_failure_is_acknowledged_without_a_later_retry() {
+        let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                session_id: Some("saved-conversation".into()),
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: BTreeMap::from([("CODEX_HOME".into(), "/removed".into())]),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        replacement
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/selected".into());
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        let mut writes = empty_writes();
+        writes
+            .conversions
+            .push_back(ConversionCheckpoint::AccountRecovery(
+                AccountRecoveryWrite {
+                    card: CardId::new(),
+                    source,
+                    replacement,
+                    reply,
+                },
+            ));
+        assert!(
+            writes.flush(&store).is_empty(),
+            "failure belongs to the explicit request"
+        );
+        assert!(receipt.recv().unwrap().is_err());
+        assert!(writes.is_settled());
+        writes.rearm_quarantine();
+        assert!(writes.flush(&store).is_empty());
+        assert_eq!(
+            store.attempts.load(Ordering::Relaxed),
+            1,
+            "a rejected candidate must never commit later"
+        );
+        assert!(writes.account_rebindings.is_empty());
     }
 
     #[test]

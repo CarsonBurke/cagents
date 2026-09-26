@@ -124,6 +124,19 @@ fn project_key(repository: &Path) -> String {
 }
 
 impl Registry {
+    pub fn contains_managed_home(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+        let path = homes.path(provider, key);
+        self.accounts.iter().any(|account| {
+            (account.provider == provider && account.key == key && account.linked_home.is_none())
+                || account
+                    .linked_home
+                    .as_ref()
+                    .is_some_and(|linked| linked == &path)
+        }) || self
+            .pending
+            .iter()
+            .any(|pending| pending.provider == provider && pending.key == key)
+    }
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -485,7 +498,113 @@ pub struct Store {
     directory: PathBuf,
 }
 
+#[derive(Debug)]
+pub enum LaunchAccountError {
+    Removed { provider: Provider, key: Uuid },
+    Unreadable(io::Error),
+}
+
+impl std::fmt::Display for LaunchAccountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Removed { provider, .. } => write!(
+                formatter,
+                "This {} account was removed. Choose another account before continuing.",
+                provider.label()
+            ),
+            Self::Unreadable(error) => {
+                write!(formatter, "Cannot verify the selected account: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LaunchAccountError {}
+
+/// Keep this lease only across the child-spawn step, never a provider turn or
+/// handshake. Removal uses the same lifecycle lock before forgetting a home.
+pub struct LaunchAccountLease {
+    _lock: crate::instance::OwnedLock,
+}
+
+/// Called immediately around an actual process creation, including probes.
+/// Live attachment never needs this lease and remains usable after removal.
+pub(crate) fn authorize_spawn(
+    environment: &std::collections::BTreeMap<String, String>,
+    provider: Option<Provider>,
+) -> Result<Option<LaunchAccountLease>, LaunchAccountError> {
+    match (Store::installation(), Homes::installation()) {
+        (Some(store), Some(homes)) => store.authorize_environment(&homes, environment, provider),
+        _ => Ok(None),
+    }
+}
+
+/// Commands have already selected their explicit provider home. Inspect only
+/// those non-secret path overrides; inherited credentials are never collected.
+pub(crate) fn authorize_command(
+    command: &std::process::Command,
+) -> Result<Option<LaunchAccountLease>, LaunchAccountError> {
+    let environment = command
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            if !Account::PROVIDERS
+                .iter()
+                .any(|provider| super::home_variable(*provider) == Some(name))
+            {
+                return None;
+            }
+            Some((name.to_owned(), value?.to_str()?.to_owned()))
+        })
+        .collect();
+    authorize_spawn(&environment, None)
+}
+
 impl Store {
+    pub fn authorize_launch(
+        &self,
+        homes: &Homes,
+        recipe: &crate::model::LaunchRecipe,
+        provider: Option<Provider>,
+    ) -> Result<Option<LaunchAccountLease>, LaunchAccountError> {
+        self.authorize_environment(homes, &recipe.environment, provider)
+    }
+
+    fn authorize_environment(
+        &self,
+        homes: &Homes,
+        environment: &std::collections::BTreeMap<String, String>,
+        provider: Option<Provider>,
+    ) -> Result<Option<LaunchAccountLease>, LaunchAccountError> {
+        let selected: Vec<_> = Account::PROVIDERS
+            .into_iter()
+            .filter(|candidate| provider.is_none_or(|provider| provider == *candidate))
+            .filter_map(|provider| {
+                environment
+                    .get(super::home_variable(provider)?)
+                    .and_then(|path| homes.managed_identity(Path::new(path)))
+            })
+            .collect();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let lock = homes
+            .lifecycle_lock()
+            .map_err(LaunchAccountError::Unreadable)?;
+        let registry = self.load().map_err(LaunchAccountError::Unreadable)?;
+        if registry.is_newer() {
+            return Err(LaunchAccountError::Unreadable(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the accounts were saved by a newer cagents",
+            )));
+        }
+        for (provider, key) in selected {
+            if !registry.contains_managed_home(homes, provider, key) {
+                return Err(LaunchAccountError::Removed { provider, key });
+            }
+        }
+        Ok(Some(LaunchAccountLease { _lock: lock }))
+    }
     pub fn installation() -> Option<Self> {
         crate::instance::project_dirs().map(|dirs| Self::at(dirs.config_dir()))
     }
@@ -494,6 +613,102 @@ impl Store {
         Self {
             directory: directory.into(),
         }
+    }
+
+    /// Creates and records a pending sign-in as one lifecycle transaction.
+    /// The closure may seed bounded local configuration, never launch a CLI.
+    pub fn create_pending(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        started_at: u64,
+        create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        let _lifecycle = homes.lifecycle_lock()?;
+        let _lock = self.lock()?;
+        let mut registry = read(&self.path())?;
+        if registry.is_newer() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the accounts were saved by a newer cagents",
+            ));
+        }
+        let (key, home) = create()?;
+        registry.begin(provider, key, started_at);
+        registry.version = VERSION;
+        let result = registry
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("accounts revision exhausted"))
+            .and_then(|revision| {
+                registry.revision = revision;
+                write(&self.directory, &self.path(), &registry)
+            });
+        if let Err(error) = result {
+            let _ = homes.remove(provider, key);
+            return Err(error);
+        }
+        Ok((key, home))
+    }
+
+    /// Forget and park under the same lifecycle lock as spawning. A failed
+    /// deletion cannot make an unregistered home launchable again; the sweep
+    /// finishes parked trees later. Linked aliases still protect their home.
+    pub fn remove_home(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        key: Uuid,
+        registered: bool,
+    ) -> io::Result<(Registry, Option<String>)> {
+        let (registry, error) = {
+            let _lifecycle = homes.lifecycle_lock()?;
+            let (registry, ()) = self.update(|registry| {
+                if registered {
+                    registry.unregister(key);
+                } else {
+                    registry.abandon(key);
+                }
+            })?;
+            let error = if registry.contains_managed_home(homes, provider, key) {
+                None
+            } else {
+                homes
+                    .park(provider, key)
+                    .err()
+                    .map(|error| error.to_string())
+            };
+            (registry, error)
+        };
+        homes.finish_removals();
+        Ok((registry, error))
+    }
+
+    pub fn register_pending(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        let _lifecycle = homes.lifecycle_lock()?;
+        self.update_checked(|registry| {
+            if registry.find(account.key).is_some_and(|existing| {
+                existing.provider == account.provider && existing.linked_home.is_none()
+            }) {
+                return Ok(Ok(()));
+            }
+            if !registry
+                .pending
+                .iter()
+                .any(|pending| pending.key == account.key && pending.provider == account.provider)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "The pending sign-in was removed before it completed",
+                ));
+            }
+            Ok(registry.register(account, system))
+        })
     }
 
     fn path(&self) -> PathBuf {
@@ -517,6 +732,13 @@ impl Store {
     /// result, all under the lock; returns the registry written and what
     /// `change` returned.
     pub fn update<T>(&self, change: impl FnOnce(&mut Registry) -> T) -> io::Result<(Registry, T)> {
+        self.update_checked(|registry| Ok(change(registry)))
+    }
+
+    fn update_checked<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+    ) -> io::Result<(Registry, T)> {
         let _lock = self.lock()?;
         let path = self.path();
         let mut registry = read(&path)?;
@@ -527,7 +749,7 @@ impl Store {
             ));
         }
         let before = registry.clone();
-        let result = change(&mut registry);
+        let result = change(&mut registry)?;
         if registry != before {
             registry.version = VERSION;
             registry.revision = before
@@ -543,7 +765,16 @@ impl Store {
     /// interrupted in - outside the lock, since deleting a home can take a
     /// while and a parked home is no account's any more.
     pub fn load_and_sweep(&self, homes: &Homes) -> io::Result<Registry> {
-        let registry = self.load()?;
+        let registry = {
+            let _lifecycle = homes.lifecycle_lock()?;
+            let _lock = self.lock()?;
+            let exists = self.path().try_exists()?;
+            let registry = read(&self.path())?;
+            if exists && !registry.is_newer() {
+                homes.park_orphans(&registry)?;
+            }
+            registry
+        };
         homes.finish_removals();
         Ok(registry)
     }
@@ -610,6 +841,147 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    fn account_recipe(home: &Path) -> crate::model::LaunchRecipe {
+        let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+        recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into());
+        recipe
+    }
+
+    #[test]
+    fn removal_waits_for_spawn_lease_and_prevents_later_launch_or_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
+        let recipe = account_recipe(&home);
+        let lease = store
+            .authorize_launch(&homes, &recipe, None)
+            .unwrap()
+            .unwrap();
+        let (started, starts) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let removal_store = store.clone();
+        let removal_homes = homes.clone();
+        let removal = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            done.send(removal_store.remove_home(&removal_homes, Provider::Claude, key, false))
+                .unwrap();
+        });
+        starts.recv().unwrap();
+        assert!(
+            result
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert!(home.is_dir());
+        drop(lease);
+        result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        removal.join().unwrap();
+        assert!(!home.exists());
+        assert!(
+            matches!(store.authorize_launch(&homes, &recipe, None), Err(LaunchAccountError::Removed { key: removed, .. }) if removed == key)
+        );
+        let mut account = managed(Provider::Claude, "fixture@example.com");
+        account.key = key;
+        assert!(store.register_pending(&homes, account, &[]).is_err());
+        assert!(store.load().unwrap().find(key).is_none());
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn orphan_sweep_preserves_pending_registered_linked_and_recent_homes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let mut homes_created = Vec::new();
+        for _ in 0..5 {
+            homes_created.push(homes.create(Provider::Claude, None).unwrap());
+        }
+        for (_, path) in &homes_created[..4] {
+            fs::File::open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+                .unwrap();
+        }
+        store
+            .update(|registry| {
+                registry.begin(Provider::Claude, homes_created[0].0, 1);
+                let mut account = managed(Provider::Claude, "registered@example.com");
+                account.key = homes_created[1].0;
+                registry.accounts.push(account);
+                let mut linked = managed(Provider::Claude, "linked@example.com");
+                linked.linked_home = Some(homes_created[2].1.clone());
+                registry.accounts.push(linked);
+            })
+            .unwrap();
+        store.load_and_sweep(&homes).unwrap();
+        for index in [0, 1, 2, 4] {
+            assert!(homes_created[index].1.is_dir());
+        }
+        assert!(!homes_created[3].1.exists());
+        let recipe = account_recipe(&directory.path().join("unmanaged"));
+        assert!(
+            store
+                .authorize_launch(&homes, &recipe, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn orphan_sweep_finishes_an_interrupted_removal_and_a_recreated_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Codex, None).unwrap();
+        fs::write(home.join("old-history"), "fixture").unwrap();
+        let parked = home.parent().unwrap().join(format!(".removing-{key}"));
+        fs::rename(&home, &parked).unwrap();
+        fs::create_dir(&home).unwrap();
+        fs::write(home.join("recreated"), "fixture").unwrap();
+        fs::File::open(&home)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+        // A supported existing registry authorizes orphan cleanup.
+        store.load().unwrap();
+        write(&store.directory, &store.path(), &Registry::default()).unwrap();
+        store.load_and_sweep(&homes).unwrap();
+        assert!(!home.exists());
+        assert!(!parked.exists());
+    }
+
+    #[test]
+    fn unreadable_newer_or_missing_registry_never_sweeps_unknown_homes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (_, home) = homes.create(Provider::Claude, None).unwrap();
+        fs::File::open(&home)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+        store.load_and_sweep(&homes).unwrap();
+        assert!(home.is_dir());
+        let mut newer = Registry::default();
+        newer.version = VERSION + 1;
+        write(&store.directory, &store.path(), &newer).unwrap();
+        store.load_and_sweep(&homes).unwrap();
+        assert!(home.is_dir());
+        fs::write(store.path(), "invalid = [").unwrap();
+        assert!(store.load_and_sweep(&homes).is_err());
+        assert!(home.is_dir());
+    }
 
     fn managed(provider: Provider, email: &str) -> Registered {
         Registered {
