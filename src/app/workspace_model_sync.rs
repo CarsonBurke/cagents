@@ -831,7 +831,9 @@ mod tests {
             app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
                 project,
                 generation,
-                Ok(()),
+                Ok(super::super::project_ui::ProjectSessionClosure::for_roots(
+                    vec![repository.clone()],
+                )),
             )),
         );
         assert!(app.sidebar_model.project(project).is_none());
@@ -866,7 +868,9 @@ mod tests {
             app.handle_project_action(super::super::project_ui::Action::ProjectSessionsClosed(
                 project,
                 generation,
-                Ok(()),
+                Ok(super::super::project_ui::ProjectSessionClosure::for_roots(
+                    vec![repository.clone()],
+                )),
             )),
         );
         assert!(app.sidebar_model.project(project).is_some());

@@ -1420,6 +1420,132 @@ pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(live)
 }
 
+/// Saved ownership evidence from another window. Directory scopes are not
+/// project identities: callers must classify them against current shared roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedSessionOwner {
+    Project(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Read one consistent snapshot without migrating or writing another window's
+/// database. Only open cards with explicit navigation ownership contribute.
+pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, SavedSessionOwner)>> {
+    let mut connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let transaction = connection.transaction()?;
+    let mut projects = HashMap::<ProjectId, PathBuf>::new();
+    let mut statement = transaction.prepare("SELECT project_id, repository_json FROM projects")?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (id, path) = row?;
+        projects.insert(
+            parse_id("project", &id)?,
+            from_json("project repository", &path)?,
+        );
+    }
+    let mut statement = transaction.prepare("SELECT workspace_id FROM workspaces")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut owners = Vec::new();
+    for id in ids {
+        let Some(manifest) =
+            load_workspace_manifest_connection(&transaction, parse_id("workspace", &id)?)?
+        else {
+            continue;
+        };
+        if !manifest.existence.is_open() {
+            continue;
+        }
+        // Keep conflicting saved memberships visible. UI restore normalizes
+        // them, but removal must retain every foreign ownership claim.
+        let channels: Vec<ProjectChannel> = metadata(
+            &transaction,
+            &format!("workspace:{id}:navigation:{CHANNELS_FIELD}"),
+        )?
+        .map(|value| from_json("workspace channels", &value))
+        .transpose()?
+        .unwrap_or_default();
+        for card in manifest.cards.iter().filter(|card| {
+            card.existence.is_open()
+                && matches!(
+                    card.kind,
+                    PersistedCardKind::Terminal | PersistedCardKind::Chat
+                )
+        }) {
+            let mut card_owners = Vec::new();
+            for channel in channels
+                .iter()
+                .filter(|channel| channel.cards.contains(&card.id))
+            {
+                card_owners.push(SavedSessionOwner::Project(
+                    projects
+                        .get(&channel.project_id)
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(format!(
+                                "channel {} refers to missing project {}",
+                                channel.id, channel.project_id
+                            ))
+                        })?
+                        .clone(),
+                ));
+            }
+            if card_owners.is_empty()
+                && let Some(directory) = manifest.card_scopes.get(&card.id)
+            {
+                card_owners.push(SavedSessionOwner::Directory(directory.clone()));
+            }
+            if card_owners.is_empty() {
+                continue;
+            }
+            // Identity-only reads keep unopened older window schemas readable
+            // when terminal recipes gain new fields in a later migration.
+            let ids = match card.kind {
+                PersistedCardKind::Terminal => {
+                    let id: String = transaction.query_row(
+                        "SELECT terminal_id FROM terminal_recipes WHERE card_id = ?1",
+                        [card.id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    vec![parse_id("terminal", &id)?]
+                }
+                PersistedCardKind::Chat => {
+                    #[derive(serde::Deserialize)]
+                    struct Identity {
+                        id: TerminalId,
+                    }
+                    #[derive(serde::Deserialize)]
+                    struct ChatIdentity {
+                        id: TerminalId,
+                        terminal: Option<Identity>,
+                    }
+                    let content: String = transaction.query_row(
+                        "SELECT content_json FROM cards WHERE card_id = ?1",
+                        [card.id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    let chat: ChatIdentity = from_json("chat ownership", &content)?;
+                    let mut ids = vec![chat.id];
+                    if let Some(terminal) = chat.terminal {
+                        ids.push(terminal.id);
+                    }
+                    ids
+                }
+                _ => unreachable!("only terminal and chat summaries were selected"),
+            };
+            for id in ids {
+                owners.extend(card_owners.iter().cloned().map(|owner| (id, owner)));
+            }
+        }
+    }
+    Ok(owners)
+}
+
 fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>) -> Result<()> {
     for sql in [
         "SELECT terminal_id FROM terminal_recipes",
@@ -4024,6 +4150,104 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn saved_session_ownership_reads_channels_and_scopes_without_changing_the_window() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("other-window.sqlite3");
+        let store = StateStore::open(&path, boot("owner")).unwrap();
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Child".into(),
+            repository: directory.path().join("parent/child"),
+            kind: crate::model::ProjectKind::Folder,
+            existence: Existence::Open,
+        };
+        store.save_project(&project).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("owner"));
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+            unreachable!()
+        };
+        let terminal_id = terminal.id;
+        workspace.channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Owned outside cwd".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let before = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![(
+                terminal_id,
+                SavedSessionOwner::Project(project.repository.clone())
+            )]
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            before.generation
+        );
+        let mut channels = workspace.channels.clone();
+        workspace.channels.clear();
+        workspace
+            .card_scopes
+            .insert(card, directory.path().join("parent/child"));
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![(
+                terminal_id,
+                SavedSessionOwner::Directory(directory.path().join("parent/child"))
+            )]
+        );
+        let other = ProjectState {
+            id: ProjectId::new(),
+            repository: directory.path().join("parent"),
+            ..project.clone()
+        };
+        store.save_project(&other).unwrap();
+        channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: other.id,
+            ..channels[0].clone()
+        });
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                params![
+                    to_json(&channels).unwrap(),
+                    format!("workspace:{}:navigation:{CHANNELS_FIELD}", workspace.id)
+                ],
+            )
+            .unwrap();
+        // Ownership must not need to restore a recipe or normalize away a
+        // contradictory claim in an older or damaged saved window.
+        connection
+            .execute("UPDATE terminal_recipes SET recipe_json = 'invalid'", [])
+            .unwrap();
+        assert_eq!(
+            read_project_session_owners(&path).unwrap(),
+            vec![
+                (terminal_id, SavedSessionOwner::Project(project.repository)),
+                (terminal_id, SavedSessionOwner::Project(other.repository)),
+            ]
+        );
     }
 
     #[test]
