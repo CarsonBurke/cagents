@@ -846,11 +846,16 @@ impl Cagents {
 
     fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
-        let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
+        let title = chrome.map_or_else(
+            || card.map_or("Column", |card| card.title.as_str()),
+            |chrome| chrome.title.as_str(),
+        );
         let focus_id = self.card_header_widget_id(id);
-        let caption = card.map(|card| card_kind_caption(&card.kind));
+        let caption = chrome
+            .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
+            .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
         let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
             Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
             Some(CardKind::Repository(_)) => {
