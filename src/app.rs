@@ -27,7 +27,6 @@ pub use daemon_stop::run_daemon_stop_confirmation;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
-    ffi::OsStr,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -3928,13 +3927,16 @@ async fn open_system_url(url: Url) -> Result<(), String> {
         Ok(()) => Ok(()),
         // Portal diagnostics are also intentionally omitted: they are an
         // external error boundary and may include the URI supplied above.
-        Err(_) => open_system_url_with_opener(&url, "xdg-open").await,
+        Err(_) => open_system_url_with_opener(&url, tokio::process::Command::new("xdg-open")).await,
     }
 }
 
-async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Result<(), String> {
+async fn open_system_url_with_opener(
+    url: &Url,
+    mut opener: tokio::process::Command,
+) -> Result<(), String> {
     let presented = SanitizedLocation::from(url);
-    let result = tokio::process::Command::new(opener)
+    let result = opener
         .arg(url.as_str())
         .stdin(Stdio::null())
         // An opener can echo its argument in diagnostics. The authoritative
@@ -14187,31 +14189,35 @@ mod tests {
 
     #[test]
     fn system_opener_failure_redaction_contract() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let opener = directory.path().join("fake-opener");
-        std::fs::write(
-            &opener,
-            concat!("#!/bin/sh\n", "printf '%s\\n' \"$1\" >&2\n", "exit 42\n",),
-        )
-        .unwrap();
-        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
-
         let raw =
             "https://alice:password@example.test:8443/private%20path?oauth=secret#access-token";
         let url = Url::parse(raw).unwrap();
+        // Execute a stable interpreter, not a newly written executable whose
+        // write descriptor a parallel test's fork may still hold (ETXTBSY).
+        // The URL stays a separate argument; the failing opener receives its
+        // authoritative contents even though presentation must redact them.
+        let mut opener = tokio::process::Command::new("/bin/sh");
+        opener
+            .args([
+                "-c",
+                "[ \"$1\" = \"$EXPECTED_URI\" ] || exit 43; printf '%s\\n' \"$1\" >&2; exit 42",
+                "test-opener",
+            ])
+            .env("EXPECTED_URI", raw);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let error = runtime
-            .block_on(open_system_url_with_opener(&url, &opener))
+            .block_on(open_system_url_with_opener(&url, opener))
             .unwrap_err();
 
-        assert!(error.contains("https://example.test:8443/private%20path"));
-        assert!(error.contains("system opener exited"));
-        assert!(error.contains("42"));
+        assert!(
+            error.contains("https://example.test:8443/private%20path"),
+            "{error}"
+        );
+        assert!(error.contains("system opener exited"), "{error}");
+        assert!(error.contains("42"), "{error}");
         for sensitive in [
             "alice",
             "password",
