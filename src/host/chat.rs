@@ -2806,6 +2806,37 @@ for line in sys.stdin:
     /// must still see the close succeed and its connection stay usable.
     #[test]
     fn a_control_client_closes_a_live_chat_it_attached_to() {
+        control_client_closes_chat(false);
+    }
+
+    #[test]
+    fn a_control_client_waits_for_slow_provider_interruption_before_closing() {
+        control_client_closes_chat(true);
+    }
+
+    fn control_client_closes_chat(slow: bool) {
+        struct Interruptible;
+        impl Adapter for Interruptible {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                assert_eq!(command, Command::Interrupt);
+                Ok(Step {
+                    writes: vec![json!({"interrupt": true})],
+                    events: Vec::new(),
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![Event::Status {
+                        busy: false,
+                        detail: "Interrupted".into(),
+                    }],
+                })
+            }
+        }
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("control-close"),
             boot_id: BootId::new("boot"),
@@ -2814,18 +2845,35 @@ for line in sys.stdin:
         let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
-            program: "/bin/cat".into(),
-            arguments: Vec::new(),
+            program: if slow { "/bin/sh" } else { "/bin/cat" }.into(),
+            arguments: if slow {
+                vec![
+                    "-c".into(),
+                    "read -r interrupt; sleep 6; printf '{\"done\":true}\\n'; exec cat".into(),
+                ]
+            } else {
+                Vec::new()
+            },
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step::default();
+        if slow {
+            initial.events.push(Event::Status {
+                busy: true,
+                detail: "Working".into(),
+            });
+        }
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let weak = Arc::downgrade(&host);
         let handle = Handle::start(
             spec,
-            Box::new(Echo(false)),
+            if slow {
+                Box::new(Interruptible) as Box<dyn Adapter>
+            } else {
+                Box::new(Echo(false))
+            },
             initial,
             store,
             None,
@@ -2864,7 +2912,11 @@ for line in sys.stdin:
         });
 
         let mut client = crate::control::ControlClient::connect(&socket).unwrap();
+        let started = Instant::now();
         client.close_chat(session).unwrap();
+        if slow {
+            assert!(started.elapsed() >= Duration::from_secs(6));
+        }
         assert!(handle.is_completed());
         assert!(client.list_chats().unwrap().is_empty());
         drop(client);

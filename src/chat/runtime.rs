@@ -574,7 +574,7 @@ impl ChildGuard {
         unsafe {
             libc::kill(-pid, libc::SIGTERM);
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + super::TERMINATE_GRACE;
         let mut exited = false;
         while Instant::now() < deadline {
             if self.0.try_wait().ok().flatten().is_some() {
@@ -691,7 +691,7 @@ impl Actor {
                 {
                     return Ok(());
                 }
-                if closing.is_some_and(|at: Instant| at.elapsed() > IO_TIMEOUT) {
+                if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
                     return Err(format!(
                         "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
                     ));
