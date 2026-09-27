@@ -465,3 +465,98 @@ pub(super) fn window_rows(
     ancestors.extend(first..end);
     ancestors
 }
+
+/// Reveal against the actual laid-out viewport, including before the first
+/// wheel event and after a resize. The result updates the virtual row window.
+pub(super) fn reveal_row(id: widget::Id, position: usize, depth: usize) -> iced::Task<PageAction> {
+    use iced::advanced::widget::{Operation, operation};
+    struct Reveal {
+        id: widget::Id,
+        position: usize,
+        depth: usize,
+        viewport: Option<(f32, f32)>,
+    }
+    impl Operation<PageAction> for Reveal {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<PageAction>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            content: iced::Rectangle,
+            translation: iced::Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id != Some(&self.id) {
+                return;
+            }
+            let padding = cosmic::theme::spacing().space_xxxs as f32;
+            let offset = reveal_offset(
+                self.position,
+                self.depth,
+                padding,
+                translation.y,
+                bounds.height,
+                content.height,
+            );
+            state.scroll_to(operation::scrollable::AbsoluteOffset {
+                x: None,
+                y: Some(offset),
+            });
+            self.viewport = Some((offset, bounds.height));
+        }
+        fn finish(&self) -> operation::Outcome<PageAction> {
+            self.viewport
+                .map_or(operation::Outcome::None, |(offset, height)| {
+                    operation::Outcome::Some(PageAction::Viewport { offset, height })
+                })
+        }
+    }
+    iced::advanced::widget::operate(Reveal {
+        id,
+        position,
+        depth,
+        viewport: None,
+    })
+}
+
+fn reveal_offset(
+    position: usize,
+    depth: usize,
+    padding: f32,
+    current: f32,
+    height: f32,
+    content: f32,
+) -> f32 {
+    let row = design::DENSE_ROW_HEIGHT;
+    let top = padding + position as f32 * row;
+    // At very small heights a complete ancestor stack cannot fit. Still reveal
+    // as much of the selected row as the viewport permits.
+    let headers = (depth as f32 * row).min((height - row).max(0.0));
+    let next = if top < current + headers {
+        top - headers
+    } else if top + row > current + height {
+        top + row - height
+    } else {
+        current
+    };
+    next.clamp(0.0, (content - height).max(0.0))
+}
+
+#[cfg(test)]
+mod reveal_tests {
+    use super::*;
+    #[test]
+    fn keyboard_reveal_uses_initial_short_viewport_and_all_sticky_ancestors() {
+        let row = design::DENSE_ROW_HEIGHT;
+        let forward = reveal_offset(150, 3, 2.0, 0.0, 120.0, 1000.0 * row);
+        assert_eq!(forward, 2.0 + 151.0 * row - 120.0);
+        let backward = reveal_offset(10, 3, 2.0, 900.0, 600.0, 1000.0 * row);
+        assert_eq!(backward, 2.0 + 7.0 * row);
+        assert_eq!(
+            reveal_offset(10, 3, 2.0, backward, 600.0, 1000.0 * row),
+            backward
+        );
+    }
+}

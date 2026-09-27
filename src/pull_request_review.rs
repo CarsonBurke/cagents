@@ -374,6 +374,8 @@ pub struct State {
     files: Vec<ReviewFile>,
     files_truncated: bool,
     pages: file_pages::Pages,
+    file_scroll_id: widget::Id,
+    reveal_row: Option<(usize, usize)>,
     rows: Vec<Row>,
     file_list_mode: FileListMode,
     hide_viewed: bool,
@@ -558,6 +560,8 @@ impl State {
             files: Vec::new(),
             files_truncated: false,
             pages: file_pages::Pages::default(),
+            file_scroll_id: widget::Id::unique(),
+            reveal_row: None,
             rows: Vec::new(),
             file_list_mode: FileListMode::Tree,
             hide_viewed: false,
@@ -653,7 +657,26 @@ impl State {
 
     pub fn update(&mut self, action: Action) -> ActionTask {
         let task = self.update_inner(action);
-        ActionTask::batch([task, self.load_file_page(false), self.persist_cache()])
+        let generation = self.generation;
+        let authority_revision = self.authority_revision;
+        let reveal = self
+            .reveal_row
+            .take()
+            .map_or_else(ActionTask::none, |(position, depth)| {
+                file_pages::reveal_row(self.file_scroll_id.clone(), position, depth).map(
+                    move |action| Action::Fenced {
+                        generation,
+                        authority_revision,
+                        action: Box::new(Action::FilePage(action)),
+                    },
+                )
+            });
+        ActionTask::batch([
+            task,
+            reveal,
+            self.load_file_page(false),
+            self.persist_cache(),
+        ])
     }
 
     fn update_inner(&mut self, action: Action) -> ActionTask {
@@ -1094,6 +1117,8 @@ impl State {
         self.range = None;
         self.files.clear();
         self.pages = file_pages::Pages::default();
+        self.file_scroll_id = widget::Id::unique();
+        self.reveal_row = None;
         self.files_truncated = false;
         self.rows.clear();
         self.collapsed_directories.clear();
@@ -1304,6 +1329,7 @@ impl State {
         self.pages.seek_unviewed = false;
         self.pages.wanted = None;
         self.selected = Some(path);
+        self.reveal_selected_file();
         self.cache_dirty = true;
         self.emit_open(index);
     }
@@ -1318,6 +1344,20 @@ impl State {
             old_path: entry.old_path.clone(),
             basis: range.basis(),
         });
+    }
+
+    fn reveal_selected_file(&mut self) {
+        let Some(selected) = &self.selected else {
+            return;
+        };
+        let displayed = self.displayed_file_rows(&directory_tallies(&self.rows, &self.files));
+        let Some(position) = displayed
+            .iter()
+            .position(|index| self.rows[*index].path == *selected)
+        else {
+            return;
+        };
+        self.reveal_row = Some((position, self.rows[displayed[position]].depth));
     }
 
     /// Moves the selection through the tree's file rows. With nothing
@@ -1693,15 +1733,17 @@ impl State {
             .iter()
             .filter(|file| file.sync == ViewedSync::Unknown)
             .count();
-        let mut content = vec![toolbar.into()];
+        // Keep the scrollable in a stable child slot when pagination finishes
+        // or fails. Moving it within the column discards its scroll state.
+        let mut status = Vec::new();
         if unknown > 0 {
-            content.push(design::caption(format!("{unknown} viewed states not loaded")).into());
+            status.push(design::caption(format!("{unknown} viewed states not loaded")).into());
         }
         if let Some(error) = &self.pages.error {
-            content.push(design::caption(error).into());
+            status.push(design::caption(error).into());
         }
         if self.pages.cursor.is_some() {
-            content.push(
+            status.push(
                 widget::button::text(if self.pages.loading {
                     "Loading viewed states…"
                 } else if self.pages.error.is_some() {
@@ -1716,11 +1758,14 @@ impl State {
                 .into(),
             );
         }
-        content.push(list);
-        widget::column::with_children(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        widget::column::with_children(vec![
+            toolbar.into(),
+            widget::container(widget::column::with_children(status)).into(),
+            list,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn displayed_file_rows(&self, tallies: &[(usize, usize, usize)]) -> Vec<usize> {
@@ -1809,6 +1854,7 @@ impl State {
                 ])))
                 .width(Length::Fill),
         )
+        .id(self.file_scroll_id.clone())
         .on_scroll(|viewport| {
             Action::FilePage(file_pages::PageAction::Viewport {
                 offset: viewport.absolute_offset().y,
