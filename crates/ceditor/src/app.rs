@@ -1528,7 +1528,6 @@ impl Editor {
             Arc::new(GitHubService::system("gh")),
             RepositoryService::system("git"),
         )
-        .with_external_review_requests()
         .with_cache(Some(Arc::new(ReviewPreferenceStore {
             store: pull_request_review::cache::JsonStore::new(
                 self.settings_path.with_file_name("review.json"),

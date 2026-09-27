@@ -5005,7 +5005,6 @@ impl Cagents {
                 Arc::new(GitHubService::system("gh")),
                 RepositoryService::system("git"),
             )
-            .with_external_review_requests()
             .with_cache(self.session.as_ref().map(|session| {
                 session.operation_store() as Arc<dyn pull_request_review::cache::Store>
             })),
