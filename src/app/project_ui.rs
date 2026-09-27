@@ -1719,8 +1719,12 @@ fn close_sessions_in_scope(
                 }
         ) {
             client
-                .release_completed_terminal(terminal.session)
+                .release_completed_terminal(terminal.session, true)
                 .map_err(|error| error.to_string())
+                .and_then(|outcome| match outcome {
+                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                })
         } else {
             client
                 .close_terminal_checked(id, true)

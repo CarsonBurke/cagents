@@ -3242,7 +3242,7 @@ pub enum Message {
     CompletedTerminalClosed {
         card: CardId,
         session: TerminalSession,
-        result: Result<(), String>,
+        result: Result<terminal_close::CompletedCloseOutcome, String>,
     },
     SaveAndCloseRepository(CardId),
     OverwriteAndCloseRepository(CardId),
@@ -11778,27 +11778,7 @@ impl Application for Cagents {
                 card,
                 session,
                 result,
-            } => {
-                self.terminal_close_attempts.remove(&session.id);
-                if !self.card_state(card).is_some_and(|state| {
-                    state.existence.is_open()
-                        && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
-                }) {
-                    return Task::none();
-                }
-                match result {
-                    Ok(()) => {
-                        self.closed_terminal_cards.insert(card);
-                        self.request_card_removal(card)
-                    }
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(format!(
-                            "Could not release the completed terminal: {error}. Its card is retained; retry Close."
-                        )));
-                        Task::none()
-                    }
-                }
-            }
+            } => self.completed_terminal_closed(card, session, result),
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self

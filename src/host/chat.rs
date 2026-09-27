@@ -2157,16 +2157,27 @@ pub(super) fn close_for_terminal(
             .map(|record| record.handle.clone())
     };
     if let Some(handle) = handle {
-        handle.close().map_err(unavailable)?;
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state
-            .chats
-            .get(&terminal_id)
-            .is_some_and(|record| record.handle.same_actor(&handle))
-        {
-            state.chats.remove(&terminal_id);
-            state.inventory_generation += 1;
-        }
+        close_terminal_actor(host, terminal_id, &handle)?;
+    }
+    Ok(())
+}
+
+/// Close only the actor inspected before leaving the host lock. A replacement
+/// with the same durable ID must not be stopped or retired by an old receipt.
+pub(super) fn close_terminal_actor(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    handle: &Handle,
+) -> Result<(), ProtocolError> {
+    handle.close().map_err(unavailable)?;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state
+        .chats
+        .get(&terminal_id)
+        .is_some_and(|record| record.handle.same_actor(handle))
+    {
+        state.chats.remove(&terminal_id);
+        state.inventory_generation += 1;
     }
     Ok(())
 }

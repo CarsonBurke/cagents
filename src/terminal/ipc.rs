@@ -265,6 +265,8 @@ pub enum ClientRequest {
     /// This grants no authority to stop a live replacement.
     ReleaseCompletedTerminal {
         session: TerminalSession,
+        /// Explicit confirmation may also close its exact paired native actor.
+        allow_active: bool,
     },
     /// Rearm hidden output observation without granting presentation credit.
     TerminalAcknowledge {

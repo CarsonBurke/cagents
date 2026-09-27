@@ -6,6 +6,7 @@ pub(super) struct CloseIntent {
     pub card: CardId,
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
+    completed_source: Option<TerminalSession>,
     pub generation: u64,
     pub restore_card: Option<CardId>,
     pub pending: bool,
@@ -24,6 +25,12 @@ pub enum CloseOutcome {
     Unreachable(String),
 }
 
+#[derive(Debug, Clone)]
+pub enum CompletedCloseOutcome {
+    Closed,
+    Active(HostSessionProof),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct QueuedCardClose {
     card: CardId,
@@ -31,13 +38,16 @@ pub(super) struct QueuedCardClose {
 }
 
 fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
-    matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
+    intent.completed_source.is_none()
+        && matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
         if session.id == intent.terminal && session.continuity.live_proof().as_ref() == Some(&intent.proof))
 }
 
 fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
     matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
-        if session.id == intent.terminal && matches!(session.continuity,
+        if session.id == intent.terminal
+            && intent.completed_source.as_ref().is_none_or(|source| source == session)
+            && matches!(session.continuity,
             TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }))
 }
 
@@ -133,9 +143,16 @@ impl Cagents {
                         .map_err(|error| error.to_string())?;
                     let mut client =
                         ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                    client
-                        .release_completed_terminal(source)
-                        .map_err(|error| error.to_string())
+                    match client
+                        .release_completed_terminal(source, allow_active)
+                        .map_err(|error| error.to_string())?
+                    {
+                        TerminalCloseResult::Closed => Ok(CompletedCloseOutcome::Closed),
+                        TerminalCloseResult::Active => {
+                            Ok(CompletedCloseOutcome::Active(client.proof().clone()))
+                        }
+                        TerminalCloseResult::Unknown(error) => Err(error),
+                    }
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -183,6 +200,7 @@ impl Cagents {
                 card,
                 terminal: session.id,
                 proof,
+                completed_source: None,
                 generation: 0,
                 restore_card: self.workspace.focused(),
                 pending: false,
@@ -201,6 +219,58 @@ impl Cagents {
             return self.start_terminal_close(allow_active);
         }
         self.request_card_removal(card)
+    }
+
+    pub(super) fn completed_terminal_closed(
+        &mut self,
+        card: CardId,
+        session: TerminalSession,
+        result: Result<CompletedCloseOutcome, String>,
+    ) -> Task<Message> {
+        self.terminal_close_attempts.remove(&session.id);
+        if !self.card_state(card).is_some_and(|state| {
+            state.existence.is_open()
+                && matches!(&state.kind, CardKind::Terminal(current) if current == &session)
+        }) {
+            return Task::none();
+        }
+        match result {
+            Ok(CompletedCloseOutcome::Closed) => {
+                self.closed_terminal_cards.insert(card);
+                self.request_card_removal(card)
+            }
+            Ok(CompletedCloseOutcome::Active(proof)) => {
+                if self.terminal_close.is_some() {
+                    self.queued_card_closes.push_back(QueuedCardClose {
+                        card,
+                        unasked: false,
+                    });
+                    return Task::none();
+                }
+                self.terminal_close = Some(CloseIntent {
+                    card,
+                    terminal: session.id,
+                    proof,
+                    completed_source: Some(session),
+                    generation: 0,
+                    restore_card: self.workspace.focused(),
+                    restore_keyboard_nav: self.core.keyboard_nav(),
+                    pending: false,
+                    active: true,
+                    dont_ask_again: false,
+                    detail: None,
+                    focus: 1,
+                });
+                self.core.set_keyboard_nav(false);
+                close_focus(1)
+            }
+            Err(error) => {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not release the completed terminal: {error}. Its card is retained; retry Close."
+                )));
+                Task::none()
+            }
+        }
     }
 
     pub(super) fn pending_terminal_spawn(&self, card: CardId) -> bool {
@@ -413,14 +483,9 @@ impl Cagents {
         if intent.pending || intent.detail.is_some() {
             return Task::none();
         }
-        if !target_matches(intent, self.card_state(intent.card)) {
-            if exited_target_matches(intent, self.card_state(intent.card)) {
-                let intent = self.terminal_close.take().unwrap();
-                if intent.active || intent.detail.is_some() {
-                    self.core.set_keyboard_nav(intent.restore_keyboard_nav);
-                }
-                return self.close_card_as(intent.card, allow_active, false);
-            }
+        if !target_matches(intent, self.card_state(intent.card))
+            && !exited_target_matches(intent, self.card_state(intent.card))
+        {
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
             self.core.set_keyboard_nav(false);
@@ -563,7 +628,7 @@ impl Cagents {
             widget::text::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
-                "This terminal has a running program or background jobs. Closing stops them."
+                "This terminal or its paired conversation still owns running processes. Closing stops them."
             }))
             .into(),
         ];
@@ -666,10 +731,101 @@ mod tests {
         let _ = app.update(Message::CompletedTerminalClosed {
             card,
             session: source,
-            result: Ok(()),
+            result: Ok(CompletedCloseOutcome::Closed),
         });
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(!app.closed_terminal_cards.contains(&card));
+    }
+
+    #[test]
+    fn completed_terminal_with_live_conversation_uses_fenced_close_confirmation() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let source = session.clone();
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("paired"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let _ = app.begin_card_close(card);
+        let _ = app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            result: Ok(CompletedCloseOutcome::Active(proof.clone())),
+        });
+        assert!(app.terminal_close_dialog().is_some());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.update(Message::ConfirmTerminalClose);
+        let intent = app.terminal_close.as_ref().unwrap().clone();
+        assert!(intent.pending);
+        assert_eq!(intent.completed_source, Some(source));
+        assert_eq!(intent.proof, proof);
+        let _ = app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        });
+        assert!(app.closed_terminal_cards.contains(&card));
+    }
+
+    #[test]
+    fn completed_confirmation_cannot_close_a_relaunched_card() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        let original_continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("paired"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let proof = original_continuity.live_proof().unwrap();
+        session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let source = session.clone();
+        let _ = app.begin_card_close(card);
+        let _ = app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source,
+            result: Ok(CompletedCloseOutcome::Active(proof)),
+        });
+        let _ = app.update(Message::ConfirmTerminalClose);
+        let intent = app.terminal_close.as_ref().unwrap().clone();
+        assert!(intent.pending);
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = original_continuity;
+        let _ = app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::Closed,
+        });
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.closed_terminal_cards.contains(&card));
+        assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
     }
 
     #[test]
@@ -756,6 +912,25 @@ mod tests {
 }
 
 fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
+    if let Some(source) = &intent.completed_source {
+        let run = || -> Result<CloseOutcome, String> {
+            let path =
+                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            if client.proof() != &intent.proof || !intent.proof.is_complete() {
+                return Ok(CloseOutcome::Stale);
+            }
+            client
+                .release_completed_terminal(source.clone(), allow_active)
+                .map_err(|error| error.to_string())
+                .map(|outcome| match outcome {
+                    TerminalCloseResult::Closed => CloseOutcome::Closed,
+                    TerminalCloseResult::Active => CloseOutcome::Active,
+                    TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+                })
+        };
+        return run().unwrap_or_else(CloseOutcome::Unreachable);
+    }
     close_hosted_terminal(intent.terminal, &intent.proof, allow_active)
 }
 
@@ -786,10 +961,14 @@ pub(super) fn close_hosted_terminal(
             | TerminalContinuity::RelaunchAvailable {
                 last_exit: Some(_), ..
             } => {
-                client
-                    .release_completed_terminal(descriptor.session.clone())
-                    .map_err(|error| error.to_string())?;
-                return Ok(CloseOutcome::Closed);
+                return client
+                    .release_completed_terminal(descriptor.session.clone(), allow_active)
+                    .map_err(|error| error.to_string())
+                    .map(|outcome| match outcome {
+                        TerminalCloseResult::Closed => CloseOutcome::Closed,
+                        TerminalCloseResult::Active => CloseOutcome::Active,
+                        TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+                    });
             }
             continuity if continuity.live_proof().as_ref() == Some(proof) => {}
             _ => return Ok(CloseOutcome::Stale),

@@ -98,19 +98,15 @@ fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_car
             occurred_at_unix_ms: 1,
         },
     };
-    let source = session.clone();
+    let terminal = session.id;
     let _ = app.update(Message::ConfirmTerminalClose);
-    assert!(app.terminal_close.is_none());
+    assert!(app.terminal_close.as_ref().unwrap().pending);
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(!app.closed_terminal_cards.contains(&card));
-    assert!(app.terminal_close_attempts.contains(&source.id));
-    let _ = app.update(Message::CompletedTerminalClosed {
-        card,
-        session: source,
-        result: Ok(()),
-    });
+    assert!(app.terminal_close_attempts.contains(&terminal));
+    report_close(&mut app, terminal_close::CloseOutcome::Closed);
     assert!(app.closed_terminal_cards.contains(&card));
-    assert!(app.terminal_close_attempts.is_empty());
+    assert!(app.terminal_close.is_none());
 
     let (mut app, card, _, _) = live_app();
     request_active_close(&mut app, card);
