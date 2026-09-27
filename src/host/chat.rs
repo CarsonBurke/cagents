@@ -332,6 +332,10 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
+    if let Update::Execution { run, update } = update {
+        super::agent_execution::observed(&host, id, run, update);
+        return;
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
     if let Update::Attention(evidence) = &update {
@@ -1045,6 +1049,23 @@ fn start(
                 return Err(unavailable(
                     "Daemon shutdown cancelled chat start; exact source/session evidence remains recoverable",
                 ));
+            }
+        }
+        // Capability is transient process context, never a public launch
+        // recipe. A fresh provider may delegate only as its real session.
+        if source.is_none()
+            && let Ok(registry) = super::agent_execution::registry(host)
+        {
+            let authority = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .register_agent_authority(&crate::agent_execution::HostedSession::Chat(
+                    session.clone(),
+                ))
+                .map_err(unavailable)?;
+            if let Some(token) = authority.token() {
+                spec.environment
+                    .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
         }
         let weak = Arc::downgrade(host);
