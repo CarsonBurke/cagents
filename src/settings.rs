@@ -242,6 +242,9 @@ pub struct KeyboardShortcuts {
     pub review_toggle_viewed: Vec<String>,
     pub review_next_file: Vec<String>,
     pub review_previous_file: Vec<String>,
+    pub review_next_unviewed: Vec<String>,
+    pub review_next_change: Vec<String>,
+    pub review_previous_change: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -260,6 +263,9 @@ impl Default for KeyboardShortcuts {
             review_toggle_viewed: vec!["Alt+V".to_owned()],
             review_next_file: vec!["Alt+Down".to_owned()],
             review_previous_file: vec!["Alt+Up".to_owned()],
+            review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
+            review_next_change: vec!["Alt+J".to_owned()],
+            review_previous_change: vec!["Alt+K".to_owned()],
         }
     }
 }
@@ -269,7 +275,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 13] {
+    fn actions(&self) -> [&Vec<String>; 16] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -284,6 +290,9 @@ impl KeyboardShortcuts {
             &self.review_toggle_viewed,
             &self.review_next_file,
             &self.review_previous_file,
+            &self.review_next_unviewed,
+            &self.review_next_change,
+            &self.review_previous_change,
         ]
     }
 
@@ -304,7 +313,7 @@ impl KeyboardShortcuts {
                     error: SettingsError::InvalidShortcut(error),
                 })
             };
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=12) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=15) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return fault("every keyboard shortcut needs at least one chord", None);
@@ -328,7 +337,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 13] = [
+const SHORTCUT_ACTIONS: [&str; 16] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -342,6 +351,9 @@ const SHORTCUT_ACTIONS: [&str; 13] = [
     "review_toggle_viewed",
     "review_next_file",
     "review_previous_file",
+    "review_next_unviewed",
+    "review_next_change",
+    "review_previous_change",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -957,6 +969,9 @@ where
     preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
     preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
     preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_unviewed", "Alt+Shift+Down");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_change", "Alt+J");
+    preserve_existing_shortcut(&mut shortcuts, "review_previous_change", "Alt+K");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -981,6 +996,9 @@ where
     preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
     preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
     preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_unviewed", "Alt+Shift+Down");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_change", "Alt+J");
+    preserve_existing_shortcut(&mut shortcuts, "review_previous_change", "Alt+K");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -2915,6 +2933,33 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn new_review_navigation_migration_preserves_existing_bindings() {
+        let mut value = toml::Value::try_from(AppSettings::default()).unwrap();
+        let shortcuts = value
+            .get_mut("keyboard_shortcuts")
+            .unwrap()
+            .as_table_mut()
+            .unwrap();
+        for key in [
+            "review_next_unviewed",
+            "review_next_change",
+            "review_previous_change",
+        ] {
+            shortcuts.remove(key);
+        }
+        shortcuts.insert("new_terminal".into(), vec!["Alt+J"].into());
+        shortcuts.insert("search_projects".into(), vec!["Alt+Shift+Down"].into());
+        let migrated: AppSettings = value.try_into().unwrap();
+        assert!(migrated.keyboard_shortcuts.review_next_change.is_empty());
+        assert!(migrated.keyboard_shortcuts.review_next_unviewed.is_empty());
+        assert_eq!(
+            migrated.keyboard_shortcuts.review_previous_change,
+            ["Alt+K"]
+        );
+        migrated.validate().unwrap();
+    }
+
+    #[test]
     fn a_chord_a_card_needs_for_safety_cannot_be_bound() {
         // A bound chord is reserved, so the card never sees it: binding one of
         // these would leave a runaway program with no way to be stopped.
@@ -3351,11 +3396,11 @@ next_column = ["Alt+W", "Alt+Right"]
             document["keyboard_shortcuts"]
                 .as_table_mut()
                 .unwrap()
-                .insert("future_action".into(), vec!["Alt+K", "Alt+F12"].into());
+                .insert("future_action".into(), vec!["Alt+F17", "Alt+F12"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.new_terminal = vec!["alt+k".into()];
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+f17".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert_eq!(
             saved(&path)["keyboard_shortcuts"]["future_action"],
@@ -3729,11 +3774,11 @@ next_column = ["Alt+W", "Alt+Right"]
             document["keyboard_shortcuts"]
                 .as_table_mut()
                 .unwrap()
-                .insert("future_action".into(), vec!["Alt+K"].into());
+                .insert("future_action".into(), vec!["Alt+F17"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.new_terminal = vec!["alt+k".into()];
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+f17".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert!(
             saved(&path)["keyboard_shortcuts"]

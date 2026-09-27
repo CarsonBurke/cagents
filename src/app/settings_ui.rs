@@ -703,6 +703,24 @@ fn settings_category_controls<'a>(
                     &draft.keyboard_shortcuts.review_previous_file,
                     SettingsField::ShortcutReviewPreviousFile,
                 ),
+                setting_input(
+                    "Next unviewed file",
+                    "Opens the next unviewed file in the focused pull request pane; may repeat while held.",
+                    &draft.keyboard_shortcuts.review_next_unviewed,
+                    SettingsField::ShortcutReviewNextUnviewed,
+                ),
+                setting_input(
+                    "Next changed hunk",
+                    "Opens the next changed hunk in the focused pull request pane; may repeat while held.",
+                    &draft.keyboard_shortcuts.review_next_change,
+                    SettingsField::ShortcutReviewNextChange,
+                ),
+                setting_input(
+                    "Previous changed hunk",
+                    "Opens the previous changed hunk in the focused pull request pane; may repeat while held.",
+                    &draft.keyboard_shortcuts.review_previous_change,
+                    SettingsField::ShortcutReviewPreviousChange,
+                ),
             ],
         )],
     }

@@ -7099,14 +7099,14 @@ fn diff_surface<'a>(
                 let leading = review.and_then(|review| {
                     let path = runtime.selected.as_ref()?.path.to_str()?;
                     review
-                        .has_annotation(path, None, None, true)
+                        .has_leading_annotation(path, [0; 2])
                         .then_some((review, path))
                 });
                 if let Some((review, path)) = leading {
                     widget::scrollable(
                         widget::column::with_children([
                             review
-                                .annotation(path, None, None, true)
+                                .leading_annotation(path, [0; 2])
                                 .map(move |action| RepositoryAction::Review { card, action }),
                             no_text_view_height(content, Length::Shrink),
                         ])
@@ -7270,6 +7270,7 @@ fn diff_model_view<'a>(
                     runtime,
                     review,
                     path,
+                    line_counts: model.line_counts,
                 })
             });
             // Only mounted rows and the sparse set of previously measured
@@ -7288,7 +7289,7 @@ fn diff_model_view<'a>(
             let mut children = Vec::with_capacity(visible.end - visible.start + 3);
             let mut slots = Vec::new();
             if let Some(ctx) =
-                context.filter(|ctx| ctx.review.has_annotation(ctx.path, None, None, true))
+                context.filter(|ctx| ctx.review.has_leading_annotation(ctx.path, ctx.line_counts))
             {
                 slots.push((children.len(), None));
                 children.push(ctx.annotation(None, None, true));
@@ -7408,6 +7409,7 @@ struct DiffReviewContext<'a> {
     runtime: &'a RepositoryRuntime,
     review: &'a crate::pull_request_review::State,
     path: &'a str,
+    line_counts: [usize; 2],
 }
 
 impl<'a> DiffReviewContext<'a> {
@@ -7417,12 +7419,15 @@ impl<'a> DiffReviewContext<'a> {
         new: Option<u32>,
         leading: bool,
     ) -> Element<'a, RepositoryAction> {
-        self.review
-            .annotation(self.path, old, new, leading)
-            .map(move |action| RepositoryAction::Review {
-                card: self.card,
-                action,
-            })
+        let annotation = if leading {
+            self.review.leading_annotation(self.path, self.line_counts)
+        } else {
+            self.review.annotation(self.path, old, new, false)
+        };
+        annotation.map(move |action| RepositoryAction::Review {
+            card: self.card,
+            action,
+        })
     }
 
     fn line_action(self, old: Option<u32>, new: Option<u32>) -> Option<RepositoryAction> {
@@ -10907,6 +10912,7 @@ mod tests {
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
             DiffState::ready(staged_text_diff(DiffModel {
+                line_counts: [0; 2],
                 before: Arc::from(""),
                 inline_rows: Vec::new(),
                 split_rows: Vec::new(),
@@ -11594,6 +11600,7 @@ mod tests {
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(DiffModel {
+                line_counts: [0; 2],
                 before: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
                 split_rows: vec![split; 100_000],
@@ -11627,6 +11634,7 @@ mod tests {
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(DiffModel {
+                line_counts: [0; 2],
                 before: Arc::from(""),
                 inline_rows: vec![
                     InlineDiffRow {
@@ -13600,6 +13608,7 @@ mod tests {
 
     fn model_with(additions: u32) -> DiffModel {
         DiffModel {
+            line_counts: [0; 2],
             before: Arc::from(""),
             inline_rows: Vec::new(),
             split_rows: Vec::new(),

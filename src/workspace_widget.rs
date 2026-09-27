@@ -54,6 +54,9 @@ pub enum GlobalShortcut {
     ReviewToggleViewed,
     ReviewNextFile,
     ReviewPreviousFile,
+    ReviewNextUnviewed,
+    ReviewNextChange,
+    ReviewPreviousChange,
 }
 
 /// Where a shortcut applies, which decides when its chord is withheld from
@@ -154,6 +157,24 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: true,
         scope: ShortcutScope::Review,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewNextUnviewed,
+        label: "Next unviewed file",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewNextChange,
+        label: "Next changed hunk",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewPreviousChange,
+        label: "Previous changed hunk",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -179,6 +200,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ReviewToggleViewed => &shortcuts.review_toggle_viewed,
         GlobalShortcut::ReviewNextFile => &shortcuts.review_next_file,
         GlobalShortcut::ReviewPreviousFile => &shortcuts.review_previous_file,
+        GlobalShortcut::ReviewNextUnviewed => &shortcuts.review_next_unviewed,
+        GlobalShortcut::ReviewNextChange => &shortcuts.review_next_change,
+        GlobalShortcut::ReviewPreviousChange => &shortcuts.review_previous_change,
     }
 }
 

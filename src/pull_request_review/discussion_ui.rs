@@ -62,6 +62,8 @@ struct Composer {
 #[derive(Default)]
 struct FileThreads {
     leading: Vec<usize>,
+    /// Preserve GitHub's order when anchors must fall back above the file.
+    anchored: Vec<usize>,
     lines: HashMap<(crate::github::ReviewDiffSide, u64), Vec<usize>>,
     comments: usize,
     unresolved: usize,
@@ -222,6 +224,7 @@ impl State {
                             file.comments += thread.comments.len();
                             file.unresolved += usize::from(!thread.resolved);
                             if let Some(line) = thread.line.filter(|_| !thread.outdated) {
+                                file.anchored.push(index);
                                 file.lines
                                     .entry((thread.side, line))
                                     .or_default()
@@ -566,6 +569,17 @@ impl State {
     }
 
     fn composer_on(&self, path: &str, old: Option<u32>, new: Option<u32>, leading: bool) -> bool {
+        self.composer_at(path, old, new, leading, None)
+    }
+
+    fn composer_at(
+        &self,
+        path: &str,
+        old: Option<u32>,
+        new: Option<u32>,
+        leading: bool,
+        bounds: Option<[usize; 2]>,
+    ) -> bool {
         let Some(composer) = &self.discussion.composer else {
             return false;
         };
@@ -583,10 +597,10 @@ impl State {
                     }
             }
             Destination::Reply(id) => self
-                .threads_on(path, old, new, leading)
+                .threads_at(path, old, new, leading, bounds)
                 .any(|t| &t.id == id),
             Destination::Edit(id) => self
-                .threads_on(path, old, new, leading)
+                .threads_at(path, old, new, leading, bounds)
                 .any(|t| t.comments.iter().any(|c| c.id.as_ref() == Some(id))),
         }
     }
@@ -597,6 +611,17 @@ impl State {
         old: Option<u32>,
         new: Option<u32>,
         leading: bool,
+    ) -> impl Iterator<Item = &'a PullRequestReviewThread> {
+        self.threads_at(path, old, new, leading, None)
+    }
+
+    fn threads_at<'a>(
+        &'a self,
+        path: &'a str,
+        old: Option<u32>,
+        new: Option<u32>,
+        leading: bool,
+        bounds: Option<[usize; 2]>,
     ) -> impl Iterator<Item = &'a PullRequestReviewThread> {
         use crate::github::ReviewDiffSide::{Left, Right};
         let file = self.discussion.threads.get(path);
@@ -611,6 +636,27 @@ impl State {
             .filter(|_| !leading)
             .and_then(|file| file.lines.get(&(Right, u64::from(new?))));
         top.iter()
+            .chain(
+                file.into_iter()
+                    .filter(move |_| leading && bounds.is_some())
+                    .flat_map(move |file| {
+                        file.anchored.iter().filter(move |index| {
+                            let Some(thread) = self
+                                .discussion
+                                .conversation
+                                .as_ref()
+                                .and_then(|conversation| conversation.threads.get(**index))
+                            else {
+                                return false;
+                            };
+                            let counts = bounds.unwrap_or_default();
+                            let count = counts[usize::from(thread.side == Right)];
+                            thread
+                                .line
+                                .is_some_and(|line| line == 0 || line > count as u64)
+                        })
+                    }),
+            )
             .chain(left.into_iter().flatten())
             .chain(right.into_iter().flatten())
             .filter_map(|index| self.discussion.conversation.as_ref()?.threads.get(*index))
@@ -635,11 +681,37 @@ impl State {
         new: Option<u32>,
         leading: bool,
     ) -> Element<'a, super::Action> {
+        self.annotation_at(path, old, new, leading, None)
+    }
+
+    pub fn has_leading_annotation(&self, path: &str, bounds: [usize; 2]) -> bool {
+        self.threads_at(path, None, None, true, Some(bounds))
+            .next()
+            .is_some()
+            || self.composer_at(path, None, None, true, Some(bounds))
+    }
+
+    pub fn leading_annotation<'a>(
+        &'a self,
+        path: &'a str,
+        bounds: [usize; 2],
+    ) -> Element<'a, super::Action> {
+        self.annotation_at(path, None, None, true, Some(bounds))
+    }
+
+    fn annotation_at<'a>(
+        &'a self,
+        path: &'a str,
+        old: Option<u32>,
+        new: Option<u32>,
+        leading: bool,
+        bounds: Option<[usize; 2]>,
+    ) -> Element<'a, super::Action> {
         let enabled = self.can_mutate_discussion();
         let mut rows: Vec<Element<'a, Action>> = Vec::new();
-        for thread in self.threads_on(path, old, new, leading) {
+        for thread in self.threads_at(path, old, new, leading, bounds) {
             let expanded = !thread.resolved || self.discussion.expanded.contains(&thread.id);
-            let label = format!(
+            let mut label = format!(
                 "{}{} · {} comments",
                 if thread.outdated { "Outdated · " } else { "" },
                 if thread.resolved {
@@ -649,6 +721,12 @@ impl State {
                 },
                 thread.comments.len()
             );
+            if leading
+                && !thread.outdated
+                && let Some(line) = thread.line
+            {
+                label = format!("Line {line} · unavailable in this diff · {label}");
+            }
             rows.push(
                 button::text(label)
                     .on_press(Action::ToggleThread(thread.id.clone()))
@@ -733,7 +811,7 @@ impl State {
                 rows.push(design::caption("More comments are available on GitHub.").into());
             }
         }
-        if self.composer_on(path, old, new, leading)
+        if self.composer_at(path, old, new, leading, bounds)
             && let Some(composer) = &self.discussion.composer
         {
             let label = match &composer.destination {
@@ -963,5 +1041,17 @@ mod tests {
         assert_eq!(ids(Some(7), None, false), ["left"]);
         assert_eq!(ids(None, Some(7), false), ["right"]);
         assert_eq!(ids(None, None, true), ["outdated"]);
+        let fallback = |bounds| {
+            state
+                .threads_at("file.rs", None, None, true, Some(bounds))
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fallback([7, 6]), ["outdated", "right"]);
+        assert_eq!(fallback([0, 0]), ["outdated", "left", "right"]);
+        assert_eq!(fallback([7, 7]), ["outdated"]);
+        drop(state.update_discussion(Action::Reply("right".into())));
+        assert!(state.composer_at("file.rs", None, None, true, Some([0, 0])));
+        assert!(!state.composer_at("file.rs", None, None, true, Some([7, 7])));
     }
 }

@@ -88,6 +88,7 @@ pub struct ReviewFile {
 /// Everything one load produces, so a stale load can be dropped whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
+    pub pull_request: PullRequest,
     pub context: ReviewContext,
     pub files: PullRequestFiles,
     pub range: PullRequestRange,
@@ -169,6 +170,8 @@ pub enum Action {
     NextFile,
     PreviousFile,
     NextUnviewed,
+    NextChange,
+    PreviousChange,
     SetFileListMode(FileListMode),
     ToggleHideViewed,
     ToggleViewed(RepoPath),
@@ -217,6 +220,8 @@ pub enum Effect {
     /// The selected file is gone from the range, so the viewer should show
     /// nothing rather than a stale diff.
     CloseFile,
+    NextChange,
+    PreviousChange,
     OpenUrl(Url),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
@@ -810,6 +815,16 @@ impl State {
                 self.next_unviewed();
                 ActionTask::none()
             }
+            Action::NextChange | Action::PreviousChange => {
+                if self.selected.is_some() {
+                    self.effects.push(if matches!(action, Action::NextChange) {
+                        Effect::NextChange
+                    } else {
+                        Effect::PreviousChange
+                    });
+                }
+                ActionTask::none()
+            }
             Action::SetFileListMode(mode) => {
                 self.file_list_mode = mode;
                 self.rebuild_rows();
@@ -1114,6 +1129,9 @@ impl State {
     /// Installs a load, carrying pending marks across so an in-flight mutation
     /// is not undone by the older answer a refresh may return.
     fn adopt(&mut self, loaded: &Loaded) {
+        if let Some(target) = &mut self.target {
+            target.pull_request = Arc::new(loaded.pull_request.clone());
+        }
         self.cache_loading = false;
         self.cached_viewer = None;
         self.notice = None;
@@ -2290,6 +2308,18 @@ pub fn prune_fetched_refs(
 /// The whole load, on the blocking pool: GitHub's view of the pull request,
 /// then the fetch that brings its objects here, then the file list from the
 /// fetched range. A head that moves between the two is re-read once.
+fn metadata_matches_context(pull_request: &PullRequest, context: &ReviewContext) -> bool {
+    pull_request.head_ref_oid == context.head_oid
+        && pull_request
+            .id
+            .as_ref()
+            .is_none_or(|id| id == &context.pull_request_id)
+        && pull_request
+            .base_ref_oid
+            .as_ref()
+            .is_none_or(|oid| oid == &context.base_oid)
+}
+
 fn load_review(
     api: &dyn GitHubReviewApi,
     git: &RepositoryService,
@@ -2307,41 +2337,33 @@ fn load_review(
             target.repository.owner, target.repository.name
         )
     })?;
-    let base_branch = ValidatedBranchName::parse(target.pull_request.base_ref_name.as_str())
-        .map_err(|error| error.to_string())?;
-    let mut context = api
-        .review_context(&key, cancellation)
-        .map_err(|error| error.to_string())?;
-    let mut files = api
-        .pull_request_files(&key, cancellation)
-        .map_err(|error| error.to_string())?;
     let mut attempts = 0;
-    let range = loop {
+    let (pull_request, context, files, range) = loop {
+        let context = api
+            .review_context(&key, cancellation)
+            .map_err(|error| error.to_string())?;
+        let pull_request = api
+            .pull_request(&key, cancellation)
+            .map_err(|error| error.to_string())?;
+        if !metadata_matches_context(&pull_request, &context) {
+            if attempts == 0 {
+                attempts += 1;
+                continue;
+            }
+            return Err("The pull request changed while loading its header. Refresh to load a consistent revision.".into());
+        }
+        let base_branch = ValidatedBranchName::parse(pull_request.base_ref_name.as_str())
+            .map_err(|error| error.to_string())?;
+        let files = api
+            .pull_request_files(&key, cancellation)
+            .map_err(|error| error.to_string())?;
         let head = Oid::parse(context.head_oid.as_str()).map_err(|error| error.to_string())?;
         match git.fetch_pull_request_range(
-            &target.worktree,
-            &remote,
-            target.pull_request.number,
-            &base_branch,
-            &head,
-            cancellation,
+            &target.worktree, &remote, target.pull_request.number, &base_branch, &head, cancellation,
         ) {
-            Ok(range) if range.base_tip.as_str() == context.base_oid => break range,
-            Ok(_) if attempts == 0 => {
-                attempts += 1;
-                context = api.review_context(&key, cancellation).map_err(|error| error.to_string())?;
-                files = api.pull_request_files(&key, cancellation).map_err(|error| error.to_string())?;
-            }
+            Ok(range) if range.base_tip.as_str() == context.base_oid => break (pull_request, context, files, range),
+            Ok(_) | Err(RepositoryError::PullRequestHeadMoved { .. }) if attempts == 0 => { attempts += 1; }
             Ok(_) => return Err("The pull request base moved while loading. Refresh to fetch a consistent review range.".into()),
-            Err(RepositoryError::PullRequestHeadMoved { .. }) if attempts == 0 => {
-                attempts += 1;
-                context = api
-                    .review_context(&key, cancellation)
-                    .map_err(|error| error.to_string())?;
-                files = api
-                    .pull_request_files(&key, cancellation)
-                    .map_err(|error| error.to_string())?;
-            }
             Err(error) => return Err(error.to_string()),
         }
     };
@@ -2354,6 +2376,7 @@ fn load_review(
         )
         .map_err(|error| error.to_string())?;
     Ok(Loaded {
+        pull_request,
         context,
         files,
         range,
@@ -2609,6 +2632,7 @@ pub(crate) mod tests {
     pub(crate) fn loaded(entries: Vec<DiffEntry>, files: Vec<PullRequestFile>) -> Loaded {
         let head = Oid::parse("a".repeat(40)).unwrap();
         Loaded {
+            pull_request: pull_request(1),
             context: ReviewContext {
                 pull_request_id: "PR_1".into(),
                 head_oid: head.as_str().to_owned(),
@@ -2643,6 +2667,29 @@ pub(crate) mod tests {
     fn open_with(state: &mut State, loaded: Loaded) {
         drop(state.update(Action::Open(target(1))));
         finish_load(state, loaded);
+    }
+
+    #[test]
+    fn refreshed_metadata_replaces_stale_header_and_checks() {
+        let (mut state, _) = state();
+        let mut fresh = loaded(vec![], vec![]);
+        fresh.pull_request.title = "Renamed on GitHub".into();
+        fresh.pull_request.base_ref_name = "release".into();
+        fresh.pull_request.review_decision = Some(RemoteValue("APPROVED".into()));
+        open_with(&mut state, fresh.clone());
+        assert_eq!(
+            *state.target.as_ref().unwrap().pull_request,
+            fresh.pull_request
+        );
+        assert!(metadata_matches_context(
+            &fresh.pull_request,
+            &fresh.context
+        ));
+        fresh.pull_request.head_ref_oid = "d".repeat(40);
+        assert!(!metadata_matches_context(
+            &fresh.pull_request,
+            &fresh.context
+        ));
     }
 
     #[test]
