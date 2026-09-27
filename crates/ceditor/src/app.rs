@@ -1,7 +1,7 @@
 use cagents::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents::{
     design,
-    github::{self, GitHubService},
+    github::GitHubService,
     lsp::{
         LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
         LspStatus,
@@ -6536,7 +6536,7 @@ mod tests {
         assert!(app.handle_shortcut(&next).is_none(), "still none open");
 
         let target = pull_request_review::ReviewTarget {
-            repository: github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            repository: cagents::github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
             worktree: "/workspace".into(),
             pull_request: Arc::new(
                 serde_json::from_value(serde_json::json!({
