@@ -305,6 +305,43 @@ mod tests {
         );
     }
     #[test]
+    fn a_failed_delivery_is_offered_again_only_after_fresh_validated_observation() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let generation = monitor.entries[&repository].generation;
+        let loaded = || Action::Loaded {
+            repository: repository.clone(),
+            generation,
+            work: Work::Page { cursor: None },
+            result: Ok(reply("viewer", Some("request51"))),
+        };
+        drop(monitor.update(loaded(), [repository.clone()]));
+        let lost = monitor.take_observed();
+        assert_eq!(lost.len(), 1);
+        // The report RPC failed after this page; an ordinary UI tick must not
+        // replay stale account authority, nor permanently mark the ID delivered.
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        assert!(monitor.take_observed().is_empty());
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        drop(monitor.update(loaded(), [repository.clone()]));
+        assert_eq!(monitor.take_observed(), lost);
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        drop(monitor.update(
+            Action::Loaded {
+                repository: repository.clone(),
+                generation,
+                work: Work::Page { cursor: None },
+                result: Ok(reply("changed-viewer", None)),
+            },
+            [repository],
+        ));
+        assert!(monitor.take_observed().is_empty());
+    }
+
+    #[test]
     fn stale_repository_reply_cannot_grant_requests_to_readded_binding() {
         let mut monitor = Monitor::default();
         let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();

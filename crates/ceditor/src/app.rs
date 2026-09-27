@@ -6788,6 +6788,67 @@ mod tests {
         app.active.unwrap()
     }
 
+    #[test]
+    fn review_alert_waits_for_its_repository_and_ignores_superseded_verification() {
+        use cagents::notifications::{Target, review::ReviewRequest, ui::Action as Observed};
+        use notification_ui::Action;
+        let mut app = editor();
+        let request = ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "first".into(),
+        };
+        drop(
+            app.notification_action(Action::Observed(Observed::Activated(Target::PullRequest(
+                request.clone(),
+            )))),
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Open this review's repository")
+        );
+        let other = add(&mut app, "/other", None);
+        let wanted = add(&mut app, "/wanted", None);
+        drop(app.tab_mut(wanted).unwrap().review.set_source(Some(
+            pull_request_review::ReviewSource {
+                repository: request.repository_key(),
+                worktree: "/wanted".into(),
+            },
+        )));
+        drop(app.select_tab(other));
+        let newer = ReviewRequest {
+            request: "second".into(),
+            ..request.clone()
+        };
+        drop(
+            app.notification_action(Action::Observed(Observed::Activated(Target::PullRequest(
+                newer.clone(),
+            )))),
+        );
+        drop(app.notification_action(Action::Verified {
+            request,
+            result: Ok(()),
+        }));
+        assert_eq!(
+            app.active,
+            Some(other),
+            "older async verification cannot open an obsolete request"
+        );
+        drop(app.notification_action(Action::Verified {
+            request: newer,
+            result: Ok(()),
+        }));
+        assert_eq!(app.active, Some(wanted));
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_panel, WorktreePanel::PullRequests);
+    }
+
     /// Alt+Down and its siblings are ordinary editing chords elsewhere, so
     /// they act on a review only while one is open and on screen.
     #[test]

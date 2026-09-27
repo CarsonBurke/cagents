@@ -3529,6 +3529,54 @@ mod tests {
     }
 
     #[test]
+    fn review_activation_survives_cold_editor_reconnect_without_crossing_shells() {
+        use crate::notifications::{
+            Application, Destination, Presence, Target, review::ReviewRequest,
+        };
+        let mut host = test_host();
+        let target = Target::PullRequest(ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "request".into(),
+        });
+        let destination = Destination {
+            application: Application::Ceditor,
+            window: "shared-slot".into(),
+        };
+        host.register_client(1);
+        let agents = Presence {
+            window: destination.window.clone(),
+            ..Default::default()
+        };
+        host.watch_notifications(1, agents.clone());
+        assert_eq!(
+            host.activate_notification_destination(target.clone(), None, None, Some(&destination)),
+            destination
+        );
+        assert_eq!(
+            host.watch_notifications(1, agents),
+            None,
+            "same slot in Cagents has no editor authority"
+        );
+        host.register_client(2);
+        let editor = Presence {
+            window: destination.window.clone(),
+            application: Application::Ceditor,
+            ..Default::default()
+        };
+        assert_eq!(host.watch_notifications(2, editor.clone()), Some(target));
+        assert_eq!(
+            host.watch_notifications(2, editor),
+            None,
+            "activation is consumed once"
+        );
+    }
+
+    #[test]
     fn explicit_close_fences_attention_without_discarding_completed_history() {
         let recipe = crate::model::LaunchRecipe {
             unset_environment: Default::default(),
