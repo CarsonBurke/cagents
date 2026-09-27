@@ -27,6 +27,9 @@ struct Capture {
 }
 
 impl Tracker {
+    pub fn active(&self) -> Option<RunId> {
+        self.active
+    }
     pub fn activity(&mut self, state: crate::agent::ActivityState) -> Option<(RunId, Update)> {
         let run = self.active?;
         let capture = self.runs.get_mut(&run)?;

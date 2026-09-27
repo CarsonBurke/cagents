@@ -17,6 +17,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod ownership;
+pub(super) use ownership::{
+    Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
+    reconcile_agent_run, reconcile_agent_run_under_control,
+};
+
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
 const EXECUTION_CLIENT: u64 = 0;
@@ -184,7 +190,7 @@ fn dispatch(
     let gate = agent_gate(host, accepted.agent.id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
-    let context = Arc::new(chat::protocol::ExecutionContext::new(directory));
+    let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
         .verify_directory(&accepted.agent.spec.target.directory)
         .map_err(before)?;
@@ -193,6 +199,48 @@ fn dispatch(
         .unwrap_or_else(|p| p.into_inner())
         .validate_agent_dispatch(accepted)
         .map_err(before)?;
+    if let Some(identity) = context.directory_identity().map_err(before)? {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pin_agent_directory(accepted.agent.id, identity)
+            .map_err(before)?;
+    } else if let Some(identity) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_directory(accepted.agent.id)
+        .map_err(before)?
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&accepted.agent.spec.target.directory)
+            .map_err(|error| before(error.to_string()))?;
+        context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
+            directory,
+        ))));
+        if context.directory_identity().map_err(before)? != Some(identity) {
+            return Err(before(
+                "The approved agent directory changed before provider dispatch".into(),
+            ));
+        }
+        context
+            .verify_directory(&accepted.agent.spec.target.directory)
+            .map_err(before)?;
+    }
+    if matches!(accepted.agent.origin, Origin::Automation { .. })
+        && !registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_dispatch_is_authorized(accepted.agent.id, accepted.run.id)
+            .map_err(before)?
+    {
+        return Err(before(
+            "Interactive work took ownership of this agent; automatic dispatch was cancelled"
+                .into(),
+        ));
+    }
     let request = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -332,6 +380,10 @@ fn dispatch(
         announce(host, &registry);
         (session, handle)
     };
+    // A visible, bound startup may be closed while a provider is initializing.
+    // Reacquire and revalidate before the first external prompt, rather than
+    // making interactive close wait through the whole readiness deadline.
+    drop(_dispatch);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = handle.snapshot(None).expect("unconditional snapshot");
@@ -353,12 +405,43 @@ fn dispatch(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent(accepted.agent.id).map_err(before)?.closed
+            || registry.agent_run(accepted.run.id).map_err(before)? != accepted.run
+            || (matches!(accepted.agent.origin, Origin::Automation { .. })
+                && !registry
+                    .agent_dispatch_is_authorized(accepted.agent.id, accepted.run.id)
+                    .map_err(before)?)
+        {
+            return Err(before(
+                "Execution ownership changed while the provider initialized".into(),
+            ));
+        }
+    }
+    if !host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&session.id)
+        .is_some_and(|record| record.handle.same_actor(&handle))
+    {
+        return Err(before(
+            "The exact provider changed before prompt dispatch".into(),
+        ));
+    }
     if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
         create_console(host, &registry, accepted.agent.id, &session, &handle).map_err(before)?;
     }
     context
         .verify_directory(&accepted.agent.spec.target.directory)
         .map_err(before)?;
+    if matches!(accepted.agent.origin, Origin::Automation { .. }) {
+        // Live interactive work may survive removal; each scheduled prompt
+        // still requires its explicitly selected account to be registered.
+        selected_account(&accepted.agent.spec).map_err(before)?;
+    }
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
     handle
@@ -780,6 +863,8 @@ fn console(
             prompt,
             idempotency_key,
         } => {
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -792,6 +877,10 @@ fn console(
                     },
                     now(),
                 )?;
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .claim_agent_interaction(id, Some(accepted.run.id))?;
             dispatch_accepted(host, accepted.clone())?;
             Ok(Reply::Accepted(accepted))
         }
@@ -805,6 +894,12 @@ fn console(
             ) {
                 return Err("Use an accepted agent run to submit console prompts".into());
             }
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .claim_agent_interaction(id, None)?;
             handle.command(command)?;
             Ok(Reply::Console(None))
         }
