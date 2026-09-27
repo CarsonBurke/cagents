@@ -54,7 +54,21 @@ impl Cagents {
     }
 
     pub(super) fn update_automation_ui(&mut self, action: Action) -> Task<Message> {
-        if matches!(action, Action::New | Action::Edit) {
+        // Restored utility cards bypass open_automations, and the account
+        // catalog can finish loading after the card opens. Keep labels and
+        // availability current before displaying or confirming a definition.
+        // Existing drafts own their choice snapshots, so polling cannot move
+        // a user's account or target selection.
+        if matches!(
+            action,
+            Action::Tick
+                | Action::Refresh
+                | Action::Select(_)
+                | Action::New
+                | Action::Edit
+                | Action::Enable
+                | Action::RunNow
+        ) {
             self.refresh_automation_choices();
         }
         match self.automation_ui.update(action) {
