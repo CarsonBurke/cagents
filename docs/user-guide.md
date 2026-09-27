@@ -211,6 +211,8 @@ not change the checkout. Cagents uses its regular worktree creation flow;
 Ceditor previews the resolved destination, creates the worktree, and offers
 **Open worktree**. Both preserve the original checkout and record interrupted
 creation for reconciliation instead of silently repeating it.
+Ceditor's **Worktrees** footer opens recent operation results, including a
+completed worktree recovered after a restart, with an **Open worktree** action.
 
 ## Worktrees
 
