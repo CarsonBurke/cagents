@@ -806,6 +806,9 @@ impl State {
                 self.set_viewed(indices, viewed)
             }
             Action::ToggleViewedAndAdvance => {
+                if self.context.is_none() {
+                    return ActionTask::none();
+                }
                 let Some(index) = self
                     .selected
                     .as_ref()
@@ -2680,6 +2683,23 @@ pub(crate) mod tests {
         }));
         assert!(state.files.is_empty());
         assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn cached_viewed_shortcut_does_not_advance_without_marking() {
+        let (mut state, _) = state();
+        drop(state.open(target(1)));
+        let mut snapshot = cache::fixture();
+        snapshot.files[0].viewed = false;
+        snapshot.files.push(cache::File {
+            entry: entry("z.rs", ChangeKind::Modified),
+            viewed: false,
+            unverified: false,
+        });
+        state.adopt_cache(snapshot);
+        drop(state.update(Action::ToggleViewedAndAdvance));
+        assert_eq!(state.selected, Some(path("src/main.rs")));
+        assert!(!state.files[0].viewed);
     }
 
     /// Answers the load the state is waiting on, as the worker would.
