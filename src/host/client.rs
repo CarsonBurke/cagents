@@ -239,7 +239,7 @@ fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
-fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
+pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,
@@ -293,6 +293,16 @@ fn process_request(
     ensure_control_open(host)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Agent {
+            authority,
+            operation,
+        } => {
+            let reply =
+                super::agent_execution::process(host, authority, operation).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?;
+            Ok((ServerResponse::Agent(reply), Vec::new(), false))
+        }
         ClientRequest::WatchNotifications { presence }
         | ClientRequest::NotificationPresence { presence } => {
             crate::instance::validate_window_slot(&presence.window).map_err(|error| {
@@ -1386,6 +1396,8 @@ mod tests {
             state.chats.insert(
                 chat_id,
                 super::super::chat::Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
                     session: chat::Session {
                         owned_codex_listener: None,
                         id: chat_id,

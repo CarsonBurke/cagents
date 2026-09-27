@@ -200,11 +200,32 @@ impl Registry {
         &mut self,
         session: &HostedSession,
     ) -> Result<Authority, String> {
+        self.register_authority(session, false)
+    }
+
+    /// A fresh process cannot reuse the capability of an exited same-ID
+    /// process. Authenticated holder adoption uses the proof-fenced CAS.
+    pub(crate) fn fresh_agent_authority(
+        &mut self,
+        session: &HostedSession,
+    ) -> Result<Authority, String> {
+        self.register_authority(session, true)
+    }
+
+    fn register_authority(
+        &mut self,
+        session: &HostedSession,
+        fresh: bool,
+    ) -> Result<Authority, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let id = session.id().to_string();
+        if fresh {
+            tx.execute("DELETE FROM agent_authorities WHERE session_id = ?1", [&id])
+                .map_err(|error| error.to_string())?;
+        }
         let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT token, source FROM agent_authorities WHERE session_id = ?1",
@@ -384,6 +405,7 @@ impl Registry {
                     spec: spec.clone(),
                     channel,
                     session: None,
+                    console: None,
                     created_ms: now_ms,
                     closed: false,
                 };
@@ -437,6 +459,53 @@ impl Registry {
 
     pub(crate) fn agent(&self, id: AgentId) -> Result<Agent, String> {
         read_agent(&self.db, id)
+    }
+
+    pub(crate) fn execution_sequence(&self) -> Result<u64, String> {
+        self.db
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn previous_agent_acceptance(
+        &self,
+        origin: &Origin,
+        request: &Submit,
+    ) -> Result<Option<Accepted>, String> {
+        let row: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT request, record FROM agent_runs WHERE origin = ?1 AND idempotency_key = ?2",
+                params![encode(origin)?, request.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(stored, run)| {
+            if decode::<Submit>(&stored)? != *request {
+                return Err(
+                    "The idempotency key already identifies a different agent request".into(),
+                );
+            }
+            let run: Run = decode(&run)?;
+            Ok(Accepted {
+                agent: self.agent(run.agent)?,
+                run,
+                created: false,
+            })
+        })
+        .transpose()
+    }
+
+    pub(crate) fn validate_agent_dispatch(&self, accepted: &Accepted) -> Result<(), String> {
+        let agent = self.agent(accepted.agent.id)?;
+        let run = self.agent_run(accepted.run.id)?;
+        if agent.closed || run != accepted.run || agent != accepted.agent {
+            return Err("The accepted execution changed before provider dispatch".into());
+        }
+        require_channel(&self.db, agent.channel, &agent.spec.target.repository)
     }
 
     pub(crate) fn agent_request(&self, run: RunId) -> Result<Submit, String> {
@@ -495,7 +564,13 @@ impl Registry {
         if agent.closed || agent.session.as_ref() != expected {
             return Err("The agent session changed before attachment was saved".into());
         }
+        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
         agent.session = Some(session);
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
         tx.execute(
             "UPDATE agents SET record = ?2, session_id = ?3 WHERE id = ?1",
             params![
@@ -510,6 +585,131 @@ impl Registry {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(agent)
+    }
+
+    pub(crate) fn bind_agent_console(
+        &mut self,
+        id: AgentId,
+        expected: &HostedSession,
+        console: crate::model::TerminalSession,
+    ) -> Result<Agent, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut agent = read_agent(&tx, id)?;
+        if agent.closed
+            || agent.session.as_ref() != Some(expected)
+            || agent.console.is_some()
+            || expected.id() != console.id
+        {
+            return Err("The provider session changed before its console was attached".into());
+        }
+        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+        agent.console = Some(console);
+        tx.execute(
+            "UPDATE agents SET record = ?2 WHERE id = ?1",
+            params![id.to_string(), encode(&agent)?],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(agent)
+    }
+
+    pub(crate) fn retained_agent_authority(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Authority, String> {
+        let token = self
+            .db
+            .query_row(
+                "SELECT token FROM agent_authorities WHERE session_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|_| "The paired provider has no retained execution authority".to_owned())?;
+        Ok(Authority::session(token))
+    }
+
+    /// Retire an exact process after confirmed teardown, including closes from
+    /// the UI. The run, capacity and delegated authority change atomically.
+    pub(crate) fn retire_agent_process(
+        &mut self,
+        source: &HostedSession,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let authority: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [source.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(authority) = authority
+            && source.same_process(&decode::<HostedSession>(&authority)?)
+        {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1",
+                [source.id().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let record: Option<String> = tx
+            .query_row(
+                "SELECT record FROM agents WHERE session_id = ?1 AND closed = 0",
+                [source.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let mut changed = false;
+        if let Some(record) = record {
+            let mut agent: Agent = decode(&record)?;
+            if agent
+                .session
+                .as_ref()
+                .is_some_and(|expected| expected.same_process(source))
+            {
+                let records = tx.prepare("SELECT record FROM agent_runs WHERE agent = ?1 AND state IN ('accepted', 'running', 'waiting')")
+                    .map_err(|e| e.to_string())?.query_map([agent.id.to_string()], |row| row.get::<_, String>(0))
+                    .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|e| e.to_string())?;
+                for record in records {
+                    let mut run: Run = decode(&record)?;
+                    run.state = State::Cancelled;
+                    run.finished_ms = Some(now_ms);
+                    run.revision = run
+                        .revision
+                        .checked_add(1)
+                        .ok_or("Agent run revision exhausted")?;
+                    tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
+                        params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
+                }
+                agent.closed = true;
+                tx.execute(
+                    "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
+                    params![agent.id.to_string(), encode(&agent)?],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+                changed = true;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
     }
 
     /// Called after confirmed runtime teardown, never before requesting it.
@@ -534,6 +734,11 @@ impl Registry {
             return Err("The agent still has an unfinished run".into());
         }
         agent.closed = true;
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
         tx.execute(
             "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
             params![id.to_string(), encode(&agent)?],

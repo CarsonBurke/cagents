@@ -885,7 +885,7 @@ mod activity_tests {
 #[path = "agent_recovery.rs"]
 pub mod agent_recovery;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
     /// Native Codex listener provenance retained while this is its CLI view.

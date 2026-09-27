@@ -225,6 +225,7 @@ pub(crate) struct HostState {
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
     /// Connections that asked for shared-model edges, kept separately from
     /// `watchers` because watching terminals and watching the model are
     /// independent subscriptions with independent clients - the CLI reads the
@@ -278,6 +279,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
+            execution_gates: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
@@ -484,7 +486,7 @@ impl HostState {
     /// broadcast, because a redraw broadcast returns early for a subscriber that
     /// is not visible and a sidebar edge is not a repaint - a hidden window that
     /// missed one would show a channel that no longer exists until it restarted.
-    fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
+    pub(super) fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -2619,8 +2621,58 @@ fn start_terminal_view(
         })
     };
 
+    let agent_authority = if paired {
+        match super::agent_execution::registry(shared) {
+            Ok(registry) => registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retained_agent_authority(terminal_id)
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    } else if adoption.is_none() {
+        match super::agent_execution::registry(shared) {
+            Ok(registry) => {
+                let mut source = session.clone();
+                let proof = shared
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                source.continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
+                };
+                source.resume_hint =
+                    crate::model::agent_recovery::observed_hint_from_launch(&source.launch);
+                match registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .fresh_agent_authority(&crate::agent_execution::HostedSession::Terminal(source))
+                {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        shared
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .cancel_spawn(terminal_id);
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            error,
+                            false,
+                        ));
+                    }
+                }
+            }
+            Err(_) => Default::default(),
+        }
+    } else {
+        Default::default()
+    };
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
+        agent_authority,
         columns: options.columns,
         rows: options.rows,
         cell_width_px: options.cell_width_px,

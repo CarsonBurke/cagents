@@ -17,6 +17,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+mod agents;
+pub use agents::AgentCommand;
+
 use crate::{
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
     model::{
@@ -66,6 +69,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Start, message, inspect, wait for, and close owned provider agents.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Launch the native cagents UI and return immediately.
     Ui {
         /// Open another durable window slot instead of activating a running UI.
@@ -1378,6 +1386,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
@@ -1524,6 +1533,7 @@ where
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
@@ -2912,6 +2922,7 @@ mod tests {
                     ordinal: 4,
                 }],
                 closed_projects: Vec::new(),
+                agents: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -3163,6 +3174,7 @@ mod tests {
                 }],
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                agents: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -3223,6 +3235,7 @@ mod tests {
                 projects: served,
                 channels: Vec::new(),
                 closed_projects: Vec::new(),
+                agents: Vec::new(),
             };
             write_frame(
                 &mut server_stream,
@@ -3344,6 +3357,7 @@ mod tests {
                         projects: Vec::new(),
                         channels: Vec::new(),
                         closed_projects: Vec::new(),
+                        agents: Vec::new(),
                     },
                 ),
             )
@@ -3401,6 +3415,7 @@ mod tests {
                 })
                 .collect(),
             closed_projects: Vec::new(),
+            agents: Vec::new(),
         }
     }
 

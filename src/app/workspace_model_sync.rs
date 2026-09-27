@@ -99,7 +99,10 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         // Reading the model afterwards is how an adopting window learns where
         // the new channel sorts, and it is one request on a connection that is
         // otherwise idle until the next edge.
-        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
+        let ranked = matches!(
+            edit,
+            ModelEdit::CreateChannel { .. } | ModelEdit::AgentsChanged
+        );
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
             .map_err(|error| error.to_string())?;
@@ -501,6 +504,12 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id);
         }
+        for agent in &model.agents {
+            if let Some(task) = self.adopt_execution_agent(agent) {
+                changed = true;
+                tasks.push(task);
+            }
+        }
         self.workspace_model = model;
         if changed {
             self.sort_durable_channels();
@@ -509,6 +518,87 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         Task::batch(tasks)
+    }
+
+    /// Adoption records the daemon's exact descriptor without launching a
+    /// replacement, switching channels, or taking focus from current work.
+    fn adopt_execution_agent(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+    ) -> Option<Task<Message>> {
+        if agent.closed
+            || self.channel_ui.is_deleting(agent.channel)
+            || self.channel_ui.was_deleted(agent.channel)
+        {
+            return None;
+        }
+        let selected;
+        let session = if agent.spec.surface == crate::agent_execution::Surface::Terminal {
+            selected = crate::agent_execution::HostedSession::Terminal(agent.console.clone()?);
+            &selected
+        } else {
+            agent.session.as_ref()?
+        };
+        let channel_index = self
+            .durable
+            .channels
+            .iter()
+            .position(|channel| channel.id == agent.channel)?;
+        let card_id = CardId::from_uuid(agent.id.as_uuid());
+        // Includes tombstones: an explicit local close is never undone by an
+        // old model read, a reconnect, or another window observing this agent.
+        if self.durable.cards.iter().any(|card| card.id == card_id) {
+            return None;
+        }
+        let kind = match session {
+            crate::agent_execution::HostedSession::Chat(session) => CardKind::Chat(session.clone()),
+            crate::agent_execution::HostedSession::Terminal(session) => {
+                CardKind::Terminal(session.clone())
+            }
+        };
+        let card = CardState {
+            id: card_id,
+            generation: self.durable.generation,
+            title: format!("{} agent", agent.spec.provider.label()),
+            width_fraction: self.settings.default_column_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind,
+        };
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.cards.push(card.clone());
+        durable
+            .card_scopes
+            .insert(card_id, agent.spec.target.directory.clone());
+        let channel = &mut durable.channels[channel_index];
+        channel.cards.push(card_id);
+        channel.focused.get_or_insert(card_id);
+        self.cards.insert(card_id, CardRuntime::Loading);
+        self.lifecycle.register(
+            card_id,
+            Exposure::Offscreen,
+            Residency::Cold,
+            Instant::now(),
+        );
+        if self.durable.active_channel != Some(agent.channel) {
+            return Some(Task::none());
+        }
+        let item = WorkspaceCard::new(
+            card_id,
+            card.title,
+            CardWidth::Fraction(card.width_fraction),
+        )
+        .expect("execution title and default width are valid");
+        let task = self
+            .workspace
+            .add_card(item, self.workspace.cards().len(), false)
+            .map(|update| self.apply_viewport(update, true, false))
+            .unwrap_or_else(|error| {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                Task::none()
+            });
+        Some(task)
     }
 
     /// Takes the shared half of a channel this window already has.
@@ -816,6 +906,7 @@ mod tests {
             projects: Vec::new(),
             channels,
             closed_projects: Vec::new(),
+            agents: Vec::new(),
         }
     }
 

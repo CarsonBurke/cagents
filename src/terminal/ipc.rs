@@ -87,7 +87,8 @@ use crate::{
 /// Version 26 adds daemon-owned durable lifecycle attention and notification control.
 /// Version 27 reports screen loss after authenticated crash adoption and adds
 /// exact-recipe cleanup for retained completed terminals.
-pub const PROTOCOL_VERSION: u16 = 27;
+/// Version 28 adds durable agent commands, execution identity, and hosted consoles.
+pub const PROTOCOL_VERSION: u16 = 28;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -350,6 +351,10 @@ pub enum ClientRequest {
     },
     AcknowledgeNotification {
         id: uuid::Uuid,
+    },
+    Agent {
+        authority: crate::agent_execution::Authority,
+        operation: crate::agent_execution::Operation,
     },
 }
 
@@ -633,6 +638,7 @@ pub enum ServerResponse {
     Notifications {
         snapshot: crate::notifications::Snapshot,
     },
+    Agent(crate::agent_execution::Reply),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -157,6 +157,7 @@ impl Registry {
             .map(PathBuf::from)
             .collect();
         Ok(WorkspaceModel {
+            agents: self.agents(None)?,
             identity,
             sequence: sequence as u64,
             projects,
@@ -173,6 +174,9 @@ impl Registry {
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
+            ModelEdit::AgentsChanged => {
+                return Err("Agent model changes are committed by the execution service".into());
+            }
             ModelEdit::OpenProject {
                 repository,
                 name,

@@ -978,6 +978,10 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        command.env_remove(crate::agent_execution::AUTHORITY_ENV);
+        if let Some(token) = config.agent_authority.token() {
+            command.env(crate::agent_execution::AUTHORITY_ENV, token);
+        }
         command.env(
             "CAGENTS_RECOVERY_ORIGIN",
             session.recovery_origin.unwrap_or(session.id).to_string(),
@@ -1020,6 +1024,19 @@ impl Worker {
                         .collect();
                     let _account = crate::account::registry::authorize_spawn(&environment, None)
                         .map_err(|error| error.to_string())?;
+                let mut skill_environment: std::collections::BTreeMap<String, String> = environment;
+                if let Some(home) = command.get_env("HOME").and_then(|value| value.to_str()) {
+                    skill_environment.insert("HOME".into(), home.into());
+                }
+                crate::agent_execution::bundled::install(
+                    crate::agent::Provider::from_program(&session.launch.program),
+                    &skill_environment,
+                );
+                if let Some(path) = crate::agent_execution::bundled::matched_path(
+                    command.get_env("PATH").and_then(|value| value.to_str()),
+                ) {
+                    command.env("PATH", path);
+                }
                     (
                         holder::spawn_recoverable(
                             command,
