@@ -28,6 +28,10 @@ impl RowOffsets {
         }
     }
 
+    pub fn annotations(&self) -> &std::collections::BTreeMap<usize, f32> {
+        &self.annotations
+    }
+
     pub fn offset(&self, row: usize) -> f32 {
         self.position(row) as f32
     }

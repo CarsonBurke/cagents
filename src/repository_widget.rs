@@ -315,6 +315,25 @@ pub enum LspIntent {
 
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
+    Review {
+        card: CardId,
+        action: crate::pull_request_review::Action,
+    },
+    ReviewLine {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        action: crate::pull_request_review::Action,
+        extend: bool,
+    },
+    DiffAnnotations {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        mode: DiffMode,
+        layout_revision: u64,
+        review_revision: (u64, u64),
+        leading: f32,
+        rows: Vec<(usize, f32)>,
+    },
     RefreshFiles {
         card: CardId,
     },
@@ -549,7 +568,8 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
-            Self::RefreshFiles { card }
+            Self::Review { card, .. }
+            | Self::RefreshFiles { card }
             | Self::ListDirectory { card, .. }
             | Self::SearchDirectory { card, .. }
             | Self::DirectorySearchLoaded { card, .. }
@@ -588,7 +608,9 @@ impl RepositoryAction {
             | Self::PdfTone { card, .. }
             | Self::PdfZoom { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
-            Self::FilesLoaded { identity, .. }
+            Self::ReviewLine { identity, .. }
+            | Self::DiffAnnotations { identity, .. }
+            | Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
@@ -1581,6 +1603,12 @@ pub struct RepositoryRuntime {
     /// Retained logical position while a reopened comparison has no geometry.
     /// Kept through the first uniform layout until measurement or user scroll.
     pending_diff_anchor: Option<DiffViewportAnchor>,
+    diff_layout_revision: u64,
+    review_line_anchor: Option<(
+        AsyncIdentity,
+        DiffBasis,
+        crate::pull_request_review::discussion::Anchor,
+    )>,
     diff_horizontal: f32,
     preview_scroll_id: widget::Id,
     viewports: FileViewportAnchors,
@@ -1719,6 +1747,8 @@ impl RepositoryRuntime {
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
             diff_viewport: ListViewport::default(),
             pending_diff_anchor: None,
+            diff_layout_revision: 0,
+            review_line_anchor: None,
             diff_horizontal: 0.0,
             preview_scroll_id: widget::Id::new(format!("repository.preview.{identity}")),
             viewports: FileViewportAnchors::default(),
@@ -4589,6 +4619,55 @@ impl RepositoryRuntime {
                 }
                 Task::none()
             }
+            RepositoryAction::Review { .. } => Task::none(),
+            RepositoryAction::ReviewLine {
+                identity,
+                basis,
+                mut action,
+                extend,
+            } => {
+                if !self.accepts_selected(&identity) || self.diff_basis != basis {
+                    return Task::none();
+                }
+                if let Some(anchor) = review_begin_anchor(&mut action) {
+                    if extend
+                        && let Some((previous_identity, previous_basis, previous)) =
+                            &self.review_line_anchor
+                        && previous_identity == &identity
+                        && previous_basis == &basis
+                        && previous.path == anchor.path
+                        && previous.side == anchor.side
+                    {
+                        let origin = previous.start_line;
+                        anchor.start_line = origin.min(anchor.line);
+                        anchor.line = origin.max(anchor.line);
+                    } else {
+                        self.review_line_anchor = Some((identity.clone(), basis, anchor.clone()));
+                    }
+                }
+                Task::done(RepositoryAction::Review {
+                    card: identity.card,
+                    action,
+                })
+            }
+            RepositoryAction::DiffAnnotations {
+                identity,
+                basis,
+                mode,
+                layout_revision,
+                leading,
+                rows,
+                ..
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.diff_basis != basis
+                    || self.diff_mode != mode
+                    || self.diff_layout_revision != layout_revision
+                {
+                    return Task::none();
+                }
+                self.set_diff_annotation_heights(mode, leading, &rows)
+            }
             RepositoryAction::DiffViewport {
                 offset,
                 height,
@@ -4668,6 +4747,7 @@ impl RepositoryRuntime {
     }
 
     fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         match self
             .diffs
@@ -5827,12 +5907,20 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    view_with_review(card, runtime, None)
+}
+
+pub fn view_with_review<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     // File browsing lives in the sidebar tree, and the flat list exists only
     // for diff/change review. With nothing selected the card reports its
     // file-listing state instead of duplicating the tree as a second flat
     // browser: a loading or failed list must stay visible with its retry.
     let body = if runtime.selected.is_some() {
-        selected_file_view(card, runtime)
+        selected_file_view(card, runtime, review)
     } else {
         match &runtime.files {
             FileListState::Loading => loading(),
@@ -6308,10 +6396,14 @@ fn find_strip<'a>(
     )
 }
 
-fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+fn selected_file_view<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     match runtime.source_surface {
         SourceSurface::Editor => editor_surface(card, runtime),
-        SourceSurface::Diff => diff_surface(card, runtime),
+        SourceSurface::Diff => diff_surface(card, runtime, review),
     }
 }
 
@@ -6960,7 +7052,11 @@ fn diff_review_controls(
         .into()
 }
 
-fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+fn diff_surface<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     if runtime.mutation_refresh_pending && !runtime.diff_basis.is_immutable() {
         return match &runtime.files {
             FileListState::Failed(error) => {
@@ -6998,8 +7094,36 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                     new_label,
                 },
                 _,
-            )) => diff_model_view(card, runtime, model, old_label, new_label),
-            Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => no_text_view(content),
+            )) => diff_model_view(card, runtime, model, old_label, new_label, review),
+            Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => {
+                let leading = review.and_then(|review| {
+                    let path = runtime.selected.as_ref()?.path.to_str()?;
+                    review
+                        .has_annotation(path, None, None, true)
+                        .then_some((review, path))
+                });
+                if let Some((review, path)) = leading {
+                    widget::scrollable(
+                        widget::column::with_children([
+                            review
+                                .annotation(path, None, None, true)
+                                .map(move |action| RepositoryAction::Review { card, action }),
+                            // The information panel uses Fill for its ordinary
+                            // centered presentation. Bound that panel inside the
+                            // scrolling thread list, whose height stays natural.
+                            widget::container(no_text_view(content))
+                                .height(240.0)
+                                .into(),
+                        ])
+                        .width(Length::Fill),
+                    )
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .into()
+                } else {
+                    no_text_view(content)
+                }
+            }
             Some(DiffState::Ready(RenderedDiff::Error(error), _)) => {
                 information_state("Could not compute diff", error.clone())
             }
@@ -7112,8 +7236,9 @@ fn diff_model_view<'a>(
     model: &'a DiffModel,
     old_label: &'a str,
     new_label: &'a str,
+    review: Option<&'a crate::pull_request_review::State>,
 ) -> Element<'a, RepositoryAction> {
-    let rows: Element<'a, RepositoryAction> = if model.is_empty() {
+    let rows: Element<'a, RepositoryAction> = if model.is_empty() && review.is_none() {
         information_state(
             "No content changes",
             format!("{old_label} and {new_label} hold identical text."),
@@ -7134,41 +7259,73 @@ fn diff_model_view<'a>(
                 .diff_rows()
                 .expect("rendered comparison owns its row layout");
             let visible = visible_diff_rows(rows, runtime.diff_viewport);
+            let context = review.and_then(|review| {
+                let path = runtime.selected.as_ref()?.path.to_str()?;
+                Some(DiffReviewContext {
+                    card,
+                    runtime,
+                    review,
+                    path,
+                })
+            });
+            // Only mounted rows and the sparse set of previously measured
+            // annotations are inspected; large unchanged files stay virtual.
+            let retained: BTreeMap<usize, f32> = rows
+                .annotations()
+                .iter()
+                .filter(|(index, _)| {
+                    context.is_some_and(|ctx| {
+                        let (old, new) = diff_row_lines(model, runtime.diff_mode, **index);
+                        ctx.review.has_annotation(ctx.path, old, new, false)
+                    })
+                })
+                .map(|(row, height)| (*row, *height))
+                .collect();
             let mut children = Vec::with_capacity(visible.end - visible.start + 3);
-            if rows.leading_height() > 0.0 {
-                children.push(
-                    iced::widget::Space::new()
-                        .height(rows.leading_height())
-                        .into(),
-                );
+            let mut slots = Vec::new();
+            if let Some(ctx) =
+                context.filter(|ctx| ctx.review.has_annotation(ctx.path, None, None, true))
+            {
+                slots.push((children.len(), None));
+                children.push(ctx.annotation(None, None, true));
             }
             if visible.top_space > 0.0 {
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
-            match runtime.diff_mode {
-                DiffMode::Inline => children.extend(
-                    model.inline_rows[visible.start..visible.end]
-                        .iter()
-                        .enumerate()
-                        .map(|(index, row)| {
-                            diff_row_block(
-                                inline_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                                rows.height(visible.start + index),
-                            )
-                        }),
-                ),
-                DiffMode::Split => children.extend(
-                    model.split_rows[visible.start..visible.end]
-                        .iter()
-                        .enumerate()
-                        .map(|(index, row)| {
-                            diff_row_block(
-                                split_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                                rows.height(visible.start + index),
-                            )
-                        }),
-                ),
-            };
+            for index in visible.start..visible.end {
+                let (old, new) = diff_row_lines(model, runtime.diff_mode, index);
+                let code = match runtime.diff_mode {
+                    DiffMode::Inline => inline_diff_row_with_review(
+                        &model.inline_rows[index],
+                        &model.syntax,
+                        gutter,
+                        code_width,
+                        horizontal,
+                        context.and_then(|ctx| ctx.line_action(old, new)),
+                    ),
+                    DiffMode::Split => split_diff_row_with_review(
+                        &model.split_rows[index],
+                        &model.syntax,
+                        gutter,
+                        code_width,
+                        horizontal,
+                        context.map(|ctx| (ctx.line_action(old, None), ctx.line_action(None, new))),
+                    ),
+                };
+                if let Some(ctx) =
+                    context.filter(|ctx| ctx.review.has_annotation(ctx.path, old, new, false))
+                {
+                    slots.push((children.len(), Some(index)));
+                    children.push(
+                        widget::column::with_children([code, ctx.annotation(old, new, false)])
+                            .spacing(0)
+                            .width(Length::Fill)
+                            .into(),
+                    );
+                } else {
+                    children.push(code);
+                }
+            }
             if visible.bottom_space > 0.0 {
                 children.push(
                     iced::widget::Space::new()
@@ -7187,11 +7344,29 @@ fn diff_model_view<'a>(
                     .height(crate::design::SCROLLBAR_GUTTER)
                     .into(),
             );
+            let column = widget::column::with_children(children)
+                .spacing(0)
+                .width(viewport_width)
+                .into();
+            let content = if let Some(ctx) = context {
+                Element::new(DiffAnnotationMeasure {
+                    content: column,
+                    identity: runtime.current_identity(card, PathBuf::from(ctx.path)),
+                    basis: runtime.diff_basis.clone(),
+                    mode: runtime.diff_mode,
+                    layout_revision: runtime.diff_layout_revision,
+                    review_revision: ctx.review.annotation_revision(),
+                    expected_leading: rows.leading_height(),
+                    expected: rows.annotations().clone(),
+                    retained,
+                    slots,
+                    pending_anchor: runtime.pending_diff_anchor.is_some(),
+                })
+            } else {
+                column
+            };
             let canvas = Element::new(DiffHorizontalContent {
-                content: widget::column::with_children(children)
-                    .spacing(0)
-                    .width(viewport_width)
-                    .into(),
+                content,
                 width: Length::Fixed(size.width + overflow),
                 content_width: viewport_width,
                 offset: -horizontal,
@@ -7223,16 +7398,80 @@ fn diff_model_view<'a>(
     rows
 }
 
-/// Review integration replaces the additional space with its measured thread
-/// widgets. Ordinary rows keep their original tree and fixed code-line height.
-fn diff_row_block<'a>(
-    row: Element<'a, RepositoryAction>,
-    height: f32,
-) -> Element<'a, RepositoryAction> {
-    if height <= DIFF_ROW_HEIGHT {
-        row
+#[derive(Clone, Copy)]
+struct DiffReviewContext<'a> {
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: &'a crate::pull_request_review::State,
+    path: &'a str,
+}
+
+impl<'a> DiffReviewContext<'a> {
+    fn annotation(
+        self,
+        old: Option<u32>,
+        new: Option<u32>,
+        leading: bool,
+    ) -> Element<'a, RepositoryAction> {
+        self.review
+            .annotation(self.path, old, new, leading)
+            .map(move |action| RepositoryAction::Review {
+                card: self.card,
+                action,
+            })
+    }
+
+    fn line_action(self, old: Option<u32>, new: Option<u32>) -> Option<RepositoryAction> {
+        use crate::github::ReviewDiffSide;
+        let (side, line) = if let Some(line) = new {
+            (ReviewDiffSide::Right, line)
+        } else {
+            (ReviewDiffSide::Left, old?)
+        };
+        let anchor = crate::pull_request_review::discussion::Anchor {
+            path: self.path.to_owned(),
+            side,
+            start_line: u64::from(line),
+            line: u64::from(line),
+        };
+        Some(RepositoryAction::ReviewLine {
+            identity: self
+                .runtime
+                .current_identity(self.card, PathBuf::from(self.path)),
+            basis: self.runtime.diff_basis.clone(),
+            action: self.review.review_action(
+                crate::pull_request_review::discussion_ui::Action::Begin(anchor),
+            ),
+            extend: false,
+        })
+    }
+}
+
+fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u32>, Option<u32>) {
+    match mode {
+        DiffMode::Inline => model
+            .inline_rows
+            .get(index)
+            .map(|row| (row.old_line, row.new_line)),
+        DiffMode::Split => model
+            .split_rows
+            .get(index)
+            .map(|row| (row.old_line, row.new_line)),
+    }
+    .unwrap_or_default()
+}
+
+fn review_begin_anchor(
+    action: &mut crate::pull_request_review::Action,
+) -> Option<&mut crate::pull_request_review::discussion::Anchor> {
+    use crate::pull_request_review::{Action, discussion_ui};
+    let Action::Discussion(discussion_ui::Action::Fenced { action, .. }) = action else {
+        return None;
+    };
+    if let discussion_ui::Action::Begin(anchor) = action.as_mut() {
+        Some(anchor)
     } else {
-        widget::container(row).height(height).into()
+        None
     }
 }
 
@@ -7271,6 +7510,7 @@ impl DiffScrollGeometry {
     }
 }
 
+#[cfg(test)]
 fn inline_diff_row<'a>(
     row: &'a InlineDiffRow,
     syntax: &DiffSyntax,
@@ -7278,14 +7518,25 @@ fn inline_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
+    inline_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+}
+
+fn inline_diff_row_with_review<'a>(
+    row: &'a InlineDiffRow,
+    syntax: &DiffSyntax,
+    gutter: f32,
+    code_width: f32,
+    horizontal: f32,
+    action: Option<RepositoryAction>,
+) -> Element<'a, RepositoryAction> {
     let marker = match row.kind {
         DiffRowKind::Addition => "+",
         DiffRowKind::Deletion => "−",
-        DiffRowKind::Context | DiffRowKind::Modification => " ",
+        _ => " ",
     };
     diff_container(
         widget::row::with_children(vec![
-            diff_gutter(row.new_line.or(row.old_line), gutter),
+            diff_review_gutter(row.new_line.or(row.old_line), gutter, action),
             widget::text::body(marker)
                 .size(DIFF_FONT_SIZE)
                 .font(Font::MONOSPACE)
@@ -7311,6 +7562,7 @@ fn inline_diff_row<'a>(
     )
 }
 
+#[cfg(test)]
 fn split_diff_row<'a>(
     row: &'a SplitDiffRow,
     syntax: &DiffSyntax,
@@ -7318,6 +7570,18 @@ fn split_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
+    split_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+}
+
+fn split_diff_row_with_review<'a>(
+    row: &'a SplitDiffRow,
+    syntax: &DiffSyntax,
+    gutter: f32,
+    code_width: f32,
+    horizontal: f32,
+    actions: Option<(Option<RepositoryAction>, Option<RepositoryAction>)>,
+) -> Element<'a, RepositoryAction> {
+    let (old_action, new_action) = actions.unwrap_or_default();
     let old_kind = if row.kind != DiffRowKind::Context && row.old_text.is_some() {
         DiffRowKind::Deletion
     } else {
@@ -7338,6 +7602,7 @@ fn split_diff_row<'a>(
             gutter,
             code_width,
             horizontal,
+            old_action,
         ),
         widget::container(iced::widget::Space::new())
             .width(DIFF_SPLIT_DIVIDER)
@@ -7360,6 +7625,7 @@ fn split_diff_row<'a>(
             gutter,
             code_width,
             horizontal,
+            new_action,
         ),
     ])
     .spacing(0)
@@ -7376,16 +7642,38 @@ fn diff_half<'a>(
     gutter: f32,
     code_width: f32,
     horizontal: f32,
+    action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
     diff_container(
         widget::row::with_children(vec![
-            diff_gutter(lines.0.or(lines.1), gutter),
+            diff_review_gutter(lines.0.or(lines.1), gutter, action),
             diff_text(text, changed, syntax, kind, code_width, horizontal, lines),
         ])
         .align_y(Alignment::Center),
         kind,
         Length::FillPortion(1),
     )
+}
+
+fn diff_review_gutter(
+    line: Option<u32>,
+    width: f32,
+    action: Option<RepositoryAction>,
+) -> Element<'static, RepositoryAction> {
+    let label = diff_gutter(line, width);
+    match action {
+        Some(action) => crate::interaction::tooltip(
+            widget::button::custom(label)
+                .on_press(action)
+                .padding(0)
+                .width(width)
+                .height(DIFF_ROW_HEIGHT - 6.0)
+                .class(cosmic::theme::Button::Text),
+            "Comment on this line · Shift-click to select a range",
+        )
+        .into(),
+        None => label,
+    }
 }
 
 fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryAction> {
@@ -7595,6 +7883,12 @@ struct DiffScrollObserver<'a> {
 }
 
 impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObserver<'_> {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<iced::keyboard::Modifiers>()
+    }
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(iced::keyboard::Modifiers::default())
+    }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -7636,6 +7930,17 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObs
         shell: &mut Shell<'_, RepositoryAction>,
         viewport: &iced::Rectangle,
     ) {
+        let modifiers = tree.state.downcast_mut::<iced::keyboard::Modifiers>();
+        match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(value)) => {
+                *modifiers = *value
+            }
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                *modifiers = iced::keyboard::Modifiers::default()
+            }
+            _ => {}
+        }
+        let extend = modifiers.shift();
         let user_initiated = matches!(
             event,
             iced::Event::Mouse(_) | iced::Event::Touch(_) | iced::Event::Keyboard(_)
@@ -7663,8 +7968,179 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObs
             {
                 *tagged = user_initiated;
             }
+            if let RepositoryAction::ReviewLine { extend: tagged, .. } = &mut message {
+                *tagged = extend;
+            }
             message
         });
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: iced::mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+}
+
+/// Measures the actual natural-height column after layout. Every child remains
+/// part of the ordinary widget tree, including focus, overlays and accessibility.
+struct DiffAnnotationMeasure<'a> {
+    content: Element<'a, RepositoryAction>,
+    identity: AsyncIdentity,
+    basis: DiffBasis,
+    mode: DiffMode,
+    layout_revision: u64,
+    review_revision: (u64, u64),
+    expected_leading: f32,
+    expected: BTreeMap<usize, f32>,
+    retained: BTreeMap<usize, f32>,
+    slots: Vec<(usize, Option<usize>)>,
+    pending_anchor: bool,
+}
+
+impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffAnnotationMeasure<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> iced::Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, RepositoryAction>,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if matches!(
+            event,
+            iced::Event::Window(iced::window::Event::RedrawRequested(_))
+        ) {
+            let mut rows = self.retained.clone();
+            let mut leading = 0.0;
+            for (child, (_, row)) in layout.children().enumerate().filter_map(|(index, child)| {
+                self.slots
+                    .iter()
+                    .find(|(slot, _)| *slot == index)
+                    .map(|slot| (child, slot))
+            }) {
+                let height = child.bounds().height;
+                match row {
+                    Some(row) => {
+                        rows.insert(*row, (height - DIFF_ROW_HEIGHT).max(0.0));
+                    }
+                    None => leading = height,
+                }
+            }
+            rows.retain(|_, height| height.is_finite() && *height > 0.0);
+            if leading != self.expected_leading || rows != self.expected || self.pending_anchor {
+                shell.publish(RepositoryAction::DiffAnnotations {
+                    identity: self.identity.clone(),
+                    basis: self.basis.clone(),
+                    mode: self.mode,
+                    layout_revision: self.layout_revision,
+                    review_revision: self.review_revision,
+                    leading,
+                    rows: rows.into_iter().collect(),
+                });
+            }
+        }
     }
     fn draw(
         &self,
@@ -7836,6 +8312,40 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
         }
     }
 
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.children().next().expect("diff content"),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.children().next().expect("diff content"),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
     fn a11y_nodes(
         &self,
         layout: Layout<'_>,
@@ -9083,7 +9593,7 @@ mod tests {
         // coordinates are derived from.
         let surface = iced::Size::new(420.0, 240.0);
         let diff = laid_out(
-            diff_model_view(card, &runtime, model, "HEAD", "Worktree"),
+            diff_model_view(card, &runtime, model, "HEAD", "Worktree", None),
             &renderer,
             surface,
         );
@@ -9336,11 +9846,11 @@ mod tests {
                 "the fixture has to delete lines for this to mean anything"
             );
             let rendered = laid_out(
-                diff_model_view(card, &runtime, model, "Index", "Working buffer"),
+                diff_model_view(card, &runtime, model, "Index", "Working buffer", None),
                 &renderer,
                 size,
             );
-            let mounted = laid_out(diff_surface(card, &runtime), &renderer, size);
+            let mounted = laid_out(diff_surface(card, &runtime, None), &renderer, size);
             let rendered = diff_rows(Layout::new(&rendered));
             assert!(
                 rendered >= model.row_count(mode),
@@ -10711,6 +11221,175 @@ mod tests {
     }
 
     #[test]
+    fn annotation_measurement_uses_natural_layout_and_preserves_child_interaction() {
+        let renderer = headless_renderer();
+        let card = CardId::new();
+        let (_, identity) = diff_runtime(card);
+        let content = widget::column::with_children([
+            iced::widget::Space::new().height(42.0).into(),
+            widget::column::with_children([
+                iced::widget::Space::new().height(DIFF_ROW_HEIGHT).into(),
+                widget::button::standard("Reply to review")
+                    .height(64.0)
+                    .on_press(RepositoryAction::NextChange { card })
+                    .into(),
+            ])
+            .spacing(0)
+            .into(),
+        ])
+        .spacing(0)
+        .width(300.0)
+        .into();
+        let mut element = Element::new(DiffAnnotationMeasure {
+            content,
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            layout_revision: 4,
+            review_revision: (2, 3),
+            expected_leading: 0.0,
+            expected: BTreeMap::from([(8, 99.0), (20, 80.0)]),
+            // Row 8's removed discussion is deliberately absent. An offscreen
+            // discussion retains its last measured height until it mounts.
+            retained: BTreeMap::from([(20, 80.0)]),
+            slots: vec![(0, None), (1, Some(2))],
+            pending_anchor: false,
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = iced::Rectangle::with_size(iced::Size::new(300.0, 600.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        let mut messages = Vec::new();
+        let cursor = iced::mouse::Cursor::Available(iced::Point::new(40.0, 90.0));
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(&messages[..], [RepositoryAction::DiffAnnotations { leading, rows, review_revision: (2, 3), .. }] if *leading == 42.0 && rows == &[(2,64.0),(20,80.0)])
+        );
+        messages.clear();
+        for event in [
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        assert!(
+            matches!(&messages[..], [RepositoryAction::NextChange { card: pressed }] if *pressed == card)
+        );
+        let accessible = element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, cursor);
+        assert!(!accessible.root().is_empty() || !accessible.children().is_empty());
+    }
+
+    #[test]
+    fn annotation_measurements_reject_replaced_comparison_and_wrong_document() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        let content = || staged_text_diff(crate::diff_view::build_diff("old\n", "new\n"));
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+        let measurement = RepositoryAction::DiffAnnotations {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            layout_revision: runtime.diff_layout_revision,
+            review_revision: (0, 0),
+            leading: 40.0,
+            rows: vec![(0, 80.0)],
+        };
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+        drop(runtime.update(measurement));
+        assert_eq!(runtime.diff_rows().unwrap().leading_height(), 0.0);
+        let mut stale = identity.clone();
+        stale.path = "different.txt".into();
+        for (identity, expected_leading) in [(stale, 0.0), (identity, 40.0)] {
+            drop(runtime.update(RepositoryAction::DiffAnnotations {
+                identity,
+                basis: DiffBasis::IndexToWorktree,
+                mode: DiffMode::Inline,
+                layout_revision: runtime.diff_layout_revision,
+                review_revision: (0, 0),
+                leading: 40.0,
+                rows: vec![(0, 80.0)],
+            }));
+            assert_eq!(
+                runtime.diff_rows().unwrap().leading_height(),
+                expected_leading
+            );
+        }
+        assert_eq!(runtime.diff_rows().unwrap().leading_height(), 40.0);
+        assert_eq!(runtime.diff_rows().unwrap().height(0), 110.0);
+    }
+
+    #[test]
+    fn gutter_ranges_preserve_side_and_original_anchor_when_backtracking() {
+        use crate::github::ReviewDiffSide::{Left, Right};
+        use crate::pull_request_review::{Action, discussion::Anchor, discussion_ui};
+        use futures_util::StreamExt;
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        for (line, side, extend, expected) in [
+            (5, Right, false, (5, 5)),
+            (9, Right, true, (5, 9)),
+            (3, Right, true, (3, 5)),
+            (2, Left, true, (2, 2)),
+        ] {
+            let task = runtime.update(RepositoryAction::ReviewLine {
+                identity: identity.clone(),
+                basis: DiffBasis::IndexToWorktree,
+                extend,
+                action: Action::Discussion(discussion_ui::Action::Fenced {
+                    generation: 11,
+                    authority_revision: 7,
+                    action: Box::new(discussion_ui::Action::Begin(Anchor {
+                        path: "notes.txt".into(),
+                        side,
+                        start_line: line,
+                        line,
+                    })),
+                }),
+            });
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            let output = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.next())
+                .unwrap();
+            let iced::runtime::Action::Output(RepositoryAction::Review { mut action, .. }) = output
+            else {
+                panic!("review action");
+            };
+            let anchor = review_begin_anchor(&mut action).unwrap();
+            assert_eq!((anchor.start_line, anchor.line), expected);
+            assert_eq!(anchor.side, side);
+            assert!(matches!(
+                action,
+                Action::Discussion(discussion_ui::Action::Fenced { generation: 11, .. })
+            ));
+        }
+    }
+
+    #[test]
     fn measured_diff_blocks_preserve_anchor_and_change_navigation() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
@@ -10920,7 +11599,7 @@ mod tests {
                 offset,
                 height: 720.0,
             };
-            let element = diff_surface(card, &runtime);
+            let element = diff_surface(card, &runtime, None);
             assert!(widget_nodes(&element) < 1_500, "diff widget tree was eager");
         }
     }
@@ -12518,11 +13197,11 @@ mod tests {
             "no base may be guessed"
         );
         assert!(!context.can_retry_diff);
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
 
         // The same surface with nothing to offer still says what is wrong.
         runtime.basis_resolution = Some(BasisResolution::NeedsBase(Vec::new()));
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
         assert_eq!(
             runtime.inspector_context().diff_state,
             Some("Choose a base")
@@ -12818,7 +13497,7 @@ mod tests {
             runtime.diff_model().is_none(),
             "a conflict has no two-sided model"
         );
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
 
         for (new, expected) in [
             (DiffSide::Binary { bytes: 3 }, "Binary"),
@@ -12858,7 +13537,7 @@ mod tests {
             assert!(runtime.diff_model().is_none());
             // The surface renders the fact instead of panicking on a state
             // #45's reduced content type had no variant for.
-            let _ = diff_surface(card, &runtime);
+            let _ = diff_surface(card, &runtime, None);
         }
     }
 
