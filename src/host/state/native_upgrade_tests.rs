@@ -152,6 +152,18 @@ exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
         let socket = registry::socket(&registry::directory(Kind::Native).unwrap(), id);
         let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
         assert!(record.root.is_current());
+        for policy in [
+            crate::update::impact::Policy::WhenIdle,
+            crate::update::impact::Policy::Interrupt,
+        ] {
+            let preview = super::update::inspect(&host, policy, true).unwrap();
+            assert!(preview.ready(), "{preview:?}");
+            assert_eq!(preview.sessions.len(), 1);
+            assert_eq!(
+                preview.sessions[0].disposition,
+                crate::update::impact::Disposition::Continues
+            );
+        }
         let checkpoint_directory = root.join(if fail_final_save {
             "failed-checkpoint"
         } else {

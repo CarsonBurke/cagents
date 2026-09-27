@@ -243,6 +243,7 @@ done
         !before.state.is_terminal(),
         "agent_end is not correlated prompt completion"
     );
+    assert_upgrade_environment(&host, accepted.agent.id);
     std::fs::write(root.join("omp-release-result"), b"release").unwrap();
     let done = settled(&host, accepted.run.id);
     assert_eq!(done.state, State::Succeeded, "{done:?}");
@@ -270,7 +271,94 @@ done
     let arguments = std::fs::read_to_string(root.join("omp-arguments")).unwrap();
     assert!(arguments.contains("--model\nfixture/model\n"));
     assert!(arguments.contains("--approval-mode\nwrite\n"));
+    assert_upgrade_environment(&host, accepted.agent.id);
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+fn assert_upgrade_environment(host: &SharedHost, agent: AgentId) {
+    let session = registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let mut state = host.lock().unwrap();
+    let record = state.chats.get(&session).unwrap();
+    if record.session.launch.provider == Provider::Claude {
+        let project: String = record
+            .session
+            .launch
+            .recipe
+            .working_directory
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let directory = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".claude/projects")
+            .join(project);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!(
+                "{}.jsonl",
+                record.handle.confirmed_session_id().unwrap()
+            )),
+            b"",
+        )
+        .unwrap();
+    }
+    let execution = record.handle.execution_environment();
+    assert!(
+        execution
+            .0
+            .contains_key(crate::agent_execution::AUTHORITY_ENV)
+    );
+    super::super::chat::validate_upgrade_environment(&record.session.launch, false, &record.handle)
+        .expect("daemon-owned authority and CLI PATH must not block recovery");
+    for name in ["PATH", "ANTHROPIC_API_KEY"] {
+        let mut changed = record.session.launch.clone();
+        changed
+            .recipe
+            .environment
+            .insert(name.into(), "different-selected-value".into());
+        assert!(
+            super::super::chat::validate_upgrade_environment(&changed, false, &record.handle)
+                .is_err(),
+            "selected {name} must still be compared"
+        );
+    }
+    let (busy, _) = record.handle.update_activity();
+    use crate::update::impact::{Disposition, Policy};
+    for (policy, expected) in [
+        (
+            Policy::WhenIdle,
+            if busy {
+                Disposition::WaitsForIdle
+            } else {
+                Disposition::Resumes
+            },
+        ),
+        (
+            Policy::Interrupt,
+            if busy {
+                Disposition::Interrupted
+            } else {
+                Disposition::Resumes
+            },
+        ),
+    ] {
+        let impact = state.upgrade_impact(policy).unwrap();
+        let impact = impact
+            .sessions
+            .iter()
+            .find(|impact| impact.id == session)
+            .unwrap();
+        assert_eq!(impact.disposition, expected, "{}", impact.reason);
+    }
 }
 
 #[test]
@@ -775,6 +863,7 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     let result = settled(&host, accepted.run.id);
     assert_eq!(result.state, State::Succeeded, "{result:?}");
     assert_eq!(result.result.text, "SERVICE_RESULT_1");
+    assert_upgrade_environment(&host, accepted.agent.id);
     assert!(result.provider_key.is_some());
     let retry = submit(&host, &Authority::default(), request.clone()).unwrap();
     assert!(!retry.created);

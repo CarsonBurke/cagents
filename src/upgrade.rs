@@ -397,9 +397,9 @@ pub(crate) mod handoff {
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
 
-    /// Checkpoints that carry terminals are version 2; any other is still
-    /// written as version 1, which a daemon from before carrying can replay.
-    const VERSION: u16 = 3;
+    /// Legacy relaunches use 1, carried terminals 2, retained native owners 3,
+    /// and consent that forbids carried recipe fallback 4.
+    const VERSION: u16 = 4;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_TERMINALS: usize = 1024;
@@ -478,6 +478,10 @@ pub(crate) mod handoff {
         pub terminals: Vec<Terminal>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub carried: Vec<Carried>,
+        /// These carried processes were promised continuity, not permission to
+        /// execute their recipes if authenticated adoption becomes unavailable.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub preserve_carried: bool,
         pub chats: Vec<Chat>,
     }
 
@@ -495,13 +499,17 @@ pub(crate) mod handoff {
                 phase: Phase::Prepared,
                 terminals,
                 carried,
+                preserve_carried: false,
                 chats,
             }
         }
 
         /// The oldest version that can hold this checkpoint.
         fn format(&self) -> u16 {
-            if self.chats.iter().any(|chat| {
+            if self.preserve_carried {
+                // Older readers may relaunch a missing carried holder.
+                4
+            } else if self.chats.iter().any(|chat| {
                 matches!(
                     chat.source.native_continuity,
                     chat::NativeContinuity::Durable { .. }
@@ -687,8 +695,21 @@ pub(crate) mod handoff {
                         source_proof(previous.source.proof.clone(), &mut proofs)?;
                     }
                     validate_chat_source(&previous.source, &previous.launch)?;
-                    let expected_launch = if durable { &chat.launch } else { &next.launch };
-                    if previous.source.id != chat.source.id || &previous.launch != expected_launch {
+                    let follows = if durable {
+                        previous.launch == chat.launch
+                    } else {
+                        // Restart argv is normalized, while the successor's
+                        // issued descriptor retains the immutable source recipe.
+                        // Bind both to the confirmed identity before comparing
+                        // the complete executable, argv, cwd and environment.
+                        previous.launch.provider == next.launch.provider
+                            && previous.launch.session_id == next.launch.session_id
+                            && previous
+                                .launch
+                                .terminal_recipe()
+                                .is_some_and(|recipe| Some(recipe) == next.launch.terminal_recipe())
+                    };
+                    if previous.source.id != chat.source.id || !follows {
                         return Err("Upgrade native lineage is inconsistent".into());
                     }
                 }
@@ -974,7 +995,14 @@ pub(crate) mod handoff {
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_ok());
-            save(br#"{"version":4,"terminals":[],"chats":[]}"#);
+            save(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION + 1,
+                    "terminals": [],
+                    "chats": [],
+                }))
+                .unwrap(),
+            );
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());

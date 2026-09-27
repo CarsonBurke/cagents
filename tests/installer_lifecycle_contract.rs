@@ -101,6 +101,24 @@ fn release_fixture(
     restart: Option<&str>,
     download: Option<&str>,
 ) {
+    coordinated_release_fixture(
+        compatible,
+        terminals,
+        publish_failure,
+        restart,
+        download,
+        "installed",
+    );
+}
+
+fn coordinated_release_fixture(
+    compatible: bool,
+    terminals: usize,
+    publish_failure: Option<&str>,
+    restart: Option<&str>,
+    download: Option<&str>,
+    coordinator: &str,
+) {
     let home = tempfile::tempdir().unwrap();
     let data = home.path().join("data with spaces");
     let prefix = data.join("cagents-install");
@@ -115,6 +133,10 @@ fn release_fixture(
     let status = r#"#!/bin/sh
 CLI=old
 case "$*" in
+  'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
+    case "$FIXTURE_COORDINATOR:$CLI" in installed:new|candidate:old|none:*) exit 64 ;; esac
+    exec "$FIXTURE_REAL_CLI" "$@"
+    ;;
   '--json daemon status')
     [ "$#" -eq 3 ] || exit 98
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 9; fi
@@ -128,7 +150,11 @@ case "$*" in
     elif [ "$running" = false ] && [ -e "$FIXTURE_CHECKPOINT" ]; then
       printf '%s:stopped\n' "$CLI" >> "$FIXTURE_ACTIONS"
     fi
-    printf '{"ok":true,"command":"daemon.status","data":{"running":%s}}\n' "$running"
+    if [ "$FIXTURE_COORDINATOR:$CLI" = starting:new ]; then
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":null}}\n' "$running"
+    else
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture"}}\n' "$running"
+    fi
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -240,7 +266,9 @@ esac
     fs::create_dir(&tools).unwrap();
     // Fail after current switches, exercising the real rollback trap.
     if let Some(failure) = publish_failure {
-        let fail = if failure == "signal" {
+        let fail = if failure == "outer-signal" {
+            "kill -TERM \"$(cat \"$FIXTURE_OUTER_PID_FILE\")\"; sleep 1; exit 8"
+        } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
             "exit 8"
@@ -326,6 +354,9 @@ esac
     let checkpoint = home.path().join("checkpoint");
     let restored = home.path().join("restored");
     fs::write(&running, "old\n").unwrap();
+    let runtime = home.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = Command::new("sh");
     command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
     if restart.is_some() {
@@ -359,6 +390,11 @@ esac
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+        .env("FIXTURE_COORDINATOR", coordinator)
+        .env("FIXTURE_OUTER_PID_FILE", home.path().join("outer-pid"))
         .env(
             "CAGENTS_REPOSITORY",
             if download == Some("public") {
@@ -381,8 +417,25 @@ esac
         .env("FIXTURE_RESTART", restart.unwrap_or_default())
         .env("FIXTURE_TERMINALS", terminals.to_string())
         .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    fs::write(home.path().join("outer-pid"), output.id().to_string()).unwrap();
+    let output = output.wait_with_output().unwrap();
+    if coordinator == "none" {
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("install a current release first")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(!prefix.join("versions/9.9.9").exists());
+        assert!(fs::read_to_string(actions).unwrap_or_default().is_empty());
+        return;
+    }
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
             Some("success" | "relaunch" | "decline" | "decline-legacy") => {
@@ -390,7 +443,7 @@ esac
             }
             Some("empty") => terminals == 0 && publish_failure.is_none(),
             Some(_) => false,
-            None => (compatible || terminals == 0) && publish_failure.is_none(),
+            None => publish_failure.is_none(),
         };
     assert_eq!(
         output.status.success(),
@@ -412,6 +465,15 @@ esac
         })
     );
     let actions = fs::read_to_string(actions).unwrap_or_default();
+    if coordinator == "starting" {
+        assert!(
+            actions.is_empty(),
+            "an unconfirmed startup lock must not authorize daemon replacement"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running sessions were preserved")
+        );
+    }
     assert!(!actions.contains("UNSAFE"), "{actions}");
     if restart == Some("empty-start-unknown") {
         assert_eq!(actions, "require-empty\nnew:start\n");
@@ -468,26 +530,20 @@ esac
         assert!(!actions.contains("prepare"), "{actions}");
         assert!(!checkpoint.exists());
     } else {
-        assert_eq!(
-            actions
-                .lines()
-                .filter(|line| *line == "require-empty")
-                .count(),
-            1
+        assert!(
+            actions.is_empty(),
+            "deferred updates must not stop/start/checkpoint: {actions}"
         );
         assert!(!checkpoint.exists());
-        assert_eq!(
-            actions
-                .lines()
-                .filter(|line| line.ends_with(":start"))
-                .count(),
-            usize::from(terminals == 0),
-            "An empty daemon may be restarted once, never replayed: {actions}"
-        );
+        if success {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running sessions were preserved")
+            );
+        }
     }
     assert_eq!(
         fs::read_to_string(&running).unwrap(),
-        if retained_candidate && (restart.is_some() || !compatible) {
+        if retained_candidate && restart.is_some() {
             "new\n"
         } else {
             "old\n"
@@ -514,6 +570,26 @@ esac
 }
 
 #[test]
+fn candidate_coordinator_supports_upgrading_an_older_installed_cli() {
+    coordinated_release_fixture(true, 2, None, None, None, "candidate");
+}
+
+#[test]
+fn candidate_startup_lock_without_handshake_defers_to_the_verified_owner() {
+    coordinated_release_fixture(true, 2, None, None, None, "starting");
+}
+
+#[test]
+fn unsupported_coordinators_refuse_before_mutating_the_installation() {
+    coordinated_release_fixture(true, 2, None, None, None, "none");
+}
+
+#[test]
+fn interrupting_the_outer_installer_waits_for_inner_rollback() {
+    coordinated_release_fixture(true, 2, Some("outer-signal"), None, None, "installed");
+}
+
+#[test]
 fn an_unconfirmed_update_cannot_interrupt_sessions_created_after_preflight() {
     for count in [0, 1, 7] {
         upgrade_fixture(true, count, None, Some("empty"));
@@ -530,7 +606,7 @@ fn compatible_switch_preserves_terminals_without_any_shutdown_request() {
 }
 
 #[test]
-fn incompatible_switch_only_stops_an_atomically_empty_daemon() {
+fn incompatible_install_defers_daemon_replacement_without_stopping_sessions() {
     for count in [0, 1, 7] {
         upgrade_fixture(false, count, None, None);
     }

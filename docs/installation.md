@@ -215,19 +215,20 @@ upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.
 
 Full self-managed (`install.sh`) installations, including packages built
 locally with a `+local` version, check authenticated GitHub releases at startup
-and every six hours. When a newer stable version is available, an update icon
-appears in the top-right application controls; its tooltip names the version.
+and every six hours. A newer stable version appears in a notice above the
+workspace. Dismissing it with × retains the update in the notices popover.
 Build metadata identifies the installed binaries but does not make a published
 release with the same base version count as an upgrade.
 
-Clicking it checks the impact first. If the daemon has live sessions, one
-confirmation explains that agent conversations resume where supported, shells
-reopen in their working directories, and running shell jobs stop. Without that
-confirmation the installer can only replace an empty daemon, even if a session
-starts during the download. A UI-only replacement offers a reopen button and
-keeps the daemon and terminals running. Source, browserless, and OS-package
-installations keep their own update method and are never replaced by the
-application.
+Clicking it stages verified bytes, probes the candidate's protocol, and presents
+its actual session impact before installation. Held terminals and supported
+native Codex servers continue in the same processes. Other native chats wait
+for idle, or you can explicitly choose interruption and exact resumption.
+Changed session ownership or impact requires another confirmation. A compatible
+replacement reopens windows while keeping the daemon and sessions alive.
+Newer matched sets already installed under the same managed installation,
+including local builds, use this same flow. Source trees and OS packages retain
+their own update method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
 downloaded bytes, and asks every open window to save. Dirty editors, unsent
@@ -245,14 +246,20 @@ is still available; the diagnostic files are kept.
 
 Rerun the installer for a compatible update: the existing daemon and its live
 PTYs keep running. By default the installer verifies the staged CLI against the
-running daemon before switching `current`, and an incompatible update can stop
-only an empty daemon.
+running daemon before switching `current`. An incompatible build is installed
+without replacing the running daemon; saved windows reopen with that daemon's
+matching UI. Finish the staged update in the application or run
+`cagents daemon upgrade`. This command displays the same impact, asks for
+approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
+additionally permits active native turns to stop.
 
-To replace the daemon as well, close the application windows and append
-`--restart-daemon` to the installer invocation. This checkpoints supported
-sessions and resumes supported shells and exact agent conversations in **new
-processes**; it does not preserve the old PTYs. It requires checkpoint support
-in the currently installed CLI and daemon.
+For an explicitly authorized direct daemon replacement, append
+`--restart-daemon` to the installer invocation. The coordinator saves and closes
+application windows before checkpointing. Supported holders retain live
+processes; other recoverable sessions resume in new processes. This legacy
+direct path authorizes interruption and requires checkpoint support in the
+running daemon's own CLI. Prefer the application or `daemon upgrade` for a
+session-by-session preview and waiting for native turns.
 
 | Option | Effect |
 | --- | --- |

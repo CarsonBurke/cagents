@@ -8872,12 +8872,15 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
+        self.update_ui.confirmation.is_some() || self.other_modal_is_open()
+    }
+
+    fn other_modal_is_open(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
         }
-        self.update_ui.confirmation.is_some()
-            || self.worktree_dialog.is_some()
+        self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
             || self.terminal_close_dialog_visible()
@@ -10415,6 +10418,8 @@ impl Application for Cagents {
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
+            app.update_update_ui(update_ui::Action::LoadDismissal),
+            app.update_update_ui(update_ui::Action::Poll),
             app.load_accounts(),
         ];
         // Unused default chats are never saved. Recreate the active scope's
@@ -11794,6 +11799,7 @@ impl Application for Cagents {
                         return Task::none();
                     }
                     // The update restarts every window from what is on disk.
+                    self.update_ui.confirmation = None;
                     let drafts = self.flush_settings_drafts();
                     self.persist();
                     let save = self.capture_workspace_save();
@@ -13209,27 +13215,8 @@ impl Application for Cagents {
         if let Some(dialog) = self.browser_import_dialog() {
             return Some(dialog);
         }
-        if let Some(count) = self.update_ui.confirmation {
-            return Some(dialog_ui::overlay(dialog_ui::surface(
-                widget::column::with_children(vec![
-                    widget::text::title3("Update and reopen cagents?").into(),
-                    notice_body(format!(
-                        "The terminal service will restart, interrupting {count} live sessions. Agent conversations resume where supported{}; shells reopen in their working directories. Running shell jobs will stop. Your windows and tabs will reopen automatically.",
-                        if self.settings.relaunch_agents_on_upgrade {
-                            ", and agents that cannot resume exactly reopen in their resume picker"
-                        } else {
-                            ""
-                        }
-                    )),
-                    widget::row::with_children(vec![
-                        iced::widget::Space::new().width(Length::Fill).into(),
-                        widget::button::standard("Cancel").id(widget::Id::new("update.cancel"))
-                            .on_press(Message::UpdateUi(update_ui::Action::CancelApply)).into(),
-                        widget::button::suggested("Update and reopen")
-                            .on_press(Message::UpdateUi(update_ui::Action::ConfirmApply)).into(),
-                    ]).spacing(8).into(),
-                ]).spacing(16), 520.0,
-            ), Some(Message::UpdateUi(update_ui::Action::CancelApply)), 1.0));
+        if let Some(dialog) = self.update_dialog() {
+            return Some(dialog);
         }
         if let Some(intent) = &self.terminal_close
             && self.terminal_close_dialog_visible()
@@ -13820,10 +13807,15 @@ impl Application for Cagents {
         let bar = self
             .status_bar()
             .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
-        let surface: Element<'_, Message> = widget::column::with_children(vec![surface, bar])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let update = widget::container(
+            self.update_notice(false)
+                .unwrap_or_else(|| widget::Space::new().height(Length::Shrink).into()),
+        );
+        let surface: Element<'_, Message> =
+            widget::column::with_children(vec![update.into(), surface, bar])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
         let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),

@@ -322,11 +322,18 @@ impl IdentityReplacement {
 enum ConversionCheckpoint {
     Snapshot(Arc<WorkspaceState>),
     IdentityReplacement(IdentityReplacement),
-    AccountRecovery(AccountRecoveryWrite),
+    ChatRecovery(ChatRecoveryWrite),
 }
 
 #[derive(Debug)]
-struct AccountRecoveryWrite {
+enum ChatRecoveryKind {
+    Account,
+    Upgrade,
+}
+
+#[derive(Debug)]
+struct ChatRecoveryWrite {
+    kind: ChatRecoveryKind,
     card: CardId,
     source: crate::chat::Session,
     replacement: crate::chat::Session,
@@ -616,6 +623,28 @@ impl SessionRuntime {
         replacement: crate::chat::Session,
     ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
     {
+        self.rebind_chat(ChatRecoveryKind::Account, card_id, source, replacement)
+    }
+
+    /// Commit authenticated daemon-upgrade lineage before activating the chat.
+    pub fn rebind_chat_upgrade(
+        &self,
+        card_id: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        self.rebind_chat(ChatRecoveryKind::Upgrade, card_id, source, replacement)
+    }
+
+    fn rebind_chat(
+        &self,
+        kind: ChatRecoveryKind,
+        card_id: CardId,
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let (lock, changed) = &*self.queue;
         let mut queue = lock.lock().map_err(|_| "Session writer is unavailable")?;
@@ -635,14 +664,13 @@ impl SessionRuntime {
         }
         queue
             .conversions
-            .push_back(ConversionCheckpoint::AccountRecovery(
-                AccountRecoveryWrite {
-                    card: card_id,
-                    source,
-                    replacement,
-                    reply,
-                },
-            ));
+            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
+                kind,
+                card: card_id,
+                source,
+                replacement,
+                reply,
+            }));
         changed.notify_one();
         Ok(receiver)
     }
@@ -850,10 +878,10 @@ struct PendingWrites {
     project_generations: HashMap<ProjectId, u64>,
     worktree_generations: HashMap<WorktreeId, u64>,
     quarantine: Quarantine,
-    /// Successful, explicit account transitions translate only old snapshots
+    /// Successful, explicit chat transitions translate only old snapshots
     /// queued while the UI awaited acknowledgment. Other card fields, including
     /// tombstones, remain exactly as submitted.
-    account_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
+    chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
 }
 
 /// When storage first refused a subject, and why it refuses it now.
@@ -1150,6 +1178,16 @@ impl Quarantine {
 }
 
 trait SessionStore {
+    fn rebind_chat_upgrade(
+        &self,
+        _card_id: CardId,
+        _source: &crate::chat::Session,
+        _replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "This store does not support upgrade recovery".into(),
+        ))
+    }
     fn rebind_chat_account(
         &self,
         _card_id: CardId,
@@ -1192,6 +1230,14 @@ trait SessionStore {
 }
 
 impl SessionStore for StateStore {
+    fn rebind_chat_upgrade(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_upgrade(self, card_id, source, replacement)
+    }
     fn rebind_chat_account(
         &self,
         card_id: CardId,
@@ -1256,6 +1302,14 @@ impl SessionStore for StateStore {
 }
 
 impl SessionStore for Arc<StateStore> {
+    fn rebind_chat_upgrade(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::rebind_chat_upgrade(self, card_id, source, replacement)
+    }
     fn rebind_chat_account(
         &self,
         card_id: CardId,
@@ -1338,7 +1392,7 @@ impl PendingWrites {
             project_generations,
             worktree_generations,
             quarantine: Quarantine::default(),
-            account_rebindings: HashMap::new(),
+            chat_rebindings: HashMap::new(),
         }
     }
 
@@ -1418,7 +1472,7 @@ impl PendingWrites {
             .find_map(|checkpoint| match checkpoint {
                 ConversionCheckpoint::Snapshot(snapshot) => Some(snapshot.id),
                 ConversionCheckpoint::IdentityReplacement(_)
-                | ConversionCheckpoint::AccountRecovery(_) => None,
+                | ConversionCheckpoint::ChatRecovery(_) => None,
             })
             .or_else(|| self.workspace.as_ref().map(|snapshot| snapshot.id))
     }
@@ -1513,17 +1567,24 @@ impl PendingWrites {
                 return Ok(());
             };
             match checkpoint {
-                ConversionCheckpoint::AccountRecovery(recovery) => {
-                    let result = store.rebind_chat_account(
-                        recovery.card,
-                        &recovery.source,
-                        &recovery.replacement,
-                    );
+                ConversionCheckpoint::ChatRecovery(recovery) => {
+                    let result = match recovery.kind {
+                        ChatRecoveryKind::Account => store.rebind_chat_account(
+                            recovery.card,
+                            &recovery.source,
+                            &recovery.replacement,
+                        ),
+                        ChatRecoveryKind::Upgrade => store.rebind_chat_upgrade(
+                            recovery.card,
+                            &recovery.source,
+                            &recovery.replacement,
+                        ),
+                    };
                     if result.is_ok() {
-                        self.account_rebindings
+                        self.chat_rebindings
                             .insert(recovery.card, (recovery.source, recovery.replacement));
                     }
-                    // An explicit account change is one-shot. In particular an
+                    // An explicit identity change is one-shot. In particular an
                     // I/O failure must not silently commit after the UI has
                     // refused activation and retired its candidate.
                     let _ = recovery
@@ -1546,17 +1607,17 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::Snapshot(mut snapshot) => {
                     let needs_translation = |state: &crate::model::CardState| {
-                        self.account_rebindings.get(&state.id).is_some_and(|(source, _)| {
+                        self.chat_rebindings.get(&state.id).is_some_and(|(source, _)| {
                             matches!(&state.kind, CardKind::Chat(session) if session == source)
                         })
                     };
-                    if !self.account_rebindings.is_empty()
+                    if !self.chat_rebindings.is_empty()
                         && snapshot.cards.iter().any(needs_translation)
                     {
                         for state in &mut Arc::make_mut(&mut snapshot).cards {
                             if needs_translation(state) {
                                 state.kind =
-                                    CardKind::Chat(self.account_rebindings[&state.id].1.clone());
+                                    CardKind::Chat(self.chat_rebindings[&state.id].1.clone());
                             }
                         }
                     }
@@ -2303,6 +2364,15 @@ mod tests {
     }
 
     impl SessionStore for FakeStore {
+        fn rebind_chat_upgrade(
+            &self,
+            _card_id: CardId,
+            _source: &crate::chat::Session,
+            _replacement: &crate::chat::Session,
+        ) -> Result<(), StoreError> {
+            self.write()
+        }
+
         fn rebind_chat_account(
             &self,
             _card_id: CardId,
@@ -3692,59 +3762,120 @@ mod tests {
     }
 
     #[test]
-    fn account_recovery_io_failure_is_acknowledged_without_a_later_retry() {
-        let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+    fn chat_recovery_io_failure_is_acknowledged_without_a_later_retry() {
+        for kind in [ChatRecoveryKind::Account, ChatRecoveryKind::Upgrade] {
+            let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                proof: None,
+                terminal: None,
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    session_id: Some("saved-conversation".into()),
+                    recipe: LaunchRecipe {
+                        program: "codex".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/project".into(),
+                        environment: BTreeMap::from([("CODEX_HOME".into(), "/removed".into())]),
+                        unset_environment: Default::default(),
+                    },
+                },
+            };
+            let mut replacement = source.clone();
+            replacement.id = TerminalId::new();
+            replacement
+                .launch
+                .recipe
+                .environment
+                .insert("CODEX_HOME".into(), "/selected".into());
+            let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+            let mut writes = empty_writes();
+            writes
+                .conversions
+                .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
+                    kind,
+                    card: CardId::new(),
+                    source,
+                    replacement,
+                    reply,
+                }));
+            assert!(
+                writes.flush(&store).is_empty(),
+                "failure belongs to the explicit request"
+            );
+            assert!(receipt.recv().unwrap().is_err());
+            assert!(writes.is_settled());
+            writes.rearm_quarantine();
+            assert!(writes.flush(&store).is_empty());
+            assert_eq!(
+                store.attempts.load(Ordering::Relaxed),
+                1,
+                "a rejected candidate must never commit later"
+            );
+            assert!(writes.chat_rebindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn upgrade_recovery_translates_queued_source_snapshots_before_the_next_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("session.db"), BootId::new("boot")).unwrap();
+        let proof = |name| crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(name),
+            boot_id: BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new(name),
+        };
         let source = crate::chat::Session {
             id: TerminalId::new(),
-            proof: None,
+            proof: Some(proof("old")),
             terminal: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
-                provider: crate::agent::Provider::Codex,
-                session_id: Some("saved-conversation".into()),
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
                 recipe: LaunchRecipe {
-                    program: "codex".into(),
+                    program: "claude".into(),
                     arguments: Vec::new(),
                     working_directory: "/project".into(),
-                    environment: BTreeMap::from([("CODEX_HOME".into(), "/removed".into())]),
+                    environment: BTreeMap::new(),
                     unset_environment: Default::default(),
                 },
             },
         };
         let mut replacement = source.clone();
-        replacement.id = TerminalId::new();
-        replacement
-            .launch
-            .recipe
-            .environment
-            .insert("CODEX_HOME".into(), "/selected".into());
-        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
+        replacement.proof = Some(proof("new"));
+        replacement.launch.session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        let mut snapshot = workspace();
+        let card = snapshot.cards[0].id;
+        snapshot.cards[0].kind = CardKind::Chat(source.clone());
         let mut writes = empty_writes();
+        writes.workspace = Some(Arc::new(snapshot.clone()));
+        assert!(writes.flush(&store).is_empty());
+
+        let (reply, receipt) = std::sync::mpsc::sync_channel(1);
         writes
             .conversions
-            .push_back(ConversionCheckpoint::AccountRecovery(
-                AccountRecoveryWrite {
-                    card: CardId::new(),
-                    source,
-                    replacement,
-                    reply,
-                },
-            ));
-        assert!(
-            writes.flush(&store).is_empty(),
-            "failure belongs to the explicit request"
-        );
-        assert!(receipt.recv().unwrap().is_err());
-        assert!(writes.is_settled());
-        writes.rearm_quarantine();
+            .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
+                kind: ChatRecoveryKind::Upgrade,
+                card,
+                source,
+                replacement: replacement.clone(),
+                reply,
+            }));
+        // An autosave produced while Ready awaits the receipt still carries
+        // the old descriptor. It must not undo the authenticated handoff.
+        snapshot.cards[0].title = "Saved during recovery".into();
+        writes.workspace = Some(Arc::new(snapshot));
         assert!(writes.flush(&store).is_empty());
-        assert_eq!(
-            store.attempts.load(Ordering::Relaxed),
-            1,
-            "a rejected candidate must never commit later"
-        );
-        assert!(writes.account_rebindings.is_empty());
+        receipt.recv().unwrap().unwrap();
+        let saved = store.load_card(card, None).unwrap().unwrap();
+        assert_eq!(saved.kind, CardKind::Chat(replacement));
+        assert_eq!(saved.title, "Saved during recovery");
+        assert!(writes.is_settled());
     }
 
     #[test]

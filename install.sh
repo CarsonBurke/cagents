@@ -9,6 +9,8 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Install the cagents Linux x86_64 release for the current user.
+When the running daemon is incompatible, install the files and defer its
+replacement to the application unless --restart-daemon is explicit.
 
 Options:
   --version VERSION  Install a release version (default: latest v* release)
@@ -375,6 +377,7 @@ DAEMON_STOPPED_FOR_SWITCH=0
 DAEMON_CHECKPOINTED=0
 OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
+DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
@@ -594,6 +597,80 @@ if ! awk -v top="$TOP_LEVEL" '
     fail 'archive has an unexpected or incomplete entry structure'
 fi
 
+# The verified candidate owns the UI launch fence before any installation
+# mutation. Re-entry reuses these downloaded assets and is authorized only by
+# the actual inherited lock, never by this environment marker alone.
+CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
+    || fail 'could not extract the verified update coordinator'
+chmod 0700 "$CANDIDATE_COORDINATOR"
+supports_install_guard() {
+    [ -x "$1" ] \
+        && "$1" coordinate-install --help >/dev/null 2>&1 \
+        && "$1" verify-install-guard --help >/dev/null 2>&1 \
+        && "$1" record-deferred-install --help >/dev/null 2>&1
+}
+if supports_install_guard "$PREFIX/current/bin/cagents"; then
+    # A newer installed coordinator also makes rollback to an older release
+    # safe when that candidate predates the window-coordination commands.
+    COORDINATOR=$PREFIX/current/bin/cagents
+elif supports_install_guard "$CANDIDATE_COORDINATOR"; then
+    COORDINATOR=$CANDIDATE_COORDINATOR
+else
+    fail 'neither the installed CLI nor this release supports safe window coordination; install a current release first, then retry this version; installation was not changed'
+fi
+if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
+    "$COORDINATOR" verify-install-guard >/dev/null \
+        || fail 'inherited application update fence is invalid; installation was not changed'
+else
+    INSTALLER_SOURCE=$0
+    if [ ! -f "$INSTALLER_SOURCE" ] || [ ! -r "$INSTALLER_SOURCE" ]; then
+        # A stdin invocation has no script to re-enter. Only the same selected
+        # release's verified installer may substitute for it; local archives
+        # never cause an unexpected network fetch.
+        [ -z "$LOCAL_ARCHIVE" ] \
+            || fail 'save install.sh to a file and run sh /path/to/install.sh with the same options; stdin cannot be coordinated with a local archive'
+        INSTALLER_SOURCE=$DOWNLOAD_DIR/install.sh
+        download_release_asset install.sh "$INSTALLER_SOURCE"
+        INSTALLER_HASH=$(awk '
+            $2 == "install.sh" { count++; hash = tolower($1) }
+            END { if (count != 1) exit 1; print hash }
+        ' "$CHECKSUMS_PATH") || fail 'SHA256SUMS does not identify this release installer'
+        if command -v sha256sum >/dev/null 2>&1; then
+            INSTALLER_ACTUAL=$(sha256sum "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
+        else
+            INSTALLER_ACTUAL=$(shasum -a 256 "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
+        fi
+        [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
+    fi
+    set -- --version "$VERSION" --prefix "$PREFIX"
+    [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
+    [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
+    case $RELAUNCH_AGENTS in
+        1) set -- "$@" --relaunch-agents ;;
+        0) set -- "$@" --no-relaunch-agents ;;
+    esac
+    # Keep the downloaded assets until the coordinator finishes cancellation
+    # and window relaunch. A signal interrupts wait, so retry it after forwarding.
+    COORDINATOR_PID=
+    COORDINATOR_INTERRUPTED=0
+    trap 'COORDINATOR_INTERRUPTED=1; if [ -n "$COORDINATOR_PID" ]; then kill -TERM "$COORDINATOR_PID" 2>/dev/null || :; fi' HUP INT TERM
+    CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
+        "$COORDINATOR" coordinate-install --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@" &
+    COORDINATOR_PID=$!
+    if [ "$COORDINATOR_INTERRUPTED" -eq 1 ]; then
+        kill -TERM "$COORDINATOR_PID" 2>/dev/null || :
+    fi
+    while :; do
+        COORDINATOR_INTERRUPTED=0
+        if wait "$COORDINATOR_PID"; then COORDINATOR_STATUS=0; else COORDINATOR_STATUS=$?; fi
+        [ "$COORDINATOR_INTERRUPTED" -eq 1 ] || break
+    done
+    COORDINATOR_PID=
+    trap 'exit 1' HUP INT TERM
+    exit "$COORDINATOR_STATUS"
+fi
+
 if [ -L "$PREFIX" ]; then
     fail "refusing to install through symlink $PREFIX"
 fi
@@ -742,17 +819,18 @@ ensure_link() {
 }
 
 
+OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
 if [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
-        read_daemon_status "$PREFIX/current/bin/cagents"
+        read_daemon_status "$OWNER_CLI"
         case $DAEMON_STATUS in
             running)
                 OLD_DAEMON_WAS_RUNNING=1
                 if [ "$REQUIRE_EMPTY_DAEMON" -eq 1 ]; then
-                    stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+                    stop_daemon_and_wait "$OWNER_CLI"
                     DAEMON_STOPPED_FOR_SWITCH=1
                 else
-                    prepare_daemon_upgrade "$PREFIX/current/bin/cagents"
+                    prepare_daemon_upgrade "$OWNER_CLI"
                 fi
                 ;;
             stopped) ;;
@@ -762,16 +840,33 @@ if [ "$HAD_CURRENT" -eq 1 ]; then
         # The candidate handshake proves protocol compatibility without changing
         # the running process. Compatible updates never replace live PTYs.
         read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+        if [ "$DAEMON_STATUS" = running ]; then
+            case $daemon_output in
+                *'"daemon_version":""'*) DAEMON_STATUS=unknown ;;
+                *'"daemon_version":"'*) ;;
+                *) DAEMON_STATUS=unknown ;;
+            esac
+        fi
         case $DAEMON_STATUS in
             running)
                 OLD_DAEMON_WAS_RUNNING=1
                 ;;
             stopped) ;;
             *)
-                read_daemon_status "$PREFIX/current/bin/cagents"
-                [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
-                stop_daemon_and_wait "$PREFIX/current/bin/cagents"
-                DAEMON_STOPPED_FOR_SWITCH=1
+                read_daemon_status "$OWNER_CLI"
+                case $DAEMON_STATUS in
+                    running)
+                        OLD_DAEMON_WAS_RUNNING=1
+                        # Routing is recorded before current changes. The
+                        # outer owner reopens the previous UI even if a later
+                        # publication failure rolls this transaction back.
+                        "$COORDINATOR" record-deferred-install >/dev/null \
+                            || fail 'cannot preserve the running application for a deferred update; installation was not changed'
+                        DAEMON_DEFERRED=1
+                        ;;
+                    stopped) ;;
+                    *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
+                esac
                 ;;
         esac
     fi
@@ -793,8 +888,9 @@ ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
 # A requested daemon update commits only after the replacement starts. Ordinary
 # installs retain their existing login-autostart behavior on startup failure.
 [ "$RESTART_DAEMON" -eq 1 ] || TRANSACTION_COMMITTED=1
-DAEMON_START_ATTEMPTED=1
-if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
+if [ "$DAEMON_DEFERRED" -eq 1 ]; then
+    : # The installed candidate must not try to start beside the older daemon.
+elif DAEMON_START_ATTEMPTED=1 && "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
     DAEMON_STARTED=1
 else
     if [ "$RESTART_DAEMON" -eq 1 ]; then
@@ -812,7 +908,9 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 
-if [ "$DAEMON_STARTED" -eq 1 ]; then
+if [ "$DAEMON_DEFERRED" -eq 1 ]; then
+    printf 'Installed cagents %s; running sessions were preserved. Open the application to finish updating its daemon.\n' "$VERSION"
+elif [ "$DAEMON_STARTED" -eq 1 ]; then
     printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
 else
     printf 'Installed cagents %s; the production daemon will start at graphical login.\n' "$VERSION"

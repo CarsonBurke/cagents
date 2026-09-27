@@ -48,9 +48,17 @@ enum ActorCommand {
     CloseIfIdle {
         generation: u64,
     },
+    CheckUpdateReadiness(crossbeam_channel::Sender<UpdateReadiness>),
     InterruptRun(crate::model::RunId),
 }
 type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateReadiness {
+    Idle,
+    Busy,
+    Unready,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
@@ -110,6 +118,7 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
@@ -118,7 +127,7 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(super::Session),
+    New(super::Session, BTreeMap<String, String>),
     Adopted(
         super::native_holder::Holder,
         crate::daemon::holder_registry::Process,
@@ -143,6 +152,7 @@ impl Handle {
         initial: Step,
         store: Store,
         source: super::Session,
+        recovery_environment: BTreeMap<String, String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -152,7 +162,7 @@ impl Handle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(source)),
+            Some(NativeOwnership::New(source, recovery_environment)),
             notify,
         )
     }
@@ -191,6 +201,13 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // Compare the reconstructible launch context, before the daemon adds
+        // its transient capability and matched CLI path. Never persist those
+        // additions or weaken comparisons of the user's selected environment.
+        let recovery_environment = match &ownership {
+            Some(NativeOwnership::New(_, environment)) => environment.clone(),
+            _ => spec.environment.clone(),
+        };
         if !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
             && let Some(context) = &spec.execution
         {
@@ -228,7 +245,7 @@ impl Handle {
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let native_holder = match ownership {
-            Some(NativeOwnership::New(source))
+            Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
                 Some(super::native_holder::spawn(spec.clone(), source)?)
@@ -274,6 +291,7 @@ impl Handle {
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
+            recovery_environment,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             detached_native: detached_native.clone(),
@@ -567,6 +585,19 @@ impl Handle {
         self.close()
     }
 
+    /// Checks readiness on the actor after all previously queued commands.
+    /// The caller must hold the host's exclusive control gate until checkpoint
+    /// preparation finishes: a snapshot alone cannot fence a command whose
+    /// caller timed out while the actor was still admitting it.
+    /// This barrier neither interrupts nor stops the provider.
+    pub(crate) fn check_update_readiness(&self) -> Result<UpdateReadiness, String> {
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::CheckUpdateReadiness(reply))?;
+        response
+            .try_recv()
+            .map_err(|error| format!("Provider update readiness was not acknowledged: {error}"))
+    }
+
     pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
         self.ownership_command(ActorCommand::InterruptRun(run))
     }
@@ -657,11 +688,11 @@ impl Handle {
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
-    pub(crate) fn execution_environment_matches(
+    pub(crate) fn recovery_environment_matches(
         &self,
         environment: &BTreeMap<String, String>,
     ) -> bool {
-        &self.0.execution_environment.0 == environment
+        &self.0.recovery_environment == environment
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
@@ -693,6 +724,22 @@ impl Handle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
+    }
+    /// Update preflights need activity without loading the transcript window.
+    pub(crate) fn update_activity(&self) -> (bool, bool) {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.busy || state.waiting || !state.requests.is_empty(),
+            state.ready,
+        )
+    }
+    pub(crate) fn update_title(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .title
+            .clone()
     }
     #[cfg(test)]
     pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
@@ -1390,12 +1437,7 @@ impl Actor {
                 ActorCommand::CloseIfIdle { generation } => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let idle = state.generation == generation
-                        && state.ready
-                        && !state.busy
-                        && !state.waiting
-                        && state.requests.is_empty()
-                        && self.pending.is_empty()
-                        && self.output.is_empty();
+                        && self.update_readiness(&state) == UpdateReadiness::Idle;
                     if idle {
                         self.stop.store(true, Ordering::Release);
                     }
@@ -1404,6 +1446,12 @@ impl Actor {
                     } else {
                         Err("Provider state changed before conditional idle close".into())
                     });
+                    continue;
+                }
+                ActorCommand::CheckUpdateReadiness(readiness) => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = readiness.send(self.update_readiness(&state));
+                    let _ = reply.send(Ok(()));
                     continue;
                 }
             };
@@ -1478,6 +1526,16 @@ impl Actor {
         }
         Ok(())
     }
+    fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
+        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
+            UpdateReadiness::Unready
+        } else if state.busy || state.waiting || !state.requests.is_empty() {
+            UpdateReadiness::Busy
+        } else {
+            UpdateReadiness::Idle
+        }
+    }
+
     fn observe_update(&self) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let generation = state.generation;
@@ -2061,6 +2119,130 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn update_readiness_fences_a_prompt_whose_caller_stopped_waiting() {
+        struct GatedPrompt {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
+        impl Adapter for GatedPrompt {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::Compact => Ok(Step {
+                        events: vec![Event::Ready(true)],
+                        ..Step::default()
+                    }),
+                    Command::Prompt { .. } => {
+                        self.entered.send(()).map_err(|error| error.to_string())?;
+                        self.release
+                            .recv_timeout(Duration::from_secs(5))
+                            .map_err(|error| error.to_string())?;
+                        Ok(Step::default())
+                    }
+                    Command::Interrupt => Ok(Step {
+                        events: vec![Event::Status {
+                            busy: false,
+                            detail: String::new(),
+                        }],
+                        ..Step::default()
+                    }),
+                    _ => Ok(Step::default()),
+                }
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let spec = ProcessSpec {
+            execution: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(GatedPrompt {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Unready,
+            "initialization is not idle"
+        );
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Idle
+        );
+        assert!(
+            !handle.0.stop.load(Ordering::Acquire),
+            "readiness must not close the actor"
+        );
+
+        // The request was accepted into the actor queue, but its caller has
+        // stopped waiting for acknowledgment. Its snapshot is still idle.
+        let (reply, timed_out) = crossbeam_channel::bounded(1);
+        drop(timed_out);
+        handle
+            .0
+            .commands
+            .send((
+                ActorCommand::Provider {
+                    run: None,
+                    command: Command::Prompt {
+                        text: "accepted work".into(),
+                        attachments: Vec::new(),
+                        mode: super::super::PromptMode::Send,
+                    },
+                },
+                reply,
+            ))
+            .unwrap();
+        handle.wake();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!handle.snapshot(None).unwrap().busy);
+        let (reply, acknowledgment) = crossbeam_channel::bounded(1);
+        let (result, readiness) = crossbeam_channel::bounded(1);
+        handle
+            .0
+            .commands
+            .send((ActorCommand::CheckUpdateReadiness(result), reply))
+            .unwrap();
+        handle.wake();
+        assert!(matches!(
+            readiness.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            readiness.recv_timeout(Duration::from_secs(5)).unwrap(),
+            UpdateReadiness::Busy
+        );
+        acknowledgment
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(handle.snapshot(None).unwrap().busy);
+        handle.close().unwrap();
+    }
+
     #[test]
     fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
         use super::super::protocol::{ExecutionContext, LaunchOutcome};

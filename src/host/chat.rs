@@ -687,6 +687,7 @@ fn start(
         selection,
         execution_environment,
         None,
+        None,
     )
 }
 
@@ -705,6 +706,7 @@ pub(super) fn start_execution(
         None,
         Default::default(),
         Some(context),
+        None,
     )
 }
 
@@ -731,6 +733,7 @@ fn start_with_execution(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
+    restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -942,11 +945,27 @@ fn start_with_execution(
             }
         }
     }
+    // An authenticated checkpoint may need different resume argv from the
+    // immutable recipe issued to windows. Keep that execution detail out of
+    // the descriptor, authority registry and runtime's installed identity.
+    if let Some(restart) = restart_launch
+        && (session.launch.provider != restart.provider
+            || session.launch.session_id != restart.session_id
+            || session
+                .launch
+                .terminal_recipe()
+                .is_none_or(|recipe| Some(recipe) != restart.terminal_recipe()))
+    {
+        return Err(error(
+            "Native restart launch differs from its issued conversation",
+        ));
+    }
+    let process_launch = restart_launch.unwrap_or(&session.launch);
     let (mut spec, mut adapter) =
         if let Some(owned_socket) = owned_socket.filter(|path| !path.exists()) {
-            chat::protocol::codex::create_with_listener(&session.launch, owned_socket)
+            chat::protocol::codex::create_with_listener(process_launch, owned_socket)
         } else {
-            chat::protocol::create(&session.launch)
+            chat::protocol::create(process_launch)
         }
         .map_err(|message| {
             // Removal may have won after the early check while the adapter
@@ -1195,6 +1214,8 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
+        spec.remove_unset_environment();
+        let recovery_environment = spec.environment.clone();
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
         if !matches!(
@@ -1243,6 +1264,7 @@ fn start_with_execution(
             initial,
             store,
             session.clone(),
+            recovery_environment,
             move |update| {
                 if let Update::Execution { run, update } = update {
                     if let Some(host) = weak.upgrade() {
@@ -2500,7 +2522,7 @@ pub(super) fn validate_upgrade_environment(
         hosted_source,
         crate::model::agent_recovery::fresh_native_environment(launch.provider, false),
     )?;
-    if !handle.execution_environment_matches(&restored) {
+    if !handle.recovery_environment_matches(&restored) {
         return Err(
             "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
                 .into(),
@@ -2523,6 +2545,14 @@ pub(super) fn restore_upgrade(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = saved.source.clone();
     session.launch = saved.launch.clone();
+    // Claude/OMP restart their process, but the conversation descriptor keeps
+    // its issued recipe. Publishing the normalized resume argv instead makes
+    // the next ordinary window save look like a different conversation.
+    let restart_launch = matches!(session.launch.provider, Provider::Claude | Provider::Omp)
+        .then_some(&saved.launch);
+    if restart_launch.is_some() {
+        session.launch.recipe = saved.source.launch.recipe.clone();
+    }
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         session.proof = Some(state.proof().clone());
@@ -2563,7 +2593,7 @@ pub(super) fn restore_upgrade(
     } else {
         None
     };
-    let response = start(
+    let response = start_with_execution(
         host,
         0,
         session,
@@ -2571,6 +2601,8 @@ pub(super) fn restore_upgrade(
         false,
         selection,
         Default::default(),
+        None,
+        restart_launch,
     )
     .map_err(|error| error.message)?;
     let id = match response {
@@ -3566,11 +3598,14 @@ for line in sys.stdin:
 
     #[test]
     fn native_upgrade_restores_exact_provider_session_and_only_resolves_proven_source() {
-        let (_directory, host, saved) = upgrade_fixture();
+        let (_directory, host, mut saved) = upgrade_fixture();
+        saved.launch.recipe = saved.launch.terminal_recipe().unwrap();
+        assert_ne!(saved.launch.recipe, saved.source.launch.recipe);
         restore_upgrade(&host, &saved).unwrap();
         let restored = resolve_upgrade(&host, &saved.source).unwrap();
         assert_eq!(restored.id, saved.source.id);
         assert_eq!(restored.launch.session_id, saved.launch.session_id);
+        assert_eq!(restored.launch.recipe, saved.source.launch.recipe);
         assert_eq!(
             restored.proof.as_ref(),
             Some(host.lock().unwrap_or_else(|p| p.into_inner()).proof())
@@ -3593,6 +3628,7 @@ for line in sys.stdin:
             "REPORTED_SESSION".into(),
             "98765432-1234-4234-8234-123456789abc".into(),
         );
+        saved.source.launch.recipe.environment = saved.launch.recipe.environment.clone();
         assert!(restore_upgrade(&host, &saved).is_err());
         assert!(resolve_upgrade(&host, &saved.source).is_err());
         let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
@@ -3604,6 +3640,27 @@ for line in sys.stdin:
         assert!(
             handle.failure().is_some(),
             "the rejected session remains diagnosed"
+        );
+    }
+
+    #[test]
+    fn native_restart_cannot_change_the_issued_account_environment() {
+        let (_directory, host, mut saved) = upgrade_fixture();
+        saved
+            .launch
+            .recipe
+            .environment
+            .insert("HOME".into(), "/another/account".into());
+        assert!(
+            restore_upgrade(&host, &saved)
+                .unwrap_err()
+                .contains("differs from its issued conversation")
+        );
+        assert!(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .is_empty()
         );
     }
 

@@ -116,6 +116,22 @@ pub enum TopCommand {
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
     UpdateWorker { job_id: String },
+    /// Cooperatively fence application windows around an external installer.
+    #[command(hide = true)]
+    CoordinateInstall {
+        #[arg(long)]
+        prefix: PathBuf,
+        #[arg(long)]
+        installer: PathBuf,
+        #[arg(last = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Validate a launch fence inherited from the update coordinator.
+    #[command(hide = true)]
+    VerifyInstallGuard,
+    /// Record that staged files must retain windows on the running daemon's UI.
+    #[command(hide = true)]
+    RecordDeferredInstall,
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -136,6 +152,15 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
+    /// Finish a staged installation through the same reviewed update flow as the app.
+    Upgrade {
+        /// Approve the displayed impact without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Permit interruption of active native turns that cannot stay alive.
+        #[arg(long)]
+        interrupt: bool,
+    },
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
@@ -842,6 +867,36 @@ impl ControlClient {
         }
     }
 
+    pub fn upgrade_impact(
+        &mut self,
+        policy: crate::update::impact::Policy,
+    ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
+        match self.request_strict(ClientRequest::UpgradeImpact { policy })? {
+            ServerResponse::UpgradeImpact(impact) => Ok(impact),
+            response => Err(unexpected_response("update impact", &response)),
+        }
+    }
+
+    pub fn prepare_confirmed_upgrade(
+        &mut self,
+        impact: crate::update::impact::DaemonImpact,
+        relaunch_agents: bool,
+    ) -> Result<(u64, u64), ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::PrepareConfirmedUpgrade {
+                impact,
+                relaunch_agents,
+            },
+            Instant::now() + Duration::from_secs(60),
+        )? {
+            ServerResponse::UpgradePrepared { terminals, chats } => Ok((terminals, chats)),
+            response => Err(unexpected_response(
+                "confirmed upgrade checkpoint",
+                &response,
+            )),
+        }
+    }
+
     pub fn daemon_version(&mut self) -> Result<String, ControlError> {
         match self.request_strict(ClientRequest::BuildInfo)? {
             ServerResponse::BuildInfo { version } => Ok(version),
@@ -1433,6 +1488,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Snapshot { .. } => "snapshot",
         ServerResponse::ShutdownAccepted => "shutdown_accepted",
         ServerResponse::ShutdownPreflight(_) => "shutdown_preflight",
+        ServerResponse::UpgradeImpact(_) => "upgrade_impact",
         ServerResponse::ShutdownOutcome(_) => "shutdown_outcome",
         ServerResponse::ChatAttached { .. } => "chat_attached",
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
@@ -1570,6 +1626,36 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
+        TopCommand::CoordinateInstall {
+            prefix,
+            installer,
+            arguments,
+        } => {
+            crate::install_guard::run(&prefix, &installer, &arguments)
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.coordinate_install",
+                data: json!({"reopened": true}),
+                human: "Installer finished; saved windows reopened".into(),
+            })
+        }
+        TopCommand::VerifyInstallGuard => {
+            instance::validate_install_guard().map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.verify_install_guard",
+                data: json!({"valid": true}),
+                human: "Installer owns the application update fence".into(),
+            })
+        }
+        TopCommand::RecordDeferredInstall => {
+            crate::install_guard::record_deferred()
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.record_deferred_install",
+                data: json!({"deferred":true}),
+                human: "Daemon replacement deferred".into(),
+            })
+        }
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
@@ -1629,6 +1715,7 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
 }
 
 pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
+    crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
     let timeout = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
@@ -1740,6 +1827,16 @@ fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     match command {
+        DaemonCommand::Upgrade { yes, interrupt } => {
+            let job = crate::update::upgrade_installed(yes, interrupt)
+                .map_err(|error| AppError::new("update", error))?;
+            Ok(CommandOutput {
+                command: "daemon.upgrade",
+                human: job.message.clone(),
+                data: serde_json::to_value(job)
+                    .map_err(|error| AppError::new("serialization", error))?,
+            })
+        }
         DaemonCommand::Start => {
             let socket = terminal::ensure_daemon_ready()
                 .map_err(|error| AppError::new("daemon_start", error))?;

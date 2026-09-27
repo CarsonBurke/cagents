@@ -9,44 +9,249 @@ pub(super) struct State {
     checking: bool,
     applying: bool,
     polling: bool,
+    poll_retry: bool,
+    inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
     restarting: bool,
-    inspecting_impact: bool,
-    pub(super) confirmation: Option<u64>,
+    pub(super) confirmation: Option<crate::update::UpdateConfirmation>,
+    submitted_confirmation: Option<String>,
+    dismissed: Option<String>,
+    dismissal_loaded: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    LoadDismissal,
+    DismissalLoaded(Result<Option<String>, String>),
+    DismissNotice(String),
+    DismissalSaved(Result<(), String>),
     Check,
     Checked(Result<UpdateState, String>),
     Apply,
-    ImpactChecked(Result<u64, String>),
-    ConfirmApply,
+    ChoosePolicy(crate::update::impact::Policy),
+    Decided {
+        job: String,
+        nonce: String,
+        result: Result<(), String>,
+    },
+    ConfirmApply(String),
+    ReviewJob,
     CancelApply,
-    StartApply(bool),
+    StartApply,
     Applied(Result<UpdateJob, String>),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
+    InstallationInspected(Option<PathBuf>),
     Restart,
-    Restarted(Result<(), String>),
-    RestartLapsed,
 }
 
 impl State {
     fn updating(&self) -> bool {
         self.applying
-            || self.inspecting_impact
-            || self.job.as_ref().is_some_and(|job| {
-                !matches!(job.phase, UpdatePhase::Complete | UpdatePhase::Failed)
-            })
+            || self
+                .job
+                .as_ref()
+                .is_some_and(|job| !job.phase.is_terminal())
     }
 }
 
 impl Cagents {
+    fn decide_update(&mut self, choice: crate::update::UpdateChoice) -> Task<Message> {
+        let Some(confirmation) = self.update_ui.confirmation.take() else {
+            return Task::none();
+        };
+        let Some(job) = &self.update_ui.job else {
+            return Task::none();
+        };
+        let id = job.id.clone();
+        self.update_ui.submitted_confirmation = Some(confirmation.nonce.clone());
+        cosmic::task::future(async move {
+            let expected_job = id.clone();
+            let expected_nonce = confirmation.nonce.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::update::decide(&id, &confirmation.nonce, choice)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::UpdateUi(Action::Decided {
+                job: expected_job,
+                nonce: expected_nonce,
+                result,
+            })
+        })
+    }
+
+    pub(super) fn update_dialog(&self) -> Option<Element<'_, Message>> {
+        use crate::update::impact::{Disposition, Policy};
+        let confirmation = self.update_ui.confirmation.as_ref()?;
+        let preview = &confirmation.preview;
+        let mut body = vec![
+            widget::text::title3(format!("Update to {}?", preview.candidate.version)).into(),
+            notice_body(if preview.replaces_daemon {
+                "The terminal service will be replaced. Your windows and tabs will reopen automatically. Review what happens to each session below."
+            } else {
+                "Your windows will reopen with the new build. The terminal service and its sessions stay running."
+            }),
+        ];
+        let mut blocked = false;
+        if let Some(daemon) = &preview.daemon {
+            let mut rows = daemon
+                .sessions
+                .iter()
+                .map(|session| {
+                    let label = match session.disposition {
+                        Disposition::Continues => "Continues",
+                        Disposition::Resumes => "Resumes",
+                        Disposition::WaitsForIdle => "Waits for idle",
+                        Disposition::Interrupted => "Interrupted",
+                        Disposition::ResumePicker => "Choose a conversation",
+                        Disposition::Blocked => "Needs attention",
+                    };
+                    notice_body(format!("{} · {label}\n{}", session.title, session.reason))
+                })
+                .collect::<Vec<_>>();
+            rows.extend(daemon.blockers.iter().map(notice_body));
+            body.push(
+                widget::container(widget::scrollable(
+                    widget::column::with_children(rows).spacing(10),
+                ))
+                .max_height(320)
+                .into(),
+            );
+            blocked = !daemon.blockers.is_empty()
+                || daemon
+                    .sessions
+                    .iter()
+                    .any(|session| session.disposition == Disposition::Blocked);
+            if daemon.sessions.iter().any(|session| {
+                matches!(
+                    session.disposition,
+                    Disposition::WaitsForIdle | Disposition::Interrupted
+                )
+            }) {
+                let (label, policy) = if daemon.policy == Policy::WhenIdle {
+                    ("Review interruption instead", Policy::Interrupt)
+                } else {
+                    ("Wait for idle instead", Policy::WhenIdle)
+                };
+                body.push(
+                    widget::button::standard(label)
+                        .on_press(Message::UpdateUi(Action::ChoosePolicy(policy)))
+                        .into(),
+                );
+            }
+        }
+        body.push(
+            widget::row::with_children(vec![
+                iced::widget::Space::new().width(Length::Fill).into(),
+                widget::button::standard("Cancel")
+                    .id(widget::Id::new("update.cancel"))
+                    .on_press(Message::UpdateUi(Action::CancelApply))
+                    .into(),
+                widget::button::suggested(
+                    if preview.daemon.as_ref().is_some_and(|daemon| {
+                        daemon
+                            .sessions
+                            .iter()
+                            .any(|session| session.disposition == Disposition::WaitsForIdle)
+                    }) {
+                        "Update when idle"
+                    } else {
+                        "Update and reopen"
+                    },
+                )
+                .on_press_maybe((!blocked).then_some(Message::UpdateUi(Action::ConfirmApply(
+                    confirmation.nonce.clone(),
+                ))))
+                .into(),
+            ])
+            .spacing(8)
+            .into(),
+        );
+        Some(dialog_ui::overlay(
+            dialog_ui::surface(widget::column::with_children(body).spacing(16), 600.0),
+            Some(Message::UpdateUi(Action::CancelApply)),
+            1.0,
+        ))
+    }
+
+    fn available_update_notice(&self) -> Option<(String, String, Action)> {
+        if !self.update_ui.dismissal_loaded
+            || self.update_ui.updating()
+            || self.update_ui.restarting
+        {
+            return None;
+        }
+        if let Some(installed) = &self.update_ui.superseded {
+            return Some((
+                format!("installed:{}", installed.display()),
+                "An installed update is ready to finish.".into(),
+                Action::Restart,
+            ));
+        }
+        match &self.update_ui.result {
+            Some(UpdateState::Available { release }) => Some((
+                release.notice_identity(),
+                format!("cagents {} is available.", release.version),
+                Action::Apply,
+            )),
+            _ => None,
+        }
+    }
+
+    pub(super) fn retained_update_notice(&self) -> bool {
+        self.available_update_notice()
+            .is_some_and(|(identity, _, _)| self.update_ui.dismissed.as_ref() == Some(&identity))
+    }
+
+    pub(super) fn update_notice(&self, retained: bool) -> Option<Element<'_, Message>> {
+        let (identity, message, action) = self.available_update_notice()?;
+        if (self.update_ui.dismissed.as_ref() == Some(&identity)) != retained {
+            return None;
+        }
+        let blocker = self.window_update_blocker();
+        let mut description = vec![widget::text::body(message).into()];
+        if let Some(reason) = blocker {
+            description.push(design::caption(reason).into());
+        }
+        let mut controls = vec![
+            widget::column::with_children(description)
+                .width(Length::Fill)
+                .into(),
+            widget::button::standard("Review update")
+                .on_press_maybe((blocker.is_none()).then_some(Message::UpdateUi(action)))
+                .into(),
+        ];
+        if !retained {
+            controls.push(
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                    "Keep this update in application notices",
+                    false,
+                    !self.modal_is_open(),
+                    Some(Message::UpdateUi(Action::DismissNotice(identity))),
+                )
+                .into(),
+            );
+        }
+        Some(
+            widget::container(
+                widget::row::with_children(controls)
+                    .align_y(Alignment::Center)
+                    .spacing(8),
+            )
+            .padding([8, 12])
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     pub(super) fn window_update_blocker(&self) -> Option<&'static str> {
-        if self.modal_is_open()
+        if self.other_modal_is_open()
             || self.has_active_worktree_operations()
             || self.project_ui.deletion_running()
             || self.channel_ui.deletion_running()
@@ -96,10 +301,13 @@ impl Cagents {
             .map(|_| Message::UpdateUi(Action::InspectInstallation));
         // Release discovery talks to GitHub and drives the installer, neither
         // of which a development instance may do.
-        if crate::instance::NAME == "development" {
+        if crate::instance::NAME == "development"
+            && !self.update_ui.updating()
+            && !self.update_ui.poll_retry
+        {
             return installation;
         }
-        let progress = if self.update_ui.updating() {
+        let progress = if self.update_ui.updating() || self.update_ui.poll_retry {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
         } else {
             iced::time::every(Duration::from_secs(6 * 60 * 60))
@@ -117,7 +325,11 @@ impl Cagents {
                     || "Preparing application update".to_owned(),
                     |job| format!("Updating to {}: {}", job.version, job.message),
                 ),
-                None,
+                state
+                    .job
+                    .as_ref()
+                    .and_then(UpdateJob::active_confirmation)
+                    .map(|_| Message::UpdateUi(Action::ReviewJob)),
             )
         } else if state.restarting {
             (
@@ -189,6 +401,62 @@ impl Cagents {
 
     pub(super) fn update_update_ui(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::LoadDismissal => {
+                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
+                    self.update_ui.dismissal_loaded = true;
+                    return Task::none();
+                };
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        store
+                            .load_dismissed_update()
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| value);
+                    Message::UpdateUi(Action::DismissalLoaded(result))
+                })
+            }
+            Action::DismissalLoaded(result) => {
+                self.update_ui.dismissal_loaded = true;
+                match result {
+                    Ok(identity) => self.update_ui.dismissed = identity,
+                    Err(error) => tracing::warn!(%error, "could not load update notice dismissal"),
+                }
+                Task::none()
+            }
+            Action::DismissNotice(identity) => {
+                if self
+                    .available_update_notice()
+                    .is_none_or(|(current, _, _)| current != identity)
+                {
+                    return Task::none();
+                }
+                self.update_ui.dismissed = Some(identity.clone());
+                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
+                    return Task::none();
+                };
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        store
+                            .save_dismissed_update(&identity)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| value);
+                    Message::UpdateUi(Action::DismissalSaved(result))
+                })
+            }
+            Action::DismissalSaved(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::warning(format!(
+                        "Could not remember update notice dismissal: {error}"
+                    )));
+                }
+                Task::none()
+            }
             Action::Check => {
                 if crate::instance::NAME == "development"
                     || self.update_ui.checking
@@ -227,65 +495,50 @@ impl Cagents {
                 if self.update_ui.updating() || self.window_update_blocker().is_some() {
                     return Task::none();
                 }
-                self.update_ui.inspecting_impact = true;
-                cosmic::task::future(async {
-                    let result = tokio::task::spawn_blocking(|| {
-                        let socket = crate::terminal::ipc::daemon_socket_path()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = match crate::control::ControlClient::connect(&socket) {
-                            Ok(client) => client,
-                            Err(crate::control::ControlError::Connect(error))
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::NotFound
-                                        | std::io::ErrorKind::ConnectionRefused
-                                ) =>
-                            {
-                                return Ok(0);
-                            }
-                            Err(error) => return Err(error.to_string()),
-                        };
-                        client
-                            .shutdown_preflight()
-                            .map(|preflight| preflight.capability.live_terminals)
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                    Message::UpdateUi(Action::ImpactChecked(result))
-                })
+                self.update_update_ui(Action::StartApply)
             }
-            Action::ImpactChecked(result) => {
-                self.update_ui.inspecting_impact = false;
-                if self.window_update_blocker().is_some() {
+            Action::ChoosePolicy(policy) => {
+                self.decide_update(crate::update::UpdateChoice::Policy(policy))
+            }
+            Action::ReviewJob => {
+                if !self.other_modal_is_open() {
+                    self.update_ui.confirmation = self
+                        .update_ui
+                        .job
+                        .as_ref()
+                        .and_then(|job| job.active_confirmation().cloned());
+                }
+                Task::none()
+            }
+            Action::ConfirmApply(nonce) => {
+                if self
+                    .update_ui
+                    .confirmation
+                    .as_ref()
+                    .is_none_or(|confirmation| confirmation.nonce != nonce)
+                {
                     return Task::none();
                 }
-                match result {
-                    Ok(0) => self.update_update_ui(Action::StartApply(false)),
-                    Ok(count) => {
-                        self.update_ui.confirmation = Some(count);
-                        iced::widget::operation::focus(widget::Id::new("update.cancel"))
-                            .map(cosmic::Action::App)
-                    }
-                    Err(error) => {
-                        self.update_ui.error = Some(error);
-                        Task::none()
-                    }
-                }
+                self.decide_update(crate::update::UpdateChoice::Confirm)
             }
-            Action::ConfirmApply => {
-                if self.update_ui.confirmation.take().is_none() {
+            Action::CancelApply => self.decide_update(crate::update::UpdateChoice::Cancel),
+            Action::Decided { job, nonce, result } => {
+                if self
+                    .update_ui
+                    .job
+                    .as_ref()
+                    .is_none_or(|current| current.id != job)
+                    || self.update_ui.submitted_confirmation.as_ref() != Some(&nonce)
+                {
                     return Task::none();
                 }
-                self.update_update_ui(Action::StartApply(true))
+                if let Err(error) = result {
+                    self.update_ui.submitted_confirmation = None;
+                    self.update_ui.error = Some(error);
+                }
+                self.update_update_ui(Action::Poll)
             }
-            Action::CancelApply => {
-                self.update_ui.confirmation = None;
-                iced::widget::operation::focus(widget::Id::new("application-update"))
-                    .map(cosmic::Action::App)
-            }
-            Action::StartApply(allow_interruptions) => {
+            Action::StartApply => {
                 if self.update_ui.updating() {
                     return Task::none();
                 }
@@ -304,8 +557,7 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::apply(&release, allow_interruptions)
-                            .map_err(|error| error.to_string())
+                        crate::update::apply(&release).map_err(|error| error.to_string())
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -315,6 +567,7 @@ impl Cagents {
             }
             Action::Applied(result) => {
                 self.update_ui.applying = false;
+                self.update_ui.restarting = false;
                 match result {
                     Ok(job) => self.update_ui.job = Some(job),
                     Err(error) => {
@@ -347,27 +600,49 @@ impl Cagents {
                 }
                 match result {
                     Ok(Some(job)) => {
+                        self.update_ui.poll_retry = false;
+                        self.update_ui.error = None;
                         if matches!(job.phase, UpdatePhase::Failed) {
                             self.update_ui.error = Some(job.message.clone());
                             self.status = Some(TransientNotice::error(job.message.clone()));
                         }
+                        self.update_ui.confirmation =
+                            job.confirmation.clone().filter(|confirmation| {
+                                matches!(
+                                    job.phase,
+                                    UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
+                                ) && self.update_ui.submitted_confirmation.as_ref()
+                                    != Some(&confirmation.nonce)
+                                    && !self.other_modal_is_open()
+                            });
                         self.update_ui.job = Some(job);
                     }
                     Ok(None) => {
-                        self.update_ui.job = None;
+                        self.update_ui.poll_retry = self.update_ui.updating();
+                        if !self.update_ui.poll_retry {
+                            self.update_ui.job = None;
+                        } else if let Some(job) = &mut self.update_ui.job {
+                            job.confirmation = None;
+                        }
+                        self.update_ui.confirmation = None;
                         if expected_job.is_some() {
                             self.update_ui.error = Some("Update status is unavailable".into());
                         }
                     }
                     Err(error) => {
-                        self.update_ui.job = None;
+                        self.update_ui.poll_retry = true;
+                        if let Some(job) = &mut self.update_ui.job {
+                            job.confirmation = None;
+                        }
+                        self.update_ui.confirmation = None;
                         self.update_ui.error = Some(error);
                     }
                 }
                 Task::none()
             }
             Action::InspectInstallation => {
-                if self.update_ui.restarting
+                if self.update_ui.inspecting
+                    || self.update_ui.restarting
                     || self.update_ui.updating()
                     // A release update owns the same launch fence and reopens
                     // the windows itself when it finishes.
@@ -375,11 +650,18 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // A handful of stats against a warm dentry cache, and a task
-                // round-trip would have to re-read all of it before acting.
-                self.update_ui.superseded = crate::update::superseding_ui();
-                if self.update_ui.superseded.is_none() {
-                    return Task::none();
+                self.update_ui.inspecting = true;
+                cosmic::task::future(async {
+                    let installed = tokio::task::spawn_blocking(crate::update::superseding_ui)
+                        .await
+                        .unwrap_or(None);
+                    Message::UpdateUi(Action::InstallationInspected(installed))
+                })
+            }
+            Action::InstallationInspected(installed) => {
+                self.update_ui.inspecting = false;
+                if !self.update_ui.restarting && !self.update_ui.updating() {
+                    self.update_ui.superseded = installed;
                 }
                 Task::none()
             }
@@ -400,34 +682,14 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::restart_into_installed(&installed)
+                        crate::update::apply_installed(&installed)
                             .map_err(|error| error.to_string())
                     })
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
-                    Message::UpdateUi(Action::Restarted(result))
+                    Message::UpdateUi(Action::Applied(result))
                 })
-            }
-            Action::Restarted(result) => match result {
-                // The helper now owns the close; this window ordinarily exits
-                // inside it. Time the wait out rather than leaving the window
-                // permanently convinced a restart is still coming, since a
-                // helper can lose the fence to another window's operation.
-                Ok(()) => cosmic::task::future(async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    Message::UpdateUi(Action::RestartLapsed)
-                }),
-                Err(error) => {
-                    self.update_ui.restarting = false;
-                    self.status = Some(TransientNotice::error(error.clone()));
-                    self.update_ui.error = Some(error);
-                    Task::none()
-                }
-            },
-            Action::RestartLapsed => {
-                self.update_ui.restarting = false;
-                Task::none()
             }
         }
     }
@@ -436,6 +698,69 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let confirmation = crate::update::UpdateConfirmation {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            preview: crate::update::impact::Preview {
+                candidate: crate::update::impact::Candidate {
+                    version: "new".into(),
+                    protocol: 32,
+                    digest: "verified".into(),
+                },
+                replaces_daemon: false,
+                daemon: None,
+            },
+            expires_at_unix_ms: u64::MAX,
+        };
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Ready".into(),
+            log_path: "/fixture/update.log".into(),
+            confirmation: Some(confirmation.clone()),
+        };
+        app.update_ui.job = Some(job.clone());
+        app.update_ui.confirmation = Some(confirmation);
+        drop(app.update_update_ui(Action::Polled(
+            Some(job.id.clone()),
+            Err("temporary read failure".into()),
+        )));
+        assert!(app.update_ui.poll_retry && app.update_ui.updating());
+        assert_eq!(app.update_ui.job.as_ref().unwrap().id, job.id);
+        assert!(app.update_ui.confirmation.is_none());
+        assert!(app.update_ui.job.as_ref().unwrap().confirmation.is_none());
+        drop(app.update_update_ui(Action::ReviewJob));
+        assert!(app.update_ui.confirmation.is_none());
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job)))));
+        assert!(!app.update_ui.poll_retry);
+        assert!(app.update_ui.error.is_none());
+        assert!(app.update_ui.confirmation.is_some());
+    }
+
+    #[test]
+    fn update_banner_moves_to_retained_notices_and_new_builds_announce_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.update_ui.dismissal_loaded = true;
+        app.update_ui.superseded = Some(PathBuf::from("/install/versions/one/bin/cagents-ui"));
+        assert!(app.update_notice(false).is_some());
+        assert!(!app.retained_update_notice());
+        let identity = app.available_update_notice().unwrap().0;
+        drop(app.update_update_ui(Action::DismissNotice(identity.clone())));
+        assert!(app.update_notice(false).is_none());
+        assert!(app.retained_update_notice());
+        assert!(app.update_notice(true).is_some());
+        app.update_ui.superseded = Some(PathBuf::from("/install/versions/two/bin/cagents-ui"));
+        drop(app.update_update_ui(Action::DismissNotice(identity)));
+        assert!(
+            app.update_notice(false).is_some(),
+            "an old button cannot dismiss a newer build"
+        );
+        assert!(!app.retained_update_notice());
+    }
 
     fn custom_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
         use cosmic::iced::advanced::widget::Tree;
@@ -507,18 +832,44 @@ mod tests {
     #[test]
     fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.update_ui.inspecting_impact = true;
-        drop(app.update_update_ui(Action::ImpactChecked(Ok(2))));
-        assert_eq!(app.update_ui.confirmation, Some(2));
+        app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            preview: crate::update::impact::Preview {
+                candidate: crate::update::impact::Candidate {
+                    version: "9.8.7".into(),
+                    protocol: 32,
+                    digest: "verified".into(),
+                },
+                replaces_daemon: false,
+                daemon: None,
+            },
+            expires_at_unix_ms: u64::MAX,
+        });
         assert!(app.modal_is_open());
         assert!(!app.update_ui.applying);
+        let confirmation = app.update_ui.confirmation.clone();
+        drop(app.update_update_ui(Action::ConfirmApply("stale-preview".into())));
+        assert!(app.update_ui.confirmation.is_some());
         drop(app.update_update_ui(Action::CancelApply));
         assert!(app.update_ui.confirmation.is_none());
         assert!(!app.modal_is_open());
         assert!(!app.update_ui.applying);
-        // An empty daemon needs no interruption dialog.
-        drop(app.update_update_ui(Action::ImpactChecked(Ok(0))));
+        // Old status files may retain a preview after helper death. A terminal
+        // phase is never an actionable confirmation, even for that old shape.
+        drop(app.update_update_ui(Action::Polled(
+            None,
+            Ok(Some(UpdateJob {
+                id: uuid::Uuid::new_v4().to_string(),
+                version: "9.8.7".into(),
+                phase: UpdatePhase::Failed,
+                message: "Helper exited".into(),
+                log_path: "/nonexistent/update.log".into(),
+                confirmation,
+            })),
+        )));
         assert!(app.update_ui.confirmation.is_none());
+        assert!(!app.modal_is_open());
+        assert_eq!(app.update_ui.error.as_deref(), Some("Helper exited"));
     }
 
     /// The restart saves and closes every window, so it must lose to anything
@@ -547,7 +898,7 @@ mod tests {
         drop(app.update_update_ui(Action::Restart));
         assert_eq!(app.update_ui.superseded, Some(installed));
 
-        drop(app.update_update_ui(Action::RestartLapsed));
+        drop(app.update_update_ui(Action::Applied(Err("helper unavailable".into()))));
         assert!(
             !app.update_ui.restarting,
             "a helper that never closed this window must not block later attempts"

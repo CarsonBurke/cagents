@@ -405,6 +405,28 @@ impl StateStore {
         metadata(&inner.connection, "window_view_v1")
     }
 
+    pub fn load_dismissed_update(&self) -> Result<Option<String>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        metadata(&inner.connection, "dismissed_update_v1")
+    }
+
+    pub fn save_dismissed_update(&self, identity: &str) -> Result<()> {
+        if identity.is_empty() || identity.len() > 4096 {
+            return Err(StoreError::InvalidState(
+                "invalid update notice identity".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        set_metadata(&transaction, "dismissed_update_v1", identity)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_window_view(&self, value: &str) -> Result<()> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -639,6 +661,31 @@ impl StateStore {
                 "Account recovery has no exact confirmed conversation".into(),
             ));
         }
+        self.rebind_chat_descriptor(card_id, source, replacement)
+    }
+
+    /// Commit a provider-confirmed ID rotation from authenticated daemon
+    /// upgrade lineage. Ordinary snapshots cannot authorize this transition.
+    pub fn rebind_chat_upgrade(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<()> {
+        if !crate::chat::is_upgrade_recovery(source, replacement) {
+            return Err(StoreError::InvalidState(
+                "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs".into(),
+            ));
+        }
+        self.rebind_chat_descriptor(card_id, source, replacement)
+    }
+
+    fn rebind_chat_descriptor(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<()> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let transaction = inner
@@ -653,14 +700,14 @@ impl StateStore {
             || !from_json::<Existence>("card existence", &existence)?.is_open()
         {
             return Err(StoreError::InvalidState(
-                "The account recovery card is no longer an open chat".into(),
+                "The recovery card is no longer an open chat".into(),
             ));
         }
         let stored: crate::chat::Session = from_json(
             "chat card",
             &content.ok_or_else(|| StoreError::CorruptRow {
                 field: "chat card".into(),
-                reason: "The account recovery source has no payload".into(),
+                reason: "The recovery source has no payload".into(),
             })?,
         )?;
         if &stored == replacement {
@@ -668,7 +715,7 @@ impl StateStore {
         }
         if &stored != source {
             return Err(StoreError::InvalidState(
-                "The saved conversation changed before account recovery committed".into(),
+                "The saved conversation changed before recovery committed".into(),
             ));
         }
         transaction.execute(
@@ -4622,12 +4669,80 @@ mod tests {
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
     }
 
-    /// A chat card takes a new conversation - another provider, another
-    /// account's home, a fresh identity - only through the explicit
-    /// replacement, never through a snapshot on its own. Before the
-    /// replacement existed, switching a new thread's provider or account left
-    /// every later save failing with "saved state is invalid", and the next
-    /// launch restored the conversation the card no longer had.
+    #[test]
+    fn upgrade_recovery_requires_exact_lineage_and_keeps_snapshots_strict() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Omp);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        // Restarting the same provider conversation with its issued recipe
+        // remains an ordinary save; only cross-proof ID rotation needs a CAS.
+        source.proof.as_mut().unwrap().host_incarnation = "second-daemon".into();
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        lane.save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement.proof.as_mut().unwrap().host_incarnation = "third-daemon".into();
+        replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(lane.save(&store, &workspace).is_err());
+        for altered in 0..8 {
+            let mut refused = replacement.clone();
+            match altered {
+                0 => refused.id = TerminalId::new(),
+                1 => refused.launch.provider = crate::agent::Provider::Claude,
+                2 => refused.launch.recipe.program = "other-provider".into(),
+                3 => {
+                    refused
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("ACCOUNT_HOME".into(), "/other".into());
+                }
+                4 => refused.proof = None,
+                5 => refused.proof = source.proof.clone(),
+                6 => refused.launch.session_id = None,
+                _ => refused.proof.as_mut().unwrap().host_incarnation = "".into(),
+            }
+            assert!(
+                store.rebind_chat_upgrade(card, &source, &refused).is_err(),
+                "alteration {altered}"
+            );
+        }
+        let mut stale = source.clone();
+        stale.launch.recipe.arguments.push("--stale".into());
+        let mut stale_replacement = replacement.clone();
+        stale_replacement.launch.recipe = stale.launch.recipe.clone();
+        assert!(
+            store
+                .rebind_chat_upgrade(card, &stale, &stale_replacement)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        let reopened =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
     #[test]
     fn account_recovery_rebinds_only_the_exact_saved_conversation() {
         let directory = tempdir().unwrap();
@@ -4719,6 +4834,8 @@ mod tests {
         );
     }
 
+    /// A chat card takes a new provider, account, or conversation only through
+    /// explicit replacement, never through an ordinary workspace snapshot.
     #[test]
     fn a_chat_card_takes_a_new_conversation_only_through_its_replacement() {
         let directory = tempdir().unwrap();

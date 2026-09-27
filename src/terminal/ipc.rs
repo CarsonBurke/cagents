@@ -91,7 +91,8 @@ use crate::{
 /// Version 29 carries native-provider crash-continuity capabilities.
 /// Version 30 makes notification activation and lifecycle identity typed.
 /// Version 31 adds explicit user automation management and durable run routing.
-pub const PROTOCOL_VERSION: u16 = 31;
+/// Version 32 binds update preparation to typed, daemon-owned session impact.
+pub const PROTOCOL_VERSION: u16 = 32;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -287,6 +288,13 @@ pub enum ClientRequest {
     },
     PrepareUpgrade {
         capability: ShutdownCapability,
+        relaunch_agents: bool,
+    },
+    UpgradeImpact {
+        policy: crate::update::impact::Policy,
+    },
+    PrepareConfirmedUpgrade {
+        impact: crate::update::impact::DaemonImpact,
         relaunch_agents: bool,
     },
     ResolveUpgradeChat {
@@ -602,6 +610,7 @@ pub enum ServerResponse {
     },
     ShutdownAccepted,
     ShutdownPreflight(ShutdownPreflight),
+    UpgradeImpact(crate::update::impact::DaemonImpact),
     ShutdownOutcome(ShutdownOutcome),
     ChatAttached {
         session: crate::chat::Session,

@@ -1069,6 +1069,7 @@ fn ensure_daemon_ready_at(
     }
 
     let mut command = Command::new(&daemon_binary);
+    crate::install_guard::sanitize_child_environment(&mut command);
     if application == crate::notifications::Application::Ceditor {
         command.arg(crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
     }

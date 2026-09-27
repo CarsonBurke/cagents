@@ -284,6 +284,7 @@ pub(super) fn process_request(
     let exclusive = matches!(
         &request,
         ClientRequest::PrepareUpgrade { .. }
+            | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
@@ -426,6 +427,33 @@ pub(super) fn process_request(
         } => {
             let (terminals, chats) =
                 super::state::prepare_upgrade(host, capability, relaunch_agents)?;
+            Ok((
+                ServerResponse::UpgradePrepared { terminals, chats },
+                Vec::new(),
+                true,
+            ))
+        }
+        ClientRequest::UpgradeImpact { policy } => {
+            let impact = super::state::update::inspect(host, policy, false)?;
+            Ok((ServerResponse::UpgradeImpact(impact), Vec::new(), false))
+        }
+        ClientRequest::PrepareConfirmedUpgrade {
+            impact,
+            relaunch_agents,
+        } => {
+            let current = super::state::update::inspect(host, impact.policy, true)?;
+            if !impact.preserves_consent(&current) || !current.ready() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Update impact changed or sessions are not ready; review the current update preview",
+                    false,
+                ));
+            }
+            let (terminals, chats) = super::state::prepare_preserving_upgrade(
+                host,
+                current.capability,
+                relaunch_agents,
+            )?;
             Ok((
                 ServerResponse::UpgradePrepared { terminals, chats },
                 Vec::new(),

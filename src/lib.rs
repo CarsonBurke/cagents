@@ -44,6 +44,7 @@ pub mod github;
 pub mod host;
 #[cfg(feature = "ui")]
 pub mod inspector;
+mod install_guard;
 pub mod instance;
 #[cfg(feature = "ui")]
 pub mod interaction;

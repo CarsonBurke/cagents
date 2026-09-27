@@ -118,6 +118,7 @@ pub enum Action {
     Switch(CardId),
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
+    UpgradeCommitted(Target, Ready, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -202,6 +203,7 @@ impl Action {
             self,
             Self::Ready(..)
                 | Self::AccountCommitted(..)
+                | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -264,6 +266,7 @@ struct Attempt {
     target: Target,
     session: chat::Session,
     recovery: Option<AccountRecovery>,
+    upgrade_committed: bool,
 }
 
 struct LocalReturn {
@@ -2273,6 +2276,7 @@ impl Cagents {
             Phase::Starting(Attempt {
                 target,
                 session: replacement.clone(),
+                upgrade_committed: false,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
                     committed: false,
@@ -3230,6 +3234,7 @@ impl Cagents {
                 target,
                 session: session.clone(),
                 recovery: None,
+                upgrade_committed: false,
             }),
         );
         let sender = self.chat_ui.sender.clone();
@@ -3934,6 +3939,26 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::UpgradeCommitted(target, ready, result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(Phase::Starting(attempt)) =
+                            self.chat_ui.phases.get_mut(&target.card)
+                            && attempt.target == target
+                        {
+                            attempt.upgrade_committed = true;
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut reply) = ready.0.lock() {
+                            *reply = Some(Err(chat::StartFailure::retry(format!(
+                                "The upgraded conversation was not saved: {error}. Its saved identity is retained; retry to reconnect."
+                            ))));
+                        }
+                    }
+                }
+                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+            }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
                     Ok(()) => {
@@ -3977,11 +4002,17 @@ impl Cagents {
                 let account_committed =
                     recovery.as_ref().is_some_and(|recovery| recovery.committed);
                 let account_source = recovery.map(|recovery| recovery.source);
+                let upgrade_source = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|handle| handle.upgrade_recovery())
+                    .map(|(source, _)| source);
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
                             CardKind::Chat(session) => account_source
                                 .as_ref()
+                                .or(upgrade_source)
                                 .map_or(session.id == attempt.session.id, |source| {
                                     session == source
                                 }),
@@ -4004,6 +4035,54 @@ impl Cagents {
                 }
                 match result {
                     Ok(handle) => {
+                        if let Some((source, resolved)) = handle.upgrade_recovery() {
+                            let replacement = handle.session();
+                            if account_source.is_some()
+                                || source != &attempt.session
+                                || &replacement != resolved
+                                || !chat::is_upgrade_recovery(source, &replacement)
+                                || handle.snapshot().session_id != replacement.launch.session_id
+                            {
+                                self.status = Some(TransientNotice::error(
+                                    "The provider did not confirm the exact upgraded conversation. Its saved identity is retained.",
+                                ));
+                                return Task::none();
+                            }
+                            if !attempt.upgrade_committed {
+                                let receipt = self
+                                    .session
+                                    .as_ref()
+                                    .ok_or_else(|| "Session storage is unavailable".to_owned())
+                                    .and_then(|writer| {
+                                        writer.rebind_chat_upgrade(
+                                            target.card,
+                                            source.clone(),
+                                            replacement,
+                                        )
+                                    });
+                                self.chat_ui
+                                    .phases
+                                    .insert(target.card, Phase::Starting(attempt));
+                                let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result = match receipt {
+                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
+                                            receipt
+                                                .recv()
+                                                .map_err(|error| {
+                                                    format!("Session writer disconnected: {error}")
+                                                })
+                                                .and_then(|result| result)
+                                        })
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|result| result),
+                                        Err(error) => Err(error),
+                                    };
+                                    Message::ChatUi(Action::UpgradeCommitted(target, ready, result))
+                                });
+                            }
+                        }
                         if let Some(source) = &account_source {
                             let replacement = handle.session();
                             if !chat::is_account_recovery(source, &replacement)
@@ -5753,7 +5832,9 @@ mod tests {
                 let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
                 while let Some(action) = stream.next().await {
                     if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                        message @ Message::ChatUi(Action::AccountCommitted(..)),
+                        message @ Message::ChatUi(
+                            Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                        ),
                     )) = action
                     {
                         return message;
@@ -7849,6 +7930,104 @@ mod tests {
         let _ = app.update(Message::AccountUi(account_ui::Action::OpenPane));
         assert!(app.utility_card(&CardKind::Accounts).is_some());
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+    }
+
+    #[test]
+    fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
+        for stale_reply in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let source = chat_runtime(&app, card).session.clone();
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            app.persist();
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(10))
+                .unwrap();
+            let mut replacement = source.clone();
+            replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
+            replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            let handle = Arc::new(ClientHandle::fixture_upgrade(
+                source.clone(),
+                replacement.clone(),
+                Snapshot {
+                    session_id: replacement.launch.session_id.clone(),
+                    ready: true,
+                    ..Snapshot::default()
+                },
+            ));
+            let target = app.chat_ui.next_target(card);
+            app.chat_ui.phases.insert(
+                card,
+                Phase::Starting(Attempt {
+                    target,
+                    session: source.clone(),
+                    recovery: None,
+                    upgrade_committed: false,
+                }),
+            );
+            app.cards.remove(&card);
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone())
+            );
+            assert!(!app.cards.contains_key(&card));
+            let receipt = account_commit_reply(task);
+            assert!(matches!(
+                receipt,
+                Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
+            ));
+            if stale_reply {
+                let next = app.chat_ui.next_target(card);
+                app.chat_ui.phases.insert(
+                    card,
+                    Phase::Starting(Attempt {
+                        target: next,
+                        session: source.clone(),
+                        recovery: None,
+                        upgrade_committed: false,
+                    }),
+                );
+                let _ = app.update(receipt);
+                assert_eq!(app.chat_ui.attempt(card).unwrap().target, next);
+                assert!(!app.chat_ui.attempt(card).unwrap().upgrade_committed);
+                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+                assert!(!app.cards.contains_key(&card));
+            } else {
+                let _ = app.update(receipt);
+                assert!(!app.chat_start_pending(card));
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(replacement.clone())
+                );
+                assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                app.persist();
+                let writer = app.session.as_ref().unwrap();
+                writer.flush(Duration::from_secs(10)).unwrap();
+                assert_eq!(writer.last_error(), None);
+                assert_eq!(
+                    writer
+                        .operation_store()
+                        .load_card(card, None)
+                        .unwrap()
+                        .unwrap()
+                        .kind,
+                    CardKind::Chat(replacement)
+                );
+            }
+        }
     }
 
     #[test]

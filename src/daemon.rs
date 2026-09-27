@@ -476,6 +476,29 @@ struct StoredLockMetadata {
     pid: u32,
 }
 
+/// Locate the executable of this instance's live, kernel-verified lock owner.
+/// Update coordination uses its sibling CLI to speak the owner's own protocol.
+pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
+    let paths = RuntimePaths::discover()?;
+    let mut lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+        return Ok(None);
+    };
+    lock.seek(SeekFrom::Start(0))?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
+    let _validated = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
+    Ok(Some(executable))
+}
+
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
@@ -876,10 +899,21 @@ mod tests {
         let mut child = std::process::Command::new("/bin/sh");
         child.args([
             "-c",
-            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; printf ready",
+            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; test -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_INSTALL_OWNER_CLI+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 43; printf ready",
             "descriptor-probe",
             &fd.to_string(),
         ]);
+        for name in [
+            crate::instance::INSTALL_GUARD_ENV,
+            "CAGENTS_INSTALL_RESULT_FD",
+            "CAGENTS_INSTALL_OWNER_CLI",
+            "CAGENTS_ARCHIVE",
+            "CAGENTS_CHECKSUMS",
+            "CAGENTS_REPOSITORY",
+        ] {
+            child.env(name, "installer-only");
+        }
+        crate::install_guard::sanitize_child_environment(&mut child);
         // SAFETY: this child-only hook calls async-signal-safe descriptor syscalls.
         // Clearing CLOEXEC models installer assets intentionally passed to a worker.
         unsafe {

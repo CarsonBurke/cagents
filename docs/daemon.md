@@ -53,6 +53,7 @@ cagents daemon stop --confirm
 | `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
+| `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
 | `daemon stop` | Request daemon termination (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
@@ -84,13 +85,36 @@ cagents daemon stop --confirm
 
 By default, `install.sh` verifies the staged CLI against the running daemon
 before switching the `current` symlink. Compatible upgrades keep the daemon PID,
-session proof, and PTYs. An incompatible default upgrade can stop only an
-atomically empty daemon; otherwise it leaves the current installation intact.
-Finish the terminals, or explicitly confirm their termination with the installed
-CLI, then retry. Older CLIs without the atomic shutdown operation fail closed;
-there is no force-stop fallback. If publishing launchers fails, the installer
+session proof, and PTYs. An incompatible default upgrade stages the new matched
+set and keeps the running daemon and its matching UI alive. Finish the update
+from the application's update notice or with `cagents daemon upgrade`. The
+coordinator retains the running daemon's own CLI, including across successive
+staged installs, so a protocol change does not require manually composing shell
+commands. Unknown ownership refuses the switch. If publishing launchers fails, the installer
 restores the previous version without stopping compatible sessions. Existing
 version directories are retained.
+
+The application shows available updates above the workspace. Dismissing the
+notice moves it into the notices popover; it remains available there. Release
+downloads are checksum verified before the candidate's own CLI reports its
+protocol. Locally installed builds use the same flow with a verified matched
+set of executables.
+
+Before replacing a daemon, the confirmation names each affected session and
+whether it continues, resumes, waits for idle, or is blocked. Supported held
+Codex servers keep their process, active turn, and approvals. Other native
+providers wait for idle by default; choosing interruption explicitly authorizes
+ending their active turn before resuming the saved conversation. Accepted agent
+launches and automation prechecks must settle first. Changed ownership or impact
+requires a fresh confirmation. The final check also waits behind previously
+accepted provider commands, so a queued prompt cannot masquerade as idle.
+
+`daemon upgrade` uses this same worker and confirmation. `--yes` skips the
+interactive prompt; `--interrupt` additionally permits native turn interruption.
+It does not grant approval for a different inventory discovered afterward.
+Unsaved window work blocks replacement, and failures remain visible in the
+application's update state. A compatible update closes and reopens windows
+without replacing the daemon or recovering sessions.
 
 ## Full daemon upgrades
 

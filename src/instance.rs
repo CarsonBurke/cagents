@@ -738,9 +738,50 @@ pub struct UiUpdateGuard {
     _legacy_fence: OwnedLock,
     prepared: Vec<String>,
     closed: Vec<String>,
+    fallback_executable: Option<PathBuf>,
 }
 
 impl UiUpdateGuard {
+    pub fn set_fallback_executable(&mut self, executable: PathBuf) {
+        self.fallback_executable = Some(executable);
+    }
+
+    pub fn has_running_windows(&self) -> io::Result<bool> {
+        running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
+    }
+    /// Pass the held launch fence to an installer that would otherwise try to
+    /// acquire it again. The child validates both this exact lock description
+    /// and the completed window shutdown; an environment flag is not authority.
+    pub fn inherit_for_install(&self, command: &mut process::Command) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        let lock = self
+            .lock
+            .as_ref()
+            .ok_or_else(|| io::Error::other("update launch fence was released"))?;
+        let fd = lock.as_raw_fd();
+        command.env(INSTALL_GUARD_ENV, INSTALL_GUARD_FD.to_string());
+        // SAFETY: the guard remains alive through spawn. Only descriptor
+        // syscalls execute after fork, and the reserved slot cannot overwrite
+        // another inherited release asset.
+        unsafe {
+            command.pre_exec(move || {
+                if fd != INSTALL_GUARD_FD {
+                    if libc::fcntl(INSTALL_GUARD_FD, libc::F_GETFD) != -1 {
+                        return Err(io::Error::from_raw_os_error(libc::EBUSY));
+                    }
+                    if libc::dup2(fd, INSTALL_GUARD_FD) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                if libc::fcntl(INSTALL_GUARD_FD, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
     pub fn acquire() -> io::Result<Self> {
         let runtime = runtime_directory()?;
         let lock = owned_lock(
@@ -763,6 +804,7 @@ impl UiUpdateGuard {
             runtime,
             prepared: Vec::new(),
             closed: Vec::new(),
+            fallback_executable: None,
         })
     }
 
@@ -829,6 +871,59 @@ impl UiUpdateGuard {
     }
 }
 
+pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+const INSTALL_GUARD_FD: i32 = 197;
+
+/// Verify the inherited open-file description owns the active exclusive fence.
+/// Do not wrap it in OwnedLock: dropping a validator must not unlock its parent.
+pub(crate) fn validate_install_guard() -> io::Result<()> {
+    use std::os::fd::BorrowedFd;
+    if env::var(INSTALL_GUARD_ENV).ok().as_deref() != Some("197") {
+        return Err(io::Error::other("installer has no inherited update fence"));
+    }
+    if unsafe { libc::fcntl(INSTALL_GUARD_FD, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_GETFD established that the descriptor exists; clone it rather
+    // than taking ownership of the descriptor shared with our parent.
+    let inherited = unsafe { BorrowedFd::borrow_raw(INSTALL_GUARD_FD) }.try_clone_to_owned()?;
+    let inherited = File::from(inherited);
+    let runtime = runtime_directory()?;
+    let path = runtime.join(format!("{APPLICATION_LOCK_FILE}.update"));
+    let expected = fs::symlink_metadata(&path)?;
+    let actual = inherited.metadata()?;
+    if !actual.is_file()
+        || actual.uid() != current_uid()
+        || actual.mode() & 0o077 != 0
+        || actual.nlink() != 1
+        || !expected.is_file()
+        || actual.dev() != expected.dev()
+        || actual.ino() != expected.ino()
+    {
+        return Err(io::Error::other(
+            "installer inherited a different update fence",
+        ));
+    }
+    match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+        Ok(_) => return Err(io::Error::other("installer update fence is not held")),
+        Err(error) => return Err(error),
+    }
+    if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        return Err(io::Error::other("installer does not own the update fence"));
+    }
+    if !running_window_slots(&runtime)?.is_empty() {
+        return Err(io::Error::other(
+            "application windows have not finished closing",
+        ));
+    }
+    let _legacy = owned_lock(
+        &runtime.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )?;
+    Ok(())
+}
+
 impl Drop for UiUpdateGuard {
     fn drop(&mut self) {
         for slot in &self.prepared {
@@ -850,7 +945,11 @@ impl Drop for UiUpdateGuard {
         }
         let _ = self.release_launch_fence();
         for slot in &self.closed {
-            let _ = launch_window(false, Some(slot), None);
+            if let Some(executable) = &self.fallback_executable {
+                let _ = launch_window_at(executable, false, Some(slot), None);
+            } else {
+                let _ = launch_window(false, Some(slot), None);
+            }
         }
         let _ = self._legacy_fence.unlock();
     }
@@ -1659,6 +1758,7 @@ mod tests {
             _legacy_fence: legacy,
             prepared: Vec::new(),
             closed: Vec::new(),
+            fallback_executable: None,
         };
         assert!(WindowLease::acquire_in(runtime.path(), true, None).is_err());
         drop(guard);
@@ -1710,6 +1810,7 @@ mod tests {
             runtime: runtime.path().into(),
             prepared: Vec::new(),
             closed: Vec::new(),
+            fallback_executable: None,
         };
         assert!(
             guard
