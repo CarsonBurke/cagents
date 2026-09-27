@@ -98,7 +98,7 @@ impl Cagents {
         ];
         let mut blocked = false;
         if let Some(daemon) = &preview.daemon {
-            let rows = daemon
+            let mut rows = daemon
                 .sessions
                 .iter()
                 .map(|session| {
@@ -113,6 +113,7 @@ impl Cagents {
                     notice_body(format!("{} · {label}\n{}", session.title, session.reason))
                 })
                 .collect::<Vec<_>>();
+            rows.extend(daemon.blockers.iter().map(notice_body));
             body.push(
                 widget::container(widget::scrollable(
                     widget::column::with_children(rows).spacing(10),
@@ -120,9 +121,6 @@ impl Cagents {
                 .max_height(320)
                 .into(),
             );
-            for reason in &daemon.blockers {
-                body.push(notice_body(reason));
-            }
             blocked = !daemon.blockers.is_empty()
                 || daemon
                     .sessions
