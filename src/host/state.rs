@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
+mod update;
 
 const EVENT_REPLAY_CAPACITY: usize = 256;
 pub(super) const MAX_TERMINALS: usize = 1024;

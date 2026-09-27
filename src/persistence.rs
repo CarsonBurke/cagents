@@ -405,6 +405,28 @@ impl StateStore {
         metadata(&inner.connection, "window_view_v1")
     }
 
+    pub fn load_dismissed_update(&self) -> Result<Option<String>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        metadata(&inner.connection, "dismissed_update_v1")
+    }
+
+    pub fn save_dismissed_update(&self, identity: &str) -> Result<()> {
+        if identity.is_empty() || identity.len() > 4096 {
+            return Err(StoreError::InvalidState(
+                "invalid update notice identity".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        set_metadata(&transaction, "dismissed_update_v1", identity)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_window_view(&self, value: &str) -> Result<()> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;

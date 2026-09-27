@@ -694,6 +694,14 @@ impl Handle {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
     }
+    /// Update preflights need activity without loading the transcript window.
+    pub(crate) fn update_activity(&self) -> (bool, bool) {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.busy || state.waiting || !state.requests.is_empty(),
+            state.ready,
+        )
+    }
     #[cfg(test)]
     pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
         let inner = Arc::downgrade(&self.0);

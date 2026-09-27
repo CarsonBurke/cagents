@@ -420,6 +420,7 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
+            || self.retained_update_notice()
             || self
                 .save_health
                 .as_ref()
@@ -453,31 +454,42 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let severity = self
-            .notices
-            .severity()
-            .max(health_severity)
-            .unwrap_or(NoticeSeverity::Warning);
-        let control = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon(severity.icon()),
-            match severity {
-                NoticeSeverity::Success => "Application notices: success",
-                NoticeSeverity::Warning => "Application notices",
-                NoticeSeverity::Error => "Application errors",
+        let recorded_severity = self.notices.severity().max(health_severity);
+        let update_only = recorded_severity.is_none() && self.retained_update_notice();
+        let severity = recorded_severity.unwrap_or(NoticeSeverity::Warning);
+        let mut control = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon(if update_only {
+                "software-update-available-symbolic"
+            } else {
+                severity.icon()
+            }),
+            if update_only {
+                "Application update available"
+            } else {
+                match severity {
+                    NoticeSeverity::Success => "Application notices: success",
+                    NoticeSeverity::Warning => "Application notices",
+                    NoticeSeverity::Error => "Application errors",
+                }
             },
             self.chrome_ui.popup == Some(Popup::Notices),
             !self.modal_is_open(),
             (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
         )
-        .id(widget::Id::new("chrome.notices"))
-        .icon_color(match severity {
-            NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
-            NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
-            NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
-        });
+        .id(widget::Id::new("chrome.notices"));
+        if !update_only {
+            control = control.icon_color(match severity {
+                NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
+                NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
+                NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
+            });
+        }
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
+                if let Some(update) = self.update_notice(true) {
+                    notices.push(update);
+                }
                 for entry in self.notices.recent() {
                     let body: Element<'_, Message> = if entry.repeats > 1 {
                         widget::column::with_children(vec![

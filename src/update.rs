@@ -1,5 +1,10 @@
 //! Explicit, self-managed release updates. `gh` owns authentication; discovery
 //! never writes installation state. The detached worker alone may run an installer.
+mod candidate;
+mod confirmation;
+mod installed;
+pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
+pub mod impact;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -29,6 +34,7 @@ use thiserror::Error;
 const REPOSITORY: &str = "CarsonBurke/cagents";
 const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
 const SMALL_ASSET_LIMIT: u64 = 1024 * 1024;
+const JOB_STATE_LIMIT: u64 = crate::terminal_ipc::MAX_FRAME_BYTES as u64;
 const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const WORKER_LOCK_FD: i32 = 198;
 
@@ -72,6 +78,12 @@ pub struct Release {
     installer: Asset,
 }
 
+impl Release {
+    pub fn notice_identity(&self) -> String {
+        format!("release:{}:{}", self.id, self.version)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Asset {
     id: u64,
@@ -91,10 +103,19 @@ pub enum UpdatePhase {
     Starting,
     Downloading,
     Verifying,
+    AwaitingConfirmation,
+    WaitingForIdle,
     ClosingWindows,
     Installing,
     Complete,
     Failed,
+    Cancelled,
+}
+
+impl UpdatePhase {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +125,19 @@ pub struct UpdateJob {
     pub phase: UpdatePhase,
     pub message: String,
     pub log_path: PathBuf,
+    #[serde(default)]
+    pub confirmation: Option<confirmation::Confirmation>,
+}
+
+impl UpdateJob {
+    pub fn active_confirmation(&self) -> Option<&UpdateConfirmation> {
+        matches!(
+            self.phase,
+            UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
+        )
+        .then_some(self.confirmation.as_ref())
+        .flatten()
+    }
 }
 
 #[derive(Deserialize)]
@@ -351,40 +385,87 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 /// Explicit user authorization: this starts a detached worker, not an in-process
 /// task. Its inherited lock closes the double-click / concurrent-window race.
 #[derive(Serialize, Deserialize)]
-struct UpdateRequest {
-    release: Release,
-    allow_interruptions: bool,
+enum UpdateRequest {
+    Release(Release),
+    Installed { root: PathBuf },
 }
 
-pub fn apply(release: &Release, allow_interruptions: bool) -> Result<UpdateJob, UpdateError> {
+pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= installed_version(&installation.version)? {
         return Err(invalid(
             "selected release is not newer than the running installation",
         ));
     }
+    start_job(
+        &installation,
+        &release.version,
+        &UpdateRequest::Release(release.clone()),
+    )
+}
+
+pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
+    let installation = running_installation()?;
+    let layout = locate(&std::env::current_exe()?)?;
+    let served = served_version_root(&layout)?;
+    if served == layout.version_root
+        || executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()?
+    {
+        return Err(invalid(
+            "the installed candidate changed; inspect the installation again",
+        ));
+    }
+    let version = served
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(unsupported_install)?
+        .to_owned();
+    start_job(
+        &installation,
+        &version,
+        &UpdateRequest::Installed { root: served },
+    )
+}
+
+fn running_installation() -> Result<Installation, UpdateError> {
+    let layout = locate(&std::env::current_exe()?)?;
+    if layout.version != crate::VERSION {
+        return Err(unsupported_install());
+    }
+    Ok(Installation {
+        prefix: layout.prefix,
+        version: layout.version,
+    })
+}
+
+fn start_job(
+    installation: &Installation,
+    version: &str,
+    request: &UpdateRequest,
+) -> Result<UpdateJob, UpdateError> {
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
     let id = uuid::Uuid::new_v4().to_string();
     let job = UpdateJob {
         id: id.clone(),
-        version: release.version.clone(),
+        version: version.into(),
         phase: UpdatePhase::Starting,
         message: "Starting verified update".into(),
         log_path: state.join(format!("{id}.log")),
+        confirmation: None,
     };
     let log = private_create(&job.log_path)?;
     write_job(&state, &job)?;
-    let request = private_create(&state.join(format!("{id}.request")))?;
-    serde_json::to_writer(
-        &request,
-        &UpdateRequest {
-            release: release.clone(),
-            allow_interruptions,
-        },
-    )?;
-    request.sync_all()?;
-    let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
+    let request_file = private_create(&state.join(format!("{id}.request")))?;
+    serde_json::to_writer(&request_file, request)?;
+    request_file.sync_all()?;
+    let mut command = Command::new(
+        installation
+            .prefix
+            .join("versions")
+            .join(&installation.version)
+            .join("bin/cagents"),
+    );
     command
         .arg("update-worker")
         .arg(&id)
@@ -427,28 +508,39 @@ pub fn apply(release: &Release, allow_interruptions: bool) -> Result<UpdateJob, 
 
 /// Returns the latest operation, including retained failure diagnostics.
 pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
-    let installation = Installation::detect()?;
+    let executable = std::env::current_exe()?;
+    if executable
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        != Some(std::ffi::OsStr::new("versions"))
+    {
+        return Ok(None);
+    }
+    let installation = running_installation()?;
     let state = installation.prefix.join(".update");
     if !state.exists() {
         return Ok(None);
     }
     let state = installation.state_dir()?;
-    let mut job: UpdateJob = match read_private(&state.join("status.json"), SMALL_ASSET_LIMIT) {
+    let mut job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => serde_json::from_slice(&bytes)?,
         Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !matches!(job.phase, UpdatePhase::Complete | UpdatePhase::Failed) {
+    if !job.phase.is_terminal() {
         match acquire_lock(&state) {
             Ok(_lock) => {
                 // A worker may have completed (or a later job may have run)
                 // between the initial snapshot and acquiring this lease.
                 job = serde_json::from_slice(&read_private(
                     &state.join("status.json"),
-                    SMALL_ASSET_LIMIT,
+                    JOB_STATE_LIMIT,
                 )?)?;
-                if !matches!(job.phase, UpdatePhase::Complete | UpdatePhase::Failed) {
+                if !job.phase.is_terminal() {
                     job.phase = UpdatePhase::Failed;
+                    job.confirmation = None;
                     job.message =
                         "Update helper exited before completion; see the private update log".into();
                     write_job(&state, &job)?;
@@ -574,22 +666,23 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     {
         return Err(invalid("invalid update job identifier"));
     }
-    let installation = Installation::detect()?;
+    let installation = running_installation()?;
     let state = installation.state_dir()?;
     let _lock = inherited_lock(&state)?;
-    let mut job: UpdateJob = serde_json::from_slice(&read_private(
-        &state.join("status.json"),
-        SMALL_ASSET_LIMIT,
-    )?)?;
+    let mut job: UpdateJob =
+        serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
     if job.id != job_id || job.phase != UpdatePhase::Starting {
         return Err(invalid("update job is no longer pending"));
     }
     let result = perform_update(&installation, &state, &mut job);
-    job.phase = if result.is_ok() {
+    job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
+        UpdatePhase::Cancelled
+    } else if result.is_ok() {
         UpdatePhase::Complete
     } else {
         UpdatePhase::Failed
     };
+    job.confirmation = None;
     job.message = match &result {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(error) => error.to_string(),
@@ -607,7 +700,15 @@ fn perform_update(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
-    let selected = request.release;
+    let selected = match request {
+        UpdateRequest::Release(release) => {
+            Installation::detect()?;
+            release
+        }
+        UpdateRequest::Installed { root } => {
+            return installed::perform(installation, state, job, &root);
+        }
+    };
     let cancellation = CancellationToken::new();
     let endpoint = format!("repos/{REPOSITORY}/releases/{}", selected.id);
     let release = applicable_release(serde_json::from_slice(&metadata(
@@ -642,6 +743,14 @@ fn perform_update(
         "Verifying sealed release bytes",
     )?;
     verify_digest(&mut archive, &archive_hash)?;
+    let staged = candidate::Staged::from_archive(&release, &archive, &archive_hash, &cancellation)?;
+    if staged.identity.protocol == crate::terminal_ipc::PROTOCOL_VERSION {
+        staged.verify_compatible_handshake(&cancellation)?;
+    }
+    let confirmed = confirmation::wait(state, job, |policy| {
+        Installation::detect()?;
+        observe_impact(&staged.identity, policy)
+    })?;
     set_phase(
         state,
         job,
@@ -651,6 +760,28 @@ fn perform_update(
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
     let install_result = (|| {
+        Installation::detect()?;
+        let current = observe_impact(
+            &staged.identity,
+            confirmed
+                .daemon
+                .as_ref()
+                .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
+        )?;
+        if !confirmed.preserves_consent(&current) {
+            return Err(invalid(
+                "Session ownership changed while saving windows; reopen and review the update again",
+            ));
+        }
+        if let Some(daemon) = current.daemon {
+            let socket = crate::terminal_ipc::daemon_socket_path()?;
+            let mut client = crate::control::ControlClient::connect(&socket)
+                .map_err(|error| invalid(error.to_string()))?;
+            client
+                .prepare_confirmed_upgrade(daemon, false)
+                .map_err(|error| invalid(error.to_string()))?;
+            wait_daemon_stopped(&socket)?;
+        }
         set_phase(
             state,
             job,
@@ -663,7 +794,7 @@ fn perform_update(
             &installer,
             &archive,
             &checksums,
-            request.allow_interruptions,
+            current.replaces_daemon,
         )
     })();
     let reopen_result = guard
@@ -676,13 +807,76 @@ fn perform_update(
     reopen_result
 }
 
+fn observe_impact(
+    candidate: &impact::Candidate,
+    policy: impact::Policy,
+) -> Result<impact::Preview, UpdateError> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client = match crate::control::ControlClient::connect(&socket) {
+        Ok(client) => Some(client),
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let paths = crate::daemon::RuntimePaths::discover()
+                .map_err(|error| invalid(error.to_string()))?;
+            if crate::daemon::HostLease::is_held(&paths)
+                .map_err(|error| invalid(error.to_string()))?
+            {
+                return Err(invalid(
+                    "The terminal service is starting or stopping; retry the update preview shortly",
+                ));
+            }
+            None
+        }
+        Err(error) => return Err(invalid(error.to_string())),
+    };
+    let replaces_daemon =
+        client.is_some() && candidate.protocol != crate::terminal_ipc::PROTOCOL_VERSION;
+    let daemon = if replaces_daemon {
+        Some(
+            client
+                .as_mut()
+                .expect("connected above")
+                .upgrade_impact(policy)
+                .map_err(|error| invalid(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(impact::Preview {
+        candidate: candidate.clone(),
+        replaces_daemon,
+        daemon,
+    })
+}
+
+fn wait_daemon_stopped(socket: &Path) -> Result<(), UpdateError> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let paths =
+        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+    loop {
+        if !crate::daemon::HostLease::is_held(&paths).map_err(|error| invalid(error.to_string()))?
+            && !socket.exists()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(UpdateError::Timeout("terminal service checkpoint"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn run_installer(
     installation: &Installation,
     release: &Release,
     installer: &File,
     archive: &File,
     checksums: &File,
-    allow_interruptions: bool,
+    restart_daemon: bool,
 ) -> Result<(), UpdateError> {
     let files = [
         installer.as_raw_fd(),
@@ -694,15 +888,14 @@ fn run_installer(
         .arg(format!("/proc/self/fd/{}", files[0]))
         .args(["--version", &release.version, "--prefix"])
         .arg(&installation.prefix)
-        .arg("--restart-daemon")
         .env("CAGENTS_ARCHIVE", format!("/proc/self/fd/{}", files[1]))
         .env("CAGENTS_CHECKSUMS", format!("/proc/self/fd/{}", files[2]))
         .env("CAGENTS_REPOSITORY", REPOSITORY)
         .env_remove("ENV")
         .env_remove("BASH_ENV")
         .stdin(Stdio::null());
-    if !allow_interruptions {
-        command.arg("--require-empty-daemon");
+    if restart_daemon {
+        command.arg("--restart-daemon");
     }
     // SAFETY: descriptor flags only; sealed anonymous files cannot be replaced
     // between checksum verification and the installer's own second verification.
@@ -774,6 +967,7 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     fs::rename(&temporary, state.join("status.json"))?;
+    File::open(state)?.sync_all()?;
     Ok(())
 }
 fn acquire_lock(state: &Path) -> Result<File, UpdateError> {
@@ -875,7 +1069,6 @@ fn gh_request(
     if cancellation.cancelled() {
         return Err(UpdateError::Cancelled);
     }
-    let mut file = anonymous_file()?;
     let mut command = Command::new("gh");
     command
         .args([
@@ -899,16 +1092,31 @@ fn gh_request(
         .env_remove("GH_FORCE_TTY")
         .env_remove("GH_REPO")
         .env_remove("GH_HOST")
-        .env_remove("GH_DEBUG")
+        .env_remove("GH_DEBUG");
+    bounded_command(&mut command, "GitHub request", limit, timeout, cancellation)
+}
+
+/// Stream a subprocess into sealed storage without buffering a release binary
+/// in memory. Extraction and candidate probes share the downloader's limits.
+fn bounded_command(
+    command: &mut Command,
+    operation: &'static str,
+    limit: u64,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Result<File, UpdateError> {
+    if cancellation.cancelled() {
+        return Err(UpdateError::Cancelled);
+    }
+    let mut file = anonymous_file()?;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
-    let mut child = command.spawn().map_err(|error| {
-        invalid(format!(
-            "cannot start GitHub CLI; install and authenticate gh: {error}"
-        ))
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| invalid(format!("cannot start {operation}: {error}")))?;
     let mut pipe = child.stdout.take().expect("piped stdout");
     let result = (|| {
         let fd = pipe.as_raw_fd();
@@ -927,14 +1135,14 @@ fn gh_request(
                 return Err(UpdateError::Cancelled);
             }
             if start.elapsed() > timeout {
-                return Err(UpdateError::Timeout("GitHub request"));
+                return Err(UpdateError::Timeout(operation));
             }
             match pipe.read(&mut buffer) {
                 Ok(0) => eof = true,
                 Ok(length) => {
                     total += length as u64;
                     if total > limit {
-                        return Err(invalid("GitHub response exceeds its size limit"));
+                        return Err(invalid(format!("{operation} exceeds its size limit")));
                     }
                     file.write_all(&buffer[..length])?;
                     continue;
@@ -945,9 +1153,7 @@ fn gh_request(
             }
             if eof && let Some(status) = child.try_wait()? {
                 if !status.success() {
-                    return Err(invalid(format!(
-                        "GitHub request failed ({status}); check gh authentication and connectivity"
-                    )));
+                    return Err(invalid(format!("{operation} failed ({status})")));
                 }
                 break;
             }

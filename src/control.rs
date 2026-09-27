@@ -842,6 +842,33 @@ impl ControlClient {
         }
     }
 
+    pub fn upgrade_impact(
+        &mut self,
+        policy: crate::update::impact::Policy,
+    ) -> Result<crate::update::impact::DaemonImpact, ControlError> {
+        match self.request_strict(ClientRequest::UpgradeImpact { policy })? {
+            ServerResponse::UpgradeImpact(impact) => Ok(impact),
+            response => Err(unexpected_response("update impact", &response)),
+        }
+    }
+
+    pub fn prepare_confirmed_upgrade(
+        &mut self,
+        impact: crate::update::impact::DaemonImpact,
+        relaunch_agents: bool,
+    ) -> Result<(u64, u64), ControlError> {
+        match self.request_strict(ClientRequest::PrepareConfirmedUpgrade {
+            impact,
+            relaunch_agents,
+        })? {
+            ServerResponse::UpgradePrepared { terminals, chats } => Ok((terminals, chats)),
+            response => Err(unexpected_response(
+                "confirmed upgrade checkpoint",
+                &response,
+            )),
+        }
+    }
+
     pub fn daemon_version(&mut self) -> Result<String, ControlError> {
         match self.request_strict(ClientRequest::BuildInfo)? {
             ServerResponse::BuildInfo { version } => Ok(version),
@@ -1433,6 +1460,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Snapshot { .. } => "snapshot",
         ServerResponse::ShutdownAccepted => "shutdown_accepted",
         ServerResponse::ShutdownPreflight(_) => "shutdown_preflight",
+        ServerResponse::UpgradeImpact(_) => "upgrade_impact",
         ServerResponse::ShutdownOutcome(_) => "shutdown_outcome",
         ServerResponse::ChatAttached { .. } => "chat_attached",
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
