@@ -217,6 +217,79 @@ mod tests {
     }
 
     #[test]
+    fn repeated_history_cursor_retries_and_can_later_classify() {
+        let mut scan = Scan::default();
+        let current = request("active");
+        let discovery = scan.next();
+        page(
+            &mut scan,
+            &discovery,
+            vec![entry(1, Some(current.clone()))],
+            None,
+        );
+        let first = scan.next();
+        scan.history(
+            &first,
+            HistoryPage {
+                viewer: viewer("reader"),
+                current: Some(current.clone()),
+                events: vec![event("one", current.requested_reviewer.clone())],
+                previous_cursor: Some("repeated".into()),
+            },
+        )
+        .unwrap();
+        let repeated = Work::History {
+            number: 1,
+            request: current.clone(),
+            before: Some("repeated".into()),
+        };
+        assert!(
+            scan.history(
+                &repeated,
+                HistoryPage {
+                    viewer: viewer("reader"),
+                    current: Some(current.clone()),
+                    events: Vec::new(),
+                    previous_cursor: Some("repeated".into()),
+                }
+            )
+            .is_err()
+        );
+        scan.failed_history(&repeated);
+        assert_eq!(scan.requested[&1].history, History::Unknown);
+        let discovery = scan.next();
+        page(
+            &mut scan,
+            &discovery,
+            vec![entry(1, Some(current.clone()))],
+            None,
+        );
+        let retry = scan.next();
+        assert_eq!(
+            retry,
+            Work::History {
+                number: 1,
+                request: current.clone(),
+                before: None
+            }
+        );
+        scan.history(
+            &retry,
+            HistoryPage {
+                viewer: viewer("reader"),
+                current: Some(current.clone()),
+                events: vec![
+                    event("one", current.requested_reviewer.clone()),
+                    event("two", current.requested_reviewer),
+                ],
+                previous_cursor: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(scan.requested[&1].history, History::ReRequested);
+    }
+
+    #[test]
     fn repeated_cursor_restarts_discovery_without_losing_current_requests() {
         let mut scan = Scan::default();
         let first = scan.next();
@@ -445,6 +518,13 @@ impl Scan {
         } else {
             let cursor = page.previous_cursor.unwrap();
             if !pending.cursors.insert(cursor.clone()) {
+                // This response consumed the queue entry. Retain it for a
+                // fresh traversal after the monitor's backoff; otherwise an
+                // unchanged current request could remain Unknown forever.
+                pending.before = None;
+                pending.cursors.clear();
+                pending.matching.clear();
+                self.histories.push_back(pending);
                 return Err("GitHub repeated a review history cursor".into());
             }
             pending.before = Some(cursor);

@@ -140,7 +140,6 @@ pub enum ViewedOutcome {
 #[derive(Debug, Clone)]
 pub enum Action {
     FilePage(file_pages::PageAction),
-    ReviewRequests(request_ui::Action),
     BrowserFenced {
         generation: u64,
         action: Box<Action>,
@@ -222,7 +221,6 @@ impl Action {
             self,
             Self::FilePage(file_pages::PageAction::Loaded { .. })
                 | Self::Loaded { .. }
-                | Self::ReviewRequests(_)
                 | Self::ListLoaded { .. }
                 | Self::TargetLoaded { .. }
                 | Self::Cached { .. }
@@ -627,7 +625,7 @@ impl State {
         self.browser_filter = BrowserFilter::default();
         let closed = self.close();
         match self.source {
-            Some(_) => ActionTask::batch([closed, self.load_list(), self.poll_review_requests()]),
+            Some(_) => ActionTask::batch([closed, self.load_list()]),
             None => closed,
         }
     }
@@ -765,7 +763,6 @@ impl State {
                 self.update(*action)
             }
             Action::Discussion(action) => self.update_discussion(action),
-            Action::ReviewRequests(action) => self.update_review_requests(action),
             Action::SetSource(source) => self.set_source(source),
             Action::LoadList => self.load_list(),
             Action::LoadMore => self.load_list_page(true),
