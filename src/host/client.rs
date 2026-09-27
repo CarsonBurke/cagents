@@ -803,7 +803,9 @@ fn process_request(
                     }
                 };
                 let paired = state.chats.get(&session.id).map(|record| {
-                    if (record.session.launch.provider != crate::agent::Provider::Codex
+                    if !record.paired_terminal.as_ref().is_some_and(|expected| {
+                        handle.as_ref().is_some_and(|actual| actual.same_worker(expected))
+                    }) || (record.session.launch.provider != crate::agent::Provider::Codex
                         && !record.owns_execution_console())
                         || !record.session.terminal.as_ref().is_some_and(|terminal| {
                             terminal.id == session.id && terminal.launch == session.launch
@@ -1247,7 +1249,7 @@ mod tests {
             state.register_client(1);
             state.reserve_spawn(session.id).unwrap();
             state
-                .finish_spawn(1, session.clone(), terminal, false)
+                .finish_spawn(1, session.clone(), terminal.clone(), false)
                 .unwrap();
             state.chats.insert(
                 session.id,
@@ -1255,7 +1257,7 @@ mod tests {
                     execution_instance: uuid::Uuid::new_v4(),
                     console_recipe: (provider != crate::agent::Provider::Codex)
                         .then(|| session.launch.clone()),
-                    paired_terminal: None,
+                    paired_terminal: Some(terminal),
                     session: chat::Session {
                         id: session.id,
                         owned_codex_listener: None,
