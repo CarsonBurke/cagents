@@ -167,6 +167,7 @@ impl Editor {
         }
         if let Err(error) = self.notifications.observer.start() {
             self.notice = Some(format!("Review alerts: {error}"));
+            return self.open_requested_review();
         }
         let report = if requests.is_empty() {
             Task::none()

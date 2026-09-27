@@ -114,7 +114,15 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
     match destination.application {
         crate::notifications::Application::Cagents => slot_socket_name(&destination.window),
         crate::notifications::Application::Ceditor => {
-            format!("{ACTIVATION_SOCKET_FILE}.ceditor.{}", destination.window)
+            // Keep the editor's namespace independent and compact. Appending
+            // it to the Cagents name exceeds sockaddr_un for ordinary isolated
+            // development runtime directories and UUID window identities.
+            let prefix = if IS_DEVELOPMENT {
+                "ceditor-development.activate"
+            } else {
+                "ceditor.activate"
+            };
+            format!("{prefix}.{}", destination.window)
         }
     }
 }
@@ -1944,6 +1952,45 @@ mod tests {
         assert!(
             resolve_notification_executable(&sibling, [installed, PathBuf::from("ceditor")])
                 .is_err()
+        );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn editor_activation_supports_isolated_runtime_and_full_window_name() {
+        use crate::notifications::{Application, Destination};
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let padding = 37 - root.path().as_os_str().len() - 1;
+        let runtime = root.path().join("r".repeat(padding));
+        fs::create_dir(&runtime).unwrap();
+        let destination = Destination {
+            application: Application::Ceditor,
+            window: "w".repeat(40),
+        };
+        destination.validate().unwrap();
+        let (sender, receiver) = async_channel::bounded(1);
+        let listener = UiActivationListener::bind_named(
+            &runtime,
+            destination_socket_name(&destination),
+            sender,
+        )
+        .unwrap();
+        assert!(
+            activate_socket_with_token(
+                &runtime,
+                destination_socket_name(&destination),
+                Some("editor-token"),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            receiver.recv_blocking().unwrap().token.as_deref(),
+            Some("editor-token")
+        );
+        drop(listener);
+        assert!(
+            !activate_socket_with_token(&runtime, destination_socket_name(&destination), None,)
+                .unwrap()
         );
     }
 
