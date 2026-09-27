@@ -118,6 +118,7 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
@@ -126,7 +127,7 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(super::Session),
+    New(super::Session, BTreeMap<String, String>),
     Adopted(
         super::native_holder::Holder,
         crate::daemon::holder_registry::Process,
@@ -151,6 +152,7 @@ impl Handle {
         initial: Step,
         store: Store,
         source: super::Session,
+        recovery_environment: BTreeMap<String, String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -160,7 +162,7 @@ impl Handle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(source)),
+            Some(NativeOwnership::New(source, recovery_environment)),
             notify,
         )
     }
@@ -199,6 +201,13 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        // Compare the reconstructible launch context, before the daemon adds
+        // its transient capability and matched CLI path. Never persist those
+        // additions or weaken comparisons of the user's selected environment.
+        let recovery_environment = match &ownership {
+            Some(NativeOwnership::New(_, environment)) => environment.clone(),
+            _ => spec.environment.clone(),
+        };
         if !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
             && let Some(context) = &spec.execution
         {
@@ -236,7 +245,7 @@ impl Handle {
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
         let native_holder = match ownership {
-            Some(NativeOwnership::New(source))
+            Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
                 Some(super::native_holder::spawn(spec.clone(), source)?)
@@ -282,6 +291,7 @@ impl Handle {
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
+            recovery_environment,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             detached_native: detached_native.clone(),
@@ -678,11 +688,11 @@ impl Handle {
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
-    pub(crate) fn execution_environment_matches(
+    pub(crate) fn recovery_environment_matches(
         &self,
         environment: &BTreeMap<String, String>,
     ) -> bool {
-        &self.0.execution_environment.0 == environment
+        &self.0.recovery_environment == environment
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)

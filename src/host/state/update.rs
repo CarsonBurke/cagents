@@ -146,12 +146,11 @@ impl HostState {
                     .terminals
                     .get(&id)
                     .is_some_and(|terminal| !terminal.handle.is_completed());
-            let environment_ready = super::super::chat::validate_upgrade_environment(
+            let environment = super::super::chat::validate_upgrade_environment(
                 &launch,
                 hosted_source,
                 &record.handle,
-            )
-            .is_ok();
+            );
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
@@ -162,8 +161,9 @@ impl HostState {
                     Disposition::Blocked,
                     "Close this conversation to finish its pending provider cleanup, then retry.",
                 )
-            } else if !ready || !aligned || !environment_ready || launch.terminal_recipe().is_none()
-            {
+            } else if let Err(reason) = &environment {
+                (Disposition::Blocked, reason.as_str())
+            } else if !ready || !aligned || launch.terminal_recipe().is_none() {
                 (
                     Disposition::Blocked,
                     "Wait for the provider to confirm its resumable conversation, or close it.",

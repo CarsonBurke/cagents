@@ -1195,6 +1195,8 @@ fn start_with_execution(
                 .verify_directory(&spec.working_directory)
                 .map_err(unavailable)?;
         }
+        spec.remove_unset_environment();
+        let recovery_environment = spec.environment.clone();
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
         if !matches!(
@@ -1243,6 +1245,7 @@ fn start_with_execution(
             initial,
             store,
             session.clone(),
+            recovery_environment,
             move |update| {
                 if let Update::Execution { run, update } = update {
                     if let Some(host) = weak.upgrade() {
@@ -2500,7 +2503,7 @@ pub(super) fn validate_upgrade_environment(
         hosted_source,
         crate::model::agent_recovery::fresh_native_environment(launch.provider, false),
     )?;
-    if !handle.execution_environment_matches(&restored) {
+    if !handle.recovery_environment_matches(&restored) {
         return Err(
             "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
                 .into(),
