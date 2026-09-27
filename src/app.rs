@@ -1666,6 +1666,20 @@ fn pull_request_head(
         .unwrap_or_default()
 }
 
+fn lone_chat_width(available: f32, preferred: CardWidth) -> f32 {
+    let available = if available.is_finite() {
+        available.max(0.0)
+    } else {
+        0.0
+    };
+    let limits = crate::workspace::WidthLimits::default();
+    let preferred = preferred
+        .resolve(available, limits)
+        .clamp(limits.minimum.min(available), available);
+    let wide = ((available - limits.minimum * 2.0) / limits.minimum).clamp(0.0, 1.0);
+    available + (preferred - available) * wide
+}
+
 /// The GitHub base branch a comparison has already proved, or empty.
 ///
 /// A remote-tracking ref is reduced with the remote names this worktree
@@ -7205,6 +7219,45 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// The workspace always fills its viewport. Only a lone native chat
+    /// keeps a readable, centered surface within that full-width pane.
+    fn workspace_card_view(
+        &self,
+        id: CardId,
+        focused: bool,
+        splitter: bool,
+    ) -> Element<'_, Message> {
+        if !self
+            .card_state(id)
+            .is_some_and(|card| matches!(card.kind, CardKind::Chat(_)))
+        {
+            return self.card_view(id, focused, splitter);
+        }
+        let preferred = self
+            .workspace
+            .card(id)
+            .map_or(CardWidth::Fraction(0.5), |card| card.width);
+        // Keep the same widget root when a neighbor opens or closes, so
+        // composer selection, focus, and transcript state survive re-layout.
+        let lone = self.workspace.cards().len() == 1;
+        iced::widget::responsive(move |size| {
+            let width = if lone {
+                lone_chat_width(size.width, preferred)
+            } else {
+                size.width
+            };
+            widget::container(
+                widget::container(self.card_view(id, focused, splitter))
+                    .width(Length::Fixed(width))
+                    .height(Length::Fill),
+            )
+            .center_x(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        })
+        .into()
     }
 
     fn card_view<'a>(
@@ -13555,7 +13608,7 @@ impl Application for Cagents {
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
-                    self.card_view(
+                    self.workspace_card_view(
                         context.id,
                         context.focused,
                         has_multiple_panes && card_beside_inspector != Some(context.id),
@@ -21178,6 +21231,18 @@ mod tests {
             number,
             url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
         })
+    }
+
+    #[test]
+    fn lone_native_chat_uses_readable_width_without_a_compact_breakpoint_jump() {
+        let preferred = CardWidth::Fraction(0.35);
+        assert_eq!(lone_chat_width(800.0, preferred), 800.0);
+        assert!((lone_chat_width(1440.0, preferred) - 504.0).abs() < 0.001);
+        assert_eq!(lone_chat_width(320.0, CardWidth::Fixed(2000.0)), 320.0);
+        assert_eq!(lone_chat_width(1440.0, CardWidth::Fraction(0.125)), 480.0);
+        assert!(
+            (lone_chat_width(961.0, preferred) - lone_chat_width(959.0, preferred)).abs() < 3.0
+        );
     }
 
     #[test]
