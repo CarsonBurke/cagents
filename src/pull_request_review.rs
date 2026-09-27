@@ -1639,7 +1639,10 @@ impl State {
                 })
                 .collect(),
         };
-        let count = rows.len();
+        let count = match &self.list {
+            ListState::Ready(pull_requests) if !pull_requests.is_empty() => rows.len(),
+            _ => 0,
+        };
         let list = widget::scrollable(
             widget::container(widget::column::with_children(rows).spacing(0))
                 .padding(design::with_vertical_rail(Padding::from([
