@@ -9,6 +9,7 @@ pub(super) struct State {
     checking: bool,
     applying: bool,
     polling: bool,
+    inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
     restarting: bool,
@@ -41,6 +42,7 @@ pub enum Action {
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
     InspectInstallation,
+    InstallationInspected(Option<PathBuf>),
     Restart,
 }
 
@@ -627,7 +629,8 @@ impl Cagents {
                 Task::none()
             }
             Action::InspectInstallation => {
-                if self.update_ui.restarting
+                if self.update_ui.inspecting
+                    || self.update_ui.restarting
                     || self.update_ui.updating()
                     // A release update owns the same launch fence and reopens
                     // the windows itself when it finishes.
@@ -635,11 +638,18 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                // A handful of stats against a warm dentry cache, and a task
-                // round-trip would have to re-read all of it before acting.
-                self.update_ui.superseded = crate::update::superseding_ui();
-                if self.update_ui.superseded.is_none() {
-                    return Task::none();
+                self.update_ui.inspecting = true;
+                cosmic::task::future(async {
+                    let installed = tokio::task::spawn_blocking(crate::update::superseding_ui)
+                        .await
+                        .unwrap_or(None);
+                    Message::UpdateUi(Action::InstallationInspected(installed))
+                })
+            }
+            Action::InstallationInspected(installed) => {
+                self.update_ui.inspecting = false;
+                if !self.update_ui.restarting && !self.update_ui.updating() {
+                    self.update_ui.superseded = installed;
                 }
                 Task::none()
             }

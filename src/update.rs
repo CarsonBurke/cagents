@@ -405,15 +405,29 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
-    let installation = running_installation()?;
+    let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
-    if served == layout.version_root
-        || executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()?
-    {
+    if served == layout.version_root && !daemon_protocol_mismatch() {
+        return Err(invalid("the installed application is already running"));
+    }
+    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
+    }
+    // A newly opened UI may already be current while an older daemon still
+    // owns the sessions. Its own CLI must perform the preview and checkpoint.
+    if let Some(owner) = installed_daemon_owner(&layout)? {
+        installation.version = owner.version;
+    }
+    if served
+        == installation
+            .prefix
+            .join("versions")
+            .join(&installation.version)
+    {
+        return Err(invalid("the installed application is already running"));
     }
     let version = served
         .file_name()
@@ -425,6 +439,124 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
         &version,
         &UpdateRequest::Installed { root: served },
     )
+}
+
+fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout>, UpdateError> {
+    let Some(executable) =
+        crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let owner = locate(&executable)?;
+    if owner.prefix != layout.prefix || executable.file_name().is_none_or(|name| name != "cagentsd")
+    {
+        return Err(invalid(
+            "The running terminal service belongs to another installation; finish its update from that installation.",
+        ));
+    }
+    Ok(Some(owner))
+}
+
+/// CLI entry point for the same leased worker, exact preview and window fence
+/// used by the application. The running daemon's matched CLI owns the worker.
+pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
+    use std::io::IsTerminal;
+    if !yes && !io::stdin().is_terminal() {
+        return Err(invalid(
+            "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns to stop.",
+        ));
+    }
+    let layout = locate(&std::env::current_exe()?)?;
+    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
+    let initial = apply_installed(&candidate)?;
+    let policy = if interrupt {
+        impact::Policy::Interrupt
+    } else {
+        impact::Policy::WhenIdle
+    };
+    let mut submitted = None;
+    let mut policy_requested = None;
+    let deadline = Instant::now() + Duration::from_secs(45 * 60);
+    loop {
+        let job = status()?
+            .filter(|job| job.id == initial.id)
+            .ok_or_else(|| {
+                invalid("The update job changed; inspect the current update in the app.")
+            })?;
+        if job.phase.is_terminal() {
+            return if job.phase == UpdatePhase::Complete {
+                Ok(job)
+            } else {
+                Err(invalid(job.message))
+            };
+        }
+        if let Some(confirmation) = job.active_confirmation() {
+            if confirmation
+                .preview
+                .daemon
+                .as_ref()
+                .is_some_and(|daemon| daemon.policy != policy)
+            {
+                if policy_requested.as_ref() != Some(&confirmation.nonce) {
+                    decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
+                    policy_requested = Some(confirmation.nonce.clone());
+                }
+            } else if submitted.as_ref() != Some(&confirmation.nonce) {
+                if submitted.is_some() {
+                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    return Err(invalid(
+                        "Update impact changed after approval; review and retry the update.",
+                    ));
+                }
+                eprintln!(
+                    "Update to {}{}",
+                    job.version,
+                    if confirmation.preview.replaces_daemon {
+                        " (replaces terminal service)"
+                    } else {
+                        " (keeps terminal service)"
+                    }
+                );
+                if let Some(daemon) = &confirmation.preview.daemon {
+                    for session in &daemon.sessions {
+                        eprintln!("  {}: {}", session.title, session.reason);
+                    }
+                    if !daemon.blockers.is_empty()
+                        || daemon
+                            .sessions
+                            .iter()
+                            .any(|session| session.disposition == impact::Disposition::Blocked)
+                    {
+                        for blocker in &daemon.blockers {
+                            eprintln!("  {blocker}");
+                        }
+                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                        return Err(invalid(
+                            "Resolve the displayed update blockers, then retry.",
+                        ));
+                    }
+                }
+                if !yes {
+                    eprint!("Proceed with this update? [y/N] ");
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                        return Err(UpdateError::Cancelled);
+                    }
+                }
+                decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
+                submitted = Some(confirmation.nonce.clone());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "The update is still running; inspect its progress in the app.",
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn running_installation() -> Result<Installation, UpdateError> {
@@ -567,7 +699,27 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// `+local` builds a developer installs, since nothing here is downloaded: the
 /// bytes are already installed under a privately owned root.
 pub fn superseding_ui() -> Option<PathBuf> {
-    superseding_ui_from(&std::env::current_exe().ok()?)
+    let executable = std::env::current_exe().ok()?;
+    if let Some(replacement) = superseding_ui_from(&executable) {
+        return Some(replacement);
+    }
+    let layout = locate(&executable).ok()?;
+    if !daemon_protocol_mismatch() {
+        return None;
+    }
+    let owner = installed_daemon_owner(&layout).ok()??;
+    (owner.version_root != layout.version_root).then(|| layout.version_root.join("bin/cagents-ui"))
+}
+
+fn daemon_protocol_mismatch() -> bool {
+    crate::terminal_ipc::daemon_socket_path()
+        .ok()
+        .is_some_and(|socket| {
+            matches!(
+                crate::control::ControlClient::connect(&socket),
+                Err(crate::control::ControlError::UnsupportedVersion { .. })
+            )
+        })
 }
 
 fn superseding_ui_from(executable: &Path) -> Option<PathBuf> {
@@ -893,6 +1045,15 @@ fn run_installer(
         .env("CAGENTS_ARCHIVE", format!("/proc/self/fd/{}", files[1]))
         .env("CAGENTS_CHECKSUMS", format!("/proc/self/fd/{}", files[2]))
         .env("CAGENTS_REPOSITORY", REPOSITORY)
+        .env(
+            "CAGENTS_INSTALL_OWNER_CLI",
+            installation
+                .prefix
+                .join("versions")
+                .join(&installation.version)
+                .join("bin/cagents"),
+        )
+        .env_remove("CAGENTS_INSTALL_RESULT_FD")
         .env_remove("ENV")
         .env_remove("BASH_ENV")
         .stdin(Stdio::null());

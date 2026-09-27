@@ -149,6 +149,15 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
+    /// Finish a staged installation through the same reviewed update flow as the app.
+    Upgrade {
+        /// Approve the displayed impact without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Permit interruption of active native turns that cannot stay alive.
+        #[arg(long)]
+        interrupt: bool,
+    },
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
@@ -1806,6 +1815,16 @@ fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     match command {
+        DaemonCommand::Upgrade { yes, interrupt } => {
+            let job = crate::update::upgrade_installed(yes, interrupt)
+                .map_err(|error| AppError::new("update", error))?;
+            Ok(CommandOutput {
+                command: "daemon.upgrade",
+                human: job.message.clone(),
+                data: serde_json::to_value(job)
+                    .map_err(|error| AppError::new("serialization", error))?,
+            })
+        }
         DaemonCommand::Start => {
             let socket = terminal::ensure_daemon_ready()
                 .map_err(|error| AppError::new("daemon_start", error))?;

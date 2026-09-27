@@ -98,7 +98,10 @@ impl HostState {
                 continue;
             }
             let source = self.descriptor(0, id)?.session;
-            let (disposition, reason) = if record.execution_environment.is_none() && can_carry(id) {
+            let (disposition, reason) = if record.execution_environment.is_none()
+                && record.handle.holder_identity().is_some()
+                && can_carry(id)
+            {
                 (
                     Disposition::Continues,
                     "The terminal and its running processes stay alive.",
@@ -166,11 +169,10 @@ impl HostState {
                     "Wait for the provider to confirm its resumable conversation, or close it.",
                 )
             } else if durable
-                && self
-                    .terminals
-                    .get(&id)
-                    .is_some_and(|terminal| !terminal.handle.is_completed())
-                && !can_carry(id)
+                && self.terminals.get(&id).is_some_and(|terminal| {
+                    !terminal.handle.is_completed()
+                        && (!can_carry(id) || terminal.handle.holder_identity().is_none())
+                })
             {
                 (
                     Disposition::Blocked,
