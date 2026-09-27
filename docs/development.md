@@ -221,6 +221,7 @@ data. It does not signal the host daemon or install anything on the host.
 ```sh
 scripts/run-ceditor-development /path/to/project
 scripts/run-ceditor-development /path/to/file.rs
+scripts/run-ceditor-development --review-alerts /path/to/project
 scripts/install-ceditor                  # default prefix ~/.local
 scripts/install-ceditor --prefix /absolute/path
 ```
@@ -228,3 +229,14 @@ scripts/install-ceditor --prefix /absolute/path
 The development runner uses an isolated application and settings identity.
 The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
 built executable.
+
+Standalone Ceditor review alerts use the shared daemon notification broker. The
+`--review-alerts` runner builds the CLI, daemon, and editor in separate feature
+lanes; the daemon starts lazily when GitHub review requests are scanned. Ordinary
+editing does not require a running daemon. Release archives include these three
+matched executables in a private `lib/ceditor` tree. The source installer switches
+that private tree atomically and exposes only `bin/ceditor`, leaving a separate
+Cagents installation untouched. Existing private builds remain available to
+running windows and daemons; update Ceditor with its original installer, not the
+Cagents self-updater. Opening an alert for the other application requires that
+application to be installed alongside the daemon or in an absolute PATH directory.
