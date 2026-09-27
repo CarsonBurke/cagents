@@ -12,7 +12,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -297,6 +297,31 @@ impl AsRef<str> for BrowserFilter {
 pub struct ReviewSource {
     pub repository: GitHubRepoKey,
     pub worktree: PathBuf,
+}
+
+impl ReviewSource {
+    /// Local remote identity is sufficient for cached reads. Mutation authority
+    /// still comes from the freshly verified review context.
+    pub fn from_remotes(
+        worktree: &Path,
+        remotes: &[crate::repository::RemoteRecord],
+    ) -> Option<Self> {
+        let keys = remotes
+            .iter()
+            .filter_map(|remote| crate::github::remote_repository_key(remote.fetch_url.as_deref()?))
+            .collect::<Vec<_>>();
+        let repository = keys
+            .iter()
+            .find(|key| {
+                crate::github::remote_for_repository(remotes, key).as_deref() == Some("origin")
+            })
+            .or_else(|| keys.first())?
+            .clone();
+        Some(Self {
+            repository,
+            worktree: worktree.to_path_buf(),
+        })
+    }
 }
 
 pub struct State {

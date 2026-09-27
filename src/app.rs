@@ -1703,6 +1703,7 @@ pub struct LoadedRepository {
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     github: GitHubAvailability,
+    review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
 }
 
@@ -3905,6 +3906,8 @@ pub struct Cagents {
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
+    /// Locally derived read identity; never grants GitHub mutation authority.
+    review_repositories: HashMap<ProjectId, GitHubRepoKey>,
     /// The generation of the latest load of each project. Every generation is
     /// drawn from `repository_load_sequence`, so generations of different
     /// projects are ordered too: a load that reaches another project's
@@ -5017,10 +5020,8 @@ impl Cagents {
         let Some(target) = self.pull_request_target(project, number) else {
             // Sidebar refreshes are bounded. A saved PR outside that first
             // batch still deserves an exact lookup, not a silent dismissal.
-            if matches!(
-                self.github_availability.get(&project),
-                Some(GitHubAvailability::Ready { .. })
-            ) && let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card)
+            if pane.review.source().is_some()
+                && let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card)
             {
                 pane.pending_number = None;
                 return self.apply_pull_request_review(
@@ -5116,8 +5117,12 @@ impl Cagents {
         };
         let source = pane
             .project(&self.sidebar_model)
-            .and_then(|id| self.github_availability.get(&id))
-            .and_then(GitHubAvailability::repository_key)
+            .and_then(|id| {
+                self.github_availability
+                    .get(&id)
+                    .and_then(GitHubAvailability::repository_key)
+                    .or_else(|| self.review_repositories.get(&id))
+            })
             .map(|repository| pull_request_review::ReviewSource {
                 repository: repository.clone(),
                 worktree: pane.repository.clone(),
@@ -10103,6 +10108,7 @@ impl Application for Cagents {
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
+            review_repositories: HashMap::new(),
             repository_generations: HashMap::new(),
             repository_pr_cancellations: HashMap::new(),
             repository_load_sequence: 0,
@@ -10621,6 +10627,7 @@ impl Application for Cagents {
                                 previous.cancel();
                             }
                             self.github_availability.remove(&project_id);
+                            self.review_repositories.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
                             let task = if open_cards && !self.refuse_in_deleting_worktree(&worktree)
@@ -10731,6 +10738,11 @@ impl Application for Cagents {
                             } else {
                                 loaded.github.label().into()
                             };
+                        if let Some(key) = loaded.review_repository.clone() {
+                            self.review_repositories.insert(project_id, key);
+                        } else {
+                            self.review_repositories.remove(&project_id);
+                        }
                         self.github_availability
                             .insert(project_id, loaded.github.clone());
                         if let Some(existing) = self
@@ -10845,6 +10857,7 @@ impl Application for Cagents {
                             project.github_status = unavailable.label().into();
                         }
                         self.github_availability.insert(project_id, unavailable);
+                        self.review_repositories.remove(&project_id);
                         self.status = Some(TransientNotice::error(error.clone()));
                         finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                         task = self.apply_closed_project_tombstones();
@@ -13801,6 +13814,7 @@ fn load_project(
         repository: None,
         worktrees: Vec::new(),
         github: GitHubAvailability::NotAssociated,
+        review_repository: None,
         head_repositories: HashMap::new(),
     })
 }
@@ -13843,6 +13857,13 @@ fn load_repository(
             Some((record.id, key))
         })
         .collect();
+    let review_repository = service
+        .remotes(&repository.selected_path, &cancellation)
+        .ok()
+        .and_then(|remotes| {
+            pull_request_review::ReviewSource::from_remotes(&repository.selected_path, &remotes)
+        })
+        .map(|source| source.repository);
     let github_availability = load_repository_github(&repository, &cancellation);
     // The shared model's own derivation, not a second copy of it: a project
     // this window opened and one the CLI opened are one row in the registry,
@@ -13861,6 +13882,7 @@ fn load_repository(
         repository: Some(repository),
         worktrees,
         github: github_availability,
+        review_repository,
         head_repositories,
     })
 }
@@ -18319,6 +18341,7 @@ mod tests {
             }),
             worktrees: Vec::new(),
             github: GitHubAvailability::NotAssociated,
+            review_repository: None,
             head_repositories: HashMap::new(),
         };
 
@@ -19314,6 +19337,7 @@ mod tests {
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
+            review_repositories: HashMap::new(),
             repository_generations: HashMap::new(),
             repository_pr_cancellations: HashMap::new(),
             repository_load_sequence: 0,
@@ -21166,6 +21190,39 @@ mod tests {
             Some(CardRuntime::PullRequests(pane)) => assert_eq!(pane.pending_number, None),
             _ => panic!("the pull request card is missing"),
         }
+    }
+
+    #[test]
+    fn a_restored_review_can_read_its_cache_when_the_sidebar_list_is_offline() {
+        let (mut app, project) = pull_request_test_app(&[]);
+        let key = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        app.github_availability.insert(
+            project,
+            GitHubAvailability::Failed {
+                detail: "offline".into(),
+            },
+        );
+        app.review_repositories.insert(project, key.clone());
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            pane.pending_number = Some(42);
+        }
+        drop(app.open_pending_pull_requests(project));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+            panic!("missing review")
+        };
+        assert_eq!(
+            pane.review.source().map(|source| &source.repository),
+            Some(&key)
+        );
+        assert_eq!(
+            pane.pending_number, None,
+            "exact cache lookup was dispatched"
+        );
+        assert!(
+            app.github_availability[&project].repository_key().is_none(),
+            "local read identity never grants sidebar mutation authority"
+        );
     }
 
     /// The pane's surfaces each add and remove named controls (the refresh

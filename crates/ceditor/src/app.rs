@@ -100,19 +100,7 @@ fn review_source_for_remotes(
     root: &Path,
     remotes: &[cagents::repository::RemoteRecord],
 ) -> Option<ReviewSource> {
-    let key = remotes
-        .iter()
-        .filter_map(|remote| github::remote_repository_key(remote.fetch_url.as_deref()?))
-        .collect::<Vec<_>>();
-    let repository = key
-        .iter()
-        .find(|key| github::remote_for_repository(remotes, key).as_deref() == Some("origin"))
-        .or_else(|| key.first())?
-        .clone();
-    Some(ReviewSource {
-        repository,
-        worktree: root.to_path_buf(),
-    })
+    ReviewSource::from_remotes(root, remotes)
 }
 
 struct FileOperationDialog {
