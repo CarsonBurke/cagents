@@ -19,6 +19,8 @@ use std::{
 };
 
 pub(super) struct Record {
+    pub(super) execution_instance: uuid::Uuid,
+    pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
     pub session: Session,
     pub handle: Handle,
     // Retain the exact CLI/account that authorized a shared Codex attachment.
@@ -29,6 +31,16 @@ pub(super) struct Record {
     // A failed terminal spawn must keep the closed actor's execution context
     // retryable and must not disappear through recovery or daemon upgrade.
     pub(super) returning_terminal: bool,
+}
+
+impl Record {
+    /// The private recipe is installed only by the execution service after
+    /// accepting this actor. A CLI basename or user-supplied argv is no proof.
+    pub(super) fn owns_execution_console(&self) -> bool {
+        self.session.terminal.as_ref().is_some_and(|terminal| {
+            terminal.id == self.session.id && self.console_recipe.as_ref() == Some(&terminal.launch)
+        })
+    }
 }
 
 // Transition evidence is not an actor: no transcript, socket, store or execution
@@ -332,10 +344,6 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
-    if let Update::Execution { run, update } = update {
-        super::agent_execution::observed(&host, id, run, update);
-        return;
-    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
     if let Update::Attention(evidence) = &update {
@@ -1053,13 +1061,15 @@ fn start(
         }
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
-        if source.is_none()
-            && let Ok(registry) = super::agent_execution::registry(host)
+        if !matches!(
+            spec.transport,
+            chat::protocol::TransportSpec::UnixWebSocket { .. }
+        ) && let Ok(registry) = super::agent_execution::registry(host)
         {
             let authority = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .register_agent_authority(&crate::agent_execution::HostedSession::Chat(
+                .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
                     session.clone(),
                 ))
                 .map_err(unavailable)?;
@@ -1068,6 +1078,26 @@ fn start(
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
         }
+        let execution_instance = uuid::Uuid::new_v4();
+        let bundle_account = if !matches!(
+            spec.transport,
+            chat::protocol::TransportSpec::UnixWebSocket { .. }
+        ) {
+            let lease = crate::account::registry::authorize_spawn(&spec.environment, None)
+                .map_err(|error| unavailable(error.to_string()))?;
+            crate::agent_execution::bundled::install(
+                Some(session.launch.provider),
+                &spec.environment,
+            );
+            if let Some(path) = crate::agent_execution::bundled::matched_path(
+                spec.environment.get("PATH").map(String::as_str),
+            ) {
+                spec.environment.insert("PATH".into(), path);
+            }
+            Some(lease)
+        } else {
+            None
+        };
         let weak = Arc::downgrade(host);
         let id = session.id;
         let handle = Handle::start(
@@ -1076,13 +1106,28 @@ fn start(
             initial,
             store,
             session.launch.session_id.clone(),
-            move |update| changed(&weak, id, update),
+            move |update| {
+                if let Update::Execution { run, update } = update {
+                    if let Some(host) = weak.upgrade() {
+                        super::agent_execution::observed(
+                            &host,
+                            id,
+                            execution_instance,
+                            run,
+                            update,
+                        );
+                    }
+                } else {
+                    changed(&weak, id, update);
+                }
+            },
         )
         .map_err(|message| {
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| unavailable(message))
         })?;
+        drop(bundle_account);
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -1116,6 +1161,8 @@ fn start(
             ..Observation::default()
         };
         let record = Record {
+            execution_instance,
+            console_recipe: None,
             session,
             handle,
             source_process,
@@ -1848,6 +1895,9 @@ pub(super) fn process(
             if let Some(terminal) = terminal {
                 let _ = terminal.handle.shutdown();
             }
+            if let Some(record) = &record {
+                super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
+            }
             drop(record);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
@@ -2168,7 +2218,8 @@ pub(super) fn close_for_terminal(
             .chats
             .get(&terminal_id)
             .filter(|record| {
-                record.session.launch.provider == Provider::Codex
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
                     && record
                         .session
                         .terminal
@@ -2192,13 +2243,19 @@ pub(super) fn close_terminal_actor(
 ) -> Result<(), ProtocolError> {
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state
+    let removed = if state
         .chats
         .get(&terminal_id)
         .is_some_and(|record| record.handle.same_actor(handle))
     {
-        state.chats.remove(&terminal_id);
         state.inventory_generation += 1;
+        state.chats.remove(&terminal_id)
+    } else {
+        None
+    };
+    drop(state);
+    if let Some(record) = removed {
+        super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     Ok(())
 }
@@ -3324,6 +3381,8 @@ for line in sys.stdin:
             state.chats.insert(
                 chat_id,
                 Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
                     session: session.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -3536,6 +3595,8 @@ for line in sys.stdin:
         host.lock().unwrap().chats.insert(
             chat_id,
             Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -3632,6 +3693,8 @@ for line in sys.stdin:
             state.chats.insert(
                 chat_id,
                 Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
                     session: Session {
                         owned_codex_listener: None,
                         id: chat_id,

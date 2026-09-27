@@ -15486,6 +15486,7 @@ mod tests {
                 projects: Vec::new(),
                 channels,
                 closed_projects: Vec::new(),
+                agents: Vec::new(),
             };
             match frame {
                 // One adopted row.

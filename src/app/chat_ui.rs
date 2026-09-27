@@ -1991,57 +1991,7 @@ fn fresh_chat_session(
     working_directory: PathBuf,
     account: &Account,
 ) -> Result<chat::Session, String> {
-    let mut recipe = LaunchRecipe {
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).into())
-            .collect(),
-        program: provider.executable().into(),
-        arguments: Vec::new(),
-        working_directory,
-        environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
-    };
-    if account.provider == provider
-        && let (Some(variable), Some(home)) =
-            (account::home_variable(provider), account.resolved_home())
-    {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
-    }
-    recipe
-        .environment
-        .retain(|name, _| !recipe.unset_environment.contains(name));
-    match provider {
-        // A shared listener lets CLI and native views use the same thread.
-        Provider::Codex => recipe
-            .arguments
-            .extend(["--remote".into(), "unix://".into()]),
-        Provider::Omp => {
-            let root = provider
-                .session_root(&recipe)
-                .ok_or("Cannot locate the configured account for a new conversation")?;
-            recipe.arguments.extend([
-                "--session-dir".into(),
-                root.join("sessions/native").to_string_lossy().into_owned(),
-            ]);
-        }
-        Provider::Claude => {}
-    }
-    Ok(chat::Session {
-        owned_codex_listener: None,
-        id,
-        launch: chat::Launch {
-            provider,
-            recipe,
-            session_id: None,
-        },
-        proof: None,
-        terminal: None,
-    })
+    chat::fresh_session(provider, id, working_directory, account)
 }
 
 /// What a draft for `provider` shows before anything runs: the models the

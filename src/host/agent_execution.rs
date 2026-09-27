@@ -9,7 +9,7 @@ use crate::{
         Surface, Update,
     },
     chat::{self, Command, PromptMode},
-    model::{AgentId, LaunchRecipe, RunId, TerminalId},
+    model::{AgentId, RunId, TerminalId},
     terminal_ipc::{ClientRequest, ServerResponse},
 };
 use std::{
@@ -48,10 +48,13 @@ pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin,
                     && record.session.launch.recipe == source.launch.recipe
                     && record.session.launch.provider == source.launch.provider
             }),
-            HostedSession::Terminal(source) => state
-                .terminals
-                .get(&source.id)
-                .is_some_and(|record| !record.handle.is_completed() && record.session == source),
+            HostedSession::Terminal(source) => {
+                state.terminals.get(&source.id).is_some_and(|record| {
+                    !record.handle.is_completed()
+                        && record.session.launch == source.launch
+                        && source.continuity.live_proof().as_ref() == Some(state.proof())
+                })
+            }
         };
         if !live {
             return Err("The issuing agent session is no longer live or proved adopted".into());
@@ -84,29 +87,37 @@ fn selected_account(spec: &Spec) -> Result<Account, String> {
 pub(super) fn submit(
     host: &SharedHost,
     authority: &Authority,
-    mut request: Submit,
+    request: Submit,
 ) -> Result<Accepted, String> {
     request.validate()?;
     let origin = origin(host, authority)?;
-    let selected = if let Destination::New(spec) = &mut request.destination {
-        spec.target.repository =
+    let registry = registry(host)?;
+    if let Some(previous) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .previous_agent_acceptance(&origin, &request)?
+    {
+        return Ok(previous);
+    }
+    let selected = if let Destination::New(spec) = &request.destination {
+        let mut selected = spec.clone();
+        selected.target.repository =
             crate::workspace_model::canonical_repository(&spec.target.repository)?;
-        spec.target.directory =
+        selected.target.directory =
             std::fs::canonicalize(&spec.target.directory).map_err(|e| e.to_string())?;
-        if !spec.target.directory.is_dir() {
+        if !selected.target.directory.is_dir() {
             return Err("The agent working directory is not a directory".into());
         }
-        let mut selected = spec.clone();
-        selected.account = Some(selected_account(spec)?.id());
+        selected.account = Some(selected_account(&selected)?.id());
         Some(selected)
     } else {
         None
     };
-    let registry = registry(host)?;
     let accepted = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .submit_agent_with_spec(&origin, &request, selected.as_ref(), now())?;
+    announce(host, &registry);
     dispatch_accepted(host, accepted.clone())?;
     Ok(accepted)
 }
@@ -143,17 +154,26 @@ pub(super) fn dispatch_accepted(host: &SharedHost, accepted: Accepted) -> Result
 
 fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String)> {
     let before = |message| (State::Failed, message);
+    let control = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .control_gate
+        .clone();
+    let _control = control.read().unwrap_or_else(|p| p.into_inner());
+    super::client::ensure_control_open(host).map_err(|error| before(error.message))?;
+    let gate = agent_gate(host, accepted.agent.id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .validate_agent_dispatch(accepted)
+        .map_err(before)?;
     let request = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent_request(accepted.run.id)
         .map_err(before)?;
-    if accepted.agent.spec.surface != Surface::Chat {
-        return Err(before(
-            "Structured terminal execution is not available in this build".into(),
-        ));
-    }
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
@@ -173,36 +193,13 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let mut recipe = LaunchRecipe {
-            program: accepted.agent.spec.provider.executable().into(),
-            arguments: Vec::new(),
-            working_directory: accepted.agent.spec.target.directory.clone(),
-            environment: Default::default(),
-            unset_environment: account
-                .credential_overrides()
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
-        };
-        if let Some((name, path)) = account.probe_environment() {
-            recipe.environment.insert(
-                name.into(),
-                path.to_str()
-                    .ok_or_else(|| before("Account path is not UTF-8".into()))?
-                    .into(),
-            );
-        }
-        let session = chat::Session {
-            id: TerminalId::new(),
-            launch: chat::Launch {
-                provider: accepted.agent.spec.provider,
-                recipe,
-                session_id: None,
-            },
-            proof: None,
-            terminal: None,
-            owned_codex_listener: None,
-        };
+        let session = chat::fresh_session(
+            accepted.agent.spec.provider,
+            TerminalId::new(),
+            accepted.agent.spec.target.directory.clone(),
+            &account,
+        )
+        .map_err(before)?;
         let response = super::chat::process(
             host,
             EXECUTION_CLIENT,
@@ -239,8 +236,12 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
             let _ = handle.close();
             return Err(before(error));
         }
+        announce(host, &registry);
         (session, handle)
     };
+    if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
+        create_console(host, &registry, accepted.agent.id, &session, &handle).map_err(before)?;
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = handle.snapshot(None).expect("unconditional snapshot");
@@ -286,14 +287,33 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
     Ok(())
 }
 
-pub(super) fn observed(host: &SharedHost, session: TerminalId, run: RunId, update: Update) {
+pub(super) fn observed(
+    host: &SharedHost,
+    session: TerminalId,
+    instance: uuid::Uuid,
+    run: RunId,
+    update: Update,
+) {
+    let source = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state
+            .chats
+            .get(&session)
+            .filter(|record| record.execution_instance == instance)
+        else {
+            return;
+        };
+        record.session.clone()
+    };
     let Ok(registry) = registry(host) else { return };
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let result = (|| {
         let current = registry.agent_run(run)?;
         let agent = registry.agent(current.agent)?;
         if agent.closed
-            || agent.session.as_ref().map(HostedSession::id) != Some(session)
+            || !matches!(&agent.session, Some(HostedSession::Chat(expected))
+                if expected.id == source.id && expected.proof == source.proof
+                    && expected.launch.recipe == source.launch.recipe)
             || current.state.is_terminal()
         {
             return Ok(());
@@ -358,3 +378,414 @@ pub(super) fn status(
 fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
+
+fn announce(host: &SharedHost, registry: &SharedRegistry) {
+    let sequence = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_sequence();
+    if let Ok(sequence) = sequence {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .announce_model_edit(
+                EXECUTION_CLIENT,
+                sequence,
+                &crate::workspace_model::ModelEdit::AgentsChanged,
+            );
+    }
+}
+
+pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    // Normal interactive sessions still work without the optional registry.
+    let Ok(registry) = registry(host) else {
+        return Ok(());
+    };
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retire_agent_process(&HostedSession::Chat(session.clone()), now())?;
+    if changed {
+        announce(host, &registry);
+    }
+    Ok(())
+}
+
+fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_gates
+        .entry(id)
+        .or_default()
+        .clone()
+}
+
+fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
+    let origin = origin(host, authority)?;
+    let gate = agent_gate(host, id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let registry = registry(host)?;
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent(id)?;
+    if agent.origin != origin {
+        return Err("This caller does not own the agent".into());
+    }
+    if agent.closed {
+        return Ok(agent);
+    }
+    if let Some(source) = &agent.session {
+        match source {
+            HostedSession::Chat(session) => {
+                let hosted = {
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    state
+                        .chats
+                        .get(&session.id)
+                        .map(|record| record.session.clone())
+                };
+                if let Some(current) = hosted {
+                    if current.proof != session.proof
+                        || current.launch.recipe != session.launch.recipe
+                    {
+                        return Err("The agent ownership changed before close; its successor was not stopped".into());
+                    }
+                    super::chat::process(
+                        host,
+                        EXECUTION_CLIENT,
+                        ClientRequest::ChatClose {
+                            chat_id: session.id,
+                        },
+                    )
+                    .map_err(|error| error.message)?;
+                } else {
+                    // A lost actor is not proof that its process has exited.
+                    // Recovery/holder reconciliation must resolve ownership.
+                    return Err("Cannot confirm teardown of the missing agent; reconcile its saved session first".into());
+                }
+            }
+            HostedSession::Terminal(_) => {
+                return Err("Structured terminal close is not available in this build".into());
+            }
+        }
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retire_agent_authority(source)?;
+    }
+    // No dispatch can race this proof: it uses this same per-agent gate and
+    // revalidates the durable open/accepted record before creating any child.
+    let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let current = store.latest_agent_run(id)?;
+    if !current.state.is_terminal() {
+        store.update_agent_run(
+            current.id,
+            current.revision,
+            Update::Finished {
+                state: State::Cancelled,
+                result: current.result,
+            },
+            now(),
+        )?;
+    }
+    let result = store.close_agent(&origin, id)?;
+    drop(store);
+    announce(host, &registry);
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_gates
+        .remove(&id);
+    Ok(result)
+}
+
+pub(super) fn process(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, String> {
+    use crate::agent_execution::{Operation, Reply, Summary};
+    match operation {
+        Operation::Console { agent, command } => console(host, &authority, agent, command),
+        Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
+        Operation::Status(id) => {
+            status(host, &authority, id).map(|(agent, run)| Reply::Status { agent, run })
+        }
+        Operation::Run(id) => {
+            let origin = origin(host, &authority)?;
+            let registry = registry(host)?;
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let run = registry.agent_run(id)?;
+            let agent = registry.agent(run.agent)?;
+            if agent.origin != origin {
+                return Err("This caller does not own the agent".into());
+            }
+            Ok(Reply::Status { agent, run })
+        }
+        Operation::List => {
+            let origin = origin(host, &authority)?;
+            let registry = registry(host)?;
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let summaries = registry
+                .agents(Some(&origin))?
+                .into_iter()
+                .map(|agent| {
+                    let run = registry.latest_agent_run(agent.id)?;
+                    Ok(Summary {
+                        agent,
+                        run: run.id,
+                        state: run.state,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            Ok(Reply::Listed(summaries))
+        }
+        Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
+    }
+}
+
+fn create_console(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+) -> Result<(), String> {
+    let program = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name("cagents");
+    if !program.is_file() {
+        return Err("The matched cagents CLI for the console is unavailable".into());
+    }
+    let recipe = crate::model::LaunchRecipe {
+        program: program
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "Console executable path is not UTF-8")?,
+        arguments: vec!["agent".into(), "console".into(), agent.to_string()],
+        working_directory: session.launch.recipe.working_directory.clone(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get_mut(&session.id)
+            .filter(|record| record.handle.same_actor(handle))
+            .ok_or("The provider changed before opening its console")?;
+        record.console_recipe = Some(recipe.clone());
+    }
+    let terminal = crate::model::TerminalSession {
+        id: session.id,
+        launch: recipe.clone(),
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+    };
+    let descriptor = super::state::spawn_terminal_view(
+        host,
+        EXECUTION_CLIENT,
+        terminal,
+        crate::terminal_ipc::TerminalSpawnOptions {
+            initially_visible: false,
+            ..Default::default()
+        },
+        None,
+        true,
+    )
+    .map_err(|error| error.message)?;
+    // Publish the in-memory pair before the durable view: concurrent explicit
+    // close must already know which terminal belongs to this exact actor.
+    let publish = (|| {
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state
+                .chats
+                .get_mut(&session.id)
+                .filter(|record| record.handle.same_actor(handle))
+                .ok_or("The provider closed while publishing its console")?;
+            record.session.terminal = Some(descriptor.session.clone());
+        }
+        let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let expected = registry
+            .agent(agent)?
+            .session
+            .ok_or("Provider binding disappeared")?;
+        registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
+        Ok::<_, String>(())
+    })();
+    if let Err(error) = publish {
+        let terminal = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(record) = state
+                .chats
+                .get_mut(&session.id)
+                .filter(|record| record.handle.same_actor(handle))
+            {
+                record.session.terminal = None;
+                record.console_recipe = None;
+            }
+            if state
+                .terminals
+                .get(&session.id)
+                .is_some_and(|record| record.session == descriptor.session)
+            {
+                state.retire_terminal(session.id)
+            } else {
+                None
+            }
+        };
+        if let Some(terminal) = terminal {
+            let _ = terminal.handle.shutdown();
+        }
+        return Err(error);
+    }
+    announce(host, registry);
+    Ok(())
+}
+
+fn console(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+    command: crate::agent_execution::ConsoleCommand,
+) -> Result<crate::agent_execution::Reply, String> {
+    use crate::agent_execution::{ConsoleCommand, ConsoleView, Reply};
+    let caller = origin(host, authority)?;
+    let registry = registry(host)?;
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent(id)?;
+    let terminal = agent
+        .console
+        .as_ref()
+        .ok_or("The console is not attached yet")?;
+    if agent.closed
+        || caller
+            != (Origin::Child {
+                parent: terminal.id,
+            })
+    {
+        return Err("This session does not own the requested agent console".into());
+    }
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&terminal.id)
+            .filter(|record| record.owns_execution_console())
+            .ok_or("The exact paired provider console is unavailable")?;
+        record.handle.clone()
+    };
+    match command {
+        ConsoleCommand::Submit {
+            prompt,
+            idempotency_key,
+        } => {
+            let accepted = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .submit_agent(
+                    &agent.origin,
+                    &Submit {
+                        destination: Destination::Existing(id),
+                        prompt,
+                        idempotency_key,
+                    },
+                    now(),
+                )?;
+            dispatch_accepted(host, accepted.clone())?;
+            Ok(Reply::Accepted(accepted))
+        }
+        ConsoleCommand::Control(command) => {
+            if !matches!(
+                command,
+                Command::Answer { .. }
+                    | Command::Interrupt
+                    | Command::SetModel { .. }
+                    | Command::SetPermissionMode { .. }
+            ) {
+                return Err("Use an accepted agent run to submit console prompts".into());
+            }
+            handle.command(command)?;
+            Ok(Reply::Console(None))
+        }
+        ConsoleCommand::Read {
+            after_generation,
+            after_run,
+        } => {
+            let run = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .latest_agent_run(id)?;
+            // The durable outcome can arrive after the last transcript update.
+            // A transcript-only cursor must not hide completion or token usage.
+            let cursor = (after_run == Some((run.id, run.revision)))
+                .then_some(after_generation)
+                .flatten();
+            let Some(snapshot) = handle.snapshot(cursor) else {
+                return Ok(Reply::Console(None));
+            };
+            let mut chunks = Vec::new();
+            let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
+            let mut truncated = false;
+            for item in snapshot.items.iter().rev() {
+                let mut text = match &item.content {
+                    chat::ItemContent::Text {
+                        text,
+                        thinking: false,
+                        ..
+                    } => format!("{:?}: {text}\n", item.role),
+                    chat::ItemContent::Command {
+                        command,
+                        status,
+                        output,
+                        ..
+                    } => format!("Command ({status:?}): {command}\n{output}\n"),
+                    chat::ItemContent::Tool {
+                        name,
+                        status,
+                        output,
+                        ..
+                    } => format!("Tool {name} ({status:?}): {output}\n"),
+                    _ => continue,
+                };
+                if text.len() > remaining {
+                    crate::agent_execution::truncate(&mut text, remaining);
+                    truncated = true;
+                }
+                remaining -= text.len();
+                chunks.push(text);
+                if remaining == 0 {
+                    break;
+                }
+            }
+            chunks.reverse();
+            let mut requests = snapshot.requests;
+            for request in &mut requests {
+                for field in &mut request.fields {
+                    if field.secret {
+                        field.initial.clear();
+                    }
+                }
+            }
+            Ok(Reply::Console(Some(ConsoleView {
+                generation: snapshot.generation,
+                text: chunks.concat(),
+                truncated,
+                requests,
+                ready: snapshot.ready,
+                run,
+            })))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

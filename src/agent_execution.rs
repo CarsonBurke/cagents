@@ -7,6 +7,9 @@
 
 use std::path::PathBuf;
 
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) mod bundled;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -24,6 +27,17 @@ pub const MAX_PARENT_RUNNING: usize = 8;
 pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
+
+/// Presentation routing only. Daemon ownership additionally requires its
+/// private exact console recipe and the issued paired session descriptor.
+pub fn console_agent(recipe: &crate::model::LaunchRecipe) -> Option<AgentId> {
+    let [command, surface, agent] = recipe.arguments.as_slice() else {
+        return None;
+    };
+    (command == "agent" && surface == "console")
+        .then(|| agent.parse().ok())
+        .flatten()
+}
 
 /// A session capability injected by the daemon, never copied into a public
 /// launch recipe or diagnostic. Absence is the user's CLI scope; that scope
@@ -139,13 +153,33 @@ impl Submit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostedSession {
     Chat(chat::Session),
     Terminal(TerminalSession),
 }
 
 impl HostedSession {
+    /// Runtime ownership excludes mutable conversation/presentation metadata.
+    /// A successor proof or different launch never identifies this process.
+    pub(crate) fn same_process(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Chat(a), Self::Chat(b)) => {
+                a.id == b.id
+                    && a.proof == b.proof
+                    && a.launch.provider == b.launch.provider
+                    && a.launch.recipe == b.launch.recipe
+            }
+            (Self::Terminal(a), Self::Terminal(b)) => {
+                a.id == b.id
+                    && a.launch == b.launch
+                    && a.continuity.live_proof().is_some()
+                    && a.continuity.live_proof() == b.continuity.live_proof()
+            }
+            _ => false,
+        }
+    }
+
     pub fn id(&self) -> TerminalId {
         match self {
             Self::Chat(session) => session.id,
@@ -154,13 +188,15 @@ impl HostedSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
     pub origin: Origin,
     pub spec: Spec,
     pub channel: ChannelId,
     pub session: Option<HostedSession>,
+    #[serde(default)]
+    pub console: Option<TerminalSession>,
     pub created_ms: u64,
     pub closed: bool,
 }
@@ -241,6 +277,58 @@ pub struct Accepted {
     pub run: Run,
     /// False when an identical earlier request is being acknowledged again.
     pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Operation {
+    Submit(Submit),
+    Status(AgentId),
+    Run(RunId),
+    List,
+    Close(AgentId),
+    Console {
+        agent: AgentId,
+        command: ConsoleCommand,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ConsoleCommand {
+    Read {
+        after_generation: Option<u64>,
+        after_run: Option<(RunId, u64)>,
+    },
+    Submit {
+        prompt: String,
+        idempotency_key: String,
+    },
+    Control(chat::Command),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsoleView {
+    pub generation: u64,
+    pub text: String,
+    pub truncated: bool,
+    pub requests: Vec<chat::Request>,
+    pub ready: bool,
+    pub run: Run,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Summary {
+    pub agent: Agent,
+    pub run: RunId,
+    pub state: State,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Reply {
+    Accepted(Accepted),
+    Status { agent: Agent, run: Run },
+    Listed(Vec<Summary>),
+    Closed(Agent),
+    Console(Option<ConsoleView>),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

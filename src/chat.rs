@@ -305,7 +305,7 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
         })
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,
     pub launch: Launch,
@@ -1296,4 +1296,67 @@ mod tests {
             .host_incarnation = "".into();
         assert!(!unrelated.owns_codex_listener());
     }
+}
+
+/// Shared native launch policy for UI drafts and durable daemon executions.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn fresh_session(
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
+) -> Result<Session, String> {
+    let mut recipe = LaunchRecipe {
+        unset_environment: account
+            .credential_overrides()
+            .iter()
+            .map(|name| (*name).into())
+            .collect(),
+        program: provider.executable().into(),
+        arguments: Vec::new(),
+        working_directory,
+        environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
+    };
+    if account.provider == provider
+        && let (Some(variable), Some(home)) = (
+            crate::account::home_variable(provider),
+            account.resolved_home(),
+        )
+    {
+        let home = home
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
+        recipe.environment.insert(variable.to_owned(), home);
+    }
+    recipe
+        .environment
+        .retain(|name, _| !recipe.unset_environment.contains(name));
+    match provider {
+        // A shared listener lets CLI and native views use the same thread.
+        Provider::Codex => recipe
+            .arguments
+            .extend(["--remote".into(), "unix://".into()]),
+        Provider::Omp => {
+            let root = provider
+                .session_root(&recipe)
+                .ok_or("Cannot locate the configured account for a new conversation")?;
+            recipe.arguments.extend([
+                "--session-dir".into(),
+                root.join("sessions/native").to_string_lossy().into_owned(),
+            ]);
+        }
+        Provider::Claude => {}
+    }
+    Ok(Session {
+        owned_codex_listener: None,
+        id,
+        launch: Launch {
+            provider,
+            recipe,
+            session_id: None,
+        },
+        proof: None,
+        terminal: None,
+    })
 }

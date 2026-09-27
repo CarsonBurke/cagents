@@ -113,6 +113,24 @@ impl AccountId {
     }
 }
 
+impl std::str::FromStr for AccountId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((provider, key)) = value.split_once('/') else {
+            return Err("Use a provider/account ID, such as claude/system".into());
+        };
+        if !Provider::ALL
+            .iter()
+            .any(|candidate| candidate.executable() == provider)
+            || !(key == "system" || uuid::Uuid::parse_str(key).is_ok())
+        {
+            return Err("Use a provider followed by /system or a registered account UUID".into());
+        }
+        Ok(Self(value.into()))
+    }
+}
+
 impl std::fmt::Display for AccountId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)

@@ -93,6 +93,9 @@ pub struct WorkspaceModel {
     /// Reopening the repository clears its tombstone.
     #[serde(default)]
     pub closed_projects: Vec<PathBuf>,
+    /// Durable execution sessions, adopted into their explicitly owned channel.
+    #[serde(default)]
+    pub agents: Vec<crate::agent_execution::Agent>,
 }
 
 impl WorkspaceModel {
@@ -116,6 +119,7 @@ impl WorkspaceModel {
     pub fn fold(&mut self, sequence: u64, edit: &ModelEdit) {
         self.sequence = sequence;
         match edit {
+            ModelEdit::AgentsChanged => {}
             ModelEdit::OpenProject {
                 repository,
                 name,
@@ -214,6 +218,8 @@ pub enum ModelEdit {
     /// A no-op on an unknown id, so a second delete of one channel is not an
     /// error for the second window to issue it.
     DeleteChannel { id: ChannelId },
+    /// Daemon-only invalidation after a committed execution descriptor change.
+    AgentsChanged,
 }
 
 impl ModelEdit {
@@ -254,7 +260,9 @@ impl ModelEdit {
                 repository: canonical_repository(&repository)?,
                 title,
             },
-            edit @ (Self::RetitleChannel { .. } | Self::DeleteChannel { .. }) => edit,
+            edit @ (Self::RetitleChannel { .. }
+            | Self::DeleteChannel { .. }
+            | Self::AgentsChanged) => edit,
         })
     }
 }
