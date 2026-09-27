@@ -2947,7 +2947,8 @@ impl SidebarState {
             SidebarAction::ToggleProject(project_id) => {
                 toggle_membership(&mut self.collapsed_projects, *project_id);
             }
-            SidebarAction::OpenRepository { project_id, .. } => {
+            SidebarAction::OpenRepository { project_id, .. }
+            | SidebarAction::BrowsePullRequests { project_id } => {
                 self.selection = Some(SidebarSelection::Project(*project_id));
             }
             SidebarAction::OpenWorktree {
@@ -3151,6 +3152,10 @@ pub enum SidebarAction {
     NewWorktree {
         project_id: ProjectId,
         repository: PathBuf,
+    },
+    /// Opens the project's PR browser, including PRs without local worktrees.
+    BrowsePullRequests {
+        project_id: ProjectId,
     },
     /// Opens the pull request using the configured link destination.
     OpenPullRequest {
@@ -4150,6 +4155,7 @@ fn project_identity_row<'a>(
     selected: bool,
     modal_open: bool,
     compact: bool,
+    review_mode: bool,
 ) -> Element<'a, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
@@ -4160,19 +4166,29 @@ fn project_identity_row<'a>(
             selected,
         )
         .id(chrome.open_id.clone())
-        .name(if compact {
-            &*chrome.compact_open_name
+        .name(if review_mode && project.github_ready {
+            Cow::Owned(format!("Browse pull requests in {}", project.name))
+        } else if compact {
+            Cow::Borrowed(&*chrome.compact_open_name)
         } else {
-            &*chrome.open_name
+            Cow::Borrowed(&*chrome.open_name)
         })
         .on_press_maybe(gated(
-            SidebarAction::OpenRepository {
-                project_id: project.id,
-                repository: project.repository.clone(),
+            if review_mode && project.github_ready {
+                SidebarAction::BrowsePullRequests {
+                    project_id: project.id,
+                }
+            } else {
+                SidebarAction::OpenRepository {
+                    project_id: project.id,
+                    repository: project.repository.clone(),
+                }
             },
             modal_open,
         ));
-    let tip: Cow<'a, str> = if compact {
+    let tip: Cow<'a, str> = if review_mode && project.github_ready {
+        Cow::Owned(format!("Browse pull requests in {}", project.name))
+    } else if compact {
         Cow::Borrowed(&*chrome.compact_open_name)
     } else {
         Cow::Owned(project.repository.display().to_string())
@@ -4490,6 +4506,7 @@ fn project_view<'a>(
         selection == Some(SidebarSelection::Project(project_id)),
         modal_open,
         false,
+        project.state.filter == SidebarFilter::PullRequests,
     );
 
     let disclosure: Element<'a, SidebarAction> = if has_children {
@@ -4632,7 +4649,13 @@ fn compact_project<'a>(
             if project_id == entity.id
     );
     let header = context_controls(
-        project_identity_row(entity, selected, modal_open, true),
+        project_identity_row(
+            entity,
+            selected,
+            modal_open,
+            true,
+            project.state.filter == SidebarFilter::PullRequests,
+        ),
         entity.id,
         None,
         modal_open,
@@ -8349,9 +8372,10 @@ fn filtered_projects<'a>(
                 SidebarFilter::All => {
                     project_matches || !worktrees.is_empty() || !channels.is_empty()
                 }
-                SidebarFilter::Attention | SidebarFilter::PullRequests => {
-                    !worktrees.is_empty() || !channels.is_empty()
+                SidebarFilter::PullRequests => {
+                    (project_matches && project.github_ready) || !worktrees.is_empty()
                 }
+                SidebarFilter::Attention => !worktrees.is_empty() || !channels.is_empty(),
             };
             visible.then_some(FilteredProject {
                 project,
@@ -10111,7 +10135,7 @@ pub(crate) mod tests {
         // the group hands it.
         let header = |compact: bool, width: f32| {
             laid_out(
-                &mut project_identity_row(&model.projects[0], false, false, compact),
+                &mut project_identity_row(&model.projects[0], false, false, compact, false),
                 width,
             )
         };
@@ -10197,7 +10221,7 @@ pub(crate) mod tests {
         let width = design::NAVIGATION_DEFAULT_WIDTH;
         let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
         let mut element = project_header_row(
-            project_identity_row(&model.projects[0], false, false, false),
+            project_identity_row(&model.projects[0], false, false, false, false),
             vec![
                 icon_action(
                     "go-down-symbolic",
@@ -12135,6 +12159,23 @@ pub(crate) mod tests {
                     "compact={compact}, modal_open={modal_open}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn pr_browser_keeps_authenticated_projects_without_matching_worktrees() {
+        let mut entry = project();
+        entry.github_ready = true;
+        entry.pull_requests.clear();
+        entry.worktrees.clear();
+        entry.channels.clear();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState {
+            filter: SidebarFilter::PullRequests,
+            ..SidebarState::default()
+        };
+        for compact in [false, true] {
+            assert_eq!(filtered_projects(&model, &state, compact).len(), 1);
         }
     }
 

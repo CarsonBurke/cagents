@@ -819,7 +819,7 @@ fn review_panel<'a>(
     modal_open: bool,
 ) -> Element<'a, pull_request_review::Action> {
     if !review.is_open() {
-        return pull_request_review::browser(review.list(), None, modal_open);
+        return review.browser(modal_open);
     }
     let rows = vec![
         review.header(modal_open),
@@ -2244,7 +2244,15 @@ impl Editor {
         let id = self.active.unwrap();
         let tab = self.tab_mut(id).unwrap();
         let files = repository_task(tab.runtime.refresh_visible(id));
-        Task::batch([files, self.refresh_snapshot(id, false)])
+        let review = if self.sidebar_open && self.sidebar_panel == WorktreePanel::PullRequests {
+            self.handle_review(
+                id,
+                pull_request_review::Action::RefreshIfDue(std::time::Instant::now()),
+            )
+        } else {
+            Task::none()
+        };
+        Task::batch([files, review, self.refresh_snapshot(id, false)])
     }
 
     fn refresh(&mut self, id: CardId) -> Task<Message> {

@@ -727,6 +727,13 @@ pub struct ListPullRequestsRequest {
     pub limit: u16,
 }
 
+/// A cursor page, so repositories with many open PRs remain fully browsable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestPage {
+    pub pull_requests: Vec<PullRequest>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatePullRequestRequest {
     pub repository: GitHubRepoKey,
@@ -1181,6 +1188,19 @@ pub trait GitHubReviewApi: Send + Sync {
         request: &ListPullRequestsRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequest>, GitHubError>;
+
+    fn pull_request_page(
+        &self,
+        repository: &GitHubRepoKey,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError>;
+
+    fn pull_request(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequest, GitHubError>;
 }
 
 #[derive(Debug, Error)]
@@ -2201,6 +2221,56 @@ impl<E: ProcessExecutor> GitHubService<E> {
 }
 
 impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
+    fn pull_request(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequest, GitHubError> {
+        self.view(key, cancellation)
+    }
+    fn pull_request_page(
+        &self,
+        repository: &GitHubRepoKey,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestPage, GitHubError> {
+        // Creation order is stable while checks and review state change.
+        // Updated-order cursors can skip rows as older PRs receive activity.
+        let query = "query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}}} pageInfo{hasNextPage endCursor}}}}";
+        let mut variables = vec![
+            ("owner", repository.owner.as_str().into()),
+            ("name", repository.name.as_str().into()),
+        ];
+        if let Some(cursor) = cursor {
+            variables.push(("cursor", cursor.into()));
+        }
+        let data = self.graphql(repository, query, variables, cancellation)?;
+        let connection: Connection<serde_json::Value> =
+            decode_value(data.pointer("/repository/pullRequests").ok_or_else(|| {
+                GitHubError::Inspection("GitHub returned no pull request page.".into())
+            })?)?;
+        let next = if connection.page_info.has_next_page {
+            Some(next_cursor(&connection.page_info, cursor)?)
+        } else {
+            None
+        };
+        let pull_requests = connection.nodes.into_iter().map(|mut value| {
+            // The aggregate state is enough for the browser filter; the
+            // detailed review header loads individual checks on demand.
+            if let Some(state) = value.pointer("/commits/nodes/0/commit/statusCheckRollup/state").and_then(serde_json::Value::as_str).map(str::to_owned) {
+                value["statusCheckRollup"] = serde_json::json!([{
+                    "__typename":"StatusContext", "context":"All checks", "state":state, "targetUrl":null
+                }]);
+            }
+            let pull_request: PullRequest = decode_value(&value)?;
+            validate_pull_request(&pull_request, repository)?;
+            Ok(pull_request)
+        }).collect::<Result<Vec<_>, GitHubError>>()?;
+        Ok(PullRequestPage {
+            pull_requests,
+            next_cursor: next,
+        })
+    }
     fn review_context(
         &self,
         key: &PullRequestKey,
@@ -3407,6 +3477,47 @@ mod tests {
     }
 
     const THREAD_JSON: &str = r#"{"id":"PRRT_1","path":"src/lib.rs","line":12,"originalLine":12,"startLine":10,"originalStartLine":10,"diffSide":"RIGHT","startDiffSide":"RIGHT","isOutdated":false,"isResolved":false,"isCollapsed":false,"viewerCanResolve":true,"viewerCanUnresolve":false,"comments":{"nodes":[{"id":"PRRC_1","author":{"login":"me"},"body":"Draft","createdAt":"now","url":"https://github.com/owner/repo/pull/7#discussion_r1","viewerDidAuthor":true,"viewerCanUpdate":true,"viewerCanDelete":true,"commentState":"PENDING"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
+
+    #[test]
+    fn browser_reads_one_cursor_page_and_checks_repository_identity() {
+        let page = serde_json::json!({"data":{"repository":{"pullRequests":{
+            "nodes":[{"number":7,"title":"Review","state":"OPEN","headRefName":"feature","baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7","commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}}],
+            "pageInfo":{"hasNextPage":true,"endCursor":"next"}
+        }}}});
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            page.to_string().as_bytes(),
+        )]));
+        let service = GitHubService::new("gh", fake.clone());
+        let result = service
+            .pull_request_page(&repository(), Some("prior"), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(result.next_cursor.as_deref(), Some("next"));
+        assert_eq!(
+            result.pull_requests[0].check_summaries()[0].bucket.0,
+            "fail"
+        );
+        let commands = fake.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(argument_strings(&commands[0]).contains(&"cursor=prior".to_owned()));
+        drop(commands);
+
+        for (url, cursor) in [
+            ("https://github.com/other/repo/pull/7", "next"),
+            ("https://github.com/owner/repo/pull/7", "prior"),
+        ] {
+            let mut page = page.clone();
+            page["data"]["repository"]["pullRequests"]["nodes"][0]["url"] = url.into();
+            page["data"]["repository"]["pullRequests"]["pageInfo"]["endCursor"] = cursor.into();
+            let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+                page.to_string().as_bytes(),
+            )]));
+            assert!(
+                GitHubService::new("gh", fake)
+                    .pull_request_page(&repository(), Some("prior"), &CancellationToken::new())
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn graphql_sends_integers_typed_and_never_interpolates_the_number() {

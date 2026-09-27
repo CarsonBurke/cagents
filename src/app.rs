@@ -2483,6 +2483,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenRepository { .. }
                     | SidebarAction::OpenWorktree { .. }
                     | SidebarAction::OpenPullRequest { .. }
+                    | SidebarAction::BrowsePullRequests { .. }
                     | SidebarAction::NewWorktree { .. }
                     | SidebarAction::NewChannel { .. }
                     | SidebarAction::OpenChannel { .. }
@@ -4995,6 +4996,12 @@ impl Cagents {
     /// Opens the pull request a card was restored with once it can be named.
     /// Called on creation and again whenever a project's GitHub state lands.
     fn open_pending_pull_request(&mut self, card: CardId) -> Task<Message> {
+        let source = self.ensure_pull_request_source(card);
+        let open = self.open_pending_pull_request_target(card);
+        Task::batch([source, open])
+    }
+
+    fn open_pending_pull_request_target(&mut self, card: CardId) -> Task<Message> {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return Task::none();
         };
@@ -5005,15 +5012,18 @@ impl Cagents {
             return Task::none();
         };
         let Some(target) = self.pull_request_target(project, number) else {
-            // A listed project whose GitHub state is settled but does not
-            // carry the number has nothing to restore: the pull request was
-            // merged or closed since, and waiting would never end.
+            // Sidebar refreshes are bounded. A saved PR outside that first
+            // batch still deserves an exact lookup, not a silent dismissal.
             if matches!(
                 self.github_availability.get(&project),
                 Some(GitHubAvailability::Ready { .. })
             ) && let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card)
             {
                 pane.pending_number = None;
+                return self.apply_pull_request_review(
+                    card,
+                    pull_request_review::Action::OpenNumber(number),
+                );
             }
             return Task::none();
         };
@@ -5030,8 +5040,7 @@ impl Cagents {
             .iter()
             .filter_map(|(card, runtime)| match runtime {
                 CardRuntime::PullRequests(pane)
-                    if pane.pending_number.is_some()
-                        && pane.project(&self.sidebar_model) == Some(project) =>
+                    if pane.project(&self.sidebar_model) == Some(project) =>
                 {
                     Some(*card)
                 }
@@ -5070,6 +5079,47 @@ impl Cagents {
         let focus = cosmic::task::message(Message::FocusCard(card));
         let open = self.apply_pull_request_review(card, pull_request_review::Action::Open(target));
         Task::batch([created, focus, open])
+    }
+
+    fn browse_pull_requests(&mut self, project: ProjectId) -> Task<Message> {
+        let Some(project) = self.sidebar_model.project(project) else {
+            return Task::none();
+        };
+        let repository = project.repository.clone();
+        let existing = self.durable.cards.iter().find(|card| {
+            card.existence.is_open()
+                && self.durable.channels.iter().any(|channel| {
+                    Some(channel.id) == self.durable.active_channel && channel.cards.contains(&card.id)
+                })
+                && matches!(&card.kind, CardKind::PullRequests(view) if view.repository == repository)
+        });
+        let (card, created) = match existing {
+            Some(card) => (card.id, Task::none()),
+            None => self.add_pull_requests_card(repository),
+        };
+        let source = self.ensure_pull_request_source(card);
+        let close = self.apply_pull_request_review(card, pull_request_review::Action::Close);
+        Task::batch([
+            created,
+            source,
+            close,
+            cosmic::task::message(Message::FocusCard(card)),
+        ])
+    }
+
+    fn ensure_pull_request_source(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let source = pane
+            .project(&self.sidebar_model)
+            .and_then(|id| self.github_availability.get(&id))
+            .and_then(GitHubAvailability::repository_key)
+            .map(|repository| pull_request_review::ReviewSource {
+                repository: repository.clone(),
+                worktree: pane.repository.clone(),
+            });
+        self.apply_pull_request_review(card, pull_request_review::Action::SetSource(source))
     }
 
     /// Drops fetched ranges of pull requests the project's GitHub state no
@@ -5119,10 +5169,18 @@ impl Cagents {
             repository: repository.clone(),
             selected_number: None,
         };
-        let title = repository
-            .file_name()
-            .and_then(|name| normalize_card_name(&name.to_string_lossy()))
-            .map_or_else(|| "Pull requests".to_owned(), |name| format!("{name} PRs"));
+        let title = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == repository)
+            .map(|project| format!("{} PRs", project.name))
+            .unwrap_or_else(|| {
+                repository
+                    .file_name()
+                    .and_then(|name| normalize_card_name(&name.to_string_lossy()))
+                    .map_or_else(|| "Pull requests".to_owned(), |name| format!("{name} PRs"))
+            });
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -5158,7 +5216,11 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        (card_id, self.apply_viewport(update, true, false))
+        let source = self.ensure_pull_request_source(card_id);
+        (
+            card_id,
+            Task::batch([self.apply_viewport(update, true, false), source]),
+        )
     }
 
     /// Routes one review action to a pull request card and carries out what
@@ -5196,10 +5258,10 @@ impl Cagents {
                 let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
                     return Task::none();
                 };
-                let Some(target) = pane
-                    .project(&self.sidebar_model)
-                    .and_then(|project| self.pull_request_target(project, number))
-                else {
+                let Some(target) = pane.review.listed_target(number).or_else(|| {
+                    pane.project(&self.sidebar_model)
+                        .and_then(|project| self.pull_request_target(project, number))
+                }) else {
                     return Task::none();
                 };
                 pull_request_review::Action::Open(target)
@@ -5300,56 +5362,7 @@ impl Cagents {
                 .into(),
             );
             side.push(design::horizontal_rule());
-            let availability = pane
-                .project(&self.sidebar_model)
-                .and_then(|project| self.github_availability.get(&project));
-            let rows: Vec<Element<'a, pull_request_review::Action>> = match availability {
-                Some(GitHubAvailability::Ready { pull_requests, .. })
-                    if pull_requests.is_empty() =>
-                {
-                    vec![
-                        widget::container(design::caption("No open pull requests."))
-                            .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
-                            .into(),
-                    ]
-                }
-                Some(GitHubAvailability::Ready { pull_requests, .. }) => pull_requests
-                    .iter()
-                    .map(|(pull_request, _)| {
-                        pull_request_review::browser_row(pull_request, false, modal_open)
-                    })
-                    .collect(),
-                Some(availability) => vec![
-                    widget::container(
-                        design::caption(availability.label())
-                            .wrapping(iced::widget::text::Wrapping::Word),
-                    )
-                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
-                    .into(),
-                ],
-                None => vec![
-                    widget::container(
-                        design::caption("This repository is not open as a project.")
-                            .wrapping(iced::widget::text::Wrapping::Word),
-                    )
-                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
-                    .into(),
-                ],
-            };
-            side.push(
-                widget::scrollable(
-                    widget::container(widget::column::with_children(rows).spacing(0))
-                        .padding(design::with_vertical_rail(Padding::from([
-                            spacing.space_xxxs,
-                            spacing.space_xxs,
-                        ])))
-                        .width(Length::Fill),
-                )
-                .class(cosmic::style::iced::Scrollable::Minimal)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            );
+            side.push(review.browser(modal_open));
         }
         let side: Element<'a, pull_request_review::Action> = widget::container(
             widget::column::with_children(side)
@@ -11116,6 +11129,7 @@ impl Application for Cagents {
                         self.select_worktree(directory, true)
                     }
                     SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
+                    SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
                     SidebarAction::OpenPullRequest {
                         project_id,
                         number,
