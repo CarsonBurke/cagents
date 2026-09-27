@@ -160,12 +160,14 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
     let waiting = fixture.cli(&["agent", "wait", first_run, "--timeout", "10"]);
     assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
     let terminal = waiting["agent"]["console"]["id"].as_str().unwrap();
+    // PTY snapshots can split the heading from its following instructions.
+    // Wait for the actionable line before asserting the complete request.
     let displayed = fixture.cli(&[
         "terminal",
         "wait",
         terminal,
         "--text",
-        "Input requested",
+        "Use /answer console-approval",
         "--timeout",
         "10",
     ]);
@@ -173,7 +175,7 @@ fn terminal_console_answers_requests_and_submits_durable_followups() {
         displayed["snapshot"]["text"]
             .as_str()
             .unwrap()
-            .contains("/answer")
+            .contains("Input requested")
     );
     fixture.cli(&[
         "terminal",
