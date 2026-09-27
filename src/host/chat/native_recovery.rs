@@ -219,6 +219,7 @@ fn restore_reserved(
         after_generation: handle.observe_next_update(),
         ..Observation::default()
     };
+    let previous_sources = retained_upgrade_sources(sources, &session);
     let record = Record {
         execution_instance,
         console_recipe: execution_console,
@@ -245,20 +246,28 @@ fn restore_reserved(
     if let Some(context) = execution_context {
         context.installed();
     }
-    state.upgrade_chats.insert(
-        id,
-        sources
-            .into_iter()
-            .map(|source| crate::upgrade::handoff::ChatSource {
-                launch: source.launch.clone(),
-                source,
-            })
-            .collect(),
-    );
+    state.upgrade_chats.insert(id, previous_sources);
     state.inventory_generation += 1;
     drop(state);
     drop(retired);
     Ok(response)
+}
+
+fn retained_upgrade_sources(
+    sources: Vec<Session>,
+    successor: &Session,
+) -> Vec<crate::upgrade::handoff::ChatSource> {
+    sources
+        .into_iter()
+        .filter(|source| source != successor)
+        .map(|source| crate::upgrade::handoff::ChatSource {
+            // The holder authenticated these immutable aliases, including the
+            // first descriptor issued before the provider named its thread.
+            // Their effective continuation is the now-confirmed same thread.
+            launch: successor.launch.clone(),
+            source,
+        })
+        .collect()
 }
 
 pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), String> {
@@ -284,4 +293,101 @@ pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_adoption_preserves_unnamed_aliases_for_a_later_planned_upgrade() {
+        use crate::{
+            chat::{Launch, NativeContinuity, OwnedCodexListener},
+            model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
+            upgrade::handoff::{Chat, Checkpoint},
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("original"),
+            host_incarnation: HostIncarnation::new("original-incarnation"),
+            boot_id: BootId::new("same-boot"),
+        };
+        let id = TerminalId::new();
+        let socket = std::path::PathBuf::from(format!("/var/tmp/cagents-codex-{id}/control.sock"));
+        let unnamed = Session {
+            id,
+            launch: Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
+                    working_directory: "/var/tmp".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: Some(OwnedCodexListener {
+                socket,
+                allocator: proof,
+            }),
+            native_continuity: NativeContinuity::ReconnectOnly,
+        };
+        let mut confirmed = unnamed.clone();
+        confirmed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        confirmed.native_continuity = NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        chat::protocol::align_resume_identity(&mut confirmed.launch).unwrap();
+        let mut successor = confirmed.clone();
+        successor.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("successor");
+        let sources = vec![unnamed.clone(), confirmed.clone(), successor.clone()];
+        let previous_sources = retained_upgrade_sources(sources, &successor);
+        assert_eq!(previous_sources.len(), 2);
+        assert_eq!(
+            previous_sources[0].source, unnamed,
+            "issued descriptors stay immutable"
+        );
+        assert_eq!(previous_sources[1].source, confirmed);
+        let checkpoint = Checkpoint::new(
+            successor.proof.clone().unwrap(),
+            Vec::new(),
+            Vec::new(),
+            vec![Chat {
+                launch: successor.launch.clone(),
+                source: successor,
+                previous_sources,
+            }],
+        );
+        checkpoint.validate().unwrap();
+        let mut wrong_thread = checkpoint.clone();
+        wrong_thread.chats[0].previous_sources[0].launch.session_id =
+            Some(uuid::Uuid::new_v4().to_string());
+        assert!(wrong_thread.validate().is_err());
+        let mut wrong_alias_thread = checkpoint.clone();
+        wrong_alias_thread.chats[0].previous_sources[1]
+            .source
+            .launch
+            .session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(wrong_alias_thread.validate().is_err());
+        let mut old_boot = checkpoint.clone();
+        old_boot.chats[0].previous_sources[0]
+            .source
+            .proof
+            .as_mut()
+            .unwrap()
+            .boot_id = BootId::new("different-boot");
+        assert!(old_boot.validate().is_err());
+        let mut duplicate = checkpoint.clone();
+        let alias = duplicate.chats[0].previous_sources[0].clone();
+        duplicate.chats[0].previous_sources.push(alias);
+        assert!(duplicate.validate().is_err());
+        let mut ordinary = checkpoint;
+        ordinary.chats[0].source.native_continuity = NativeContinuity::ReconnectOnly;
+        assert!(
+            ordinary.validate().is_err(),
+            "ordinary relaunches still require distinct daemon proofs"
+        );
+    }
 }

@@ -651,6 +651,11 @@ pub(crate) mod handoff {
                     return Err("Upgrade native source identity is inconsistent".into());
                 }
                 let mut proofs = Vec::new();
+                let durable = matches!(
+                    chat.source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                );
+                let mut aliases = Vec::new();
                 for (previous, next) in chat.previous_sources.iter().zip(
                     chat.previous_sources
                         .iter()
@@ -658,9 +663,31 @@ pub(crate) mod handoff {
                         .map(|previous| &previous.source)
                         .chain(std::iter::once(&chat.source)),
                 ) {
-                    source_proof(previous.source.proof.clone(), &mut proofs)?;
+                    if durable {
+                        // A retained native owner can issue several descriptors
+                        // under one daemon proof (thread confirmation, paired
+                        // view publication). These are exact aliases, not a
+                        // sequence of provider relaunches.
+                        if previous.source.proof.as_ref().is_none_or(|proof| {
+                            !proof.is_complete() || proof.boot_id != self.proof.boot_id
+                        }) || aliases.contains(&&previous.source)
+                            || previous.source == chat.source
+                            || previous
+                                .source
+                                .launch
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|id| Some(id) != chat.launch.session_id.as_ref())
+                        {
+                            return Err("Upgrade native alias ownership is inconsistent".into());
+                        }
+                        aliases.push(&previous.source);
+                    } else {
+                        source_proof(previous.source.proof.clone(), &mut proofs)?;
+                    }
                     validate_chat_source(&previous.source, &previous.launch)?;
-                    if previous.source.id != chat.source.id || previous.launch != next.launch {
+                    let expected_launch = if durable { &chat.launch } else { &next.launch };
+                    if previous.source.id != chat.source.id || &previous.launch != expected_launch {
                         return Err("Upgrade native lineage is inconsistent".into());
                     }
                 }
