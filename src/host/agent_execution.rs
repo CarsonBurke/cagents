@@ -113,8 +113,9 @@ pub(super) fn submit(
     }
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
+        let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
         selected.target.repository =
-            crate::workspace_model::canonical_repository(&spec.target.repository)?;
+            crate::project_location::resolve(&spec.target.repository, Some(&model))?.key;
         selected.target.directory =
             std::fs::canonicalize(&spec.target.directory).map_err(|e| e.to_string())?;
         if !selected.target.directory.is_dir() {

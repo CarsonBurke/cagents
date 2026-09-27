@@ -33,7 +33,7 @@ impl Fixture {
                 "PATH",
                 format!("{}:/usr/bin:/bin", root.join("bin").display()),
             )
-            .current_dir(root.join("project"))
+            .current_dir(root)
             .stdin(Stdio::null());
         command
     }
@@ -286,4 +286,77 @@ fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
         fixture.cli(&["agent", "close", agent])["agent"]["closed"],
         true
     );
+}
+
+#[test]
+fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let worktree = fixture.root.path().join("linked");
+    for arguments in [
+        vec!["init", "--initial-branch=main"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+        vec![
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            worktree.to_str().unwrap(),
+        ],
+    ] {
+        let output = Fixture::command(fixture.root.path(), Path::new("/usr/bin/git"))
+            .current_dir(&project)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let opened = fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let key = opened["project"]["repository"].clone();
+    let mut first = None;
+    for (path, request_key) in [(&project, "checkout"), (&worktree, "worktree")] {
+        let path = path.to_str().unwrap();
+        let arguments = [
+            "agent",
+            "spawn",
+            "--provider",
+            "claude",
+            "--repository",
+            path,
+            "--directory",
+            path,
+            "--prompt",
+            "wait for consent",
+            "--idempotency-key",
+            request_key,
+        ];
+        let accepted = fixture.cli(&arguments);
+        assert_eq!(accepted["agent"]["spec"]["target"]["repository"], key);
+        assert_eq!(accepted["agent"]["spec"]["target"]["directory"], path);
+        let agent = accepted["agent"]["id"].as_str().unwrap();
+        let run = accepted["run"]["id"].as_str().unwrap();
+        assert_eq!(
+            fixture.cli(&["agent", "wait", run, "--timeout", "10"])["run"]["state"],
+            "Waiting"
+        );
+        fixture.cli(&["agent", "close", agent]);
+        if request_key == "checkout" {
+            first = Some((accepted, arguments.map(str::to_owned)));
+        }
+    }
+    fs::rename(&project, fixture.root.path().join("retired-project")).unwrap();
+    let (first, arguments) = first.unwrap();
+    let retry = fixture.cli(&arguments.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(retry["created"], false);
+    assert_eq!(retry["agent"]["id"], first["agent"]["id"]);
+    assert_eq!(retry["run"]["id"], first["run"]["id"]);
 }
