@@ -179,7 +179,10 @@ mod tests {
             ).unwrap();
         }
         let store = StateStore::open(&path, crate::model::BootId::new("boot")).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            crate::persistence::CURRENT_SCHEMA_VERSION
+        );
         for number in 1..=33 {
             let mut snapshot = cache::fixture();
             snapshot.key.number = number;
