@@ -1376,7 +1376,6 @@ mod tests {
     #[test]
     fn only_missing_or_refused_socket_connections_retire_the_whole_handoff_batch() {
         use crate::control::{ControlClient, ControlError};
-        use std::os::unix::net::UnixListener;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let terminals = [handoff_terminal(), handoff_terminal()];
@@ -1384,14 +1383,20 @@ mod tests {
             acknowledge_terminal_handoffs_on(ControlClient::connect(&socket), &terminals),
             vec![Ok(()), Ok(())]
         );
-        let listener = UnixListener::bind(&socket).unwrap();
-        drop(listener);
+        // Inject refusal explicitly: parallel subprocesses can briefly inherit a
+        // listener before exec, so dropping it does not guarantee immediate refusal.
         assert_eq!(
-            acknowledge_terminal_handoffs_on(ControlClient::connect(&socket), &terminals),
+            acknowledge_terminal_handoffs_on(
+                Err(ControlError::Connect(io::Error::from(
+                    io::ErrorKind::ConnectionRefused
+                ))),
+                &terminals,
+            ),
             vec![Ok(()), Ok(())]
         );
         for error in [
             ControlError::Connect(io::Error::from(io::ErrorKind::PermissionDenied)),
+            ControlError::Connect(io::Error::from(io::ErrorKind::ConnectionReset)),
             ControlError::Configure(io::Error::from(io::ErrorKind::NotFound)),
             ControlError::ProofMismatch,
             ControlError::ConnectionClosed,
