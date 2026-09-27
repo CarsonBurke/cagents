@@ -9421,6 +9421,26 @@ mod row_interaction {
                 }
                 return;
             }
+            // Keep bulk selection visible with the same neutral vocabulary as
+            // navigation selection, without outlining the whole row in accent.
+            if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
+                if let Some(clip) = layout.bounds().intersection(viewport) {
+                    renderer.with_layer(clip, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: layout.bounds().shrink(1.0),
+                                border: cosmic::iced::Border {
+                                    radius: 3.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            cosmic::iced::Color::from(theme.current_container().on)
+                                .scale_alpha(0.10),
+                        );
+                    });
+                }
+            }
             for (index, ((child, tree), layout)) in self
                 .children
                 .iter()
@@ -9443,24 +9463,6 @@ mod row_interaction {
                     child
                         .as_widget()
                         .draw(tree, renderer, theme, style, layout, cursor, viewport);
-                }
-            }
-            if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
-                if let Some(clip) = layout.bounds().intersection(viewport) {
-                    renderer.with_layer(clip, |renderer| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: layout.bounds().shrink(1.0),
-                                border: cosmic::iced::Border {
-                                    color: crate::design::accent_color(theme),
-                                    width: 1.0,
-                                    radius: 3.0.into(),
-                                },
-                                ..Default::default()
-                            },
-                            cosmic::iced::Color::TRANSPARENT,
-                        );
-                    });
                 }
             }
             if let Some((_, y)) = state.drop {
