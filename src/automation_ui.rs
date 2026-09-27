@@ -461,6 +461,10 @@ impl State {
             if let Some(automation) = &self.selected {
                 return self.request(Pending::Show, Request::Show { id: automation.id });
             }
+            if self.all_history {
+                // Keep paged history stable until an explicit refresh.
+                return None;
+            }
             if self.rows.len() <= PAGE {
                 return self.request(
                     Pending::List { append: false },
@@ -509,6 +513,16 @@ impl State {
             Action::Refresh => {
                 if let Some(run) = &self.run {
                     return self.request(Pending::Run, Request::ShowFiring { id: run.firing.id });
+                }
+                if self.all_history {
+                    return self.request(
+                        Pending::History { append: false },
+                        Request::History {
+                            id: None,
+                            before: None,
+                            limit: PAGE,
+                        },
+                    );
                 }
                 return self.request(
                     Pending::List { append: false },
@@ -1272,6 +1286,19 @@ mod tests {
         };
         assert!(state.selected.is_none());
         assert!(state.all_history);
+        state.pending = None;
+        assert!(state.update(Action::Tick).is_none());
+        assert!(matches!(
+            state.update(Action::Refresh),
+            Some(Effect::Request {
+                request: Request::History {
+                    id: None,
+                    before: None,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
