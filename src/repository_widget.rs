@@ -1547,6 +1547,7 @@ pub struct RepositoryRuntime {
     working_diff: WorkingDiffRefresh,
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
+    pending_fragment: Option<String>,
     diff_mode: DiffMode,
     committed_selection: Option<(DiffBasis, Option<PathBuf>)>,
     diff_basis: DiffBasis,
@@ -1657,8 +1658,8 @@ impl RepositoryRuntime {
     pub fn new(descriptor: RepositoryView) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
+            directory_only: descriptor.selected_file.is_some(),
             descriptor,
-            directory_only: false,
             standalone: false,
             external_editors: Vec::new(),
             generation: 0,
@@ -1685,6 +1686,7 @@ impl RepositoryRuntime {
             next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
+            pending_fragment: None,
             committed_selection: None,
             diff_mode: DiffMode::Inline,
             diff_basis: DiffBasis::IndexToWorktree,
@@ -1996,6 +1998,7 @@ impl RepositoryRuntime {
     pub(crate) fn post_persist_failure_fixture(card: CardId) -> (Self, RepositoryAction) {
         let path = PathBuf::from("notes.txt");
         let descriptor = RepositoryView {
+            selected_file: None,
             project: crate::model::ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -2148,6 +2151,7 @@ impl RepositoryRuntime {
     pub(crate) fn selection_fixture(card: CardId, name: &str) -> (Self, AsyncIdentity) {
         let path = PathBuf::from(name);
         let descriptor = RepositoryView {
+            selected_file: None,
             project: crate::model::ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -2227,6 +2231,14 @@ impl RepositoryRuntime {
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if let Some(path) = self.descriptor.selected_file.clone() {
+            return if self.blocks_navigation() {
+                Task::none()
+            } else {
+                self.files = FileListState::Ready(Vec::new());
+                self.open_file(card, path)
+            };
+        }
         if self.file_list_read_outstanding() {
             self.file_list_refresh_queued = true;
             return Task::none();
@@ -2241,9 +2253,27 @@ impl RepositoryRuntime {
         self.load_files(card)
     }
 
+    /// Reuses a clean file pane without resetting async generations: an older
+    /// read must not win after links switch A → B → A before loading finishes.
+    pub(crate) fn retarget_file(
+        &mut self,
+        card: CardId,
+        view: RepositoryView,
+    ) -> Task<RepositoryAction> {
+        if self.descriptor.selected_file.is_none() || self.blocks_navigation() {
+            return Task::none();
+        }
+        self.descriptor = view;
+        self.retained_viewports.clear();
+        self.initial_load(card)
+    }
+
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.descriptor.selected_file.is_some() {
+            return Task::none();
+        }
         if self.file_list_read_outstanding() {
             return Task::none();
         }
@@ -2865,6 +2895,10 @@ impl RepositoryRuntime {
     }
 
     pub fn preview_fragment(&mut self, card: CardId, fragment: &str) -> Task<RepositoryAction> {
+        if matches!(self.document, DocumentState::Loading) {
+            self.pending_fragment = Some(fragment.to_owned());
+            return Task::none();
+        }
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
         };
@@ -3529,7 +3563,9 @@ impl RepositoryRuntime {
             can_change_diff_layout: self.can_change_diff_layout(),
             can_select_staged_diff: self.can_select_diff_basis(&DiffBasis::HeadToIndex),
             can_select_unstaged_diff: self.can_select_diff_basis(&DiffBasis::IndexToWorktree),
-            can_back: selected && !self.blocks_navigation(),
+            can_back: selected
+                && self.descriptor.selected_file.is_none()
+                && !self.blocks_navigation(),
         }
     }
 
@@ -3910,7 +3946,13 @@ impl RepositoryRuntime {
                 } else {
                     Task::none()
                 };
-                Task::batch([retone, self.restore_visible_scroll(), reload])
+                let fragment = self
+                    .pending_fragment
+                    .take()
+                    .map_or_else(Task::none, |fragment| {
+                        self.preview_fragment(identity.card, &fragment)
+                    });
+                Task::batch([retone, self.restore_visible_scroll(), reload, fragment])
             }
             RepositoryAction::PdfTone { card, tone } => {
                 let DocumentState::Pdf {
@@ -4310,7 +4352,7 @@ impl RepositoryRuntime {
                 self.markdown_task(card)
             }
             RepositoryAction::BackToFiles { card } => {
-                if self.blocks_navigation() {
+                if self.descriptor.selected_file.is_some() || self.blocks_navigation() {
                     return Task::none();
                 }
                 self.retain_viewports();
@@ -4756,7 +4798,9 @@ impl RepositoryRuntime {
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
-            None if (self.standalone || self.directory_only)
+            None if (self.standalone
+                || self.directory_only
+                || self.descriptor.selected_file.is_some())
                 && crate::repository::RepoPath::parse(&path).is_ok() =>
             {
                 RepositoryFile {
@@ -4775,6 +4819,10 @@ impl RepositoryRuntime {
     }
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
+        self.pending_fragment = None;
+        if self.descriptor.selected_file.is_some() {
+            self.descriptor.selected_file = Some(file.path.clone());
+        }
         let path = file.path.clone();
         let reopening = self.selected.as_ref().is_some_and(|file| file.path == path);
         // Take the destination before retaining the departing file, which may
@@ -7690,6 +7738,45 @@ fn information_state<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retargeted_file_panes_reject_old_reads_even_after_returning_to_the_same_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "old contents").unwrap();
+        let card = crate::model::CardId::new();
+        let view = RepositoryView {
+            project: crate::model::ProjectId::new(),
+            repository: directory.path().to_path_buf(),
+            worktree: directory.path().to_path_buf(),
+            selected_file: Some("a.txt".into()),
+        };
+        let mut runtime = RepositoryRuntime::new(view.clone());
+        drop(runtime.initial_load(card));
+        let old = RepositoryAction::FileLoaded {
+            identity: runtime.current_identity(card, "a.txt".into()),
+            result: load_file(
+                directory.path(),
+                Path::new("a.txt"),
+                crate::editor::PdfTone::Original,
+            ),
+        };
+        let mut other = view.clone();
+        other.selected_file = Some("b.txt".into());
+        drop(runtime.retarget_file(card, other));
+        std::fs::write(directory.path().join("a.txt"), "new contents").unwrap();
+        drop(runtime.retarget_file(card, view));
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity: runtime.current_identity(card, "a.txt".into()),
+            result: load_file(
+                directory.path(),
+                Path::new("a.txt"),
+                crate::editor::PdfTone::Original,
+            ),
+        }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("new contents"));
+        drop(runtime.update(old));
+        assert_eq!(runtime.editor_text().as_deref(), Some("new contents"));
+        assert!(!runtime.inspector_context().can_back);
+    }
     use std::collections::BTreeSet;
 
     use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
@@ -9202,6 +9289,7 @@ mod tests {
     #[test]
     fn save_completion_keeps_edits_made_while_the_write_was_in_flight_dirty() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9409,6 +9497,7 @@ mod tests {
     #[test]
     fn obsolete_save_completion_cannot_change_document_or_release_navigation_fence() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9498,6 +9587,7 @@ mod tests {
         });
         document.dirty = false;
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9511,6 +9601,7 @@ mod tests {
     #[test]
     fn active_save_rejects_open_reload_and_discard_transitions() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9716,6 +9807,7 @@ mod tests {
     #[test]
     fn file_list_refresh_does_not_obsolete_a_pending_document_load() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9788,6 +9880,7 @@ mod tests {
     #[test]
     fn file_list_refresh_does_not_obsolete_an_active_save() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9850,6 +9943,7 @@ mod tests {
     #[test]
     fn starting_a_save_preserves_the_diff_review_surface() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -9977,6 +10071,7 @@ mod tests {
     #[test]
     fn inspector_projection_tracks_loading_conflict_and_active_diff_facts() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -10074,6 +10169,7 @@ mod tests {
     #[test]
     fn direct_diff_basis_action_cannot_select_an_absent_basis() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -10101,6 +10197,7 @@ mod tests {
     fn successful_save_invalidates_hidden_diff_then_loads_fresh_changes_on_demand() {
         for tracked in [true, false] {
             let view = RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo/.git"),
                 worktree: PathBuf::from("/repo"),
@@ -10186,6 +10283,7 @@ mod tests {
     #[test]
     fn diff_completions_are_fenced_per_basis_and_preserve_the_active_viewport() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -10262,6 +10360,7 @@ mod tests {
     #[test]
     fn stale_file_completion_cannot_replace_current_selection() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -10342,6 +10441,7 @@ mod tests {
     #[test]
     fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -12343,6 +12443,7 @@ mod tests {
     /// observable.
     fn diff_runtime(card: CardId) -> (RepositoryRuntime, AsyncIdentity) {
         let mut runtime = RepositoryRuntime::new(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -12632,6 +12733,7 @@ mod tests {
         use cosmic::iced::{Color, Rectangle, Size};
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: "/repo/.git".into(),
             worktree: "/repo".into(),
@@ -12750,6 +12852,7 @@ mod tests {
     fn empty_selection_reports_file_listing_state() {
         let card = CardId::new();
         let view = RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
             worktree: PathBuf::from("/repo"),
@@ -12998,6 +13101,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: root.path().to_path_buf(),
             worktree: root.path().to_path_buf(),
@@ -13125,6 +13229,7 @@ mod tests {
         std::fs::write(root.path().join("nested/child.txt"), "b").unwrap();
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: root.path().to_path_buf(),
             worktree: root.path().to_path_buf(),

@@ -1401,6 +1401,7 @@ impl Editor {
         };
         let descriptor_root = opened.root.clone();
         let descriptor = RepositoryView {
+            selected_file: None,
             project,
             repository: opened.root.clone(),
             worktree: opened.root.clone(),

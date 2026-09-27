@@ -144,6 +144,7 @@ impl RestoreFixture {
                     exposure: Exposure::Offscreen,
                     residency: Residency::Cold,
                     kind: CardKind::Repository(RepositoryView {
+                        selected_file: None,
                         project: project_id,
                         repository: repository_path,
                         worktree: worktree_path,
@@ -347,6 +348,25 @@ fn changed_boot_reopens_terminal_as_relaunchable_not_live() {
     );
     assert!(!terminal.continuity.can_resume_live(&fixture.proof));
 
+    reopened.shutdown().unwrap();
+}
+
+#[test]
+fn dedicated_file_descriptor_survives_sqlite_session_restore() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("session.sqlite3");
+    let mut fixture = RestoreFixture::new();
+    let CardKind::Repository(view) = &mut fixture.workspace.cards[2].kind else {
+        panic!()
+    };
+    view.selected_file = Some(PathBuf::from("results/report one.html"));
+    fixture.persist(&database);
+    let reopened = StateStore::open(&database, fixture.boot_id.clone()).unwrap();
+    let restored = reopened
+        .load_workspace(fixture.workspace.id, Some(&fixture.proof))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.cards[2].kind, fixture.workspace.cards[2].kind);
     reopened.shutdown().unwrap();
 }
 

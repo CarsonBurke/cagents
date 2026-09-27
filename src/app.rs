@@ -9,6 +9,7 @@ mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
 pub(crate) mod dialog_ui;
+mod file_ui;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -2340,6 +2341,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::CloseCard(_)
         | Message::OpenBrowser(_)
         | Message::OpenLink(..)
+        | Message::OpenDocumentLink(..)
+        | Message::PreviewLocalFile(_)
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
@@ -2454,6 +2457,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::OpenLink(..)
+            | Message::OpenDocumentLink(..)
+            | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
@@ -3252,7 +3257,9 @@ pub enum Message {
         token: Option<String>,
     },
     OpenBrowser(Url),
-    OpenLink(Url, LinkOpenGesture),
+    OpenLink(CardId, Url, LinkOpenGesture),
+    OpenDocumentLink(CardId, String),
+    PreviewLocalFile(CardId),
     OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
@@ -4914,6 +4921,7 @@ impl Cagents {
             .find(|project| project.repository == view.repository)
             .map_or_else(ProjectId::new, |project| project.id);
         let mut runtime = RepositoryRuntime::new(RepositoryView {
+            selected_file: None,
             project,
             repository: view.repository.clone(),
             worktree: view.repository.clone(),
@@ -5422,6 +5430,7 @@ impl Cagents {
     ) -> Task<Message> {
         let card_id = CardId::new();
         let view = RepositoryView {
+            selected_file: None,
             project,
             repository,
             worktree: worktree.clone(),
@@ -5477,6 +5486,9 @@ impl Cagents {
     }
 
     fn open_link_in(&mut self, url: Url, destination: LinkOpenDestination) -> Task<Message> {
+        if url.scheme() == "file" {
+            return self.open_document_link(self.workspace.focused(), url.as_str());
+        }
         match destination {
             LinkOpenDestination::IntegratedBrowser => self.add_browser(url),
             LinkOpenDestination::SystemDefault => cosmic::task::future(async move {
@@ -7262,7 +7274,12 @@ impl Cagents {
             "Retry"
         };
         let content: Element<'a, Message> = match self.cards.get(&id) {
-            Some(CardRuntime::Chat(_)) => self.chat_view(id),
+            Some(CardRuntime::Chat(_)) => self.chat_view(id).map(move |message| match message {
+                Message::ChatUi(chat_ui::Action::OpenUrl(uri)) => {
+                    Message::OpenDocumentLink(id, uri)
+                }
+                message => message,
+            }),
             Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
                 TerminalWidget::new(handle.clone())
                     .read_only(ended_terminal(card).is_some() || self.terminal_close_pending(id))
@@ -7283,7 +7300,7 @@ impl Cagents {
                     ))
                     .model_focused(card_focused)
                     .on_focus(Message::FocusCard(id))
-                    .on_open_link(Message::OpenLink)
+                    .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
                     .on_command_error(move |error| Message::TerminalError {
                         card: id,
                         message: error.to_string(),
@@ -7461,6 +7478,20 @@ impl Cagents {
             && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
         {
             rows.push(toolbar.map(Message::Repository));
+            if runtime
+                .selected_path()
+                .and_then(Path::extension)
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+                })
+            {
+                rows.push(
+                    widget::button::text("Preview HTML")
+                        .on_press(Message::PreviewLocalFile(id))
+                        .into(),
+                );
+            }
             rows.push(design::horizontal_rule());
         }
         if let Some(toolbar) = browser_toolbar {
@@ -7822,7 +7853,7 @@ impl Cagents {
                         .find(|channel| channel.cards.contains(&card.id))
                         .map(|channel| channel.id)
                         == self.durable.active_channel
-                    && matches!(&card.kind, CardKind::Repository(view) if view.worktree == worktree)
+                    && matches!(&card.kind, CardKind::Repository(view) if view.selected_file.is_none() && view.worktree == worktree)
             })
             .map(|card| card.id)
     }
@@ -10810,16 +10841,8 @@ impl Application for Cagents {
                     _ => Task::none(),
                 }
             }
-            Message::Repository(RepositoryAction::MarkdownLink { uri, .. }) => {
-                match Url::parse(&uri) {
-                    Ok(url) => self.open_clicked_link(url),
-                    Err(_) => {
-                        self.status = Some(TransientNotice::error(
-                            "could not open Markdown link: invalid absolute URL",
-                        ));
-                        Task::none()
-                    }
-                }
+            Message::Repository(RepositoryAction::MarkdownLink { card, uri }) => {
+                self.open_document_link(Some(card), &uri)
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
@@ -10912,6 +10935,21 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                let selected_view = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime))
+                        if runtime.descriptor.selected_file.is_some() =>
+                    {
+                        Some(runtime.descriptor.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(view) = selected_view
+                    && let Some(state) = self.card_state_mut(card)
+                    && state.kind != CardKind::Repository(view.clone())
+                {
+                    state.kind = CardKind::Repository(view);
+                    self.persist();
+                }
                 if files_loaded {
                     tasks.push(self.flush_pending_panel_open(card));
                 }
@@ -11941,9 +11979,15 @@ impl Application for Cagents {
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::OpenBrowser(url) => self.add_browser(url),
-            Message::OpenLink(url, gesture) => {
-                self.open_link_in(url, self.settings.link_destination(Some(gesture)))
+            Message::OpenLink(card, url, gesture) => {
+                if url.scheme() == "file" {
+                    self.open_document_link(Some(card), url.as_str())
+                } else {
+                    self.open_link_in(url, self.settings.link_destination(Some(gesture)))
+                }
             }
+            Message::OpenDocumentLink(card, uri) => self.open_document_link(Some(card), &uri),
+            Message::PreviewLocalFile(card) => self.preview_local_file(card),
             Message::OpenTerminalOutput(card) => {
                 let url = ended_terminal(self.card_state(card))
                     .and_then(|session| session.transcript_path.as_ref())
@@ -15673,6 +15717,7 @@ mod tests {
                     card,
                     CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
                         RepositoryView {
+                            selected_file: None,
                             project: ProjectId::new(),
                             repository: directory.path().to_path_buf(),
                             worktree: directory.path().to_path_buf(),
@@ -16004,6 +16049,7 @@ mod tests {
                 .find(|state| state.id == card)
                 .expect("the focused card is durable");
             state.kind = CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo/.git"),
                 worktree: PathBuf::from("/repo"),
@@ -16428,6 +16474,7 @@ mod tests {
             Message::NewTerminal,
             Message::NewBrowser,
             Message::OpenLink(
+                focused,
                 Url::parse("https://example.com").unwrap(),
                 crate::settings::LinkOpenGesture::ControlShiftClick,
             ),
@@ -18472,6 +18519,7 @@ mod tests {
             CardRuntime::Repository(Box::new(
                 repository_widget::RepositoryRuntime::file_list_fixture(
                     RepositoryView {
+                        selected_file: None,
                         project: ProjectId::new(),
                         repository: PathBuf::from(worktree),
                         worktree: PathBuf::from(worktree),
@@ -19651,6 +19699,7 @@ mod tests {
         assert_eq!(key.project_id, project);
         assert!(
             app.repository_runtime(RepositoryView {
+                selected_file: None,
                 project,
                 repository: root.clone(),
                 worktree: root.clone(),
@@ -19889,6 +19938,7 @@ mod tests {
         let kinds = [
             terminal,
             CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo"),
                 worktree: PathBuf::from("/repo"),
@@ -20073,6 +20123,7 @@ mod tests {
     #[test]
     fn restored_static_cards_do_not_block_visible_terminal_admission() {
         let static_kind = CardKind::Repository(RepositoryView {
+            selected_file: None,
             project: ProjectId::new(),
             repository: PathBuf::from("/repository"),
             worktree: PathBuf::from("/repository/worktree"),
@@ -20579,6 +20630,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Hot,
             kind: CardKind::Repository(RepositoryView {
+                selected_file: None,
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo"),
                 worktree: PathBuf::from("/repo"),

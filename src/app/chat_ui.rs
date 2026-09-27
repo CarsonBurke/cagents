@@ -4426,12 +4426,12 @@ impl Cagents {
                 }
             }
             Action::OpenUrl(raw) => match Url::parse(&raw) {
-                Ok(url) if matches!(url.scheme(), "https" | "http") => {
+                Ok(url) if matches!(url.scheme(), "https" | "http" | "file") => {
                     return self.open_clicked_link(url);
                 }
                 _ => {
                     self.status = Some(TransientNotice::error(
-                        "Only explicit HTTP and HTTPS links can be opened from chat.",
+                        "Only explicit HTTP, HTTPS, and local file links can be opened from chat.",
                     ))
                 }
             },

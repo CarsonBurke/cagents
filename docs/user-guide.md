@@ -331,6 +331,11 @@ the source for resumed history.
   start selections.
 - Ctrl-click an HTTP or HTTPS address in a terminal to open it using the
   configured link behavior.
+- Ctrl-click a local `file://` address in a terminal, or follow one in chat,
+  to open an editor beside the current pane. A visible clean file editor is
+  reused; unsaved buffers stay open. HTML opens as source; **Preview HTML**
+  opens the saved file in the integrated browser, or the system browser in
+  browserless builds. The selected file is restored with the workspace.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
   focused; Cancel or Escape keeps the pane. The close button and `Ctrl+W`
