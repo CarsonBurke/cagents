@@ -936,7 +936,8 @@ fn create_console(
             }
             if terminal.as_ref().is_some_and(|(source, handle)| {
                 state.terminals.get(&session.id).is_some_and(|record| {
-                    record.session == *source && record.handle.same_worker(handle)
+                    super::chat::matches_paired_terminal(&record.session, source, state.proof())
+                        && record.handle.same_worker(handle)
                 })
             }) {
                 state.retire_terminal(session.id);
