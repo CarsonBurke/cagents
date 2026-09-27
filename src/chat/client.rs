@@ -499,6 +499,29 @@ impl ClientHandle {
             source,
             terminate_source,
             selection,
+            None,
+            wake,
+        )
+    }
+
+    pub fn recover_account(
+        source: Session,
+        replacement: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if !super::is_account_recovery(&source, &replacement) {
+            return Err("Account recovery changed the saved conversation".into());
+        }
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        Self::connect_on(
+            stream,
+            replacement,
+            Intent::Start,
+            None,
+            false,
+            None,
+            Some(source),
             wake,
         )
     }
@@ -510,6 +533,7 @@ impl ClientHandle {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         selection: Option<String>,
+        account_recovery: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
@@ -554,7 +578,14 @@ impl ClientHandle {
         }
         let id = session.id;
         let mut attach_request = 2;
-        let request = if let Some(token) = selection {
+        let request = if let Some(source) = account_recovery {
+            let execution_environment = native_environment(&session, true);
+            ClientRequest::ChatRecoverAccount {
+                source,
+                replacement: session,
+                execution_environment,
+            }
+        } else if let Some(token) = selection {
             if intent != Intent::Start || terminate_source {
                 return Err("Selected conversation activation requires a non-destructive shared-server attachment".into());
             }
@@ -632,7 +663,14 @@ impl ClientHandle {
                     break (session, snapshot);
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
-                    return Err(error.message.into());
+                    return Err(StartFailure {
+                        message: error.message,
+                        recovery: if error.code == ipc::ProtocolErrorCode::AccountRemoved {
+                            super::Recovery::Account
+                        } else {
+                            super::Recovery::Retry
+                        },
+                    });
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
@@ -1903,8 +1941,16 @@ mod tests {
                 answer(start.request),
             );
         });
-        let result =
-            ClientHandle::connect_on(client, session, Intent::Restore, None, false, None, |_| {});
+        let result = ClientHandle::connect_on(
+            client,
+            session,
+            Intent::Restore,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        );
         worker.join().unwrap();
         result
     }

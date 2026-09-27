@@ -27,6 +27,7 @@ host = [
     "dep:libghostty-vt",
     "dep:portable-pty",
     "dep:rusqlite",
+    "dep:tempfile",
     "dep:tokio",
     "dep:tracing-subscriber",
     "dep:tungstenite",

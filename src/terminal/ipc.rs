@@ -83,7 +83,8 @@ use crate::{
 /// Version 22 carries daemon-issued owned Codex listener evidence in chat and
 /// terminal descriptors; postcard fields require a matched daemon and UI.
 /// Version 23 carries explicit environment removals in launch recipes.
-pub const PROTOCOL_VERSION: u16 = 23;
+/// Version 24 adds provider-confirmed account recovery and removed-account errors.
+pub const PROTOCOL_VERSION: u16 = 24;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -216,6 +217,13 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         source: Option<HostSessionProof>,
         terminate_source: bool,
+        execution_environment: ChatExecutionEnvironment,
+    },
+    /// Explicitly try the exact saved conversation on a different account.
+    /// The reply is gated on provider-confirmed identity, not the launch hint.
+    ChatRecoverAccount {
+        source: crate::chat::Session,
+        replacement: crate::chat::Session,
         execution_environment: ChatExecutionEnvironment,
     },
     ChatAttach {
@@ -679,6 +687,7 @@ impl ProtocolError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolErrorCode {
+    AccountRemoved,
     UnsupportedVersion,
     HandshakeRequired,
     AlreadyConnected,

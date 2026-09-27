@@ -919,10 +919,21 @@ impl Worker {
                     .retain(|effect| matches!(effect, Effect::Title(_)));
                 (adopted.held, adopted.output)
             }
-            None => (
-                holder::spawn(command, pty_size(current_size), child_exit_tx)?,
-                Vec::new(),
-            ),
+            None => {
+                let environment = crate::account::Account::PROVIDERS
+                    .into_iter()
+                    .filter_map(|provider| {
+                        let name = crate::account::home_variable(provider)?;
+                        Some((name.to_owned(), command.get_env(name)?.to_str()?.to_owned()))
+                    })
+                    .collect();
+                let _account = crate::account::registry::authorize_spawn(&environment, None)
+                    .map_err(|error| error.to_string())?;
+                (
+                    holder::spawn(command, pty_size(current_size), child_exit_tx)?,
+                    Vec::new(),
+                )
+            }
         };
         // The holder reaps the root, so its pid identifies it only while the
         // pidfd still reaches an unreaped process: checked after the capture,
@@ -4263,6 +4274,66 @@ mod tests {
         assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("0")));
         assert_eq!(command.get_env("CLICOLOR_FORCE"), Some(OsStr::new("1")));
         assert_eq!(command.get_env("COLORFGBG"), Some(OsStr::new("0;15")));
+    }
+
+    #[test]
+    fn removed_managed_home_cannot_relaunch_from_final_pty_environment() {
+        const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_PTY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            for mode in ["inherited", "returned"] {
+                assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "terminal::worker::tests::removed_managed_home_cannot_relaunch_from_final_pty_environment", "--nocapture"])
+                    .env_clear().env(CHILD, mode).env("HOME", directory.path())
+                    .env("XDG_DATA_HOME", directory.path().join("data"))
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("CODEX_HOME", directory.path().join("data").join(crate::instance::STORAGE_NAME).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
+                    .status().unwrap().success());
+            }
+            return;
+        }
+        let homes = crate::account::home::Homes::installation().unwrap();
+        let home = homes.path(
+            crate::agent::Provider::Codex,
+            uuid::Uuid::parse_str("12345678-1234-4234-8234-123456789abc").unwrap(),
+        );
+        // The child would recreate this absent home if authorization accidentally
+        // inspected only the durable recipe rather than the actual launch.
+        let mut recipe = env_recipe(BTreeMap::new());
+        recipe.arguments = vec!["-c".into(), "mkdir -p \"$CODEX_HOME\"".into()];
+        let returned = std::env::var(CHILD).unwrap() == "returned";
+        let config = TerminalConfig {
+            execution_environment: returned.then(|| {
+                crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    home.to_str().unwrap().into(),
+                )]))
+            }),
+            ..TerminalConfig::default()
+        };
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            id: crate::model::TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (_tx, commands) = command_channel(1);
+        let (events, _receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let failure = Worker::start(session, config, commands, events, published)
+            .err()
+            .expect("removed account blocks PTY creation");
+        assert!(failure.contains("removed"), "{failure}");
+        assert!(
+            !home.exists(),
+            "the CLI must never recreate the removed home"
+        );
     }
 
     #[test]

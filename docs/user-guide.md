@@ -203,6 +203,20 @@ The Accounts pane also explains which settings new provider homes share or copy.
 See [Account configuration](account-configuration.md) for Claude settings and MCP
 copies, Codex's independent configuration option, and keyring isolation.
 
+Removing a managed account prevents new launches and probes from recreating its
+home. Existing processes remain attachable. If a saved chat needs that removed
+account, its error offers other accounts from the same provider, including the
+available system/default account. Choosing one tries to resume the exact saved
+conversation; its account and runtime identity change only after the provider
+confirms that conversation. A failed or mismatched resume keeps the original
+saved descriptor. This cannot recover conversation files deleted with the old
+home if the provider cannot access them from the selected account.
+
+Account loading also removes unregistered managed homes older than 24 hours.
+Pending sign-ins, registered accounts, homes referenced by linked accounts, and
+arbitrary external directories are preserved. Missing, unreadable, or newer
+account registries prevent this orphan cleanup.
+
 ## Editor
 
 - Files save automatically after a pause. Conflicts, save errors, and

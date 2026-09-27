@@ -102,6 +102,19 @@ impl Homes {
         Self { root: root.into() }
     }
 
+    /// Recognizes only this installation's managed namespace. A UUID in an
+    /// arbitrary linked or system home never makes that directory ours.
+    pub fn managed_identity(&self, path: &Path) -> Option<(Provider, Uuid)> {
+        super::managed_home_identity(&self.root, path)
+    }
+
+    /// Serializes account creation/removal with the actual child-spawn
+    /// boundary. Never wait for this while holding the daemon's state lock.
+    pub(crate) fn lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+        crate::secure_file::prepare_private_directory(&self.root)?;
+        crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX)
+    }
+
     fn provider_directory(&self, provider: Provider) -> PathBuf {
         self.root.join(provider.executable())
     }
@@ -166,9 +179,18 @@ impl Homes {
     /// Deletes the home of account `key`. A home that is already gone is not
     /// an error: removing an account twice leaves it just as removed.
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
+        if let Some(parked) = self.park(provider, key)? {
+            remove_parked(&parked)?;
+        }
+        Ok(())
+    }
+
+    /// Rename under the lifecycle/registry locks; delete the parked tree only
+    /// after releasing them, since provider caches can be large.
+    pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
             Ok(_) => {}
         }
@@ -176,9 +198,50 @@ impl Homes {
         crate::secure_file::validate_owned_directory(&path)?;
         let parked = self
             .provider_directory(provider)
-            .join(format!("{REMOVING_PREFIX}{}", key.hyphenated()));
+            // An interrupted removal may still hold a parked tree when an
+            // older CLI recreates the original home. Each retirement gets a
+            // unique name, so neither tree prevents the other being removed.
+            .join(format!("{REMOVING_PREFIX}{}", Uuid::new_v4().hyphenated()));
         fs::rename(&path, &parked)?;
-        remove_parked(&parked)
+        Ok(Some(parked))
+    }
+
+    /// Called only with a supported, existing registry and both locks held.
+    /// A grace period also protects homes being created by an older window
+    /// that predates atomic creation/registration.
+    pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
+        for provider in super::Account::PROVIDERS {
+            let directory = self.provider_directory(provider);
+            if !directory.exists() {
+                continue;
+            }
+            crate::secure_file::reject_symlink_components(&directory)?;
+            crate::secure_file::validate_owned_directory(&directory)?;
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                let Some(key) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| Uuid::parse_str(name).ok())
+                else {
+                    continue;
+                };
+                if entry.path() != self.path(provider, key) {
+                    continue;
+                }
+                if registry.contains_managed_home(self, provider, key) {
+                    continue;
+                }
+                let metadata = entry.path().symlink_metadata()?;
+                if !metadata.is_dir()
+                    || metadata.modified()?.elapsed().unwrap_or_default() < ORPHAN_AGE
+                {
+                    continue;
+                }
+                self.park(provider, key)?;
+            }
+        }
+        Ok(())
     }
 
     /// Finishes removals an earlier run was interrupted in.

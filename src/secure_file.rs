@@ -130,7 +130,7 @@ pub(crate) fn validate_and_privatize_open_file(path: &Path, file: &File) -> io::
     file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
 }
 
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)

@@ -696,14 +696,19 @@ impl Cagents {
                 } else {
                     Vec::new()
                 };
-                runtime.view(
+                let view = runtime.view(
                     self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
                     self.settings.chat_enter_sends,
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
                     offers,
-                )
+                );
+                if let Some(recovery) = self.account_recovery_controls(card) {
+                    widget::column::with_children(vec![recovery, view]).into()
+                } else {
+                    view
+                }
             }
             _ => widget::text::body("Connecting to native chat…").into(),
         }

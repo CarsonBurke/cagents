@@ -162,6 +162,9 @@ pub struct StartFailure {
 /// What the reader can still do about a conversation that did not come back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {
+    /// The recorded managed home was removed; choose another account of this
+    /// provider before attempting the exact conversation again.
+    Account,
     /// Running the same start again is a real next step, because what refused
     /// it - a stopped daemon, a busy writer, a provider that failed to launch -
     /// can succeed on the next attempt.
@@ -313,6 +316,52 @@ pub struct Session {
     /// Daemon-issued allocation evidence, independent of the reader's TMPDIR.
     #[serde(default)]
     pub owned_codex_listener: Option<OwnedCodexListener>,
+}
+
+/// Account recovery changes only account selection. It never changes the
+/// provider, conversation, executable, working directory, or launch options.
+/// Runtime identities and daemon-allocated listener paths may be refreshed.
+pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
+    if source.id == replacement.id
+        || source.launch.session_id.is_none()
+        || source.launch.session_id != replacement.launch.session_id
+        || source.launch.provider != replacement.launch.provider
+        || replacement.terminal.is_some()
+    {
+        return false;
+    }
+    let Some(home) = crate::account::home_variable(source.launch.provider) else {
+        return false;
+    };
+    let names = crate::account::credential_overrides(source.launch.provider);
+    if replacement
+        .launch
+        .recipe
+        .environment
+        .keys()
+        .any(|name| names.contains(&name.as_str()))
+    {
+        return false;
+    }
+    let mut original = source.clone();
+    let mut candidate = replacement.clone();
+    original.reset_owned_codex_listener();
+    candidate.reset_owned_codex_listener();
+    let original = &mut original.launch.recipe;
+    let candidate = &mut candidate.launch.recipe;
+    if original.environment.get(home) == candidate.environment.get(home) {
+        return false;
+    }
+    for recipe in [&mut *original, &mut *candidate] {
+        recipe.environment.remove(home);
+        recipe
+            .environment
+            .retain(|name, _| !names.contains(&name.as_str()));
+        recipe
+            .unset_environment
+            .retain(|name| !names.contains(&name.as_str()));
+    }
+    original == candidate
 }
 
 /// The exact endpoint a daemon allocated for one native Codex conversation.

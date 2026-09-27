@@ -482,9 +482,21 @@ impl Group {
     /// tried again a few times before the start counts as failed.
     async fn spawn(mut command: Command) -> Result<Self, String> {
         let mut delay = Duration::from_millis(10);
-        let child = loop {
-            match command.spawn() {
-                Ok(child) => break child,
+        loop {
+            let (returned, spawned) = tokio::task::spawn_blocking(move || {
+                let _account = super::registry::authorize_command(command.as_std())
+                    .map_err(|error| error.to_string())?;
+                let spawned = command.spawn().map(|child| {
+                    let id = child.id().and_then(|id| i32::try_from(id).ok());
+                    Self { child, id }
+                });
+                Ok::<_, String>((command, spawned))
+            })
+            .await
+            .map_err(|error| error.to_string())??;
+            command = returned;
+            match spawned {
+                Ok(group) => return Ok(group),
                 Err(error)
                     if error.kind() == io::ErrorKind::ExecutableFileBusy
                         && delay <= Duration::from_millis(160) =>
@@ -494,9 +506,7 @@ impl Group {
                 }
                 Err(error) => return Err(spawn_failure(&error)),
             }
-        };
-        let id = child.id().and_then(|id| i32::try_from(id).ok());
-        Ok(Self { child, id })
+        }
     }
 
     fn stdout(&mut self) -> Result<tokio::io::Take<ChildStdout>, String> {

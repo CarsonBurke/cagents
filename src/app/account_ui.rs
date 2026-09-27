@@ -1213,7 +1213,7 @@ impl Cagents {
     }
 
     /// Reads the registry again, for what another window changed.
-    fn reload_registry(&self) -> Task<Message> {
+    pub(super) fn reload_registry(&self) -> Task<Message> {
         let Some(store) = self.account_ui.store.clone() else {
             return Task::none();
         };
@@ -2298,6 +2298,11 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let raw_path = raw_path.trim();
+                let _lifecycle = homes
+                    .as_ref()
+                    .map(Homes::lifecycle_lock)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
                 let chosen = if let Some(relative) = raw_path.strip_prefix("~/") {
                     std::env::var_os("HOME")
                         .map(PathBuf::from)
@@ -2378,18 +2383,12 @@ impl Cagents {
                 let program = probe::find_executable(provider.executable(), search_path.as_deref())
                     .ok_or_else(|| format!("{} is not installed", probe::cli_name(provider)))?;
                 let system = Account::system(provider).resolved_home();
-                let (key, home) = homes
-                    .create_with_config(provider, system.as_deref(), codex_config)
-                    .map_err(|error| format!("Its home could not be created: {error}"))?;
-                // Recorded before any login can land in it, so the home is
-                // never one nothing knows about.
-                if let Some(store) = &store
-                    && let Err(error) =
-                        store.update(|registry| registry.begin(provider, key, now_ms()))
-                {
-                    let _ = homes.remove(provider, key);
-                    return Err(format!("It could not be recorded: {error}"));
+                let create = || homes.create_with_config(provider, system.as_deref(), codex_config);
+                let (key, home) = match &store {
+                    Some(store) => store.create_pending(&homes, provider, now_ms(), create),
+                    None => create(),
                 }
+                .map_err(|error| format!("Its home could not be created and recorded: {error}"))?;
                 Ok((key, home, program))
             })
             .await
@@ -2455,12 +2454,7 @@ impl Cagents {
         let store = self.account_ui.store.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || -> Result<Settled, String> {
-                if let Some(homes) = homes {
-                    homes
-                        .remove(provider, key)
-                        .map_err(|error| error.to_string())?;
-                }
-                abandon(store.as_ref(), key).map(Settled::Abandoned)
+                abandon_home(store.as_ref(), homes.as_ref(), provider, key).map(Settled::Abandoned)
             })
             .await
             .map_err(|error| error.to_string())
@@ -2704,9 +2698,11 @@ impl Cagents {
         let homes = self.account_ui.homes.clone();
         let fallback = self.account_ui.registry.clone();
         cosmic::task::future(async move {
+            let registration_homes = homes.clone();
             let registered = match store.clone() {
-                Some(store) => tokio::task::spawn_blocking(move || {
-                    store.update(|registry| registry.register(managed, &system))
+                Some(store) => tokio::task::spawn_blocking(move || match registration_homes {
+                    Some(homes) => store.register_pending(&homes, managed, &system),
+                    None => store.update(|registry| registry.register(managed, &system)),
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -2729,14 +2725,9 @@ impl Cagents {
                     // own, so the existing one is unaffected - and deleted.
                     let _ = probe::logout(account).await;
                     tokio::task::spawn_blocking(move || -> Result<Settled, String> {
-                        if let Some(homes) = homes {
-                            homes
-                                .remove(provider, key)
-                                .map_err(|error| error.to_string())?;
-                        }
                         Ok(Settled::Duplicate {
                             existing,
-                            registry: abandon(store.as_ref(), key)?,
+                            registry: abandon_home(store.as_ref(), homes.as_ref(), provider, key)?,
                         })
                     })
                     .await
@@ -2841,6 +2832,12 @@ impl Cagents {
                 let _ = probe::logout(account).await;
             }
             let (registry, error) = tokio::task::spawn_blocking(move || {
+                if !linked && let (Some(store), Some(homes)) = (&store, &homes) {
+                    return match store.remove_home(homes, provider, key, true) {
+                        Ok((registry, error)) => (Some(registry), error),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                }
                 let registry = match store {
                     Some(store) => match store.update(|registry| {
                         registry.unregister(key);
@@ -3599,6 +3596,29 @@ fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), Str
 
 /// Forgets the pending sign-in `key`, returning the registry as it now
 /// stands where there is one on disk.
+fn abandon_home(
+    store: Option<&Store>,
+    homes: Option<&Homes>,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> Result<Option<Registry>, String> {
+    if let (Some(store), Some(homes)) = (store, homes) {
+        let (registry, error) = store
+            .remove_home(homes, provider, key, false)
+            .map_err(|error| error.to_string())?;
+        if let Some(error) = error {
+            return Err(error);
+        }
+        return Ok(Some(registry));
+    }
+    if let Some(homes) = homes {
+        homes
+            .remove(provider, key)
+            .map_err(|error| error.to_string())?;
+    }
+    abandon(store, key)
+}
+
 fn abandon(store: Option<&Store>, key: uuid::Uuid) -> Result<Option<Registry>, String> {
     store
         .map(|store| {

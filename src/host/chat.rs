@@ -279,6 +279,25 @@ fn error(message: impl Into<String>) -> ProtocolError {
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false)
 }
+
+fn check_launch_account(launch: &chat::Launch) -> Result<(), ProtocolError> {
+    crate::account::registry::authorize_spawn(&launch.recipe.environment, Some(launch.provider))
+        .map(drop)
+        .map_err(|failure| {
+            ProtocolError::new(
+                if matches!(
+                    failure,
+                    crate::account::registry::LaunchAccountError::Removed { .. }
+                ) {
+                    ProtocolErrorCode::AccountRemoved
+                } else {
+                    ProtocolErrorCode::TerminalUnavailable
+                },
+                failure.to_string(),
+                false,
+            )
+        })
+}
 fn attached(state: &HostState, client: ClientId, id: TerminalId) -> Result<&Record, ProtocolError> {
     let record = state.chats.get(&id).ok_or_else(|| {
         unavailable("Exact native chat is not hosted; explicit recovery is required")
@@ -721,6 +740,13 @@ fn start(
         }
     }
     // All adapter validation happens before a source terminal can be changed.
+    // Claude reads the selected home's transcript while building its adapter.
+    // Classify a removed account before that read can mask it as missing
+    // history. Codex also supports a live socket attachment, whose account is
+    // deliberately not reauthorized; its transport is checked below instead.
+    if session.launch.provider != Provider::Codex {
+        check_launch_account(&session.launch)?;
+    }
     let allocator = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -769,7 +795,20 @@ fn start(
         } else {
             chat::protocol::create(&session.launch)
         }
-        .map_err(error)?;
+        .map_err(|message| {
+            // Removal may have won after the early check while the adapter
+            // was reading history. Do not hold the lifecycle lease across
+            // those reads, but preserve the actionable account classification.
+            check_launch_account(&session.launch)
+                .err()
+                .unwrap_or_else(|| error(message))
+        })?;
+    if !matches!(
+        &spec.transport,
+        chat::protocol::TransportSpec::UnixWebSocket { .. }
+    ) {
+        check_launch_account(&session.launch)?;
+    }
     if source.is_none() {
         // A conversation with no proven source has no proven environment to
         // preserve, so it starts from the daemon's own native configuration
@@ -1005,7 +1044,11 @@ fn start(
             session.launch.session_id.clone(),
             move |update| changed(&weak, id, update),
         )
-        .map_err(unavailable)?;
+        .map_err(|message| {
+            check_launch_account(&session.launch)
+                .err()
+                .unwrap_or_else(|| unavailable(message))
+        })?;
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -1218,12 +1261,148 @@ fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::
     session
 }
 
+fn recover_account(
+    host: &SharedHost,
+    client: ClientId,
+    source: Session,
+    replacement: Session,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+) -> Result<ServerResponse, ProtocolError> {
+    if !chat::is_account_recovery(&source, &replacement)
+        || replacement.proof.is_some()
+        || replacement.owned_codex_listener.is_some()
+    {
+        return Err(error(
+            "Account recovery must retain the exact provider, conversation and launch options",
+        ));
+    }
+    match check_launch_account(&source.launch) {
+        Err(failure) if failure.code == ProtocolErrorCode::AccountRemoved => {}
+        Err(failure) => return Err(failure),
+        Ok(()) => {
+            return Err(error(
+                "The original account is available; retry the saved conversation normally",
+            ));
+        }
+    }
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chats.get(&source.id).is_some_and(|record| {
+            record.session.launch.provider != source.launch.provider
+                || record.session.launch.recipe != source.launch.recipe
+                || record.handle.session_id() != source.launch.session_id
+        }) {
+            return Err(error(
+                "The original hosted conversation changed before account recovery",
+            ));
+        }
+        if state.chat_spawning.contains_key(&source.id)
+            || state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| record.handle.owns_work())
+            || state
+                .terminals
+                .get(&source.id)
+                .is_some_and(|record| !record.handle.is_completed())
+            || state.chat_handoffs.contains_key(&source.id)
+        {
+            return Err(error(
+                "The original conversation still owns work; reconnect or close it before changing accounts",
+            ));
+        }
+    }
+    let id = replacement.id;
+    start(
+        host,
+        client,
+        replacement,
+        None,
+        false,
+        None,
+        execution_environment,
+    )?;
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&id)
+        .ok_or_else(|| unavailable("The account recovery candidate disappeared"))?
+        .handle
+        .clone();
+    let confirmation = confirm_account_conversation(
+        &handle,
+        source.launch.session_id.as_deref().unwrap(),
+        Instant::now() + Duration::from_secs(15),
+        || crate::daemon::termination_requested(),
+    );
+    let response = confirmation.map_err(unavailable).and_then(|()| {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = attached(&state, client, id)?;
+        if !record.handle.same_actor(&handle)
+            || !chat::is_account_recovery(&source, &record.session)
+        {
+            return Err(error(
+                "The account recovery candidate changed before confirmation",
+            ));
+        }
+        Ok(session_snapshot(record))
+    });
+    if let Err(failure) = response {
+        if let Err(close) = process(host, client, ClientRequest::ChatClose { chat_id: id }) {
+            return Err(unavailable(format!(
+                "{}. The candidate could not be confirmed stopped: {}",
+                failure.message, close.message
+            )));
+        }
+        return Err(failure);
+    }
+    response
+}
+
+fn confirm_account_conversation(
+    handle: &Handle,
+    expected: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<(), String> {
+    loop {
+        if cancelled() {
+            return Err(
+                "Account recovery was cancelled; the saved conversation is unchanged".into(),
+            );
+        }
+        if let Some(failure) = handle.failure() {
+            return Err(failure);
+        }
+        if handle.is_completed() {
+            return Err("The provider exited before confirming the saved conversation; it remains unchanged".into());
+        }
+        if let Some(actual) = handle.confirmed_session_id() {
+            return if actual == expected {
+                Ok(())
+            } else {
+                Err("The provider opened a different conversation; the saved conversation is unchanged".into())
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err("The provider did not confirm the exact saved conversation in time; it remains unchanged".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatRecoverAccount {
+            source,
+            replacement,
+            execution_environment,
+        } => recover_account(host, client, source, replacement, execution_environment),
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
         ClientRequest::ChatCandidates { session, source } => candidates(host, session, source),
         ClientRequest::ChatStartSelected {
@@ -1290,6 +1469,21 @@ pub(super) fn process(
             execution_environment,
         ),
         ClientRequest::ChatAttach { session } => {
+            // A live actor remains attachable after account removal. A stopped
+            // actor cannot resume with that home, so expose the same recovery
+            // choice without creating a replacement process.
+            let stopped_launch = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(session.proof.as_ref(), state.proof())?;
+                state
+                    .chats
+                    .get(&session.id)
+                    .filter(|record| record.handle.is_completed())
+                    .map(|record| record.session.launch.clone())
+            };
+            if let Some(launch) = stopped_launch {
+                check_launch_account(&launch)?;
+            }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
             if let Some(receipt) = state.chat_handoffs.get_mut(&session.id) {
@@ -1973,6 +2167,73 @@ mod tests {
     };
     use serde_json::{Value, json};
 
+    #[test]
+    fn removed_claude_account_is_reported_before_missing_resume_history() {
+        const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_HISTORY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::chat::tests::removed_claude_account_is_reported_before_missing_resume_history", "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("PATH", "/usr/bin:/bin")
+                .status().unwrap().success());
+            return;
+        }
+        let homes = crate::account::home::Homes::installation().unwrap();
+        let store = crate::account::registry::Store::installation().unwrap();
+        let (key, home) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
+        let session = Session {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            proof: None,
+            terminal: None,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "/bin/false".into(),
+                    arguments: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        home.to_str().unwrap().into(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("3a888c9d-7e33-47ad-9c0f-d538f63b9099".into()),
+            },
+        };
+        store
+            .remove_home(&homes, Provider::Claude, key, false)
+            .unwrap();
+        assert!(!home.exists());
+        // Without the account preflight this exact adapter preparation error
+        // used to hide Recovery::Account and leave the UI without its chooser.
+        assert!(
+            chat::protocol::create(&session.launch)
+                .err()
+                .unwrap()
+                .contains("history project directory is unavailable")
+        );
+        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("removed-history"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        })));
+        let failure = start(&host, 1, session, None, false, None, Default::default()).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::AccountRemoved);
+        assert!(
+            !home.exists(),
+            "preparation never recreates the removed home"
+        );
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+    }
+
     /// A conversation opened on a stopped agent terminal starts with the
     /// daemon's own provider configuration, so an upgrade restores it the same
     /// way rather than refusing it for a variable only the daemon supplies.
@@ -2282,6 +2543,57 @@ for line in sys.stdin:
                 previous_sources: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn distinct_recovery_candidates_share_one_conversation_spawn_claim() {
+        let (_directory, host, saved) = upgrade_fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut candidates = Vec::new();
+        for client in [1, 2] {
+            let mut candidate = saved.source.clone();
+            candidate.id = TerminalId::new();
+            candidate.proof = None;
+            let host = Arc::clone(&host);
+            let barrier = Arc::clone(&barrier);
+            candidates.push(thread::spawn(move || {
+                barrier.wait();
+                (
+                    client,
+                    start(
+                        &host,
+                        client,
+                        candidate,
+                        None,
+                        false,
+                        None,
+                        Default::default(),
+                    ),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = candidates
+            .into_iter()
+            .map(|task| task.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let (client, id) = outcomes
+            .into_iter()
+            .find_map(|(client, result)| match result {
+                Ok(ServerResponse::ChatAttached { session, .. }) => Some((client, session.id)),
+                _ => None,
+            })
+            .unwrap();
+        let mut retry = saved.source;
+        retry.id = TerminalId::new();
+        retry.proof = None;
+        assert!(start(&host, 3, retry, None, false, None, Default::default()).is_err());
+        assert_eq!(host.lock().unwrap().chats.len(), 1);
+        process(&host, client, ClientRequest::ChatClose { chat_id: id }).unwrap();
     }
 
     #[test]
@@ -2745,6 +3057,72 @@ for line in sys.stdin:
     }
 
     struct Echo(bool);
+    #[test]
+    fn account_recovery_requires_provider_confirmation_not_the_resume_hint() {
+        struct Confirm;
+        impl Adapter for Confirm {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![json!({"id":"saved-conversation"})],
+                    events: Vec::new(),
+                })
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![Event::Session {
+                        id: value["id"].as_str().unwrap().to_owned(),
+                        title: None,
+                    }],
+                })
+            }
+        }
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(Confirm),
+            initial,
+            store,
+            Some("saved-conversation".into()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(handle.session_id().as_deref(), Some("saved-conversation"));
+        assert!(
+            confirm_account_conversation(&handle, "saved-conversation", Instant::now(), || false)
+                .is_err()
+        );
+        handle.command(Command::Interrupt).unwrap();
+        confirm_account_conversation(
+            &handle,
+            "saved-conversation",
+            Instant::now() + Duration::from_secs(5),
+            || false,
+        )
+        .unwrap();
+        assert!(
+            confirm_account_conversation(&handle, "another-conversation", Instant::now(), || false)
+                .is_err()
+        );
+        assert!(
+            confirm_account_conversation(&handle, "saved-conversation", Instant::now(), || true)
+                .is_err()
+        );
+        handle.close().unwrap();
+    }
+
     struct ActiveFixture;
     impl Adapter for ActiveFixture {
         fn initialize(&mut self) -> Result<Step, String> {

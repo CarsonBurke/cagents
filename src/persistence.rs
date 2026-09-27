@@ -610,6 +610,66 @@ impl StateStore {
         Ok(())
     }
 
+    /// A provider-confirmed account recovery retains the external conversation
+    /// and changes only its account and runtime identity. Compare the complete
+    /// source descriptor so a stale recovery cannot overwrite newer ownership.
+    pub fn rebind_chat_account(
+        &self,
+        card_id: CardId,
+        source: &crate::chat::Session,
+        replacement: &crate::chat::Session,
+    ) -> Result<()> {
+        if !crate::chat::is_account_recovery(source, replacement)
+            || !replacement
+                .proof
+                .as_ref()
+                .is_some_and(HostSessionProof::is_complete)
+        {
+            return Err(StoreError::InvalidState(
+                "Account recovery has no exact confirmed conversation".into(),
+            ));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (kind, content, existence): (String, Option<String>, String) = transaction.query_row(
+            "SELECT kind_tag, content_json, existence_json FROM cards WHERE card_id = ?1",
+            [card_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if kind != PersistedCardKind::Chat.as_str()
+            || !from_json::<Existence>("card existence", &existence)?.is_open()
+        {
+            return Err(StoreError::InvalidState(
+                "The account recovery card is no longer an open chat".into(),
+            ));
+        }
+        let stored: crate::chat::Session = from_json(
+            "chat card",
+            &content.ok_or_else(|| StoreError::CorruptRow {
+                field: "chat card".into(),
+                reason: "The account recovery source has no payload".into(),
+            })?,
+        )?;
+        if &stored == replacement {
+            return Ok(());
+        }
+        if &stored != source {
+            return Err(StoreError::InvalidState(
+                "The saved conversation changed before account recovery committed".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
+            params![to_json(replacement)?, now_unix_ms(), card_id.to_string()],
+        )?;
+        transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_project(&self, project: &ProjectState) -> Result<u64> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -4481,6 +4541,97 @@ mod tests {
     /// replacement existed, switching a new thread's provider or account left
     /// every later save failing with "saved state is invalid", and the next
     /// launch restored the conversation the card no longer had.
+    #[test]
+    fn account_recovery_rebinds_only_the_exact_saved_conversation() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Codex);
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/accounts/removed".into());
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        replacement
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), "/accounts/selected".into());
+        replacement.launch.recipe.unset_environment.extend(
+            crate::account::credential_overrides(crate::agent::Provider::Codex)
+                .iter()
+                .map(|name| (*name).to_owned()),
+        );
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(
+            lane.save(&store, &workspace).is_err(),
+            "ordinary snapshots cannot rebind an account"
+        );
+        for altered in 0..5 {
+            let mut refused = replacement.clone();
+            match altered {
+                0 => refused.launch.session_id = Some("different-conversation".into()),
+                1 => refused.proof = None,
+                2 => refused
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-option".into()),
+                3 => refused.launch.provider = crate::agent::Provider::Claude,
+                _ => {
+                    refused
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("OPENAI_API_KEY".into(), "fixture".into());
+                }
+            }
+            assert!(store.rebind_chat_account(card, &source, &refused).is_err());
+        }
+        let mut stale = source.clone();
+        stale
+            .launch
+            .recipe
+            .environment
+            .insert("OTHER".into(), "stale".into());
+        let mut stale_replacement = replacement.clone();
+        stale_replacement
+            .launch
+            .recipe
+            .environment
+            .insert("OTHER".into(), "stale".into());
+        assert!(
+            store
+                .rebind_chat_account(card, &stale, &stale_replacement)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        store
+            .rebind_chat_account(card, &source, &replacement)
+            .unwrap();
+        store
+            .rebind_chat_account(card, &source, &replacement)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        let reopened =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
     #[test]
     fn a_chat_card_takes_a_new_conversation_only_through_its_replacement() {
         let directory = tempdir().unwrap();
