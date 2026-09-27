@@ -7877,6 +7877,11 @@ mod tests {
         answer_start(&mut app, target, Ok(handle));
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.is_draft());
+        assert!(runtime.handle().unwrap().snapshot().busy);
+        // Hidden cards attach for activity without building presentation state.
+        // Revealing the adopted card must render that existing busy snapshot.
+        app.chat_runtime_mut(target).unwrap().show(true);
+        let runtime = chat_runtime(&app, card);
         assert!(runtime.snapshot.busy);
         assert_eq!(runtime.session, session);
         assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
