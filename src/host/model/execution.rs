@@ -320,9 +320,9 @@ impl Registry {
             .transpose()
     }
 
-    /// Only the synchronous launch caller may clear this after proving no
-    /// child was created. Restart recovery never calls this inference.
-    pub(crate) fn clear_unspawned_agent_launch(
+    /// Only a launch owner may clear this after proving no provider was
+    /// created or acknowledging full teardown. A restart is never such proof.
+    pub(crate) fn clear_quiescent_agent_launch(
         &mut self,
         id: AgentId,
         source: &HostedSession,

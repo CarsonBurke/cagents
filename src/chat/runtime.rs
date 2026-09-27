@@ -142,49 +142,6 @@ impl Handle {
             }
             owned_socket = Some(OwnedSocket(socket.clone()));
         }
-        let child = match &spec.transport {
-            TransportSpec::JsonLines | TransportSpec::OwnedUnixWebSocket { .. } => {
-                let pipes = matches!(spec.transport, TransportSpec::JsonLines);
-                let mut process = Process::new(&spec.program);
-                process
-                    .args(&spec.arguments)
-                    .current_dir(&spec.working_directory)
-                    .env_clear()
-                    .envs(&spec.environment)
-                    .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
-                    .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
-                    .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
-                    .process_group(0);
-                crate::host::descriptor_limit::inherit(&mut process);
-                if let Some(directory) = spec
-                    .execution
-                    .as_ref()
-                    .and_then(|context| context.directory.clone())
-                {
-                    // SAFETY: fchdir is async-signal-safe; the captured File
-                    // remains open across fork until the provider execs.
-                    unsafe {
-                        process.pre_exec(move || {
-                            if libc::fchdir(directory.as_raw_fd()) == 0 {
-                                Ok(())
-                            } else {
-                                Err(std::io::Error::last_os_error())
-                            }
-                        });
-                    }
-                }
-                let _account = crate::account::registry::authorize_command(&process)
-                    .map_err(|error| error.to_string())?;
-                let child = process
-                    .spawn()
-                    .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
-                if let Some(context) = &spec.execution {
-                    context.spawned();
-                }
-                Some(ChildGuard(child, false))
-            }
-            TransportSpec::UnixWebSocket { .. } => None,
-        };
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
@@ -216,10 +173,13 @@ impl Handle {
             worker: Mutex::new(None),
             store: store.clone(),
             notify: notify.clone(),
-            execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(std::mem::take(
-                &mut spec.environment,
-            )),
+            execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
+                spec.environment.clone(),
+            ),
         });
+        let launch_context = spec.execution.clone();
+        let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
+        let (started, startup) = crossbeam_channel::bounded(1);
         let worker = thread::Builder::new()
             .name("cagents-chat".into())
             .spawn(move || {
@@ -227,7 +187,7 @@ impl Handle {
                 let mut actor = Actor {
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
-                    child,
+                    child: None,
                     adapter,
                     state,
                     confirmed_session,
@@ -255,46 +215,61 @@ impl Handle {
                     started: Instant::now(),
                     write_started: None,
                 };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match spec
-                    .transport
-                {
-                    TransportSpec::JsonLines => actor.run(initial),
-                    TransportSpec::UnixWebSocket {
-                        socket,
-                        device,
-                        inode,
-                    } => actor.run_websocket(initial, &socket, device, inode),
-                    TransportSpec::OwnedUnixWebSocket { socket } => {
-                        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-                        let started = Instant::now();
-                        let metadata = loop {
-                            if let Ok(metadata) = std::fs::metadata(&socket)
-                                && metadata.file_type().is_socket()
-                            {
-                                break Ok(metadata);
-                            }
-                            if actor.stop.load(Ordering::Acquire) {
-                                break Err("Provider startup cancelled".to_owned());
-                            }
-                            if actor
-                                .child
-                                .as_mut()
-                                .is_some_and(|child| child.0.try_wait().ok().flatten().is_some())
-                            {
-                                break Err("Codex server exited before opening its local socket"
-                                    .to_owned());
-                            }
-                            if started.elapsed() >= Duration::from_secs(15) {
-                                break Err(
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ready_to_begin
+                        .recv()
+                        .map_err(|_| "Provider startup was cancelled".to_string())?;
+                    if actor.stop.load(Ordering::Acquire) {
+                        let _ = started.send(Err("Provider startup was cancelled".to_string()));
+                        return Ok(());
+                    }
+                    let child = spawn_provider(&spec, &actor.stop);
+                    let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
+                    actor.child = child?;
+                    match spec.transport {
+                        TransportSpec::JsonLines => actor.run(initial),
+                        TransportSpec::UnixWebSocket {
+                            socket,
+                            device,
+                            inode,
+                        } => actor.run_websocket(initial, &socket, device, inode),
+                        TransportSpec::OwnedUnixWebSocket { socket } => {
+                            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                            let started = Instant::now();
+                            let metadata = loop {
+                                if let Ok(metadata) = std::fs::metadata(&socket)
+                                    && metadata.file_type().is_socket()
+                                {
+                                    break Ok(metadata);
+                                }
+                                if actor.stop.load(Ordering::Acquire) {
+                                    break Err("Provider startup cancelled".to_owned());
+                                }
+                                if actor.child.as_mut().is_some_and(|child| {
+                                    child.0.try_wait().ok().flatten().is_some()
+                                }) {
+                                    break Err(
+                                        "Codex server exited before opening its local socket"
+                                            .to_owned(),
+                                    );
+                                }
+                                if started.elapsed() >= Duration::from_secs(15) {
+                                    break Err(
                                     "Codex server did not open its local socket within 15 seconds"
                                         .to_owned(),
                                 );
-                            }
-                            thread::sleep(Duration::from_millis(20));
-                        };
-                        metadata.and_then(|metadata| {
-                            actor.run_websocket(initial, &socket, metadata.dev(), metadata.ino())
-                        })
+                                }
+                                thread::sleep(Duration::from_millis(20));
+                            };
+                            metadata.and_then(|metadata| {
+                                actor.run_websocket(
+                                    initial,
+                                    &socket,
+                                    metadata.dev(),
+                                    metadata.ino(),
+                                )
+                            })
+                        }
                     }
                 }))
                 .unwrap_or_else(|_| {
@@ -351,7 +326,32 @@ impl Handle {
             })
             .map_err(|e| e.to_string())?;
         *inner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
-        Ok(Self(inner))
+        let handle = Self(inner);
+        if let Some(context) = &launch_context {
+            context.claim_owner(Arc::new(handle.clone()));
+        }
+        // No child can exist before its exact actor cleanup capability and
+        // join handle are installed. Close joins this worker even if startup
+        // races cancellation, so an expired wait cannot permit a late spawn.
+        let _ = begin.send(());
+        match startup.recv_timeout(IO_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                use super::protocol::LaunchCleanup;
+                if handle.cleanup().is_ok() || launch_context.is_some() {
+                    return Err(error);
+                }
+                // Interactive launches have no execution journal. Preserve
+                // their exact actor for host publication if cleanup is unknown.
+            }
+            Err(error) if launch_context.is_some() => {
+                return Err(format!(
+                    "Provider startup did not finish: {error}; its exact cleanup owner is retained"
+                ));
+            }
+            Err(_) => {} // The host publishes the still-owned interactive actor.
+        }
+        Ok(handle)
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.submit_command(None, command)
@@ -668,6 +668,72 @@ impl Drop for Inner {
         }
     }
 }
+impl super::protocol::LaunchCleanup for Handle {
+    fn cleanup(&self) -> Result<super::protocol::LaunchOutcome, String> {
+        self.0.stop.store(true, Ordering::Release);
+        self.wake();
+        let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
+        while !self.is_completed() {
+            if Instant::now() >= deadline {
+                return Err(
+                    "Provider startup has not become quiescent; its cleanup owner is retained"
+                        .into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.close()?;
+        Ok(super::protocol::LaunchOutcome::TeardownProved)
+    }
+}
+
+fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildGuard>, String> {
+    if matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
+        return Ok(None);
+    }
+    if let Some(context) = &spec.execution {
+        context.verify_directory(&spec.working_directory)?;
+    }
+    let pipes = matches!(spec.transport, TransportSpec::JsonLines);
+    let mut process = Process::new(&spec.program);
+    process
+        .args(&spec.arguments)
+        .current_dir(&spec.working_directory)
+        .env_clear()
+        .envs(&spec.environment)
+        .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
+        .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
+        .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
+        .process_group(0);
+    crate::host::descriptor_limit::inherit(&mut process);
+    if let Some(directory) = spec
+        .execution
+        .as_ref()
+        .and_then(|context| context.directory.clone())
+    {
+        // SAFETY: fchdir is async-signal-safe; the captured File remains open
+        // across fork until the provider execs.
+        unsafe {
+            process.pre_exec(move || {
+                if libc::fchdir(directory.as_raw_fd()) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let _account =
+        crate::account::registry::authorize_command(&process).map_err(|e| e.to_string())?;
+    if stop.load(Ordering::Acquire) {
+        return Err("Provider startup was cancelled before process creation".into());
+    }
+    let child = process
+        .spawn()
+        .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+    Ok(Some(ChildGuard(child, false)))
+}
+
 struct ChildGuard(Child, bool);
 impl ChildGuard {
     fn terminate(&mut self) {
@@ -1708,6 +1774,39 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
+        use super::super::protocol::{ExecutionContext, LaunchOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let context = Arc::new(ExecutionContext::default());
+        let spec = ProcessSpec {
+            execution: Some(context.clone()),
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        assert_eq!(context.outcome(), LaunchOutcome::Uncertain);
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert!(handle.is_completed());
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert!(
+            handle.command(Command::Refresh).is_ok(),
+            "retired transcript remains readable"
+        );
+    }
+
     #[test]
     fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
         use super::*;
