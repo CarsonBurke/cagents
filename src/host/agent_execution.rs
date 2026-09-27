@@ -319,8 +319,9 @@ fn dispatch(
                 // helper teardown receipt. A timed-out caller is not proof.
                 let cleanup = context.reconcile_cleanup();
                 if matches!(cleanup, Ok(chat::protocol::LaunchOutcome::NoProvider | chat::protocol::LaunchOutcome::TeardownProved)) {
-                    match registry.lock().unwrap_or_else(|p| p.into_inner())
-                        .clear_quiescent_agent_launch(accepted.agent.id, &intent) {
+                    let cleared = registry.lock().unwrap_or_else(|p| p.into_inner())
+                        .clear_quiescent_agent_launch(accepted.agent.id, &intent);
+                    match cleared {
                         Ok(()) => before(error.message),
                         Err(clear) => {
                             host.lock().unwrap_or_else(|p| p.into_inner()).execution_startups
