@@ -98,7 +98,7 @@ pub fn pending_snapshot(
     Ok(comments)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authority {
     pub target: ReviewTarget,
     pub context: ReviewContext,

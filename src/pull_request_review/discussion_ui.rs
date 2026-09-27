@@ -295,8 +295,19 @@ impl State {
                 {
                     return ActionTask::none();
                 }
+                let authority = self.authority().expect("loaded review authority");
+                if let Some(composer) = &mut self.discussion.composer {
+                    if matches!(composer.destination, Destination::Line(_))
+                        && composer.authority == authority
+                    {
+                        composer.destination = Destination::Line(anchor);
+                    } else {
+                        self.notice = Some("Save or cancel the open comment first.".into());
+                    }
+                    return ActionTask::none();
+                }
                 self.discussion.composer = Some(Composer {
-                    authority: self.authority().expect("loaded review authority"),
+                    authority,
                     destination: Destination::Line(anchor),
                     content: text_editor::Content::new(),
                     preview: false,
@@ -304,6 +315,10 @@ impl State {
                 });
             }
             Action::Reply(id) => {
+                if self.discussion.composer.is_some() {
+                    self.notice = Some("Save or cancel the open comment first.".into());
+                    return ActionTask::none();
+                }
                 self.discussion.expanded.insert(id.clone());
                 self.discussion.composer = Some(Composer {
                     authority: self.authority().expect("loaded review authority"),
@@ -314,6 +329,10 @@ impl State {
                 });
             }
             Action::Edit(id) => {
+                if self.discussion.composer.is_some() {
+                    self.notice = Some("Save or cancel the open comment first.".into());
+                    return ActionTask::none();
+                }
                 let Some(comment) = self.discussion.conversation.as_ref().and_then(|c| {
                     c.threads.iter().flat_map(|t| &t.comments).find(|c| {
                         c.id.as_ref() == Some(&id) && c.viewer_did_author && c.is_pending()
@@ -494,13 +513,13 @@ impl State {
                 .spacing(4)
                 .into(),
             );
-            rows.push(
-                text_editor::TextEditor::new(&self.discussion.summary)
-                    .placeholder("Review summary (optional)")
-                    .height(90)
-                    .on_action(Action::Summary)
-                    .into(),
-            );
+            let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
+                .placeholder("Review summary (optional)")
+                .height(90);
+            if enabled {
+                editor = editor.on_action(Action::Summary);
+            }
+            rows.push(editor.into());
             rows.push(
                 button::suggested(if self.discussion.busy {
                     "Saving…"
@@ -724,13 +743,13 @@ impl State {
                     .map(|uri| Action::OpenLink(uri.to_string())),
                 );
             } else {
-                rows.push(
-                    text_editor::TextEditor::new(&composer.content)
-                        .placeholder("Leave a review comment…")
-                        .height(140)
-                        .on_action(Action::Composer)
-                        .into(),
-                );
+                let mut editor = text_editor::TextEditor::new(&composer.content)
+                    .placeholder("Leave a review comment…")
+                    .height(140);
+                if enabled {
+                    editor = editor.on_action(Action::Composer);
+                }
+                rows.push(editor.into());
             }
             rows.push(
                 widget::row::with_children(vec![
@@ -741,9 +760,11 @@ impl State {
                         )
                         .into(),
                     button::text(if composer.preview { "Write" } else { "Preview" })
-                        .on_press(Action::Preview)
+                        .on_press_maybe(enabled.then_some(Action::Preview))
                         .into(),
-                    button::text("Cancel").on_press(Action::Cancel).into(),
+                    button::text("Cancel")
+                        .on_press_maybe(enabled.then_some(Action::Cancel))
+                        .into(),
                 ])
                 .spacing(8)
                 .into(),
@@ -831,6 +852,36 @@ mod tests {
             "a".repeat(40)
         );
         assert_eq!(state.context.as_ref().unwrap().head_oid, "c".repeat(40));
+    }
+
+    #[test]
+    fn changing_comment_range_preserves_text_and_cannot_retarget_a_refreshed_head() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let composer = state.discussion.composer.as_mut().unwrap();
+        composer.content = text_editor::Content::with_text("Keep this draft");
+        composer.preview = true;
+        let mut extended = anchor();
+        extended.line = 9;
+        drop(state.update_discussion(Action::Begin(extended.clone())));
+        let composer = state.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text(), "Keep this draft");
+        assert!(composer.preview);
+        assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 9));
+        drop(state.update_discussion(Action::Reply("another-thread".into())));
+        assert!(matches!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::Line(_)
+        ));
+        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        next.context.head_oid = "c".repeat(40);
+        state.adopt(&next);
+        extended.line = 10;
+        drop(state.update_discussion(Action::Begin(extended)));
+        let composer = state.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text(), "Keep this draft");
+        assert_eq!(composer.authority.context.head_oid, "a".repeat(40));
+        assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 9));
     }
 
     #[test]

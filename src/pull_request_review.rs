@@ -826,9 +826,13 @@ impl State {
         ActionTask::perform(
             async move {
                 let results = tokio::task::spawn_blocking(move || {
+                    let mut refused: Option<String> = None;
                     paths
                         .into_iter()
                         .map(|path| {
+                            if let Some(message) = &refused {
+                                return (path, viewed, ViewedOutcome::NotApplied(message.clone()));
+                            }
                             if let Err(failure) = discussion::verify_authority(
                                 api.as_ref(),
                                 &git,
@@ -840,6 +844,7 @@ impl State {
                                     | discussion::Outcome::Unknown(message) => message,
                                     discussion::Outcome::Applied => unreachable!(),
                                 };
+                                refused = Some(message.clone());
                                 return (path, viewed, ViewedOutcome::NotApplied(message));
                             }
                             let outcome = api.set_file_viewed(
