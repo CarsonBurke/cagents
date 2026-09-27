@@ -19,6 +19,8 @@ use thiserror::Error;
 
 mod agents;
 pub use agents::AgentCommand;
+mod automations;
+pub use automations::AutomationCommand;
 
 use crate::{
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
@@ -69,6 +71,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Manage recurring daemon-owned work and its durable run history.
+    #[command(alias = "automations")]
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommand,
+    },
     /// Start, message, inspect, wait for, and close owned provider agents.
     Agent {
         #[command(subcommand)]
@@ -1386,6 +1394,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
         ServerResponse::BuildInfo { .. } => "build_info",
@@ -1533,6 +1542,7 @@ where
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),

@@ -14,11 +14,15 @@ use super::{schedule::Compiled, target};
 
 /// Synchronous management entry: the host IPC dispatcher owns control.read().
 /// No registry or HostState guard crosses target validation or actor cleanup.
-pub(super) fn process_under_control(
+pub(in crate::host) fn process_under_control(
     host: &SharedHost,
+    authority: crate::agent_execution::Authority,
     request: crate::automations::Request,
 ) -> Result<crate::automations::Response, String> {
     use crate::automations::{Request, Response};
+    if authority.token().is_some() {
+        return Err("An agent's child-execution capability does not grant automation management. Use an explicit user session.".into());
+    }
     let registry = agent_execution::registry(host)?;
     let handle = || {
         host.lock()
@@ -74,7 +78,12 @@ pub(super) fn process_under_control(
             revision,
             enabled: value,
             confirmed,
-        } => Response::Automation(enabled(host, id, revision, value, confirmed)?),
+        } => {
+            if value {
+                handle()?;
+            }
+            Response::Automation(enabled(host, id, revision, value, confirmed)?)
+        }
         Request::Remove { id, revision } => {
             remove(host, id, revision)?;
             Response::Removed
@@ -94,7 +103,10 @@ pub(super) fn process_under_control(
     Ok(response)
 }
 
-pub(super) fn create(host: &SharedHost, definition: Definition) -> Result<Automation, String> {
+pub(in crate::host) fn create(
+    host: &SharedHost,
+    definition: Definition,
+) -> Result<Automation, String> {
     let (definition, identity) = prepare(host, definition)?;
     agent_execution::registry(host)?
         .lock()
@@ -221,8 +233,12 @@ fn prepare(
 ) -> Result<(Definition, DirectoryIdentity), String> {
     definition.validate()?;
     Compiled::new(&definition.schedule)?.next_after(now()?)?;
-    definition.agent.target.repository = std::fs::canonicalize(&definition.agent.target.repository)
-        .map_err(|error| format!("Cannot open the automation project: {error}"))?;
+    let model = agent_execution::registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .model()?;
+    definition.agent.target.repository =
+        crate::project_location::resolve(&definition.agent.target.repository, Some(&model))?.key;
     definition.agent.target.directory =
         std::fs::canonicalize(&definition.agent.target.directory)
             .map_err(|error| format!("Cannot open the automation directory: {error}"))?;
@@ -259,4 +275,38 @@ pub(super) fn validate_target(
 
 pub(super) fn now() -> Result<u64, String> {
     crate::chat::now_ms().ok_or_else(|| "The system clock is outside the supported range".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agent_execution::Authority,
+        automations::Request,
+        host::state::HostState,
+        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+    };
+    use std::sync::Mutex;
+
+    #[test]
+    fn inherited_execution_authority_cannot_manage_automations() {
+        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("automation-authority-fixture"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        })));
+        // No registry is installed: denial must precede even reading shared
+        // automation definitions, rather than rely on a CLI-only restriction.
+        let error = process_under_control(
+            &host,
+            Authority::session("private-child-capability".into()),
+            Request::List {
+                after: None,
+                limit: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("does not grant automation management"));
+        assert!(!error.contains("private-child-capability"));
+    }
 }

@@ -87,6 +87,30 @@ pub(super) fn close_project(
 }
 
 impl Registry {
+    /// A confirmed retry reads its original receipt even after removal of the
+    /// definition or target. Reusing the key for another revision is an error.
+    pub(crate) fn previous_manual_automation_firing(
+        &self,
+        id: Uuid,
+        revision: u64,
+        request: Uuid,
+    ) -> Result<Option<Firing>, String> {
+        let previous = read_firing_key(
+            &self.db,
+            id,
+            &occurrence_key(revision, &crate::automations::Trigger::Manual { request }),
+        )?;
+        if previous
+            .as_ref()
+            .is_some_and(|firing| firing.revision != revision)
+        {
+            return Err(
+                "This manual request ID already belongs to another automation revision".into(),
+            );
+        }
+        Ok(previous)
+    }
+
     pub(crate) fn automation_firing(&self, id: Uuid) -> Result<Firing, String> {
         read_firing(&self.db, id)
     }
@@ -1024,6 +1048,11 @@ impl Registry {
         let mut automation = read_automation(&tx, id)?;
         let key = occurrence_key(expected_execution_revision, &trigger);
         if let Some(firing) = read_firing_key(&tx, id, &key)? {
+            if firing.revision != expected_execution_revision {
+                return Err(
+                    "This request ID already belongs to another automation revision".into(),
+                );
+            }
             let definition = read_definition(&tx, id, firing.revision)?;
             let target_identity = read_target_identity(&tx, id, firing.revision)?;
             return Ok(Claimed {

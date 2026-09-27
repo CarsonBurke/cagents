@@ -154,6 +154,15 @@ impl Handle {
                     .into(),
             );
         }
+        if let Some(previous) = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .previous_manual_automation_firing(id, revision, request)?
+        {
+            return Ok(previous);
+        }
         let host = self.0.host.upgrade().ok_or("The daemon is stopping")?;
         let automation = self
             .0

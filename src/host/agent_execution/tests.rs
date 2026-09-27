@@ -443,14 +443,42 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
         return;
     }
     let (host, request, path) = fixture();
-    let owner = Origin::Automation {
-        id: uuid::Uuid::new_v4(),
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
     };
+    let automation = crate::host::automations::service::create(
+        &host,
+        crate::automations::Definition {
+            name: "Interactive takeover fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Reuse,
+            precheck: None,
+        },
+    )
+    .unwrap();
+    let owner = Origin::Automation { id: automation.id };
     let accepted = registry(&host)
         .unwrap()
         .lock()
         .unwrap()
-        .submit_agent(&owner, &request, now())
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
         .unwrap();
     dispatch_accepted(&host, accepted.clone()).unwrap();
     let done = settled(&host, accepted.run.id);
@@ -535,13 +563,13 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
             now(),
         )
         .unwrap();
-    dispatch_accepted(&host, next.clone()).unwrap();
+    // The automation coordinator now owns acceptance as well as dispatch.
+    // A fabricated follow-up without its exact firing fails before the
+    // provider-facing takeover guard is reached.
     assert!(
-        settled(&host, next.run.id)
-            .result
-            .diagnostic
-            .unwrap()
-            .contains("Interactive work")
+        dispatch_accepted(&host, next)
+            .unwrap_err()
+            .contains("owning firing")
     );
     assert_eq!(
         std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(),
