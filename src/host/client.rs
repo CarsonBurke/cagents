@@ -291,7 +291,70 @@ fn process_request(
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
+    let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::WatchNotifications { presence }
+        | ClientRequest::NotificationPresence { presence } => {
+            crate::instance::validate_window_slot(&presence.window).map_err(|error| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string(), false)
+            })?;
+            if presence.sessions.len() > super::state::MAX_TERMINALS * 2
+                || presence
+                    .focused
+                    .is_some_and(|id| !presence.sessions.contains(&id))
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Invalid notification window ownership",
+                    false,
+                ));
+            }
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            // Watch and subsequent focus reports share the same live window
+            // identity, even though short control requests use another stream.
+            if notification_watch {
+                let activation = state.watch_notifications(client_id, presence);
+                Ok((
+                    ServerResponse::Notifications {
+                        snapshot: state.notification_snapshot(),
+                    },
+                    activation
+                        .into_iter()
+                        .map(|session| ServerMessage::NotificationActivated { session })
+                        .collect(),
+                    false,
+                ))
+            } else {
+                state.notification_presence(presence);
+                Ok((ServerResponse::Accepted, Vec::new(), false))
+            }
+        }
+        ClientRequest::ReadNotifications => {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            Ok((
+                ServerResponse::Notifications {
+                    snapshot: state.notification_snapshot(),
+                },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::NotificationPreferencesChanged { preferences, test } => {
+            if let Some(notifications) =
+                &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+            {
+                notifications.reload(preferences, test);
+            }
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::AcknowledgeNotification { id } => {
+            if let Some(notifications) =
+                &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+            {
+                notifications.acknowledge(id);
+            }
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::BuildInfo => Ok((
             ServerResponse::BuildInfo {
                 version: crate::VERSION.into(),
@@ -688,6 +751,9 @@ fn process_request(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
             handle.shutdown().map_err(send_error)?;
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .close_terminal_attention(terminal_id);
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::CloseTerminalChecked {
@@ -700,6 +766,9 @@ fn process_request(
                 .handle(client_id, terminal_id)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .close_terminal_attention(terminal_id);
                 super::chat::close_for_terminal(host, terminal_id)?;
             }
             Ok((

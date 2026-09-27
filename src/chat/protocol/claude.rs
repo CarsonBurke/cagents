@@ -257,6 +257,9 @@ struct Claude {
     cwd: PathBuf,
     ready: bool,
     busy: bool,
+    interruption: Option<bool>,
+    attention_generation: u64,
+    deferred_attention: HashMap<u64, (Option<String>, crate::notifications::Kind)>,
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
@@ -307,10 +310,11 @@ impl Claude {
         }
         let id = uuid::Uuid::new_v4().to_string();
         self.controls.insert(id.clone(), request.clone());
-        request
+        let wire = request
             .as_object_mut()
-            .ok_or("Malformed native Claude control operation")?
-            .remove("_cagents_reasoning");
+            .ok_or("Malformed native Claude control operation")?;
+        wire.remove("_cagents_reasoning");
+        wire.remove("_cagents_turn");
         Ok(Step {
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
@@ -400,6 +404,7 @@ impl Claude {
         let mut step = Step::default();
         self.message(&frame, &mut step)?;
         step.writes.push(frame);
+        step.events.push(Event::TurnStarted);
         self.status(true, "Claude is working", &mut step);
         Ok(step)
     }
@@ -1119,7 +1124,16 @@ impl Adapter for Claude {
                 action,
                 answers,
             } => self.answer(request_id, action, answers),
-            Command::Interrupt => self.control(json!({"subtype":"interrupt"})),
+            Command::Interrupt => {
+                if self.interruption.is_some() {
+                    return Err("Claude interruption is already pending for this turn".into());
+                }
+                let step = self.control(
+                    json!({"subtype":"interrupt", "_cagents_turn": self.attention_generation}),
+                )?;
+                self.interruption = self.busy.then_some(false);
+                Ok(step)
+            }
             Command::SetModel { model, reasoning } => {
                 if !self.ready {
                     return Err("Claude is still initializing".into());
@@ -1254,6 +1268,24 @@ impl Adapter for Claude {
                 let Some(request) = self.controls.remove(id) else {
                     return Ok(step);
                 };
+                if string(&request, "subtype") == "interrupt"
+                    && let Some(generation) = request["_cagents_turn"].as_u64()
+                {
+                    let accepted = string(response, "subtype") == "success";
+                    if let Some((key, outcome)) = self.deferred_attention.remove(&generation) {
+                        step.events.push(Event::TurnFinished {
+                            key,
+                            outcome: if accepted {
+                                crate::notifications::Kind::Cancelled
+                            } else {
+                                outcome
+                            },
+                        });
+                    } else if generation == self.attention_generation && self.interruption.is_some()
+                    {
+                        self.interruption = accepted.then_some(true);
+                    }
+                }
                 if string(response, "subtype") == "error" {
                     step.events.push(Event::Error {
                         message: format!(
@@ -1348,6 +1380,36 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
+                let had_turn = self.busy;
+                let interruption = self.interruption.take();
+                if had_turn || frame["uuid"].as_str().is_some() {
+                    step.events.push(Event::TurnSettled);
+                    use crate::notifications::Kind;
+                    // A delayed interrupt acknowledgement can arrive during
+                    // another turn. Allocate its fallback identity now instead
+                    // of borrowing that later turn's runtime identity.
+                    let key = Some(format!(
+                        "claude:{}",
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                    ));
+                    let outcome = if interruption == Some(true) {
+                        Kind::Cancelled
+                    } else if frame["is_error"].as_bool() == Some(true) {
+                        Kind::Failed
+                    } else {
+                        Kind::Succeeded
+                    };
+                    if interruption == Some(false) {
+                        self.deferred_attention
+                            .insert(self.attention_generation, (key, outcome));
+                    } else {
+                        step.events.push(Event::TurnFinished { key, outcome });
+                    }
+                }
+                self.attention_generation = self.attention_generation.wrapping_add(1);
                 let busy = !self.tasks.is_empty() || !self.pending.is_empty();
                 self.status(
                     busy,
@@ -3728,22 +3790,85 @@ mod tests {
             ..Claude::default()
         };
         let interrupt = adapter.command(Command::Interrupt).unwrap();
-        adapter
+        let acknowledged = adapter
             .receive(reply(
                 interrupt.writes[0]["request_id"].as_str().unwrap(),
                 json!({"still_queued":[]}),
             ))
             .unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
         assert!(adapter.busy);
         adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent1","task_type":"local_agent","description":"Review"})).unwrap();
-        adapter
+        let settled = adapter
             .receive(json!({"type":"result","subtype":"success","is_error":false}))
             .unwrap();
+        assert!(settled.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
         assert!(adapter.busy);
         adapter
             .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
             .unwrap();
         assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn interrupt_result_before_ack_cannot_cancel_the_following_turn() {
+        for accepted in [false, true] {
+            let mut adapter = Claude {
+                busy: true,
+                ready: true,
+                ..Claude::default()
+            };
+            let interrupt = adapter.command(Command::Interrupt).unwrap();
+            let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
+            assert!(
+                interrupt.writes[0]["request"]
+                    .get("_cagents_turn")
+                    .is_none()
+            );
+            let first = adapter
+                .receive(json!({"type":"result","uuid":"first","is_error":false}))
+                .unwrap();
+            assert!(
+                !first
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            // A new turn can begin while the old interrupt response is queued.
+            let next = adapter.send_prompt("next turn".into(), Vec::new()).unwrap();
+            assert!(
+                next.events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnStarted))
+            );
+            let acknowledgment = if accepted {
+                reply(request_id, json!({}))
+            } else {
+                json!({"type":"control_response","response":{"request_id":request_id,"subtype":"error","error":"already settled"}})
+            };
+            let acknowledged = adapter.receive(acknowledgment).unwrap();
+            let expected = if accepted {
+                crate::notifications::Kind::Cancelled
+            } else {
+                crate::notifications::Kind::Succeeded
+            };
+            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
+            let second = adapter
+                .receive(json!({"type":"result","uuid":"second","is_error":false}))
+                .unwrap();
+            assert!(second.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("claude:second"))));
+        }
     }
 
     #[test]

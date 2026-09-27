@@ -324,6 +324,7 @@ pub struct ControlClient {
     /// Shared-model edges that arrived while a correlated response was pending,
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<(u64, ModelEdit)>,
+    observed_notifications: VecDeque<crate::notifications::Update>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -357,6 +358,7 @@ impl ControlClient {
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
+            observed_notifications: VecDeque::new(),
             attached_chats: BTreeSet::new(),
         })
     }
@@ -439,6 +441,86 @@ impl ControlClient {
     /// subscribing and reading for an edit to fall into.
     pub fn watch_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
         self.expect_model(ClientRequest::WatchWorkspaceModel)
+    }
+
+    pub fn watch_notifications(
+        &mut self,
+        presence: crate::notifications::Presence,
+    ) -> Result<crate::notifications::Snapshot, ControlError> {
+        self.notification_snapshot_request(ClientRequest::WatchNotifications { presence })
+    }
+
+    pub fn read_notifications(&mut self) -> Result<crate::notifications::Snapshot, ControlError> {
+        self.notification_snapshot_request(ClientRequest::ReadNotifications)
+    }
+
+    fn notification_snapshot_request(
+        &mut self,
+        request: ClientRequest,
+    ) -> Result<crate::notifications::Snapshot, ControlError> {
+        self.stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(ControlError::Configure)?;
+        match self.request_strict(request)? {
+            ServerResponse::Notifications { snapshot } => Ok(snapshot),
+            response => Err(unexpected_response("agent attention", &response)),
+        }
+    }
+
+    fn accepted(&mut self, request: ClientRequest) -> Result<(), ControlError> {
+        match self.request_strict(request)? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("request acceptance", &response)),
+        }
+    }
+
+    pub fn notification_presence(
+        &mut self,
+        presence: crate::notifications::Presence,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::NotificationPresence { presence })
+    }
+
+    pub fn notification_preferences(
+        &mut self,
+        preferences: Option<crate::notifications::Preferences>,
+        test: bool,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::NotificationPreferencesChanged { preferences, test })
+    }
+
+    pub fn acknowledge_notification(&mut self, id: uuid::Uuid) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::AcknowledgeNotification { id })
+    }
+
+    pub fn next_notification(&mut self) -> Result<crate::notifications::Update, ControlError> {
+        if let Some(update) = self.observed_notifications.pop_front() {
+            return Ok(update);
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::NotificationsChanged => {
+                    return Ok(crate::notifications::Update::Changed);
+                }
+                ServerMessage::NotificationActivated { session } => {
+                    return Ok(crate::notifications::Update::Activated(session));
+                }
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Reads the shared model without subscribing, for a client whose state
@@ -1067,6 +1149,21 @@ impl ControlClient {
             ServerMessage::WorkspaceModelEdited { sequence, edit } => {
                 self.observed_model.push_back((sequence, edit));
             }
+            ServerMessage::NotificationsChanged => {
+                if !self
+                    .observed_notifications
+                    .contains(&crate::notifications::Update::Changed)
+                {
+                    self.observed_notifications
+                        .push_back(crate::notifications::Update::Changed);
+                }
+            }
+            ServerMessage::NotificationActivated { session } => {
+                if self.observed_notifications.len() < 32 {
+                    self.observed_notifications
+                        .push_back(crate::notifications::Update::Activated(session));
+                }
+            }
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
@@ -1229,6 +1326,8 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
+        | ServerMessage::NotificationsChanged
+        | ServerMessage::NotificationActivated { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -1249,11 +1348,14 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
+        ServerMessage::NotificationsChanged => "notifications_changed",
+        ServerMessage::NotificationActivated { .. } => "notification_activated",
     }
 }
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::Notifications { .. } => "notifications",
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",

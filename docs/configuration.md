@@ -23,6 +23,7 @@ cagents follows the XDG base-directory convention. Production paths are:
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
 - Named-window databases: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/windows/<name>/sessions.sqlite3`
 - Full-upgrade checkpoint: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/daemon-upgrade/`
+- Agent attention journal: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/agent-attention.sqlite3`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and
@@ -152,6 +153,11 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
+| `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
+| `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
+| `notifications.failure` | boolean | `true` | Alerts for failures and cancellations |
+| `notifications.waiting` | boolean | `true` | Alerts when a supported provider needs attention |
+| `notifications.while_focused` | boolean | `false` | Also alerts for the focused pane in a focused window |
 
 ## Keyboard shortcuts
 

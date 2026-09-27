@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod attention;
 mod claude;
 mod codex;
 mod rollout;
@@ -78,12 +79,15 @@ struct Entry {
 pub(crate) struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
     rollouts: rollout::Rollouts,
+    attention: Mutex<attention::Tails>,
+    waiting: Mutex<BTreeMap<(i32, u64), (ActivityState, Instant)>>,
 }
 
 #[derive(Default)]
 pub(crate) struct Observation {
     pub activity: Option<Activity>,
     pub title: Option<String>,
+    pub attention: Option<crate::notifications::Evidence>,
 }
 
 pub(crate) enum ObserveError {
@@ -96,6 +100,8 @@ impl Observer {
         Self {
             accounts: Mutex::new(BTreeMap::new()),
             rollouts: rollout::Rollouts::default(),
+            attention: Mutex::default(),
+            waiting: Mutex::default(),
         }
     }
 
@@ -112,8 +118,9 @@ impl Observer {
         // the rollouts it holds open; only one that holds none can be a client
         // of the shared server the census asks.
         if provider == Provider::Codex
-            && let Some(state) = self.rollouts.state(
+            && let Some((state, attention)) = self.rollouts.observe(
                 process.pid,
+                process.start,
                 crate::model::agent_recovery::process_started(process.start)
                     .and_then(|started| started.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|started| started.as_secs()),
@@ -122,6 +129,7 @@ impl Observer {
             return Ok(Observation {
                 activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
                 title: None,
+                attention,
             });
         }
         let key = key(provider, recipe).map_err(|_| ObserveError::Unavailable)?;
@@ -182,9 +190,65 @@ impl Observer {
             }
             Inventory::Codex(_) => None,
         };
+        let attention = match census {
+            Inventory::Claude(census) => {
+                claude::session(census, process.pid, &recipe.working_directory)
+                    .and_then(|id| {
+                        crate::agent::claude_transcript(&key.home, &recipe.working_directory, id)
+                            .ok()
+                    })
+                    .and_then(|path| {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+                            .open(path)
+                            .ok()
+                    })
+                    .and_then(|file| {
+                        self.attention
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .read_for_process(
+                                &file,
+                                attention::Format::Claude,
+                                (process.pid, process.start),
+                            )
+                            .ok()
+                            .flatten()
+                    })
+            }
+            Inventory::Codex(_) => None,
+        };
+        let waiting = (|| {
+            // Claude's PID-scoped inventory explicitly distinguishes waiting.
+            // A first census is a baseline, including when already waiting.
+            if provider != Provider::Claude {
+                return None;
+            }
+            let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
+            let key = (process.pid, process.start);
+            if !waiting.contains_key(&key) && waiting.len() >= 2048 {
+                let stale = waiting
+                    .iter()
+                    .min_by_key(|(_, (_, seen))| *seen)
+                    .map(|(key, _)| *key);
+                if let Some(stale) = stale {
+                    waiting.remove(&stale);
+                }
+            }
+            let old = waiting.insert(key, (state, Instant::now()));
+            (state == ActivityState::Waiting && old.is_some_and(|(old, _)| old != state)).then(
+                || crate::notifications::Evidence {
+                    key: format!("waiting:{}", uuid::Uuid::new_v4()),
+                    kind: crate::notifications::Kind::Waiting,
+                },
+            )
+        })();
         Ok(Observation {
             activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
             title,
+            attention: waiting.or(attention),
         })
     }
 }

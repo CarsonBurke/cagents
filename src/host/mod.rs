@@ -4,6 +4,7 @@ mod client;
 mod delivery;
 pub(crate) mod descriptor_limit;
 mod model;
+mod notifications;
 mod state;
 
 use std::{
@@ -188,6 +189,16 @@ pub fn run() -> Result<(), HostError> {
             tracing::error!(%error, "the shared workspace model is unavailable; channels will \
                                     not be shared between windows")
         }
+    }
+    let notification_broker = match notifications::Broker::start(&host) {
+        Ok(broker) => Some(broker),
+        Err(error) => {
+            tracing::warn!(%error, "agent notifications are unavailable");
+            None
+        }
+    };
+    if let Some(broker) = &notification_broker {
+        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
     }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
     let _agent_activity = activity::Monitor::start(&host)?;

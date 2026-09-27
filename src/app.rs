@@ -14,6 +14,7 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+mod notification_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -2108,6 +2109,7 @@ impl ContextTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCategory {
+    Notifications,
     General,
     Appearance,
     Terminal,
@@ -2118,8 +2120,9 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::General,
+        Self::Notifications,
         Self::Appearance,
         Self::Editor,
         Self::Terminal,
@@ -2130,6 +2133,7 @@ impl SettingsCategory {
 
     const fn label(self) -> &'static str {
         match self {
+            Self::Notifications => "Notifications",
             Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
@@ -2557,6 +2561,7 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsField {
+    Notifications(crate::notifications::Field),
     AppTheme,
     UiScale,
     TerminalLineHeight,
@@ -2653,6 +2658,7 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
+    notifications: crate::notifications::Preferences,
     app_theme: String,
     ui_scale: String,
     terminal_line_height: String,
@@ -2689,6 +2695,7 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
+            notifications: settings.notifications,
             app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
@@ -2736,6 +2743,7 @@ impl SettingsDraft {
 
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
+            SettingsField::Notifications(field) => self.notifications.set(field, value == "true"),
             SettingsField::AppTheme => self.app_theme = value,
             SettingsField::UiScale => self.ui_scale = value,
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
@@ -2848,6 +2856,10 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::Notifications(field) => value
+            .parse::<bool>()
+            .map(|enabled| next.notifications.set(field, enabled))
+            .map_err(|_| "Choose whether this notification is enabled.".to_owned()),
         SettingsField::FocusFollowsMouse => value
             .parse::<bool>()
             .map(|enabled| next.focus_follows_mouse = enabled)
@@ -3382,6 +3394,7 @@ pub enum Message {
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
     GitUi(git_ui::Action),
+    NotificationUi(notification_ui::Action),
     AccountUi(account_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -3822,6 +3835,7 @@ pub struct Cagents {
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
     workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
+    notification_ui: notification_ui::State,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
     settings: AppSettings,
@@ -9723,6 +9737,11 @@ impl Cagents {
                         self.synchronize_appearance(previous_scale)
                     }
                     SettingsField::ShowStatusBar => self.accounts_surface_changed(),
+                    SettingsField::Notifications(_) => {
+                        self.notification_ui
+                            .preferences(self.settings.notifications, false);
+                        Task::none()
+                    }
                     SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
                     SettingsField::HibernationDelayMs => {
                         // Reconciled here rather than through a queued
@@ -9995,6 +10014,7 @@ impl Application for Cagents {
             workspace_model_rx,
             workspace_model_tx,
             activation_rx,
+            notification_ui: notification_ui::State::default(),
             session,
             save_health,
             settings_base: settings.clone(),
@@ -10185,6 +10205,7 @@ impl Application for Cagents {
         }
         app.refresh_sidebar_channels();
         app.refresh_sidebar_worktree_panes();
+        app.start_notifications();
         let mut tasks = vec![
             scope,
             app.commit_terminal_handoffs(),
@@ -12568,6 +12589,7 @@ impl Application for Cagents {
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
             Message::GitUi(action) => self.update_git(action),
+            Message::NotificationUi(action) => self.update_notifications(action),
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
@@ -12792,6 +12814,7 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         let task = Task::batch([task, self.flush_settings_on_blur()]);
+        self.sync_notification_presence();
         if let Some(notice) = self.status.take() {
             match notice.severity {
                 NoticeSeverity::Error => {
@@ -12843,6 +12866,7 @@ impl Application for Cagents {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
+            self.notification_subscription(),
             self.refresh_subscription(),
             self.git_subscription(),
             self.account_subscription(),
@@ -19170,6 +19194,7 @@ mod tests {
             // drains, which is what keeps a test off the daemon entirely.
             workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
+            notification_ui: notification_ui::State::default(),
             session: None,
             save_health: None,
             settings_draft: SettingsDraft::from_settings(&settings),

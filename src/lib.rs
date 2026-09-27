@@ -51,6 +51,7 @@ pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
 pub mod model;
+pub mod notifications;
 pub mod performance;
 #[cfg(feature = "ui")]
 pub mod persistence;

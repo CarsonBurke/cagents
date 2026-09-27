@@ -1083,7 +1083,40 @@ pub fn activate_window(slot: &str) -> io::Result<bool> {
     activate_window_in(&runtime_directory()?, slot)
 }
 
+/// Use a desktop portal's activation token without mutating process-wide env.
+pub fn activate_window_with_token(slot: &str, token: Option<&str>) -> io::Result<bool> {
+    validate_window_slot(slot)?;
+    activate_window_at_with_token(&runtime_directory()?, slot, token)
+}
+
+pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result<()> {
+    validate_window_slot(slot)?;
+    let mut command = process::Command::new(env::current_exe()?.with_file_name("cagents-ui"));
+    command.args(["--window", slot]);
+    command.env_remove("XDG_ACTIVATION_TOKEN");
+    if let Some(token) = token.filter(|token| valid_activation_token(token)) {
+        command.env("XDG_ACTIVATION_TOKEN", token);
+    }
+    crate::control::spawn_ui_process(&mut command)
+}
+
 fn activate_window_in(runtime_directory: &Path, slot: &str) -> io::Result<bool> {
+    let token = env::var("XDG_ACTIVATION_TOKEN").ok();
+    activate_window_at_with_token(runtime_directory, slot, token.as_deref())
+}
+
+fn valid_activation_token(token: &str) -> bool {
+    !token.is_empty()
+        && !token.contains('\n')
+        && !token.contains('\r')
+        && token.len() < MAX_ACTIVATION_LINE_BYTES
+}
+
+fn activate_window_at_with_token(
+    runtime_directory: &Path,
+    slot: &str,
+    token: Option<&str>,
+) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
     let socket_path = runtime_directory.join(slot_socket_name(slot));
     let mut stream = match UnixStream::connect(&socket_path) {
@@ -1100,16 +1133,11 @@ fn activate_window_in(runtime_directory: &Path, slot: &str) -> io::Result<bool> 
     };
     stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
     stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-    let token = env::var("XDG_ACTIVATION_TOKEN").ok().filter(|token| {
-        !token.is_empty()
-            && !token.contains('\n')
-            && !token.contains('\r')
-            && token.len() < MAX_ACTIVATION_LINE_BYTES
-    });
+    let token = token.filter(|token| valid_activation_token(token));
     writeln!(
         stream,
         "{}",
-        match token.as_deref() {
+        match token {
             Some(token) => format!("activate {token}"),
             None => "activate".to_owned(),
         }
