@@ -132,7 +132,10 @@ pub(super) struct Broker {
 }
 
 impl Broker {
-    pub fn start(host: &SharedHost) -> std::io::Result<Self> {
+    pub fn start(
+        host: &SharedHost,
+        application: crate::notifications::Application,
+    ) -> std::io::Result<Self> {
         let (wake, receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
@@ -149,7 +152,7 @@ impl Broker {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => runtime.block_on(run(shared, host, receiver)),
+                    Ok(runtime) => runtime.block_on(run(shared, host, receiver, application)),
                     Err(error) => publish(
                         &shared,
                         &host,
@@ -239,12 +242,15 @@ fn preferences() -> Result<Preferences, String> {
     )
 }
 
-async fn connect(shared: Weak<Shared>) -> Result<Portal, String> {
+async fn connect(
+    shared: Weak<Shared>,
+    application: crate::notifications::Application,
+) -> Result<Portal, String> {
     tokio::time::timeout(PORTAL_TIMEOUT, async move {
         // A host daemon is not launched from the UI desktop file's cgroup.
         // Registration gives the portal the same application identity as UI.
         let _ = ashpd::register_host_app(
-            crate::instance::APPLICATION_ID
+            crate::instance::notification_desktop_id(application)
                 .parse()
                 .map_err(|error| format!("Invalid application identity: {error}"))?,
         )
@@ -431,7 +437,12 @@ mod tests {
     }
 }
 
-async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: mpsc::Receiver<()>) {
+async fn run(
+    shared: Weak<Shared>,
+    host: Weak<Mutex<HostState>>,
+    mut receiver: mpsc::Receiver<()>,
+    application: crate::notifications::Application,
+) {
     let path =
         crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
     let mut journal = path
@@ -604,7 +615,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
             && proxy.is_none()
             && Instant::now() >= next_attempt
         {
-            match connect(shared.clone()).await {
+            match connect(shared.clone(), application).await {
                 Ok(connected) => {
                     proxy = Some(connected);
                     snapshot.diagnostic = None;

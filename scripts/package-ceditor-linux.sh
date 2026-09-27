@@ -85,6 +85,8 @@ for binary in ceditor cagents cagentsd; do
     install -m 0755 "$TARGET_DIR/release/$binary" "$PRIVATE/releases/$VERSION/bin/$binary"
     strip --strip-unneeded "$PRIVATE/releases/$VERSION/bin/$binary"
 done
+printf '%s\n' 'ceditor companions v1' > "$PRIVATE/releases/$VERSION/bin/.ceditor-companions"
+chmod 644 "$PRIVATE/releases/$VERSION/bin/.ceditor-companions"
 ln -s "releases/$VERSION" "$PRIVATE/current"
 ln -s ../lib/ceditor/current/bin/ceditor "$PACKAGE_ROOT/bin/ceditor"
 install -m 0644 "$ROOT_DIR/packaging/$DESKTOP_ID.desktop" "$PACKAGE_ROOT/share/applications/$DESKTOP_ID.desktop"

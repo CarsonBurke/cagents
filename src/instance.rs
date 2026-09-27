@@ -1225,6 +1225,56 @@ pub fn activate_destination(
     activate_socket_with_token(&runtime, destination_socket_name(destination), token)
 }
 
+pub const CEDITOR_NOTIFICATION_ARGUMENT: &str = "--ceditor-notifications";
+const CEDITOR_COMPANIONS_MARKER: &str = ".ceditor-companions";
+const CEDITOR_COMPANIONS_CONTENT: &[u8] = b"ceditor companions v1\n";
+
+/// A fixed local install marker preserves desktop identity when the private
+/// CLI restarts its daemon. Development launches use the explicit fixed flag.
+/// Neither path permits a caller-supplied desktop ID or executable path.
+pub fn notification_daemon_application(
+    executable: &Path,
+    editor_requested: bool,
+) -> io::Result<crate::notifications::Application> {
+    let marker = executable.with_file_name(CEDITOR_COMPANIONS_MARKER);
+    let installed = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.mode() & 0o022 != 0
+                || !(metadata.uid() == 0 || metadata.uid() == current_uid())
+                || metadata.len() != CEDITOR_COMPANIONS_CONTENT.len() as u64
+                || fs::read(&marker)? != CEDITOR_COMPANIONS_CONTENT
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid private Ceditor companion marker",
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if installed || editor_requested {
+        // A flag is accepted only with an owned co-installed editor, never a
+        // PATH lookup which could silently select another installation.
+        resolve_notification_executable(&executable.with_file_name("ceditor"), std::iter::empty())?;
+        Ok(crate::notifications::Application::Ceditor)
+    } else {
+        Ok(crate::notifications::Application::Cagents)
+    }
+}
+
+pub fn notification_desktop_id(application: crate::notifications::Application) -> &'static str {
+    match application {
+        crate::notifications::Application::Cagents => APPLICATION_ID,
+        crate::notifications::Application::Ceditor if IS_DEVELOPMENT => {
+            "io.github.cagents.ceditor.Development"
+        }
+        crate::notifications::Application::Ceditor => "io.github.cagents.ceditor",
+    }
+}
+
 // The editor's daemon is a private matched companion. The other shell may be
 // installed separately, so resolve only these fixed application names, never a
 // path carried by an alert. Relative PATH entries cannot redirect activation.
@@ -1838,6 +1888,36 @@ mod tests {
                 "cagents-development-ui.activate",
             )
         );
+    }
+
+    #[test]
+    fn private_editor_companion_uses_only_fixed_owned_desktop_context() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = root.path().join("cagentsd");
+        assert_eq!(
+            notification_daemon_application(&daemon, false).unwrap(),
+            crate::notifications::Application::Cagents
+        );
+        assert!(notification_daemon_application(&daemon, true).is_err());
+        let editor = root.path().join("ceditor");
+        fs::write(&editor, "fixture executable").unwrap();
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            notification_daemon_application(&daemon, true).unwrap(),
+            crate::notifications::Application::Ceditor
+        );
+        let marker = root.path().join(CEDITOR_COMPANIONS_MARKER);
+        fs::write(&marker, CEDITOR_COMPANIONS_CONTENT).unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            notification_daemon_application(&daemon, false).unwrap(),
+            crate::notifications::Application::Ceditor
+        );
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(notification_daemon_application(&daemon, false).is_err());
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&marker, "unrecognized context").unwrap();
+        assert!(notification_daemon_application(&daemon, false).is_err());
     }
 
     #[test]
