@@ -702,6 +702,14 @@ impl Handle {
             state.ready,
         )
     }
+    pub(crate) fn update_title(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .title
+            .clone()
+    }
     #[cfg(test)]
     pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
         let inner = Arc::downgrade(&self.0);

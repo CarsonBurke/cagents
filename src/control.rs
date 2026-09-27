@@ -870,10 +870,13 @@ impl ControlClient {
         impact: crate::update::impact::DaemonImpact,
         relaunch_agents: bool,
     ) -> Result<(u64, u64), ControlError> {
-        match self.request_strict(ClientRequest::PrepareConfirmedUpgrade {
-            impact,
-            relaunch_agents,
-        })? {
+        match self.request_with_deadline(
+            ClientRequest::PrepareConfirmedUpgrade {
+                impact,
+                relaunch_agents,
+            },
+            Instant::now() + Duration::from_secs(60),
+        )? {
             ServerResponse::UpgradePrepared { terminals, chats } => Ok((terminals, chats)),
             response => Err(unexpected_response(
                 "confirmed upgrade checkpoint",

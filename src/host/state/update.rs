@@ -47,14 +47,14 @@ impl HostState {
             impact.sessions.push(SessionImpact {
                 id,
                 kind: SessionKind::Terminal,
-                title: std::path::Path::new(&source.launch.program)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .chars()
-                    .filter(|character| !character.is_control())
-                    .take(80)
-                    .collect(),
+                title: display_title(
+                    record
+                        .conversation_title
+                        .as_ref()
+                        .map(|(_, title)| title.as_str())
+                        .unwrap_or(&source.launch.program),
+                    &source.launch.working_directory,
+                ),
                 identity: identity(&(self.inventory_generation, &source))?,
                 disposition,
                 reason: reason.into(),
@@ -102,7 +102,14 @@ impl HostState {
             impact.sessions.push(SessionImpact {
                 id,
                 kind: SessionKind::NativeChat,
-                title: record.session.launch.provider.label().into(),
+                title: display_title(
+                    record
+                        .handle
+                        .update_title()
+                        .as_deref()
+                        .unwrap_or(record.session.launch.provider.label()),
+                    &record.session.launch.recipe.working_directory,
+                ),
                 identity: identity(&(self.inventory_generation, &record.session, confirmed))?,
                 disposition,
                 reason: reason.into(),
@@ -113,6 +120,17 @@ impl HostState {
             .sort_by_key(|session| (session.kind, session.id));
         Ok(impact)
     }
+}
+
+fn display_title(name: &str, directory: &std::path::Path) -> String {
+    let clean = |text: &str| {
+        text.chars()
+            .filter(|character| !character.is_control())
+            .take(80)
+            .collect::<String>()
+    };
+    let directory = directory.file_name().unwrap_or_default().to_string_lossy();
+    format!("{} · {}", clean(name), clean(&directory))
 }
 
 fn identity(value: &impl serde::Serialize) -> Result<String, ProtocolError> {
