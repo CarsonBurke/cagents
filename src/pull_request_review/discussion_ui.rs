@@ -63,6 +63,8 @@ struct Composer {
 struct FileThreads {
     leading: Vec<usize>,
     lines: HashMap<(crate::github::ReviewDiffSide, u64), Vec<usize>>,
+    comments: usize,
+    unresolved: usize,
 }
 
 pub(super) struct DiscussionState {
@@ -217,6 +219,8 @@ impl State {
                                 .threads
                                 .entry(thread.path.clone())
                                 .or_default();
+                            file.comments += thread.comments.len();
+                            file.unresolved += usize::from(!thread.resolved);
                             if let Some(line) = thread.line.filter(|_| !thread.outdated) {
                                 file.lines
                                     .entry((thread.side, line))
@@ -548,6 +552,13 @@ impl State {
             authority_revision: self.authority_revision,
             action: Box::new(action),
         })
+    }
+
+    pub(super) fn discussion_counts(&self, path: &str) -> (usize, usize) {
+        self.discussion
+            .threads
+            .get(path)
+            .map_or((0, 0), |file| (file.comments, file.unresolved))
     }
 
     pub fn annotation_revision(&self) -> (u64, u64) {

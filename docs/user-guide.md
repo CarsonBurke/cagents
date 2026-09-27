@@ -143,7 +143,7 @@ matching refresh re-enables creation.
 
 ## Pull request review
 
-Clicking a pull request row in Projects opens a **pull request pane** for that
+Clicking a row in Projects' **Pull requests** filter opens a **pull request pane** for that
 repository: the project's open pull requests on the left, and the selected
 one's changed files with their GitHub **viewed** marks under a header that shows
 progress and links to GitHub.
@@ -154,6 +154,10 @@ progress and links to GitHub.
   them; a refused mark reverts and says so.
 - **Alt+V** marks the open file viewed and moves on; **Alt+Down** and
   **Alt+Up** step through files.
+- The file toolbar switches between tree and flat lists, hides viewed files,
+  and jumps to the next unviewed file. Navigation reveals collapsed ancestors
+  and skips hidden viewed files. Each file shows its comment and unresolved
+  discussion counts; the viewed progress stays visible above the list.
 - One pane serves each repository, and a restored pane reopens its pull request
   once GitHub has been read.
 - Settings → Links → **Open pull requests in** switches rows back to plain
