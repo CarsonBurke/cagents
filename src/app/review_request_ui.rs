@@ -33,6 +33,27 @@ impl Cagents {
             .update(action, repositories.values().cloned())
             .map(Message::ReviewRequests)
             .map(cosmic::Action::App);
+        let requests = self.refresh_ui.review_requests.take_observed();
+        let report = if requests.is_empty()
+            || !self.settings.notifications.enabled
+            || !self.settings.notifications.review_requests
+        {
+            Task::none()
+        } else {
+            iced::Task::perform(
+                crate::notifications::review::report(
+                    crate::notifications::review::ObservedRequests {
+                        destination: crate::notifications::Destination {
+                            application: crate::notifications::Application::Cagents,
+                            window: instance::window_slot().into(),
+                        },
+                        requests,
+                    },
+                ),
+                |result| Message::NotificationUi(notification_ui::Action::ReviewsReported(result)),
+            )
+            .map(cosmic::Action::App)
+        };
         for project in &mut self.sidebar_model.projects {
             let snapshot = repositories.get(&project.id).and_then(|repository| {
                 self.refresh_ui
@@ -55,6 +76,7 @@ impl Cagents {
                 }
             }
         }
-        task
+        self.review_alert_focus_changed();
+        Task::batch([task, report, self.open_pending_review_alert()])
     }
 }

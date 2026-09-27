@@ -171,6 +171,7 @@ impl Tracker {
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
             Kind::Waiting => return Err("Waiting is not a completed agent run".into()),
+            Kind::ReviewRequested => return Err("A review request is not an agent outcome".into()),
         };
         let mut capture = self
             .runs

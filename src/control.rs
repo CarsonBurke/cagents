@@ -484,6 +484,13 @@ impl ControlClient {
         }
     }
 
+    pub fn observe_review_requests(
+        &mut self,
+        observed: crate::notifications::review::ObservedRequests,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::ObserveReviewRequests { observed })
+    }
+
     pub fn notification_presence(
         &mut self,
         presence: crate::notifications::Presence,

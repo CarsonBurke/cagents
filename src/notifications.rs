@@ -3,6 +3,9 @@
 //! The daemon owns delivery and the durable journal. Windows report focus and
 //! acknowledge attention; they do not each send a desktop notification.
 
+pub mod review;
+#[cfg(feature = "ui")]
+pub mod ui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -10,16 +13,40 @@ use crate::{agent::Provider, model::TerminalId};
 
 /// Durable activation and lifecycle identity. Optional source-process metadata
 /// describes focus and window ownership, not the notice's retirement authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Target {
     Session(TerminalId),
+    PullRequest(review::ReviewRequest),
 }
 
 impl Target {
-    pub(crate) fn storage_key(self) -> String {
+    pub(crate) fn storage_key(&self) -> String {
         match self {
             Self::Session(id) => id.to_string(),
+            Self::PullRequest(request) => request.storage_key(),
         }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum Application {
+    #[default]
+    Cagents,
+    Ceditor,
+}
+
+/// A real shell window, distinct from the lifecycle identity being opened.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Destination {
+    pub application: Application,
+    pub window: String,
+}
+
+impl Destination {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::instance::validate_window_slot(&self.window).map_err(|error| error.to_string())
     }
 }
 
@@ -29,6 +56,7 @@ pub enum Kind {
     Failed,
     Cancelled,
     Waiting,
+    ReviewRequested,
 }
 
 impl Kind {
@@ -38,6 +66,7 @@ impl Kind {
             Self::Failed => "Agent failed",
             Self::Cancelled => "Agent cancelled",
             Self::Waiting => "Agent needs your attention",
+            Self::ReviewRequested => "Your review was requested",
         }
     }
 }
@@ -55,7 +84,9 @@ pub struct Event {
     /// Focus and preferred-window metadata only, never lifecycle authority.
     pub source_session: Option<TerminalId>,
     pub provider: Option<Provider>,
-    pub directory: PathBuf,
+    pub directory: Option<PathBuf>,
+    #[serde(default)]
+    pub destination: Option<Destination>,
     pub evidence: Evidence,
 }
 
@@ -70,13 +101,43 @@ impl Event {
             target: Target::Session(session),
             source_session: Some(session),
             provider: Some(provider),
-            directory,
+            directory: Some(directory),
+            destination: None,
             evidence,
         }
     }
 
+    pub fn validate(&self) -> Result<(), String> {
+        if self.evidence.key.len() > 1024
+            || self
+                .directory
+                .as_ref()
+                .is_some_and(|directory| directory.as_os_str().len() > 4096)
+        {
+            return Err("Notification metadata exceeds its size limit".into());
+        }
+        if let Some(destination) = &self.destination {
+            destination.validate()?;
+        }
+        if let Target::PullRequest(request) = &self.target {
+            request.validate()?;
+            if self.evidence.kind != Kind::ReviewRequested
+                || self.evidence.key != request.request
+                || self.source_session.is_some()
+                || self.provider.is_some()
+                || self.directory.is_some()
+                || self.destination.is_none()
+            {
+                return Err("Review alerts require exact request and application authority, without provider metadata".into());
+            }
+        } else if self.evidence.kind == Kind::ReviewRequested {
+            return Err("Review alerts require a pull-request target".into());
+        }
+        Ok(())
+    }
+
     pub fn target(&self) -> Target {
-        self.target
+        self.target.clone()
     }
     pub fn source_session(&self) -> Option<TerminalId> {
         self.source_session
@@ -115,6 +176,7 @@ pub struct Preferences {
     pub failure: bool,
     pub waiting: bool,
     pub while_focused: bool,
+    pub review_requests: bool,
 }
 
 impl Default for Preferences {
@@ -125,6 +187,7 @@ impl Default for Preferences {
             failure: true,
             waiting: true,
             while_focused: false,
+            review_requests: true,
         }
     }
 }
@@ -147,8 +210,21 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     pub window: String,
+    #[serde(default)]
+    pub application: Application,
+    #[serde(default)]
+    pub focused_target: Option<Target>,
     pub sessions: Vec<TerminalId>,
     pub focused: Option<TerminalId>,
+}
+
+impl Presence {
+    pub fn destination(&self) -> Destination {
+        Destination {
+            application: self.application,
+            window: self.window.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,6 +234,7 @@ pub enum Field {
     Failure,
     Waiting,
     WhileFocused,
+    ReviewRequests,
 }
 
 impl Preferences {
@@ -168,6 +245,7 @@ impl Preferences {
             Field::Failure => self.failure,
             Field::Waiting => self.waiting,
             Field::WhileFocused => self.while_focused,
+            Field::ReviewRequests => self.review_requests,
         }
     }
     pub fn set(&mut self, field: Field, value: bool) {
@@ -177,11 +255,12 @@ impl Preferences {
             Field::Failure => &mut self.failure,
             Field::Waiting => &mut self.waiting,
             Field::WhileFocused => &mut self.while_focused,
+            Field::ReviewRequests => &mut self.review_requests,
         } = value;
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     Changed,
     Activated(Target),
@@ -195,15 +274,23 @@ impl Preferences {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
                 Kind::Waiting => self.waiting,
+                Kind::ReviewRequested => self.review_requests,
             }
     }
 }
 
 /// Only bounded, non-content context may cross into desktop notifications.
 pub fn context(event: &Event) -> String {
+    if let Target::PullRequest(request) = &event.target {
+        return format!(
+            "{}/{} #{}",
+            request.owner, request.repository, request.number
+        );
+    }
     let directory = event
         .directory
-        .file_name()
+        .as_ref()
+        .and_then(|directory| directory.file_name())
         .unwrap_or_default()
         .to_string_lossy();
     let directory: String = directory
@@ -233,7 +320,8 @@ mod tests {
             target: Target::Session(session),
             source_session: None,
             provider: None,
-            directory: "/project".into(),
+            directory: Some("/project".into()),
+            destination: None,
             evidence: event.evidence,
         };
         let bytes = postcard::to_stdvec(&event).unwrap();
@@ -273,7 +361,11 @@ mod tests {
             target: Target::Session(TerminalId::new()),
             source_session: None,
             provider: Some(Provider::Codex),
-            directory: PathBuf::from(format!("/private/account/{}\n", "x".repeat(200))),
+            directory: Some(PathBuf::from(format!(
+                "/private/account/{}\n",
+                "x".repeat(200)
+            ))),
+            destination: None,
             evidence: Evidence {
                 key: "turn".into(),
                 kind: Kind::Succeeded,
