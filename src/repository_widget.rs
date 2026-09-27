@@ -7108,12 +7108,7 @@ fn diff_surface<'a>(
                             review
                                 .annotation(path, None, None, true)
                                 .map(move |action| RepositoryAction::Review { card, action }),
-                            // The information panel uses Fill for its ordinary
-                            // centered presentation. Bound that panel inside the
-                            // scrolling thread list, whose height stays natural.
-                            widget::container(no_text_view(content))
-                                .height(240.0)
-                                .into(),
+                            no_text_view_height(content, Length::Shrink),
                         ])
                         .width(Length::Fill),
                     )
@@ -7137,13 +7132,20 @@ fn diff_surface<'a>(
 /// no single old side, and pretending otherwise would claim the file had been
 /// added.
 fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
+    no_text_view_height(content, Length::Fill)
+}
+
+fn no_text_view_height(
+    content: &DiffContent,
+    height: Length,
+) -> Element<'static, RepositoryAction> {
     match content {
         DiffContent::Comparison {
             old,
             new,
             old_label,
             new_label,
-        } => information_state(
+        } => information_state_height(
             format!("No text diff between {old_label} and {new_label}"),
             [(old_label, old), (new_label, new)]
                 .into_iter()
@@ -7151,13 +7153,14 @@ fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
                 .map(|(label, side)| format!("{label}: {}", side_detail(side)))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            height,
         ),
         DiffContent::Unmerged {
             base,
             ours,
             theirs,
             worktree,
-        } => information_state(
+        } => information_state_height(
             "This path is conflicted",
             [
                 ("Common ancestor", base),
@@ -7169,6 +7172,7 @@ fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
             .map(|(label, side)| format!("{label}: {}", side_detail(side)))
             .collect::<Vec<_>>()
             .join("\n"),
+            height,
         ),
     }
 }
@@ -8492,6 +8496,14 @@ fn information_state<'a>(
     title: impl Into<String>,
     detail: impl Into<String>,
 ) -> Element<'a, RepositoryAction> {
+    information_state_height(title, detail, Length::Fill)
+}
+
+fn information_state_height<'a>(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    height: Length,
+) -> Element<'a, RepositoryAction> {
     widget::container(
         widget::container(
             widget::column::with_children(vec![
@@ -8510,7 +8522,10 @@ fn information_state<'a>(
         .padding(cosmic::theme::spacing().space_m)
         .max_width(620),
     )
-    .center(Length::Fill)
+    .width(Length::Fill)
+    .height(height)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
     .into()
 }
 
