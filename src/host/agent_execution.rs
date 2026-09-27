@@ -315,17 +315,23 @@ fn dispatch(
         let intent = HostedSession::Chat(session.clone());
         let response = super::chat::start_execution(host, EXECUTION_CLIENT, session, context.clone())
             .map_err(|error| {
-                // start_execution returns only after its synchronous spawn
-                // attempt ended. A holder must mark the witness at holder-child
-                // creation, before a background task could spawn the provider.
-                if !context.did_spawn() {
+                // The retained owner joins startup or receives an explicit
+                // helper teardown receipt. A timed-out caller is not proof.
+                let cleanup = context.reconcile_cleanup();
+                if matches!(cleanup, Ok(chat::protocol::LaunchOutcome::NoProvider | chat::protocol::LaunchOutcome::TeardownProved)) {
                     match registry.lock().unwrap_or_else(|p| p.into_inner())
-                        .clear_unspawned_agent_launch(accepted.agent.id, &intent) {
+                        .clear_quiescent_agent_launch(accepted.agent.id, &intent) {
                         Ok(()) => before(error.message),
-                        Err(clear) => (State::Interrupted, format!("{}; cannot clear unspawned launch intent: {clear}", error.message)),
+                        Err(clear) => {
+                            host.lock().unwrap_or_else(|p| p.into_inner()).execution_startups
+                                .insert(accepted.agent.id, (intent.clone(), context.clone()));
+                            (State::Interrupted, format!("{}; cannot clear proved-quiescent launch intent: {clear}. Close the agent to retry the durable update.", error.message))
+                        },
                     }
                 } else {
-                    (State::Interrupted, format!("Provider startup did not establish confirmed ownership: {}. The private launch intent is retained; no prompt was resent.", error.message))
+                    host.lock().unwrap_or_else(|p| p.into_inner()).execution_startups
+                        .insert(accepted.agent.id, (intent.clone(), context.clone()));
+                    (State::Interrupted, format!("Provider startup did not establish confirmed ownership: {}; cleanup: {cleanup:?}. The exact cleanup owner is retained; close the agent to retry teardown. No prompt was resent.", error.message))
                 }
             })?;
         let ServerResponse::ChatAttached { session, .. } = response else {
@@ -641,9 +647,36 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                     )
                     .map_err(|error| error.message)?;
                 } else {
-                    // A lost actor is not proof that its process has exited.
-                    // Recovery/holder reconciliation must resolve ownership.
-                    return Err("Cannot confirm teardown of the missing agent; reconcile its saved session first".into());
+                    let startup = host
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .execution_startups
+                        .get(&id)
+                        .cloned();
+                    if let Some((expected, context)) = startup {
+                        if &expected != source {
+                            return Err(
+                                "The startup cleanup owner does not match the retained launch"
+                                    .into(),
+                            );
+                        }
+                        match context.reconcile_cleanup()? {
+                            chat::protocol::LaunchOutcome::NoProvider
+                            | chat::protocol::LaunchOutcome::TeardownProved => {
+                                registry
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clear_quiescent_agent_launch(id, source)?;
+                            }
+                            chat::protocol::LaunchOutcome::Uncertain => {
+                                return Err("Startup teardown remains unconfirmed; its exact cleanup owner was retained".into());
+                            }
+                        }
+                    } else {
+                        // A lost actor is not proof that its process has exited.
+                        // Recovery/holder reconciliation must resolve ownership.
+                        return Err("Cannot confirm teardown of the missing agent; reconcile its saved session first".into());
+                    }
                 }
             }
             HostedSession::Terminal(_) => {
@@ -672,6 +705,10 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     }
     let result = store.close_agent(&origin, id)?;
     drop(store);
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_startups
+        .remove(&id);
     announce(host, &registry);
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -729,6 +766,7 @@ enum ConsoleError {
     Known(String),
     Uncertain(String),
 }
+
 impl ConsoleError {
     fn run_failure(self) -> (State, String) {
         match self {
@@ -737,11 +775,13 @@ impl ConsoleError {
         }
     }
 }
+
 impl From<String> for ConsoleError {
     fn from(message: String) -> Self {
         Self::Known(message)
     }
 }
+
 impl From<&str> for ConsoleError {
     fn from(message: &str) -> Self {
         Self::Known(message.into())

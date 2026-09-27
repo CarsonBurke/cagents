@@ -60,11 +60,32 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LaunchOutcome {
+    #[default]
+    NoProvider,
+    TeardownProved,
+    Uncertain,
+}
+
+/// An exact owner, retained until startup is installed or cleanup is proved.
+/// Implementations must be bounded and idempotent; a caller timeout or an
+/// unverified process exit is not a teardown receipt.
+pub(crate) trait LaunchCleanup: Send + Sync {
+    fn cleanup(&self) -> Result<LaunchOutcome, String>;
+}
+
+#[derive(Default)]
+struct LaunchOwnership {
+    outcome: LaunchOutcome,
+    owner: Option<std::sync::Arc<dyn LaunchCleanup>>,
+}
+
 #[derive(Default)]
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
-    spawned: std::sync::atomic::AtomicBool,
+    ownership: std::sync::Mutex<LaunchOwnership>,
 }
 
 impl ExecutionContext {
@@ -95,14 +116,50 @@ impl ExecutionContext {
             None => Ok(self.expected_directory),
         }
     }
-    /// Call synchronously as soon as a child (including a launch holder) exists,
-    /// before any asynchronous worker can create another provider process.
-    pub(crate) fn spawned(&self) {
-        self.spawned
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// Claim before asynchronous work may spawn, or synchronously at child
+    /// creation when the caller itself performs the entire spawn attempt.
+    pub(crate) fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) {
+        *self.ownership.lock().unwrap_or_else(|p| p.into_inner()) = LaunchOwnership {
+            outcome: LaunchOutcome::Uncertain,
+            owner: Some(owner),
+        };
     }
-    pub(crate) fn did_spawn(&self) -> bool {
-        self.spawned.load(std::sync::atomic::Ordering::Acquire)
+    pub(crate) fn outcome(&self) -> LaunchOutcome {
+        self.ownership
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcome
+    }
+    /// The host's exact actor record now owns cleanup; do not retain a second
+    /// strong Handle through the actor's own execution context.
+    pub(crate) fn installed(&self) {
+        self.ownership
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .owner = None;
+    }
+    pub(crate) fn reconcile_cleanup(&self) -> Result<LaunchOutcome, String> {
+        let owner = {
+            let state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+            match &state.owner {
+                Some(owner) => owner.clone(),
+                None => return Ok(state.outcome),
+            }
+        };
+        let outcome = owner.cleanup()?;
+        let mut state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
+        // A worker may have transferred ownership to a helper while the caller
+        // was joining it. Its receipt cannot prove that new owner's teardown.
+        if state
+            .owner
+            .as_ref()
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &owner))
+            && outcome != LaunchOutcome::Uncertain
+        {
+            state.outcome = outcome;
+            state.owner = None;
+        }
+        Ok(state.outcome)
     }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
@@ -183,5 +240,63 @@ pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
             codex::align_resume_identity(&mut launch.recipe.arguments, &id)
         }
         crate::agent::Provider::Omp => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct Cleanup(Mutex<LaunchOutcome>);
+    impl LaunchCleanup for Cleanup {
+        fn cleanup(&self) -> Result<LaunchOutcome, String> {
+            Ok(*self.0.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn uncertain_cleanup_retains_owner_until_its_receipt_proves_teardown() {
+        let context = ExecutionContext::default();
+        assert_eq!(context.outcome(), LaunchOutcome::NoProvider);
+        let owner = Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain)));
+        context.claim_owner(owner.clone());
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::Uncertain
+        );
+        *owner.0.lock().unwrap() = LaunchOutcome::TeardownProved;
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    #[test]
+    fn old_worker_receipt_cannot_clear_transferred_helper_ownership() {
+        struct Transfer(std::sync::Weak<ExecutionContext>, Arc<Cleanup>);
+        impl LaunchCleanup for Transfer {
+            fn cleanup(&self) -> Result<LaunchOutcome, String> {
+                self.0.upgrade().unwrap().claim_owner(self.1.clone());
+                Ok(LaunchOutcome::TeardownProved)
+            }
+        }
+        let context = Arc::new(ExecutionContext::default());
+        let helper = Arc::new(Cleanup(Mutex::new(LaunchOutcome::Uncertain)));
+        context.claim_owner(Arc::new(Transfer(Arc::downgrade(&context), helper.clone())));
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::Uncertain
+        );
+        *helper.0.lock().unwrap() = LaunchOutcome::TeardownProved;
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
     }
 }
