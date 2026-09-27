@@ -36,6 +36,11 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    UpdateSource(
+        super::Session,
+        Option<crate::model::LaunchRecipe>,
+        Option<crate::terminal::holder::Record>,
+    ),
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -105,18 +110,90 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    preserve_native: Arc<AtomicBool>,
+    release_native: Arc<AtomicBool>,
+    detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
+    retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
+    native_installed: Arc<AtomicBool>,
+}
+
+enum NativeOwnership {
+    New(super::Session),
+    Adopted(
+        super::native_holder::Holder,
+        crate::daemon::holder_registry::Process,
+    ),
 }
 impl Handle {
+    #[cfg(test)]
     pub(crate) fn start(
-        mut spec: ProcessSpec,
+        spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
+    }
+
+    pub(crate) fn start_owned(
+        spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        source: super::Session,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let id = source.launch.session_id.clone();
+        Self::start_inner(
+            spec,
+            adapter,
+            initial,
+            store,
+            id,
+            Some(NativeOwnership::New(source)),
+            notify,
+        )
+    }
+
+    pub(crate) fn start_adopted(
+        mut spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        recovery: super::native_holder::Recovery,
+        holder: super::native_holder::Holder,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let server = recovery
+            .server_process
+            .ok_or("Missing retained app-server process identity")?;
+        spec.environment = recovery.execution_environment.0;
+        Self::start_inner(
+            spec,
+            adapter,
+            initial,
+            store,
+            recovery.confirmed_thread,
+            Some(NativeOwnership::Adopted(holder, server)),
+            notify,
+        )
+    }
+
+    fn start_inner(
+        mut spec: ProcessSpec,
+        adapter: Box<dyn Adapter>,
+        initial: Step,
+        store: Store,
+        session_id: Option<String>,
+        ownership: Option<NativeOwnership>,
+        notify: impl Fn(Update) + Send + Sync + 'static,
+    ) -> Result<Self, String> {
         spec.remove_unset_environment();
-        if let Some(context) = &spec.execution {
+        if !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+            && let Some(context) = &spec.execution
+        {
             context.verify_directory(&spec.working_directory)?;
         }
         let mut owned_socket = None;
@@ -140,8 +217,25 @@ impl Handle {
                     ));
                 }
             }
-            owned_socket = Some(OwnedSocket(socket.clone()));
+            if ownership.is_none() {
+                owned_socket = Some(OwnedSocket(socket.clone()));
+            }
         }
+        let expected_native_peer = match &ownership {
+            Some(NativeOwnership::Adopted(_, server)) => Some(server.clone()),
+            _ => None,
+        };
+        let adopted_native = expected_native_peer.is_some();
+        let native_installed = Arc::new(AtomicBool::new(false));
+        let native_holder = match ownership {
+            Some(NativeOwnership::New(source))
+                if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
+            {
+                Some(super::native_holder::spawn(spec.clone(), source)?)
+            }
+            Some(NativeOwnership::Adopted(holder, _)) => Some(holder),
+            _ => None,
+        };
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
@@ -158,6 +252,10 @@ impl Handle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
+        let preserve_native = Arc::new(AtomicBool::new(false));
+        let release_native = Arc::new(AtomicBool::new(false));
+        let detached_native = Arc::new(Mutex::new(None));
+        let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
             commands,
@@ -176,6 +274,11 @@ impl Handle {
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
+            preserve_native: preserve_native.clone(),
+            release_native: release_native.clone(),
+            detached_native: detached_native.clone(),
+            retained_native: retained_native.clone(),
+            native_installed: native_installed.clone(),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -188,6 +291,11 @@ impl Handle {
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
                     child: None,
+                    native_holder,
+                    expected_native_peer,
+                    native_peer: None,
+                    preserve_native: preserve_native.clone(),
+                    native_installed: native_installed.clone(),
                     adapter,
                     state,
                     confirmed_session,
@@ -223,7 +331,11 @@ impl Handle {
                         let _ = started.send(Err("Provider startup was cancelled".to_string()));
                         return Ok(());
                     }
-                    let child = spawn_provider(&spec, &actor.stop);
+                    let child = if actor.native_holder.is_some() {
+                        Ok(None)
+                    } else {
+                        spawn_provider(&spec, &actor.stop)
+                    };
                     let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                     actor.child = child?;
                     match spec.transport {
@@ -279,8 +391,19 @@ impl Handle {
                 // take seconds. Reject commands now so a caller is told the provider
                 // exited instead of waiting out an acknowledgement nobody will send.
                 draining.store(true, Ordering::Release);
+                let unexpected_loss = result.is_err() && !actor.stop.load(Ordering::Acquire);
+                let preserve_holder = actor
+                    .native_holder
+                    .as_ref()
+                    .is_some_and(|holder| holder.is_durable())
+                    && ((preserve_native.load(Ordering::Acquire)
+                        || (unexpected_loss && native_installed.load(Ordering::Acquire)))
+                        && !release_native.load(Ordering::Acquire)
+                        || (adopted_native && !native_installed.load(Ordering::Acquire)));
                 if let Err(error) = result {
-                    if !actor.attention.settled {
+                    // A lost local actor does not prove that the retained
+                    // provider turn failed. Recovery must obtain its outcome.
+                    if !actor.attention.settled && !preserve_holder {
                         (actor.notify)(Update::Attention(crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
                             kind: crate::notifications::Kind::Failed,
@@ -304,6 +427,21 @@ impl Handle {
                     child.terminate();
                     code
                 });
+                let native_closed = if let Some(mut holder) = actor.native_holder.take() {
+                    if preserve_holder {
+                        *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(holder.preserve());
+                        true
+                    } else if let Err(error) = holder.close() {
+                        *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
+                        *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                };
                 actor.apply(Event::Exited { code });
                 let usage = actor
                     .state
@@ -318,7 +456,7 @@ impl Handle {
                     (actor.notify)(Update::Execution { run, update });
                 }
                 actor.publish_activity();
-                completed.store(true, Ordering::Release);
+                completed.store(native_closed, Ordering::Release);
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -327,7 +465,7 @@ impl Handle {
             .map_err(|e| e.to_string())?;
         *inner.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         let handle = Self(inner);
-        if let Some(context) = &launch_context {
+        if !adopted_native && let Some(context) = &launch_context {
             context.claim_owner(Arc::new(handle.clone()));
         }
         // No child can exist before its exact actor cleanup capability and
@@ -441,6 +579,34 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .write(&[1]);
     }
+    pub(crate) fn update_native_source(
+        &self,
+        source: super::Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
+    ) -> Result<(), String> {
+        if !matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            return Ok(());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0
+            .commands
+            .try_send((
+                ActorCommand::UpdateSource(source, execution_console, paired_holder),
+                reply,
+            ))
+            .map_err(|error| format!("Native ownership queue unavailable: {error}"))?;
+        self.wake();
+        response
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| {
+                "Native ownership acknowledgement timed out; retain the previous descriptor"
+                    .to_string()
+            })?
+    }
     pub fn set_visible(&self, visible: bool) {
         self.0.visible.store(visible, Ordering::Release);
         self.wake();
@@ -533,7 +699,41 @@ impl Handle {
         let inner = Arc::downgrade(&self.0);
         move || inner.upgrade().is_some()
     }
+    pub(crate) fn commit_native_installation(&self) {
+        self.0.native_installed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn native_continuity(&self) -> super::NativeContinuity {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .native_continuity
+            .clone()
+    }
+
+    pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
+        if !matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            return Err("This native provider has no verified durable owner".into());
+        }
+        if self.0.release_native.load(Ordering::Acquire) {
+            return Err("Native provider has already been explicitly closed".into());
+        }
+        self.0.preserve_native.store(true, Ordering::Release);
+        self.close_inner(true)
+    }
+
     pub fn close(&self) -> Result<(), String> {
+        if self.0.native_installed.load(Ordering::Acquire) {
+            self.0.release_native.store(true, Ordering::Release);
+        }
+        self.close_inner(false)
+    }
+
+    fn close_inner(&self, preserving: bool) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         // Serialize explicit closes through the join. A protocol failure is
@@ -551,6 +751,29 @@ impl Handle {
             self.0.completed.store(false, Ordering::Release);
             *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
             return Err(error);
+        }
+        {
+            let mut retained = self
+                .0
+                .retained_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(holder) = retained.as_mut() {
+                holder.close()?;
+                retained.take();
+                self.0.completed.store(true, Ordering::Release);
+            }
+        }
+        if !preserving && self.0.native_installed.load(Ordering::Acquire) {
+            let mut detached = self
+                .0
+                .detached_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(owner) = detached.as_ref() {
+                owner.close()?;
+                detached.take();
+            }
         }
         if self.is_completed() {
             return Ok(());
@@ -572,8 +795,26 @@ impl Handle {
 
 /// Validate local launch and adapter initialization before stopping an existing CLI.
 pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    preflight_inner(spec, initial, false)
+}
+
+/// Only an authenticated retained server can restore its read-only connection
+/// after the original directory was removed. Authorizing commands still check
+/// the retained execution policy in the actor before any provider write.
+pub(crate) fn preflight_retained(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    if !matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
+        return Err("Retained preflight cannot launch a provider".into());
+    }
+    preflight_inner(spec, initial, true)
+}
+
+fn preflight_inner(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+    retained: bool,
+) -> Result<Store, String> {
     use std::os::unix::ffi::OsStrExt;
-    if !spec.working_directory.is_dir() {
+    if !retained && !spec.working_directory.is_dir() {
         return Err("Provider working directory does not exist".into());
     }
     if spec.program.is_empty()
@@ -673,7 +914,13 @@ impl super::protocol::LaunchCleanup for Handle {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
-        while !self.is_completed() {
+        while !self.is_completed()
+            && !self.0.worker.try_lock().is_ok_and(|worker| {
+                worker
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished)
+            })
+        {
             if Instant::now() >= deadline {
                 return Err(
                     "Provider startup has not become quiescent; its cleanup owner is retained"
@@ -783,6 +1030,11 @@ struct Actor {
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
+    native_holder: Option<super::native_holder::Holder>,
+    expected_native_peer: Option<crate::daemon::holder_registry::Process>,
+    native_peer: Option<crate::daemon::holder_registry::Process>,
+    preserve_native: Arc<AtomicBool>,
+    native_installed: Arc<AtomicBool>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
@@ -1110,6 +1362,22 @@ impl Actor {
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
+                    let result = self
+                        .native_holder
+                        .as_mut()
+                        .ok_or("Native holder is unavailable".to_string())
+                        .and_then(|holder| {
+                            holder.update_source(source, execution_console, paired_holder)
+                        });
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    // A partial control reply must never be reused.
+                    if failed {
+                        return Err("Native ownership update was not acknowledged".into());
+                    }
+                    continue;
+                }
                 ActorCommand::InterruptRun(run) => {
                     if self.execution.active() != Some(run) {
                         let _ = reply.send(Err(
@@ -1232,6 +1500,25 @@ impl Actor {
             Event::Reset { .. } => Some(None),
             _ => None,
         });
+        if let Some(Some(thread)) = &identity
+            && let Some(holder) = &mut self.native_holder
+            && let Some(identity) = self.adapter.server_identity()
+            && let Some(version) =
+                super::native_holder::verified_codex_version(&identity.user_agent)
+        {
+            let process = self
+                .native_peer
+                .clone()
+                .ok_or("Missing verified app-server peer")?;
+            holder.confirm(thread.clone(), identity.clone(), process)?;
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .native_continuity = super::NativeContinuity::Durable {
+                provider_version: version.to_owned(),
+            };
+            self.dirty = true;
+        }
         self.step(step)?;
         if let Some(identity) = identity {
             *self

@@ -6268,6 +6268,7 @@ impl Cagents {
         if self
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
+            || self.chat_start_pending(card)
             || self.refuse_for_deleting_card(card)
         {
             return Task::none();
@@ -18624,6 +18625,7 @@ mod tests {
         let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
         recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
         let original = crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
