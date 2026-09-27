@@ -1110,6 +1110,12 @@ pub enum Event {
         key: Option<String>,
         outcome: crate::notifications::Kind,
     },
+    /// Correlated to the harness prompt when it was accepted by this adapter,
+    /// not when a potentially delayed provider result reaches the daemon.
+    Execution {
+        run: crate::model::RunId,
+        event: crate::agent_execution::ProviderEvent,
+    },
 }
 
 #[cfg(test)]

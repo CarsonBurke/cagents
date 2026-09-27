@@ -20,6 +20,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod execution;
 mod store;
 mod websocket;
 use store::Store;
@@ -34,10 +35,18 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
-type CommandRequest = (Command, crossbeam_channel::Sender<Result<(), String>>);
+type CommandRequest = (
+    Option<crate::model::RunId>,
+    Command,
+    crossbeam_channel::Sender<Result<(), String>>,
+);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
+    Execution {
+        run: crate::model::RunId,
+        update: crate::agent_execution::Update,
+    },
     Attention(crate::notifications::Evidence),
     Presentation,
     Observed {
@@ -210,6 +219,7 @@ impl Handle {
                     dirty: false,
                     activity: ActivityState::Idle,
                     attention: TurnAttention::default(),
+                    execution: execution::Tracker::default(),
                     attention_baselined: false,
                     last_present: Instant::now(),
                     first_frame: false,
@@ -291,6 +301,18 @@ impl Handle {
                     code
                 });
                 actor.apply(Event::Exited { code });
+                let usage = actor
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .usage
+                    .clone();
+                for (run, update) in actor
+                    .execution
+                    .ended(actor.stop.load(Ordering::Acquire), usage)
+                {
+                    (actor.notify)(Update::Execution { run, update });
+                }
                 actor.publish_activity();
                 completed.store(true, Ordering::Release);
                 actor.observe_update();
@@ -303,6 +325,22 @@ impl Handle {
         Ok(Self(inner))
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
+        self.submit_command(None, command)
+    }
+
+    pub(crate) fn command_for_run(
+        &self,
+        run: crate::model::RunId,
+        command: Command,
+    ) -> Result<(), String> {
+        self.submit_command(Some(run), command)
+    }
+
+    fn submit_command(
+        &self,
+        run: Option<crate::model::RunId>,
+        command: Command,
+    ) -> Result<(), String> {
         // `completed` is published only once teardown finished; `draining` the moment
         // the actor stopped consuming its command channel.
         let exiting = self.is_completed() || self.0.draining.load(Ordering::Acquire);
@@ -330,7 +368,7 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((command, reply))
+            .try_send((run, command, reply))
             .map_err(|e| format!("Chat command queue unavailable: {e}"))?;
         self.wake();
         response
@@ -641,6 +679,7 @@ struct Actor {
     dirty: bool,
     activity: ActivityState,
     attention: TurnAttention,
+    execution: execution::Tracker,
     attention_baselined: bool,
     last_present: Instant,
     first_frame: bool,
@@ -938,7 +977,7 @@ impl Actor {
             if self.queued > QUEUE_BACKPRESSURE {
                 break;
             }
-            let Ok((command, reply)) = self.incoming.try_recv() else {
+            let Ok((run, command, reply)) = self.incoming.try_recv() else {
                 break;
             };
             if closing {
@@ -961,7 +1000,11 @@ impl Actor {
                 }
             }
             let starts_turn = matches!(&command, Command::Prompt { .. });
-            match self.adapter.command(command) {
+            let prepared = match run {
+                Some(run) => self.adapter.command_for_run(run, command),
+                None => self.adapter.command(command),
+            };
+            match prepared {
                 Ok(step) => {
                     let result = self.step(step);
                     let _ = reply.send(result.clone());
@@ -1038,7 +1081,27 @@ impl Actor {
                 self.write_started = Some(Instant::now());
             }
         }
+        let execution_scope = step.events.iter().find_map(|event| match event {
+            Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Scope,
+            } => Some(*run),
+            _ => None,
+        });
+        let mut execution_events = Vec::new();
         for event in step.events {
+            if let Event::Execution { run, event } = event {
+                if let crate::agent_execution::ProviderEvent::Started { key } = event {
+                    let update = self.execution.start(run, key)?;
+                    (self.notify)(Update::Execution { run, update });
+                } else {
+                    execution_events.push((run, event));
+                }
+                continue;
+            }
+            if let Some(run) = execution_scope {
+                self.execution.observe(run, &event);
+            }
             if let Event::AccountUsage(report) = event {
                 (self.notify)(Update::AccountUsage {
                     report,
@@ -1073,6 +1136,28 @@ impl Actor {
             }
             if let Some(message) = fatal {
                 return Err(message);
+            }
+        }
+        // The provider's final usage/items may follow its settlement in this
+        // same frame. Freeze only after applying the whole frame, then publish
+        // its final outcome (which may arrive in a much later frame).
+        for (run, event) in execution_events {
+            match event {
+                crate::agent_execution::ProviderEvent::Settled => {
+                    let usage = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .usage
+                        .clone();
+                    self.execution.settle(run, usage)?;
+                }
+                crate::agent_execution::ProviderEvent::Finished { outcome } => {
+                    let update = self.execution.finish(run, outcome)?;
+                    (self.notify)(Update::Execution { run, update });
+                }
+                crate::agent_execution::ProviderEvent::Started { .. } => unreachable!(),
+                crate::agent_execution::ProviderEvent::Scope => {}
             }
         }
         self.publish_activity();
@@ -1121,6 +1206,9 @@ impl Actor {
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         if activity != self.activity {
             self.activity = activity;
+            if let Some((run, update)) = self.execution.activity(activity) {
+                (self.notify)(Update::Execution { run, update });
+            }
             if activity == ActivityState::Waiting && baselined {
                 (self.notify)(Update::Attention(crate::notifications::Evidence {
                     key: format!("{}:waiting:{generation}", self.attention.key),
@@ -1202,7 +1290,10 @@ pub(super) fn observed_at() -> Option<u64> {
 }
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     match event {
-        Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. } => {}
+        Event::TurnStarted
+        | Event::TurnSettled
+        | Event::TurnFinished { .. }
+        | Event::Execution { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -2298,9 +2389,10 @@ mod tests {
             .filter_map(|update| match update {
                 Update::Activity { state, .. } => Some(state),
                 Update::Presentation => panic!("hidden close must not request presentation"),
-                Update::Observed { .. } | Update::AccountUsage { .. } | Update::Attention(_) => {
-                    None
-                }
+                Update::Observed { .. }
+                | Update::AccountUsage { .. }
+                | Update::Attention(_)
+                | Update::Execution { .. } => None,
             })
             .collect();
         assert_eq!(
