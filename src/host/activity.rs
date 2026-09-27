@@ -358,6 +358,7 @@ mod tests {
 
     fn candidate() -> Candidate {
         let launch = LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), "read line".into()],
             working_directory: "/".into(),
