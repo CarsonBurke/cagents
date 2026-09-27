@@ -389,12 +389,12 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event {
-                session: id,
-                provider: record.session.launch.provider,
-                directory: record.session.launch.recipe.working_directory.clone(),
-                evidence: evidence.clone(),
-            });
+            notifications.record(crate::notifications::Event::session(
+                id,
+                record.session.launch.provider,
+                record.session.launch.recipe.working_directory.clone(),
+                evidence.clone(),
+            ));
         }
         return;
     }
