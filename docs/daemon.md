@@ -258,6 +258,15 @@ recipe execution. Failed local actor installation preserves the retained server
 for another authenticated attempt. Paired terminal views must independently
 recover their own holder before the native pair is published.
 
+Execution consoles retain their exact daemon-issued recipe in the native
+holder, independently of the provider listener. The holder acknowledges pair
+changes before they become visible. Adoption advances the retained execution
+capability and agent descriptor together; uncertain accepted runs remain
+interrupted and are never resent. A scheduler's held working-directory file
+descriptor reaches the provider launch through the holder. After recovery,
+read-only attachment and cancellation remain available if that path changed,
+while new work and approvals still require the saved directory identity.
+
 ## Recovering after a daemon change
 
 When the daemon incarnation changes, cagents authenticates the replacement and

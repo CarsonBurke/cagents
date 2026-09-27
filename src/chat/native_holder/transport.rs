@@ -28,7 +28,7 @@ use std::{
 };
 
 const ARGUMENT: &str = "--cagents-native-holder";
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
@@ -40,6 +40,7 @@ struct Spawn {
     directory: PathBuf,
     environment: BTreeMap<String, String>,
     recovery: Recovery,
+    directory_fd: Option<RawFd>,
 }
 
 impl Spawn {
@@ -55,6 +56,18 @@ impl Spawn {
             .stderr(Stdio::null())
             .process_group(0);
         crate::host::descriptor_limit::inherit(&mut command);
+        if let Some(fd) = self.directory_fd {
+            // The dedicated holder keeps this validated directory alive. Only
+            // async-signal-safe syscalls run between fork and provider exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(fd) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         command
     }
 }
@@ -70,7 +83,10 @@ enum Request {
         identity: crate::chat::protocol::ServerIdentity,
         process: Process,
     },
-    UpdateSource(Session),
+    UpdateSource {
+        source: Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+    },
     Inspect {
         proof: HostSessionProof,
     },
@@ -142,9 +158,20 @@ impl Holder {
         self.control.take();
     }
 
-    pub fn update_source(&mut self, source: Session) -> Result<(), String> {
+    pub fn update_source(
+        &mut self,
+        source: Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+    ) -> Result<(), String> {
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
-        send(control, &Request::UpdateSource(source), TIMEOUT)?;
+        send(
+            control,
+            &Request::UpdateSource {
+                source,
+                execution_console,
+            },
+            TIMEOUT,
+        )?;
         match receive(control, TIMEOUT)? {
             Some(Report::SourceUpdated) => Ok(()),
             Some(Report::Failed(error)) => Err(error),
@@ -197,6 +224,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     }
     let recovery = Recovery {
         source,
+        execution_console: None,
         previous_sources: Vec::new(),
         confirmed_thread: None,
         server_version: None,
@@ -207,7 +235,13 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         ),
     };
     recovery.validate(&crate::daemon::read_boot_id().map_err(|error| error.to_string())?)?;
+    let execution = spec.execution.clone();
+    let directory = execution
+        .as_ref()
+        .and_then(|context| context.directory.clone());
+    let directory_fd = directory.as_ref().map(|file| file.as_raw_fd());
     let request = Spawn {
+        directory_fd,
         program: spec.program,
         arguments: spec.arguments,
         directory: spec.working_directory,
@@ -235,10 +269,18 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             if libc::setsid() == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
+            if let Some(directory) = directory_fd {
+                if libc::fcntl(directory, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
     let child = holder.spawn().map_err(|error| error.to_string())?;
+    if let Some(context) = &execution {
+        context.spawned();
+    }
     let pid = child.id() as i32;
     drop(remote);
     // Establish reaping before sending a request that can create a provider.
@@ -384,10 +426,29 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     released: bool,
+    _working_directory: Option<std::fs::File>,
 }
 
 impl Residence {
     fn start(spawn: Spawn) -> Result<Self, String> {
+        let working_directory = spawn
+            .directory_fd
+            .map(|fd| {
+                // The parent deliberately inherited this descriptor. Validate it
+                // before taking ownership; never accept the control socket as cwd.
+                let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if fd <= 2 || unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } == -1 {
+                    return Err("Invalid retained execution directory".to_owned());
+                }
+                if unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    return Err("Retained execution descriptor is not a directory".into());
+                }
+                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            })
+            .transpose()?;
         let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
         spawn.recovery.validate(&boot)?;
         let directory = registry::directory(Kind::Native)?;
@@ -417,6 +478,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             released: false,
+            _working_directory: working_directory,
         };
         residence
             .record
@@ -496,7 +558,10 @@ impl Residence {
                         Err(error) => Report::Failed(error),
                     }
                 }
-                Request::UpdateSource(source) => match self.recovery.update_source(source) {
+                Request::UpdateSource {
+                    source,
+                    execution_console,
+                } => match self.recovery.update_source(source, execution_console) {
                     Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
                 },
@@ -855,11 +920,16 @@ mod tests {
             .allocator
             .boot_id = boot;
         let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
         let spec = ProcessSpec {
+            execution: Some(context.clone()),
             transport: TransportSpec::OwnedUnixWebSocket { socket },
             program: "/bin/sleep".into(),
             arguments: vec!["60".into()],
-            working_directory: "/var/tmp".into(),
+            working_directory: working.path().to_owned(),
             environment: Default::default(),
             unset_environment: Default::default(),
         };
@@ -867,6 +937,10 @@ mod tests {
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
         let mut holder = spawn(spec, source.clone()).unwrap();
+        assert!(
+            context.did_spawn(),
+            "holder creation owns the launch before acknowledgment"
+        );
         let record = registry::evidence(
             &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
             Kind::Native,
@@ -874,6 +948,10 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(record.root.is_current());
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{}/cwd", record.root.pid)).unwrap(),
+            working.path()
+        );
         let records = registry::discover(
             &registry::directory(Kind::Native).unwrap(),
             &first.boot_id,

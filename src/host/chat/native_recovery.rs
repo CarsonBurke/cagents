@@ -63,17 +63,33 @@ fn restore_reserved(
     if &recovery.source != source && !recovery.previous_sources.contains(source) {
         return Err("Native holder does not recognize this exact issued descriptor".into());
     }
+    let mut retained: Vec<_> = recovery
+        .previous_sources
+        .iter()
+        .cloned()
+        .chain(std::iter::once(recovery.source.clone()))
+        .map(crate::agent_execution::HostedSession::Chat)
+        .collect();
+    let execution_registry = super::super::agent_execution::registry(host)?;
+    let directory = execution_registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_directory(&retained)?;
     let (mut spec, mut adapter) = chat::protocol::codex::create_restored(&recovery)?;
     spec.environment = recovery.execution_environment.0.clone();
+    spec.execution =
+        directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
     let mut initial = adapter.initialize()?;
-    let store = chat::runtime::preflight(&spec, &mut initial)?;
+    let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
     let mut session = recovery.source.clone();
+    let execution_console = recovery.execution_console.clone();
     let expected_thread = recovery.confirmed_thread.clone();
     let mut sources = recovery.previous_sources.clone();
     sources.push(recovery.source.clone());
     let weak = Arc::downgrade(host);
     let id = session.id;
+    let execution_instance = uuid::Uuid::new_v4();
     let handle = Handle::start_adopted(
         spec,
         adapter,
@@ -81,7 +97,21 @@ fn restore_reserved(
         store,
         recovery,
         holder,
-        move |update| changed(&weak, id, update),
+        move |update| {
+            if let Update::Execution { run, update } = update {
+                if let Some(host) = weak.upgrade() {
+                    super::super::agent_execution::observed(
+                        &host,
+                        id,
+                        execution_instance,
+                        run,
+                        update,
+                    );
+                }
+            } else {
+                changed(&weak, id, update);
+            }
+        },
     )?;
     // Installation is still reversible: close drops only this new connection
     // until the exact server confirms the retained thread and the host owns it.
@@ -146,7 +176,24 @@ fn restore_reserved(
             return Err(error);
         }
     };
-    if let Err(error) = handle.update_native_source(session.clone()) {
+    if let Err(error) = handle.update_native_source(session.clone(), execution_console.clone()) {
+        let _ = handle.close();
+        return Err(error);
+    }
+    retained.extend(
+        sources
+            .iter()
+            .cloned()
+            .map(crate::agent_execution::HostedSession::Chat),
+    );
+    if let Err(error) = execution_registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(
+            &retained,
+            &crate::agent_execution::HostedSession::Chat(session.clone()),
+        )
+    {
         let _ = handle.close();
         return Err(error);
     }
@@ -172,6 +219,8 @@ fn restore_reserved(
         ..Observation::default()
     };
     let record = Record {
+        execution_instance,
+        console_recipe: execution_console,
         session,
         handle,
         source_process: None,

@@ -36,7 +36,7 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
-    UpdateSource(super::Session),
+    UpdateSource(super::Session, Option<crate::model::LaunchRecipe>),
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -185,7 +185,9 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
-        if let Some(context) = &spec.execution {
+        if !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
+            && let Some(context) = &spec.execution
+        {
             context.verify_directory(&spec.working_directory)?;
         }
         let mut owned_socket = None;
@@ -561,7 +563,11 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .write(&[1]);
     }
-    pub(crate) fn update_native_source(&self, source: super::Session) -> Result<(), String> {
+    pub(crate) fn update_native_source(
+        &self,
+        source: super::Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+    ) -> Result<(), String> {
         if !matches!(
             self.native_continuity(),
             super::NativeContinuity::Durable { .. }
@@ -571,7 +577,7 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((ActorCommand::UpdateSource(source), reply))
+            .try_send((ActorCommand::UpdateSource(source, execution_console), reply))
             .map_err(|error| format!("Native ownership queue unavailable: {error}"))?;
         self.wake();
         response
@@ -748,8 +754,26 @@ impl Handle {
 
 /// Validate local launch and adapter initialization before stopping an existing CLI.
 pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    preflight_inner(spec, initial, false)
+}
+
+/// Only an authenticated retained server can restore its read-only connection
+/// after the original directory was removed. Authorizing commands still check
+/// the retained execution policy in the actor before any provider write.
+pub(crate) fn preflight_retained(spec: &ProcessSpec, initial: &mut Step) -> Result<Store, String> {
+    if !matches!(spec.transport, TransportSpec::UnixWebSocket { .. }) {
+        return Err("Retained preflight cannot launch a provider".into());
+    }
+    preflight_inner(spec, initial, true)
+}
+
+fn preflight_inner(
+    spec: &ProcessSpec,
+    initial: &mut Step,
+    retained: bool,
+) -> Result<Store, String> {
     use std::os::unix::ffi::OsStrExt;
-    if !spec.working_directory.is_dir() {
+    if !retained && !spec.working_directory.is_dir() {
         return Err("Provider working directory does not exist".into());
     }
     if spec.program.is_empty()
@@ -1225,14 +1249,18 @@ impl Actor {
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
-                ActorCommand::UpdateSource(source) => {
-                    let result = self.native_holder.as_mut()
+                ActorCommand::UpdateSource(source, execution_console) => {
+                    let result = self
+                        .native_holder
+                        .as_mut()
                         .ok_or("Native holder is unavailable".to_string())
-                        .and_then(|holder| holder.update_source(source));
+                        .and_then(|holder| holder.update_source(source, execution_console));
                     let failed = result.is_err();
                     let _ = reply.send(result);
                     // A partial control reply must never be reused.
-                    if failed { return Err("Native ownership update was not acknowledged".into()); }
+                    if failed {
+                        return Err("Native ownership update was not acknowledged".into());
+                    }
                     continue;
                 }
                 ActorCommand::InterruptRun(run) => {

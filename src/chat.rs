@@ -1414,6 +1414,7 @@ pub(crate) fn fresh_session(
         Provider::Claude => {}
     }
     Ok(Session {
+        native_continuity: Default::default(),
         owned_codex_listener: None,
         id,
         launch: Launch {

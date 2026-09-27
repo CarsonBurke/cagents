@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Recovery {
     pub source: super::Session,
+    pub execution_console: Option<crate::model::LaunchRecipe>,
     pub previous_sources: Vec<super::Session>,
     pub confirmed_thread: Option<String>,
     pub server_version: Option<String>,
@@ -34,6 +35,15 @@ impl Recovery {
                     .as_ref()
                     .is_some_and(|proof| proof.is_complete() && &proof.boot_id == boot)
         };
+        if self.execution_console.as_ref().is_some_and(|recipe| {
+            self.source.terminal.as_ref().is_none_or(|terminal| {
+                terminal.id != self.source.id
+                    || &terminal.launch != recipe
+                    || terminal.owned_codex_listener.is_some()
+            })
+        }) {
+            return Err("Native console has inconsistent private pairing evidence".into());
+        }
         if !valid(&self.source)
             || self.previous_sources.len() > 1024
             || self.previous_sources.iter().any(|source| !valid(source))
@@ -143,14 +153,24 @@ impl Recovery {
         Ok(())
     }
 
-    fn update_source(&mut self, source: super::Session) -> Result<(), String> {
+    fn update_source(
+        &mut self,
+        source: super::Session,
+        execution_console: Option<crate::model::LaunchRecipe>,
+    ) -> Result<(), String> {
         let mut expected = self.source.clone();
         expected.terminal = source.terminal.clone();
-        if source != expected
+        if (execution_console.is_some() && source.terminal.is_none())
+            || source != expected
             || source.terminal.as_ref().is_some_and(|terminal| {
                 terminal.id != source.id
                     || terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
-                    || terminal.owned_codex_listener != source.owned_codex_listener
+                    || match &execution_console {
+                        Some(recipe) => {
+                            &terminal.launch != recipe || terminal.owned_codex_listener.is_some()
+                        }
+                        None => terminal.owned_codex_listener != source.owned_codex_listener,
+                    }
             })
         {
             return Err("Paired view update changed native conversation ownership".into());
@@ -159,6 +179,7 @@ impl Recovery {
             self.remember_source()?;
             self.source = source;
         }
+        self.execution_console = execution_console;
         Ok(())
     }
 
@@ -238,6 +259,7 @@ mod tests {
                     allocator: proof,
                 }),
             },
+            execution_console: None,
             previous_sources: Vec::new(),
             confirmed_thread: None,
             server_version: None,
@@ -323,6 +345,62 @@ mod tests {
     }
 
     #[test]
+    fn console_pair_requires_exact_private_evidence_and_survives_adoption() {
+        let mut recovery = recovery();
+        recovery
+            .confirm(
+                "thread-console".into(),
+                server_identity(),
+                crate::daemon::holder_registry::Process { pid: 42, start: 1 },
+            )
+            .unwrap();
+        let mut paired = recovery.source.clone();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/owned/build/cagents".into(),
+            arguments: vec![
+                "agent".into(),
+                "console".into(),
+                uuid::Uuid::new_v4().to_string(),
+            ],
+            working_directory: "/var/tmp".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let live = |proof: &HostSessionProof| crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        paired.terminal = Some(crate::model::TerminalSession {
+            id: paired.id,
+            launch: recipe.clone(),
+            continuity: live(paired.proof.as_ref().unwrap()),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+        });
+        assert!(recovery.update_source(paired.clone(), None).is_err());
+        let mut wrong = recipe.clone();
+        wrong.program = "/unrelated/cagents".into();
+        assert!(recovery.update_source(paired.clone(), Some(wrong)).is_err());
+        recovery
+            .update_source(paired.clone(), Some(recipe.clone()))
+            .unwrap();
+        let mut successor = paired.proof.clone().unwrap();
+        successor.host_incarnation = crate::model::HostIncarnation::new("console-successor");
+        recovery.adopt(&paired, successor.clone()).unwrap();
+        let mut updated = recovery.source.clone();
+        updated.terminal.as_mut().unwrap().continuity = live(&successor);
+        recovery
+            .update_source(updated, Some(recipe.clone()))
+            .unwrap();
+        assert_eq!(recovery.execution_console, Some(recipe));
+        recovery.validate(&successor.boot_id).unwrap();
+        assert!(recovery.previous_sources.contains(&paired));
+    }
+
+    #[test]
     fn paired_adoption_ack_preserves_both_descriptors_without_changing_conversation() {
         use crate::model::{TerminalContinuity, TerminalSession};
         let mut recovery = recovery();
@@ -348,13 +426,13 @@ mod tests {
             owned_codex_listener: paired.owned_codex_listener.clone(),
             recovery_origin: None,
         });
-        recovery.update_source(paired.clone()).unwrap();
+        recovery.update_source(paired.clone(), None).unwrap();
         let mut proof = paired.proof.clone().unwrap();
         proof.host_incarnation = crate::model::HostIncarnation::new("next-daemon");
         recovery.adopt(&paired, proof.clone()).unwrap();
         let mut successor = recovery.source.clone();
         successor.terminal.as_mut().unwrap().continuity = live(&proof);
-        recovery.update_source(successor.clone()).unwrap();
+        recovery.update_source(successor.clone(), None).unwrap();
         assert!(successor.retains_native_pair_from(&paired));
         assert!(recovery.previous_sources.contains(&paired));
         assert_eq!(recovery.source, successor);
@@ -363,10 +441,10 @@ mod tests {
         recovery.adopt(&successor, proof.clone()).unwrap();
         let mut forged = successor.clone();
         forged.launch.session_id = Some("different-thread".into());
-        assert!(recovery.update_source(forged).is_err());
+        assert!(recovery.update_source(forged, None).is_err());
         let mut forged = successor.clone();
         forged.terminal.as_mut().unwrap().id = crate::model::TerminalId::new();
-        assert!(recovery.update_source(forged).is_err());
+        assert!(recovery.update_source(forged, None).is_err());
         assert_eq!(recovery.source, successor);
     }
 

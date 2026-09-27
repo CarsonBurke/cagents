@@ -2074,6 +2074,54 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
 /// A holder's private record is discovery only. The live holder must return
 /// matching process evidence and the previous daemon's issued lineage before
 /// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
+/// Called only after the terminal holder authenticated these descriptors and
+/// the restored worker was installed. A console keeps Chat authority until its
+/// native holder installs the exact paired successor.
+fn restore_terminal_execution_authority(
+    host: &SharedHost,
+    source: &TerminalSession,
+    previous: &[TerminalSession],
+) -> Result<(), String> {
+    use crate::agent_execution::HostedSession;
+    let registry = super::agent_execution::registry(host)?;
+    let authority = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_authority_source(source.id)?;
+    if !matches!(authority, Some(HostedSession::Terminal(_))) {
+        return Ok(());
+    }
+    let successor = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .descriptor(0, source.id)
+        .map_err(|error| error.message)?
+        .session;
+    let mut retained = Vec::new();
+    for source in previous.iter().chain(std::iter::once(source)) {
+        retained.push(HostedSession::Terminal(source.clone()));
+        if let Some(proof) = source.continuity.live_proof() {
+            // Holder discovery records detached ownership. Capability issuance
+            // used the same process proof while it was attached to the daemon.
+            let mut attached = source.clone();
+            attached.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            };
+            retained.push(HostedSession::Terminal(attached.clone()));
+            attached.resume_hint =
+                crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
+            retained.push(HostedSession::Terminal(attached));
+        }
+    }
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
+    Ok(())
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
@@ -2123,8 +2171,10 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
                 .map_err(|error| error.message)?;
             if let Some(terminal) = state.terminals.get_mut(&record.terminal) {
                 terminal.screen_lost_after_crash = screen_lost;
-                terminal.session.resume_hint = source.resume_hint;
+                terminal.session.resume_hint = source.resume_hint.clone();
             }
+            drop(state);
+            restore_terminal_execution_authority(host, &source, &previous_sources)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = restored {
@@ -2436,6 +2486,14 @@ fn adopt_carried_terminal(
                             "adopted a carried terminal but could not record its lineage");
                     } else {
                         tracing::info!(terminal = %id, "adopted a terminal carried across the upgrade");
+                    }
+                    drop(state);
+                    if let Err(error) = restore_terminal_execution_authority(
+                        host,
+                        &previous.source,
+                        &previous.previous_sources,
+                    ) {
+                        tracing::warn!(terminal = %id, %error, "terminal survived but execution authority could not be restored");
                     }
                     return true;
                 }

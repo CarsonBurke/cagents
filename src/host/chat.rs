@@ -1316,7 +1316,7 @@ fn codex_terminal_view(
         chat::protocol::align_resume_identity(&mut updated.launch).map_err(unavailable)?;
         updated.native_continuity = handle.native_continuity();
         updated.terminal = Some(descriptor.session.clone());
-        if let Err(error) = handle.update_native_source(updated) {
+        if let Err(error) = handle.update_native_source(updated, None) {
             let retired = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

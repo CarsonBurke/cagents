@@ -923,6 +923,22 @@ impl Registry {
         Ok(agent)
     }
 
+    pub(crate) fn retained_agent_authority_source(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Option<HostedSession>, String> {
+        let source: Option<String> = self
+            .db
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        source.map(|source| decode(&source)).transpose()
+    }
+
     pub(crate) fn retained_agent_authority(
         &self,
         id: crate::model::TerminalId,
@@ -1250,6 +1266,7 @@ mod tests {
 
     fn source() -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
+            native_continuity: Default::default(),
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: Provider::Claude,

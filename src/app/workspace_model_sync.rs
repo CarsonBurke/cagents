@@ -871,6 +871,7 @@ mod tests {
             .push(local(target, project, "Execution", 1));
         durable.active_channel = Some(active);
         let session = crate::chat::Session {
+            native_continuity: Default::default(),
             id: TerminalId::new(),
             proof: None,
             terminal: None,
