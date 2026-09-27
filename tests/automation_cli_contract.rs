@@ -274,7 +274,20 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
     drop(client);
     fixture.restart();
     let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
-    let snapshot = client.read_notifications().unwrap();
+    // The daemon accepts connections before its notification broker finishes
+    // restoring the journal. Observe that asynchronous restoration explicitly.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        let snapshot = client.read_notifications().unwrap();
+        if snapshot.notices.iter().any(|current| current.id == notice.id) {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run attention was not restored: {snapshot:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(snapshot.notices.len(), 1);
     assert_eq!(snapshot.notices[0].id, notice.id);
     assert_eq!(snapshot.notices[0].event.target(), target);
