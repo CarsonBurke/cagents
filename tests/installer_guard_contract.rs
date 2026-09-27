@@ -43,7 +43,7 @@ fn verify(runtime: &Path, lease: Option<&File>) -> Output {
 
 #[test]
 fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
-    for status in ["0", "7", "cancel"] {
+    for status in ["0", "7", "cancel", "deferred", "complete"] {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).unwrap();
@@ -100,17 +100,29 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             }
         });
         let prefix = root.path().join("installation");
-        let bin = prefix.join("current/bin");
+        let bin = prefix.join("versions/old/bin");
         fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
         let ui = bin.join("cagents-ui");
         fs::write(
             &ui,
-            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 92\nprintf '%s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
+            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&ui, fs::Permissions::from_mode(0o700)).unwrap();
+        let new_bin = prefix.join("versions/new/bin");
+        fs::create_dir_all(&new_bin).unwrap();
+        let new_ui = new_bin.join("cagents-ui");
+        fs::write(
+            &new_ui,
+            fs::read_to_string(&ui)
+                .unwrap()
+                .replace("'old %s", "'new %s"),
+        )
+        .unwrap();
+        fs::set_permissions(&new_ui, fs::Permissions::from_mode(0o700)).unwrap();
         let installer = root.path().join("installer.sh");
-        fs::write(&installer, "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\ntrap 'printf \"rolled-back\\n\" >> \"$HOME/events\"; exit 7' TERM\nprintf 'installed\\n' >> \"$HOME/events\"\nif [ \"$1\" = cancel ]; then while :; do sleep 0.05; done; fi\nexit \"$1\"\n").unwrap();
+        fs::write(&installer, "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\ntrap 'printf \"rolled-back\\n\" >> \"$HOME/events\"; exit 7' TERM\nprintf 'installed\\n' >> \"$HOME/events\"\nif [ \"$1\" = cancel ]; then while :; do sleep 0.05; done; fi\nif [ \"$1\" = deferred ]; then \"$FIXTURE_REAL_CLI\" record-deferred-install >/dev/null || exit 93; fi\ncase \"$1\" in deferred|complete) ln -sfn versions/new \"$FIXTURE_PREFIX/current\"; exit 0 ;; esac\nexit \"$1\"\n").unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_cagents"));
         command
             .arg("coordinate-install")
@@ -129,6 +141,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             .env("CAGENTS_CHECKSUMS", "/stale/installer/checksums")
             .env("CAGENTS_REPOSITORY", "fixture/source")
             .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+            .env("FIXTURE_PREFIX", &prefix)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         // Ignored SIGCHLD survives exec; the coordinator must reset it before
@@ -159,7 +172,11 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         }
         let output = child.wait_with_output().unwrap();
         server.join().unwrap();
-        assert_eq!(output.status.success(), status == "0", "{output:?}");
+        assert_eq!(
+            output.status.success(),
+            matches!(status, "0" | "deferred" | "complete"),
+            "{output:?}"
+        );
         assert_eq!(
             fs::read_to_string(events).unwrap(),
             if status == "cancel" {
@@ -172,6 +189,12 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             fs::read_to_string(root.path().join("reopened"))
                 .unwrap()
                 .contains("--window primary")
+        );
+        assert!(
+            fs::read_to_string(root.path().join("reopened"))
+                .unwrap()
+                .starts_with(if status == "complete" { "new " } else { "old " }),
+            "deferred installations must reopen the exact prior UI version"
         );
     }
 }

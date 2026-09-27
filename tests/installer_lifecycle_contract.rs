@@ -133,7 +133,7 @@ fn coordinated_release_fixture(
     let status = r#"#!/bin/sh
 CLI=old
 case "$*" in
-  'coordinate-install '*|'verify-install-guard'*)
+  'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
     case "$FIXTURE_COORDINATOR:$CLI" in installed:new|candidate:old|none:*) exit 64 ;; esac
     exec "$FIXTURE_REAL_CLI" "$@"
     ;;
@@ -150,7 +150,11 @@ case "$*" in
     elif [ "$running" = false ] && [ -e "$FIXTURE_CHECKPOINT" ]; then
       printf '%s:stopped\n' "$CLI" >> "$FIXTURE_ACTIONS"
     fi
-    printf '{"ok":true,"command":"daemon.status","data":{"running":%s}}\n' "$running"
+    if [ "$FIXTURE_COORDINATOR:$CLI" = starting:new ]; then
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":null}}\n' "$running"
+    else
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture"}}\n' "$running"
+    fi
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -439,7 +443,7 @@ esac
             }
             Some("empty") => terminals == 0 && publish_failure.is_none(),
             Some(_) => false,
-            None => (compatible || terminals == 0) && publish_failure.is_none(),
+            None => publish_failure.is_none(),
         };
     assert_eq!(
         output.status.success(),
@@ -461,6 +465,15 @@ esac
         })
     );
     let actions = fs::read_to_string(actions).unwrap_or_default();
+    if coordinator == "starting" {
+        assert!(
+            actions.is_empty(),
+            "an unconfirmed startup lock must not authorize daemon replacement"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running sessions were preserved")
+        );
+    }
     assert!(!actions.contains("UNSAFE"), "{actions}");
     if restart == Some("empty-start-unknown") {
         assert_eq!(actions, "require-empty\nnew:start\n");
@@ -517,26 +530,20 @@ esac
         assert!(!actions.contains("prepare"), "{actions}");
         assert!(!checkpoint.exists());
     } else {
-        assert_eq!(
-            actions
-                .lines()
-                .filter(|line| *line == "require-empty")
-                .count(),
-            1
+        assert!(
+            actions.is_empty(),
+            "deferred updates must not stop/start/checkpoint: {actions}"
         );
         assert!(!checkpoint.exists());
-        assert_eq!(
-            actions
-                .lines()
-                .filter(|line| line.ends_with(":start"))
-                .count(),
-            usize::from(terminals == 0),
-            "An empty daemon may be restarted once, never replayed: {actions}"
-        );
+        if success {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("running sessions were preserved")
+            );
+        }
     }
     assert_eq!(
         fs::read_to_string(&running).unwrap(),
-        if retained_candidate && (restart.is_some() || !compatible) {
+        if retained_candidate && restart.is_some() {
             "new\n"
         } else {
             "old\n"
@@ -568,6 +575,11 @@ fn candidate_coordinator_supports_upgrading_an_older_installed_cli() {
 }
 
 #[test]
+fn candidate_startup_lock_without_handshake_defers_to_the_verified_owner() {
+    coordinated_release_fixture(true, 2, None, None, None, "starting");
+}
+
+#[test]
 fn unsupported_coordinators_refuse_before_mutating_the_installation() {
     coordinated_release_fixture(true, 2, None, None, None, "none");
 }
@@ -594,7 +606,7 @@ fn compatible_switch_preserves_terminals_without_any_shutdown_request() {
 }
 
 #[test]
-fn incompatible_switch_only_stops_an_atomically_empty_daemon() {
+fn incompatible_install_defers_daemon_replacement_without_stopping_sessions() {
     for count in [0, 1, 7] {
         upgrade_fixture(false, count, None, None);
     }

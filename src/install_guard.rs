@@ -4,8 +4,14 @@
 use std::{
     ffi::OsString,
     fs::File,
-    io,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, BorrowedFd, FromRawFd},
+        unix::{
+            fs::{FileTypeExt, MetadataExt},
+            process::CommandExt,
+        },
+    },
     path::Path,
     process::{Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -15,12 +21,96 @@ use std::{
 
 use crate::instance::UiUpdateGuard;
 
+const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
+const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
+const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    version: u32,
+    preserve_previous_ui: bool,
+}
+
+/// The inner installer publishes routing before switching `current`, while
+/// the coordinator still holds the exact old UI executable path. This is not
+/// a success receipt: shell status independently decides transaction success.
+pub(crate) fn record_deferred() -> io::Result<()> {
+    crate::instance::validate_install_guard()?;
+    let fd = std::env::var(RESULT_FD_ENV).ok().and_then(|value| value.parse::<i32>().ok())
+        .filter(|fd| *fd >= 3).ok_or_else(|| io::Error::other("this update requires an external installer coordinator to defer daemon replacement"))?;
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(io::Error::other("installer result pipe is unavailable"));
+    }
+    // SAFETY: F_GETFL verified the open descriptor; duplicate without owning
+    // or closing the inherited descriptor used by the installer.
+    let mut file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_fifo()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::other("installer result pipe is not private"));
+    }
+    file.write_all(DEFERRED_RECEIPT)
+}
+
+struct ResultPipe {
+    reader: File,
+    writer: File,
+}
+
+impl ResultPipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe2 initializes both owned descriptors atomically.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        let mut writer = unsafe { File::from_raw_fd(fds[1]) };
+        if matches!(writer.as_raw_fd(), 197 | 198) {
+            // These slots belong to UI/worker leases. Keep our descriptor
+            // outside them before the child installs its launch-fence lease.
+            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+            if fd == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            writer = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(Self { reader, writer })
+    }
+
+    fn deferred(&mut self) -> io::Result<bool> {
+        let mut bytes = [0; 256];
+        let length = match self.reader.read(&mut bytes) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if length == 0 {
+            return Ok(false);
+        }
+        let receipt: Receipt =
+            serde_json::from_slice(&bytes[..length]).map_err(io::Error::other)?;
+        if receipt.version != 1 || !receipt.preserve_previous_ui {
+            return Err(io::Error::other(
+                "installer returned an unsupported routing receipt",
+            ));
+        }
+        Ok(true)
+    }
+}
+
 /// Installer assets and authority are scoped to the update transaction. A
 /// long-lived process must not pass stale paths or an unbacked FD marker to
 /// hosted terminals and their future installer invocations.
 pub(crate) fn sanitize_child_environment(command: &mut Command) {
     for name in [
         crate::instance::INSTALL_GUARD_ENV,
+        RESULT_FD_ENV,
+        OWNER_CLI_ENV,
         "CAGENTS_ARCHIVE",
         "CAGENTS_CHECKSUMS",
         "CAGENTS_REPOSITORY",
@@ -87,8 +177,16 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
     let _signals = Signals::install()?;
     let executable = prefix.join("current/bin/cagents-ui");
     let mut guard = UiUpdateGuard::acquire()?;
-    if executable.is_file() {
-        guard.set_fallback_executable(executable.clone());
+    let owner_bin = crate::daemon::running_executable()
+        .map_err(io::Error::other)?
+        .map(|executable| running_owner_bin(prefix, &executable))
+        .transpose()?;
+    let previous_executable = owner_bin
+        .as_ref()
+        .map(|bin| bin.join("cagents-ui"))
+        .or_else(|| executable.canonicalize().ok());
+    if let Some(previous) = &previous_executable {
+        guard.set_fallback_executable(previous.clone());
     } else if guard.has_running_windows()? {
         return Err(io::Error::other(
             "close the running application before installing into a new prefix; no previous UI exists there to restore on failure",
@@ -96,14 +194,22 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
     }
     let slots = guard.prepare_and_close_windows(Duration::from_secs(45))?;
     let fd = script.as_raw_fd();
+    let mut result = ResultPipe::new()?;
+    let result_fd = result.writer.as_raw_fd();
     let mut command = Command::new("sh");
     command
         .arg(format!("/proc/self/fd/{fd}"))
         .args(arguments)
+        .env(RESULT_FD_ENV, result_fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .process_group(0);
+    if let Some(bin) = &owner_bin {
+        command.env(OWNER_CLI_ENV, bin.join("cagents"));
+    } else {
+        command.env_remove(OWNER_CLI_ENV);
+    }
     guard.inherit_for_install(&mut command)?;
     // SAFETY: script remains open until the subprocess is reaped.
     unsafe {
@@ -111,22 +217,77 @@ pub(crate) fn run(prefix: &Path, installer: &Path, arguments: &[OsString]) -> io
             if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
+            if libc::fcntl(result_fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let installed = execute(&mut command);
-    let reopened = guard.relaunch_windows(&slots, &executable);
+    let deferred = result.deferred()?;
+    let reopen = if deferred && !slots.is_empty() {
+        previous_executable.as_ref().ok_or_else(|| {
+            io::Error::other("deferred installation has no previous UI executable")
+        })?
+    } else {
+        &executable
+    };
+    let reopened = guard.relaunch_windows(&slots, reopen);
     match (installed, reopened) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(io::Error::other(format!(
-            "{error}; saved windows reopened from the current installation"
-        ))),
+        (Err(error), Ok(())) => Err(io::Error::other(format!("{error}; saved windows reopened"))),
         (Ok(()), Err(error)) => Err(io::Error::other(format!(
             "installation finished, but reopening windows failed: {error}"
         ))),
         (Err(error), Err(reopen)) => Err(io::Error::other(format!(
             "{error}; reopening the current installation also failed: {reopen}"
         ))),
+    }
+}
+
+fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::PathBuf> {
+    let prefix = prefix.canonicalize()?;
+    let executable = executable.canonicalize()?;
+    let bin = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("running daemon has no installation directory"))?;
+    let version = bin
+        .parent()
+        .ok_or_else(|| io::Error::other("running daemon has no version directory"))?;
+    if executable.file_name().is_none_or(|name| name != "cagentsd")
+        || bin.file_name().is_none_or(|name| name != "bin")
+        || version.parent() != Some(prefix.join("versions").as_path())
+        || !bin.join("cagents").is_file()
+        || !bin.join("cagents-ui").is_file()
+    {
+        return Err(io::Error::other(
+            "the running daemon belongs to another installation; update from its own installation",
+        ));
+    }
+    Ok(bin.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn repeated_staging_keeps_the_running_version_even_when_current_is_newer() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("versions/old/bin");
+        let staged = root.path().join("versions/staged/bin");
+        for bin in [&old, &staged] {
+            std::fs::create_dir_all(bin).unwrap();
+            for executable in ["cagents", "cagentsd", "cagents-ui"] {
+                std::fs::write(bin.join(executable), "fixture").unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("versions/staged", root.path().join("current")).unwrap();
+        assert_eq!(
+            running_owner_bin(root.path(), &old.join("cagentsd")).unwrap(),
+            old
+        );
+        let unrelated = tempfile::tempdir().unwrap();
+        assert!(running_owner_bin(unrelated.path(), &staged.join("cagentsd")).is_err());
     }
 }
 

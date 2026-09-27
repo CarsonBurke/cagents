@@ -129,6 +129,9 @@ pub enum TopCommand {
     /// Validate a launch fence inherited from the update coordinator.
     #[command(hide = true)]
     VerifyInstallGuard,
+    /// Record that staged files must retain windows on the running daemon's UI.
+    #[command(hide = true)]
+    RecordDeferredInstall,
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -1642,6 +1645,15 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
                 command: "update.verify_install_guard",
                 data: json!({"valid": true}),
                 human: "Installer owns the application update fence".into(),
+            })
+        }
+        TopCommand::RecordDeferredInstall => {
+            crate::install_guard::record_deferred()
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.record_deferred_install",
+                data: json!({"deferred":true}),
+                human: "Daemon replacement deferred".into(),
             })
         }
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),

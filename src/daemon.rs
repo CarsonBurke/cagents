@@ -899,12 +899,14 @@ mod tests {
         let mut child = std::process::Command::new("/bin/sh");
         child.args([
             "-c",
-            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; test -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 43; printf ready",
+            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; test -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_INSTALL_OWNER_CLI+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 43; printf ready",
             "descriptor-probe",
             &fd.to_string(),
         ]);
         for name in [
             crate::instance::INSTALL_GUARD_ENV,
+            "CAGENTS_INSTALL_RESULT_FD",
+            "CAGENTS_INSTALL_OWNER_CLI",
             "CAGENTS_ARCHIVE",
             "CAGENTS_CHECKSUMS",
             "CAGENTS_REPOSITORY",

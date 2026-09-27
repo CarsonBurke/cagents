@@ -9,6 +9,8 @@ usage() {
 Usage: install.sh [OPTIONS]
 
 Install the cagents Linux x86_64 release for the current user.
+When the running daemon is incompatible, install the files and defer its
+replacement to the application unless --restart-daemon is explicit.
 
 Options:
   --version VERSION  Install a release version (default: latest v* release)
@@ -375,6 +377,7 @@ DAEMON_STOPPED_FOR_SWITCH=0
 DAEMON_CHECKPOINTED=0
 OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
+DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
@@ -604,7 +607,8 @@ chmod 0700 "$CANDIDATE_COORDINATOR"
 supports_install_guard() {
     [ -x "$1" ] \
         && "$1" coordinate-install --help >/dev/null 2>&1 \
-        && "$1" verify-install-guard --help >/dev/null 2>&1
+        && "$1" verify-install-guard --help >/dev/null 2>&1 \
+        && "$1" record-deferred-install --help >/dev/null 2>&1
 }
 if supports_install_guard "$PREFIX/current/bin/cagents"; then
     # A newer installed coordinator also makes rollback to an older release
@@ -815,17 +819,18 @@ ensure_link() {
 }
 
 
+OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
 if [ "$HAD_CURRENT" -eq 1 ]; then
     if [ "$RESTART_DAEMON" -eq 1 ]; then
-        read_daemon_status "$PREFIX/current/bin/cagents"
+        read_daemon_status "$OWNER_CLI"
         case $DAEMON_STATUS in
             running)
                 OLD_DAEMON_WAS_RUNNING=1
                 if [ "$REQUIRE_EMPTY_DAEMON" -eq 1 ]; then
-                    stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+                    stop_daemon_and_wait "$OWNER_CLI"
                     DAEMON_STOPPED_FOR_SWITCH=1
                 else
-                    prepare_daemon_upgrade "$PREFIX/current/bin/cagents"
+                    prepare_daemon_upgrade "$OWNER_CLI"
                 fi
                 ;;
             stopped) ;;
@@ -835,16 +840,33 @@ if [ "$HAD_CURRENT" -eq 1 ]; then
         # The candidate handshake proves protocol compatibility without changing
         # the running process. Compatible updates never replace live PTYs.
         read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+        if [ "$DAEMON_STATUS" = running ]; then
+            case $daemon_output in
+                *'"daemon_version":""'*) DAEMON_STATUS=unknown ;;
+                *'"daemon_version":"'*) ;;
+                *) DAEMON_STATUS=unknown ;;
+            esac
+        fi
         case $DAEMON_STATUS in
             running)
                 OLD_DAEMON_WAS_RUNNING=1
                 ;;
             stopped) ;;
             *)
-                read_daemon_status "$PREFIX/current/bin/cagents"
-                [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
-                stop_daemon_and_wait "$PREFIX/current/bin/cagents"
-                DAEMON_STOPPED_FOR_SWITCH=1
+                read_daemon_status "$OWNER_CLI"
+                case $DAEMON_STATUS in
+                    running)
+                        OLD_DAEMON_WAS_RUNNING=1
+                        # Routing is recorded before current changes. The
+                        # outer owner reopens the previous UI even if a later
+                        # publication failure rolls this transaction back.
+                        "$COORDINATOR" record-deferred-install >/dev/null \
+                            || fail 'cannot preserve the running application for a deferred update; installation was not changed'
+                        DAEMON_DEFERRED=1
+                        ;;
+                    stopped) ;;
+                    *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
+                esac
                 ;;
         esac
     fi
@@ -866,8 +888,9 @@ ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
 # A requested daemon update commits only after the replacement starts. Ordinary
 # installs retain their existing login-autostart behavior on startup failure.
 [ "$RESTART_DAEMON" -eq 1 ] || TRANSACTION_COMMITTED=1
-DAEMON_START_ATTEMPTED=1
-if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
+if [ "$DAEMON_DEFERRED" -eq 1 ]; then
+    : # The installed candidate must not try to start beside the older daemon.
+elif DAEMON_START_ATTEMPTED=1 && "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
     DAEMON_STARTED=1
 else
     if [ "$RESTART_DAEMON" -eq 1 ]; then
@@ -885,7 +908,9 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 
-if [ "$DAEMON_STARTED" -eq 1 ]; then
+if [ "$DAEMON_DEFERRED" -eq 1 ]; then
+    printf 'Installed cagents %s; running sessions were preserved. Open the application to finish updating its daemon.\n' "$VERSION"
+elif [ "$DAEMON_STARTED" -eq 1 ]; then
     printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
 else
     printf 'Installed cagents %s; the production daemon will start at graphical login.\n' "$VERSION"
