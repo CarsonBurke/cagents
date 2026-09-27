@@ -13,6 +13,9 @@ use std::{
 #[path = "editor_widget.rs"]
 mod text_editor;
 
+mod diff_layout;
+use diff_layout::RowOffsets;
+
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
 use cosmic::iced::advanced::{
@@ -312,6 +315,25 @@ pub enum LspIntent {
 
 #[derive(Debug, Clone)]
 pub enum RepositoryAction {
+    Review {
+        card: CardId,
+        action: crate::pull_request_review::Action,
+    },
+    ReviewLine {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        action: crate::pull_request_review::Action,
+        extend: bool,
+    },
+    DiffAnnotations {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        mode: DiffMode,
+        layout_revision: u64,
+        review_revision: (u64, u64),
+        leading: f32,
+        rows: Vec<(usize, f32)>,
+    },
     RefreshFiles {
         card: CardId,
     },
@@ -497,6 +519,7 @@ pub enum RepositoryAction {
         offset: f32,
         height: f32,
         horizontal: f32,
+        user_initiated: bool,
     },
     PreviewViewport {
         card: CardId,
@@ -545,7 +568,8 @@ pub enum ClipboardOp {
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
-            Self::RefreshFiles { card }
+            Self::Review { card, .. }
+            | Self::RefreshFiles { card }
             | Self::ListDirectory { card, .. }
             | Self::SearchDirectory { card, .. }
             | Self::DirectorySearchLoaded { card, .. }
@@ -584,7 +608,9 @@ impl RepositoryAction {
             | Self::PdfTone { card, .. }
             | Self::PdfZoom { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
-            Self::FilesLoaded { identity, .. }
+            Self::ReviewLine { identity, .. }
+            | Self::DiffAnnotations { identity, .. }
+            | Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
@@ -1321,7 +1347,20 @@ enum DiffState {
         request: u64,
         cancellation: CancellationToken,
     },
-    Ready(RenderedDiff),
+    Ready(RenderedDiff, [RowOffsets; 2]),
+}
+
+impl DiffState {
+    fn ready(content: RenderedDiff) -> Self {
+        let rows = [DiffMode::Inline, DiffMode::Split].map(|mode| {
+            let count = match &content {
+                RenderedDiff::Text { model, .. } => model.row_count(mode),
+                _ => 0,
+            };
+            RowOffsets::uniform(count, DIFF_ROW_HEIGHT)
+        });
+        Self::Ready(content, rows)
+    }
 }
 
 impl Drop for DiffState {
@@ -1414,6 +1453,7 @@ struct ListViewport {
 #[derive(Debug, Clone, Copy, Default)]
 struct DiffViewportAnchor {
     offset: f32,
+    row: Option<diff_layout::Anchor>,
     horizontal: f32,
     change: usize,
 }
@@ -1452,29 +1492,23 @@ const ZOOM_LABEL_WIDTH: f32 = 48.0;
 /// instant and the ceiling bounded.
 const MAX_RETAINED_COMMITTED_DIFFS: usize = 4;
 
+#[cfg(test)]
 fn visible_rows(total: usize, viewport: ListViewport, row_height: f32) -> VisibleRows {
+    visible_diff_rows(&RowOffsets::uniform(total, row_height), viewport)
+}
+
+fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
     let height = if viewport.height.is_finite() && viewport.height > 0.0 {
         viewport.height
     } else {
         INITIAL_VIEWPORT_HEIGHT
     };
-    let offset = if viewport.offset.is_finite() {
-        viewport.offset.max(0.0)
-    } else {
-        0.0
-    };
-    let first = (offset / row_height).floor() as usize;
-    let visible = (height / row_height).ceil() as usize + 1;
-    let start = first.saturating_sub(VISIBLE_ROW_OVERSCAN).min(total);
-    let end = first
-        .saturating_add(visible)
-        .saturating_add(VISIBLE_ROW_OVERSCAN)
-        .min(total);
+    let Range { start, end } = rows.visible(viewport.offset, height, VISIBLE_ROW_OVERSCAN);
     VisibleRows {
         start,
         end,
-        top_space: start as f32 * row_height,
-        bottom_space: total.saturating_sub(end) as f32 * row_height,
+        top_space: rows.offset(start) - rows.leading_height(),
+        bottom_space: rows.total_height() - rows.offset(end),
     }
 }
 
@@ -1566,6 +1600,15 @@ pub struct RepositoryRuntime {
     diff_change: usize,
     diff_scroll_id: widget::Id,
     diff_viewport: ListViewport,
+    /// Retained logical position while a reopened comparison has no geometry.
+    /// Kept through the first uniform layout until measurement or user scroll.
+    pending_diff_anchor: Option<DiffViewportAnchor>,
+    diff_layout_revision: u64,
+    review_line_anchor: Option<(
+        AsyncIdentity,
+        DiffBasis,
+        crate::pull_request_review::discussion::Anchor,
+    )>,
     diff_horizontal: f32,
     preview_scroll_id: widget::Id,
     viewports: FileViewportAnchors,
@@ -1703,6 +1746,9 @@ impl RepositoryRuntime {
             diff_change: 0,
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
             diff_viewport: ListViewport::default(),
+            pending_diff_anchor: None,
+            diff_layout_revision: 0,
+            review_line_anchor: None,
             diff_horizontal: 0.0,
             preview_scroll_id: widget::Id::new(format!("repository.preview.{identity}")),
             viewports: FileViewportAnchors::default(),
@@ -3299,7 +3345,7 @@ impl RepositoryRuntime {
                     self.working_diff.error = None;
                     self.set_diff_state(
                         DiffBasis::IndexToWorktree,
-                        DiffState::Ready(RenderedDiff::Text {
+                        DiffState::ready(RenderedDiff::Text {
                             model,
                             old_label: "Index".into(),
                             new_label: "Working buffer".into(),
@@ -3373,7 +3419,7 @@ impl RepositoryRuntime {
             && self.can_select_diff_basis(&self.diff_basis)
             && (matches!(
                 self.diff_state(&self.diff_basis),
-                Some(DiffState::Ready(RenderedDiff::Error(_)))
+                Some(DiffState::Ready(RenderedDiff::Error(_), _))
             ) || (self.editable_working_diff() && self.working_diff.error.is_some()))
     }
 
@@ -3496,7 +3542,7 @@ impl RepositoryRuntime {
             match self.diff_state(&self.diff_basis) {
                 None => (Some("No changes"), None, Some(0), Some(0), None),
                 Some(DiffState::Loading { .. }) => (Some("Loading"), None, None, None, None),
-                Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => {
+                Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => {
                     let changes = model.change_starts(self.diff_mode).len();
                     (
                         Some(if changes == 0 { "No changes" } else { "Ready" }),
@@ -3506,10 +3552,10 @@ impl RepositoryRuntime {
                         (changes != 0).then_some((self.diff_change + 1, changes)),
                     )
                 }
-                Some(DiffState::Ready(RenderedDiff::Error(error))) => {
+                Some(DiffState::Ready(RenderedDiff::Error(error), _)) => {
                     (Some("Unavailable"), Some(error.clone()), None, None, None)
                 }
-                Some(DiffState::Ready(RenderedDiff::NoText(content))) => {
+                Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => {
                     (Some(no_text_kind(content)), None, None, None, None)
                 }
             }
@@ -3587,7 +3633,7 @@ impl RepositoryRuntime {
                 ) => RepositoryRuntimeStatus::Unavailable,
                 None => match self.diff_state(&self.diff_basis) {
                     Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
-                    Some(DiffState::Ready(RenderedDiff::Error(_))) => {
+                    Some(DiffState::Ready(RenderedDiff::Error(_), _)) => {
                         RepositoryRuntimeStatus::Unavailable
                     }
                     _ => RepositoryRuntimeStatus::Ready,
@@ -4162,7 +4208,7 @@ impl RepositoryRuntime {
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
-                    self.set_diff_state(basis, DiffState::Ready(content));
+                    self.set_diff_state(basis, DiffState::ready(content));
                     if current {
                         self.diff_change =
                             self.diff_change.min(self.change_count().saturating_sub(1));
@@ -4573,12 +4619,65 @@ impl RepositoryRuntime {
                 }
                 Task::none()
             }
+            RepositoryAction::Review { .. } => Task::none(),
+            RepositoryAction::ReviewLine {
+                identity,
+                basis,
+                mut action,
+                extend,
+            } => {
+                if !self.accepts_selected(&identity) || self.diff_basis != basis {
+                    return Task::none();
+                }
+                if let Some(anchor) = review_begin_anchor(&mut action) {
+                    if extend
+                        && let Some((previous_identity, previous_basis, previous)) =
+                            &self.review_line_anchor
+                        && previous_identity == &identity
+                        && previous_basis == &basis
+                        && previous.path == anchor.path
+                        && previous.side == anchor.side
+                    {
+                        let origin = previous.start_line;
+                        anchor.start_line = origin.min(anchor.line);
+                        anchor.line = origin.max(anchor.line);
+                    } else {
+                        self.review_line_anchor = Some((identity.clone(), basis, anchor.clone()));
+                    }
+                }
+                Task::done(RepositoryAction::Review {
+                    card: identity.card,
+                    action,
+                })
+            }
+            RepositoryAction::DiffAnnotations {
+                identity,
+                basis,
+                mode,
+                layout_revision,
+                leading,
+                rows,
+                ..
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.diff_basis != basis
+                    || self.diff_mode != mode
+                    || self.diff_layout_revision != layout_revision
+                {
+                    return Task::none();
+                }
+                self.set_diff_annotation_heights(mode, leading, &rows)
+            }
             RepositoryAction::DiffViewport {
                 offset,
                 height,
                 horizontal,
+                user_initiated,
                 ..
             } => {
+                if user_initiated {
+                    self.pending_diff_anchor = None;
+                }
                 self.diff_viewport = ListViewport { offset, height };
                 self.diff_horizontal = horizontal;
                 Task::none()
@@ -4648,6 +4747,8 @@ impl RepositoryRuntime {
     }
 
     fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         match self
             .diffs
             .iter_mut()
@@ -4658,6 +4759,13 @@ impl RepositoryRuntime {
                 self.diffs.push((basis, state));
                 self.prune_committed_diffs();
             }
+        }
+        if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
+            anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
+            self.apply_diff_viewport(anchor);
+            // Leading threads may not be measured yet; retain their logical
+            // anchor until the first annotation projection or actual scroll.
+            self.pending_diff_anchor = Some(anchor);
         }
     }
 
@@ -4868,8 +4976,14 @@ impl RepositoryRuntime {
     }
 
     fn current_diff_viewport(&self) -> DiffViewportAnchor {
+        if let Some(anchor) = self.pending_diff_anchor {
+            return anchor;
+        }
         DiffViewportAnchor {
             offset: self.diff_viewport.offset,
+            row: self
+                .diff_rows()
+                .map(|rows| rows.anchor(self.diff_viewport.offset)),
             horizontal: self.diff_horizontal,
             change: self.diff_change,
         }
@@ -4881,7 +4995,16 @@ impl RepositoryRuntime {
     }
 
     fn apply_diff_viewport(&mut self, anchor: DiffViewportAnchor) {
-        self.diff_viewport.offset = anchor.offset;
+        let awaiting_geometry = anchor.row.is_some()
+            && self.diff_rows().is_none_or(|rows| {
+                matches!(anchor.row, Some(diff_layout::Anchor::Leading(_)))
+                    && rows.leading_height() == 0.0
+            });
+        self.pending_diff_anchor = awaiting_geometry.then_some(anchor);
+        self.diff_viewport.offset = anchor
+            .row
+            .zip(self.diff_rows())
+            .map_or(anchor.offset, |(anchor, rows)| rows.restore(anchor));
         self.diff_horizontal = anchor.horizontal;
         self.diff_change = anchor.change;
     }
@@ -5003,9 +5126,45 @@ impl RepositoryRuntime {
 
     fn diff_model(&self) -> Option<&DiffModel> {
         match self.diff_state(&self.diff_basis) {
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
             _ => None,
         }
+    }
+
+    fn diff_rows(&self) -> Option<&RowOffsets> {
+        match self.diff_state(&self.diff_basis) {
+            Some(DiffState::Ready(_, rows)) => Some(&rows[self.diff_mode_index()]),
+            _ => None,
+        }
+    }
+
+    /// Installs measured review blocks for the active comparison. The caller
+    /// fences document/request identity before applying asynchronous layout
+    /// measurements. Heights exclude the code row itself; `leading` precedes
+    /// the first row and holds discussions without a live line anchor.
+    pub fn set_diff_annotation_heights(
+        &mut self,
+        mode: DiffMode,
+        leading: f32,
+        measurements: &[(usize, f32)],
+    ) -> Task<RepositoryAction> {
+        let anchor = self.current_diff_viewport();
+        let index = usize::from(mode == DiffMode::Split);
+        let Some((_, DiffState::Ready(_, rows))) = self
+            .diffs
+            .iter_mut()
+            .find(|(basis, _)| *basis == self.diff_basis)
+        else {
+            return Task::none();
+        };
+        let changed = rows[index].annotate(leading, measurements);
+        if mode != self.diff_mode || (!changed && self.pending_diff_anchor.is_none()) {
+            return Task::none();
+        }
+        self.apply_diff_viewport(anchor);
+        self.pending_diff_anchor = None;
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 
     fn change_count(&self) -> usize {
@@ -5019,7 +5178,7 @@ impl RepositoryRuntime {
             .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
             .copied();
         if let Some(row) = row {
-            self.diff_viewport.offset = row as f32 * DIFF_ROW_HEIGHT;
+            self.diff_viewport.offset = self.diff_rows().map_or(0.0, |rows| rows.offset(row));
         }
     }
 
@@ -5031,13 +5190,14 @@ impl RepositoryRuntime {
         let Some(row) = starts.get(self.diff_change) else {
             return Task::none();
         };
-        let denominator = model.row_count(self.diff_mode).saturating_sub(1).max(1);
-        let y = *row as f32 / denominator as f32;
-        iced::widget::scrollable::snap_to(
+        let Some(rows) = self.diff_rows() else {
+            return Task::none();
+        };
+        iced::widget::scrollable::scroll_to(
             self.diff_scroll_id.clone(),
-            iced::widget::scrollable::RelativeOffset {
+            iced::widget::scrollable::AbsoluteOffset {
                 x: None,
-                y: Some(y),
+                y: Some(rows.offset(*row)),
             },
         )
     }
@@ -5747,12 +5907,20 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    view_with_review(card, runtime, None)
+}
+
+pub fn view_with_review<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     // File browsing lives in the sidebar tree, and the flat list exists only
     // for diff/change review. With nothing selected the card reports its
     // file-listing state instead of duplicating the tree as a second flat
     // browser: a loading or failed list must stay visible with its retry.
     let body = if runtime.selected.is_some() {
-        selected_file_view(card, runtime)
+        selected_file_view(card, runtime, review)
     } else {
         match &runtime.files {
             FileListState::Loading => loading(),
@@ -6228,10 +6396,14 @@ fn find_strip<'a>(
     )
 }
 
-fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+fn selected_file_view<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     match runtime.source_surface {
         SourceSurface::Editor => editor_surface(card, runtime),
-        SourceSurface::Diff => diff_surface(card, runtime),
+        SourceSurface::Diff => diff_surface(card, runtime, review),
     }
 }
 
@@ -6777,7 +6949,7 @@ fn diff_review_controls(
     runtime: &RepositoryRuntime,
 ) -> Element<'_, RepositoryAction> {
     let model = match runtime.diff_state(&runtime.diff_basis) {
-        Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
+        Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
         _ => None,
     };
     let change_count = model.map_or(0, |model| model.change_starts(runtime.diff_mode).len());
@@ -6859,11 +7031,14 @@ fn diff_review_controls(
         controls.push(crate::interaction::tooltip(
             crate::design::change_counts(&counts),
             match runtime.diff_state(&runtime.diff_basis) {
-                Some(DiffState::Ready(RenderedDiff::Text {
-                    old_label,
-                    new_label,
-                    ..
-                })) => format!(
+                Some(DiffState::Ready(
+                    RenderedDiff::Text {
+                        old_label,
+                        new_label,
+                        ..
+                    },
+                    _,
+                )) => format!(
                     "{}: {old_label} → {new_label}",
                     basis_label(&runtime.diff_basis)
                 ),
@@ -6877,7 +7052,11 @@ fn diff_review_controls(
         .into()
 }
 
-fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+fn diff_surface<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     if runtime.mutation_refresh_pending && !runtime.diff_basis.is_immutable() {
         return match &runtime.files {
             FileListState::Failed(error) => {
@@ -6908,13 +7087,39 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                 "This file has nothing to show for the selected comparison.",
             ),
             Some(DiffState::Loading { .. }) => loading(),
-            Some(DiffState::Ready(RenderedDiff::Text {
-                model,
-                old_label,
-                new_label,
-            })) => diff_model_view(card, runtime, model, old_label, new_label),
-            Some(DiffState::Ready(RenderedDiff::NoText(content))) => no_text_view(content),
-            Some(DiffState::Ready(RenderedDiff::Error(error))) => {
+            Some(DiffState::Ready(
+                RenderedDiff::Text {
+                    model,
+                    old_label,
+                    new_label,
+                },
+                _,
+            )) => diff_model_view(card, runtime, model, old_label, new_label, review),
+            Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => {
+                let leading = review.and_then(|review| {
+                    let path = runtime.selected.as_ref()?.path.to_str()?;
+                    review
+                        .has_annotation(path, None, None, true)
+                        .then_some((review, path))
+                });
+                if let Some((review, path)) = leading {
+                    widget::scrollable(
+                        widget::column::with_children([
+                            review
+                                .annotation(path, None, None, true)
+                                .map(move |action| RepositoryAction::Review { card, action }),
+                            no_text_view_height(content, Length::Shrink),
+                        ])
+                        .width(Length::Fill),
+                    )
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .into()
+                } else {
+                    no_text_view(content)
+                }
+            }
+            Some(DiffState::Ready(RenderedDiff::Error(error), _)) => {
                 information_state("Could not compute diff", error.clone())
             }
         },
@@ -6927,13 +7132,20 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
 /// no single old side, and pretending otherwise would claim the file had been
 /// added.
 fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
+    no_text_view_height(content, Length::Fill)
+}
+
+fn no_text_view_height(
+    content: &DiffContent,
+    height: Length,
+) -> Element<'static, RepositoryAction> {
     match content {
         DiffContent::Comparison {
             old,
             new,
             old_label,
             new_label,
-        } => information_state(
+        } => information_state_height(
             format!("No text diff between {old_label} and {new_label}"),
             [(old_label, old), (new_label, new)]
                 .into_iter()
@@ -6941,13 +7153,14 @@ fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
                 .map(|(label, side)| format!("{label}: {}", side_detail(side)))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            height,
         ),
         DiffContent::Unmerged {
             base,
             ours,
             theirs,
             worktree,
-        } => information_state(
+        } => information_state_height(
             "This path is conflicted",
             [
                 ("Common ancestor", base),
@@ -6959,6 +7172,7 @@ fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
             .map(|(label, side)| format!("{label}: {}", side_detail(side)))
             .collect::<Vec<_>>()
             .join("\n"),
+            height,
         ),
     }
 }
@@ -7026,8 +7240,9 @@ fn diff_model_view<'a>(
     model: &'a DiffModel,
     old_label: &'a str,
     new_label: &'a str,
+    review: Option<&'a crate::pull_request_review::State>,
 ) -> Element<'a, RepositoryAction> {
-    let rows: Element<'a, RepositoryAction> = if model.is_empty() {
+    let rows: Element<'a, RepositoryAction> = if model.is_empty() && review.is_none() {
         information_state(
             "No content changes",
             format!("{old_label} and {new_label} hold identical text."),
@@ -7044,24 +7259,77 @@ fn diff_model_view<'a>(
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
-            let total = model.row_count(runtime.diff_mode);
-            let visible = visible_rows(total, runtime.diff_viewport, DIFF_ROW_HEIGHT);
-            let mut children = Vec::with_capacity(visible.end - visible.start + 2);
+            let rows = runtime
+                .diff_rows()
+                .expect("rendered comparison owns its row layout");
+            let visible = visible_diff_rows(rows, runtime.diff_viewport);
+            let context = review.and_then(|review| {
+                let path = runtime.selected.as_ref()?.path.to_str()?;
+                Some(DiffReviewContext {
+                    card,
+                    runtime,
+                    review,
+                    path,
+                })
+            });
+            // Only mounted rows and the sparse set of previously measured
+            // annotations are inspected; large unchanged files stay virtual.
+            let retained: BTreeMap<usize, f32> = rows
+                .annotations()
+                .iter()
+                .filter(|(index, _)| {
+                    context.is_some_and(|ctx| {
+                        let (old, new) = diff_row_lines(model, runtime.diff_mode, **index);
+                        ctx.review.has_annotation(ctx.path, old, new, false)
+                    })
+                })
+                .map(|(row, height)| (*row, *height))
+                .collect();
+            let mut children = Vec::with_capacity(visible.end - visible.start + 3);
+            let mut slots = Vec::new();
+            if let Some(ctx) =
+                context.filter(|ctx| ctx.review.has_annotation(ctx.path, None, None, true))
+            {
+                slots.push((children.len(), None));
+                children.push(ctx.annotation(None, None, true));
+            }
             if visible.top_space > 0.0 {
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
-            match runtime.diff_mode {
-                DiffMode::Inline => {
-                    children.extend(model.inline_rows[visible.start..visible.end].iter().map(
-                        |row| inline_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                    ))
+            for index in visible.start..visible.end {
+                let (old, new) = diff_row_lines(model, runtime.diff_mode, index);
+                let code = match runtime.diff_mode {
+                    DiffMode::Inline => inline_diff_row_with_review(
+                        &model.inline_rows[index],
+                        &model.syntax,
+                        gutter,
+                        code_width,
+                        horizontal,
+                        context.and_then(|ctx| ctx.line_action(old, new)),
+                    ),
+                    DiffMode::Split => split_diff_row_with_review(
+                        &model.split_rows[index],
+                        &model.syntax,
+                        gutter,
+                        code_width,
+                        horizontal,
+                        context.map(|ctx| (ctx.line_action(old, None), ctx.line_action(None, new))),
+                    ),
+                };
+                if let Some(ctx) =
+                    context.filter(|ctx| ctx.review.has_annotation(ctx.path, old, new, false))
+                {
+                    slots.push((children.len(), Some(index)));
+                    children.push(
+                        widget::column::with_children([code, ctx.annotation(old, new, false)])
+                            .spacing(0)
+                            .width(Length::Fill)
+                            .into(),
+                    );
+                } else {
+                    children.push(code);
                 }
-                DiffMode::Split => {
-                    children.extend(model.split_rows[visible.start..visible.end].iter().map(
-                        |row| split_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                    ))
-                }
-            };
+            }
             if visible.bottom_space > 0.0 {
                 children.push(
                     iced::widget::Space::new()
@@ -7080,18 +7348,36 @@ fn diff_model_view<'a>(
                     .height(crate::design::SCROLLBAR_GUTTER)
                     .into(),
             );
+            let column = widget::column::with_children(children)
+                .spacing(0)
+                .width(viewport_width)
+                .into();
+            let content = if let Some(ctx) = context {
+                Element::new(DiffAnnotationMeasure {
+                    content: column,
+                    identity: runtime.current_identity(card, PathBuf::from(ctx.path)),
+                    basis: runtime.diff_basis.clone(),
+                    mode: runtime.diff_mode,
+                    layout_revision: runtime.diff_layout_revision,
+                    review_revision: ctx.review.annotation_revision(),
+                    expected_leading: rows.leading_height(),
+                    expected: rows.annotations().clone(),
+                    retained,
+                    slots,
+                    pending_anchor: runtime.pending_diff_anchor.is_some(),
+                })
+            } else {
+                column
+            };
             let canvas = Element::new(DiffHorizontalContent {
-                content: widget::column::with_children(children)
-                    .spacing(0)
-                    .width(viewport_width)
-                    .into(),
+                content,
                 width: Length::Fixed(size.width + overflow),
                 content_width: viewport_width,
                 offset: -horizontal,
                 accessible_text: None,
                 viewport: Some(iced::Size::new(viewport_width, size.height)),
             });
-            widget::scrollable(canvas)
+            let scrollable = widget::scrollable(canvas)
                 .direction(iced::widget::scrollable::Direction::Both {
                     vertical: crate::design::scrollbar(),
                     horizontal: crate::design::scrollbar(),
@@ -7102,14 +7388,95 @@ fn diff_model_view<'a>(
                     offset: viewport.absolute_offset().y,
                     height: viewport.bounds().height,
                     horizontal: viewport.absolute_offset().x,
+                    user_initiated: false,
                 })
                 .height(Length::Fill)
                 .width(Length::Fill)
-                .into()
+                .into();
+            Element::new(DiffScrollObserver {
+                content: scrollable,
+            })
         })
         .into()
     };
     rows
+}
+
+#[derive(Clone, Copy)]
+struct DiffReviewContext<'a> {
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: &'a crate::pull_request_review::State,
+    path: &'a str,
+}
+
+impl<'a> DiffReviewContext<'a> {
+    fn annotation(
+        self,
+        old: Option<u32>,
+        new: Option<u32>,
+        leading: bool,
+    ) -> Element<'a, RepositoryAction> {
+        self.review
+            .annotation(self.path, old, new, leading)
+            .map(move |action| RepositoryAction::Review {
+                card: self.card,
+                action,
+            })
+    }
+
+    fn line_action(self, old: Option<u32>, new: Option<u32>) -> Option<RepositoryAction> {
+        use crate::github::ReviewDiffSide;
+        let (side, line) = if let Some(line) = new {
+            (ReviewDiffSide::Right, line)
+        } else {
+            (ReviewDiffSide::Left, old?)
+        };
+        let anchor = crate::pull_request_review::discussion::Anchor {
+            path: self.path.to_owned(),
+            side,
+            start_line: u64::from(line),
+            line: u64::from(line),
+        };
+        Some(RepositoryAction::ReviewLine {
+            identity: self
+                .runtime
+                .current_identity(self.card, PathBuf::from(self.path)),
+            basis: self.runtime.diff_basis.clone(),
+            action: self.review.review_action(
+                crate::pull_request_review::discussion_ui::Action::Begin(anchor),
+            ),
+            extend: false,
+        })
+    }
+}
+
+fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u32>, Option<u32>) {
+    match mode {
+        DiffMode::Inline => model
+            .inline_rows
+            .get(index)
+            .map(|row| (row.old_line, row.new_line)),
+        DiffMode::Split => model
+            .split_rows
+            .get(index)
+            .map(|row| (row.old_line, row.new_line)),
+    }
+    .unwrap_or_default()
+}
+
+fn review_begin_anchor(
+    action: &mut crate::pull_request_review::Action,
+) -> Option<&mut crate::pull_request_review::discussion::Anchor> {
+    use crate::pull_request_review::{Action, discussion_ui};
+    let Action::Discussion(discussion_ui::Action::Fenced { action, .. }) = action else {
+        return None;
+    };
+    if let discussion_ui::Action::Begin(anchor) = action.as_mut() {
+        Some(anchor)
+    } else {
+        None
+    }
 }
 
 const DIFF_ROW_PADDING: f32 = 4.0;
@@ -7147,6 +7514,7 @@ impl DiffScrollGeometry {
     }
 }
 
+#[cfg(test)]
 fn inline_diff_row<'a>(
     row: &'a InlineDiffRow,
     syntax: &DiffSyntax,
@@ -7154,14 +7522,25 @@ fn inline_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
+    inline_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+}
+
+fn inline_diff_row_with_review<'a>(
+    row: &'a InlineDiffRow,
+    syntax: &DiffSyntax,
+    gutter: f32,
+    code_width: f32,
+    horizontal: f32,
+    action: Option<RepositoryAction>,
+) -> Element<'a, RepositoryAction> {
     let marker = match row.kind {
         DiffRowKind::Addition => "+",
         DiffRowKind::Deletion => "−",
-        DiffRowKind::Context | DiffRowKind::Modification => " ",
+        _ => " ",
     };
     diff_container(
         widget::row::with_children(vec![
-            diff_gutter(row.new_line.or(row.old_line), gutter),
+            diff_review_gutter(row.new_line.or(row.old_line), gutter, action),
             widget::text::body(marker)
                 .size(DIFF_FONT_SIZE)
                 .font(Font::MONOSPACE)
@@ -7187,6 +7566,7 @@ fn inline_diff_row<'a>(
     )
 }
 
+#[cfg(test)]
 fn split_diff_row<'a>(
     row: &'a SplitDiffRow,
     syntax: &DiffSyntax,
@@ -7194,6 +7574,18 @@ fn split_diff_row<'a>(
     code_width: f32,
     horizontal: f32,
 ) -> Element<'a, RepositoryAction> {
+    split_diff_row_with_review(row, syntax, gutter, code_width, horizontal, None)
+}
+
+fn split_diff_row_with_review<'a>(
+    row: &'a SplitDiffRow,
+    syntax: &DiffSyntax,
+    gutter: f32,
+    code_width: f32,
+    horizontal: f32,
+    actions: Option<(Option<RepositoryAction>, Option<RepositoryAction>)>,
+) -> Element<'a, RepositoryAction> {
+    let (old_action, new_action) = actions.unwrap_or_default();
     let old_kind = if row.kind != DiffRowKind::Context && row.old_text.is_some() {
         DiffRowKind::Deletion
     } else {
@@ -7214,6 +7606,7 @@ fn split_diff_row<'a>(
             gutter,
             code_width,
             horizontal,
+            old_action,
         ),
         widget::container(iced::widget::Space::new())
             .width(DIFF_SPLIT_DIVIDER)
@@ -7236,6 +7629,7 @@ fn split_diff_row<'a>(
             gutter,
             code_width,
             horizontal,
+            new_action,
         ),
     ])
     .spacing(0)
@@ -7252,16 +7646,38 @@ fn diff_half<'a>(
     gutter: f32,
     code_width: f32,
     horizontal: f32,
+    action: Option<RepositoryAction>,
 ) -> Element<'a, RepositoryAction> {
     diff_container(
         widget::row::with_children(vec![
-            diff_gutter(lines.0.or(lines.1), gutter),
+            diff_review_gutter(lines.0.or(lines.1), gutter, action),
             diff_text(text, changed, syntax, kind, code_width, horizontal, lines),
         ])
         .align_y(Alignment::Center),
         kind,
         Length::FillPortion(1),
     )
+}
+
+fn diff_review_gutter(
+    line: Option<u32>,
+    width: f32,
+    action: Option<RepositoryAction>,
+) -> Element<'static, RepositoryAction> {
+    let label = diff_gutter(line, width);
+    match action {
+        Some(action) => crate::interaction::tooltip(
+            widget::button::custom(label)
+                .on_press(action)
+                .padding(0)
+                .width(width)
+                .height(DIFF_ROW_HEIGHT - 6.0)
+                .class(cosmic::theme::Button::Text),
+            "Comment on this line · Shift-click to select a range",
+        )
+        .into(),
+        None => label,
+    }
 }
 
 fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryAction> {
@@ -7464,6 +7880,338 @@ struct DiffAccessibleText<'a> {
     id: iced::advanced::widget::Id,
 }
 
+/// The scrollable reports layout clamps as well as input. Tag its viewport
+/// messages at the event boundary without capturing or dispatching extra input.
+struct DiffScrollObserver<'a> {
+    content: Element<'a, RepositoryAction>,
+}
+
+impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObserver<'_> {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<iced::keyboard::Modifiers>()
+    }
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(iced::keyboard::Modifiers::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> iced::Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, RepositoryAction>,
+        viewport: &iced::Rectangle,
+    ) {
+        let modifiers = tree.state.downcast_mut::<iced::keyboard::Modifiers>();
+        match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(value)) => {
+                *modifiers = *value
+            }
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                *modifiers = iced::keyboard::Modifiers::default()
+            }
+            _ => {}
+        }
+        let extend = modifiers.shift();
+        let user_initiated = matches!(
+            event,
+            iced::Event::Mouse(_) | iced::Event::Touch(_) | iced::Event::Keyboard(_)
+        );
+        let mut messages = Vec::new();
+        let mut local = Shell::new(&mut messages);
+        if shell.is_event_captured() {
+            local.capture_event();
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            &mut local,
+            viewport,
+        );
+        shell.merge(local, |mut message| {
+            if let RepositoryAction::DiffViewport {
+                user_initiated: tagged,
+                ..
+            } = &mut message
+            {
+                *tagged = user_initiated;
+            }
+            if let RepositoryAction::ReviewLine { extend: tagged, .. } = &mut message {
+                *tagged = extend;
+            }
+            message
+        });
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: iced::mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+}
+
+/// Measures the actual natural-height column after layout. Every child remains
+/// part of the ordinary widget tree, including focus, overlays and accessibility.
+struct DiffAnnotationMeasure<'a> {
+    content: Element<'a, RepositoryAction>,
+    identity: AsyncIdentity,
+    basis: DiffBasis,
+    mode: DiffMode,
+    layout_revision: u64,
+    review_revision: (u64, u64),
+    expected_leading: f32,
+    expected: BTreeMap<usize, f32>,
+    retained: BTreeMap<usize, f32>,
+    slots: Vec<(usize, Option<usize>)>,
+    pending_anchor: bool,
+}
+
+impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffAnnotationMeasure<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> iced::Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, RepositoryAction>,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if matches!(
+            event,
+            iced::Event::Window(iced::window::Event::RedrawRequested(_))
+        ) {
+            let mut rows = self.retained.clone();
+            let mut leading = 0.0;
+            for (child, (_, row)) in layout.children().enumerate().filter_map(|(index, child)| {
+                self.slots
+                    .iter()
+                    .find(|(slot, _)| *slot == index)
+                    .map(|slot| (child, slot))
+            }) {
+                let height = child.bounds().height;
+                match row {
+                    Some(row) => {
+                        rows.insert(*row, (height - DIFF_ROW_HEIGHT).max(0.0));
+                    }
+                    None => leading = height,
+                }
+            }
+            rows.retain(|_, height| height.is_finite() && *height > 0.0);
+            if leading != self.expected_leading || rows != self.expected || self.pending_anchor {
+                shell.publish(RepositoryAction::DiffAnnotations {
+                    identity: self.identity.clone(),
+                    basis: self.basis.clone(),
+                    mode: self.mode,
+                    layout_revision: self.layout_revision,
+                    review_revision: self.review_revision,
+                    leading,
+                    rows: rows.into_iter().collect(),
+                });
+            }
+        }
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: iced::mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
+}
+
 /// A clipped native-text viewport, also used in reverse to keep the split
 /// canvas fixed inside its single native horizontal scrollable. No text is
 /// truncated or reshaped as the shared coordinate changes.
@@ -7568,6 +8316,40 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
         }
     }
 
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.children().next().expect("diff content"),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.children().next().expect("diff content"),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
     fn a11y_nodes(
         &self,
         layout: Layout<'_>,
@@ -7714,6 +8496,14 @@ fn information_state<'a>(
     title: impl Into<String>,
     detail: impl Into<String>,
 ) -> Element<'a, RepositoryAction> {
+    information_state_height(title, detail, Length::Fill)
+}
+
+fn information_state_height<'a>(
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    height: Length,
+) -> Element<'a, RepositoryAction> {
     widget::container(
         widget::container(
             widget::column::with_children(vec![
@@ -7732,7 +8522,10 @@ fn information_state<'a>(
         .padding(cosmic::theme::spacing().space_m)
         .max_width(620),
     )
-    .center(Length::Fill)
+    .width(Length::Fill)
+    .height(height)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -7798,7 +8591,7 @@ mod tests {
         runtime.working_diff.additions = added_source_lines(&model);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model)),
+            DiffState::ready(staged_text_diff(model)),
         );
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
@@ -7864,7 +8657,7 @@ mod tests {
             runtime.diff_basis = basis.clone();
             runtime.set_diff_state(
                 basis,
-                DiffState::Ready(staged_text_diff(crate::diff_view::build_diff(
+                DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
                     "old\n",
                     "historic\n",
                 ))),
@@ -7958,7 +8751,7 @@ mod tests {
         let before = Arc::clone(&runtime.working_diff.active.as_ref().unwrap().before);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(crate::diff_view::build_diff(
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
                 "old\n", "new\n",
             ))),
         );
@@ -8055,7 +8848,7 @@ mod tests {
         assert!(
             matches!(
                 runtime.diff_state(&DiffBasis::IndexToWorktree),
-                Some(DiffState::Ready(_))
+                Some(DiffState::Ready(_, _))
             ),
             "our own save must not replace the working diff with a loading screen"
         );
@@ -8088,7 +8881,7 @@ mod tests {
         assert_eq!(runtime.source_surface, SourceSurface::Diff);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
         assert!(matches!(
@@ -8127,7 +8920,7 @@ mod tests {
         assert_eq!(runtime.source_surface, SourceSurface::Diff);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
         assert!(matches!(
@@ -8183,7 +8976,7 @@ mod tests {
 
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         assert!(runtime.can_retry_diff());
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
@@ -8266,10 +9059,11 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 900.0,
             height: 300.0,
@@ -8278,6 +9072,7 @@ mod tests {
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
         assert_eq!(runtime.diff_viewport.offset, 900.0);
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 1500.0,
             height: 300.0,
@@ -8354,10 +9149,11 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 1200.0,
             height: 300.0,
@@ -8457,6 +9253,7 @@ mod tests {
         let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "old.txt");
         runtime.set_standalone(true);
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 600.0,
             height: 300.0,
@@ -8562,7 +9359,7 @@ mod tests {
         assert_eq!(runtime.diff_mode, DiffMode::Inline);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("read failed".into())),
+            DiffState::ready(RenderedDiff::Error("read failed".into())),
         );
         assert!(runtime.can_retry_diff());
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
@@ -8571,7 +9368,7 @@ mod tests {
             runtime.diff_state(&basis),
             Some(DiffState::Loading { .. })
         ));
-        runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+        runtime.set_diff_state(basis, DiffState::ready(staged_text_diff(model_with(1))));
         assert!(runtime.can_change_diff_layout());
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
         assert_eq!(runtime.diff_mode, DiffMode::Split);
@@ -8811,7 +9608,7 @@ mod tests {
         // coordinates are derived from.
         let surface = iced::Size::new(420.0, 240.0);
         let diff = laid_out(
-            diff_model_view(card, &runtime, model, "HEAD", "Worktree"),
+            diff_model_view(card, &runtime, model, "HEAD", "Worktree", None),
             &renderer,
             surface,
         );
@@ -9064,11 +9861,11 @@ mod tests {
                 "the fixture has to delete lines for this to mean anything"
             );
             let rendered = laid_out(
-                diff_model_view(card, &runtime, model, "Index", "Working buffer"),
+                diff_model_view(card, &runtime, model, "Index", "Working buffer", None),
                 &renderer,
                 size,
             );
-            let mounted = laid_out(diff_surface(card, &runtime), &renderer, size);
+            let mounted = laid_out(diff_surface(card, &runtime, None), &renderer, size);
             let rendered = diff_rows(Layout::new(&rendered));
             assert!(
                 rendered >= model.row_count(mode),
@@ -9741,7 +10538,7 @@ mod tests {
         runtime.source_surface = SourceSurface::Diff;
         runtime.set_diff_state(
             commit.clone(),
-            DiffState::Ready(staged_text_diff(model_with(4))),
+            DiffState::ready(staged_text_diff(model_with(4))),
         );
         let _ = runtime.refresh_after_mutation(card);
         let _ = runtime.update(RepositoryAction::FilesLoaded {
@@ -10109,7 +10906,7 @@ mod tests {
         runtime.diff_mode = DiffMode::Split;
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: Vec::new(),
                 split_rows: Vec::new(),
@@ -10149,7 +10946,7 @@ mod tests {
         );
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
-            DiffState::Ready(RenderedDiff::Error("diff failed".into())),
+            DiffState::ready(RenderedDiff::Error("diff failed".into())),
         );
         assert_eq!(
             runtime.inspector_runtime_status(),
@@ -10353,7 +11150,7 @@ mod tests {
         });
         assert!(matches!(
             runtime.diff_state(&DiffBasis::IndexToWorktree),
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) if model.additions == 2
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) if model.additions == 2
         ));
     }
 
@@ -10439,6 +11236,327 @@ mod tests {
     }
 
     #[test]
+    fn annotation_measurement_uses_natural_layout_and_preserves_child_interaction() {
+        let renderer = headless_renderer();
+        let card = CardId::new();
+        let (_, identity) = diff_runtime(card);
+        let content = widget::column::with_children([
+            iced::widget::Space::new().height(42.0).into(),
+            widget::column::with_children([
+                iced::widget::Space::new().height(DIFF_ROW_HEIGHT).into(),
+                widget::button::standard("Reply to review")
+                    .height(64.0)
+                    .on_press(RepositoryAction::NextChange { card })
+                    .into(),
+            ])
+            .spacing(0)
+            .into(),
+        ])
+        .spacing(0)
+        .width(300.0)
+        .into();
+        let mut element = Element::new(DiffAnnotationMeasure {
+            content,
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            layout_revision: 4,
+            review_revision: (2, 3),
+            expected_leading: 0.0,
+            expected: BTreeMap::from([(8, 99.0), (20, 80.0)]),
+            // Row 8's removed discussion is deliberately absent. An offscreen
+            // discussion retains its last measured height until it mounts.
+            retained: BTreeMap::from([(20, 80.0)]),
+            slots: vec![(0, None), (1, Some(2))],
+            pending_anchor: false,
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = iced::Rectangle::with_size(iced::Size::new(300.0, 600.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        let mut messages = Vec::new();
+        let cursor = iced::mouse::Cursor::Available(iced::Point::new(40.0, 90.0));
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(&messages[..], [RepositoryAction::DiffAnnotations { leading, rows, review_revision: (2, 3), .. }] if *leading == 42.0 && rows == &[(2,64.0),(20,80.0)])
+        );
+        messages.clear();
+        for event in [
+            iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(event),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+        }
+        assert!(
+            matches!(&messages[..], [RepositoryAction::NextChange { card: pressed }] if *pressed == card)
+        );
+        let accessible = element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, cursor);
+        assert!(!accessible.root().is_empty() || !accessible.children().is_empty());
+    }
+
+    #[test]
+    fn annotation_measurements_reject_replaced_comparison_and_wrong_document() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        let content = || staged_text_diff(crate::diff_view::build_diff("old\n", "new\n"));
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+        let measurement = RepositoryAction::DiffAnnotations {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            layout_revision: runtime.diff_layout_revision,
+            review_revision: (0, 0),
+            leading: 40.0,
+            rows: vec![(0, 80.0)],
+        };
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+        drop(runtime.update(measurement));
+        assert_eq!(runtime.diff_rows().unwrap().leading_height(), 0.0);
+        let mut stale = identity.clone();
+        stale.path = "different.txt".into();
+        for (identity, expected_leading) in [(stale, 0.0), (identity, 40.0)] {
+            drop(runtime.update(RepositoryAction::DiffAnnotations {
+                identity,
+                basis: DiffBasis::IndexToWorktree,
+                mode: DiffMode::Inline,
+                layout_revision: runtime.diff_layout_revision,
+                review_revision: (0, 0),
+                leading: 40.0,
+                rows: vec![(0, 80.0)],
+            }));
+            assert_eq!(
+                runtime.diff_rows().unwrap().leading_height(),
+                expected_leading
+            );
+        }
+        assert_eq!(runtime.diff_rows().unwrap().leading_height(), 40.0);
+        assert_eq!(runtime.diff_rows().unwrap().height(0), 110.0);
+    }
+
+    #[test]
+    fn gutter_ranges_preserve_side_and_original_anchor_when_backtracking() {
+        use crate::github::ReviewDiffSide::{Left, Right};
+        use crate::pull_request_review::{Action, discussion::Anchor, discussion_ui};
+        use cosmic::iced::futures::StreamExt;
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        for (line, side, extend, expected) in [
+            (5, Right, false, (5, 5)),
+            (9, Right, true, (5, 9)),
+            (3, Right, true, (3, 5)),
+            (2, Left, true, (2, 2)),
+        ] {
+            let task = runtime.update(RepositoryAction::ReviewLine {
+                identity: identity.clone(),
+                basis: DiffBasis::IndexToWorktree,
+                extend,
+                action: Action::Discussion(discussion_ui::Action::Fenced {
+                    generation: 11,
+                    authority_revision: 7,
+                    action: Box::new(discussion_ui::Action::Begin(Anchor {
+                        path: "notes.txt".into(),
+                        side,
+                        start_line: line,
+                        line,
+                    })),
+                }),
+            });
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            let output = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(stream.next())
+                .unwrap();
+            let iced::runtime::Action::Output(RepositoryAction::Review { mut action, .. }) = output
+            else {
+                panic!("review action");
+            };
+            let anchor = review_begin_anchor(&mut action).unwrap();
+            assert_eq!((anchor.start_line, anchor.line), expected);
+            assert_eq!(anchor.side, side);
+            assert!(matches!(
+                action,
+                Action::Discussion(discussion_ui::Action::Fenced { generation: 11, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn measured_diff_blocks_preserve_anchor_and_change_navigation() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let mut model = model_with(2);
+        model.inline_rows = (0..10)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        model.inline_change_starts = vec![2, 7];
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(model)),
+        );
+        runtime.diff_viewport = ListViewport {
+            offset: 105.0,
+            height: 120.0,
+        };
+        runtime.diff_horizontal = 44.0;
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
+        assert_eq!(runtime.diff_viewport.offset, 270.0);
+        assert_eq!(runtime.diff_horizontal, 44.0);
+        let unchanged = runtime.diff_viewport.offset;
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
+        assert_eq!(runtime.diff_viewport.offset, unchanged);
+        drop(runtime.update(RepositoryAction::NextChange { card }));
+        assert_eq!(runtime.diff_viewport.offset, 390.0);
+        drop(runtime.update(RepositoryAction::PreviousChange { card }));
+        assert_eq!(runtime.diff_viewport.offset, 210.0);
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
+        assert_eq!(runtime.diff_viewport.offset, 60.0);
+    }
+
+    #[test]
+    fn annotated_file_reopen_restores_logical_anchor_after_async_load() {
+        for (saved, scrolled, expected) in [
+            (350.0, None, 350.0),
+            (350.0, Some(60.0), 260.0),
+            (100.0, None, 100.0),
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = diff_runtime(card);
+            let content =
+                || staged_text_diff(crate::diff_view::build_diff("", &"line\n".repeat(20)));
+            runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+            drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
+            runtime.diff_viewport.offset = saved;
+            let file = runtime.selected.clone().unwrap();
+            drop(runtime.open_file_entry(card, file.clone()));
+            assert!(runtime.pending_diff_anchor.is_some());
+            runtime.source_surface = SourceSurface::Diff;
+            drop(runtime.ensure_current_diff(card));
+            let Some(DiffState::Loading { request, .. }) =
+                runtime.diff_state(&DiffBasis::IndexToWorktree)
+            else {
+                panic!("reopened comparison must load afresh");
+            };
+            let request = *request;
+            drop(runtime.update(RepositoryAction::DiffLoaded {
+                identity: runtime.current_identity(card, file.path),
+                basis: DiffBasis::IndexToWorktree,
+                request,
+                content: content(),
+            }));
+            assert_eq!(
+                runtime.diff_viewport.offset,
+                if saved >= 200.0 { saved - 200.0 } else { 0.0 }
+            );
+            // A redraw clamps the temporary uniform document into a taller
+            // viewport. This is not the reader choosing a different line.
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                user_initiated: false,
+                card,
+                offset: 0.0,
+                height: 900.0,
+                horizontal: 0.0,
+            }));
+            assert!(runtime.pending_diff_anchor.is_some());
+            if let Some(offset) = scrolled {
+                drop(runtime.update(RepositoryAction::DiffViewport {
+                    user_initiated: true,
+                    card,
+                    offset,
+                    height: 120.0,
+                    horizontal: 0.0,
+                }));
+            }
+            drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
+            assert_eq!(runtime.diff_viewport.offset, expected);
+            assert!(runtime.pending_diff_anchor.is_none());
+        }
+    }
+
+    #[test]
+    fn diff_scroll_observer_distinguishes_redraw_from_wheel_without_duplicate_events() {
+        let renderer = headless_renderer();
+        let card = CardId::new();
+        let content = widget::scrollable(iced::widget::Space::new().height(2000.0))
+            .height(200.0)
+            .width(300.0)
+            .on_scroll(move |viewport| RepositoryAction::DiffViewport {
+                card,
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+                horizontal: viewport.absolute_offset().x,
+                user_initiated: false,
+            });
+        let mut element = Element::new(DiffScrollObserver {
+            content: content.into(),
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = iced::Rectangle::with_size(iced::Size::new(300.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        for (event, expected_input) in [
+            (
+                iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+                false,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -3.0 },
+                }),
+                true,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Available(iced::Point::new(20.0, 20.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(
+                matches!(messages[0], RepositoryAction::DiffViewport { user_initiated, .. } if user_initiated == expected_input)
+            );
+        }
+    }
+
+    #[test]
     fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         let view = RepositoryView {
             selected_file: None,
@@ -10475,7 +11593,7 @@ mod tests {
         });
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
                 split_rows: vec![split; 100_000],
@@ -10496,7 +11614,7 @@ mod tests {
                 offset,
                 height: 720.0,
             };
-            let element = diff_surface(card, &runtime);
+            let element = diff_surface(card, &runtime, None);
             assert!(widget_nodes(&element) < 1_500, "diff widget tree was eager");
         }
     }
@@ -10508,7 +11626,7 @@ mod tests {
         runtime.diff_viewport.height = 720.0;
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: vec![
                     InlineDiffRow {
@@ -12094,11 +13212,11 @@ mod tests {
             "no base may be guessed"
         );
         assert!(!context.can_retry_diff);
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
 
         // The same surface with nothing to offer still says what is wrong.
         runtime.basis_resolution = Some(BasisResolution::NeedsBase(Vec::new()));
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
         assert_eq!(
             runtime.inspector_context().diff_state,
             Some("Choose a base")
@@ -12216,7 +13334,7 @@ mod tests {
         let (mut runtime, _) = diff_runtime(card);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         runtime.source_surface = SourceSurface::Diff;
 
@@ -12232,7 +13350,7 @@ mod tests {
             assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
             assert!(matches!(
                 runtime.diff_state(&DiffBasis::IndexToWorktree),
-                Some(DiffState::Ready(RenderedDiff::Text { .. }))
+                Some(DiffState::Ready(RenderedDiff::Text { .. }, _))
             ));
             let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
                 card,
@@ -12253,7 +13371,7 @@ mod tests {
         let (mut runtime, identity) = diff_runtime(card);
         // Previously viewed working comparisons remain cached.
         for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
-            runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+            runtime.set_diff_state(basis, DiffState::ready(staged_text_diff(model_with(1))));
         }
         let commit = |step: u8| DiffBasis::CommitToParent {
             oid: fixture_oid(step * 2),
@@ -12382,7 +13500,7 @@ mod tests {
 
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(RenderedDiff::NoText(DiffContent::Unmerged {
+            DiffState::ready(RenderedDiff::NoText(DiffContent::Unmerged {
                 base: text(),
                 ours: text(),
                 theirs: text(),
@@ -12394,7 +13512,7 @@ mod tests {
             runtime.diff_model().is_none(),
             "a conflict has no two-sided model"
         );
-        let _ = diff_surface(card, &runtime);
+        let _ = diff_surface(card, &runtime, None);
 
         for (new, expected) in [
             (DiffSide::Binary { bytes: 3 }, "Binary"),
@@ -12423,7 +13541,7 @@ mod tests {
         ] {
             runtime.set_diff_state(
                 DiffBasis::IndexToWorktree,
-                DiffState::Ready(RenderedDiff::NoText(DiffContent::Comparison {
+                DiffState::ready(RenderedDiff::NoText(DiffContent::Comparison {
                     old: text(),
                     new,
                     old_label: "Index".into(),
@@ -12434,7 +13552,7 @@ mod tests {
             assert!(runtime.diff_model().is_none());
             // The surface renders the fact instead of panicking on a state
             // #45's reduced content type had no variant for.
-            let _ = diff_surface(card, &runtime);
+            let _ = diff_surface(card, &runtime, None);
         }
     }
 

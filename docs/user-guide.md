@@ -159,6 +159,22 @@ progress and links to GitHub.
 - Settings → Links → **Open pull requests in** switches rows back to plain
   links.
 
+Click a diff line number to write a comment. Shift-click another line on the
+same side to select an inclusive range. **Save pending comment** keeps the
+comment in your GitHub draft review; **Preview** renders its Markdown before
+saving. Existing discussions appear below their lines, with outdated threads
+above the file. Resolved threads collapse. You can reply, resolve or reopen a
+thread, and edit or delete your own pending comments.
+
+The review bar shows the pending comment count and offers **Comment**,
+**Approve**, or **Request changes**, with an optional summary. Save or cancel
+an open composer first. **Review and submit** shows the repository, pull
+request, exact commit, event, summary, and pending count before submission.
+The app rechecks the repository, signed-in account, commit, and pending comment
+contents before sending. If a request's answer is lost, it asks you to check
+GitHub rather than silently posting it again. The same controls are available
+in ceditor's Pull requests panel.
+
 ## Worktrees
 
 When creating a worktree, enter a branch name, a Linear issue ID such as

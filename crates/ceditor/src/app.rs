@@ -3274,7 +3274,21 @@ impl Application for Editor {
                     });
                     Task::batch([task, self.drain(card)])
                 }
+                Message::Repository(RepositoryAction::Review { card, action }) => {
+                    self.handle_review(card, action)
+                }
                 Message::Repository(action) => {
+                    if let RepositoryAction::DiffAnnotations {
+                        identity,
+                        review_revision,
+                        ..
+                    } = &action
+                        && !self
+                            .tab(identity.card)
+                            .is_some_and(|tab| tab.review.annotation_revision() == *review_revision)
+                    {
+                        return Task::none();
+                    }
                     let id = action.card();
                     if (self.modal_open()
                         || self
@@ -4448,7 +4462,22 @@ impl Application for Editor {
                 editor.push(find_bar(self));
                 editor.push(design::horizontal_rule().into());
             }
-            editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
+            editor.push(
+                repository_widget::view_with_review(
+                    tab.id,
+                    &tab.runtime,
+                    tab.review.is_open().then_some(&tab.review),
+                )
+                .map(Message::Repository),
+            );
+            if tab.review.is_open() {
+                editor.push(design::horizontal_rule().into());
+                editor.push(
+                    tab.review
+                        .review_bar(self.modal_open())
+                        .map(move |action| Message::PullRequestReview(tab.id, action)),
+                );
+            }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
                 for (index, item) in tab.completions.iter().enumerate() {

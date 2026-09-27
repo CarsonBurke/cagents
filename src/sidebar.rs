@@ -4586,6 +4586,7 @@ fn project_view<'a>(
                     project_id,
                     worktree,
                     is_primary_worktree(&entity.repository, &worktree.path),
+                    project.state.filter == SidebarFilter::PullRequests,
                     selection,
                     modal_open,
                     entity.github_ready,
@@ -4683,6 +4684,7 @@ fn compact_project<'a>(
                 entity.id,
                 worktree,
                 is_primary_worktree(&entity.repository, &worktree.path),
+                project.state.filter == SidebarFilter::PullRequests,
                 selection,
                 modal_open,
                 entity.github_ready,
@@ -5187,6 +5189,7 @@ fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
     primary: bool,
+    review_mode: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
@@ -5282,7 +5285,15 @@ fn worktree_view<'a>(
         == Some(SidebarSelection::Worktree {
             project_id,
             worktree_id: worktree.id,
-        });
+        })
+        || (review_mode
+            && worktree.pull_request().is_some_and(|pr| {
+                selection
+                    == Some(SidebarSelection::PullRequest {
+                        project_id,
+                        number: pr.number,
+                    })
+            }));
     // A worktree on its way out is not somewhere to go: opening it would start
     // sessions in a directory Git is about to remove.
     let inert = modal_open || deleting;
@@ -5296,11 +5307,7 @@ fn worktree_view<'a>(
             deletion,
         ))
         .on_press_maybe(gated(
-            SidebarAction::OpenWorktree {
-                project_id,
-                worktree_id: worktree.id,
-                path: worktree.path.clone(),
-            },
+            worktree_primary_action(project_id, worktree, review_mode),
             inert,
         ));
     let action: Element<'a, SidebarAction> = if compact {
@@ -5354,6 +5361,26 @@ fn worktree_view<'a>(
         ),
         entity_id("worktree.retry-delete", worktree.id),
     ))
+}
+
+fn worktree_primary_action(
+    project_id: ProjectId,
+    worktree: &SidebarWorktree,
+    review_mode: bool,
+) -> SidebarAction {
+    if review_mode && let Some(pr) = worktree.pull_request() {
+        SidebarAction::OpenPullRequest {
+            project_id,
+            number: pr.number,
+            url: pr.url.clone(),
+        }
+    } else {
+        SidebarAction::OpenWorktree {
+            project_id,
+            worktree_id: worktree.id,
+            path: worktree.path.clone(),
+        }
+    }
 }
 
 fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarAction> {
@@ -9675,6 +9702,7 @@ pub(crate) mod tests {
                 project_id(1),
                 &worktree,
                 primary,
+                false,
                 None,
                 false,
                 true,
@@ -12262,6 +12290,28 @@ pub(crate) mod tests {
 
         pr.state = Some(WorktreePullRequestState::Open);
         assert!(pr.has_pending_checks(), "reopening restores ongoing checks");
+    }
+
+    #[test]
+    fn pull_request_filter_rows_open_reviews_and_other_rows_open_worktrees() {
+        let project = project();
+        let mut worktree = project.worktrees[0].clone();
+        let pr = project.pull_requests[0].clone();
+        worktree.set_pull_request(pr.clone());
+        assert!(
+            matches!(worktree_primary_action(project.id, &worktree, true),
+            SidebarAction::OpenPullRequest { project_id, number, url }
+            if project_id == project.id && number == pr.number && url == pr.url)
+        );
+        assert!(
+            matches!(worktree_primary_action(project.id, &worktree, false),
+            SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
+        );
+        worktree.clear_pull_request();
+        assert!(
+            matches!(worktree_primary_action(project.id, &worktree, true),
+            SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
+        );
     }
 
     #[test]

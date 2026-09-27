@@ -847,6 +847,7 @@ pub struct PullRequestFiles {
 pub struct PendingReview {
     pub id: String,
     pub comment_count: u64,
+    pub commit_oid: Option<String>,
 }
 
 /// What a review pane needs before its first mutation: the node id every
@@ -955,6 +956,8 @@ impl ReplyToThreadRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitReviewRequest {
     pub pull_request_id: String,
+    /// The immutable diff head shown by the confirmation surface.
+    pub commit_oid: String,
     pub review_id: Option<String>,
     pub event: ReviewEvent,
     pub body: String,
@@ -963,6 +966,7 @@ pub struct SubmitReviewRequest {
 impl SubmitReviewRequest {
     pub fn validate(&self) -> Result<(), GitHubValidationError> {
         validate_node_id("pull_request_id", &self.pull_request_id)?;
+        validate_review_oid(&self.commit_oid)?;
         if let Some(review) = &self.review_id {
             validate_node_id("review_id", review)?;
         }
@@ -1010,6 +1014,17 @@ fn validate_node_id(field: &'static str, value: &str) -> Result<(), GitHubValida
         Err(GitHubValidationError::InvalidField {
             field,
             reason: "must be a GraphQL node id".into(),
+        })
+    }
+}
+
+fn validate_review_oid(value: &str) -> Result<(), GitHubValidationError> {
+    if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(GitHubValidationError::InvalidField {
+            field: "commit_oid",
+            reason: "must be a full Git object ID".into(),
         })
     }
 }
@@ -1095,6 +1110,7 @@ pub trait GitHubReviewApi: Send + Sync {
         &self,
         repository: &GitHubRepoKey,
         pull_request_id: &str,
+        commit_oid: &str,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<PendingReview>, GitHubError>;
 
@@ -2044,6 +2060,12 @@ struct PendingReviewPage {
     id: String,
     author: Option<GitHubActor>,
     comments: TotalCount,
+    commit: Option<ReviewCommit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewCommit {
+    oid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2187,7 +2209,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         key.validate()?;
         let data = self.graphql(
             &key.repository,
-            "query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} comments{totalCount}} pageInfo{hasNextPage endCursor}}}}}",
+            "query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} commit{oid} comments{totalCount}} pageInfo{hasNextPage endCursor}}}}}",
             Self::pull_request_variables(key),
             cancellation,
         )?;
@@ -2215,6 +2237,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             .map(|review| PendingReview {
                 id: review.id,
                 comment_count: review.comments.total_count,
+                commit_oid: review.commit.map(|commit| commit.oid),
             });
         Ok(ReviewContext {
             pull_request_id: page.id,
@@ -2276,13 +2299,15 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         &self,
         repository: &GitHubRepoKey,
         pull_request_id: &str,
+        commit_oid: &str,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<PendingReview>, GitHubError> {
         validate_node_id("pull_request_id", pull_request_id)?;
+        validate_review_oid(commit_oid)?;
         let outcome = self.mutate(
             repository,
-            "mutation($pullRequest:ID!){addPullRequestReview(input:{pullRequestId:$pullRequest}){pullRequestReview{id comments{totalCount}}}}",
-            vec![("pullRequest", pull_request_id.into())],
+            "mutation($pullRequest:ID!,$commit:GitObjectID!){addPullRequestReview(input:{pullRequestId:$pullRequest,commitOID:$commit}){pullRequestReview{id commit{oid} comments{totalCount}}}}",
+            vec![("pullRequest", pull_request_id.into()), ("commit", commit_oid.into())],
             "/addPullRequestReview/pullRequestReview",
             cancellation,
         )?;
@@ -2291,6 +2316,7 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             .map(|review| PendingReview {
                 id: review.id,
                 comment_count: review.comments.total_count,
+                commit_oid: review.commit.map(|commit| commit.oid),
             }))
     }
 
@@ -2426,9 +2452,10 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             }
             None => {
                 variables.push(("pullRequest", request.pull_request_id.as_str().into()));
+                variables.push(("commit", request.commit_oid.as_str().into()));
                 self.mutate(
                     repository,
-                    "mutation($pullRequest:ID!,$event:PullRequestReviewEvent!,$body:String){addPullRequestReview(input:{pullRequestId:$pullRequest,event:$event,body:$body}){pullRequestReview{id state url}}}",
+                    "mutation($pullRequest:ID!,$commit:GitObjectID!,$event:PullRequestReviewEvent!,$body:String){addPullRequestReview(input:{pullRequestId:$pullRequest,commitOID:$commit,event:$event,body:$body}){pullRequestReview{id state url}}}",
                     variables,
                     "/addPullRequestReview/pullRequestReview",
                     cancellation,
@@ -3431,7 +3458,8 @@ mod tests {
             context.pending,
             Some(PendingReview {
                 id: "PRR_mine".into(),
-                comment_count: 2
+                comment_count: 2,
+                commit_oid: None,
             })
         );
         let context = service
@@ -3690,7 +3718,12 @@ mod tests {
         )]));
         let service = GitHubService::new("gh", fake);
         let outcome = service
-            .start_review(&repository(), "PR_1", &CancellationToken::new())
+            .start_review(
+                &repository(),
+                "PR_1",
+                &"a".repeat(40),
+                &CancellationToken::new(),
+            )
             .unwrap();
         match outcome {
             ReviewMutationOutcome::OutcomeUnknown { failure } => {
@@ -3715,6 +3748,7 @@ mod tests {
                 &repository(),
                 &SubmitReviewRequest {
                     pull_request_id: "PR_1".into(),
+                    commit_oid: "a".repeat(40),
                     review_id: Some("PRR_1".into()),
                     event: ReviewEvent::Approve,
                     body: "LGTM".into(),
@@ -3731,6 +3765,7 @@ mod tests {
                 &repository(),
                 &SubmitReviewRequest {
                     pull_request_id: "PR_1".into(),
+                    commit_oid: "a".repeat(40),
                     review_id: None,
                     event: ReviewEvent::Comment,
                     body: "  ".into(),
@@ -3748,6 +3783,12 @@ mod tests {
         let second = argument_strings(&commands[1]);
         assert!(second.iter().any(|a| a.contains("addPullRequestReview(")));
         assert!(second.contains(&"pullRequest=PR_1".to_owned()));
+        assert!(second.contains(&format!("commit={}", "a".repeat(40))));
+        assert!(
+            second
+                .iter()
+                .any(|argument| argument.contains("commitOID:$commit"))
+        );
         assert!(!second.iter().any(|a| a.starts_with("body=")));
     }
 
