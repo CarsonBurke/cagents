@@ -507,8 +507,8 @@ impl ControlClient {
                 ServerMessage::NotificationsChanged => {
                     return Ok(crate::notifications::Update::Changed);
                 }
-                ServerMessage::NotificationActivated { session } => {
-                    return Ok(crate::notifications::Update::Activated(session));
+                ServerMessage::NotificationActivated { target } => {
+                    return Ok(crate::notifications::Update::Activated(target));
                 }
                 ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
                 ServerMessage::Error(error) => {
@@ -1181,10 +1181,10 @@ impl ControlClient {
                         .push_back(crate::notifications::Update::Changed);
                 }
             }
-            ServerMessage::NotificationActivated { session } => {
+            ServerMessage::NotificationActivated { target } => {
                 if self.observed_notifications.len() < 32 {
                     self.observed_notifications
-                        .push_back(crate::notifications::Update::Activated(session));
+                        .push_back(crate::notifications::Update::Activated(target));
                 }
             }
             ServerMessage::ChatChanged { chat_id }

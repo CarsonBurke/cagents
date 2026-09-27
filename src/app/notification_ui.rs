@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     control::ControlClient,
-    notifications::{Preferences, Presence, Snapshot, Update},
+    notifications::{Preferences, Presence, Snapshot, Target, Update},
 };
 use std::{
     collections::BTreeSet,
@@ -13,7 +13,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub enum Action {
     Snapshot(Snapshot),
-    Activated(TerminalId),
+    Activated(Target),
     Test,
     Failed(String),
 }
@@ -67,7 +67,7 @@ impl State {
         });
     }
 
-    fn acknowledge(&mut self, id: uuid::Uuid) {
+    pub(super) fn acknowledge(&mut self, id: uuid::Uuid) {
         if self.acknowledged.insert(id) {
             self.changed(|pending| {
                 pending.acknowledged.insert(id);
@@ -245,7 +245,9 @@ impl Cagents {
                 .snapshot
                 .notices
                 .iter()
-                .filter(|notice| notice.event.session == focused && !notice.acknowledged)
+                .filter(|notice| {
+                    notice.event.source_session() == Some(focused) && !notice.acknowledged
+                })
                 .map(|notice| notice.id)
                 .collect::<Vec<_>>();
             for id in ids {
@@ -271,13 +273,13 @@ impl Cagents {
                 for notice in &snapshot.notices {
                     if !notice.acknowledged
                         && !self.notification_ui.acknowledged.contains(&notice.id)
+                        && let Some(session) = notice.event.source_session()
                         && let Some(card) = self
                             .durable
                             .cards
                             .iter()
                             .find(|card| {
-                                card.existence.is_open()
-                                    && card_session(card) == Some(notice.event.session)
+                                card.existence.is_open() && card_session(card) == Some(session)
                             })
                             .map(|card| card.id)
                     {
@@ -289,7 +291,7 @@ impl Cagents {
                 self.sync_notification_presence();
                 Task::none()
             }
-            Action::Activated(session) => {
+            Action::Activated(Target::Session(session)) => {
                 let Some(card) = self
                     .durable
                     .cards
@@ -382,8 +384,9 @@ mod tests {
         let notice = crate::notifications::Notice {
             id,
             event: crate::notifications::Event {
-                session,
-                provider: Provider::Claude,
+                target: crate::notifications::Target::Session(session),
+                source_session: Some(session),
+                provider: Some(Provider::Claude),
                 directory: "/tmp".into(),
                 evidence: crate::notifications::Evidence {
                     key: "complete".into(),
@@ -425,8 +428,9 @@ mod tests {
             notices: vec![crate::notifications::Notice {
                 id,
                 event: crate::notifications::Event {
-                    session,
-                    provider: Provider::Claude,
+                    target: crate::notifications::Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Claude),
                     directory: "/tmp".into(),
                     evidence: crate::notifications::Evidence {
                         key: "focused-completion".into(),
@@ -488,11 +492,11 @@ mod tests {
             cards: vec![card],
             focused: Some(card),
         });
-        drop(app.update_notifications(Action::Activated(session)));
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert_eq!(app.durable.active_channel, Some(channel));
         assert_eq!(app.workspace.focused(), Some(card));
         let count = app.durable.cards.len();
-        drop(app.update_notifications(Action::Activated(TerminalId::new())));
+        drop(app.update_notifications(Action::Activated(Target::Session(TerminalId::new()))));
         assert_eq!(app.durable.active_channel, Some(channel));
         assert_eq!(app.workspace.focused(), Some(card));
         assert_eq!(

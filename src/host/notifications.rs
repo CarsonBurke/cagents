@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::state::{ClientId, HostState, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot},
+    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target},
 };
 
 const MAX_PENDING: usize = 2048;
@@ -37,8 +37,8 @@ impl Drop for Portal {
 
 #[derive(Default)]
 struct Pending {
-    events: BTreeMap<TerminalId, Event>,
-    retired: BTreeSet<TerminalId>,
+    events: BTreeMap<Target, Event>,
+    retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
@@ -72,13 +72,14 @@ impl Handle {
             // Producers fence worker identity before enqueueing. A newer
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
-            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.session) {
-                pending.events.insert(event.session, event);
+            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
+                pending.events.insert(event.target(), event);
             }
         });
     }
 
     pub fn retire(&self, session: TerminalId) {
+        let session = Target::Session(session);
         self.change(|pending| {
             pending.events.remove(&session);
             if pending.retired.len() < MAX_PENDING {
@@ -374,8 +375,9 @@ mod tests {
         }));
         let session = TerminalId::new();
         let event = |key: &str| Event {
-            session,
-            provider: crate::agent::Provider::Codex,
+            target: crate::notifications::Target::Session(session),
+            source_session: Some(session),
+            provider: Some(crate::agent::Provider::Codex),
             directory: "/fixture".into(),
             evidence: crate::notifications::Evidence {
                 key: key.into(),
@@ -387,8 +389,11 @@ mod tests {
         assert!(handle.0.pending.lock().unwrap().events.is_empty());
         handle.record(event("new"));
         let pending = handle.0.pending.lock().unwrap();
-        assert!(pending.retired.contains(&session));
-        assert_eq!(pending.events[&session].evidence.key, "new");
+        assert!(pending.retired.contains(&Target::Session(session)));
+        assert_eq!(
+            pending.events[&Target::Session(session)].evidence.key,
+            "new"
+        );
     }
 
     #[test]
@@ -441,7 +446,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
     let mut proxy = None;
     // Only events observed during this daemon lifetime are eligible for retry.
     // Restored attention stays visible in the UI without announcing old backlog.
-    let mut delivery = BTreeMap::<crate::model::TerminalId, Notice>::new();
+    let mut delivery = BTreeMap::<Target, Notice>::new();
     let mut withdrawals = BTreeSet::new();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
@@ -523,7 +528,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
             if let Some(old) = snapshot
                 .notices
                 .iter()
-                .find(|notice| notice.event.session == session)
+                .find(|notice| notice.event.target() == session)
             {
                 queue_withdrawal(&mut withdrawals, old.id);
             }
@@ -545,22 +550,24 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
             if stopped(&shared) {
                 return;
             }
-            let focused = presence
-                .values()
-                .any(|window| window.focused == Some(event.session));
+            let focused = presence.values().any(|window| {
+                event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+            });
             let suppressed = !policy.allows(event.evidence.kind, focused);
             match journal.record(event, suppressed) {
                 Ok(Some(notice)) => {
-                    delivery.remove(&notice.event.session);
+                    delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot
                         .notices
                         .iter()
-                        .find(|old| old.event.session == notice.event.session)
+                        .find(|old| old.event.target() == notice.event.target())
                     {
                         queue_withdrawal(&mut withdrawals, old.id);
                     }
                     if !suppressed {
-                        delivery.insert(notice.event.session, notice);
+                        delivery.insert(notice.event.target(), notice);
                     }
                 }
                 Ok(None) => {}
@@ -582,9 +589,12 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
         delivery.retain(|_, notice| {
-            let focused = presence
-                .values()
-                .any(|window| window.focused == Some(notice.event.session));
+            let focused = presence.values().any(|window| {
+                notice
+                    .event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+            });
             policy.allows(notice.event.evidence.kind, focused)
         });
         if (!delivery.is_empty() || !withdrawals.is_empty() || pending.test)
@@ -615,7 +625,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                 }
                 match send(&backend.proxy, &notice).await {
                     Ok(()) => {
-                        delivery.remove(&notice.event.session);
+                        delivery.remove(&notice.event.target());
                         if let Err(error) = journal.delivered(notice.id) {
                             snapshot.diagnostic = Some(error);
                         }
@@ -689,7 +699,11 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     let window = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .activate_notification(notice.event.session, notice.window.as_deref());
+                        .activate_notification(
+                            notice.event.target(),
+                            notice.event.source_session(),
+                            notice.window.as_deref(),
+                        );
                     // Activation and the matched executable handshake can wait;
                     // they never run under the daemon's session lock.
                     match crate::instance::activate_window_with_token(&window, token.as_deref()) {

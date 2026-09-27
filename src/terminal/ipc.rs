@@ -87,7 +87,9 @@ use crate::{
 /// Version 26 adds daemon-owned durable lifecycle attention and notification control.
 /// Version 27 reports screen loss after authenticated crash adoption and adds
 /// exact-recipe cleanup for retained completed terminals.
-pub const PROTOCOL_VERSION: u16 = 27;
+/// Version 30 makes notification activation and lifecycle identity typed.
+/// Versions 28 and 29 are reserved by the execution and native-holder changes.
+pub const PROTOCOL_VERSION: u16 = 30;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -554,7 +556,7 @@ pub enum ServerMessage {
     },
     NotificationsChanged,
     NotificationActivated {
-        session: TerminalId,
+        target: crate::notifications::Target,
     },
 }
 
