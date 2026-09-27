@@ -18,6 +18,7 @@ mod notification_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
@@ -3444,6 +3445,7 @@ pub enum Message {
     BranchUi(branch_ui::Action),
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
+    ReviewRequests(review_request_ui::Action),
     GitUi(git_ui::Action),
     NotificationUi(notification_ui::Action),
     AccountUi(account_ui::Action),
@@ -5003,6 +5005,7 @@ impl Cagents {
                 Arc::new(GitHubService::system("gh")),
                 RepositoryService::system("git"),
             )
+            .with_external_review_requests()
             .with_cache(self.session.as_ref().map(|session| {
                 session.operation_store() as Arc<dyn pull_request_review::cache::Store>
             })),
@@ -10936,6 +10939,7 @@ impl Application for Cagents {
                             self.observe_git_repository(&loaded, generation),
                             self.open_pending_pull_requests(project_id),
                             self.prune_pull_request_refs(project_id),
+                            self.update_review_requests(review_request_ui::Action::Tick),
                         ]);
                         if open_cards {
                             if !self.refuse_in_deleting_worktree(&worktree) {
@@ -12791,6 +12795,7 @@ impl Application for Cagents {
             Message::AccountUi(action) => self.update_account_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
+            Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
@@ -13069,6 +13074,7 @@ impl Application for Cagents {
             self.chat_subscription(),
             self.notification_subscription(),
             self.refresh_subscription(),
+            self.review_request_subscription(),
             self.git_subscription(),
             self.account_subscription(),
             self.document_tone_subscription(),

@@ -550,6 +550,38 @@ impl SidebarProject {
         })
     }
 
+    pub fn apply_review_requests(
+        &mut self,
+        requested: &std::collections::BTreeMap<
+            u64,
+            crate::github::review_requests::scan::Requested,
+        >,
+    ) {
+        let apply = |row: &mut SidebarPullRequest| {
+            let request = requested.get(&row.number);
+            row.needs_review = request.is_some();
+            row.review_requested_again = request.is_some_and(|request| {
+                request.history == crate::github::review_requests::scan::History::ReRequested
+            });
+        };
+        for row in &mut self.pull_requests {
+            apply(row);
+        }
+        if let Some(cached) = &mut self.cached_display {
+            for row in &mut cached.rows {
+                apply(row);
+            }
+        }
+        for worktree in &mut self.worktrees {
+            if let Some(mut row) = worktree.pull_request().cloned() {
+                apply(&mut row);
+                if worktree.pull_request() != Some(&row) {
+                    worktree.set_pull_request(row);
+                }
+            }
+        }
+    }
+
     pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
         self.pull_requests = pull_requests;
         self.cached_display = None;
@@ -884,6 +916,11 @@ impl SidebarWorktree {
                 pr.number,
                 check_description(pr.checks)
             );
+            if pr.review_requested_again {
+                status.push_str(", review re-requested from you");
+            } else if pr.needs_review {
+                status.push_str(", needs your review");
+            }
         }
         let branch = self.branch.as_deref().unwrap_or("Detached HEAD");
         let accessible_name = format!("Open worktree {}, {branch}, {status}", self.chrome.label);
@@ -1041,6 +1078,7 @@ pub struct SidebarPullRequest {
     pub checks: CheckStatus,
     pub state: Option<WorktreePullRequestState>,
     pub needs_review: bool,
+    pub review_requested_again: bool,
     pub head_oid: Option<String>,
 }
 
@@ -1067,6 +1105,7 @@ impl SidebarPullRequest {
             checks,
             state: None,
             needs_review: false,
+            review_requested_again: false,
             head_oid: None,
         }
     }
@@ -1096,12 +1135,8 @@ impl SidebarPullRequest {
         row.state = WorktreePullRequestState::from_github(pull_request);
         row.head_repository = pull_request.head_repository_key();
         row.head_oid = Some(pull_request.head_ref_oid.clone());
-        row.needs_review = pull_request
-            .review_decision
-            .as_ref()
-            .is_some_and(|decision| {
-                matches!(decision.0.as_str(), "REVIEW_REQUIRED" | "CHANGES_REQUESTED")
-            });
+        // REVIEW_REQUIRED is branch policy, not a request for the current viewer.
+        // The authenticated request scanner supplies viewer-specific authority.
         row
     }
 
@@ -1140,6 +1175,7 @@ fn pull_request_icon(pr: &SidebarPullRequest) -> widget::icon::Handle {
 /// itself, which is the only way to keep the lookup off the global theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullRequestTone {
+    Review,
     Merged,
     Danger,
     Pending,
@@ -1152,7 +1188,8 @@ fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
     match pr.state {
         Some(WorktreePullRequestState::Merged) => PullRequestTone::Merged,
         Some(WorktreePullRequestState::Closed) => PullRequestTone::Danger,
-        _ if pr.checks == CheckStatus::Failing || pr.needs_review => PullRequestTone::Danger,
+        _ if pr.checks == CheckStatus::Failing => PullRequestTone::Danger,
+        _ if pr.needs_review => PullRequestTone::Review,
         _ if pr.checks == CheckStatus::Pending => PullRequestTone::Pending,
         _ if pr.draft => PullRequestTone::Draft,
         _ if pr.checks == CheckStatus::Passing => PullRequestTone::Passing,
@@ -1166,6 +1203,7 @@ impl PullRequestTone {
         match self {
             // Merged is GitHub's purple, which no COSMIC role names.
             Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
+            Self::Review => design::accent_color(theme),
             Self::Danger => cosmic.destructive.base.into(),
             Self::Pending => cosmic.warning.base.into(),
             Self::Draft => theme.current_container().component.on_disabled.into(),
@@ -5278,6 +5316,22 @@ fn worktree_view<'a>(
                 BadgeTone::Warning,
             ));
         }
+        content = content.push(slot(indicators.pull_request.and_then(|pr| {
+            pr.needs_review.then(|| {
+                crate::interaction::tooltip(
+                    design::caption(if pr.review_requested_again {
+                        "Review again"
+                    } else {
+                        "Review"
+                    }),
+                    if pr.review_requested_again {
+                        "Your review was requested again"
+                    } else {
+                        "Your review is requested"
+                    },
+                )
+            })
+        })));
         if indicators.pending_checks && activity != Some(crate::agent::ActivityState::Working) {
             content = content.push(check_indicator(CheckStatus::Pending));
         }
@@ -9540,6 +9594,21 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn required_review_policy_does_not_claim_the_viewer_was_requested() {
+        let mut pull_request = crate::pull_request_review::tests::pull_request(51);
+        for decision in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"] {
+            pull_request.review_decision = Some(crate::github::RemoteValue(decision.into()));
+            let row = super::SidebarPullRequest::from_github(
+                crate::model::ProjectId::new(),
+                &pull_request,
+                &[],
+            );
+            assert!(!row.needs_review);
+            assert!(!row.review_requested_again);
+        }
+    }
+
     use super::*;
     use crate::{
         github::RemoteValue,

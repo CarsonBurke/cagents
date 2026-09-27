@@ -20,6 +20,7 @@ const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
 pub(super) struct State {
     pub(super) git: git_ui::State,
+    pub(super) review_requests: review_request_ui::State,
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
@@ -32,6 +33,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             git: git_ui::State::default(),
+            review_requests: review_request_ui::State::default(),
             focused: false,
             source_generation: 0,
             source_cancel: None,
