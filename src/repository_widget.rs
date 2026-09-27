@@ -500,6 +500,7 @@ pub enum RepositoryAction {
         offset: f32,
         height: f32,
         horizontal: f32,
+        user_initiated: bool,
     },
     PreviewViewport {
         card: CardId,
@@ -1577,6 +1578,9 @@ pub struct RepositoryRuntime {
     diff_change: usize,
     diff_scroll_id: widget::Id,
     diff_viewport: ListViewport,
+    /// Retained logical position while a reopened comparison has no geometry.
+    /// Kept through the first uniform layout until measurement or user scroll.
+    pending_diff_anchor: Option<DiffViewportAnchor>,
     diff_horizontal: f32,
     preview_scroll_id: widget::Id,
     viewports: FileViewportAnchors,
@@ -1714,6 +1718,7 @@ impl RepositoryRuntime {
             diff_change: 0,
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
             diff_viewport: ListViewport::default(),
+            pending_diff_anchor: None,
             diff_horizontal: 0.0,
             preview_scroll_id: widget::Id::new(format!("repository.preview.{identity}")),
             viewports: FileViewportAnchors::default(),
@@ -4588,8 +4593,12 @@ impl RepositoryRuntime {
                 offset,
                 height,
                 horizontal,
+                user_initiated,
                 ..
             } => {
+                if user_initiated {
+                    self.pending_diff_anchor = None;
+                }
                 self.diff_viewport = ListViewport { offset, height };
                 self.diff_horizontal = horizontal;
                 Task::none()
@@ -4659,6 +4668,7 @@ impl RepositoryRuntime {
     }
 
     fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+        let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
         match self
             .diffs
             .iter_mut()
@@ -4669,6 +4679,13 @@ impl RepositoryRuntime {
                 self.diffs.push((basis, state));
                 self.prune_committed_diffs();
             }
+        }
+        if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
+            anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
+            self.apply_diff_viewport(anchor);
+            // Leading threads may not be measured yet; retain their logical
+            // anchor until the first annotation projection or actual scroll.
+            self.pending_diff_anchor = Some(anchor);
         }
     }
 
@@ -4879,6 +4896,9 @@ impl RepositoryRuntime {
     }
 
     fn current_diff_viewport(&self) -> DiffViewportAnchor {
+        if let Some(anchor) = self.pending_diff_anchor {
+            return anchor;
+        }
         DiffViewportAnchor {
             offset: self.diff_viewport.offset,
             row: self
@@ -4895,6 +4915,12 @@ impl RepositoryRuntime {
     }
 
     fn apply_diff_viewport(&mut self, anchor: DiffViewportAnchor) {
+        let awaiting_geometry = anchor.row.is_some()
+            && self.diff_rows().is_none_or(|rows| {
+                matches!(anchor.row, Some(diff_layout::Anchor::Leading(_)))
+                    && rows.leading_height() == 0.0
+            });
+        self.pending_diff_anchor = awaiting_geometry.then_some(anchor);
         self.diff_viewport.offset = anchor
             .row
             .zip(self.diff_rows())
@@ -5051,10 +5077,12 @@ impl RepositoryRuntime {
         else {
             return Task::none();
         };
-        if !rows[index].annotate(leading, measurements) || mode != self.diff_mode {
+        let changed = rows[index].annotate(leading, measurements);
+        if mode != self.diff_mode || (!changed && self.pending_diff_anchor.is_none()) {
             return Task::none();
         }
         self.apply_diff_viewport(anchor);
+        self.pending_diff_anchor = None;
         self.capture_diff_viewport();
         self.restore_visible_scroll()
     }
@@ -7170,7 +7198,7 @@ fn diff_model_view<'a>(
                 accessible_text: None,
                 viewport: Some(iced::Size::new(viewport_width, size.height)),
             });
-            widget::scrollable(canvas)
+            let scrollable = widget::scrollable(canvas)
                 .direction(iced::widget::scrollable::Direction::Both {
                     vertical: crate::design::scrollbar(),
                     horizontal: crate::design::scrollbar(),
@@ -7181,10 +7209,14 @@ fn diff_model_view<'a>(
                     offset: viewport.absolute_offset().y,
                     height: viewport.bounds().height,
                     horizontal: viewport.absolute_offset().x,
+                    user_initiated: false,
                 })
                 .height(Length::Fill)
                 .width(Length::Fill)
-                .into()
+                .into();
+            Element::new(DiffScrollObserver {
+                content: scrollable,
+            })
         })
         .into()
     };
@@ -7554,6 +7586,150 @@ struct DiffAccessibleText<'a> {
     text: &'a str,
     lines: (Option<u32>, Option<u32>),
     id: iced::advanced::widget::Id,
+}
+
+/// The scrollable reports layout clamps as well as input. Tag its viewport
+/// messages at the event boundary without capturing or dispatching extra input.
+struct DiffScrollObserver<'a> {
+    content: Element<'a, RepositoryAction>,
+}
+
+impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffScrollObserver<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> iced::Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &cosmic::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, RepositoryAction>,
+        viewport: &iced::Rectangle,
+    ) {
+        let user_initiated = matches!(
+            event,
+            iced::Event::Mouse(_) | iced::Event::Touch(_) | iced::Event::Keyboard(_)
+        );
+        let mut messages = Vec::new();
+        let mut local = Shell::new(&mut messages);
+        if shell.is_event_captured() {
+            local.capture_event();
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            &mut local,
+            viewport,
+        );
+        shell.merge(local, |mut message| {
+            if let RepositoryAction::DiffViewport {
+                user_initiated: tagged,
+                ..
+            } = &mut message
+            {
+                *tagged = user_initiated;
+            }
+            message
+        });
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &cosmic::Renderer,
+    ) -> iced::mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<
+        iced::advanced::overlay::Element<'b, RepositoryAction, cosmic::Theme, cosmic::Renderer>,
+    > {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: iced::mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &tree.children[0], cursor)
+    }
 }
 
 /// A clipped native-text viewport, also used in reverse to keep the split
@@ -8362,6 +8538,7 @@ mod tests {
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 900.0,
             height: 300.0,
@@ -8370,6 +8547,7 @@ mod tests {
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
         assert_eq!(runtime.diff_viewport.offset, 900.0);
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 1500.0,
             height: 300.0,
@@ -8450,6 +8628,7 @@ mod tests {
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 1200.0,
             height: 300.0,
@@ -8549,6 +8728,7 @@ mod tests {
         let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "old.txt");
         runtime.set_standalone(true);
         drop(runtime.update(RepositoryAction::DiffViewport {
+            user_initiated: true,
             card,
             offset: 600.0,
             height: 300.0,
@@ -10566,6 +10746,120 @@ mod tests {
         assert_eq!(runtime.diff_viewport.offset, 210.0);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
         assert_eq!(runtime.diff_viewport.offset, 60.0);
+    }
+
+    #[test]
+    fn annotated_file_reopen_restores_logical_anchor_after_async_load() {
+        for (saved, scrolled, expected) in [
+            (350.0, None, 350.0),
+            (350.0, Some(60.0), 260.0),
+            (100.0, None, 100.0),
+        ] {
+            let card = CardId::new();
+            let (mut runtime, _) = diff_runtime(card);
+            let content =
+                || staged_text_diff(crate::diff_view::build_diff("", &"line\n".repeat(20)));
+            runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(content()));
+            drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
+            runtime.diff_viewport.offset = saved;
+            let file = runtime.selected.clone().unwrap();
+            drop(runtime.open_file_entry(card, file.clone()));
+            assert!(runtime.pending_diff_anchor.is_some());
+            runtime.source_surface = SourceSurface::Diff;
+            drop(runtime.ensure_current_diff(card));
+            let Some(DiffState::Loading { request, .. }) =
+                runtime.diff_state(&DiffBasis::IndexToWorktree)
+            else {
+                panic!("reopened comparison must load afresh");
+            };
+            let request = *request;
+            drop(runtime.update(RepositoryAction::DiffLoaded {
+                identity: runtime.current_identity(card, file.path),
+                basis: DiffBasis::IndexToWorktree,
+                request,
+                content: content(),
+            }));
+            assert_eq!(
+                runtime.diff_viewport.offset,
+                if saved >= 200.0 { saved - 200.0 } else { 0.0 }
+            );
+            // A redraw clamps the temporary uniform document into a taller
+            // viewport. This is not the reader choosing a different line.
+            drop(runtime.update(RepositoryAction::DiffViewport {
+                user_initiated: false,
+                card,
+                offset: 0.0,
+                height: 900.0,
+                horizontal: 0.0,
+            }));
+            assert!(runtime.pending_diff_anchor.is_some());
+            if let Some(offset) = scrolled {
+                drop(runtime.update(RepositoryAction::DiffViewport {
+                    user_initiated: true,
+                    card,
+                    offset,
+                    height: 120.0,
+                    horizontal: 0.0,
+                }));
+            }
+            drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
+            assert_eq!(runtime.diff_viewport.offset, expected);
+            assert!(runtime.pending_diff_anchor.is_none());
+        }
+    }
+
+    #[test]
+    fn diff_scroll_observer_distinguishes_redraw_from_wheel_without_duplicate_events() {
+        let renderer = headless_renderer();
+        let card = CardId::new();
+        let content = widget::scrollable(iced::widget::Space::new().height(2000.0))
+            .height(200.0)
+            .width(300.0)
+            .on_scroll(move |viewport| RepositoryAction::DiffViewport {
+                card,
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+                horizontal: viewport.absolute_offset().x,
+                user_initiated: false,
+            });
+        let mut element = Element::new(DiffScrollObserver {
+            content: content.into(),
+        });
+        let mut tree = Tree::new(element.as_widget());
+        let bounds = iced::Rectangle::with_size(iced::Size::new(300.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        for (event, expected_input) in [
+            (
+                iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+                false,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -3.0 },
+                }),
+                true,
+            ),
+        ] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Available(iced::Point::new(20.0, 20.0)),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
+            assert_eq!(messages.len(), 1);
+            assert!(
+                matches!(messages[0], RepositoryAction::DiffViewport { user_initiated, .. } if user_initiated == expected_input)
+            );
+        }
     }
 
     #[test]
