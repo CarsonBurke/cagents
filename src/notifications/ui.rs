@@ -164,8 +164,9 @@ impl Observer {
                 let mut reported = None;
                 while !sender.is_closed() {
                     let result = (|| -> Result<(), String> {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
+                        let socket =
+                            crate::terminal::ensure_daemon_ready_for(super::Application::Ceditor)
+                                .map_err(|error| error.to_string())?;
                         let mut client =
                             ControlClient::connect(&socket).map_err(|error| error.to_string())?;
                         let snapshot = client

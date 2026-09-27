@@ -1022,12 +1022,21 @@ enum PendingRequest {
 /// bounded per-session allowance. The daemon gets its own process group so closing
 /// the launching CLI, GUI, or terminal does not terminate it.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
+    ensure_daemon_ready_for(crate::notifications::Application::Cagents)
+}
+
+pub fn ensure_daemon_ready_for(
+    application: crate::notifications::Application,
+) -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
-    ensure_daemon_ready_at(&socket)?;
+    ensure_daemon_ready_at(&socket, application)?;
     Ok(socket)
 }
 
-fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError> {
+fn ensure_daemon_ready_at(
+    socket: &Path,
+    application: crate::notifications::Application,
+) -> Result<(), HostedTerminalStartError> {
     match UnixStream::connect(socket) {
         Ok(stream) => {
             drop(stream);
@@ -1060,6 +1069,9 @@ fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError>
     }
 
     let mut command = Command::new(&daemon_binary);
+    if application == crate::notifications::Application::Ceditor {
+        command.arg(crate::instance::CEDITOR_NOTIFICATION_ARGUMENT);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

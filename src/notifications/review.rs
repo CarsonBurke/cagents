@@ -157,7 +157,8 @@ impl ReviewRequest {
 pub async fn report(observed: ObservedRequests) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         observed.validate()?;
-        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let socket = crate::terminal::ensure_daemon_ready_for(observed.destination.application)
+            .map_err(|error| error.to_string())?;
         crate::control::ControlClient::connect(&socket)
             .map_err(|error| error.to_string())?
             .observe_review_requests(observed)
