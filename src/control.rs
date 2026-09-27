@@ -2533,13 +2533,8 @@ fn resolve_project_location(
     model: Option<&WorkspaceModel>,
 ) -> Result<crate::project_location::ProjectLocation, AppError> {
     let from = project_directory(repository)?;
-    if let Some(project) = model.and_then(|model| model.project(&from)) {
-        return Ok(crate::project_location::ProjectLocation {
-            key: from,
-            kind: project.kind,
-        });
-    }
-    crate::project_location::discover(&from).map_err(|error| AppError::new("repository", error))
+    crate::project_location::resolve(&from, model)
+        .map_err(|error| AppError::new("repository", error))
 }
 
 /// The shared project key for the repository containing `directory`, asked of
