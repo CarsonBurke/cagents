@@ -124,7 +124,18 @@ impl Recovery {
 
     fn remember_source(&mut self) -> Result<(), String> {
         if !self.previous_sources.contains(&self.source) {
-            if self.previous_sources.len() >= 1024 {
+            // Bound retained recipes by bytes as well as count. A large launch
+            // environment must not multiply into gigabytes over proof rotations.
+            const MAX_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
+            let retained = serde_json::to_vec(self)
+                .map_err(|error| error.to_string())?
+                .len();
+            let additional = serde_json::to_vec(&self.source)
+                .map_err(|error| error.to_string())?
+                .len();
+            if self.previous_sources.len() >= 1024
+                || retained.saturating_add(additional) > MAX_RECOVERY_BYTES
+            {
                 return Err("Native holder ownership lineage is full".into());
             }
             self.previous_sources.push(self.source.clone());
@@ -357,5 +368,29 @@ mod tests {
         forged.terminal.as_mut().unwrap().id = crate::model::TerminalId::new();
         assert!(recovery.update_source(forged).is_err());
         assert_eq!(recovery.source, successor);
+    }
+
+    #[test]
+    fn large_recipe_cannot_multiply_unbounded_retained_lineage() {
+        let mut recovery = recovery();
+        recovery
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("FIXTURE_LARGE".into(), "x".repeat(2 * 1024 * 1024));
+        let original = recovery.source.clone();
+        assert!(
+            recovery
+                .confirm(
+                    "exact-thread".into(),
+                    server_identity(),
+                    crate::daemon::holder_registry::Process { pid: 42, start: 1 },
+                )
+                .is_err()
+        );
+        assert_eq!(recovery.source, original);
+        assert!(recovery.previous_sources.is_empty());
+        assert!(!recovery.is_durable());
     }
 }

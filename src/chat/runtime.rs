@@ -401,8 +401,17 @@ impl Handle {
                 // exited instead of waiting out an acknowledgement nobody will send.
                 draining.store(true, Ordering::Release);
                 let unexpected_loss = result.is_err() && !actor.stop.load(Ordering::Acquire);
+                let preserve_holder = actor
+                    .native_holder
+                    .as_ref()
+                    .is_some_and(|holder| holder.is_durable())
+                    && (preserve_native.load(Ordering::Acquire)
+                        || unexpected_loss
+                        || !native_installed.load(Ordering::Acquire));
                 if let Err(error) = result {
-                    if !actor.attention.settled {
+                    // A lost local actor does not prove that the retained
+                    // provider turn failed. Recovery must obtain its outcome.
+                    if !actor.attention.settled && !preserve_holder {
                         (actor.notify)(Update::Attention(crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
                             kind: crate::notifications::Kind::Failed,
@@ -427,11 +436,7 @@ impl Handle {
                     code
                 });
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
-                    if holder.is_durable()
-                        && (preserve_native.load(Ordering::Acquire)
-                            || unexpected_loss
-                            || !native_installed.load(Ordering::Acquire))
-                    {
+                    if preserve_holder {
                         holder.preserve();
                         true
                     } else if let Err(error) = holder.close() {

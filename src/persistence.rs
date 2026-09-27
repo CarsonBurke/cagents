@@ -5078,6 +5078,7 @@ mod tests {
         let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Codex);
         let mut terminal = chat.terminal.take().unwrap();
         let proof = terminal.continuity.live_proof().unwrap();
+        chat.proof = Some(proof.clone());
         let conversation = chat.launch.session_id.take();
         chat.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
         assert!(chat.claim_owned_codex_listener(&directory.path().join("daemon-tmp"), &proof));

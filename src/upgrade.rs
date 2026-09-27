@@ -399,7 +399,7 @@ pub(crate) mod handoff {
 
     /// Checkpoints that carry terminals are version 2; any other is still
     /// written as version 1, which a daemon from before carrying can replay.
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_TERMINALS: usize = 1024;
@@ -500,7 +500,20 @@ pub(crate) mod handoff {
 
         /// The oldest version that can hold this checkpoint.
         fn format(&self) -> u16 {
-            if self.carried.is_empty() { 1 } else { 2 }
+            if self.chats.iter().any(|chat| {
+                matches!(
+                    chat.source.native_continuity,
+                    chat::NativeContinuity::Durable { .. }
+                )
+            }) {
+                // Older readers would ignore this metadata and relaunch a
+                // recipe while its native holder still owns the server.
+                3
+            } else if self.carried.is_empty() {
+                1
+            } else {
+                2
+            }
         }
 
         pub fn validate(&self) -> Result<(), String> {
@@ -680,6 +693,9 @@ pub(crate) mod handoff {
 
     #[cfg(any(feature = "host", test))]
     fn validate_chat_source(source: &chat::Session, launch: &chat::Launch) -> Result<(), String> {
+        if !source.has_valid_native_continuity() {
+            return Err("Upgrade native continuity evidence is inconsistent".into());
+        }
         let mut confirmed = source.launch.clone();
         confirmed.session_id = launch.session_id.clone();
         let recipe = confirmed
@@ -929,6 +945,8 @@ pub(crate) mod handoff {
                 std::time::Duration::from_secs(45)
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
+            assert!(store.startup_timeout().is_ok());
+            save(br#"{"version":4,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());
@@ -1258,6 +1276,53 @@ mod tests {
         )
         .unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+    }
+
+    #[test]
+    fn retained_native_checkpoint_requires_a_holder_aware_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        checkpoint.terminals.clear();
+        let mut source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), "unix://".into()],
+                    working_directory: directory.path().into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: Some(checkpoint.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        assert!(source.claim_owned_codex_listener(directory.path(), &checkpoint.proof));
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        source.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        checkpoint.chats.push(handoff::Chat {
+            launch: source.launch.clone(),
+            source,
+            previous_sources: Vec::new(),
+        });
+        store.save(&checkpoint).unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 3);
+        store.load().unwrap().unwrap().validate().unwrap();
+        saved["version"] = serde_json::json!(2);
+        fs::write(&store.path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(
+            store.load().is_err(),
+            "durable ownership cannot masquerade as recipe-only recovery"
+        );
     }
 
     #[test]
