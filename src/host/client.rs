@@ -449,8 +449,11 @@ pub(super) fn process_request(
                     false,
                 ));
             }
-            let (terminals, chats) =
-                super::state::prepare_upgrade(host, current.capability, relaunch_agents)?;
+            let (terminals, chats) = super::state::prepare_preserving_upgrade(
+                host,
+                current.capability,
+                relaunch_agents,
+            )?;
             Ok((
                 ServerResponse::UpgradePrepared { terminals, chats },
                 Vec::new(),
