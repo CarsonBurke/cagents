@@ -461,7 +461,8 @@ pub(crate) mod handoff {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct ChatSource {
         pub source: chat::Session,
-        /// Provider-confirmed launch issued by the next daemon.
+        /// Provider-confirmed continuation. Durable native aliases all retain
+        /// the same live thread; ordinary restarts use the next daemon's launch.
         pub launch: chat::Launch,
     }
 
