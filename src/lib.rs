@@ -54,6 +54,8 @@ pub mod lsp;
 pub mod model;
 pub mod notifications;
 pub mod performance;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod process;
 #[cfg(feature = "ui")]
 pub mod persistence;
 pub mod project_location;
