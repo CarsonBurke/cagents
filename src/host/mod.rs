@@ -176,6 +176,9 @@ pub fn run() -> Result<(), HostError> {
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
     let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .enable_holder_recovery();
     // A daemon that cannot open the shared-model store still hosts terminals.
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
@@ -201,6 +204,7 @@ pub fn run() -> Result<(), HostError> {
         host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
     }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
+    state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
     let _agent_activity = activity::Monitor::start(&host)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;

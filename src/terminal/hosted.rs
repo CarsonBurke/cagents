@@ -2669,6 +2669,7 @@ mod tests {
             assert_eq!(handle.proof(), None);
             assert!(handle.wait_until_attached(Duration::ZERO).is_err());
             let terminal = TerminalDescriptor {
+                screen_lost_after_crash: false,
                 session,
                 generation: 0,
                 event_sequence: 0,
@@ -2910,6 +2911,7 @@ mod tests {
                     ServerMessage::Response {
                         response: ServerResponse::Attached {
                             terminal: TerminalDescriptor {
+                                screen_lost_after_crash: false,
                                 session,
                                 generation: 0,
                                 event_sequence: 0,
@@ -3391,6 +3393,7 @@ mod tests {
                 response: ServerResponse::Connected {
                     proof: pinned.clone(),
                     resumed: vec![TerminalDescriptor {
+                        screen_lost_after_crash: false,
                         session,
                         generation: 0,
                         event_sequence: 0,

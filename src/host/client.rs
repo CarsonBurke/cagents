@@ -756,6 +756,83 @@ fn process_request(
                 .close_terminal_attention(terminal_id, Some(&handle));
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::ReleaseCompletedTerminal {
+            session,
+            allow_active,
+        } => {
+            if !matches!(
+                session.continuity,
+                crate::model::TerminalContinuity::Exited { .. }
+                    | crate::model::TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            ) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Only an ended terminal result may be retired",
+                    false,
+                ));
+            }
+            let (handle, paired) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let handle = match state.terminals.get(&session.id) {
+                    None => None,
+                    Some(record)
+                        if record.session.launch == session.launch
+                            && record.handle.is_completed() =>
+                    {
+                        Some(record.handle.clone())
+                    }
+                    Some(_) => {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The terminal changed or still owns work; nothing was closed",
+                            false,
+                        ));
+                    }
+                };
+                let paired = state.chats.get(&session.id).map(|record| {
+                    if record.session.launch.provider != crate::agent::Provider::Codex
+                        || !record.session.terminal.as_ref().is_some_and(|terminal| {
+                            terminal.id == session.id && terminal.launch == session.launch
+                        })
+                    {
+                        return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                            "The completed terminal no longer identifies its native conversation", false));
+                    }
+                    Ok(record.handle.clone())
+                }).transpose()?;
+                (handle, paired)
+            };
+            if paired.as_ref().is_some_and(|handle| handle.owns_work()) && !allow_active {
+                return Ok((
+                    ServerResponse::TerminalCloseChecked {
+                        terminal_id: session.id,
+                        outcome: crate::terminal_ipc::TerminalCloseResult::Active,
+                    },
+                    Vec::new(),
+                    false,
+                ));
+            }
+            if let Some(paired) = paired {
+                super::chat::close_terminal_actor(host, session.id, &paired)?;
+            }
+            if let Some(handle) = &handle {
+                handle.shutdown().map_err(send_error)?;
+            }
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .close_terminal_attention(session.id, handle.as_ref());
+            Ok((
+                ServerResponse::TerminalCloseChecked {
+                    terminal_id: session.id,
+                    outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::CloseTerminalChecked {
             terminal_id,
             allow_active,
@@ -984,6 +1061,256 @@ mod tests {
     use super::*;
     use crate::model::TerminalId;
     use std::sync::Mutex;
+
+    #[test]
+    fn completed_release_refuses_live_or_changed_sessions() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalExit, TerminalSession,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("completed-release"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(proof)));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        let mut session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = crate::terminal::TerminalHandle::spawn(
+            session.clone(),
+            crate::terminal::TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), handle.clone(), true)
+                .unwrap();
+        }
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 0,
+            },
+        };
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: session.clone(),
+                    allow_active: false,
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            !handle.is_completed(),
+            "a forged completed receipt cannot stop a running process"
+        );
+        handle.shutdown().unwrap();
+        let mut changed = session.clone();
+        changed.launch.arguments.push("different".into());
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: changed,
+                    allow_active: false
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session,
+                    allow_active: false
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn completed_terminal_requires_confirmation_for_its_exact_native_actor() {
+        use crate::{
+            chat::{
+                self,
+                protocol::{Adapter, ProcessSpec, Step},
+            },
+            model::{
+                BootId, HostIncarnation, HostSessionId, TerminalContinuity, TerminalExit,
+                TerminalSession,
+            },
+        };
+        struct Quiet;
+        impl Adapter for Quiet {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: chat::Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("paired-completion"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
+            proof.clone(),
+        )));
+        let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/true".into();
+        recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Exited {
+                last_exit: TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            },
+        };
+        let terminal =
+            crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {})
+                .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        recipe.program = "/bin/cat".into();
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let actor = chat::runtime::Handle::start(
+            spec,
+            Box::new(Quiet),
+            initial,
+            store,
+            Some("exact-thread".into()),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), terminal, false)
+                .unwrap();
+            state.chats.insert(
+                session.id,
+                super::super::chat::Record {
+                    session: chat::Session {
+                        id: session.id,
+                        owned_codex_listener: None,
+                        proof: Some(proof),
+                        terminal: Some(session.clone()),
+                        launch: chat::Launch {
+                            provider: crate::agent::Provider::Codex,
+                            recipe,
+                            session_id: Some("exact-thread".into()),
+                        },
+                    },
+                    handle: actor.clone(),
+                    source_process: None,
+                    subscribers: Default::default(),
+                    observations: Default::default(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let request = |allow_active| ClientRequest::ReleaseCompletedTerminal {
+            session: session.clone(),
+            allow_active,
+        };
+        assert!(matches!(
+            process_request(&host, 1, request(false)).unwrap().0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Active,
+                ..
+            }
+        ));
+        assert!(
+            !actor.is_completed(),
+            "a completed PTY does not authorize stopping its native actor"
+        );
+        assert!(
+            !host
+                .lock()
+                .unwrap()
+                .notification_closed
+                .contains(&session.id)
+        );
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&session.id)
+            .unwrap()
+            .session
+            .terminal
+            .as_mut()
+            .unwrap()
+            .launch
+            .arguments
+            .push("changed".into());
+        assert!(process_request(&host, 1, request(true)).is_err());
+        assert!(!actor.is_completed());
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&session.id)
+            .unwrap()
+            .session
+            .terminal = Some(session.clone());
+        assert!(matches!(
+            process_request(&host, 1, request(true)).unwrap().0,
+            ServerResponse::TerminalCloseChecked {
+                outcome: crate::terminal_ipc::TerminalCloseResult::Closed,
+                ..
+            }
+        ));
+        assert!(actor.is_completed());
+        assert!(!host.lock().unwrap().chats.contains_key(&session.id));
+        assert!(
+            host.lock()
+                .unwrap()
+                .notification_closed
+                .contains(&session.id)
+        );
+    }
 
     #[test]
     fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {

@@ -100,19 +100,111 @@ impl Cagents {
         &mut self,
         terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
     ) -> Task<Message> {
+        let mut reconnect = Vec::new();
         for terminal in &terminals {
+            // Existing handles intentionally refuse proof changes. Replace one
+            // only after a fresh inventory proves its complete issued lineage;
+            // the start path checks the replacement daemon's lease again.
+            for card in &self.durable.cards {
+                if !card.existence.is_open() || self.terminal_start_in_flight(card.id) {
+                    continue;
+                }
+                let CardKind::Terminal(saved) = &card.kind else {
+                    continue;
+                };
+                let Some(proof) = saved.continuity.live_proof() else {
+                    continue;
+                };
+                if terminal.session.id == saved.id
+                    && terminal.session.continuity.live_proof().as_ref() != Some(&proof)
+                    && terminal.upgrade_sources.iter().any(|source| {
+                        source.id == saved.id
+                            && source.launch == saved.launch
+                            && source.continuity.live_proof().as_ref() == Some(&proof)
+                    })
+                {
+                    reconnect.push((card.id, saved.clone(), card.exposure == Exposure::Visible));
+                }
+            }
             if !terminal.upgrade_relaunches.is_empty() {
                 self.relaunched_terminals.insert(terminal.session.id);
             } else {
                 self.relaunched_terminals.remove(&terminal.session.id);
             }
         }
-        self.observe_hosted_terminals(
-            terminals
-                .into_iter()
-                .map(|terminal| terminal.session)
-                .collect(),
-        )
+        let mut tasks = Vec::new();
+        for (card, session, visible) in reconnect {
+            let visible = visible && self.workspace_surfaces_visible();
+            self.terminal_recovery_attempts.remove(&session.id);
+            let residency = Residency::Hydrating {
+                epoch: unix_millis().max(1) as u64,
+            };
+            if let Some(state) = self.card_state_mut(card) {
+                state.residency = residency.clone();
+            }
+            self.lifecycle.register(
+                card,
+                if visible {
+                    Exposure::Visible
+                } else {
+                    Exposure::Offscreen
+                },
+                residency,
+                Instant::now(),
+            );
+            // Dropping the former handle also drops its queued input. No input
+            // addressed to an old proof is replayed into the replacement.
+            self.cards.insert(card, CardRuntime::Loading);
+            tasks.push(self.start_terminal(card, session, visible, false));
+        }
+        tasks.push(
+            self.observe_hosted_terminals(
+                terminals
+                    .iter()
+                    .map(|terminal| terminal.session.clone())
+                    .collect(),
+            ),
+        );
+        self.terminal_crash_notices.retain(|card, _| {
+            self.durable
+                .cards
+                .iter()
+                .any(|state| state.id == *card && state.existence.is_open())
+        });
+        for terminal in terminals
+            .iter()
+            .filter(|terminal| terminal.screen_lost_after_crash)
+        {
+            let Some(proof) = terminal.session.continuity.live_proof() else {
+                continue;
+            };
+            for card in &self.durable.cards {
+                let CardKind::Terminal(saved) = &card.kind else {
+                    continue;
+                };
+                if !card.existence.is_open()
+                    || saved.id != terminal.session.id
+                    || !matches!(
+                        self.cards.get(&card.id),
+                        Some(CardRuntime::Terminal(_) | CardRuntime::Loading)
+                    )
+                    || !(saved.continuity.live_proof() == Some(proof.clone())
+                        || terminal.upgrade_sources.iter().any(|source| {
+                            source.id == saved.id
+                                && source.launch == saved.launch
+                                && source.continuity.live_proof() == saved.continuity.live_proof()
+                        }))
+                    || self.terminal_crash_notices.get(&card.id) == Some(&proof)
+                {
+                    continue;
+                }
+                self.terminal_crash_notices.insert(card.id, proof.clone());
+                self.status = Some(TransientNotice::warning(
+                    "A terminal survived the service restart. Output from before the restart was not recovered; running programs continue.",
+                ));
+            }
+        }
+        Task::batch(tasks)
     }
     /// Adopts every observed hosted terminal this window has no card for.
     ///
@@ -456,11 +548,80 @@ mod tests {
             state.existence = closed.clone();
         }
 
-        let _ = app.observe_hosted_terminals(vec![session]);
+        let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            session.id,
+            session.launch.clone(),
+            None,
+        );
+        descriptor.session = session;
+        descriptor.screen_lost_after_crash = true;
+        app.status = None;
+        let _ = app.observe_hosted_descriptors(vec![descriptor]);
+        assert!(
+            app.status.is_none(),
+            "closed cards cannot emit recovery notices"
+        );
 
         let remaining = cards_for(&app, card_terminal(&app, card));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].existence, closed);
+    }
+
+    #[test]
+    fn replacement_inventory_rebinds_only_open_cards_with_exact_issued_lineage() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        let saved = hosted("/repo");
+        drop(app.observe_hosted_terminals(vec![saved.clone()]));
+        let card = cards_for(&app, saved.id)[0].id;
+        app.cards
+            .insert(card, CardRuntime::Failed("connection lost".into()));
+        let mut replacement = saved.clone();
+        replacement.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: HostSessionId::new("replacement"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("replacement"),
+        };
+        let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+            saved.id,
+            saved.launch.clone(),
+            None,
+        );
+        descriptor.session = replacement;
+        drop(app.observe_hosted_descriptors(vec![descriptor.clone()]));
+        assert!(matches!(app.cards[&card], CardRuntime::Failed(_)));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        let mut unrelated = saved.clone();
+        unrelated.launch.arguments.push("other".into());
+        descriptor.upgrade_sources = vec![unrelated];
+        drop(app.observe_hosted_descriptors(vec![descriptor.clone()]));
+        assert_eq!(app.terminal_starts_in_flight(), 0);
+        descriptor.upgrade_sources = vec![saved.clone()];
+        descriptor.screen_lost_after_crash = true;
+        drop(app.observe_hosted_descriptors(vec![descriptor.clone()]));
+        assert!(matches!(app.cards[&card], CardRuntime::Loading));
+        assert_eq!(app.terminal_starts_in_flight(), 1);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("Output from before"))
+        );
+        assert_eq!(cards_for(&app, saved.id).len(), 1);
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind, CardKind::Terminal(session) if session == &saved),
+            "the old receipt remains until successful attachment is persisted"
+        );
+        app.status = Some(TransientNotice::success("Keep this newer notice"));
+        drop(app.observe_hosted_descriptors(vec![descriptor]));
+        assert_eq!(
+            app.status.as_ref().unwrap().message,
+            "Keep this newer notice"
+        );
+        assert_eq!(
+            app.terminal_starts_in_flight(),
+            1,
+            "inventory replay cannot start another attachment"
+        );
     }
 
     #[test]

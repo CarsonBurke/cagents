@@ -686,6 +686,29 @@ impl ControlClient {
         self.finish_attachment(terminal_id, action)
     }
 
+    pub fn release_completed_terminal(
+        &mut self,
+        session: crate::model::TerminalSession,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let id = session.id;
+        // A completed PTY can still own a native provider actor. Its explicit
+        // close must allow the same bounded teardown as closing the chat.
+        match self.request_with_deadline(
+            ClientRequest::ReleaseCompletedTerminal {
+                session,
+                allow_active,
+            },
+            Instant::now() + CHAT_CLOSE_TIMEOUT,
+        )? {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id,
+                outcome,
+            } if terminal_id == id => Ok(outcome),
+            response => Err(unexpected_response("completed terminal release", &response)),
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,
@@ -3948,6 +3971,71 @@ mod tests {
                 ..
             })
         ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn completed_terminal_release_allows_paired_actor_teardown() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: LaunchRecipe::shell("/".into()).unwrap(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            },
+        };
+        let expected = session.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                close.request,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: expected.clone(),
+                    allow_active: true,
+                }
+            );
+            thread::sleep(Duration::from_millis(50));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(close.request_id),
+                    proof: pinned,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::TerminalCloseChecked {
+                            terminal_id: expected.id,
+                            outcome: terminal::ipc::TerminalCloseResult::Closed,
+                        },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert_eq!(
+            client.release_completed_terminal(session, true).unwrap(),
+            terminal::ipc::TerminalCloseResult::Closed,
+        );
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         server.join().unwrap();
     }
 

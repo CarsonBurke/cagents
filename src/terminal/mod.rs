@@ -1,3 +1,5 @@
+#[cfg(feature = "host")]
+pub(crate) mod holder;
 mod hosted;
 pub mod ipc;
 mod snapshot;
@@ -30,3 +32,5 @@ pub use widget::{CellMetrics, TerminalWidget};
 pub use worker::TerminalHandle;
 #[cfg(feature = "host")]
 pub(crate) use worker::UpgradeSnapshot;
+#[cfg(feature = "host")]
+pub(crate) use worker::holder::inspect as inspect_holder;

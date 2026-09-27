@@ -3239,6 +3239,11 @@ pub enum Message {
         generation: u64,
         outcome: terminal_close::CloseOutcome,
     },
+    CompletedTerminalClosed {
+        card: CardId,
+        session: TerminalSession,
+        result: Result<terminal_close::CompletedCloseOutcome, String>,
+    },
     SaveAndCloseRepository(CardId),
     OverwriteAndCloseRepository(CardId),
     DiscardAndCloseRepository(CardId),
@@ -3827,6 +3832,7 @@ pub struct Cagents {
     /// time after startup so their rows show what the agent is doing.
     restored_agent_attaches: VecDeque<CardId>,
     relaunched_terminals: HashSet<TerminalId>,
+    terminal_crash_notices: HashMap<CardId, crate::model::HostSessionProof>,
     /// The shared sidebar model as this window last saw it.
     workspace_model: crate::workspace_model::WorkspaceModel,
     /// Repositories this window has already been asked to open on the shared
@@ -10020,6 +10026,7 @@ impl Application for Cagents {
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
+            terminal_crash_notices: HashMap::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
@@ -11767,6 +11774,11 @@ impl Application for Cagents {
                 generation,
                 outcome,
             } => self.terminal_close_finished(card, terminal, proof, generation, outcome),
+            Message::CompletedTerminalClosed {
+                card,
+                session,
+                result,
+            } => self.completed_terminal_closed(card, session, result),
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
@@ -13914,7 +13926,16 @@ fn recover_terminal(
     explicit_retry: bool,
 ) -> Result<(daemon_recovery::RecoveredTerminal, TerminalStartMode), String> {
     let recovered = daemon_recovery::reconcile(session, explicit_retry)?;
-    let mode = terminal_start_mode(&recovered.session)?;
+    let mode = if recovered.attach_completed {
+        TerminalStartMode::Attach(
+            recovered
+                .expected_host
+                .clone()
+                .ok_or("completed holder has no owning daemon")?,
+        )
+    } else {
+        terminal_start_mode(&recovered.session)?
+    };
     Ok((recovered, mode))
 }
 
@@ -19210,6 +19231,7 @@ mod tests {
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
+            terminal_crash_notices: HashMap::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,
