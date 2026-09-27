@@ -3313,6 +3313,7 @@ mod tests {
         let executable = directory.path().join("claude");
         symlink("/bin/sleep", &executable).unwrap();
         let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), "read line; exec \"$AGENT\" 10".into()],
             working_directory: directory.path().into(),

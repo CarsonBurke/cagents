@@ -4011,6 +4011,7 @@ for line in sys.stdin:
     fn stable_conversation_title_survives_replay_eviction_without_duplicate_edges() {
         let shared = Arc::new(Mutex::new(test_host()));
         let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
             program: "/bin/cat".into(),
             arguments: Vec::new(),
             working_directory: "/".into(),
