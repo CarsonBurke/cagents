@@ -57,7 +57,8 @@ pub enum Request {
         firing: Uuid,
     },
     History {
-        id: Uuid,
+        /// None includes retained runs from removed definitions.
+        id: Option<Uuid>,
         before: Option<HistoryCursor>,
         limit: usize,
     },
@@ -446,5 +447,6 @@ pub struct HistoryCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub firings: Vec<Firing>,
+    pub names: std::collections::BTreeMap<Uuid, String>,
     pub next: Option<HistoryCursor>,
 }

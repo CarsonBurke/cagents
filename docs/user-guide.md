@@ -229,6 +229,92 @@ widths, inspector, and scroll positions. Terminal and native-chat sessions are
 owned by the daemon, so input and explicit process closure affect every window
 showing that session. Closing a window leaves its processes running.
 
+## Scheduled automations
+
+Open **Automations** from the clock button in the sidebar footer. Choose an open
+project or worktree, provider, account, prompt, model, and permission mode. Pick
+an hourly, daily, weekday, weekly, or five-field cron schedule with an explicit
+IANA timezone. New definitions are paused. **Enable…** and **Run now…** show the
+exact saved launch settings before confirmation; changing those settings or the
+schedule pauses future runs until you confirm again. Renaming preserves the
+existing execution settings.
+
+The daemon runs enabled schedules with every window closed. It must itself be
+running: cagents does not install a system scheduler. On startup it considers
+only the latest missed occurrence within 15 minutes and records older missed
+deadlines as skipped. Nonexistent local times during a clock change are skipped;
+repeated local minutes run once. Each automation has one active run, and an
+overlapping deadline is skipped rather than queued behind it.
+
+An optional shell precheck runs in the chosen directory with a bounded timeout.
+Exit zero permits the prompt; another exit skips it. Cancellation and timeout
+terminate and reap the precheck's descendants before releasing capacity. An
+uncertain result after daemon loss is recorded as interrupted and never resent
+automatically. Precheck supervision uses two short-lived helper processes per
+active precheck, with at most four prechecks at once.
+
+A fresh conversation closes the automation's idle provider after its result is
+durable. **Reuse this automation’s idle agent** keeps its own verified idle conversation for the
+next occurrence. If you take over the conversation, automatic cleanup and reuse
+stop until ownership is resolved. Removing the chosen account or replacing the
+target directory cannot silently redirect a future run to another account or
+directory. Closing a project pauses its schedules.
+
+**All run history** includes runs from removed definitions. It pages through
+their original names, times, outcomes, and bounded results. Opening history does
+not start or attach a provider. **Open agent** explicitly opens a still-live
+session; completed fresh sessions remain readable in history. Completion alerts
+open this exact run history and survive provider cleanup. Removing a definition
+prevents future runs and retains its past runs.
+
+The same operations are available without a window:
+
+```sh
+cagents automation create --definition automation.json
+cagents automation show AUTOMATION_ID
+cagents automation enable AUTOMATION_ID --revision REVISION --confirm
+cagents automation run-now AUTOMATION_ID --execution-revision EXECUTION_REVISION --request-id REQUEST_UUID --confirm
+cagents automation history
+cagents automation history AUTOMATION_ID --limit 50
+cagents automation run FIRING_ID
+```
+
+Read both revisions from `show`. Reuse the same request UUID when retrying a
+manual request whose response was lost; a new UUID means a new run. History
+returns `next` with the paired `--before-ms` and `--before-id` cursor for the next
+page. `--json` returns the same typed results for scripts. A definition file has
+this shape (the repository must already be open):
+
+```json
+{
+  "name": "Daily review",
+  "prompt": "Review the changes and summarize risks.",
+  "agent": {
+    "provider": "Claude",
+    "account": null,
+    "target": {
+      "repository": "/absolute/project",
+      "directory": "/absolute/project",
+      "channel": null
+    },
+    "surface": "Chat",
+    "model": null,
+    "permission_mode": null
+  },
+  "schedule": {
+    "pattern": { "daily": { "hour": 9, "minute": 0 } },
+    "timezone": "America/Vancouver"
+  },
+  "session_mode": "fresh",
+  "precheck": null
+}
+```
+
+An omitted account selection resolves once when the definition is saved and is
+then pinned in the saved definition. Review that account before enabling. Agent
+child capabilities cannot create or modify unattended schedules; use an
+explicit user CLI session for automation management.
+
 ## Settings
 
 Open **Settings** from the gear in the lower-left corner. Valid changes save

@@ -50,6 +50,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
              FOREIGN KEY(automation, revision) REFERENCES automation_revisions(automation, revision)
          ) STRICT;
          CREATE INDEX IF NOT EXISTS automation_history ON automation_firings(automation, created_ms DESC, id DESC);
+         CREATE INDEX IF NOT EXISTS automation_all_history ON automation_firings(created_ms DESC, id DESC);
          CREATE INDEX IF NOT EXISTS automation_active ON automation_firings(state);
          CREATE UNIQUE INDEX IF NOT EXISTS automation_run ON automation_firings(run_id) WHERE run_id IS NOT NULL;
          PRAGMA user_version = 2;
@@ -910,38 +911,47 @@ impl Registry {
 
     pub(crate) fn automation_history(
         &self,
-        id: Uuid,
+        id: Option<Uuid>,
         before: Option<HistoryCursor>,
         limit: usize,
     ) -> Result<HistoryPage, String> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
         let mut query = self
             .db
-            .prepare(
-                "SELECT record FROM automation_firings WHERE automation=?1
-            AND (?2 IS NULL OR created_ms < ?2 OR (created_ms = ?2 AND id < ?3))
-            ORDER BY created_ms DESC,id DESC LIMIT ?4",
-            )
+            .prepare(if id.is_some() {
+                "SELECT f.record,json_extract(r.definition,'$.name') FROM automation_firings f JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision WHERE f.automation=?1
+            AND (?2 IS NULL OR f.created_ms < ?2 OR (f.created_ms = ?2 AND f.id < ?3))
+            ORDER BY f.created_ms DESC,f.id DESC LIMIT ?4"
+            } else {
+                "SELECT f.record,json_extract(r.definition,'$.name') FROM automation_firings f JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision WHERE ?1 IS NULL
+            AND (?2 IS NULL OR f.created_ms < ?2 OR (f.created_ms = ?2 AND f.id < ?3))
+            ORDER BY f.created_ms DESC,f.id DESC LIMIT ?4"
+            })
             .map_err(|error| error.to_string())?;
         let records = query
             .query_map(
                 params![
-                    id.to_string(),
+                    id.map(|id| id.to_string()),
                     before.as_ref().map(|cursor| cursor.created_ms),
                     before.map(|cursor| cursor.id.to_string()),
                     limit + 1
                 ],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let mut firings = records
+        let mut entries = records
             .into_iter()
-            .map(|record| decode::<Firing>(&record))
+            .map(|(record, name)| decode::<Firing>(&record).map(|firing| (firing, name)))
             .collect::<Result<Vec<_>, _>>()?;
-        let more = firings.len() > limit;
-        firings.truncate(limit);
+        let more = entries.len() > limit;
+        entries.truncate(limit);
+        let names = entries
+            .iter()
+            .map(|(firing, name)| (firing.id, name.clone()))
+            .collect();
+        let firings: Vec<_> = entries.into_iter().map(|(firing, _)| firing).collect();
         let next = more
             .then(|| {
                 firings.last().map(|last| HistoryCursor {
@@ -950,7 +960,11 @@ impl Registry {
                 })
             })
             .flatten();
-        Ok(HistoryPage { firings, next })
+        Ok(HistoryPage {
+            firings,
+            names,
+            next,
+        })
     }
 }
 
@@ -1676,12 +1690,75 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             registry
-                .automation_history(automation.id, None, 100)
+                .automation_history(Some(automation.id), None, 100)
                 .unwrap()
                 .firings
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn automation_global_history_pages_removed_definitions_with_immutable_names() {
+        use crate::{
+            automations::{Precheck, SkipReason, Trigger},
+            host::automations::precheck::Outcome,
+        };
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(Precheck {
+            command: "exit 1".into(),
+            timeout_seconds: 1,
+        });
+        let mut expected = std::collections::BTreeMap::new();
+        for index in 0..3 {
+            definition.name = format!("Retained {index}");
+            let automation = registry
+                .create_automation(definition.clone(), 100, test_identity())
+                .unwrap();
+            let claim = registry
+                .claim_automation(
+                    automation.id,
+                    1,
+                    None,
+                    Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap();
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    Outcome::Stopped {
+                        state: FiringState::Skipped,
+                        skip: Some(SkipReason::PrecheckExit),
+                        diagnostic: "not ready".into(),
+                    },
+                    300,
+                )
+                .unwrap();
+            registry.remove_automation(automation.id, 1, 400).unwrap();
+            expected.insert(claim.firing.id, definition.name.clone());
+        }
+        assert!(registry.automations(None, 100).unwrap().is_empty());
+        let mut cursor = None;
+        let mut observed = std::collections::BTreeMap::new();
+        loop {
+            let page = registry.automation_history(None, cursor, 1).unwrap();
+            assert_eq!(page.firings.len(), 1);
+            assert_eq!(page.names.len(), 1);
+            let firing = &page.firings[0];
+            assert!(
+                observed
+                    .insert(firing.id, page.names[&firing.id].clone())
+                    .is_none()
+            );
+            let Some(next) = page.next else { break };
+            cursor = Some(next);
+        }
+        assert_eq!(observed, expected);
     }
 
     #[test]
@@ -2204,7 +2281,7 @@ mod tests {
             .unwrap();
         assert!(claim.accepted.is_some());
         let history = registry
-            .automation_history(automation.id, None, 10)
+            .automation_history(Some(automation.id), None, 10)
             .unwrap();
         assert_eq!(history.firings.len(), 2);
         assert_eq!(history.firings.iter().filter(|firing| firing.skip == Some(crate::automations::SkipReason::MissedDeadline)).count(), 1);

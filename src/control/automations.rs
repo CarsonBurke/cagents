@@ -66,7 +66,8 @@ pub enum AutomationCommand {
         firing: Uuid,
     },
     History {
-        id: Uuid,
+        /// Omit to include all automations, including removed definitions.
+        id: Option<Uuid>,
         #[arg(long, requires = "before_id")]
         before_ms: Option<u64>,
         #[arg(long, requires = "before_ms")]
@@ -351,6 +352,15 @@ mod tests {
 
     #[test]
     fn automation_history_requires_the_complete_stable_cursor() {
+        let (_, all) = request(parse(&["cagents", "automation", "history"]).unwrap()).unwrap();
+        assert!(matches!(
+            all,
+            Request::History {
+                id: None,
+                before: None,
+                ..
+            }
+        ));
         let id = Uuid::new_v4().to_string();
         let entry = Uuid::new_v4().to_string();
         assert!(

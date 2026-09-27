@@ -56,6 +56,7 @@ pub enum Field {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Browse,
     Tick,
     Refresh,
     More,
@@ -82,6 +83,7 @@ pub enum Action {
     Confirm(u64),
     CancelConfirmation,
     History,
+    AllHistory,
     MoreHistory,
     Run(Uuid),
     InspectRun(crate::model::RunId),
@@ -330,6 +332,8 @@ pub struct State {
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
     history_next: Option<HistoryCursor>,
+    history_names: std::collections::BTreeMap<Uuid, String>,
+    all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
     notice: Option<String>,
@@ -394,6 +398,10 @@ impl State {
                     self.selected = Some(automation);
                     if matches!(pending, Pending::Save) {
                         self.draft = None;
+                        self.all_history = false;
+                        self.history.clear();
+                        self.history_names.clear();
+                        self.history_next = None;
                         self.notice = Some(
                             "Saved. Review the launch settings before enabling or running.".into(),
                         );
@@ -402,8 +410,10 @@ impl State {
                 Ok(Response::History(page)) => {
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
+                        self.history_names.clear();
                     }
                     self.history.extend(page.firings);
+                    self.history_names.extend(page.names);
                     self.history_next = page.next;
                 }
                 Ok(Response::Detail(detail)) => {
@@ -488,7 +498,22 @@ impl State {
         }
         self.confirmation = None;
         match action {
+            Action::Browse => {
+                self.run = None;
+                self.selected = None;
+                self.all_history = false;
+                return self.request(
+                    Pending::List { append: false },
+                    Request::List {
+                        after: None,
+                        limit: PAGE,
+                    },
+                );
+            }
             Action::Refresh => {
+                if let Some(run) = &self.run {
+                    return self.request(Pending::Run, Request::ShowFiring { id: run.firing.id });
+                }
                 return self.request(
                     Pending::List { append: false },
                     Request::List {
@@ -513,7 +538,9 @@ impl State {
             }
             Action::Select(id) => {
                 self.draft = None;
+                self.all_history = false;
                 self.history.clear();
+                self.history_names.clear();
                 self.history_next = None;
                 self.run = None;
                 return self.request(Pending::Show, Request::Show { id });
@@ -669,13 +696,18 @@ impl State {
                     );
                 }
             }
-            Action::History | Action::MoreHistory => {
-                if let Some(automation) = &self.selected {
+            Action::History | Action::MoreHistory | Action::AllHistory => {
+                if matches!(action, Action::AllHistory) {
+                    self.all_history = true;
+                    self.selected = None;
+                    self.run = None;
+                }
+                if self.all_history || self.selected.is_some() {
                     let append = matches!(action, Action::MoreHistory);
                     return self.request(
                         Pending::History { append },
                         Request::History {
-                            id: automation.id,
+                            id: self.selected.as_ref().map(|automation| automation.id),
                             before: if append {
                                 self.history_next.clone()
                             } else {
@@ -687,7 +719,15 @@ impl State {
                 }
             }
             Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
-            Action::InspectRun(run) => return self.request(Pending::Run, Request::ShowRun { run }),
+            Action::InspectRun(run) => {
+                self.selected = None;
+                self.all_history = false;
+                self.run = None;
+                self.history.clear();
+                self.history_names.clear();
+                self.history_next = None;
+                return self.request(Pending::Run, Request::ShowRun { run });
+            }
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(
@@ -752,130 +792,155 @@ impl State {
             content = content.push(
                 widget::row::with_children(vec![
                     button("New automation", Action::New, !busy),
+                    button(
+                        "Automations",
+                        Action::Browse,
+                        !busy && (self.run.is_some() || self.all_history),
+                    ),
                     button("Refresh", Action::Refresh, !busy),
+                    button("All run history", Action::AllHistory, !busy),
                 ])
                 .spacing(8)
                 .wrap(),
             );
-            content = content.push(
-                widget::text_input("Search loaded automations", &self.search)
-                    .on_input(Action::Search),
-            );
-            let query = self.search.to_lowercase();
-            for row in self.rows.iter().filter(|row| {
-                row.name.to_lowercase().contains(&query)
-                    || row
-                        .directory
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&query)
-            }) {
-                let next = row
-                    .next
-                    .as_ref()
-                    .map(|next| next.local.as_str())
-                    .unwrap_or("—");
-                let label = format!(
-                    "{} · {}\n{}\nNext: {} · Last: {}",
-                    row.name,
-                    if row.enabled { "Enabled" } else { "Paused" },
-                    row.directory.display(),
-                    next,
-                    row.last_state.map(state_label).unwrap_or("No runs")
-                );
-                content = content.push(button_owned(label, Action::Select(row.id), !busy));
-                if let Some(blocked) = &row.blocked {
-                    content = content.push(widget::text::body(blocked));
-                }
-            }
-            if self.rows.is_empty() {
-                content = content.push(widget::text::body(
-                    "Create an automation to schedule work in an open project.",
-                ));
-            }
-            if self.more {
-                content = content.push(button("Load more automations", Action::More, !busy));
-            }
-            if let Some(selected) = &self.selected {
-                content = content
-                    .push(widget::text::title4(selected.definition.name.as_str()))
-                    .push(launch_description(selected, &self.accounts))
-                    .push(widget::text::body(format!(
-                        "{} · Next: {} ({})",
-                        if selected.enabled {
-                            "Enabled"
-                        } else {
-                            "Paused"
-                        },
-                        selected
+            if self.run.is_none() {
+                if !self.all_history {
+                    content = content.push(
+                        widget::text_input("Search loaded automations", &self.search)
+                            .on_input(Action::Search),
+                    );
+                    let query = self.search.to_lowercase();
+                    for row in self.rows.iter().filter(|row| {
+                        row.name.to_lowercase().contains(&query)
+                            || row
+                                .directory
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .contains(&query)
+                    }) {
+                        let next = row
                             .next
                             .as_ref()
                             .map(|next| next.local.as_str())
-                            .unwrap_or("—"),
-                        selected.definition.schedule.timezone
-                    )));
-                if let Some(blocked) = &selected.blocked {
-                    content = content.push(widget::text::body(blocked));
-                }
-                content = content.push(
-                    widget::row::with_children(vec![
-                        button("Edit", Action::Edit, !busy),
-                        if selected.enabled {
-                            button("Pause", Action::Pause, !busy)
-                        } else {
-                            button(
-                                "Enable…",
-                                Action::Enable,
-                                !busy && selected.blocked.is_none(),
-                            )
-                        },
-                        button(
-                            if self.manual_requests.get(&selected.id).is_some_and(
-                                |(revision, _)| *revision == selected.execution_revision,
-                            ) {
-                                "Retry run…"
-                            } else {
-                                "Run now…"
-                            },
-                            Action::RunNow,
-                            !busy && selected.active_firing.is_none() && selected.blocked.is_none(),
-                        ),
-                        button(
-                            "Remove…",
-                            Action::Remove,
-                            !busy && selected.active_firing.is_none() && selected.blocked.is_none(),
-                        ),
-                    ])
-                    .spacing(8)
-                    .wrap(),
-                );
-                content = content.push(button("Refresh history", Action::History, !busy));
-                for firing in &self.history {
-                    let origin = match &firing.trigger {
-                        crate::automations::Trigger::Manual { .. } => "Manual".to_owned(),
-                        crate::automations::Trigger::Scheduled { occurrence } => {
-                            format!("Scheduled {}", occurrence.local)
+                            .unwrap_or("—");
+                        let label = format!(
+                            "{} · {}\n{}\nNext: {} · Last: {}",
+                            row.name,
+                            if row.enabled { "Enabled" } else { "Paused" },
+                            row.directory.display(),
+                            next,
+                            row.last_state.map(state_label).unwrap_or("No runs")
+                        );
+                        content = content.push(button_owned(label, Action::Select(row.id), !busy));
+                        if let Some(blocked) = &row.blocked {
+                            content = content.push(widget::text::body(blocked));
                         }
-                    };
-                    content = content.push(button_owned(
-                        format!(
-                            "{} · {} · {}",
-                            timestamp(firing.created_ms),
-                            origin,
-                            state_label(firing.state)
-                        ),
-                        Action::Run(firing.id),
-                        !busy,
-                    ));
+                    }
+                    if self.rows.is_empty() {
+                        content = content.push(widget::text::body(
+                            "Create an automation to schedule work in an open project.",
+                        ));
+                    }
+                    if self.more {
+                        content =
+                            content.push(button("Load more automations", Action::More, !busy));
+                    }
+                    if let Some(selected) = &self.selected {
+                        content = content
+                            .push(widget::text::title4(selected.definition.name.as_str()))
+                            .push(launch_description(selected, &self.accounts))
+                            .push(widget::text::body(format!(
+                                "{} · Next: {} ({})",
+                                if selected.enabled {
+                                    "Enabled"
+                                } else {
+                                    "Paused"
+                                },
+                                selected
+                                    .next
+                                    .as_ref()
+                                    .map(|next| next.local.as_str())
+                                    .unwrap_or("—"),
+                                selected.definition.schedule.timezone
+                            )));
+                        if let Some(blocked) = &selected.blocked {
+                            content = content.push(widget::text::body(blocked));
+                        }
+                        content = content.push(
+                            widget::row::with_children(vec![
+                                button("Edit", Action::Edit, !busy),
+                                if selected.enabled {
+                                    button("Pause", Action::Pause, !busy)
+                                } else {
+                                    button(
+                                        "Enable…",
+                                        Action::Enable,
+                                        !busy && selected.blocked.is_none(),
+                                    )
+                                },
+                                button(
+                                    if self.manual_requests.get(&selected.id).is_some_and(
+                                        |(revision, _)| *revision == selected.execution_revision,
+                                    ) {
+                                        "Retry run…"
+                                    } else {
+                                        "Run now…"
+                                    },
+                                    Action::RunNow,
+                                    !busy
+                                        && selected.active_firing.is_none()
+                                        && selected.blocked.is_none(),
+                                ),
+                                button(
+                                    "Remove…",
+                                    Action::Remove,
+                                    !busy
+                                        && selected.active_firing.is_none()
+                                        && selected.blocked.is_none(),
+                                ),
+                            ])
+                            .spacing(8)
+                            .wrap(),
+                        );
+                    }
                 }
-                if self.history_next.is_some() {
-                    content = content.push(button("Older runs", Action::MoreHistory, !busy));
+                if self.selected.is_some() || self.all_history {
+                    content = content.push(button("Refresh history", Action::History, !busy));
+                    if self.history.is_empty() && !busy {
+                        content = content.push(widget::text::body("No runs in this history page."));
+                    }
+                    for firing in &self.history {
+                        let origin = match &firing.trigger {
+                            crate::automations::Trigger::Manual { .. } => "Manual".to_owned(),
+                            crate::automations::Trigger::Scheduled { occurrence } => {
+                                format!("Scheduled {}", occurrence.local)
+                            }
+                        };
+                        content = content.push(button_owned(
+                            format!(
+                                "{} · {} · {} · {}",
+                                self.history_names
+                                    .get(&firing.id)
+                                    .map(String::as_str)
+                                    .unwrap_or("Run"),
+                                timestamp(firing.created_ms),
+                                origin,
+                                state_label(firing.state)
+                            ),
+                            Action::Run(firing.id),
+                            !busy,
+                        ));
+                    }
+                    if self.history_next.is_some() {
+                        content = content.push(button("Older runs", Action::MoreHistory, !busy));
+                    }
                 }
             }
             if let Some(run) = &self.run {
                 content = content
                     .push(widget::text::title4(format!(
-                        "Run · {}",
+                        "{} · {}",
+                        run.definition.name,
                         state_label(run.firing.state)
                     )))
                     .push(widget::text::body(format!(
@@ -1194,6 +1259,28 @@ mod tests {
         assert!(state.update(Action::Confirm(old)).is_none());
         assert!(state.pending.is_none());
         assert_eq!(state.draft.as_ref().unwrap().name, "New launch");
+    }
+
+    #[test]
+    fn all_automation_history_is_independent_of_current_definition_selection() {
+        let mut state = State {
+            selected: Some(automation()),
+            ..Default::default()
+        };
+        let Some(Effect::Request {
+            request:
+                Request::History {
+                    id: None,
+                    before: None,
+                    ..
+                },
+            ..
+        }) = state.update(Action::AllHistory)
+        else {
+            panic!("global history request expected")
+        };
+        assert!(state.selected.is_none());
+        assert!(state.all_history);
     }
 
     #[test]
