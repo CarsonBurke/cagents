@@ -1493,7 +1493,11 @@ mod tests {
     #[test]
     fn future_registry_schema_is_refused_without_modifying_it() {
         let (registry, directory, _) = fixture();
-        registry.db.pragma_update(None, "user_version", 2).unwrap();
+        let future_version = super::super::SCHEMA_VERSION + 1;
+        registry
+            .db
+            .pragma_update(None, "user_version", future_version)
+            .unwrap();
         drop(registry);
         let path = directory.path().join("model.sqlite3");
         let error = Registry::at(&path)
@@ -1504,7 +1508,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            future_version
         );
     }
 

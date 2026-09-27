@@ -21,6 +21,8 @@ latency-harness = ["ui"]
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
 host = [
+    "dep:croner",
+    "dep:jiff",
     "dep:ashpd",
     "dep:futures-util",
     "dep:base64",
@@ -150,6 +152,8 @@ postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
 roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
+croner = { version = "4.0", default-features = false, features = ["jiff"], optional = true }
+jiff = { version = "0.2.35", optional = true }
 raw-window-handle = { version = "=0.6.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 semver = { version = "1.0", features = ["serde"] }

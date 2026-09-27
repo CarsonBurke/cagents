@@ -1,5 +1,6 @@
 mod activity;
 mod agent_execution;
+mod automations;
 mod chat;
 mod client;
 mod delivery;
@@ -164,6 +165,12 @@ impl From<PlatformError> for HostError {
     fn from(error: PlatformError) -> Self {
         Self::Platform(error.to_string())
     }
+}
+
+/// Dedicated precheck owners must enter before tracing or runtime threads are
+/// started: their descendant cleanup relies on being the sole child reaper.
+pub fn run_automation_helper() -> Option<Result<(), String>> {
+    automations::helper_entry()
 }
 
 pub fn run() -> Result<(), HostError> {
