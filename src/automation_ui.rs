@@ -1257,6 +1257,35 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_choices_preserves_the_open_drafts_launch_selection() {
+        let existing = automation();
+        let account = AccountChoice {
+            label: "Original account".into(),
+            id: existing.definition.agent.account.clone().unwrap(),
+            provider: Provider::Claude,
+        };
+        let target = TargetChoice {
+            label: "Original target".into(),
+            target: existing.definition.agent.target.clone(),
+        };
+        let mut state = State {
+            selected: Some(existing.clone()),
+            ..State::default()
+        };
+        state.set_choices(vec![target], vec![account]);
+        state.update(Action::Edit);
+        // A refresh may remove or reorder the live catalog while the editor
+        // is open; its numeric selections must retain their original meaning.
+        state.set_choices(Vec::new(), Vec::new());
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.definition().unwrap(), existing.definition);
+        assert_eq!(draft.accounts[0].label, "Original account");
+        assert_eq!(draft.targets[0].label, "Original target");
+        assert!(state.accounts.is_empty());
+        assert!(state.targets.is_empty());
+    }
+
+    #[test]
     fn editing_invalidates_a_queued_automation_confirmation() {
         let mut state = State {
             selected: Some(automation()),
