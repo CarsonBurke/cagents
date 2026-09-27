@@ -1,5 +1,6 @@
 mod account_ui;
 mod agent_ui;
+mod automation_ui;
 mod branch_ui;
 #[cfg(feature = "integrated-browser")]
 mod browser_import_ui;
@@ -1151,7 +1152,7 @@ fn restored_runtime_residency(
         CardKind::Chat(_) => Residency::Hibernated,
         CardKind::Repository(_) | CardKind::PullRequests(_) => durable_residency.clone(),
         // Utility panes hold no process or page, so they are never hibernated.
-        CardKind::Settings | CardKind::Accounts => Residency::Hot,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations => Residency::Hot,
     }
 }
 
@@ -1391,6 +1392,12 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             starting: "Loading accounts…",
             unavailable: "Accounts unavailable",
         },
+        Some(CardKind::Automations) => CardLabels {
+            type_label: "Automations",
+            icon: "alarm-symbolic",
+            starting: "Loading automations…",
+            unavailable: "Automations unavailable",
+        },
         None => CardLabels {
             type_label: "Column",
             icon: "view-grid-symbolic",
@@ -1410,7 +1417,9 @@ fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
         CardKind::PullRequests(view) => display_path(&view.repository),
         CardKind::Repository(view) => display_path(&view.worktree),
         // Neither pane belongs to a place: both apply to the whole application.
-        CardKind::Settings | CardKind::Accounts => Cow::Borrowed("Application-wide"),
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+            Cow::Borrowed("Application-wide")
+        }
     }
 }
 
@@ -2370,6 +2379,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
+        Message::AutomationUi(action) => !action.background(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2490,6 +2500,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenChannel { .. }
                     | SidebarAction::CreatePullRequest { .. }
                     | SidebarAction::OpenSettings
+                    | SidebarAction::OpenAutomations
             )
     ) || matches!(
         message,
@@ -3433,6 +3444,7 @@ pub enum Message {
     GitUi(git_ui::Action),
     NotificationUi(notification_ui::Action),
     AccountUi(account_ui::Action),
+    AutomationUi(crate::automation_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -3594,6 +3606,7 @@ enum CardRuntime {
     /// the runtime only marks that the card is ready.
     Settings,
     Accounts,
+    Automations,
 }
 
 impl CardRuntime {
@@ -3602,6 +3615,7 @@ impl CardRuntime {
         match kind {
             CardKind::Settings => Self::Settings,
             CardKind::Accounts => Self::Accounts,
+            CardKind::Automations => Self::Automations,
             _ => unreachable!("only utility panes have a utility runtime"),
         }
     }
@@ -3924,6 +3938,7 @@ pub struct Cagents {
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
     account_ui: account_ui::State,
+    automation_ui: crate::automation_ui::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
@@ -4457,11 +4472,15 @@ impl Cagents {
                         .insert(card.id, CardRuntime::PullRequests(Box::new(pane)));
                     repository_tasks.push(self.open_pending_pull_request(card.id));
                 }
-                kind @ (CardKind::Settings | CardKind::Accounts) => {
+                kind @ (CardKind::Settings | CardKind::Accounts | CardKind::Automations) => {
                     if let Some(state) = self.card_state_mut(card.id) {
                         state.residency = Residency::Hot;
                     }
                     self.cards.insert(card.id, CardRuntime::utility(&kind));
+                    if matches!(kind, CardKind::Automations) {
+                        repository_tasks
+                            .push(self.update_automation_ui(crate::automation_ui::Action::Refresh));
+                    }
                 }
             }
         }
@@ -4904,7 +4923,7 @@ impl Cagents {
             CardKind::Repository(_) | CardKind::PullRequests(_) => {
                 card.residency = Residency::Hot;
             }
-            CardKind::Settings | CardKind::Accounts => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes are refused before cloning")
             }
         }
@@ -4959,7 +4978,7 @@ impl Cagents {
                     .insert(id, CardRuntime::PullRequests(Box::new(pane)));
                 self.open_pending_pull_request(id)
             }
-            CardKind::Settings | CardKind::Accounts => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes are refused before cloning")
             }
         };
@@ -6174,7 +6193,8 @@ impl Cagents {
                 | CardRuntime::Chat(_)
                 | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
-                | CardRuntime::Accounts,
+                | CardRuntime::Accounts
+                | CardRuntime::Automations,
             )
             | None => {}
         }
@@ -6339,7 +6359,7 @@ impl Cagents {
                 self.open_pending_pull_request(card)
             }
             CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
-            CardKind::Settings | CardKind::Accounts => {
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
                 unreachable!("utility panes return before a retry registers them")
             }
         }
@@ -6694,7 +6714,8 @@ impl Cagents {
                     | Some(CardRuntime::Repository(_))
                     | Some(CardRuntime::PullRequests(_))
                     | Some(CardRuntime::Settings)
-                    | Some(CardRuntime::Accounts) => false,
+                    | Some(CardRuntime::Accounts)
+                    | Some(CardRuntime::Automations) => false,
                     #[cfg(feature = "integrated-browser")]
                     Some(CardRuntime::Browser(_)) => true,
                     _ => self
@@ -7436,6 +7457,7 @@ impl Cagents {
                 self.default_account_choices(),
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
+            Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
             Some(CardRuntime::Completed) => {
                 widget::container(design::body(ended_terminal(card).map_or_else(
                     || "Process finished successfully.".to_string(),
@@ -7744,7 +7766,7 @@ impl Cagents {
                             })
                     })
             }),
-            CardKind::Settings | CardKind::Accounts => None,
+            CardKind::Settings | CardKind::Accounts | CardKind::Automations => None,
         };
         if let Some(action) = action {
             self.sidebar_state.apply(&action);
@@ -7867,7 +7889,8 @@ impl Cagents {
             CardKind::Browser(_)
             | CardKind::PullRequests(_)
             | CardKind::Settings
-            | CardKind::Accounts => SidebarFocus::None,
+            | CardKind::Accounts
+            | CardKind::Automations => SidebarFocus::None,
         }
     }
 
@@ -8711,7 +8734,8 @@ impl Cagents {
                 | CardRuntime::Repository(_)
                 | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
-                | CardRuntime::Accounts => Ok(()),
+                | CardRuntime::Accounts
+                | CardRuntime::Automations => Ok(()),
             };
             if failure.is_none() {
                 failure = result.err();
@@ -8920,7 +8944,8 @@ impl Cagents {
             | Some(CardRuntime::Terminal(_))
             | Some(CardRuntime::PullRequests(_))
             | Some(CardRuntime::Settings)
-            | Some(CardRuntime::Accounts) => InspectorRuntimeStatus::Ready,
+            | Some(CardRuntime::Accounts)
+            | Some(CardRuntime::Automations) => InspectorRuntimeStatus::Ready,
             Some(CardRuntime::Repository(runtime)) => match runtime.inspector_runtime_status() {
                 RepositoryRuntimeStatus::Loading => InspectorRuntimeStatus::Loading,
                 RepositoryRuntimeStatus::Ready => InspectorRuntimeStatus::Ready,
@@ -10137,6 +10162,7 @@ impl Application for Cagents {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             account_ui: account_ui::State::installation(),
+            automation_ui: crate::automation_ui::State::default(),
             chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
@@ -11307,6 +11333,7 @@ impl Application for Cagents {
                         }
                     }
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
+                    SidebarAction::OpenAutomations => self.open_automations(),
                     // The handle clamps to its own rendered bounds, and the
                     // settings file accepts a narrower range, so the width is
                     // clamped again before it can reach a rejected save.
@@ -12709,6 +12736,7 @@ impl Application for Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
+            Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::RefreshUi(action) => {
@@ -12991,6 +13019,7 @@ impl Application for Cagents {
             self.refresh_subscription(),
             self.git_subscription(),
             self.account_subscription(),
+            self.automation_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
             Subscription::run_with(
@@ -19384,6 +19413,7 @@ mod tests {
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             account_ui: account_ui::State::default(),
+            automation_ui: crate::automation_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
             channel_offsets: HashMap::new(),

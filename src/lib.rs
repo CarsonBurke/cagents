@@ -9,6 +9,8 @@ pub mod agent;
 pub mod agent_execution;
 #[cfg(feature = "ui")]
 pub mod app;
+#[cfg(feature = "ui")]
+pub mod automation_ui;
 pub mod automations;
 #[cfg(feature = "integrated-browser")]
 pub mod browser;

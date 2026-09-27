@@ -357,7 +357,8 @@ impl Cagents {
                 | CardRuntime::Chat(_)
                 | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
-                | CardRuntime::Accounts => {}
+                | CardRuntime::Accounts
+                | CardRuntime::Automations => {}
             }
         }
         self.lifecycle.remove(id);

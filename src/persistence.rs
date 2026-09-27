@@ -32,7 +32,7 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -179,6 +179,7 @@ pub enum PersistedCardKind {
     Repository,
     Settings,
     Accounts,
+    Automations,
 }
 
 impl PersistedCardKind {
@@ -191,6 +192,7 @@ impl PersistedCardKind {
             Self::Repository => "repository",
             Self::Settings => "settings",
             Self::Accounts => "accounts",
+            Self::Automations => "automations",
         }
     }
 
@@ -203,6 +205,7 @@ impl PersistedCardKind {
             "repository" => Ok(Self::Repository),
             "settings" => Ok(Self::Settings),
             "accounts" => Ok(Self::Accounts),
+            "automations" => Ok(Self::Automations),
             other => Err(StoreError::corrupt_row(
                 "card kind",
                 format!("unknown kind `{other}`"),
@@ -1995,6 +1998,29 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                  ) STRICT;",
             )?;
         }
+        if current < 10 {
+            transaction.execute_batch(
+                "CREATE TABLE cards_v10 (
+                    card_id TEXT PRIMARY KEY NOT NULL,
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+                    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                    generation INTEGER NOT NULL CHECK (generation >= 0),
+                    title TEXT NOT NULL,
+                    width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),
+                    existence_json TEXT NOT NULL,
+                    kind_tag TEXT NOT NULL CHECK (kind_tag IN (
+                        'terminal', 'chat', 'browser', 'pull_requests', 'repository',
+                        'settings', 'accounts', 'automations')),
+                    content_json TEXT,
+                    updated_at_unix_ms INTEGER NOT NULL,
+                    content_hash INTEGER
+                 ) STRICT;
+                 INSERT INTO cards_v10 SELECT * FROM cards;
+                 DROP TABLE cards;
+                 ALTER TABLE cards_v10 RENAME TO cards;
+                 CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
+            )?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -2967,7 +2993,8 @@ impl<'card> CardWrite<'card> {
             CardKind::Terminal(_)
             | CardKind::Browser(_)
             | CardKind::Settings
-            | CardKind::Accounts => None,
+            | CardKind::Accounts
+            | CardKind::Automations => None,
         };
         let payload = match &card.kind {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
@@ -3008,7 +3035,8 @@ impl<'card> CardWrite<'card> {
             | CardKind::PullRequests(_)
             | CardKind::Repository(_)
             | CardKind::Settings
-            | CardKind::Accounts => CardPayloadWrite::Inline,
+            | CardKind::Accounts
+            | CardKind::Automations => CardPayloadWrite::Inline,
         };
 
         let mut hasher = ContentHasher::new();
@@ -3762,6 +3790,7 @@ fn load_card_connection(
         )?),
         PersistedCardKind::Settings => CardKind::Settings,
         PersistedCardKind::Accounts => CardKind::Accounts,
+        PersistedCardKind::Automations => CardKind::Automations,
     };
 
     Ok(Some(CardState {
@@ -3998,6 +4027,7 @@ fn card_kind(kind: &CardKind) -> PersistedCardKind {
         CardKind::Repository(_) => PersistedCardKind::Repository,
         CardKind::Settings => PersistedCardKind::Settings,
         CardKind::Accounts => PersistedCardKind::Accounts,
+        CardKind::Automations => PersistedCardKind::Automations,
     }
 }
 
@@ -5256,7 +5286,11 @@ mod tests {
             workspace: commit.generation,
             cards: commit.card_generations,
         };
-        for kind in [CardKind::Settings, CardKind::Accounts] {
+        for kind in [
+            CardKind::Settings,
+            CardKind::Accounts,
+            CardKind::Automations,
+        ] {
             let mut card = workspace.cards[1].clone();
             card.id = CardId::new();
             card.title = "Utility".into();
@@ -5272,7 +5306,11 @@ mod tests {
                 .map(|card| card.kind.clone())
                 .skip(2)
                 .collect::<Vec<_>>(),
-            vec![CardKind::Settings, CardKind::Accounts]
+            vec![
+                CardKind::Settings,
+                CardKind::Accounts,
+                CardKind::Automations
+            ]
         );
         let inner = store.lock_inner().unwrap();
         assert!(

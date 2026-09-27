@@ -505,6 +505,14 @@ impl Cagents {
             self.publish_shared_channel(id);
         }
         for agent in &model.agents {
+            // Scheduled agents stay headless until an explicit history or
+            // notification action opens their exact live run.
+            if matches!(
+                agent.origin,
+                crate::agent_execution::Origin::Automation { .. }
+            ) {
+                continue;
+            }
             if let Some(task) = self.adopt_execution_agent(agent) {
                 changed = true;
                 tasks.push(task);
@@ -522,7 +530,7 @@ impl Cagents {
 
     /// Adoption records the daemon's exact descriptor without launching a
     /// replacement, switching channels, or taking focus from current work.
-    fn adopt_execution_agent(
+    pub(super) fn adopt_execution_agent(
         &mut self,
         agent: &crate::agent_execution::Agent,
     ) -> Option<Task<Message>> {
@@ -909,6 +917,23 @@ mod tests {
             closed: false,
         };
         let card = CardId::from_uuid(agent.id.as_uuid());
+        let mut scheduled = agent.clone();
+        scheduled.origin = Origin::Automation {
+            id: uuid::Uuid::new_v4(),
+        };
+        app.workspace_model = registry(vec![
+            shared(active, &agent.spec.target.repository, "Active", 0),
+            shared(target, &agent.spec.target.repository, "Execution", 1),
+        ]);
+        app.workspace_model.agents.push(scheduled);
+        drop(app.reconcile_workspace_model());
+        assert!(
+            !app.durable
+                .cards
+                .iter()
+                .any(|candidate| candidate.id == card),
+            "model refresh must not mount scheduled history or its live actor"
+        );
         assert!(app.adopt_execution_agent(&agent).is_some());
         assert_eq!(app.durable.active_channel, Some(active));
         assert_eq!(app.workspace.focused(), focus);

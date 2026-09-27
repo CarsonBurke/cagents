@@ -3060,6 +3060,7 @@ impl SidebarState {
             | SidebarAction::RefreshWorktree { .. }
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
+            | SidebarAction::OpenAutomations
             | SidebarAction::Stage { .. }
             | SidebarAction::Unstage { .. }
             | SidebarAction::Commit { .. }
@@ -3177,6 +3178,7 @@ pub enum SidebarAction {
         worktree: Option<PathBuf>,
     },
     OpenSettings,
+    OpenAutomations,
 
     OpenCommit {
         key: ActiveWorktreeKey,
@@ -3678,8 +3680,17 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
     )
     .id(stable_id("settings"))
     .into();
+    let automations = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("alarm-symbolic"),
+        "Automations",
+        false,
+        !modal_open,
+        Some(SidebarAction::OpenAutomations),
+    )
+    .id(stable_id("automations"))
+    .into();
     if compact {
-        let children: Vec<Element<'a, SidebarAction>> = vec![settings];
+        let children: Vec<Element<'a, SidebarAction>> = vec![automations, settings];
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(spacing.space_xxxs)
@@ -3687,7 +3698,7 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
             .width(Length::Fill)
             .into();
     }
-    widget::row::with_children(vec![settings])
+    widget::row::with_children(vec![automations, settings])
         .align_y(Alignment::Center)
         .padding(spacing.space_xxxs)
         .width(Length::Fill)
