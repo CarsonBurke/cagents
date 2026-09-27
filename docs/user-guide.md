@@ -143,10 +143,17 @@ matching refresh re-enables creation.
 
 ## Pull request review
 
-Clicking a row in Projects' **Pull requests** filter opens a **pull request pane** for that
-repository: the project's open pull requests on the left, and the selected
+In Projects' **Pull requests** filter, click a project name to browse all of its
+open PRs, including those with no local worktree. A matching worktree row opens
+its PR directly. The **pull request pane** shows open pull requests on the left, and the selected
 one's changed files with their GitHub **viewed** marks under a header that shows
 progress and links to GitHub.
+
+The shared browser in cagents and ceditor loads 50 PRs at a time. **Load more
+pull requests** follows the next cursor with no fixed total limit. Search by
+title, number, or author and filter drafts or check status across the loaded
+rows; the counts make that scope visible. An open, focused review refreshes
+every 30 seconds, keeping its file marks and discussion current.
 
 - Choosing a file shows its diff against the fetched merge base without
   touching the working tree, so staging and the diff-basis switch are absent.
