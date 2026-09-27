@@ -20,6 +20,7 @@ pub struct Observer {
     listener: Option<UiActivationListener>,
     started: bool,
     presence_wake: Option<crossbeam_channel::Sender<()>>,
+    acknowledging: Arc<Mutex<std::collections::BTreeSet<uuid::Uuid>>>,
 }
 
 impl Default for Observer {
@@ -41,6 +42,7 @@ impl Default for Observer {
             listener: None,
             started: false,
             presence_wake: None,
+            acknowledging: Default::default(),
         }
     }
 }
@@ -208,6 +210,53 @@ impl Observer {
         let receiver = self.receiver.clone();
         cosmic::iced::Task::perform(async move { receiver.recv().await.ok() }, |action| action)
             .and_then(cosmic::iced::Task::done)
+    }
+
+    pub fn focused_target(&self) -> Option<Target> {
+        self.presence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .focused_target
+            .clone()
+    }
+
+    pub fn acknowledge(&self, ids: Vec<uuid::Uuid>) -> cosmic::iced::Task<Action> {
+        let ids = {
+            let mut pending = self.acknowledging.lock().unwrap_or_else(|p| p.into_inner());
+            ids.into_iter()
+                .filter(|id| pending.insert(*id))
+                .collect::<Vec<_>>()
+        };
+        if ids.is_empty() {
+            return cosmic::iced::Task::none();
+        }
+        let pending = self.acknowledging.clone();
+        cosmic::iced::Task::perform(
+            async move {
+                let remove = ids.clone();
+                let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let socket =
+                        crate::terminal_ipc::daemon_socket_path().map_err(|e| e.to_string())?;
+                    let mut client = ControlClient::connect(&socket).map_err(|e| e.to_string())?;
+                    for id in ids {
+                        client
+                            .acknowledge_notification(id)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|result| result);
+                let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+                for id in remove {
+                    pending.remove(&id);
+                }
+                result.err().map(Action::Failed)
+            },
+            |action| action,
+        )
+        .and_then(cosmic::iced::Task::done)
     }
 
     pub fn focus(&self, target: Option<Target>) -> cosmic::iced::Task<Action> {

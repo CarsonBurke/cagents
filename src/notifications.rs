@@ -214,6 +214,31 @@ pub struct Snapshot {
     pub diagnostic: Option<String>,
 }
 
+/// Reading a target clears its existing alert on a focus edge. An opted-in
+/// fresh alert for the target already being watched remains visible.
+pub fn focused_notice_ids(
+    snapshot: &Snapshot,
+    target: Option<&Target>,
+    source_session: Option<TerminalId>,
+    focus_changed: bool,
+    while_focused: bool,
+) -> Vec<uuid::Uuid> {
+    if !focus_changed && while_focused {
+        return Vec::new();
+    }
+    snapshot
+        .notices
+        .iter()
+        .filter(|notice| {
+            !notice.acknowledged
+                && (target.is_some_and(|target| &notice.event.target == target)
+                    || source_session
+                        .is_some_and(|session| notice.event.source_session() == Some(session)))
+        })
+        .map(|notice| notice.id)
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     pub window: String,
@@ -338,6 +363,59 @@ mod tests {
             event
         );
         assert_eq!(context(&event), "project");
+    }
+
+    #[test]
+    fn typed_focus_acknowledges_only_read_requests_and_preserves_opted_in_fresh_alerts() {
+        let target = Target::PullRequest(review::ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "reader".into(),
+            request: "current".into(),
+        });
+        let id = uuid::Uuid::new_v4();
+        let snapshot = Snapshot {
+            notices: vec![Notice {
+                id,
+                event: Event {
+                    target: target.clone(),
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: Some(Destination {
+                        application: Application::Ceditor,
+                        window: "editor".into(),
+                    }),
+                    evidence: Evidence {
+                        key: "current".into(),
+                        kind: Kind::ReviewRequested,
+                    },
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&target), None, true, true),
+            [id]
+        );
+        assert!(focused_notice_ids(&snapshot, Some(&target), None, false, true).is_empty());
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&target), None, false, false),
+            [id]
+        );
+        let mut different = target.clone();
+        let Target::PullRequest(request) = &mut different else {
+            unreachable!()
+        };
+        request.request = "new-request".into();
+        assert!(focused_notice_ids(&snapshot, Some(&different), None, true, false).is_empty());
+        assert!(focused_notice_ids(&snapshot, None, None, true, false).is_empty());
     }
 
     #[test]

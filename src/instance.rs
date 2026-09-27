@@ -1739,7 +1739,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ui")]
     #[test]
     fn notification_launch_resolves_private_siblings_then_safe_installed_shells() {
         let root = tempfile::tempdir().unwrap();
@@ -1767,6 +1766,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn notification_application_destinations_use_distinct_real_sockets() {
         use crate::notifications::{Application, Destination};

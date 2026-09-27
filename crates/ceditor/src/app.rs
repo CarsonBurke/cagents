@@ -4457,6 +4457,8 @@ impl Application for Editor {
             self.can_refresh_visible() && (previous_tabs.0 != self.active || !was_refresh_visible);
         Task::batch([
             task,
+            self.notification_focus(),
+            self.open_requested_review(),
             if tabs_changed {
                 self.reveal_active_tab()
             } else {
