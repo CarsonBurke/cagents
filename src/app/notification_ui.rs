@@ -247,32 +247,22 @@ impl Cagents {
                 .presence
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let changed = previous.focused != focused;
+            let changed =
+                previous.focused != focused || previous.focused_target != presence.focused_target;
             *previous = presence.clone();
             changed
         };
+        let read = crate::notifications::focused_notice_ids(
+            &self.notification_ui.snapshot,
+            presence.focused_target.as_ref(),
+            focused,
+            focus_changed,
+            self.settings.notifications.while_focused,
+        );
         self.notification_ui
             .changed(|pending| pending.presence = Some(presence));
-        // A snapshot can arrive while focus stays on this agent. When the
-        // user opted into alerts while watching it, acknowledging that fresh
-        // snapshot would immediately withdraw the desktop alert. Returning
-        // to a pane still acknowledges it, as does explicit portal activation.
-        if let Some(focused) = focused
-            && (focus_changed || !self.settings.notifications.while_focused)
-        {
-            let ids = self
-                .notification_ui
-                .snapshot
-                .notices
-                .iter()
-                .filter(|notice| {
-                    notice.event.source_session() == Some(focused) && !notice.acknowledged
-                })
-                .map(|notice| notice.id)
-                .collect::<Vec<_>>();
-            for id in ids {
-                self.notification_ui.acknowledge(id);
-            }
+        for id in read {
+            self.notification_ui.acknowledge(id);
         }
     }
 

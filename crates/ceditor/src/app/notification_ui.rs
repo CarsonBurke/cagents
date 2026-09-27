@@ -201,10 +201,19 @@ impl Editor {
                 self.review_requests
                     .target(&target.repository, target.pull_request.number)
             });
-        self.notifications
-            .observer
-            .focus(target)
-            .map(|action| Message::Notification(Action::Focus(action)))
-            .map(cosmic::Action::App)
+        let changed = self.notifications.observer.focused_target() != target;
+        let read = notifications::focused_notice_ids(
+            &self.notifications.snapshot,
+            target.as_ref(),
+            None,
+            changed,
+            self.settings.notifications.while_focused,
+        );
+        iced::Task::batch([
+            self.notifications.observer.focus(target),
+            self.notifications.observer.acknowledge(read),
+        ])
+        .map(|action| Message::Notification(Action::Focus(action)))
+        .map(cosmic::Action::App)
     }
 }
