@@ -158,6 +158,11 @@ rows; the counts make that scope visible. An open, focused review refreshes
 every 30 seconds, keeping its file marks and discussion current.
 The same refresh updates its title, checks, review decision, and base branch.
 
+Large reviews mount only visible file rows and their folder ancestors. Viewed
+marks load in pages as you scroll or navigate; unfetched marks stay visibly
+unknown and cannot be toggled. **Load more viewed states** also fetches a page
+on demand. A failed page can be retried without losing the open diff.
+
 Previously opened reviews retain their file list, viewed marks, and selected
 file locally. If GitHub is unavailable, enter `#123` in the browser and choose
 **Open #123** to read its cached diff. The header identifies the cached viewer;

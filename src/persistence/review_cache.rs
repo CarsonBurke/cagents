@@ -151,6 +151,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_keeps_unfetched_viewed_states_distinct_from_unviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            &dir.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        let mut snapshot = cache::fixture();
+        snapshot
+            .unknown_paths
+            .insert(snapshot.files[0].entry.path.clone());
+        snapshot.files[0].viewed = false;
+        snapshot.files[0].unverified = true;
+        store.save(&snapshot, 1).unwrap();
+        assert_eq!(store.load(&snapshot.key).unwrap(), Some(snapshot));
+    }
+
+    #[test]
     fn version_eight_migrates_and_eviction_cascades_file_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite3");

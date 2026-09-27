@@ -16180,11 +16180,11 @@ mod tests {
     }
 
     fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
-        let mut fresh = frame(app);
-        assert_tree_is_faithful(
-            tree,
-            &cosmic::iced::advanced::widget::Tree::new(fresh.as_widget_mut()),
-        );
+        // Responsive widgets construct their children during layout. Compare
+        // two presented frames so their complete widget trees are available.
+        let mut fresh = cosmic::iced::advanced::widget::Tree::empty();
+        present(app, &mut headless_renderer(), &mut fresh);
+        assert_tree_is_faithful(tree, &fresh);
     }
 
     /// A repository card whose durable state and runtime both say repository,
@@ -21404,6 +21404,65 @@ mod tests {
             present(&app, &mut renderer, &mut tree);
             assert_frame_is_faithful(&app, &tree);
         }
+    }
+
+    #[test]
+    fn thousand_file_review_mounts_a_bounded_tree_and_draws_repeated_frames() {
+        use crate::pull_request_review::{Action, tests as review};
+        use cosmic::iced::advanced::widget::Tree;
+        let (mut app, project) = pull_request_test_app(&[1]);
+        drop(app.update(open_pull_request(project, 1)));
+        let card = pull_request_cards(&app)[0].0;
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("review pane")
+        };
+        let mut snapshot = review::loaded(
+            (0..1000)
+                .map(|i| {
+                    review::entry(
+                        &format!("src/file-{i:04}.rs"),
+                        crate::repository::ChangeKind::Modified,
+                    )
+                })
+                .collect(),
+            (0..100)
+                .map(|i| review::remote_file(&format!("src/file-{i:04}.rs"), false))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        review::finish_load(&mut pane.review, snapshot);
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        fn nodes(tree: &Tree) -> usize {
+            1 + tree.children.iter().map(nodes).sum::<usize>()
+        }
+        let mut timings = Vec::new();
+        for frame in 0..12 {
+            let start = Instant::now();
+            present(&app, &mut renderer, &mut tree);
+            timings.push(start.elapsed());
+            assert!(
+                nodes(&tree) < 5000,
+                "offscreen file widgets must not be mounted: {}",
+                nodes(&tree)
+            );
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: Action::FilePage(
+                    crate::pull_request_review::file_pages::PageAction::Viewport {
+                        offset: frame as f32 * 70.0 * design::DENSE_ROW_HEIGHT,
+                        height: 1000.0,
+                    },
+                ),
+            }));
+        }
+        timings.sort();
+        eprintln!(
+            "1000-file review, full layout/draw: median {:?}, max {:?}, mounted nodes {}",
+            timings[6],
+            timings[11],
+            nodes(&tree)
+        );
     }
 
     /// Restoring is the shell's doing, not a keystroke aimed at a dialog, so
