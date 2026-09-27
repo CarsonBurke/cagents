@@ -898,6 +898,16 @@ impl Adapter for Omp {
                     .into(),
                 });
             }
+            "agent_end" if frame["isTerminal"].as_bool() == Some(false) => {
+                // OMP can yield for maintenance or asynchronous delivery and
+                // resume the same run. Older runtimes omit this field, so only
+                // an explicit false excludes the terminal boundary below.
+                self.busy = true;
+                step.events.push(Event::Status {
+                    busy: true,
+                    detail: "Working".into(),
+                });
+            }
             "agent_end" | "auto_compaction_end" => {
                 let finished = text(&frame, "type") == "agent_end" && self.agent_turn_active;
                 let outcome = if finished {
@@ -1163,6 +1173,39 @@ mod tests {
                     .any(|event| matches!(event, Event::TurnFinished { .. }))
             );
         }
+    }
+
+    #[test]
+    fn intermediate_agent_end_does_not_announce_or_settle_the_run() {
+        let mut adapter = Omp::default();
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        adapter.receive(json!({"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[]}})).unwrap();
+        let intermediate = adapter
+            .receive(json!({"type":"agent_end","isTerminal":false}))
+            .unwrap();
+        assert!(
+            !intermediate
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. } | Event::TurnSettled))
+        );
+        assert!(adapter.busy);
+        let terminal = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            terminal
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnSettled))
+        );
     }
 
     /// oh-my-pi lists a skill as the command `skill:name`, which it runs from
