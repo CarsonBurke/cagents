@@ -88,6 +88,86 @@ done
 }
 
 #[test]
+fn uncertain_private_startup_can_retry_exact_cleanup_without_losing_capacity() {
+    if isolated("uncertain_private_startup_can_retry_exact_cleanup_without_losing_capacity")
+        .is_some()
+    {
+        return;
+    }
+    use chat::protocol::{ExecutionContext, LaunchCleanup, LaunchOutcome};
+    struct Owner(Mutex<LaunchOutcome>);
+    impl LaunchCleanup for Owner {
+        fn cleanup(&self) -> Result<LaunchOutcome, String> {
+            Ok(*self.0.lock().unwrap())
+        }
+    }
+    let (host, request, _) = fixture();
+    let registry = registry(&host).unwrap();
+    let accepted = registry
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let mut session = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        accepted.agent.spec.target.directory.clone(),
+        &Account::system(Provider::Claude),
+    )
+    .unwrap();
+    session.proof = Some(host.lock().unwrap().proof().clone());
+    let source = HostedSession::Chat(session);
+    registry
+        .lock()
+        .unwrap()
+        .reserve_agent_launch(accepted.agent.id, &source)
+        .unwrap();
+    let owner = Arc::new(Owner(Mutex::new(LaunchOutcome::Uncertain)));
+    let context = Arc::new(ExecutionContext::default());
+    context.claim_owner(owner.clone());
+    host.lock()
+        .unwrap()
+        .execution_startups
+        .insert(accepted.agent.id, (source.clone(), context));
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap_err()
+            .contains("unconfirmed")
+    );
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap(),
+        Some(source)
+    );
+    assert!(
+        !registry
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    *owner.0.lock().unwrap() = LaunchOutcome::TeardownProved;
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(host.lock().unwrap().execution_startups.is_empty());
+}
+
+#[test]
 fn omp_service_waits_for_correlated_result_and_reuses_one_provider() {
     if isolated("omp_service_waits_for_correlated_result_and_reuses_one_provider").is_some() {
         return;

@@ -1099,7 +1099,7 @@ fn start_with_execution(
                 ));
             }
         }
-        spec.execution = execution;
+        spec.execution = execution.clone();
         if let Some(context) = &spec.execution {
             context
                 .verify_directory(&spec.working_directory)
@@ -1220,6 +1220,9 @@ fn start_with_execution(
         };
         let response = session_snapshot(&record);
         state.chats.insert(id, record);
+        if let Some(context) = &execution {
+            context.installed();
+        }
         state.inventory_generation += 1;
         Ok(response)
     })();

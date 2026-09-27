@@ -226,6 +226,13 @@ pub(crate) struct HostState {
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
+    pub(super) execution_startups: BTreeMap<
+        crate::model::AgentId,
+        (
+            crate::agent_execution::HostedSession,
+            Arc<crate::chat::protocol::ExecutionContext>,
+        ),
+    >,
     /// Connections that asked for shared-model edges, kept separately from
     /// `watchers` because watching terminals and watching the model are
     /// independent subscriptions with independent clients - the CLI reads the
@@ -280,6 +287,7 @@ impl HostState {
             model: None,
             execution_registry: None,
             execution_gates: BTreeMap::new(),
+            execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
