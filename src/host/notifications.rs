@@ -69,9 +69,9 @@ impl Handle {
             return;
         }
         self.change(|pending| {
-            if pending.retired.contains(&event.session) {
-                return;
-            }
+            // Producers fence worker identity before enqueueing. A newer
+            // worker may reuse this session while retirement is still queued;
+            // apply that retirement first, then its new event in the broker.
             if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.session) {
                 pending.events.insert(event.session, event);
             }
@@ -362,6 +362,34 @@ async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_coalescing_preserves_only_later_worker_evidence() {
+        let (wake, _receiver) = mpsc::channel(1);
+        let handle = Handle(Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        }));
+        let session = TerminalId::new();
+        let event = |key: &str| Event {
+            session,
+            provider: crate::agent::Provider::Codex,
+            directory: "/fixture".into(),
+            evidence: crate::notifications::Evidence {
+                key: key.into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        };
+        handle.record(event("old"));
+        handle.retire(session);
+        assert!(handle.0.pending.lock().unwrap().events.is_empty());
+        handle.record(event("new"));
+        let pending = handle.0.pending.lock().unwrap();
+        assert!(pending.retired.contains(&session));
+        assert_eq!(pending.events[&session].evidence.key, "new");
+    }
 
     #[test]
     fn portal_retry_wakes_without_another_ui_or_agent_event() {
