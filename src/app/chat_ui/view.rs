@@ -961,6 +961,8 @@ impl Runtime {
                     // conversation is left alone, but this card stops being
                     // the way back to it.
                     "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
+                } else if snapshot.exited && self.session.owns_codex_listener() {
+                    "Chat attachment ended. The retained provider may still be running; your draft is retained."
                 } else if snapshot.exited {
                     "Agent process exited. The transcript and draft are retained."
                 } else {
@@ -1426,6 +1428,8 @@ impl Runtime {
             (Some("agent-working-symbolic"), "Sending")
         } else if self.disconnected {
             (Some("dialog-warning-symbolic"), "Disconnected")
+        } else if snapshot.exited && self.session.owns_codex_listener() {
+            (Some("dialog-warning-symbolic"), "Unavailable")
         } else if snapshot.exited {
             (Some("dialog-warning-symbolic"), "Exited")
         } else if failed {

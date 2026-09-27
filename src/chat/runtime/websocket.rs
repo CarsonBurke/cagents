@@ -161,6 +161,35 @@ impl Actor {
         inode: u64,
     ) -> Result<(), String> {
         let socket = connect(path, device, inode)?;
+        if self.native_holder.is_some() {
+            let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+            let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            if unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERCRED,
+                    (&mut credentials as *mut libc::ucred).cast(),
+                    &mut length,
+                )
+            } != 0
+                || length as usize != std::mem::size_of::<libc::ucred>()
+            {
+                return Err("Cannot verify owned app-server peer".into());
+            }
+            let peer = crate::daemon::holder_registry::Process::read(credentials.pid)
+                .map_err(|error| error.to_string())?;
+            if self
+                .expected_native_peer
+                .as_ref()
+                .is_some_and(|expected| expected != &peer)
+            {
+                return Err(
+                    "Retained Codex endpoint belongs to a different app-server process".into(),
+                );
+            }
+            self.native_peer = Some(peer);
+        }
         let config = WebSocketConfig::default()
             .read_buffer_size(8192)
             .write_buffer_size(0)
@@ -203,6 +232,19 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            if self.stop.load(Ordering::Acquire)
+                && self
+                    .native_holder
+                    .as_ref()
+                    .is_some_and(|holder| holder.is_durable())
+                && (self.preserve_native.load(Ordering::Acquire)
+                    || !self.native_installed.load(Ordering::Acquire))
+            {
+                // A proved owner keeps the server and current turn. Closing
+                // this connection must not send an interrupt or flush an
+                // uncertain queued prompt/approval during daemon replacement.
+                return Ok(());
+            }
             if self.stop.load(Ordering::Acquire) && closing.is_none() {
                 closing = Some(Instant::now());
             }

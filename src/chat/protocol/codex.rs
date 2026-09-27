@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, Step, TransportSpec};
+use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
@@ -74,19 +74,35 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
 }
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_inner(launch, None)
+    create_inner(launch, None, None)
 }
 
 pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_inner(launch, Some(socket))
+    create_inner(launch, Some(socket), None)
+}
+
+/// Only authenticated holder recovery supplies this identity. The runtime
+/// additionally verifies the exact retained app-server peer before initialize.
+pub(crate) fn create_restored(
+    recovery: &crate::chat::native_holder::Recovery,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    let confirmed = recovery
+        .server_identity
+        .clone()
+        .ok_or("Missing retained server identity")?;
+    if recovery.server_process.is_none() {
+        return Err("Missing retained app-server process identity".into());
+    }
+    create_inner(&recovery.source.launch, None, Some(confirmed))
 }
 
 fn create_inner(
     launch: &Launch,
     owned_socket: Option<PathBuf>,
+    retained_identity: Option<ServerIdentity>,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     if launch
         .session_id
@@ -182,12 +198,16 @@ fn create_inner(
     } else {
         spec.working_directory.join(home)
     };
-    let expected_home = std::fs::canonicalize(&home).map_err(|e| {
-        format!(
-            "Cannot verify Codex account directory {}: {e}",
-            home.display()
-        )
-    })?;
+    let expected_home = if let Some(identity) = &retained_identity {
+        identity.canonical_home.clone()
+    } else {
+        std::fs::canonicalize(&home).map_err(|e| {
+            format!(
+                "Cannot verify Codex account directory {}: {e}",
+                home.display()
+            )
+        })?
+    };
     // Joining a thread that already exists means joining whichever process
     // owns it, so it needs the shared control socket. A brand-new
     // conversation owns nothing, so it runs as this application's own `codex
@@ -261,6 +281,8 @@ fn create_inner(
     Ok((
         spec,
         Box::new(Codex {
+            server_identity: None,
+            retained_identity,
             thread: launch.session_id.clone(),
             start,
             alias,
@@ -329,6 +351,8 @@ enum RequestKind {
     Elicitation,
 }
 struct Codex {
+    server_identity: Option<ServerIdentity>,
+    retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
     start: Value,
     alias: Option<PathBuf>,
@@ -881,6 +905,9 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn server_identity(&self) -> Option<&ServerIdentity> {
+        self.server_identity.as_ref()
+    }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -1043,7 +1070,33 @@ impl Adapter for Codex {
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
                 Pending::Initialize => {
-                    crate::agent::observe::socket::verify_account(result, &self.expected_home)?;
+                    if let Some(retained) = &self.retained_identity {
+                        if result["codexHome"].as_str() != Some(retained.reported_home.as_str()) {
+                            return Err("Retained Codex server changed its account identity".into());
+                        }
+                    } else {
+                        crate::agent::observe::socket::verify_account(result, &self.expected_home)?;
+                    }
+                    let user_agent = result
+                        .get("userAgent")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty() && value.len() <= 1024);
+                    let identity = user_agent.map(|user_agent| ServerIdentity {
+                        user_agent: user_agent.to_owned(),
+                        canonical_home: self.expected_home.clone(),
+                        reported_home: result["codexHome"]
+                            .as_str()
+                            .expect("account identity was verified above")
+                            .to_owned(),
+                    });
+                    if self
+                        .retained_identity
+                        .as_ref()
+                        .is_some_and(|retained| Some(retained) != identity.as_ref())
+                    {
+                        return Err("Retained Codex server identity changed".into());
+                    }
+                    self.server_identity = identity;
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
                     if self.thread.is_some() {
@@ -2354,6 +2407,8 @@ mod tests {
 
     fn adapter() -> Codex {
         Codex {
+            server_identity: None,
+            retained_identity: None,
             thread: Some("thread-exact".into()),
             start: json!({}),
             alias: None,

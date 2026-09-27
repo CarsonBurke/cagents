@@ -140,6 +140,13 @@ This retains one small holder process per terminal until cleanup. A completed
 worker also retains its final screen (at most 8 MiB) in the holder, so another
 daemon crash cannot turn a completed command into a new execution. Closing its
 card or removing its owning project explicitly releases that retained result.
+Retained native/terminal pairs bind the terminal holder's exact process incarnation,
+not only a reusable session ID. Private release receipts allow an interrupted
+Close to finish after daemon restart. A terminal receipt proves its root and PTY
+owner were released (active close also stops the inspected terminal family); it
+makes no claim about previously disowned processes outside that family. Native
+provider holders separately reap all owned provider/tool descendants before
+confirming their release.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
@@ -229,6 +236,57 @@ recovery.
 
 Closed windows keep their recovery lineage across successive full upgrades;
 they do not need to be opened for every release.
+
+## Native provider continuity
+
+A newly owned native Codex server uses a small dedicated holder that remains
+alive when its daemon connection disappears. The holder owns only the provider
+process tree and bounded private control metadata; it does not run the UI,
+terminal emulator, transcript store, or a second protocol actor. It never sends
+a prompt or answers an approval. Explicit close terminates and reaps the entire
+owned process tree, including tools that changed their process group, before
+acknowledging cleanup. A private cleanup receipt records only the exact process
+and daemon identities after every descendant is reaped. If the Release reply is
+lost, a later close verifies that receipt; a missing socket or process alone is
+never treated as proof. Successful close consumes the receipt.
+
+Durable continuity is enabled only after the actual server confirms its exact
+thread, account directory, process identity, and a tested version. The current
+allowlist is Codex **0.157.1**. Other versions and providers retain their existing
+reconnect/resume behavior and do not acquire this durability claim. To extend
+the allowlist in `chat/native_holder.rs`, test a long-running command, a yielded
+command poll, and a pending approval across connection loss, then repeat those
+cases through a killed cagents daemon. Confirm the same server and thread and
+that no prompt or approval was automatically resent.
+
+A replacement daemon must hold the installation's exclusive lease and match
+the private holder's boot, process identities, and exact issued descriptor
+lineage. Removed account storage does not invalidate the proved server's process
+identity, but successful attachment still requires that server to confirm the
+thread. Codex 0.157.1 can return metadata for an unloaded thread or a live turn
+waiting on approval while refusing to attach because its rollout is missing,
+even when no history page is requested. That failure preserves the holder
+and reports unavailable history; metadata alone is not live continuity. This
+exception cannot authorize a new process or recreate the removed directory.
+A missing, exited, or mismatched holder refuses automatic
+recipe execution. Failed local actor installation preserves the retained server
+for another authenticated attempt. Paired terminal views must independently
+recover their own holder before the native pair is published.
+
+When unavailable history prevents attachment, Close still authenticates the
+exact retained owner and tears it down without loading history. The card keeps
+its descriptor until cleanup is confirmed. Private teardown receipts retain
+hashes of issued descriptors, allowing a lost close response to be retried after
+a daemon restart without interpreting a missing process as successful cleanup.
+
+Execution consoles retain their exact daemon-issued recipe in the native
+holder, independently of the provider listener. The holder acknowledges pair
+changes before they become visible. Adoption advances the retained execution
+capability and agent descriptor together; uncertain accepted runs remain
+interrupted and are never resent. A scheduler's held working-directory file
+descriptor reaches the provider launch through the holder. After recovery,
+read-only attachment and cancellation remain available if that path changed,
+while new work and approvals still require the saved directory identity.
 
 ## Recovering after a daemon change
 

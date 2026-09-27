@@ -29,6 +29,7 @@ use std::{
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
+            fs::MetadataExt,
             net::{UnixListener, UnixStream},
             process::CommandExt,
         },
@@ -51,7 +52,7 @@ use crate::terminal::holder::{self as registry, Record, Recovery};
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
 /// Protocol 1 holders could not be detached.
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 4;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
@@ -99,6 +100,8 @@ enum Request {
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
     Release,
+    /// Sent only after checked family termination or a drained completed PTY.
+    ReleaseProved,
     /// Final bounded emulator image, retained only after the root exits.
     CacheScreen { screen: String, screen_lost: bool },
     /// The successor allocated its parser and can now own the replay bytes.
@@ -223,6 +226,9 @@ pub(super) fn spawn_recoverable(
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(process));
+    let registered_id = recovery.as_ref().map(|recovery| recovery.source.id);
+    let owner = registry::Process::read(holder.process.as_ref().unwrap().id() as i32)
+        .map_err(|error| error.to_string())?;
     holder.registered = recovery.is_some();
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
@@ -272,6 +278,14 @@ pub(super) fn spawn_recoverable(
         _ => return Err("terminal holder answered out of turn".into()),
     };
     holder.protocol = PROTOCOL;
+    if let Some(id) = registered_id {
+        let record = registry::evidence(&registry::socket(&registry::directory()?, id))?
+            .ok_or("New terminal holder has no discovery evidence")?;
+        if record.holder != owner || record.root.pid != pid {
+            return Err("New terminal holder evidence does not match its exact child".into());
+        }
+        holder.record = Some(record);
+    }
     watched(holder, pid, descriptors, None, exits)
 }
 
@@ -377,6 +391,7 @@ pub(super) fn adopt_recoverable(
     holder.detached = false;
     holder.adoption_pending = evidence.is_some();
     holder.registered = evidence.is_some();
+    holder.record = evidence;
     holder.screen_lost = screen_lost;
     Ok(Adopted {
         held: watched(holder, pid, descriptors, exited, exits)?,
@@ -524,9 +539,17 @@ pub(super) struct Holder {
     adoption_pending: bool,
     registered: bool,
     screen_lost: bool,
+    cleanup_proved: bool,
+    record: Option<Record>,
 }
 
 impl Holder {
+    pub(super) fn record(&self) -> Option<&Record> {
+        self.record.as_ref()
+    }
+    pub(super) fn prove_cleanup(&mut self) {
+        self.cleanup_proved = true;
+    }
     pub(super) fn registered(&self) -> bool {
         self.registered
     }
@@ -590,6 +613,8 @@ impl Holder {
             adoption_pending: false,
             registered: false,
             screen_lost: false,
+            cleanup_proved: false,
+            record: None,
         }
     }
 
@@ -675,12 +700,28 @@ impl Drop for Holder {
         if !self.detached {
             // First, so the watch takes the holder's exit for the release it is.
             drop(self.release.take());
-            let _ = send(&self.control, &Request::Release, &[]);
+            let request = if self.cleanup_proved && self.protocol >= 4 {
+                Request::ReleaseProved
+            } else {
+                Request::Release
+            };
+            let _ = send(&self.control, &request, &[]);
             let exited = self
                 .pidfd
                 .as_ref()
                 .is_some_and(|pidfd| exits_within(pidfd, RELEASE_GRACE).unwrap_or(false));
-            if !exited {
+            if !exited && self.cleanup_proved && self.protocol >= 4 {
+                // A proved release may still be fsyncing its receipt. Keep
+                // that exact owner alive; killing it would erase the only
+                // authority for a retry after the daemon exits.
+                if let Some(mut process) = self.process.take() {
+                    let _ = thread::Builder::new()
+                        .name("terminal-release".into())
+                        .spawn(move || {
+                            let _ = process.wait();
+                        });
+                }
+            } else if !exited {
                 tracing::warn!("killing a terminal holder that did not exit when released");
                 match (&mut self.process, &self.pidfd) {
                     (Some(process), _) => {
@@ -898,6 +939,8 @@ struct Residence {
     directory: PathBuf,
     listener: UnixListener,
     record: Record,
+    socket_device: u64,
+    socket_inode: u64,
 }
 
 impl Residence {
@@ -909,6 +952,7 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let record = Record {
             version: PROTOCOL,
+            kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
             terminal: recovery.source.id,
@@ -918,6 +962,7 @@ impl Residence {
         };
         let socket = registry::socket(&directory, record.terminal);
         let listener = UnixListener::bind(&socket).map_err(|error| error.to_string())?;
+        let metadata = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
         if let Err(error) = record.create(&directory) {
             let _ = std::fs::remove_file(socket);
             return Err(error.to_string());
@@ -926,13 +971,33 @@ impl Residence {
             directory,
             listener,
             record,
+            socket_device: metadata.dev(),
+            socket_inode: metadata.ino(),
         })
+    }
+
+    fn retire(&self) -> io::Result<()> {
+        let path = registry::socket(&self.directory, self.record.terminal);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.dev() == self.socket_device && metadata.ino() == self.socket_inode =>
+            {
+                match std::fs::remove_file(path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    result => result?,
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.record.remove_record(&self.directory)
     }
 }
 
 impl Drop for Residence {
     fn drop(&mut self) {
-        self.record.remove(&self.directory);
+        let _ = self.retire();
     }
 }
 
@@ -1058,6 +1123,7 @@ fn serve(control: UnixStream) -> i32 {
     let mut cached_screen = None;
     let mut pending_replay: Option<(String, Vec<u8>, bool)> = None;
     let mut control = control;
+    let mut cleanup_proved = false;
     loop {
         let disposition = if lost {
             Attendance::Lost
@@ -1073,6 +1139,10 @@ fn serve(control: UnixStream) -> i32 {
         };
         let (socket, screen, output, screen_lost) = match disposition {
             Attendance::Release => break,
+            Attendance::ReleaseProved => {
+                cleanup_proved = true;
+                break;
+            }
             Attendance::Lost => match &residence {
                 Some(residence) => {
                     let (screen, output, lost) = pending_replay.take().unwrap_or_else(|| {
@@ -1152,6 +1222,25 @@ fn serve(control: UnixStream) -> i32 {
     drop(child);
     // The master closes with the holder, hanging up whatever is left on it.
     drop(pair.master);
+    if cleanup_proved && let (Some(residence), Some(recovery)) = (&residence, &recovery) {
+        // The checked worker has already stopped its exact process family;
+        // independently require that this holder reaped the root too.
+        if exit.is_none() && exits_within(&pidfd, Duration::ZERO).unwrap_or(false) {
+            exit = reap(pid);
+        }
+        if exit.is_some() {
+            loop {
+                if registry::cleanup::publish(&residence.record, recovery).is_ok()
+                    && residence.retire().is_ok()
+                {
+                    break;
+                }
+                // A failed durable write retains this exact small owner;
+                // callers time out honestly and can retry its receipt.
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     0
 }
 
@@ -1159,6 +1248,7 @@ fn serve(control: UnixStream) -> i32 {
 /// `None`, or asks for it to be detached onto a socket, with its screen.
 enum Attendance {
     Release,
+    ReleaseProved,
     Lost,
     Detach { socket: PathBuf, screen: String },
 }
@@ -1246,6 +1336,7 @@ fn attend(
                     Attendance::Detach { socket, screen }
                 }
                 Ok(Some((Request::Release, _))) => Attendance::Release,
+                Ok(Some((Request::ReleaseProved, _))) => Attendance::ReleaseProved,
                 _ => Attendance::Lost,
             };
         }
@@ -2012,6 +2103,26 @@ mod tests {
     #[test]
     fn registered_holder_survives_sigkill_and_repeated_adoption_without_restarting_root() {
         const CHILD: &str = "CAGENTS_HOLDER_CRASH_FIXTURE";
+        const COORDINATOR: &str = "CAGENTS_HOLDER_CRASH_COORDINATOR";
+        if std::env::var_os(CHILD).is_none() && std::env::var_os(COORDINATOR).is_none() {
+            // Receipt validation deliberately discovers the caller's runtime
+            // and actual exclusive lease. Isolate the whole coordinator rather
+            // than changing process-global environment in a parallel test.
+            let directory = tempfile::Builder::new()
+                .prefix("cagents-holder-close-")
+                .tempdir_in("/var/tmp")
+                .unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::holder::tests::registered_holder_survives_sigkill_and_repeated_adoption_without_restarting_root", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", directory.path())
+                .env("XDG_RUNTIME_DIR", directory.path()).env(COORDINATOR, directory.path())
+                .status().unwrap();
+            assert!(
+                status.success(),
+                "isolated holder coordinator failed: {status}"
+            );
+            return;
+        }
         if let Some(ready) = std::env::var_os(CHILD) {
             let proof = crate::model::HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
@@ -2084,12 +2195,12 @@ mod tests {
                 }
             }
         }
-        let directory = tempfile::tempdir().unwrap();
-        let ready = directory.path().join("ready");
+        let directory = PathBuf::from(std::env::var_os(COORDINATOR).expect("isolated coordinator"));
+        let ready = directory.as_path().join("ready");
         let daemon = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "terminal::worker::holder::tests::registered_holder_survives_sigkill_and_repeated_adoption_without_restarting_root", "--nocapture"])
-            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", directory.path())
-            .env("XDG_RUNTIME_DIR", directory.path()).env(CHILD, &ready)
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", directory.as_path())
+            .env("XDG_RUNTIME_DIR", directory.as_path()).env(CHILD, &ready)
             .spawn().unwrap();
         let mut cleanup = Cleanup {
             daemon,
@@ -2108,7 +2219,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let holders = directory
-            .path()
+            .as_path()
             .join(crate::instance::RUNTIME_SUBDIRECTORY)
             .join("holders");
         let boot = crate::daemon::read_boot_id().unwrap();
@@ -2124,7 +2235,9 @@ mod tests {
         cleanup.daemon.wait().unwrap();
         assert!(record.holder.is_current());
         assert!(record.root.is_current());
-        let runtime = directory.path().join(crate::instance::RUNTIME_SUBDIRECTORY);
+        let runtime = directory
+            .as_path()
+            .join(crate::instance::RUNTIME_SUBDIRECTORY);
         let paths = crate::daemon::RuntimePaths {
             directory: runtime.clone(),
             socket: runtime.join(crate::terminal::ipc::SOCKET_FILE_NAME),
@@ -2194,7 +2307,7 @@ mod tests {
         };
         let lease = crate::daemon::HostLease::acquire(&paths, &third).unwrap();
         let (mut next, _) = inspect(&socket, &record, &third).unwrap();
-        assert_eq!(next.previous_sources, vec![original]);
+        assert_eq!(next.previous_sources, vec![original.clone()]);
         next.previous_sources.push(next.source.clone());
         next.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
             host_session_id: crate::model::HostSessionId::new("third"),
@@ -2255,9 +2368,9 @@ mod tests {
         let (mut completed, _) = inspect(&socket, &record, &final_proof).unwrap();
         completed.previous_sources.push(completed.source.clone());
         completed.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
-            host_session_id: final_proof.host_session_id,
+            host_session_id: final_proof.host_session_id.clone(),
             boot_id: boot,
-            host_incarnation: final_proof.host_incarnation,
+            host_incarnation: final_proof.host_incarnation.clone(),
         };
         let (exits, exited) = crossbeam_channel::bounded(1);
         let mut restored = adopt_recoverable(&socket, exits, Some(completed)).unwrap();
@@ -2272,6 +2385,9 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&restored.output).contains("completed-result"));
         restored.held.holder.commit_adoption().unwrap();
+        // This fixture has observed the exact root exit and drained retained
+        // output, equivalent to the completed worker's close disposition.
+        restored.held.holder.prove_cleanup();
         drop(restored);
         wait_gone(record.root.pid);
         wait_gone(record.holder.pid);
@@ -2281,6 +2397,26 @@ mod tests {
                 .is_empty()
         );
         assert!(!socket.exists(), "explicit release removes its endpoint");
+        assert!(registry::cleanup::confirmed(&original, &record, &final_proof).unwrap());
+        let mut replacement = record.clone();
+        replacement.holder.start += 1;
+        assert!(
+            !registry::cleanup::confirmed(&original, &replacement, &final_proof).unwrap(),
+            "same terminal descriptor does not prove a different holder's cleanup"
+        );
+        let mut wrong = original.clone();
+        wrong.launch.arguments.push("different".into());
+        assert!(!registry::cleanup::confirmed(&wrong, &record, &final_proof).unwrap());
+        drop(_lease);
+        let retry = crate::model::HostSessionProof {
+            host_incarnation: crate::model::HostIncarnation::new("close-retry"),
+            ..final_proof
+        };
+        let _lease = crate::daemon::HostLease::acquire(&paths, &retry).unwrap();
+        assert!(
+            registry::cleanup::confirmed(&original, &record, &retry).unwrap(),
+            "terminal proof survives the daemon loss between paired cleanup and native receipt confirmation"
+        );
     }
 
     #[test]

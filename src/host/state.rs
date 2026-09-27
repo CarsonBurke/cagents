@@ -251,6 +251,7 @@ pub(crate) struct HostState {
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
+    pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
@@ -302,6 +303,7 @@ impl HostState {
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
+            native_closing: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),
@@ -312,6 +314,10 @@ impl HostState {
 
     pub(crate) fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    pub(super) fn has_committed_upgrade(&self) -> bool {
+        self.upgrade.is_some()
     }
 
     /// The shared proof, for a broadcast that must not clone it per subscriber.
@@ -1503,12 +1509,15 @@ fn prepare_upgrade_with_policy(
                 "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
             ));
         }
-        // A terminal is carried to the next daemon, processes and all, unless
-        // a native conversation shares its identity or it runs in one's exact
-        // environment, which is never written down: those restart as before.
+        // A durable native holder also keeps its paired terminal alive. Its
+        // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            !state.chats.contains_key(id)
-                && record.execution_environment.is_none()
+            (state.chats.get(id).is_some_and(|chat| {
+                matches!(
+                    chat.handle.native_continuity(),
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some_and(|holders| holder_socket_fits(&holder_socket(holders, *id)))
         };
         let carried = state
@@ -1556,7 +1565,16 @@ fn prepare_upgrade_with_policy(
                     "A native provider has unconfirmed work after a failed close; resolve that provider before upgrading",
                 ));
             }
-            let source = record.session.clone();
+            let mut source = record.session.clone();
+            source.native_continuity = record.handle.native_continuity();
+            if matches!(
+                source.native_continuity,
+                crate::chat::NativeContinuity::Durable { .. }
+            ) {
+                source.launch.session_id = record.handle.confirmed_session_id();
+                crate::chat::protocol::align_resume_identity(&mut source.launch)
+                    .map_err(upgrade_error)?;
+            }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
             // An interrupt-driven reset rotates the live conversation past
@@ -1585,6 +1603,10 @@ fn prepare_upgrade_with_policy(
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -1883,14 +1905,31 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?
     };
     for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-        handle.close()?;
+        let durable = matches!(
+            handle.native_continuity(),
+            crate::chat::NativeContinuity::Durable { .. }
+        );
+        if durable {
+            handle.preserve_for_restart()?;
+        } else {
+            handle.close()?;
+        }
         if handle.owns_work() {
             return Err("Native provider shutdown remains unconfirmed; checkpoint retained".into());
         }
-        chat.launch.session_id = handle.confirmed_session_id();
-        chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
-            "Closed provider did not retain its exact conversation identity; checkpoint retained",
-        )?;
+        if durable {
+            // The retained server and every issued alias refer to this exact
+            // launch. A terminal resume recipe describes a new server, not
+            // the live owner the successor must authenticate.
+            if chat.launch.session_id != handle.confirmed_session_id() {
+                return Err("Retained provider changed its confirmed conversation during upgrade; checkpoint retained".into());
+            }
+        } else {
+            chat.launch.session_id = handle.confirmed_session_id();
+            chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
+                "Closed provider did not retain its exact conversation identity; checkpoint retained",
+            )?;
+        }
     }
     // Carried last: a holder left waiting by an upgrade that then fails
     // outlives its daemon for nothing, and only the final save follows this.
@@ -2061,6 +2100,54 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
 /// A holder's private record is discovery only. The live holder must return
 /// matching process evidence and the previous daemon's issued lineage before
 /// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
+/// Called only after the terminal holder authenticated these descriptors and
+/// the restored worker was installed. A console keeps Chat authority until its
+/// native holder installs the exact paired successor.
+fn restore_terminal_execution_authority(
+    host: &SharedHost,
+    source: &TerminalSession,
+    previous: &[TerminalSession],
+) -> Result<(), String> {
+    use crate::agent_execution::HostedSession;
+    let registry = super::agent_execution::registry(host)?;
+    let authority = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_authority_source(source.id)?;
+    if !matches!(authority, Some(HostedSession::Terminal(_))) {
+        return Ok(());
+    }
+    let successor = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .descriptor(0, source.id)
+        .map_err(|error| error.message)?
+        .session;
+    let mut retained = Vec::new();
+    for source in previous.iter().chain(std::iter::once(source)) {
+        retained.push(HostedSession::Terminal(source.clone()));
+        if let Some(proof) = source.continuity.live_proof() {
+            // Holder discovery records detached ownership. Capability issuance
+            // used the same process proof while it was attached to the daemon.
+            let mut attached = source.clone();
+            attached.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            };
+            retained.push(HostedSession::Terminal(attached.clone()));
+            attached.resume_hint =
+                crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
+            retained.push(HostedSession::Terminal(attached));
+        }
+    }
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
+    Ok(())
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
@@ -2110,8 +2197,10 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
                 .map_err(|error| error.message)?;
             if let Some(terminal) = state.terminals.get_mut(&record.terminal) {
                 terminal.screen_lost_after_crash = screen_lost;
-                terminal.session.resume_hint = source.resume_hint;
+                terminal.session.resume_hint = source.resume_hint.clone();
             }
+            drop(state);
+            restore_terminal_execution_authority(host, &source, &previous_sources)?;
             Ok::<_, String>(())
         })();
         if let Err(error) = restored {
@@ -2147,7 +2236,12 @@ fn restore_upgrade_from(
         return Ok(());
     };
     checkpoint.validate()?;
-    if !checkpoint.chats.is_empty() {
+    if checkpoint.chats.iter().any(|chat| {
+        !matches!(
+            chat.source.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        )
+    }) {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -2157,6 +2251,14 @@ fn restore_upgrade_from(
         ensure_no_surviving_process(&terminal.source, std::process::id(), proc_root)?;
     }
     for chat in &checkpoint.chats {
+        // A private holder authenticates the exact still-running server. Its
+        // presence is the purpose of adoption, not permission to relaunch it.
+        if matches!(
+            chat.source.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        ) {
+            continue;
+        }
         let terminal = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
@@ -2189,7 +2291,12 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if super::chat::owns_codex_listener(&chat.source)
+                && !matches!(
+                    chat.source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+            {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -2201,6 +2308,26 @@ fn restore_upgrade_from(
             }
             if adopt_carried_terminal(host, terminal, holders, proc_root) {
                 adopted.push(terminal.source.id);
+            }
+        }
+        // Completed paired views are deliberately absent from the execution
+        // checkpoint, but their authenticated holders retain the final screen.
+        // Restore those receipts before requiring a native pair to match.
+        if checkpoint.chats.iter().any(|chat| {
+            chat.source.terminal.is_some()
+                && matches!(
+                    chat.source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+        }) {
+            restore_orphaned_holders(host)?;
+        }
+        for chat in &checkpoint.chats {
+            if matches!(
+                chat.source.native_continuity,
+                crate::chat::NativeContinuity::Durable { .. }
+            ) {
+                super::chat::restore_upgrade(host, chat)?;
             }
         }
         for terminal in &checkpoint.terminals {
@@ -2386,6 +2513,14 @@ fn adopt_carried_terminal(
                     } else {
                         tracing::info!(terminal = %id, "adopted a terminal carried across the upgrade");
                     }
+                    drop(state);
+                    if let Err(error) = restore_terminal_execution_authority(
+                        host,
+                        &previous.source,
+                        &previous.previous_sources,
+                    ) {
+                        tracing::warn!(terminal = %id, %error, "terminal survived but execution authority could not be restored");
+                    }
                     return true;
                 }
                 Err(failure) => error = failure.message,
@@ -2503,7 +2638,14 @@ fn close_failed_restore(
         )
     };
     for chat in chats {
-        chat.close()?;
+        if matches!(
+            chat.native_continuity(),
+            crate::chat::NativeContinuity::Durable { .. }
+        ) {
+            chat.preserve_for_restart()?;
+        } else {
+            chat.close()?;
+        }
         if chat.owns_work() {
             return Err("Failed restore still has unconfirmed native work".into());
         }
@@ -2567,9 +2709,56 @@ pub(super) fn spawn_terminal_view(
     )
 }
 
+/// Returns the exact worker published with the descriptor. A subsequent lookup
+/// by ID cannot establish ownership: another caller may already have replaced it.
+pub(super) fn spawn_terminal_view_owned(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        None,
+        None,
+    )
+}
+
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
 /// adopting the one a predecessor daemon's holder waits with there.
 fn start_terminal_view(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+    )
+    .map(|(descriptor, _)| descriptor)
+}
+
+/// Starts a terminal's worker, spawning its process or, given `adoption`,
+/// adopting the one a predecessor daemon's holder waits with there.
+fn start_terminal_view_owned(
     shared: &SharedHost,
     client_id: ClientId,
     session: TerminalSession,
@@ -2578,7 +2767,7 @@ fn start_terminal_view(
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
-) -> Result<TerminalDescriptor, ProtocolError> {
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     if let Some(environment) = &mut execution_environment {
@@ -2728,6 +2917,11 @@ fn start_terminal_view(
                 .get_mut(&terminal_id)
                 .expect("finished spawn")
                 .execution_environment = retained_environment;
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished spawn")
+                .options = options.clone();
         }
         if native_handoff {
             // A chat connection cannot consume PTY events. The GUI attaches a
@@ -2743,13 +2937,6 @@ fn start_terminal_view(
             return Err(error);
         }
     };
-    shared
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .terminals
-        .get_mut(&terminal_id)
-        .expect("finished spawn")
-        .options = options;
     // Initial publication can happen before the record is subscribable. Clear
     // that edge after insertion; the Spawn response carries the same snapshot,
     // and later generations can now produce a fresh wake.
@@ -2779,16 +2966,20 @@ fn start_terminal_view(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.terminals.remove(&terminal_id);
-        state.inventory_generation += 1;
-        state.subscriptions.detach(client_id, terminal_id);
+        if state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_worker(&redraw_handle))
+        {
+            state.retire_terminal(terminal_id);
+        }
         return Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
             format!("could not start terminal event monitor: {error}"),
             true,
         ));
     }
-    Ok(descriptor)
+    Ok((descriptor, redraw_handle))
 }
 
 fn apply_visibility(
@@ -3102,6 +3293,9 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
         false,
     )
 }
+
+#[cfg(test)]
+mod native_upgrade_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3509,6 +3703,7 @@ for line in sys.stdin:
         }
         let host = Arc::new(Mutex::new(test_host()));
         let source = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
@@ -3795,6 +3990,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
@@ -4497,6 +4693,7 @@ for line in sys.stdin:
                         recipe: recipe.clone(),
                         session_id: None,
                     },
+                    native_continuity: Default::default(),
                     owned_codex_listener: None,
                     proof: Some(state.proof().clone()),
                     terminal: None,
