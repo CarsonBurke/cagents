@@ -273,6 +273,11 @@ async fn connect(
             let _ = ready.send(Ok(()));
             futures_util::pin_mut!(actions);
             while let Some(action) = actions.next().await {
+                tracing::debug!(
+                    id = action.id(),
+                    action = action.name(),
+                    "desktop notification action received"
+                );
                 let Some(shared) = shared.upgrade() else {
                     break;
                 };
@@ -728,12 +733,14 @@ async fn run(
                                 &window,
                                 token.as_deref(),
                             ) {
+                                tracing::warn!(%error, "could not launch notification destination");
                                 snapshot.diagnostic = Some(format!(
                                     "Could not open the notification's window: {error}"
                                 ));
                             }
                         }
                         Err(error) => {
+                            tracing::warn!(%error, "could not activate notification destination");
                             snapshot.diagnostic = Some(format!(
                                 "Could not activate the notification's window: {error}"
                             ))
