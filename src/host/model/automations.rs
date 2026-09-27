@@ -1757,18 +1757,29 @@ mod tests {
                     300,
                 )
                 .unwrap();
+            let accepted_name = definition.name.clone();
+            definition.name.push_str(" after run");
+            let automation = registry
+                .edit_automation(
+                    automation.id,
+                    automation.revision,
+                    definition.clone(),
+                    350,
+                    test_identity(),
+                )
+                .unwrap();
             assert_eq!(
                 registry
                     .automation_run_detail(claim.firing.id)
                     .unwrap()
                     .definition
                     .name,
-                definition.name
+                accepted_name
             );
             registry
                 .remove_automation(automation.id, automation.revision, 400)
                 .unwrap();
-            expected.insert(claim.firing.id, definition.name.clone());
+            expected.insert(claim.firing.id, accepted_name);
         }
         assert!(registry.automations(None, 100).unwrap().is_empty());
         let mut cursor = None;
