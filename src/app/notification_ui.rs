@@ -501,6 +501,9 @@ mod tests {
             .filter(|card| matches!(card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
             .count();
         let run = crate::model::RunId::new();
+        // Restoring an automation card starts a list read before its cold
+        // notification activation reaches the UI.
+        drop(app.update_automation_ui(crate::automation_ui::Action::Refresh));
         drop(app.update_notifications(Action::Activated(Target::AgentRun(run))));
         assert!(
             app.durable
@@ -516,10 +519,12 @@ mod tests {
                 .count(),
             original
         );
-        assert!(
-            !app.automation_ui.can_open_run(),
-            "exact history read is pending"
-        );
+        assert!(matches!(
+            app.card_state(app.workspace.focused().unwrap())
+                .unwrap()
+                .kind,
+            CardKind::Automations
+        ));
     }
     use crate::{
         agent::Provider,
