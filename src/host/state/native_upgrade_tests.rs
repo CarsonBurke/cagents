@@ -190,6 +190,13 @@ exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
             "upgrade shutdown killed retained provider (save failure={fail_final_save})"
         );
         assert!(registry::evidence(&socket, Kind::Native).unwrap().is_some());
+        let (issued, _) = crate::chat::native_holder::inspect(&record, &proof).unwrap();
+        let stale_source = issued
+            .previous_sources
+            .iter()
+            .find(|source| matches!(source.native_continuity, NativeContinuity::ReconnectOnly))
+            .expect("holder retains its genuinely issued pre-confirmation descriptor")
+            .clone();
         if !fail_final_save {
             let ready = store.load().unwrap().unwrap();
             assert_eq!(ready.phase, Phase::Ready);
@@ -223,7 +230,9 @@ exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
                 &successor,
                 0,
                 crate::terminal::ipc::ClientRequest::ChatStart {
-                    session: source.clone(),
+                    // This real old alias predates native capability promotion.
+                    // It must recover the holder, never create a second adapter.
+                    session: stale_source.clone(),
                     source: None,
                     terminate_source: false,
                     execution_environment: Default::default(),
@@ -424,7 +433,75 @@ exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
                 "a close receipt must not authorize a changed conversation"
             );
         } else {
-            handle.close().unwrap();
+            // Model the already-published failed local adapter from an older
+            // daemon: closing it must also reclaim the independently retained
+            // provider, not acknowledge only this unrelated local process.
+            let local = completed_local_adapter(&root);
+            let mut state = HostState::new(proof.clone());
+            state.install_model(
+                crate::host::model::Registry::at(&root.join("local-close.sqlite3")).unwrap(),
+            );
+            state.chats.insert(
+                id,
+                super::super::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    console_recipe: None,
+                    paired_terminal: None,
+                    session: stale_source,
+                    handle: local,
+                    source_process: None,
+                    subscribers: std::collections::BTreeMap::from([(0, false)]),
+                    observations: Default::default(),
+                    completion_observed: true,
+                    returning_terminal: false,
+                },
+            );
+            let successor = Arc::new(Mutex::new(state));
+            let execution = super::super::agent_execution::registry(&successor).unwrap();
+            execution
+                .lock()
+                .unwrap()
+                .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
+                    prepared.chats[0].source.clone(),
+                ))
+                .unwrap();
+            let fault = rusqlite::Connection::open(root.join("local-close.sqlite3")).unwrap();
+            fault.execute_batch("CREATE TRIGGER refuse_local_retirement BEFORE DELETE ON agent_authorities BEGIN SELECT RAISE(FAIL, 'local retirement unavailable'); END;").unwrap();
+            let failed = super::super::client::process_request(
+                &successor,
+                0,
+                crate::terminal::ipc::ClientRequest::ChatClose { chat_id: id },
+            )
+            .unwrap_err();
+            assert!(
+                failed.message.contains("local retirement unavailable"),
+                "{failed:?}"
+            );
+            assert!(successor.lock().unwrap().native_closing.contains_key(&id));
+            assert!(successor.lock().unwrap().chats.contains_key(&id));
+            assert!(registry::evidence(&socket, Kind::Native).unwrap().is_none());
+            fault
+                .execute_batch("DROP TRIGGER refuse_local_retirement;")
+                .unwrap();
+            assert!(matches!(
+                super::super::client::process_request(
+                    &successor,
+                    0,
+                    crate::terminal::ipc::ClientRequest::ChatClose { chat_id: id }
+                )
+                .unwrap()
+                .0,
+                crate::terminal::ipc::ServerResponse::ChatClosed { .. }
+            ));
+            assert!(!successor.lock().unwrap().chats.contains_key(&id));
+            assert!(
+                execution
+                    .lock()
+                    .unwrap()
+                    .retained_agent_authority_source(id)
+                    .unwrap()
+                    .is_none()
+            );
         }
         wait_until(
             || !record.root.is_current(),
@@ -440,6 +517,37 @@ fn wait_until(mut condition: impl FnMut() -> bool, failure: &str) {
         assert!(Instant::now() < deadline, "{failure}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn completed_local_adapter(root: &std::path::Path) -> crate::chat::runtime::Handle {
+    use crate::chat::protocol::{Adapter, ProcessSpec, Step};
+    struct Local;
+    impl Adapter for Local {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let recipe = LaunchRecipe {
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: root.into(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mut initial = Step::default();
+    let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle =
+        crate::chat::runtime::Handle::start(spec, Box::new(Local), initial, store, None, |_| {})
+            .unwrap();
+    handle.close().unwrap();
+    handle
 }
 
 fn provider() {

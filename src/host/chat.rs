@@ -707,6 +707,20 @@ pub(super) fn start_execution(
     )
 }
 
+/// Discovery can route an old presentation descriptor to recovery, but grants
+/// no launch authority. Recovery authenticates the complete issued descriptor
+/// with the holder before attaching, and never falls back to recipe execution.
+fn has_native_owner(session: &Session) -> Result<bool, ProtocolError> {
+    if session.launch.provider != Provider::Codex {
+        return Ok(false);
+    }
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let directory = registry::directory(Kind::Native).map_err(unavailable)?;
+    registry::evidence(&registry::socket(&directory, session.id), Kind::Native)
+        .map(|record| record.is_some())
+        .map_err(unavailable)
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -766,7 +780,8 @@ fn start_with_execution(
     if matches!(
         session.native_continuity,
         chat::NativeContinuity::Durable { .. }
-    ) {
+    ) || has_native_owner(&session)?
+    {
         return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
     let reservation_id = session.id;
@@ -1862,15 +1877,26 @@ fn process_inner(
             source,
             terminate_source,
             execution_environment,
-        } => start(
-            host,
-            client,
-            client_session(host, session),
-            source,
-            terminate_source,
-            None,
-            execution_environment,
-        ),
+        } => {
+            // Keep the exact old alias, including its allocation provenance.
+            // A client can mount before the provider confirms durable support;
+            // normalizing that saved ReconnectOnly descriptor would destroy the
+            // holder's immutable evidence before recovery can authenticate it.
+            let session = if has_native_owner(&session)? {
+                session
+            } else {
+                client_session(host, session)
+            };
+            start(
+                host,
+                client,
+                session,
+                source,
+                terminate_source,
+                None,
+                execution_environment,
+            )
+        }
         ClientRequest::ChatAttach { session } => {
             // A live actor remains attachable after account removal. A stopped
             // actor cannot resume with that home, so expose the same recovery
@@ -2188,6 +2214,25 @@ fn process_inner(
             };
             handle.close().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
+            let (retained, pending_cleanup) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let retained = state
+                    .chats
+                    .get(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle))
+                    .map(|record| record.session.clone())
+                    .ok_or_else(|| {
+                        unavailable("The thread changed while its previous actor was closing.")
+                    })?;
+                (retained, state.native_closing.contains_key(&chat_id))
+            };
+            if pending_cleanup || has_native_owner(&retained)? {
+                // Closing an exited attachment proves only that local actor is
+                // gone. A server preserved by an earlier failed adoption must
+                // also acknowledge exact cleanup before this close can succeed.
+                close_retained_native(host, &retained).map_err(unavailable)?;
+                return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
+            }
             let terminal = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 let record = state
