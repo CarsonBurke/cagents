@@ -695,8 +695,21 @@ pub(crate) mod handoff {
                         source_proof(previous.source.proof.clone(), &mut proofs)?;
                     }
                     validate_chat_source(&previous.source, &previous.launch)?;
-                    let expected_launch = if durable { &chat.launch } else { &next.launch };
-                    if previous.source.id != chat.source.id || &previous.launch != expected_launch {
+                    let follows = if durable {
+                        previous.launch == chat.launch
+                    } else {
+                        // Restart argv is normalized, while the successor's
+                        // issued descriptor retains the immutable source recipe.
+                        // Bind both to the confirmed identity before comparing
+                        // the complete executable, argv, cwd and environment.
+                        previous.launch.provider == next.launch.provider
+                            && previous.launch.session_id == next.launch.session_id
+                            && previous
+                                .launch
+                                .terminal_recipe()
+                                .is_some_and(|recipe| Some(recipe) == next.launch.terminal_recipe())
+                    };
+                    if previous.source.id != chat.source.id || !follows {
                         return Err("Upgrade native lineage is inconsistent".into());
                     }
                 }
