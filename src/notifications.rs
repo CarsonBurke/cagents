@@ -34,6 +34,7 @@ pub enum Kind {
     Failed,
     Cancelled,
     Waiting,
+    Interrupted,
 }
 
 impl Kind {
@@ -43,6 +44,7 @@ impl Kind {
             Self::Failed => "Agent failed",
             Self::Cancelled => "Agent cancelled",
             Self::Waiting => "Agent needs your attention",
+            Self::Interrupted => "Agent outcome unknown",
         }
     }
 }
@@ -199,7 +201,7 @@ impl Preferences {
             && match kind {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
-                Kind::Waiting => self.waiting,
+                Kind::Waiting | Kind::Interrupted => self.waiting,
             }
     }
 }
@@ -258,6 +260,7 @@ mod tests {
             Kind::Failed,
             Kind::Cancelled,
             Kind::Waiting,
+            Kind::Interrupted,
         ] {
             assert!(preferences.allows(kind, false));
             assert!(!preferences.allows(kind, true));
@@ -265,6 +268,9 @@ mod tests {
         preferences.failure = false;
         assert!(!preferences.allows(Kind::Failed, false));
         assert!(!preferences.allows(Kind::Cancelled, false));
+        assert!(preferences.allows(Kind::Interrupted, false));
+        preferences.waiting = false;
+        assert!(!preferences.allows(Kind::Interrupted, false));
         assert!(preferences.allows(Kind::Succeeded, false));
         preferences.while_focused = true;
         assert!(preferences.allows(Kind::Succeeded, true));

@@ -693,7 +693,8 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
     }
     let kind = match run.state {
         State::Succeeded => Kind::Succeeded,
-        State::Failed | State::Interrupted => Kind::Failed,
+        State::Failed => Kind::Failed,
+        State::Interrupted => Kind::Interrupted,
         State::Cancelled => Kind::Cancelled,
         State::Waiting => Kind::Waiting,
         _ => return None,
@@ -805,7 +806,7 @@ mod tests {
                 run.id,
                 run.revision,
                 Update::Finished {
-                    state: State::Succeeded,
+                    state: State::Interrupted,
                     result: Default::default(),
                 },
                 700,
@@ -815,7 +816,7 @@ mod tests {
             run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
         assert_eq!(
             finished.evidence.kind,
-            crate::notifications::Kind::Succeeded
+            crate::notifications::Kind::Interrupted
         );
         assert_eq!(
             finished.source_session(),
