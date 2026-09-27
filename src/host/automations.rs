@@ -3,6 +3,7 @@
 
 pub(super) mod precheck;
 pub(super) mod schedule;
+pub(super) mod target;
 
 pub(super) fn helper_entry() -> Option<Result<(), String>> {
     precheck::worker::entry()

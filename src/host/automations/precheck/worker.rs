@@ -32,10 +32,11 @@ const MAX_RECORD: u64 = 128 * 1024;
 const CLEANUP_WINDOW: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(super) struct Request {
+pub(in crate::host::automations) struct Request {
     pub firing: Uuid,
     pub revision: u64,
     pub directory: PathBuf,
+    pub target_identity: crate::automations::DirectoryIdentity,
     pub precheck: Precheck,
 }
 
@@ -55,14 +56,14 @@ struct Receipt {
     outcome: Outcome,
 }
 
-pub(super) enum Status {
+pub(in crate::host::automations) enum Status {
     Running,
     Complete(Outcome),
     /// An unlocked lease without a receipt cannot prove that descendants died.
     CleanupUnconfirmed,
 }
 
-pub(super) struct Worker {
+pub(in crate::host::automations) struct Worker {
     directory: PathBuf,
     firing: Uuid,
     revision: u64,
@@ -227,12 +228,29 @@ pub(crate) fn entry() -> Option<Result<(), String>> {
             if args.next().is_some() {
                 return Err("Unexpected precheck arguments".into());
             }
-            let outcome = super::run(
-                &SystemProcessExecutor,
-                &request.precheck,
-                &request.directory,
-                &CancellationToken::default(),
-            );
+            let outcome = (|| -> io::Result<Outcome> {
+                let held_directory = crate::host::automations::target::verify(
+                    &request.directory,
+                    &request.target_identity,
+                )?;
+                // This dedicated helper has no other threads and executes one
+                // command. Retain the exact checked object through shell spawn;
+                // replacing the old pathname cannot redirect the authorized work.
+                if unsafe { libc::fchdir(held_directory.as_raw_fd()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(super::run(
+                    &SystemProcessExecutor,
+                    &request.precheck,
+                    Path::new("."),
+                    &CancellationToken::default(),
+                ))
+            })()
+            .unwrap_or_else(|error| {
+                failed(format!(
+                    "Precheck target could not be opened safely: {error}"
+                ))
+            });
             serde_json::to_writer(io::stdout().lock(), &outcome).map_err(|e| e.to_string())
         } else {
             let fd = args
@@ -266,6 +284,12 @@ pub(crate) fn entry() -> Option<Result<(), String>> {
 }
 
 fn supervisor(directory: &Path, request: &Request, _lease: File) -> io::Result<()> {
+    // SIG_IGN survives exec and automatically reaps children. That would
+    // invalidate the unreaped-PID invariant used by OwnedChildren, so restore
+    // normal waitable children before this dedicated owner launches anything.
+    if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }

@@ -5,7 +5,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{OpenOptionsExt, PermissionsExt},
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             process::CommandExt,
         },
     },
@@ -22,6 +22,10 @@ struct Worker {
 
 impl Worker {
     fn start(command: &str) -> Self {
+        Self::start_with_sigchld(command, false)
+    }
+
+    fn start_with_sigchld(command: &str, ignored: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let firing = uuid::Uuid::new_v4();
         let directory = root.path().join(firing.to_string());
@@ -31,6 +35,7 @@ impl Worker {
             directory.join("request"),
             serde_json::to_vec(&serde_json::json!({
                 "firing": firing, "revision": 1, "directory": directory,
+            "target_identity": {"device": fs::metadata(&directory).unwrap().dev(), "inode": fs::metadata(&directory).unwrap().ino()},
                 "precheck": { "command": command, "timeout_seconds": 1 }
             }))
             .unwrap(),
@@ -56,6 +61,9 @@ impl Worker {
             .stderr(Stdio::piped());
         unsafe {
             command.pre_exec(move || {
+                if ignored && libc::signal(libc::SIGCHLD, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -121,6 +129,17 @@ fn assert_descendant_gone(path: &Path) {
 fn successful_shell_still_reaps_detached_descendants_before_receipt() {
     let mut worker = Worker::start(
         "setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 5' >/dev/null 2>&1 & while ! test -s escaped.pid; do sleep 0.01; done; exit 0",
+    );
+    let receipt = worker.receipt();
+    assert_eq!(receipt["outcome"], "Passed");
+    assert_descendant_gone(&worker.directory.join("escaped.pid"));
+}
+
+#[test]
+fn inherited_ignored_sigchld_is_reset_before_owning_descendants() {
+    let mut worker = Worker::start_with_sigchld(
+        "setsid /bin/sh -c 'echo $$ > escaped.pid; exec sleep 5' >/dev/null 2>&1 & while ! test -s escaped.pid; do sleep 0.01; done; exit 0",
+        true,
     );
     let receipt = worker.receipt();
     assert_eq!(receipt["outcome"], "Passed");

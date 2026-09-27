@@ -364,6 +364,20 @@ impl Registry {
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
             );
         }
+        let already_claimed: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE run=?1)",
+                [accepted.run.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if already_claimed {
+            return Ok(false);
+        }
+        if !Self::automation_dispatch_allowed_in(&tx, accepted, now_ms)? {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
         let claimed = tx
             .execute(
                 "INSERT OR IGNORE INTO agent_dispatches(run, claimed_at) VALUES (?1, ?2)",

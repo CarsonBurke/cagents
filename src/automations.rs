@@ -12,6 +12,7 @@ use crate::{
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
+pub const MAX_CONCURRENT_PRECHECKS: usize = 4;
 pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;
 pub const MISFIRE_GRACE_MS: u64 = 15 * 60 * 1000;
@@ -172,6 +173,12 @@ pub struct Occurrence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Automation {
     pub id: Uuid,
     /// Optimistic edit version, including presentation-only renames.
@@ -179,6 +186,8 @@ pub struct Automation {
     /// The schedule/execution version named by immutable firing claims.
     pub execution_revision: u64,
     pub definition: Definition,
+    /// Filesystem authority pinned by the daemon when saving the definition.
+    pub target_identity: DirectoryIdentity,
     pub enabled: bool,
     pub created_ms: u64,
     pub updated_ms: u64,
@@ -242,6 +251,9 @@ pub struct Firing {
     pub revision: u64,
     pub trigger: Trigger,
     pub state: FiringState,
+    /// A terminal provider result still owns the automation until its session
+    /// is proved closed (fresh) or idle at the exact source (reuse).
+    pub release_pending: bool,
     pub created_ms: u64,
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
