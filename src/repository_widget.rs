@@ -11360,7 +11360,7 @@ mod tests {
     fn gutter_ranges_preserve_side_and_original_anchor_when_backtracking() {
         use crate::github::ReviewDiffSide::{Left, Right};
         use crate::pull_request_review::{Action, discussion::Anchor, discussion_ui};
-        use futures_util::StreamExt;
+        use cosmic::iced::futures::StreamExt;
         let card = CardId::new();
         let (mut runtime, identity) = diff_runtime(card);
         for (line, side, extend, expected) in [

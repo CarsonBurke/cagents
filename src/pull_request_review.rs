@@ -41,6 +41,9 @@ use crate::{
 
 type ActionTask = iced::Task<Action>;
 
+pub mod discussion;
+pub mod discussion_ui;
+
 /// How many pull requests a shell without the project sidebar lists.
 const BROWSER_LIST_LIMIT: u16 = 50;
 
@@ -115,6 +118,12 @@ pub enum ViewedOutcome {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Fenced {
+        generation: u64,
+        authority_revision: u64,
+        action: Box<Action>,
+    },
+    Discussion(discussion_ui::Action),
     /// A shell without its own list asks it to (re)load.
     LoadList,
     ListLoaded {
@@ -146,6 +155,7 @@ pub enum Action {
     ToggleViewedAndAdvance,
     ViewedApplied {
         generation: u64,
+        authority_revision: u64,
         results: Vec<(RepoPath, bool, ViewedOutcome)>,
     },
     OpenUrl(Url),
@@ -158,7 +168,12 @@ impl Action {
     pub fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Loaded { .. } | Self::ListLoaded { .. } | Self::ViewedApplied { .. }
+            Self::Loaded { .. }
+                | Self::ListLoaded { .. }
+                | Self::ViewedApplied { .. }
+                | Self::Discussion(
+                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. }
+                )
         )
     }
 }
@@ -206,6 +221,7 @@ pub struct ReviewSource {
 }
 
 pub struct State {
+    discussion: discussion_ui::DiscussionState,
     api: Arc<dyn GitHubReviewApi>,
     git: RepositoryService,
     /// Set by shells that list through this state rather than their own.
@@ -225,6 +241,7 @@ pub struct State {
     /// True while a refresh runs behind an already listed set of files.
     refreshing: bool,
     context: Option<ReviewContext>,
+    authority_revision: u64,
     range: Option<PullRequestRange>,
     files: Vec<ReviewFile>,
     files_truncated: bool,
@@ -258,6 +275,7 @@ impl Drop for State {
 impl State {
     pub fn new(api: Arc<dyn GitHubReviewApi>, git: RepositoryService) -> Self {
         Self {
+            discussion: discussion_ui::DiscussionState::default(),
             api,
             git,
             source: None,
@@ -271,6 +289,7 @@ impl State {
             load: LoadState::Idle,
             refreshing: false,
             context: None,
+            authority_revision: 0,
             range: None,
             files: Vec::new(),
             files_truncated: false,
@@ -352,8 +371,27 @@ impl State {
         std::mem::take(&mut self.effects)
     }
 
+    fn fenced(&self, action: Action) -> Action {
+        Action::Fenced {
+            generation: self.generation,
+            authority_revision: self.authority_revision,
+            action: Box::new(action),
+        }
+    }
+
     pub fn update(&mut self, action: Action) -> ActionTask {
         match action {
+            Action::Fenced {
+                generation,
+                authority_revision,
+                action,
+            } => {
+                if generation != self.generation || authority_revision != self.authority_revision {
+                    return ActionTask::none();
+                }
+                self.update(*action)
+            }
+            Action::Discussion(action) => self.update_discussion(action),
             Action::LoadList => self.load_list(),
             Action::ListLoaded { generation, result } => {
                 if generation != self.list_generation {
@@ -380,7 +418,10 @@ impl State {
                 }
                 self.refreshing = false;
                 match result {
-                    Ok(loaded) => self.adopt(&loaded),
+                    Ok(loaded) => {
+                        self.adopt(&loaded);
+                        return self.load_discussion();
+                    }
                     Err(message) => {
                         if self.load == LoadState::Loading {
                             self.load = LoadState::Failed(message);
@@ -439,9 +480,10 @@ impl State {
             }
             Action::ViewedApplied {
                 generation,
+                authority_revision,
                 results,
             } => {
-                if generation != self.generation {
+                if generation != self.generation || authority_revision != self.authority_revision {
                     return ActionTask::none();
                 }
                 for (path, viewed, outcome) in results {
@@ -561,6 +603,7 @@ impl State {
     }
 
     fn reset_target(&mut self) {
+        self.discussion = discussion_ui::DiscussionState::default();
         self.cancellation.cancel();
         self.cancellation = CancellationToken::new();
         self.generation = self.generation.wrapping_add(1);
@@ -637,15 +680,26 @@ impl State {
             .range
             .as_ref()
             .is_some_and(|range| range.basis() != loaded.range.basis());
+        let authority_changed = self.context.as_ref().is_none_or(|previous| {
+            previous.pull_request_id != loaded.context.pull_request_id
+                || previous.head_oid != loaded.context.head_oid
+                || previous.base_oid != loaded.context.base_oid
+                || previous.viewer != loaded.context.viewer
+        });
         self.files = join_files(&loaded.entries, &loaded.files);
         for file in &mut self.files {
-            if let Some((viewed, ViewedSync::Pending)) = previous.get(&file.entry.path) {
+            if !authority_changed
+                && let Some((viewed, ViewedSync::Pending)) = previous.get(&file.entry.path)
+            {
                 file.viewed = *viewed;
                 file.sync = ViewedSync::Pending;
             }
         }
         self.files_truncated = loaded.files.truncated;
         self.rows = tree_rows(&self.files);
+        if authority_changed {
+            self.authority_revision = self.authority_revision.wrapping_add(1);
+        }
         self.context = Some(loaded.context.clone());
         self.range = Some(loaded.range.clone());
         self.load = LoadState::Ready;
@@ -756,6 +810,11 @@ impl State {
         }
         let repository = target.repository.clone();
         let pull_request_id = context.pull_request_id.clone();
+        let authority = discussion::Authority {
+            target: target.clone(),
+            context: context.clone(),
+        };
+        let git = self.git.clone();
         let api = Arc::clone(&self.api);
         let cancellation = self.cancellation.clone();
         let generation = self.generation;
@@ -763,12 +822,26 @@ impl State {
         // not applied; leaving them pending would freeze them until the
         // pull request is reopened.
         let lost = paths.clone();
+        let authority_revision = self.authority_revision;
         ActionTask::perform(
             async move {
                 let results = tokio::task::spawn_blocking(move || {
                     paths
                         .into_iter()
                         .map(|path| {
+                            if let Err(failure) = discussion::verify_authority(
+                                api.as_ref(),
+                                &git,
+                                &authority,
+                                &cancellation,
+                            ) {
+                                let message = match failure {
+                                    discussion::Outcome::Refused(message)
+                                    | discussion::Outcome::Unknown(message) => message,
+                                    discussion::Outcome::Applied => unreachable!(),
+                                };
+                                return (path, viewed, ViewedOutcome::NotApplied(message));
+                            }
                             let outcome = api.set_file_viewed(
                                 &repository,
                                 &pull_request_id,
@@ -789,6 +862,7 @@ impl State {
                 });
                 Action::ViewedApplied {
                     generation,
+                    authority_revision,
                     results,
                 }
             },
@@ -1056,7 +1130,7 @@ impl State {
             "Mark viewed",
             "Mark not viewed",
             file.sync != ViewedSync::Pending && !modal_open,
-            Action::ToggleViewed(row.path.clone()),
+            self.fenced(Action::ToggleViewed(row.path.clone())),
         ));
         let name = design::body(&*row.label)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -1152,10 +1226,10 @@ impl State {
                 "Mark folder viewed",
                 "Mark folder not viewed",
                 !modal_open && total > 0,
-                Action::SetDirectoryViewed {
+                self.fenced(Action::SetDirectoryViewed {
                     directory: row.path.clone(),
                     viewed: mark != Mark::Checked,
-                },
+                }),
             ),
         ])
         .align_y(Alignment::Center)
@@ -1579,7 +1653,13 @@ fn load_review(
             &head,
             cancellation,
         ) {
-            Ok(range) => break range,
+            Ok(range) if range.base_tip.as_str() == context.base_oid => break range,
+            Ok(_) if attempts == 0 => {
+                attempts += 1;
+                context = api.review_context(&key, cancellation).map_err(|error| error.to_string())?;
+                files = api.pull_request_files(&key, cancellation).map_err(|error| error.to_string())?;
+            }
+            Ok(_) => return Err("The pull request base moved while loading. Refresh to fetch a consistent review range.".into()),
             Err(RepositoryError::PullRequestHeadMoved { .. }) if attempts == 0 => {
                 attempts += 1;
                 context = api
@@ -1617,6 +1697,8 @@ pub type SharedApi = Arc<dyn GitHubReviewApi>;
 pub(crate) struct ScriptedApi {
     pub viewed: std::sync::Mutex<Vec<(String, bool)>>,
     pub viewed_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
+    pub conversation: std::sync::Mutex<crate::github::PullRequestConversation>,
+    pub submitted: std::sync::Mutex<Vec<crate::github::SubmitReviewRequest>>,
 }
 
 #[cfg(test)]
@@ -1625,6 +1707,8 @@ impl ScriptedApi {
         Self {
             viewed: std::sync::Mutex::new(Vec::new()),
             viewed_outcome: std::sync::Mutex::new(ReviewMutationOutcome::Applied(())),
+            conversation: std::sync::Mutex::new(Default::default()),
+            submitted: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -1652,13 +1736,14 @@ impl GitHubReviewApi for ScriptedApi {
         _key: &PullRequestKey,
         _cancellation: &CancellationToken,
     ) -> Result<crate::github::PullRequestConversation, crate::github::GitHubError> {
-        unreachable!()
+        Ok(self.conversation.lock().unwrap().clone())
     }
 
     fn start_review(
         &self,
         _repository: &GitHubRepoKey,
         _pull_request_id: &str,
+        _commit_oid: &str,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::PendingReview>, crate::github::GitHubError>
     {
@@ -1710,11 +1795,18 @@ impl GitHubReviewApi for ScriptedApi {
     fn submit_review(
         &self,
         _repository: &GitHubRepoKey,
-        _request: &crate::github::SubmitReviewRequest,
+        request: &crate::github::SubmitReviewRequest,
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::SubmittedReview>, crate::github::GitHubError>
     {
-        unreachable!()
+        self.submitted.lock().unwrap().push(request.clone());
+        Ok(ReviewMutationOutcome::Applied(
+            crate::github::SubmittedReview {
+                id: "submitted".into(),
+                state: crate::github::RemoteValue("APPROVED".into()),
+                url: Url::parse("https://github.com/o/r/pull/1#review-1").unwrap(),
+            },
+        ))
     }
 
     fn discard_review(
@@ -1995,12 +2087,40 @@ pub(crate) mod tests {
         drop(state.update(Action::ToggleViewed(path("a.rs"))));
         assert!(state.files[0].viewed);
         drop(state.update(Action::ViewedApplied {
+            authority_revision: state.authority_revision,
             generation: state.generation,
             results: vec![(path("a.rs"), true, ViewedOutcome::Applied)],
         }));
         assert_eq!(state.files[0].sync, ViewedSync::Settled);
         assert!(state.notice.is_none());
         assert!(api.viewed.lock().unwrap().is_empty(), "the task never ran");
+    }
+
+    #[test]
+    fn viewed_marks_and_queued_toggles_do_not_cross_a_refreshed_head() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(vec![entry("a.rs", ChangeKind::Modified)], vec![]),
+        );
+        let queued = state.fenced(Action::ToggleViewed(path("a.rs")));
+        let previous_revision = state.authority_revision;
+        drop(state.update(Action::ToggleViewed(path("a.rs"))));
+        assert_eq!(state.files[0].sync, ViewedSync::Pending);
+        let mut next = loaded(vec![entry("a.rs", ChangeKind::Modified)], vec![]);
+        next.context.head_oid = "d".repeat(40);
+        next.range.head = Oid::parse("d".repeat(40)).unwrap();
+        state.adopt(&next);
+        assert!(!state.files[0].viewed);
+        assert_eq!(state.files[0].sync, ViewedSync::Settled);
+        drop(state.update(queued));
+        drop(state.update(Action::ViewedApplied {
+            generation: state.generation,
+            authority_revision: previous_revision,
+            results: vec![(path("a.rs"), true, ViewedOutcome::Applied)],
+        }));
+        assert!(!state.files[0].viewed);
+        assert_eq!(state.files[0].sync, ViewedSync::Settled);
     }
 
     #[test]
@@ -2019,6 +2139,7 @@ pub(crate) mod tests {
         drop(state.update(Action::ToggleViewed(path("a.rs"))));
         drop(state.update(Action::ToggleViewed(path("b.rs"))));
         drop(state.update(Action::ViewedApplied {
+            authority_revision: state.authority_revision,
             generation: state.generation,
             results: vec![
                 (
@@ -2135,6 +2256,7 @@ pub(crate) mod tests {
         assert_eq!(state.load, LoadState::Idle);
         drop(state.update(Action::Open(target(2))));
         drop(state.update(Action::ViewedApplied {
+            authority_revision: state.authority_revision,
             generation,
             results: vec![(path("a.rs"), true, ViewedOutcome::Applied)],
         }));

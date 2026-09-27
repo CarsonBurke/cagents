@@ -5347,7 +5347,10 @@ impl Cagents {
             main.push(design::horizontal_rule());
         }
         if review.selected().is_some() {
-            main.push(repository_widget::view(id, &pane.runtime).map(Message::Repository));
+            main.push(
+                repository_widget::view_with_review(id, &pane.runtime, Some(review))
+                    .map(Message::Repository),
+            );
         } else {
             let (title, detail) = if review.is_open() {
                 (
@@ -5381,6 +5384,14 @@ impl Cagents {
                 .center(Length::Fill)
                 .padding(spacing.space_m)
                 .into(),
+            );
+        }
+        if review.is_open() {
+            main.push(design::horizontal_rule());
+            main.push(
+                review
+                    .review_bar(modal_open)
+                    .map(move |action| Message::PullRequestReview { card: id, action }),
             );
         }
         widget::row::with_children(vec![
@@ -10897,7 +10908,19 @@ impl Application for Cagents {
                 };
                 Task::batch([task, self.drain_lsp_intents(card)])
             }
+            Message::Repository(RepositoryAction::Review { card, action }) => {
+                self.handle_pull_request_review(card, action)
+            }
             Message::Repository(action) => {
+                if let RepositoryAction::DiffAnnotations {
+                    identity,
+                    review_revision,
+                    ..
+                } = &action
+                    && !matches!(self.cards.get(&identity.card), Some(CardRuntime::PullRequests(pane)) if pane.review.annotation_revision() == *review_revision)
+                {
+                    return Task::none();
+                }
                 if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
                     return Task::none();
                 }
