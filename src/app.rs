@@ -1,6 +1,8 @@
 mod account_ui;
 mod agent_ui;
 mod branch_ui;
+#[cfg(feature = "integrated-browser")]
+mod browser_import_ui;
 mod channel_ui;
 mod chat_ui;
 mod chrome_ui;
@@ -1228,15 +1230,8 @@ fn terminal_start_visibility(state: Option<&CardState>) -> Option<bool> {
 }
 
 #[cfg(feature = "integrated-browser")]
-fn can_register_deferred_browser(
-    state: &CardState,
-    lifecycle_registered: bool,
-    runtime_is_loading: bool,
-) -> bool {
-    runtime_is_loading
-        && !lifecycle_registered
-        && state.existence.is_open()
-        && matches!(&state.kind, CardKind::Browser(_))
+fn can_register_deferred_browser(state: &CardState, runtime_is_loading: bool) -> bool {
+    runtime_is_loading && state.existence.is_open() && matches!(&state.kind, CardKind::Browser(_))
 }
 
 fn can_accept_terminal_start(
@@ -3269,6 +3264,8 @@ pub enum Message {
     BrowserForward(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserReload(CardId),
+    #[cfg(feature = "integrated-browser")]
+    BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserAddressChanged {
@@ -3839,6 +3836,8 @@ pub struct Cagents {
     // joins them explicitly, and field drop order is the final backstop.
     #[cfg(feature = "integrated-browser")]
     browser_teardowns: Vec<JoinHandle<()>>,
+    #[cfg(feature = "integrated-browser")]
+    browser_import: browser_import_ui::State,
     terminal_teardowns: Vec<JoinHandle<()>>,
     #[cfg(feature = "integrated-browser")]
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
@@ -4220,6 +4219,9 @@ impl Cagents {
 
     #[cfg(feature = "integrated-browser")]
     fn browser_factory_task(&self) -> Task<Message> {
+        if self.browser_factory.is_some() {
+            return Task::none();
+        }
         let Some(window_id) = self.core.main_window_id() else {
             return cosmic::task::message(Message::BrowserFactoryReady(Err(
                 "main Wayland window is unavailable".into(),
@@ -4257,6 +4259,9 @@ impl Cagents {
 
     #[cfg(feature = "integrated-browser")]
     fn register_deferred_browsers(&mut self) {
+        // A browser created before the factory arrives is already registered
+        // as Hydrating, but has no worker. Reset every Loading browser so the
+        // lifecycle can actually start it once the parent window is ready.
         let pending = self
             .durable
             .cards
@@ -4264,7 +4269,6 @@ impl Cagents {
             .filter(|card| {
                 can_register_deferred_browser(
                     card,
-                    self.lifecycle.state(card.id).is_some(),
                     matches!(self.cards.get(&card.id), Some(CardRuntime::Loading)),
                 )
             })
@@ -6931,6 +6935,15 @@ impl Cagents {
 
     #[cfg(feature = "integrated-browser")]
     fn handle_browser_event(&mut self, id: CardId, event: BrowserEvent) -> Task<Message> {
+        if !self.browser_import.offered
+            && !self.modal_is_open()
+            && matches!(
+                event,
+                BrowserEvent::LifecycleChanged(crate::browser::BrowserLifecycle::Visible)
+            )
+        {
+            let _ = self.update_browser_import(browser_import_ui::Action::Open);
+        }
         let mut tasks = Vec::new();
         let mut durable_changed = false;
         match event {
@@ -8617,6 +8630,10 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return true;
+        }
         self.update_ui.confirmation.is_some()
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
@@ -9956,6 +9973,8 @@ impl Application for Cagents {
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
@@ -10142,8 +10161,6 @@ impl Application for Cagents {
         // Unused default chats are never saved. Recreate the active scope's
         // placeholder only after restored runtimes have been initialized.
         tasks.push(app.ensure_default_pane());
-        #[cfg(feature = "integrated-browser")]
-        tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
             tasks.push(
                 window::set_icon(window_id, application_window_icon()).map(cosmic::Action::App),
@@ -11401,14 +11418,20 @@ impl Application for Cagents {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
-                cosmic::task::future(async {
+                let report = cosmic::task::future(async {
                     let result =
                         tokio::task::spawn_blocking(|| instance::report_ui_startup(&Ok(())))
                             .await
                             .map_err(|error| error.to_string())
                             .and_then(|result| result.map_err(|error| error.to_string()));
                     Message::StartupReported(result)
-                })
+                });
+                // window::run silently drops callbacks for windows that have not
+                // opened yet. Initialize only after iced acknowledges this one.
+                #[cfg(feature = "integrated-browser")]
+                return Task::batch([report, self.browser_factory_task()]);
+                #[cfg(not(feature = "integrated-browser"))]
+                report
             }
             Message::StartupReported(result) => match result {
                 Ok(()) => Task::none(),
@@ -11860,6 +11883,8 @@ impl Application for Cagents {
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
+            Message::BrowserFactoryReady(_) if self.browser_factory.is_some() => Task::none(),
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserFactoryReady(result) => match result {
                 Ok(binding) => {
                     self.browser_parent_lifetime = Some(binding.parent_lifetime);
@@ -11986,6 +12011,8 @@ impl Application for Cagents {
             }
             #[cfg(feature = "integrated-browser")]
             Message::BrowserEvent { card, event } => self.handle_browser_event(card, event),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserImport(action) => self.update_browser_import(action),
             #[cfg(feature = "integrated-browser")]
             Message::ClipboardRead {
                 card,
@@ -12944,6 +12971,10 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        #[cfg(feature = "integrated-browser")]
+        if let Some(dialog) = self.browser_import_dialog() {
+            return Some(dialog);
+        }
         if let Some(count) = self.update_ui.confirmation {
             return Some(dialog_ui::overlay(dialog_ui::surface(
                 widget::column::with_children(vec![
@@ -19183,6 +19214,8 @@ mod tests {
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
@@ -20129,6 +20162,28 @@ mod tests {
 
     #[cfg(feature = "integrated-browser")]
     #[test]
+    fn browser_created_before_factory_is_requeued_for_hydration() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.add_browser(Url::parse("https://example.com").unwrap());
+        let card = app.workspace.focused().unwrap();
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(matches!(
+            app.lifecycle.state(card),
+            Some((_, Residency::Hydrating { .. }))
+        ));
+        app.register_deferred_browsers();
+        assert!(matches!(
+            app.lifecycle.state(card),
+            Some((_, Residency::Hibernated))
+        ));
+        assert_eq!(
+            app.card_state_mut(card).unwrap().residency,
+            Residency::Hibernated
+        );
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
     fn restored_nonvisible_browser_waits_for_visible_lifecycle_hydration() {
         let url = Url::parse("about:blank").unwrap();
         let kind = CardKind::Browser(BrowserSession {
@@ -20164,7 +20219,7 @@ mod tests {
             residency: Residency::Hibernated,
             kind,
         };
-        assert!(can_register_deferred_browser(&state, false, true));
+        assert!(can_register_deferred_browser(&state, true));
 
         let now = Instant::now();
         let mut lifecycle = LifecycleManager::new(LifecycleBudget::default());
