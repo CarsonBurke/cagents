@@ -594,6 +594,49 @@ if ! awk -v top="$TOP_LEVEL" '
     fail 'archive has an unexpected or incomplete entry structure'
 fi
 
+# The verified candidate owns the UI launch fence before any installation
+# mutation. Re-entry reuses these downloaded assets and is authorized only by
+# the actual inherited lock, never by this environment marker alone.
+COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$COORDINATOR" \
+    || fail 'could not extract the verified update coordinator'
+chmod 0700 "$COORDINATOR"
+if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
+    "$COORDINATOR" verify-install-guard >/dev/null \
+        || fail 'inherited application update fence is invalid; installation was not changed'
+else
+    INSTALLER_SOURCE=$0
+    if [ ! -f "$INSTALLER_SOURCE" ] || [ ! -r "$INSTALLER_SOURCE" ]; then
+        # A stdin invocation has no script to re-enter. Only the same selected
+        # release's verified installer may substitute for it; local archives
+        # never cause an unexpected network fetch.
+        [ -z "$LOCAL_ARCHIVE" ] \
+            || fail 'save install.sh to a file and run sh /path/to/install.sh with the same options; stdin cannot be coordinated with a local archive'
+        INSTALLER_SOURCE=$DOWNLOAD_DIR/install.sh
+        download_release_asset install.sh "$INSTALLER_SOURCE"
+        INSTALLER_HASH=$(awk '
+            $2 == "install.sh" { count++; hash = tolower($1) }
+            END { if (count != 1) exit 1; print hash }
+        ' "$CHECKSUMS_PATH") || fail 'SHA256SUMS does not identify this release installer'
+        if command -v sha256sum >/dev/null 2>&1; then
+            INSTALLER_ACTUAL=$(sha256sum "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
+        else
+            INSTALLER_ACTUAL=$(shasum -a 256 "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
+        fi
+        [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
+    fi
+    set -- --version "$VERSION" --prefix "$PREFIX"
+    [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
+    [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon
+    case $RELAUNCH_AGENTS in
+        1) set -- "$@" --relaunch-agents ;;
+        0) set -- "$@" --no-relaunch-agents ;;
+    esac
+    CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
+        "$COORDINATOR" coordinate-install --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
+    exit $?
+fi
+
 if [ -L "$PREFIX" ]; then
     fail "refusing to install through symlink $PREFIX"
 fi

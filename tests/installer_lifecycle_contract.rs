@@ -115,6 +115,9 @@ fn release_fixture(
     let status = r#"#!/bin/sh
 CLI=old
 case "$*" in
+  'coordinate-install '*|'verify-install-guard')
+    exec "$FIXTURE_REAL_CLI" "$@"
+    ;;
   '--json daemon status')
     [ "$#" -eq 3 ] || exit 98
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 9; fi
@@ -326,6 +329,9 @@ esac
     let checkpoint = home.path().join("checkpoint");
     let restored = home.path().join("restored");
     fs::write(&running, "old\n").unwrap();
+    let runtime = home.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
     let mut command = Command::new("sh");
     command.arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"));
     if restart.is_some() {
@@ -359,6 +365,9 @@ esac
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
         .env(
             "CAGENTS_REPOSITORY",
             if download == Some("public") {

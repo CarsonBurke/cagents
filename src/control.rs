@@ -116,6 +116,19 @@ pub enum TopCommand {
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
     UpdateWorker { job_id: String },
+    /// Cooperatively fence application windows around an external installer.
+    #[command(hide = true)]
+    CoordinateInstall {
+        #[arg(long)]
+        prefix: PathBuf,
+        #[arg(long)]
+        installer: PathBuf,
+        #[arg(last = true)]
+        arguments: Vec<OsString>,
+    },
+    /// Validate a launch fence inherited from the update coordinator.
+    #[command(hide = true)]
+    VerifyInstallGuard,
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -1598,6 +1611,27 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
+        TopCommand::CoordinateInstall {
+            prefix,
+            installer,
+            arguments,
+        } => {
+            crate::install_guard::run(&prefix, &installer, &arguments)
+                .map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.coordinate_install",
+                data: json!({"reopened": true}),
+                human: "Installer finished; saved windows reopened".into(),
+            })
+        }
+        TopCommand::VerifyInstallGuard => {
+            instance::validate_install_guard().map_err(|error| AppError::new("install", error))?;
+            Ok(CommandOutput {
+                command: "update.verify_install_guard",
+                data: json!({"valid": true}),
+                human: "Installer owns the application update fence".into(),
+            })
+        }
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
