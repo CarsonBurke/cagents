@@ -476,6 +476,29 @@ struct StoredLockMetadata {
     pid: u32,
 }
 
+/// Locate the executable of this instance's live, kernel-verified lock owner.
+/// Update coordination uses its sibling CLI to speak the owner's own protocol.
+pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
+    let paths = RuntimePaths::discover()?;
+    let mut lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+        return Ok(None);
+    };
+    lock.seek(SeekFrom::Start(0))?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&mut lock)?;
+    let executable = fs::read_link(format!("/proc/{}/exe", stored.pid))?;
+    let _validated = open_validated_pidfd(&lock, stored.pid, Path::new("/proc"))?;
+    Ok(Some(executable))
+}
+
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
