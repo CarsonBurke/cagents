@@ -84,10 +84,10 @@ use crate::{
 /// terminal descriptors; postcard fields require a matched daemon and UI.
 /// Version 23 carries explicit environment removals in launch recipes.
 /// Version 24 adds provider-confirmed account recovery and removed-account errors.
-/// Version 25 reports screen loss after authenticated crash adoption and adds
-/// exact-recipe cleanup for retained completed terminals.
 /// Version 26 adds daemon-owned durable lifecycle attention and notification control.
-pub const PROTOCOL_VERSION: u16 = 26;
+/// Version 27 reports screen loss after authenticated crash adoption and adds
+/// exact-recipe cleanup for retained completed terminals.
+pub const PROTOCOL_VERSION: u16 = 27;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
