@@ -51,6 +51,7 @@ type Pending = Arc<
 struct Inner {
     id: TerminalId,
     session: Session,
+    upgrade_recovery: Option<(Session, Session)>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -222,6 +223,7 @@ fn restore(
     attach_request: &mut u64,
     proof: &HostSessionProof,
     mut session: Session,
+    upgrade_recovery: &mut Option<(Session, Session)>,
 ) -> Result<ClientRequest, StartFailure> {
     if session.proof.as_ref() == Some(proof) {
         return Ok(ClientRequest::ChatAttach { session });
@@ -253,6 +255,14 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
+                if session.launch.session_id.is_some()
+                    && session.launch.session_id != restored.launch.session_id
+                {
+                    if !super::is_upgrade_recovery(&session, &restored) {
+                        return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
+                    }
+                    *upgrade_recovery = Some((session, restored.clone()));
+                }
                 return Ok(ClientRequest::ChatAttach { session: restored });
             }
             Ok(_) => {
@@ -317,6 +327,7 @@ impl ClientHandle {
             inner: Arc::new(Inner {
                 id: session.id,
                 session,
+                upgrade_recovery: None,
                 proof,
                 wire: Arc::new(Mutex::new(Wire {
                     stream,
@@ -341,6 +352,18 @@ impl ClientHandle {
                 visibility_worker: Mutex::new(None),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_upgrade(source: Session, session: Session, snapshot: Snapshot) -> Self {
+        assert!(super::is_upgrade_recovery(&source, &session));
+        assert_eq!(snapshot.session_id, session.launch.session_id);
+        let proof = session.proof.clone().unwrap();
+        let mut handle = Self::fixture(session.clone(), snapshot);
+        let inner = Arc::get_mut(&mut handle.inner).unwrap();
+        inner.proof = proof;
+        inner.upgrade_recovery = Some((source, session));
+        handle
     }
 
     /// Queues a report as the reader thread would on its arrival, and says
@@ -587,6 +610,7 @@ impl ClientHandle {
         }
         let id = session.id;
         let mut attach_request = 2;
+        let mut upgrade_recovery = None;
         let request = if let Some(source) = account_recovery {
             let execution_environment = native_environment(&session, true);
             ClientRequest::ChatRecoverAccount {
@@ -619,6 +643,7 @@ impl ClientHandle {
                 &mut attach_request,
                 &proof,
                 session,
+                &mut upgrade_recovery,
             )?
         };
         codec
@@ -684,6 +709,14 @@ impl ClientHandle {
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
         };
+        if let Some((_, resolved)) = &upgrade_recovery
+            && (&session != resolved || initial.session_id != resolved.launch.session_id)
+        {
+            return Err(
+                "The attached conversation did not confirm the daemon's exact upgrade replacement"
+                    .into(),
+            );
+        }
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
@@ -711,6 +744,7 @@ impl ClientHandle {
         let inner = Arc::new(Inner {
             id,
             session,
+            upgrade_recovery,
             proof: proof.clone(),
             wire: wire.clone(),
             cancel,
@@ -899,6 +933,9 @@ impl ClientHandle {
             session.native_continuity = snapshot.native_continuity.clone();
         }
         session
+    }
+    pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
+        self.inner.upgrade_recovery.as_ref()
     }
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner
@@ -1703,6 +1740,19 @@ mod tests {
         session: Session,
         answer: ServerMessage,
     ) -> (Result<ClientRequest, StartFailure>, ClientRequest) {
+        let (outcome, request, _) = negotiate_with_recovery(live, session, answer);
+        (outcome, request)
+    }
+
+    fn negotiate_with_recovery(
+        live: &HostSessionProof,
+        session: Session,
+        answer: ServerMessage,
+    ) -> (
+        Result<ClientRequest, StartFailure>,
+        ClientRequest,
+        Option<(Session, Session)>,
+    ) {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1726,8 +1776,63 @@ mod tests {
         });
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
         let mut request_id = 2;
-        let outcome = restore(&mut client, &mut codec, &mut request_id, live, session);
-        (outcome, worker.join().unwrap())
+        let mut recovery = None;
+        let outcome = restore(
+            &mut client,
+            &mut codec,
+            &mut request_id,
+            live,
+            session,
+            &mut recovery,
+        );
+        (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn only_a_previously_named_upgrade_rotation_carries_persistence_provenance() {
+        let live = host_proof("live");
+        for previous in [None, Some(CONVERSATION), Some("previous-conversation")] {
+            let source = omp_card(previous, Some(host_proof("previous")));
+            let mut resolved = source.clone();
+            resolved.proof = Some(live.clone());
+            resolved.launch.session_id = Some(CONVERSATION.into());
+            let (outcome, _, recovery) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved {
+                        session: resolved.clone(),
+                    },
+                },
+            );
+            assert!(
+                matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == resolved)
+            );
+            assert_eq!(
+                recovery,
+                previous
+                    .filter(|id| *id != CONVERSATION)
+                    .map(|_| (source, resolved))
+            );
+        }
+        let source = omp_card(Some("previous-conversation"), Some(host_proof("previous")));
+        let mut resolved = source.clone();
+        resolved.proof = Some(live.clone());
+        resolved.launch.session_id = Some(CONVERSATION.into());
+        resolved
+            .launch
+            .recipe
+            .environment
+            .insert("ACCOUNT_HOME".into(), "/different".into());
+        let (outcome, _, recovery) = negotiate_with_recovery(
+            &live,
+            source,
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved { session: resolved },
+            },
+        );
+        assert!(outcome.is_err());
+        assert!(recovery.is_none());
     }
 
     /// An application update replaces the executables and restarts the daemon,
@@ -1751,6 +1856,7 @@ mod tests {
             &mut request_id,
             &live,
             omp_card(Some(CONVERSATION), Some(live.clone())),
+            &mut None,
         )
         .expect("a live proof attaches");
         assert!(matches!(attach, ClientRequest::ChatAttach { .. }));
@@ -1907,6 +2013,14 @@ mod tests {
         session: Session,
         answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
     ) -> Result<ClientHandle, StartFailure> {
+        restore_with_lineage(session, None, answer)
+    }
+
+    fn restore_with_lineage(
+        session: Session,
+        resolved: Option<Session>,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
         let live = host_proof("live");
         let (client, mut server) = UnixStream::pair().unwrap();
@@ -1949,11 +2063,18 @@ mod tests {
                 &mut codec,
                 &mut server,
                 lineage.request_id,
-                ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    "No durable upgrade replacement exists for this native chat",
-                    false,
-                )),
+                resolved.map_or_else(
+                    || {
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "No durable upgrade replacement exists for this native chat",
+                            false,
+                        ))
+                    },
+                    |session| ServerMessage::Response {
+                        response: ServerResponse::UpgradeChatResolved { session },
+                    },
+                ),
             );
             let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
             respond(
@@ -1975,6 +2096,48 @@ mod tests {
         );
         worker.join().unwrap();
         result
+    }
+
+    #[test]
+    fn upgrade_provenance_requires_the_exact_attached_descriptor_and_confirmation() {
+        for mismatch in 0..3 {
+            let source = omp_card(Some("prior-conversation"), Some(host_proof("prior")));
+            let mut resolved = source.clone();
+            resolved.proof = Some(host_proof("live"));
+            resolved.launch.session_id = Some(CONVERSATION.into());
+            let result =
+                restore_with_lineage(source.clone(), Some(resolved.clone()), move |request| {
+                    let ClientRequest::ChatAttach { mut session } = request else {
+                        panic!("expected exact attach")
+                    };
+                    let mut snapshot = Snapshot {
+                        session_id: session.launch.session_id.clone(),
+                        ..Default::default()
+                    };
+                    match mismatch {
+                        1 => {
+                            session
+                                .launch
+                                .recipe
+                                .environment
+                                .insert("ACCOUNT_HOME".into(), "/other".into());
+                        }
+                        2 => snapshot.session_id = Some("unconfirmed-other-thread".into()),
+                        _ => {}
+                    }
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached { session, snapshot },
+                    }
+                });
+            if mismatch == 0 {
+                assert_eq!(
+                    result.unwrap().upgrade_recovery(),
+                    Some(&(source, resolved))
+                );
+            } else {
+                assert!(result.is_err(), "mismatch {mismatch}");
+            }
+        }
     }
 
     /// A card that cannot bring its conversation back has to show what refused

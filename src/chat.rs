@@ -379,6 +379,47 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     original == candidate
 }
 
+/// The narrow descriptor change an authenticated daemon upgrade may commit.
+/// This predicate is not provenance: callers must also have resolved the exact
+/// source through ResolveUpgradeChat and attached its confirmed replacement.
+pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
+    let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
+        return false;
+    };
+    if !old.is_complete()
+        || !new.is_complete()
+        || old == new
+        || source.id != replacement.id
+        || source.launch.provider != replacement.launch.provider
+        || source.launch.recipe != replacement.launch.recipe
+        || source.owned_codex_listener != replacement.owned_codex_listener
+        || (source.native_continuity != replacement.native_continuity
+            && !matches!(source.native_continuity, NativeContinuity::ReconnectOnly))
+        || !replacement.has_valid_native_continuity()
+        || !source
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+        || !replacement
+            .launch
+            .session_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+    {
+        return false;
+    }
+    match (&source.terminal, &replacement.terminal) {
+        (None, None) => true,
+        (Some(old), Some(new)) if old.id == source.id && new.id == replacement.id => {
+            let mut normalized = new.clone();
+            normalized.continuity = old.continuity.clone();
+            &normalized == old
+        }
+        _ => false,
+    }
+}
+
 /// The exact endpoint a daemon allocated for one native Codex conversation.
 /// The allocator remains unchanged when the current host proof rotates.
 /// This is durable provenance, not authority for an arbitrary client to claim
