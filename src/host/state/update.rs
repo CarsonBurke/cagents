@@ -2,6 +2,58 @@ use super::*;
 use crate::update::impact::{DaemonImpact, Disposition, Policy, SessionImpact, SessionKind};
 use sha2::{Digest, Sha256};
 
+/// The caller holds the control gate. SQL and actor barriers deliberately run
+/// without HostState: both may need host events to finish admitted work.
+pub(in crate::host) fn inspect(
+    host: &SharedHost,
+    policy: Policy,
+    fence_actors: bool,
+) -> Result<DaemonImpact, ProtocolError> {
+    let (registry, handles) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.execution_registry.clone(),
+            state
+                .chats
+                .iter()
+                .filter(|(_, record)| record.handle.owns_work())
+                .map(|(&id, record)| (id, record.handle.clone()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut blockers = Vec::new();
+    if let Some(registry) = registry {
+        blockers.extend(
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_update_blockers()
+                .map_err(upgrade_error)?,
+        );
+    }
+    if fence_actors {
+        for (id, handle) in handles {
+            match handle.check_update_readiness().map_err(upgrade_error)? {
+                crate::chat::runtime::UpdateReadiness::Unready => blockers.push(format!(
+                    "Conversation {id} is still processing accepted provider work; retry after it settles."
+                )),
+                crate::chat::runtime::UpdateReadiness::Busy
+                    if policy == Policy::WhenIdle
+                        && !matches!(handle.native_continuity(), crate::chat::NativeContinuity::Durable { .. }) => {
+                    blockers.push(format!("Conversation {id} has accepted work; wait for it to finish."));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut impact = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_impact(policy)?;
+    impact.blockers.extend(blockers);
+    Ok(impact)
+}
+
 impl HostState {
     pub(crate) fn upgrade_impact(&mut self, policy: Policy) -> Result<DaemonImpact, ProtocolError> {
         let capability = self
@@ -14,6 +66,19 @@ impl HostState {
             sessions: Vec::new(),
             blockers: Vec::new(),
         };
+        let holders = holder_directory()
+            .ok()
+            .filter(|directory| crate::secure_file::prepare_private_directory(directory).is_ok());
+        let can_carry = |id| {
+            holders
+                .as_ref()
+                .is_some_and(|directory| holder_socket_fits(&holder_socket(directory, id)))
+        };
+        if !self.native_closing.is_empty() {
+            impact
+                .blockers
+                .push("Wait for native provider cleanup to finish.".into());
+        }
         if !self.spawning.is_empty() || !self.chat_spawning.is_empty() {
             impact
                 .blockers
@@ -33,7 +98,7 @@ impl HostState {
                 continue;
             }
             let source = self.descriptor(0, id)?.session;
-            let (disposition, reason) = if record.execution_environment.is_none() {
+            let (disposition, reason) = if record.execution_environment.is_none() && can_carry(id) {
                 (
                     Disposition::Continues,
                     "The terminal and its running processes stay alive.",
@@ -41,7 +106,7 @@ impl HostState {
             } else {
                 (
                     Disposition::Blocked,
-                    "This terminal has a private execution environment; finish it or return to its native conversation before updating.",
+                    "This terminal cannot preserve its live process through this update; finish it or close it before updating.",
                 )
             };
             impact.sessions.push(SessionImpact {
@@ -68,6 +133,22 @@ impl HostState {
             let confirmed = record.handle.confirmed_session_id();
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
+            let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
+            let durable = matches!(
+                record.handle.native_continuity(),
+                crate::chat::NativeContinuity::Durable { .. }
+            );
+            let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
+                && self
+                    .terminals
+                    .get(&id)
+                    .is_some_and(|terminal| !terminal.handle.is_completed());
+            let environment_ready = super::super::chat::validate_upgrade_environment(
+                &launch,
+                hosted_source,
+                &record.handle,
+            )
+            .is_ok();
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
@@ -78,10 +159,27 @@ impl HostState {
                     Disposition::Blocked,
                     "Close this conversation to finish its pending provider cleanup, then retry.",
                 )
-            } else if !ready || launch.terminal_recipe().is_none() {
+            } else if !ready || !aligned || !environment_ready || launch.terminal_recipe().is_none()
+            {
                 (
                     Disposition::Blocked,
                     "Wait for the provider to confirm its resumable conversation, or close it.",
+                )
+            } else if durable
+                && self
+                    .terminals
+                    .get(&id)
+                    .is_some_and(|terminal| !terminal.handle.is_completed())
+                && !can_carry(id)
+            {
+                (
+                    Disposition::Blocked,
+                    "The paired console cannot preserve its live process through this update.",
+                )
+            } else if durable {
+                (
+                    Disposition::Continues,
+                    "The provider, active turn, and pending approvals stay alive while the application reconnects.",
                 )
             } else if busy && policy == Policy::WhenIdle {
                 (
@@ -110,7 +208,12 @@ impl HostState {
                         .unwrap_or(record.session.launch.provider.label()),
                     &record.session.launch.recipe.working_directory,
                 ),
-                identity: identity(&(self.inventory_generation, &record.session, confirmed))?,
+                identity: identity(&(
+                    self.inventory_generation,
+                    &record.session,
+                    confirmed,
+                    record.handle.native_continuity(),
+                ))?,
                 disposition,
                 reason: reason.into(),
             });

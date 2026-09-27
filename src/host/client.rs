@@ -434,20 +434,14 @@ pub(super) fn process_request(
             ))
         }
         ClientRequest::UpgradeImpact { policy } => {
-            let impact = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upgrade_impact(policy)?;
+            let impact = super::state::update::inspect(host, policy, false)?;
             Ok((ServerResponse::UpgradeImpact(impact), Vec::new(), false))
         }
         ClientRequest::PrepareConfirmedUpgrade {
             impact,
             relaunch_agents,
         } => {
-            let current = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .upgrade_impact(impact.policy)?;
+            let current = super::state::update::inspect(host, impact.policy, true)?;
             if !impact.preserves_consent(&current) || !current.ready() {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::InvalidRequest,
