@@ -540,7 +540,7 @@ pub struct ChangedPath {
 
 /// One path in a committed comparison (branch or commit diff), which has no
 /// index/worktree area and cannot be conflicted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffEntry {
     pub path: RepoPath,
     pub old_path: Option<RepoPath>,
@@ -567,7 +567,7 @@ pub struct BranchComparison {
 /// served; `merge_base` is computed locally against `base_tip`, which is the
 /// base branch as the remote had it at fetch time. The two refs are display
 /// handles only: every comparison built from this range names the object ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestRange {
     pub number: u64,
     /// The base branch by the name the forge and the user know it, e.g. `main`.

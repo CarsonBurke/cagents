@@ -1,7 +1,7 @@
 use cagents::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents::{
     design,
-    github::{self, GitHubService},
+    github::GitHubService,
     lsp::{
         LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
         LspStatus,
@@ -100,19 +100,7 @@ fn review_source_for_remotes(
     root: &Path,
     remotes: &[cagents::repository::RemoteRecord],
 ) -> Option<ReviewSource> {
-    let key = remotes
-        .iter()
-        .filter_map(|remote| github::remote_repository_key(remote.fetch_url.as_deref()?))
-        .collect::<Vec<_>>();
-    let repository = key
-        .iter()
-        .find(|key| github::remote_for_repository(remotes, key).as_deref() == Some("origin"))
-        .or_else(|| key.first())?
-        .clone();
-    Some(ReviewSource {
-        repository,
-        worktree: root.to_path_buf(),
-    })
+    ReviewSource::from_remotes(root, remotes)
 }
 
 struct FileOperationDialog {
@@ -256,6 +244,9 @@ pub(crate) enum EditorShortcut {
     ReviewToggleViewed,
     ReviewNextFile,
     ReviewPreviousFile,
+    ReviewNextUnviewed,
+    ReviewNextChange,
+    ReviewPreviousChange,
 }
 impl crate::preferences::EditorShortcuts {
     fn set(&mut self, action: EditorShortcut, value: String) {
@@ -272,6 +263,9 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::ReviewToggleViewed => self.review_toggle_viewed = value,
             EditorShortcut::ReviewNextFile => self.review_next_file = value,
             EditorShortcut::ReviewPreviousFile => self.review_previous_file = value,
+            EditorShortcut::ReviewNextUnviewed => self.review_next_unviewed = value,
+            EditorShortcut::ReviewNextChange => self.review_next_change = value,
+            EditorShortcut::ReviewPreviousChange => self.review_previous_change = value,
         }
     }
 
@@ -289,6 +283,9 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::ReviewToggleViewed => &self.review_toggle_viewed,
             EditorShortcut::ReviewNextFile => &self.review_next_file,
             EditorShortcut::ReviewPreviousFile => &self.review_previous_file,
+            EditorShortcut::ReviewNextUnviewed => &self.review_next_unviewed,
+            EditorShortcut::ReviewNextChange => &self.review_next_change,
+            EditorShortcut::ReviewPreviousChange => &self.review_previous_change,
         }
     }
 
@@ -307,6 +304,9 @@ impl crate::preferences::EditorShortcuts {
             (&self.review_toggle_viewed, true),
             (&self.review_next_file, true),
             (&self.review_previous_file, true),
+            (&self.review_next_unviewed, true),
+            (&self.review_next_change, true),
+            (&self.review_previous_change, true),
         ] {
             // A review action may stay unbound: its default is dropped when
             // an older table already used the chord for something else.
@@ -407,6 +407,18 @@ impl Editor {
                 EditorShortcut::ReviewPreviousFile,
                 pull_request_review::Action::PreviousFile,
             ),
+            (
+                EditorShortcut::ReviewNextUnviewed,
+                pull_request_review::Action::NextUnviewed,
+            ),
+            (
+                EditorShortcut::ReviewNextChange,
+                pull_request_review::Action::NextChange,
+            ),
+            (
+                EditorShortcut::ReviewPreviousChange,
+                pull_request_review::Action::PreviousChange,
+            ),
         ] {
             if self.shortcut_pressed(shortcut, event) {
                 // The chords mean something only with a review on screen;
@@ -492,10 +504,38 @@ enum PreferenceFile {
     Assistance,
     Shortcuts,
     Session,
+    Review,
 }
 
 impl PreferenceFile {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
+}
+
+struct ReviewPreferenceStore {
+    store: pull_request_review::cache::JsonStore,
+    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+}
+
+impl pull_request_review::cache::Store for ReviewPreferenceStore {
+    fn load(
+        &self,
+        key: &cagents::github::PullRequestKey,
+    ) -> Result<Option<pull_request_review::cache::Snapshot>, String> {
+        self.store.load(key)
+    }
+
+    fn save(
+        &self,
+        snapshot: &pull_request_review::cache::Snapshot,
+        order: u64,
+    ) -> Result<(), String> {
+        let mut lane = self.lane.lock().unwrap_or_else(|error| error.into_inner());
+        // Writes are per-PR deltas. JsonStore rejects stale writes for that
+        // key; a newer write to a different PR must not discard this one.
+        self.store.save(snapshot, order)?;
+        lane[PreferenceFile::Review as usize] = lane[PreferenceFile::Review as usize].max(order);
+        Ok(())
+    }
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -1470,7 +1510,13 @@ impl Editor {
         let mut review = pull_request_review::State::new(
             Arc::new(GitHubService::system("gh")),
             RepositoryService::system("git"),
-        );
+        )
+        .with_cache(Some(Arc::new(ReviewPreferenceStore {
+            store: pull_request_review::cache::JsonStore::new(
+                self.settings_path.with_file_name("review.json"),
+            ),
+            lane: Arc::clone(&self.preference_lane),
+        })));
         let review_task = review
             .set_source(review_source(&descriptor_root, opened.snapshot.as_ref()))
             .map(move |action| Message::PullRequestReview(id, action))
@@ -2357,6 +2403,14 @@ impl Editor {
                         basis,
                     },
                 ))),
+                pull_request_review::Effect::NextChange => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::NextChange { card: id }),
+                )),
+                pull_request_review::Effect::PreviousChange => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::PreviousChange { card: id }),
+                )),
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     tab.runtime
                         .update(RepositoryAction::BackToFiles { card: id }),
@@ -5012,6 +5066,24 @@ impl Editor {
                             EditorShortcut::ReviewPreviousFile,
                             &self.shortcut_draft.review_previous_file,
                         ),
+                        shortcut_setting(
+                            "Next unviewed file",
+                            "Opens the next unviewed file of the open pull request.",
+                            EditorShortcut::ReviewNextUnviewed,
+                            &self.shortcut_draft.review_next_unviewed,
+                        ),
+                        shortcut_setting(
+                            "Next changed hunk",
+                            "Opens the next changed hunk of the open pull request.",
+                            EditorShortcut::ReviewNextChange,
+                            &self.shortcut_draft.review_next_change,
+                        ),
+                        shortcut_setting(
+                            "Previous changed hunk",
+                            "Opens the previous changed hunk of the open pull request.",
+                            EditorShortcut::ReviewPreviousChange,
+                            &self.shortcut_draft.review_previous_change,
+                        ),
                         // Fixed, not configurable: the completion request is wired
                         // to the chord directly rather than through the shortcut
                         // table, so list it read-only instead of leaving it
@@ -6514,7 +6586,7 @@ mod tests {
         assert!(app.handle_shortcut(&next).is_none(), "still none open");
 
         let target = pull_request_review::ReviewTarget {
-            repository: github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            repository: cagents::github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
             worktree: "/workspace".into(),
             pull_request: Arc::new(
                 serde_json::from_value(serde_json::json!({

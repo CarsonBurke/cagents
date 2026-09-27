@@ -54,6 +54,9 @@ pub enum GlobalShortcut {
     ReviewToggleViewed,
     ReviewNextFile,
     ReviewPreviousFile,
+    ReviewNextUnviewed,
+    ReviewNextChange,
+    ReviewPreviousChange,
 }
 
 /// Where a shortcut applies, which decides when its chord is withheld from
@@ -154,6 +157,24 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: true,
         scope: ShortcutScope::Review,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewNextUnviewed,
+        label: "Next unviewed file",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewNextChange,
+        label: "Next changed hunk",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewPreviousChange,
+        label: "Previous changed hunk",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -179,6 +200,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ReviewToggleViewed => &shortcuts.review_toggle_viewed,
         GlobalShortcut::ReviewNextFile => &shortcuts.review_next_file,
         GlobalShortcut::ReviewPreviousFile => &shortcuts.review_previous_file,
+        GlobalShortcut::ReviewNextUnviewed => &shortcuts.review_next_unviewed,
+        GlobalShortcut::ReviewNextChange => &shortcuts.review_next_change,
+        GlobalShortcut::ReviewPreviousChange => &shortcuts.review_previous_change,
     }
 }
 
@@ -574,12 +598,13 @@ where
     // when its requested ID changes. Key its entire subtree by worktree so
     // programmatic scroll operations cannot keep targeting the departed strip.
     WorkspaceSurface::new(
-        cosmic::widget::id_container(scrollable, scroll_id),
+        cosmic::widget::id_container(scrollable, scroll_id.clone()),
         shortcuts,
         review_focused,
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
 }
 
@@ -1231,6 +1256,12 @@ struct WorkspaceSurface<'a, Message> {
     /// the strip in one hid every card from screen readers.
     reported_width: f32,
     on_resize: Box<dyn Fn(f32) -> Message + 'a>,
+    initial_scroll: Option<(widget::Id, f32)>,
+}
+
+#[derive(Default)]
+struct WorkspaceSurfaceState {
+    initialized_scroll: Option<widget::Id>,
 }
 
 impl<'a, Message> WorkspaceSurface<'a, Message> {
@@ -1247,7 +1278,13 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             review_focused,
             reported_width,
             on_resize: Box::new(on_resize),
+            initial_scroll: None,
         }
+    }
+
+    fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
+        self.initial_scroll = Some((id, offset));
+        self
     }
 
     fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
@@ -1260,6 +1297,14 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<WorkspaceSurfaceState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(WorkspaceSurfaceState::default())
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -1283,6 +1328,28 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
             .move_to(Point::ORIGIN);
+        if let Some((id, offset)) = &self.initial_scroll {
+            let state = tree.state.downcast_mut::<WorkspaceSurfaceState>();
+            if state.initialized_scroll.as_ref() != Some(id) {
+                // Startup operations may run before the strip exists. Seed the
+                // new native scroll state after layout, even when its width
+                // already equals the restored model's width. Do this only once
+                // per strip; later user scrolling remains native state.
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    Layout::new(&content),
+                    renderer,
+                    &mut cosmic::iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+                        id.clone(),
+                        widget::scrollable::AbsoluteOffset {
+                            x: Some(offset.max(0.0)),
+                            y: None,
+                        },
+                    ),
+                );
+                state.initialized_scroll = Some(id.clone());
+            }
+        }
         layout::Node::with_children(content.size(), vec![content])
     }
 
@@ -2851,7 +2918,7 @@ mod tests {
     }
 
     #[test]
-    fn card_overlays_survive_a_camera_that_moved_them_into_view() {
+    fn restored_camera_initializes_native_scroll_once_before_the_first_frame() {
         use cosmic::iced::advanced::{renderer::Headless, widget::operation};
         const VIEWPORT: f32 = 600.0;
         const HEIGHT: f32 = 400.0;
@@ -2918,24 +2985,10 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, Size::new(VIEWPORT, HEIGHT)),
         );
-        // The camera the workspace reports and the offset the native
-        // scrollable holds are two halves of the same scroll; the widget chain
-        // only learns about the second one through `translation`.
-        element.as_widget_mut().operate(
-            &mut tree,
-            Layout::new(&node),
-            &renderer,
-            &mut operation::scrollable::scroll_to::<()>(
-                scroll_id,
-                operation::scrollable::AbsoluteOffset {
-                    x: Some(offset),
-                    y: None,
-                },
-            ),
-        );
-
+        // No startup scroll task or resize message is delivered. The initial
+        // width already matches the model, as it can after restoring a window.
         let visible = Rectangle::new(Point::ORIGIN, Size::new(VIEWPORT, HEIGHT));
-        let mut raised = element
+        let mut restored_overlay = element
             .as_widget_mut()
             .overlay(
                 &mut tree,
@@ -2945,7 +2998,9 @@ mod tests {
                 Vector::ZERO,
             )
             .expect("a mounted card raised an overlay");
-        let raised = raised.as_overlay_mut().layout(&renderer, visible.size());
+        let raised = restored_overlay
+            .as_overlay_mut()
+            .layout(&renderer, visible.size());
         let mut positions: Vec<f32> = raised
             .children()
             .iter()
@@ -2953,5 +3008,48 @@ mod tests {
             .collect();
         positions.sort_by(f32::total_cmp);
         assert_eq!(positions, expected);
+        drop(raised);
+        drop(restored_overlay);
+
+        // A later native scroll must survive relayout with the same widget
+        // state, even before its feedback has reached the workspace model.
+        let moved_offset = offset - 100.0;
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                scroll_id,
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(moved_offset),
+                    y: None,
+                },
+            ),
+        );
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(VIEWPORT, HEIGHT)),
+        );
+        let mut raised = element
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &visible,
+                Vector::ZERO,
+            )
+            .expect("native-scrolled panes retain their overlays");
+        let raised = raised.as_overlay_mut().layout(&renderer, visible.size());
+        let mut positions: Vec<f32> = raised
+            .children()
+            .iter()
+            .map(|child| child.bounds().x)
+            .collect();
+        positions.sort_by(f32::total_cmp);
+        let mut moved = projection;
+        moved.offset = moved_offset;
+        assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
 }

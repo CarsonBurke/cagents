@@ -79,6 +79,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
+| Next unviewed review file | `Alt+Shift+Down` |
+| Next / previous changed hunk in a review | `Alt+J` / `Alt+K` |
 
 Every shortcut is configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
@@ -154,6 +156,15 @@ pull requests** follows the next cursor with no fixed total limit. Search by
 title, number, or author and filter drafts or check status across the loaded
 rows; the counts make that scope visible. An open, focused review refreshes
 every 30 seconds, keeping its file marks and discussion current.
+The same refresh updates its title, checks, review decision, and base branch.
+
+Previously opened reviews retain their file list, viewed marks, and selected
+file locally. If GitHub is unavailable, enter `#123` in the browser and choose
+**Open #123** to read its cached diff. The header identifies the cached viewer;
+viewed changes and review submission stay disabled until a fresh GitHub load
+confirms the current account and revision. Unconfirmed viewed changes are
+reconciled on refresh. The cache retains up to 32 recent reviews within a
+32 MiB payload budget; it does not store pending comment bodies or credentials.
 
 - Choosing a file shows its diff against the fetched merge base without
   touching the working tree, so staging and the diff-basis switch are absent.
@@ -176,6 +187,8 @@ comment in your GitHub draft review; **Preview** renders its Markdown before
 saving. Existing discussions appear below their lines, with outdated threads
 above the file. Resolved threads collapse. You can reply, resolve or reopen a
 thread, and edit or delete your own pending comments.
+Threads whose lines are unavailable, including non-text files, also appear
+above the file so their replies and resolution controls remain reachable.
 
 The review bar shows the pending comment count and offers **Comment**,
 **Approve**, or **Request changes**, with an optional summary. Save or cancel

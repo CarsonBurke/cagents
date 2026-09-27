@@ -120,6 +120,9 @@ pub struct EditorShortcuts {
     pub review_toggle_viewed: String,
     pub review_next_file: String,
     pub review_previous_file: String,
+    pub review_next_unviewed: String,
+    pub review_next_change: String,
+    pub review_previous_change: String,
 }
 
 impl Default for EditorShortcuts {
@@ -137,6 +140,9 @@ impl Default for EditorShortcuts {
             review_toggle_viewed: "Alt+V".into(),
             review_next_file: "Alt+Down".into(),
             review_previous_file: "Alt+Up".into(),
+            review_next_unviewed: "Alt+Shift+Down".into(),
+            review_next_change: "Alt+J".into(),
+            review_previous_change: "Alt+K".into(),
         }
     }
 }
@@ -181,6 +187,12 @@ fn parse_shortcuts(contents: &str) -> Result<EditorShortcuts, toml::de::Error> {
         ("review_toggle_viewed", &mut shortcuts.review_toggle_viewed),
         ("review_next_file", &mut shortcuts.review_next_file),
         ("review_previous_file", &mut shortcuts.review_previous_file),
+        ("review_next_unviewed", &mut shortcuts.review_next_unviewed),
+        ("review_next_change", &mut shortcuts.review_next_change),
+        (
+            "review_previous_change",
+            &mut shortcuts.review_previous_change,
+        ),
     ];
     let (explicit, defaulted): (Vec<_>, Vec<_>) = review
         .into_iter()
@@ -220,6 +232,15 @@ pub fn save_shortcuts(settings: &Path, shortcuts: &EditorShortcuts) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_review_navigation_defaults_do_not_steal_existing_chords() {
+        let shortcuts =
+            super::parse_shortcuts("quick_open = \"Alt+J\"\nfilter_files = \"Alt+Shift+Down\"\n")
+                .unwrap();
+        assert!(shortcuts.review_next_change.is_empty());
+        assert!(shortcuts.review_next_unviewed.is_empty());
+        assert_eq!(shortcuts.review_previous_change, "Alt+K");
+    }
     use super::*;
 
     /// A table written before the review actions existed may already give
