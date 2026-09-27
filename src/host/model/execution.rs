@@ -35,6 +35,10 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
          ) STRICT;
          CREATE INDEX IF NOT EXISTS agent_runs_by_agent ON agent_runs(agent);
          CREATE INDEX IF NOT EXISTS agent_runs_by_state ON agent_runs(state, origin);
+         CREATE TABLE IF NOT EXISTS agent_dispatches (
+             run TEXT PRIMARY KEY REFERENCES agent_runs(id),
+             claimed_at INTEGER NOT NULL
+         ) STRICT;
          CREATE TABLE IF NOT EXISTS agent_authorities (
              token TEXT PRIMARY KEY,
              session_id TEXT NOT NULL UNIQUE,
@@ -47,6 +51,46 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// A post-commit once-only fence, shared by interactive and scheduled
+    /// dispatch. The caller performs no launch/send until this commit returns.
+    /// An accepted-but-unproved run is never redispatched after a restart.
+    pub(crate) fn claim_agent_dispatch(
+        &mut self,
+        accepted: &Accepted,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        if !accepted.created || accepted.run.state != State::Accepted {
+            return Ok(false);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let stored: String = tx
+            .query_row(
+                "SELECT record FROM agent_runs WHERE id = ?1",
+                [accepted.run.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if decode::<Run>(&stored)? != accepted.run
+            || read_agent(&tx, accepted.agent.id)? != accepted.agent
+        {
+            return Err(
+                "The accepted agent run changed before dispatch; nothing was submitted".into(),
+            );
+        }
+        let claimed = tx
+            .execute(
+                "INSERT OR IGNORE INTO agent_dispatches(run, claimed_at) VALUES (?1, ?2)",
+                params![accepted.run.id.to_string(), now_ms],
+            )
+            .map_err(|error| error.to_string())?
+            == 1;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(claimed)
+    }
+
     pub(crate) fn execution_origin(&self, authority: &Authority) -> Result<Origin, String> {
         let Some(token) = authority.token() else {
             return Ok(Origin::User);
@@ -67,6 +111,87 @@ impl Registry {
                 .parse()
                 .map_err(|_| "Stored agent session identity is invalid")?,
         })
+    }
+
+    /// The service also verifies this source against its live/adopted actor.
+    /// A retained token alone does not prove that its issuing process survived.
+    pub(crate) fn agent_authority_source(
+        &self,
+        authority: &Authority,
+    ) -> Result<Option<HostedSession>, String> {
+        self.execution_origin(authority)?;
+        authority
+            .token()
+            .map(|token| {
+                let source: String = self
+                    .db
+                    .query_row(
+                        "SELECT source FROM agent_authorities WHERE token = ?1",
+                        [token],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| {
+                        "This agent session authority is no longer registered".to_owned()
+                    })?;
+                decode(&source)
+            })
+            .transpose()
+    }
+
+    /// Retirement is exact-source fenced: a late close from the old daemon
+    /// incarnation cannot revoke the authority of its authenticated successor.
+    pub(crate) fn retire_agent_authority(&mut self, source: &HostedSession) -> Result<(), String> {
+        self.db
+            .execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
+                params![source.id().to_string(), encode(source)?],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Invoked only after holder authentication and a successful adoption of
+    /// this exact retained source. This CAS rotates only host proof, retaining
+    /// the capability already inherited by the surviving process and tools.
+    pub(crate) fn adopt_agent_authority(
+        &mut self,
+        source: &HostedSession,
+        successor: &HostedSession,
+    ) -> Result<bool, String> {
+        let mut normalized = successor.clone();
+        match (&mut normalized, source) {
+            (HostedSession::Terminal(next), HostedSession::Terminal(old)) => {
+                if next.continuity.live_proof().is_none() || old.continuity.live_proof().is_none() {
+                    return Err(
+                        "Only proved live terminal lineage can preserve agent authority".into(),
+                    );
+                }
+                next.continuity = old.continuity.clone();
+            }
+            (HostedSession::Chat(next), HostedSession::Chat(old)) => {
+                if next.proof.as_ref().is_none_or(|proof| !proof.is_complete())
+                    || old.proof.as_ref().is_none_or(|proof| !proof.is_complete())
+                {
+                    return Err(
+                        "Only proved native chat lineage can preserve agent authority".into(),
+                    );
+                }
+                next.proof = old.proof.clone();
+            }
+            _ => {
+                return Err("Agent authority cannot change session surface during adoption".into());
+            }
+        }
+        if normalized != *source {
+            return Err("Agent authority adoption changed the retained session identity".into());
+        }
+        self.db
+            .execute(
+                "UPDATE agent_authorities SET source = ?3 WHERE session_id = ?1 AND source = ?2",
+                params![source.id().to_string(), encode(source)?, encode(successor)?],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
     }
 
     /// Only an actual newly spawned session or a proved exact reattachment can
@@ -112,11 +237,21 @@ impl Registry {
         request: &Submit,
         now_ms: u64,
     ) -> Result<Accepted, String> {
+        self.submit_agent_with_spec(origin, request, None, now_ms)
+    }
+
+    pub(crate) fn submit_agent_with_spec(
+        &mut self,
+        origin: &Origin,
+        request: &Submit,
+        selected: Option<&crate::agent_execution::Spec>,
+        now_ms: u64,
+    ) -> Result<Accepted, String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let accepted = Self::submit_agent_in(&tx, origin, request, now_ms)?;
+        let accepted = Self::submit_agent_selected_in(&tx, origin, request, selected, now_ms)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(accepted)
     }
@@ -127,6 +262,16 @@ impl Registry {
         tx: &Transaction<'_>,
         origin: &Origin,
         request: &Submit,
+        now_ms: u64,
+    ) -> Result<Accepted, String> {
+        Self::submit_agent_selected_in(tx, origin, request, None, now_ms)
+    }
+
+    fn submit_agent_selected_in(
+        tx: &Transaction<'_>,
+        origin: &Origin,
+        request: &Submit,
+        selected: Option<&crate::agent_execution::Spec>,
         now_ms: u64,
     ) -> Result<Accepted, String> {
         request.validate()?;
@@ -194,6 +339,9 @@ impl Registry {
                 agent
             }
             Destination::New(spec) => {
+                // Persist the resolved account for this accepted launch while
+                // keeping the caller's original request as its retry key.
+                let spec = selected.unwrap_or(spec);
                 let children: usize = tx
                     .query_row(
                         "SELECT count(*) FROM agents WHERE origin = ?1 AND closed = 0",
@@ -289,6 +437,30 @@ impl Registry {
 
     pub(crate) fn agent(&self, id: AgentId) -> Result<Agent, String> {
         read_agent(&self.db, id)
+    }
+
+    pub(crate) fn agent_request(&self, run: RunId) -> Result<Submit, String> {
+        let request: String = self
+            .db
+            .query_row(
+                "SELECT request FROM agent_runs WHERE id = ?1",
+                [run.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        decode(&request)
+    }
+
+    pub(crate) fn latest_agent_run(&self, agent: AgentId) -> Result<Run, String> {
+        let record: String = self
+            .db
+            .query_row(
+                "SELECT record FROM agent_runs WHERE agent = ?1 ORDER BY rowid DESC LIMIT 1",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        decode(&record)
     }
 
     pub(crate) fn agents(&self, origin: Option<&Origin>) -> Result<Vec<Agent>, String> {
@@ -546,6 +718,59 @@ mod tests {
         workspace_model::ModelEdit,
     };
 
+    #[test]
+    fn authority_retirement_and_proved_successor_are_exact_source_fenced() {
+        let (mut registry, _directory, _) = fixture();
+        let source = HostedSession::Chat(crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("host"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("old"),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+        });
+        let authority = registry.register_agent_authority(&source).unwrap();
+        let mut successor = source.clone();
+        let HostedSession::Chat(next) = &mut successor else {
+            unreachable!()
+        };
+        next.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("next");
+        assert!(registry.register_agent_authority(&successor).is_err());
+        let mut unrelated = successor.clone();
+        let HostedSession::Chat(other) = &mut unrelated else {
+            unreachable!()
+        };
+        other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(registry.adopt_agent_authority(&source, &unrelated).is_err());
+        assert!(registry.adopt_agent_authority(&source, &successor).unwrap());
+        assert!(!registry.adopt_agent_authority(&source, &successor).unwrap());
+        assert_eq!(
+            registry.register_agent_authority(&successor).unwrap(),
+            authority
+        );
+        registry.retire_agent_authority(&source).unwrap();
+        assert_eq!(
+            registry.agent_authority_source(&authority).unwrap(),
+            Some(successor.clone())
+        );
+        registry.retire_agent_authority(&successor).unwrap();
+        assert!(registry.execution_origin(&authority).is_err());
+        assert!(registry.agent_authority_source(&authority).is_err());
+    }
+
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {
         let directory = tempfile::tempdir().unwrap();
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
@@ -667,6 +892,26 @@ mod tests {
                 .contains("different")
         );
         assert_eq!(registry.model().unwrap().channels.len(), 1);
+    }
+
+    #[test]
+    fn committed_dispatch_claim_is_once_only_and_restart_never_reauthorizes_it() {
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 10).unwrap();
+        assert!(registry.claim_agent_dispatch(&accepted, 11).unwrap());
+        assert!(!registry.claim_agent_dispatch(&accepted, 12).unwrap());
+        drop(registry);
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert!(!registry.claim_agent_dispatch(&accepted, 13).unwrap());
+        registry.interrupt_unproven_agent_runs(14).unwrap();
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap().state,
+            State::Interrupted
+        );
+        assert!(registry.claim_agent_dispatch(&accepted, 15).is_err());
+        let retry = registry.submit_agent(&Origin::User, &request, 16).unwrap();
+        assert!(!retry.created);
+        assert!(!registry.claim_agent_dispatch(&retry, 17).unwrap());
     }
 
     #[test]

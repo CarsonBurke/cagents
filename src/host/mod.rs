@@ -1,4 +1,5 @@
 mod activity;
+mod agent_execution;
 mod chat;
 mod client;
 mod delivery;
@@ -205,6 +206,15 @@ pub fn run() -> Result<(), HostError> {
     }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
     state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+    // A committed acceptance is not proof of provider delivery. Until a
+    // restored actor supplies exact run evidence, never authorize a resend.
+    if let Ok(registry) = agent_execution::registry(&host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
+            .map_err(io::Error::other)?;
+    }
     let _agent_activity = activity::Monitor::start(&host)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;

@@ -208,7 +208,7 @@ impl ResultSummary {
     }
 }
 
-fn truncate(text: &mut String, limit: usize) -> bool {
+pub(crate) fn truncate(text: &mut String, limit: usize) -> bool {
     if text.len() <= limit {
         return false;
     }

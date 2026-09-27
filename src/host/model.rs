@@ -47,6 +47,7 @@ pub(crate) struct Applied {
 
 pub(crate) struct Registry {
     db: Connection,
+    path: PathBuf,
 }
 
 impl Registry {
@@ -68,7 +69,17 @@ impl Registry {
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         configure(&db)?;
         migrate(&db)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: path.to_owned(),
+        })
+    }
+
+    /// Independent WAL connection for low-rate execution transactions. The
+    /// caller can hold its own mutex without stalling terminal delivery behind
+    /// the global host lock while SQLite commits or waits for another writer.
+    pub(crate) fn execution_connection(&self) -> Result<Self, String> {
+        Self::at(&self.path)
     }
 
     /// The whole model, ordered by the ranks the registry assigned.

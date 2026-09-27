@@ -224,6 +224,7 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that asked for shared-model edges, kept separately from
     /// `watchers` because watching terminals and watching the model are
     /// independent subscriptions with independent clients - the CLI reads the
@@ -276,6 +277,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            execution_registry: None,
             model_watchers: BTreeSet::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
@@ -339,6 +341,13 @@ impl HostState {
     /// constructed for a test must not reach into the user's data directory, and
     /// a daemon that cannot open the store still has terminals to host.
     pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+        self.execution_registry = match registry.execution_connection() {
+            Ok(connection) => Some(Arc::new(Mutex::new(connection))),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the agent execution registry");
+                None
+            }
+        };
         self.model = Some(registry);
     }
 
