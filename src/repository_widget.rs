@@ -13,6 +13,9 @@ use std::{
 #[path = "editor_widget.rs"]
 mod text_editor;
 
+mod diff_layout;
+use diff_layout::RowOffsets;
+
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
 use cosmic::iced::advanced::{
@@ -1321,7 +1324,20 @@ enum DiffState {
         request: u64,
         cancellation: CancellationToken,
     },
-    Ready(RenderedDiff),
+    Ready(RenderedDiff, [RowOffsets; 2]),
+}
+
+impl DiffState {
+    fn ready(content: RenderedDiff) -> Self {
+        let rows = [DiffMode::Inline, DiffMode::Split].map(|mode| {
+            let count = match &content {
+                RenderedDiff::Text { model, .. } => model.row_count(mode),
+                _ => 0,
+            };
+            RowOffsets::uniform(count, DIFF_ROW_HEIGHT)
+        });
+        Self::Ready(content, rows)
+    }
 }
 
 impl Drop for DiffState {
@@ -1414,6 +1430,7 @@ struct ListViewport {
 #[derive(Debug, Clone, Copy, Default)]
 struct DiffViewportAnchor {
     offset: f32,
+    row: Option<diff_layout::Anchor>,
     horizontal: f32,
     change: usize,
 }
@@ -1452,29 +1469,23 @@ const ZOOM_LABEL_WIDTH: f32 = 48.0;
 /// instant and the ceiling bounded.
 const MAX_RETAINED_COMMITTED_DIFFS: usize = 4;
 
+#[cfg(test)]
 fn visible_rows(total: usize, viewport: ListViewport, row_height: f32) -> VisibleRows {
+    visible_diff_rows(&RowOffsets::uniform(total, row_height), viewport)
+}
+
+fn visible_diff_rows(rows: &RowOffsets, viewport: ListViewport) -> VisibleRows {
     let height = if viewport.height.is_finite() && viewport.height > 0.0 {
         viewport.height
     } else {
         INITIAL_VIEWPORT_HEIGHT
     };
-    let offset = if viewport.offset.is_finite() {
-        viewport.offset.max(0.0)
-    } else {
-        0.0
-    };
-    let first = (offset / row_height).floor() as usize;
-    let visible = (height / row_height).ceil() as usize + 1;
-    let start = first.saturating_sub(VISIBLE_ROW_OVERSCAN).min(total);
-    let end = first
-        .saturating_add(visible)
-        .saturating_add(VISIBLE_ROW_OVERSCAN)
-        .min(total);
+    let Range { start, end } = rows.visible(viewport.offset, height, VISIBLE_ROW_OVERSCAN);
     VisibleRows {
         start,
         end,
-        top_space: start as f32 * row_height,
-        bottom_space: total.saturating_sub(end) as f32 * row_height,
+        top_space: rows.offset(start) - rows.leading_height(),
+        bottom_space: rows.total_height() - rows.offset(end),
     }
 }
 
@@ -3299,7 +3310,7 @@ impl RepositoryRuntime {
                     self.working_diff.error = None;
                     self.set_diff_state(
                         DiffBasis::IndexToWorktree,
-                        DiffState::Ready(RenderedDiff::Text {
+                        DiffState::ready(RenderedDiff::Text {
                             model,
                             old_label: "Index".into(),
                             new_label: "Working buffer".into(),
@@ -3373,7 +3384,7 @@ impl RepositoryRuntime {
             && self.can_select_diff_basis(&self.diff_basis)
             && (matches!(
                 self.diff_state(&self.diff_basis),
-                Some(DiffState::Ready(RenderedDiff::Error(_)))
+                Some(DiffState::Ready(RenderedDiff::Error(_), _))
             ) || (self.editable_working_diff() && self.working_diff.error.is_some()))
     }
 
@@ -3496,7 +3507,7 @@ impl RepositoryRuntime {
             match self.diff_state(&self.diff_basis) {
                 None => (Some("No changes"), None, Some(0), Some(0), None),
                 Some(DiffState::Loading { .. }) => (Some("Loading"), None, None, None, None),
-                Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => {
+                Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => {
                     let changes = model.change_starts(self.diff_mode).len();
                     (
                         Some(if changes == 0 { "No changes" } else { "Ready" }),
@@ -3506,10 +3517,10 @@ impl RepositoryRuntime {
                         (changes != 0).then_some((self.diff_change + 1, changes)),
                     )
                 }
-                Some(DiffState::Ready(RenderedDiff::Error(error))) => {
+                Some(DiffState::Ready(RenderedDiff::Error(error), _)) => {
                     (Some("Unavailable"), Some(error.clone()), None, None, None)
                 }
-                Some(DiffState::Ready(RenderedDiff::NoText(content))) => {
+                Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => {
                     (Some(no_text_kind(content)), None, None, None, None)
                 }
             }
@@ -3587,7 +3598,7 @@ impl RepositoryRuntime {
                 ) => RepositoryRuntimeStatus::Unavailable,
                 None => match self.diff_state(&self.diff_basis) {
                     Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
-                    Some(DiffState::Ready(RenderedDiff::Error(_))) => {
+                    Some(DiffState::Ready(RenderedDiff::Error(_), _)) => {
                         RepositoryRuntimeStatus::Unavailable
                     }
                     _ => RepositoryRuntimeStatus::Ready,
@@ -4162,7 +4173,7 @@ impl RepositoryRuntime {
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
-                    self.set_diff_state(basis, DiffState::Ready(content));
+                    self.set_diff_state(basis, DiffState::ready(content));
                     if current {
                         self.diff_change =
                             self.diff_change.min(self.change_count().saturating_sub(1));
@@ -4870,6 +4881,9 @@ impl RepositoryRuntime {
     fn current_diff_viewport(&self) -> DiffViewportAnchor {
         DiffViewportAnchor {
             offset: self.diff_viewport.offset,
+            row: self
+                .diff_rows()
+                .map(|rows| rows.anchor(self.diff_viewport.offset)),
             horizontal: self.diff_horizontal,
             change: self.diff_change,
         }
@@ -4881,7 +4895,10 @@ impl RepositoryRuntime {
     }
 
     fn apply_diff_viewport(&mut self, anchor: DiffViewportAnchor) {
-        self.diff_viewport.offset = anchor.offset;
+        self.diff_viewport.offset = anchor
+            .row
+            .zip(self.diff_rows())
+            .map_or(anchor.offset, |(anchor, rows)| rows.restore(anchor));
         self.diff_horizontal = anchor.horizontal;
         self.diff_change = anchor.change;
     }
@@ -5003,9 +5020,43 @@ impl RepositoryRuntime {
 
     fn diff_model(&self) -> Option<&DiffModel> {
         match self.diff_state(&self.diff_basis) {
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
             _ => None,
         }
+    }
+
+    fn diff_rows(&self) -> Option<&RowOffsets> {
+        match self.diff_state(&self.diff_basis) {
+            Some(DiffState::Ready(_, rows)) => Some(&rows[self.diff_mode_index()]),
+            _ => None,
+        }
+    }
+
+    /// Installs measured review blocks for the active comparison. The caller
+    /// fences document/request identity before applying asynchronous layout
+    /// measurements. Heights exclude the code row itself; `leading` precedes
+    /// the first row and holds discussions without a live line anchor.
+    pub fn set_diff_annotation_heights(
+        &mut self,
+        mode: DiffMode,
+        leading: f32,
+        measurements: &[(usize, f32)],
+    ) -> Task<RepositoryAction> {
+        let anchor = self.current_diff_viewport();
+        let index = usize::from(mode == DiffMode::Split);
+        let Some((_, DiffState::Ready(_, rows))) = self
+            .diffs
+            .iter_mut()
+            .find(|(basis, _)| *basis == self.diff_basis)
+        else {
+            return Task::none();
+        };
+        if !rows[index].annotate(leading, measurements) || mode != self.diff_mode {
+            return Task::none();
+        }
+        self.apply_diff_viewport(anchor);
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 
     fn change_count(&self) -> usize {
@@ -5019,7 +5070,7 @@ impl RepositoryRuntime {
             .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
             .copied();
         if let Some(row) = row {
-            self.diff_viewport.offset = row as f32 * DIFF_ROW_HEIGHT;
+            self.diff_viewport.offset = self.diff_rows().map_or(0.0, |rows| rows.offset(row));
         }
     }
 
@@ -5031,13 +5082,14 @@ impl RepositoryRuntime {
         let Some(row) = starts.get(self.diff_change) else {
             return Task::none();
         };
-        let denominator = model.row_count(self.diff_mode).saturating_sub(1).max(1);
-        let y = *row as f32 / denominator as f32;
-        iced::widget::scrollable::snap_to(
+        let Some(rows) = self.diff_rows() else {
+            return Task::none();
+        };
+        iced::widget::scrollable::scroll_to(
             self.diff_scroll_id.clone(),
-            iced::widget::scrollable::RelativeOffset {
+            iced::widget::scrollable::AbsoluteOffset {
                 x: None,
-                y: Some(y),
+                y: Some(rows.offset(*row)),
             },
         )
     }
@@ -6777,7 +6829,7 @@ fn diff_review_controls(
     runtime: &RepositoryRuntime,
 ) -> Element<'_, RepositoryAction> {
     let model = match runtime.diff_state(&runtime.diff_basis) {
-        Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
+        Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
         _ => None,
     };
     let change_count = model.map_or(0, |model| model.change_starts(runtime.diff_mode).len());
@@ -6859,11 +6911,14 @@ fn diff_review_controls(
         controls.push(crate::interaction::tooltip(
             crate::design::change_counts(&counts),
             match runtime.diff_state(&runtime.diff_basis) {
-                Some(DiffState::Ready(RenderedDiff::Text {
-                    old_label,
-                    new_label,
-                    ..
-                })) => format!(
+                Some(DiffState::Ready(
+                    RenderedDiff::Text {
+                        old_label,
+                        new_label,
+                        ..
+                    },
+                    _,
+                )) => format!(
                     "{}: {old_label} → {new_label}",
                     basis_label(&runtime.diff_basis)
                 ),
@@ -6908,13 +6963,16 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                 "This file has nothing to show for the selected comparison.",
             ),
             Some(DiffState::Loading { .. }) => loading(),
-            Some(DiffState::Ready(RenderedDiff::Text {
-                model,
-                old_label,
-                new_label,
-            })) => diff_model_view(card, runtime, model, old_label, new_label),
-            Some(DiffState::Ready(RenderedDiff::NoText(content))) => no_text_view(content),
-            Some(DiffState::Ready(RenderedDiff::Error(error))) => {
+            Some(DiffState::Ready(
+                RenderedDiff::Text {
+                    model,
+                    old_label,
+                    new_label,
+                },
+                _,
+            )) => diff_model_view(card, runtime, model, old_label, new_label),
+            Some(DiffState::Ready(RenderedDiff::NoText(content), _)) => no_text_view(content),
+            Some(DiffState::Ready(RenderedDiff::Error(error), _)) => {
                 information_state("Could not compute diff", error.clone())
             }
         },
@@ -7044,23 +7102,44 @@ fn diff_model_view<'a>(
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
-            let total = model.row_count(runtime.diff_mode);
-            let visible = visible_rows(total, runtime.diff_viewport, DIFF_ROW_HEIGHT);
-            let mut children = Vec::with_capacity(visible.end - visible.start + 2);
+            let rows = runtime
+                .diff_rows()
+                .expect("rendered comparison owns its row layout");
+            let visible = visible_diff_rows(rows, runtime.diff_viewport);
+            let mut children = Vec::with_capacity(visible.end - visible.start + 3);
+            if rows.leading_height() > 0.0 {
+                children.push(
+                    iced::widget::Space::new()
+                        .height(rows.leading_height())
+                        .into(),
+                );
+            }
             if visible.top_space > 0.0 {
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
             match runtime.diff_mode {
-                DiffMode::Inline => {
-                    children.extend(model.inline_rows[visible.start..visible.end].iter().map(
-                        |row| inline_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                    ))
-                }
-                DiffMode::Split => {
-                    children.extend(model.split_rows[visible.start..visible.end].iter().map(
-                        |row| split_diff_row(row, &model.syntax, gutter, code_width, horizontal),
-                    ))
-                }
+                DiffMode::Inline => children.extend(
+                    model.inline_rows[visible.start..visible.end]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            diff_row_block(
+                                inline_diff_row(row, &model.syntax, gutter, code_width, horizontal),
+                                rows.height(visible.start + index),
+                            )
+                        }),
+                ),
+                DiffMode::Split => children.extend(
+                    model.split_rows[visible.start..visible.end]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            diff_row_block(
+                                split_diff_row(row, &model.syntax, gutter, code_width, horizontal),
+                                rows.height(visible.start + index),
+                            )
+                        }),
+                ),
             };
             if visible.bottom_space > 0.0 {
                 children.push(
@@ -7110,6 +7189,19 @@ fn diff_model_view<'a>(
         .into()
     };
     rows
+}
+
+/// Review integration replaces the additional space with its measured thread
+/// widgets. Ordinary rows keep their original tree and fixed code-line height.
+fn diff_row_block<'a>(
+    row: Element<'a, RepositoryAction>,
+    height: f32,
+) -> Element<'a, RepositoryAction> {
+    if height <= DIFF_ROW_HEIGHT {
+        row
+    } else {
+        widget::container(row).height(height).into()
+    }
 }
 
 const DIFF_ROW_PADDING: f32 = 4.0;
@@ -7798,7 +7890,7 @@ mod tests {
         runtime.working_diff.additions = added_source_lines(&model);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model)),
+            DiffState::ready(staged_text_diff(model)),
         );
         runtime.working_diff.applied = runtime.wanted_working_diff();
         runtime.working_diff.desired = runtime.wanted_working_diff();
@@ -7864,7 +7956,7 @@ mod tests {
             runtime.diff_basis = basis.clone();
             runtime.set_diff_state(
                 basis,
-                DiffState::Ready(staged_text_diff(crate::diff_view::build_diff(
+                DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
                     "old\n",
                     "historic\n",
                 ))),
@@ -7958,7 +8050,7 @@ mod tests {
         let before = Arc::clone(&runtime.working_diff.active.as_ref().unwrap().before);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(crate::diff_view::build_diff(
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
                 "old\n", "new\n",
             ))),
         );
@@ -8055,7 +8147,7 @@ mod tests {
         assert!(
             matches!(
                 runtime.diff_state(&DiffBasis::IndexToWorktree),
-                Some(DiffState::Ready(_))
+                Some(DiffState::Ready(_, _))
             ),
             "our own save must not replace the working diff with a loading screen"
         );
@@ -8088,7 +8180,7 @@ mod tests {
         assert_eq!(runtime.source_surface, SourceSurface::Diff);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
         assert!(matches!(
@@ -8127,7 +8219,7 @@ mod tests {
         assert_eq!(runtime.source_surface, SourceSurface::Diff);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
         assert!(matches!(
@@ -8183,7 +8275,7 @@ mod tests {
 
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("retry".into())),
+            DiffState::ready(RenderedDiff::Error("retry".into())),
         );
         assert!(runtime.can_retry_diff());
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
@@ -8266,7 +8358,7 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -8354,7 +8446,7 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -8562,7 +8654,7 @@ mod tests {
         assert_eq!(runtime.diff_mode, DiffMode::Inline);
         runtime.set_diff_state(
             basis.clone(),
-            DiffState::Ready(RenderedDiff::Error("read failed".into())),
+            DiffState::ready(RenderedDiff::Error("read failed".into())),
         );
         assert!(runtime.can_retry_diff());
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
@@ -8571,7 +8663,7 @@ mod tests {
             runtime.diff_state(&basis),
             Some(DiffState::Loading { .. })
         ));
-        runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+        runtime.set_diff_state(basis, DiffState::ready(staged_text_diff(model_with(1))));
         assert!(runtime.can_change_diff_layout());
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
         assert_eq!(runtime.diff_mode, DiffMode::Split);
@@ -9741,7 +9833,7 @@ mod tests {
         runtime.source_surface = SourceSurface::Diff;
         runtime.set_diff_state(
             commit.clone(),
-            DiffState::Ready(staged_text_diff(model_with(4))),
+            DiffState::ready(staged_text_diff(model_with(4))),
         );
         let _ = runtime.refresh_after_mutation(card);
         let _ = runtime.update(RepositoryAction::FilesLoaded {
@@ -10109,7 +10201,7 @@ mod tests {
         runtime.diff_mode = DiffMode::Split;
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: Vec::new(),
                 split_rows: Vec::new(),
@@ -10149,7 +10241,7 @@ mod tests {
         );
         runtime.set_diff_state(
             DiffBasis::HeadToIndex,
-            DiffState::Ready(RenderedDiff::Error("diff failed".into())),
+            DiffState::ready(RenderedDiff::Error("diff failed".into())),
         );
         assert_eq!(
             runtime.inspector_runtime_status(),
@@ -10353,7 +10445,7 @@ mod tests {
         });
         assert!(matches!(
             runtime.diff_state(&DiffBasis::IndexToWorktree),
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) if model.additions == 2
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) if model.additions == 2
         ));
     }
 
@@ -10439,6 +10531,44 @@ mod tests {
     }
 
     #[test]
+    fn measured_diff_blocks_preserve_anchor_and_change_navigation() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let mut model = model_with(2);
+        model.inline_rows = (0..10)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        model.inline_change_starts = vec![2, 7];
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(model)),
+        );
+        runtime.diff_viewport = ListViewport {
+            offset: 105.0,
+            height: 120.0,
+        };
+        runtime.diff_horizontal = 44.0;
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
+        assert_eq!(runtime.diff_viewport.offset, 270.0);
+        assert_eq!(runtime.diff_horizontal, 44.0);
+        let unchanged = runtime.diff_viewport.offset;
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 60.0, &[(1, 90.0), (3, 30.0)]));
+        assert_eq!(runtime.diff_viewport.offset, unchanged);
+        drop(runtime.update(RepositoryAction::NextChange { card }));
+        assert_eq!(runtime.diff_viewport.offset, 390.0);
+        drop(runtime.update(RepositoryAction::PreviousChange { card }));
+        assert_eq!(runtime.diff_viewport.offset, 210.0);
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
+        assert_eq!(runtime.diff_viewport.offset, 60.0);
+    }
+
+    #[test]
     fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         let view = RepositoryView {
             selected_file: None,
@@ -10475,7 +10605,7 @@ mod tests {
         });
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
                 split_rows: vec![split; 100_000],
@@ -10508,7 +10638,7 @@ mod tests {
         runtime.diff_viewport.height = 720.0;
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(DiffModel {
+            DiffState::ready(staged_text_diff(DiffModel {
                 before: Arc::from(""),
                 inline_rows: vec![
                     InlineDiffRow {
@@ -12216,7 +12346,7 @@ mod tests {
         let (mut runtime, _) = diff_runtime(card);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(model_with(1))),
         );
         runtime.source_surface = SourceSurface::Diff;
 
@@ -12232,7 +12362,7 @@ mod tests {
             assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
             assert!(matches!(
                 runtime.diff_state(&DiffBasis::IndexToWorktree),
-                Some(DiffState::Ready(RenderedDiff::Text { .. }))
+                Some(DiffState::Ready(RenderedDiff::Text { .. }, _))
             ));
             let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
                 card,
@@ -12253,7 +12383,7 @@ mod tests {
         let (mut runtime, identity) = diff_runtime(card);
         // Previously viewed working comparisons remain cached.
         for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
-            runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+            runtime.set_diff_state(basis, DiffState::ready(staged_text_diff(model_with(1))));
         }
         let commit = |step: u8| DiffBasis::CommitToParent {
             oid: fixture_oid(step * 2),
@@ -12382,7 +12512,7 @@ mod tests {
 
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Ready(RenderedDiff::NoText(DiffContent::Unmerged {
+            DiffState::ready(RenderedDiff::NoText(DiffContent::Unmerged {
                 base: text(),
                 ours: text(),
                 theirs: text(),
@@ -12423,7 +12553,7 @@ mod tests {
         ] {
             runtime.set_diff_state(
                 DiffBasis::IndexToWorktree,
-                DiffState::Ready(RenderedDiff::NoText(DiffContent::Comparison {
+                DiffState::ready(RenderedDiff::NoText(DiffContent::Comparison {
                     old: text(),
                     new,
                     old_label: "Index".into(),
