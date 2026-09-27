@@ -5333,10 +5333,11 @@ impl Cagents {
             side.push(review.notice(modal_open));
             side.push(review.file_list(modal_open));
         } else {
-            let heading = pane.repository.file_name().map_or_else(
-                || "Pull requests".to_owned(),
-                |name| name.to_string_lossy().into_owned(),
-            );
+            let heading = pane
+                .project(&self.sidebar_model)
+                .and_then(|id| self.sidebar_model.project(id))
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| "Pull requests".to_owned());
             side.push(
                 widget::container(
                     widget::row::with_children(vec![
