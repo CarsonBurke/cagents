@@ -501,12 +501,15 @@ pub(super) fn observed(
     if let Err(error) = result {
         tracing::error!(%error, %run, "cannot record provider execution outcome");
     }
+    drop(registry);
+    super::automations::wake(host);
 }
 
 fn finish_failure(host: &SharedHost, run: RunId, state: State, diagnostic: String) {
     if let Ok(registry) = registry(host) {
         finish_failure_registry(&registry, run, state, diagnostic);
     }
+    super::automations::wake(host);
 }
 fn finish_failure_registry(
     registry: &SharedRegistry,
@@ -570,6 +573,7 @@ fn announce(host: &SharedHost, registry: &SharedRegistry) {
                 &crate::workspace_model::ModelEdit::AgentsChanged,
             );
     }
+    super::automations::wake(host);
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {

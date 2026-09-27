@@ -16,6 +16,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         "BEGIN IMMEDIATE;
          CREATE TABLE IF NOT EXISTS automations (
              id TEXT PRIMARY KEY,
+             repository TEXT NOT NULL,
              revision INTEGER NOT NULL,
              record TEXT NOT NULL,
              summary TEXT NOT NULL,
@@ -28,6 +29,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS automation_deadlines ON automations(enabled, next_due_ms)
              WHERE deleted_ms IS NULL;
          CREATE INDEX IF NOT EXISTS automation_owners ON automations(active_firing) WHERE active_firing IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS automations_by_project ON automations(repository) WHERE deleted_ms IS NULL;
          CREATE TABLE IF NOT EXISTS automation_revisions (
              automation TEXT NOT NULL REFERENCES automations(id),
              revision INTEGER NOT NULL,
@@ -55,7 +57,224 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     ).map_err(|error| error.to_string())
 }
 
+pub(super) fn close_project(
+    tx: &Transaction<'_>,
+    repository: &str,
+    now_ms: u64,
+) -> Result<(), String> {
+    let records = tx
+        .prepare("SELECT record FROM automations WHERE repository=?1 AND deleted_ms IS NULL")
+        .map_err(|e| e.to_string())?
+        .query_map([repository], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    for record in records {
+        let mut automation: Automation = decode(&record)?;
+        automation.revision = automation
+            .revision
+            .checked_add(1)
+            .ok_or("Automation revision overflow")?;
+        automation.execution_revision = automation.revision;
+        automation.enabled = false;
+        automation.next = None;
+        automation.channel = None;
+        automation.updated_ms = now_ms;
+        write_revision(tx, &automation)?;
+        write_automation(tx, &automation)?;
+    }
+    Ok(())
+}
+
 impl Registry {
+    pub(crate) fn automation_firing(&self, id: Uuid) -> Result<Firing, String> {
+        read_firing(&self.db, id)
+    }
+
+    pub(crate) fn cancel_automation_precheck(
+        &mut self,
+        automation_id: Uuid,
+        firing_id: Uuid,
+    ) -> Result<Firing, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let automation = read_automation(&tx, automation_id)?;
+        let mut firing = read_firing(&tx, firing_id)?;
+        if automation.active_firing != Some(firing_id)
+            || firing.automation != automation_id
+            || firing.state != FiringState::Prechecking
+            || firing.run.is_some()
+        {
+            return Err("The precheck changed before cancellation; inspect its current run".into());
+        }
+        firing.cancel_requested = true;
+        write_firing(&tx, &firing)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(firing)
+    }
+
+    pub(crate) fn automation_run_detail(
+        &self,
+        id: Uuid,
+    ) -> Result<crate::automations::RunDetail, String> {
+        let firing = read_firing(&self.db, id)?;
+        let definition = read_definition(&self.db, firing.automation, firing.revision)?;
+        let agent = firing.agent.map(|id| self.agent(id)).transpose()?;
+        let run = firing.run.map(|id| self.agent_run(id)).transpose()?;
+        if run
+            .as_ref()
+            .is_some_and(|run| Some(run.agent) != firing.agent)
+            || agent.as_ref().is_some_and(|agent| {
+                agent.origin
+                    != (crate::agent_execution::Origin::Automation {
+                        id: firing.automation,
+                    })
+            })
+        {
+            return Err("Automation history and execution identity disagree".into());
+        }
+        Ok(crate::automations::RunDetail {
+            definition,
+            firing,
+            agent,
+            run,
+        })
+    }
+
+    pub(crate) fn automation_detail_for_run(
+        &self,
+        run: crate::model::RunId,
+    ) -> Result<crate::automations::RunDetail, String> {
+        let id: String = self
+            .db
+            .query_row(
+                "SELECT id FROM automation_firings WHERE run_id=?1",
+                [run.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.automation_run_detail(
+            id.parse()
+                .map_err(|_| "Stored automation firing identity is invalid")?,
+        )
+    }
+
+    /// The service discovered invalid authority before attempting dispatch.
+    /// Refuse this shortcut once a launch claim exists: cleanup is then owned
+    /// by the execution service and cannot be inferred from an error here.
+    pub(crate) fn fail_automation_start(
+        &mut self,
+        firing_id: Uuid,
+        mut diagnostic: String,
+        now_ms: u64,
+        pause: bool,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut firing = read_firing(&tx, firing_id)?;
+        let mut automation = read_automation(&tx, firing.automation)?;
+        if automation.active_firing != Some(firing_id)
+            || !matches!(
+                firing.state,
+                FiringState::Accepted | FiringState::Prechecking
+            )
+        {
+            return Err("Automation no longer owns this unstarted firing".into());
+        }
+        crate::agent_execution::truncate(
+            &mut diagnostic,
+            crate::agent_execution::MAX_DIAGNOSTIC_BYTES,
+        );
+        if let Some(run_id) = firing.run {
+            let claimed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_dispatches WHERE run=?1)",
+                    [run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if claimed {
+                return Err("The execution service already owns this launch".into());
+            }
+            let mut run: crate::agent_execution::Run = decode(
+                &tx.query_row(
+                    "SELECT record FROM agent_runs WHERE id=?1",
+                    [run_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())?,
+            )?;
+            if run.state != crate::agent_execution::State::Accepted {
+                return Err("The accepted run changed before start failure was recorded".into());
+            }
+            run.state = crate::agent_execution::State::Failed;
+            run.revision = run.revision.checked_add(1).ok_or("Run revision overflow")?;
+            run.finished_ms = Some(now_ms);
+            run.result.diagnostic = Some(diagnostic.clone());
+            tx.execute(
+                "UPDATE agent_runs SET state='failed',revision=?2,record=?3 WHERE id=?1",
+                params![run_id.to_string(), run.revision, encode(&run)?],
+            )
+            .map_err(|e| e.to_string())?;
+            let mut agent: crate::agent_execution::Agent = decode(
+                &tx.query_row(
+                    "SELECT record FROM agents WHERE id=?1",
+                    [run.agent.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())?,
+            )?;
+            if agent.session.is_none() {
+                agent.closed = true;
+                tx.execute(
+                    "UPDATE agents SET closed=1,record=?2 WHERE id=?1",
+                    params![agent.id.to_string(), encode(&agent)?],
+                )
+                .map_err(|e| e.to_string())?;
+                if automation.reuse_agent == Some(agent.id) {
+                    automation.reuse_agent = None;
+                }
+            }
+        }
+        firing.state = FiringState::Failed;
+        firing.finished_ms = Some(now_ms);
+        firing.diagnostic = Some(diagnostic);
+        automation.active_firing = None;
+        automation.updated_ms = now_ms;
+        if pause && automation.execution_revision == firing.revision {
+            automation.enabled = false;
+            automation.next = None;
+        }
+        write_firing(&tx, &firing)?;
+        write_automation(&tx, &automation)?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn automation_project_kind(
+        &self,
+        repository: &std::path::Path,
+    ) -> Result<crate::model::ProjectKind, String> {
+        let kind: String = self
+            .db
+            .query_row(
+                "SELECT kind FROM projects WHERE repository=?1",
+                [super::repository_key(repository)?],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("The automation project is unavailable: {error}"))?;
+        match kind.as_str() {
+            "git" => Ok(crate::model::ProjectKind::Git),
+            "folder" => Ok(crate::model::ProjectKind::Folder),
+            _ => Err("The automation project has an unsupported kind".into()),
+        }
+    }
+
     pub(crate) fn active_automation_firings(&self) -> Result<Vec<Firing>, String> {
         let mut query = self.db.prepare("SELECT f.record FROM automations a JOIN automation_firings f ON f.id=a.active_firing ORDER BY f.created_ms,f.id")
             .map_err(|error| error.to_string())?;
@@ -153,6 +372,20 @@ impl Registry {
         {
             return Err("The automation session still requires a proved close".into());
         }
+        if !agent.closed
+            && tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agent_policies WHERE agent=?1 AND interactive=1)",
+                    [agent.id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "Interactive work took ownership before the automation could release its slot"
+                    .into(),
+            );
+        }
         firing.release_pending = false;
         automation.active_firing = None;
         automation.blocked = None;
@@ -185,6 +418,9 @@ impl Registry {
             &mut diagnostic,
             crate::agent_execution::MAX_DIAGNOSTIC_BYTES,
         );
+        if automation.blocked.as_ref() == Some(&diagnostic) && !automation.enabled {
+            return Ok(());
+        }
         automation.blocked = Some(diagnostic);
         automation.enabled = false;
         automation.next = None;
@@ -336,6 +572,7 @@ impl Registry {
             trigger,
             state: FiringState::Skipped,
             release_pending: false,
+            cancel_requested: false,
             created_ms: now_ms,
             started_ms: None,
             finished_ms: Some(now_ms),
@@ -457,14 +694,15 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         require_project(&tx, &automation.definition)?;
         tx.execute(
-            "INSERT INTO automations(id,revision,record,summary,enabled,next_due_ms,updated_ms)
-                    VALUES(?1,?2,?3,?4,0,NULL,?5)",
+            "INSERT INTO automations(id,revision,record,summary,enabled,next_due_ms,updated_ms,repository)
+                    VALUES(?1,?2,?3,?4,0,NULL,?5,?6)",
             params![
                 automation.id.to_string(),
                 automation.revision,
                 encode(&automation)?,
                 encode(&automation.summary(None))?,
-                now_ms
+                now_ms,
+                super::repository_key(&automation.definition.agent.target.repository)?,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -518,15 +756,24 @@ impl Registry {
         require_project(&tx, &definition)?;
         let mut without_name = definition.clone();
         without_name.name = automation.definition.name.clone();
-        let material = without_name != automation.definition;
+        // Saving the unchanged target after its directory was replaced is an
+        // explicit refresh of that definition; it must pause for new consent.
+        // A presentation-only rename never refreshes filesystem authority.
+        let material = without_name != automation.definition
+            || (definition == automation.definition
+                && target_identity != automation.target_identity);
         let new_agent = definition.agent != automation.definition.agent
-            || definition.session_mode != automation.definition.session_mode;
+            || definition.session_mode != automation.definition.session_mode
+            || (material && target_identity != automation.target_identity);
         let new_target = definition.agent.target != automation.definition.agent.target;
         if material && (automation.active_firing.is_some() || automation.blocked.is_some()) {
             return Err(
                 "Resolve the active or interrupted run before changing its execution definition"
                     .into(),
             );
+        }
+        if new_agent {
+            require_closed_reuse(&tx, &automation)?;
         }
         automation.revision = automation
             .revision
@@ -610,6 +857,7 @@ impl Registry {
         if automation.active_firing.is_some() || automation.blocked.is_some() {
             return Err("Cancel and confirm the active or interrupted run has closed before removing this automation".into());
         }
+        require_closed_reuse(&tx, &automation)?;
         tx.execute("UPDATE automations SET deleted_ms=?2,enabled=0,next_due_ms=NULL,revision=revision+1,updated_ms=?2 WHERE id=?1", params![id.to_string(), now_ms])
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
@@ -680,8 +928,8 @@ fn write_automation(tx: &Transaction<'_>, automation: &Automation) -> Result<(),
     let last_state = last
         .map(|record| decode::<Firing>(&record).map(|firing| firing.state))
         .transpose()?;
-    tx.execute("UPDATE automations SET revision=?2,record=?3,summary=?4,enabled=?5,next_due_ms=?6,updated_ms=?7,active_firing=?8 WHERE id=?1 AND deleted_ms IS NULL",
-        params![automation.id.to_string(), automation.revision, encode(automation)?, encode(&automation.summary(last_state))?, automation.enabled, automation.next.as_ref().map(|next| next.due_ms), automation.updated_ms, automation.active_firing.map(|id| id.to_string())])
+    tx.execute("UPDATE automations SET revision=?2,record=?3,summary=?4,enabled=?5,next_due_ms=?6,updated_ms=?7,active_firing=?8,repository=?9 WHERE id=?1 AND deleted_ms IS NULL",
+        params![automation.id.to_string(), automation.revision, encode(automation)?, encode(&automation.summary(last_state))?, automation.enabled, automation.next.as_ref().map(|next| next.due_ms), automation.updated_ms, automation.active_firing.map(|id| id.to_string()), super::repository_key(&automation.definition.agent.target.repository)?])
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -697,6 +945,23 @@ fn write_revision(tx: &Transaction<'_>, automation: &Automation) -> Result<(), S
         ],
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn require_closed_reuse(tx: &Transaction<'_>, automation: &Automation) -> Result<(), String> {
+    let Some(agent) = automation.reuse_agent else {
+        return Ok(());
+    };
+    let closed: bool = tx
+        .query_row(
+            "SELECT closed FROM agents WHERE id=?1",
+            [agent.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !closed {
+        return Err("Close the automation's idle provider before changing its launch settings or removing it".into());
+    }
     Ok(())
 }
 
@@ -794,10 +1059,23 @@ impl Registry {
         if automation.blocked.is_some() {
             return Err("Resolve the interrupted run before starting more work".into());
         }
+        let project_open: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",
+                [super::repository_key(
+                    &automation.definition.agent.target.repository,
+                )?],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut capacity_full = false;
         if automation.active_firing.is_none() && automation.definition.precheck.is_some() {
             let count: usize = tx.query_row("SELECT count(*) FROM automations a JOIN automation_firings f ON f.id=a.active_firing WHERE f.run_id IS NULL", [], |row| row.get(0)).map_err(|error| error.to_string())?;
             if count >= crate::automations::MAX_CONCURRENT_PRECHECKS {
-                return Err("All precheck slots are occupied; wait for running checks or resolve interrupted owners".into());
+                if matches!(trigger, Trigger::Manual { .. }) {
+                    return Err("All precheck slots are occupied; wait for running checks or resolve interrupted owners".into());
+                }
+                capacity_full = true;
             }
         }
         let mut firing = Firing {
@@ -807,6 +1085,7 @@ impl Registry {
             trigger,
             state: FiringState::Prechecking,
             release_pending: false,
+            cancel_requested: false,
             created_ms: now_ms,
             started_ms: None,
             finished_ms: None,
@@ -816,7 +1095,20 @@ impl Registry {
             diagnostic: None,
         };
         let definition = automation.definition.clone();
-        if automation.active_firing.is_some() {
+        if !project_open {
+            firing.state = FiringState::Failed;
+            firing.finished_ms = Some(now_ms);
+            firing.diagnostic = Some("The automation project was closed; open it and confirm this automation before scheduling again".into());
+            automation.enabled = false;
+            automation.next = None;
+        } else if capacity_full {
+            firing.state = FiringState::Skipped;
+            firing.skip = Some(SkipReason::Capacity);
+            firing.finished_ms = Some(now_ms);
+            firing.diagnostic = Some(
+                "All precheck slots are occupied by running or cleanup-unconfirmed checks".into(),
+            );
+        } else if automation.active_firing.is_some() {
             firing.state = FiringState::Skipped;
             firing.skip = Some(SkipReason::Overlap);
             firing.finished_ms = Some(now_ms);
@@ -856,44 +1148,63 @@ impl Registry {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut firing = read_firing(&tx, firing_id)?;
-        if firing.state != FiringState::Prechecking {
+        if !matches!(
+            firing.state,
+            FiringState::Prechecking | FiringState::Interrupted
+        ) || firing.run.is_some()
+        {
             return Ok(None);
         }
         let mut automation = read_automation(&tx, firing.automation)?;
         if automation.active_firing != Some(firing_id) {
             return Err("Precheck no longer owns this automation's active slot".into());
         }
+        if firing.state == FiringState::Interrupted {
+            // The caller has now read the exact durable cleanup receipt. It
+            // releases ownership, but cannot resurrect a previously uncertain
+            // firing into a new provider prompt, even if its shell succeeded.
+            automation.active_firing = None;
+            automation.blocked = None;
+            automation.updated_ms = now_ms;
+            write_automation(&tx, &automation)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(None);
+        }
         let current = automation.execution_revision == firing.revision
             && (matches!(firing.trigger, crate::automations::Trigger::Manual { .. })
                 || automation.enabled);
-        let accepted = if !current {
+        let accepted = if let Outcome::Stopped {
+            state,
+            skip,
+            diagnostic,
+        } = outcome
+        {
+            firing.state = state;
+            firing.skip = skip;
+            firing.diagnostic = Some(diagnostic);
+            None
+        } else if firing.cancel_requested {
+            firing.state = FiringState::Cancelled;
+            firing.diagnostic = Some("Cancelled before launching the agent".into());
+            None
+        } else if !current {
             firing.state = FiringState::Skipped;
             firing.skip = Some(SkipReason::DefinitionChanged);
             firing.diagnostic =
                 Some("Automation changed or was disabled before the precheck completed".into());
             None
         } else {
-            match outcome {
-                Outcome::Passed => {
-                    let definition = read_definition(&tx, firing.automation, firing.revision)?;
-                    let key = occurrence_key(firing.revision, &firing.trigger);
-                    accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
-                }
-                Outcome::Stopped {
-                    state,
-                    skip,
-                    diagnostic,
-                } => {
-                    firing.state = state;
-                    firing.skip = skip;
-                    firing.diagnostic = Some(diagnostic);
-                    None
-                }
-            }
+            let definition = read_definition(&tx, firing.automation, firing.revision)?;
+            let key = occurrence_key(firing.revision, &firing.trigger);
+            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
         };
         if !firing.state.is_active() {
             firing.finished_ms = Some(now_ms);
             automation.active_firing = None;
+            if firing.state == FiringState::Interrupted {
+                automation.enabled = false;
+                automation.next = None;
+            }
         }
         automation.updated_ms = now_ms;
         write_firing(&tx, &firing)?;
@@ -1131,6 +1442,64 @@ mod tests {
             registry
                 .set_automation_enabled(created.id, 1, None, false, 201)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn cancellation_racing_successful_precheck_receipt_never_accepts_a_provider_run() {
+        let (mut registry, _directory, mut definition) = fixture();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 5,
+        });
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .cancel_automation_precheck(automation.id, claim.firing.id)
+            .unwrap();
+        // The child already finished, but its receipt had not yet authorized
+        // provider acceptance. Cancellation wins that transaction boundary.
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    crate::host::automations::precheck::Outcome::Passed,
+                    220
+                )
+                .unwrap()
+                .is_none()
+        );
+        let firing = registry.automation_firing(claim.firing.id).unwrap();
+        assert_eq!(firing.state, FiringState::Cancelled);
+        assert!(firing.run.is_none());
+        assert!(
+            registry
+                .automation(automation.id)
+                .unwrap()
+                .active_firing
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .db
+                .query_row("SELECT count(*) FROM agent_runs", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
         );
     }
 
@@ -1488,6 +1857,26 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(registry.active_automation_firings().unwrap().len(), 4);
+        // A delayed receipt can prove cleanup after an earlier uncertain
+        // observation. It must release the claim without resending work.
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    firings[0],
+                    crate::host::automations::precheck::Outcome::Passed,
+                    206,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let interrupted = read_firing(&registry.db, firings[0]).unwrap();
+        assert_eq!(interrupted.state, FiringState::Interrupted);
+        assert!(interrupted.run.is_none());
+        let owner = registry.automation(interrupted.automation).unwrap();
+        assert!(owner.active_firing.is_none());
+        assert!(owner.blocked.is_none());
+        assert!(!owner.enabled);
+        assert_eq!(registry.active_automation_firings().unwrap().len(), 3);
     }
 
     #[test]
@@ -1538,6 +1927,228 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn replaced_target_requires_new_consent_even_when_its_path_is_unchanged() {
+        let (mut registry, _directory, definition) = fixture();
+        let created = registry
+            .create_automation(definition.clone(), 100, test_identity())
+            .unwrap();
+        let enabled = registry
+            .set_automation_enabled(
+                created.id,
+                1,
+                Some(Occurrence {
+                    due_ms: 1000,
+                    local: "2026-09-27T09:00".into(),
+                }),
+                true,
+                200,
+            )
+            .unwrap();
+        let replacement = crate::automations::DirectoryIdentity {
+            device: 1,
+            inode: 99,
+        };
+        let edited = registry
+            .edit_automation(
+                created.id,
+                enabled.revision,
+                definition,
+                300,
+                replacement.clone(),
+            )
+            .unwrap();
+        assert!(!edited.enabled);
+        assert!(edited.next.is_none());
+        assert_eq!(edited.target_identity, replacement);
+        assert!(edited.execution_revision > enabled.execution_revision);
+    }
+
+    #[test]
+    fn project_close_and_reopen_does_not_revive_a_queued_precheck() {
+        let (mut registry, _directory, mut definition) = fixture();
+        let repository = definition.agent.target.repository.clone();
+        definition.precheck = Some(crate::automations::Precheck {
+            command: "true".into(),
+            timeout_seconds: 1,
+        });
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: repository.clone(),
+            })
+            .unwrap();
+        let paused = registry.automation(automation.id).unwrap();
+        assert!(!paused.enabled);
+        assert!(paused.execution_revision > claim.firing.revision);
+        assert_eq!(paused.active_firing, Some(claim.firing.id));
+        registry
+            .apply(&ModelEdit::ReopenProject {
+                repository,
+                name: "Reopened".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        assert!(
+            registry
+                .finish_automation_precheck(
+                    claim.firing.id,
+                    crate::host::automations::precheck::Outcome::Passed,
+                    300
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry.automation_firing(claim.firing.id).unwrap().skip,
+            Some(crate::automations::SkipReason::DefinitionChanged)
+        );
+        assert!(!registry.automation(automation.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn authority_failure_closes_only_an_unclaimed_launch_and_pauses_its_schedule() {
+        let (mut registry, _directory, definition) = fixture();
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let accepted = claim.accepted.unwrap();
+        registry
+            .fail_automation_start(claim.firing.id, "Target was replaced".into(), 201, true)
+            .unwrap();
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap().state,
+            crate::agent_execution::State::Failed
+        );
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert!(
+            registry
+                .automation(automation.id)
+                .unwrap()
+                .active_firing
+                .is_none()
+        );
+        assert!(!registry.automation(automation.id).unwrap().enabled);
+
+        let second = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                202,
+            )
+            .unwrap();
+        let accepted = second.accepted.unwrap();
+        assert!(registry.claim_agent_dispatch(&accepted, 203).unwrap());
+        assert!(
+            registry
+                .fail_automation_start(second.firing.id, "Late error".into(), 204, true)
+                .is_err()
+        );
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap().state,
+            crate::agent_execution::State::Accepted
+        );
+        assert_eq!(
+            registry.automation(automation.id).unwrap().active_firing,
+            Some(second.firing.id)
+        );
+    }
+
+    #[test]
+    fn missed_interval_is_one_durable_record_before_the_latest_claim() {
+        let (mut registry, _directory, definition) = fixture();
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let old = Occurrence {
+            due_ms: 1000,
+            local: "2020-01-01T00:00".into(),
+        };
+        let latest = Occurrence {
+            due_ms: 9000,
+            local: "2026-09-27T09:00".into(),
+        };
+        let enabled = registry
+            .set_automation_enabled(automation.id, 1, Some(old.clone()), true, 200)
+            .unwrap();
+        registry
+            .skip_automation_deadlines(
+                automation.id,
+                enabled.execution_revision,
+                &old,
+                latest.clone(),
+                9999,
+            )
+            .unwrap();
+        assert!(
+            registry
+                .skip_automation_deadlines(
+                    automation.id,
+                    enabled.execution_revision,
+                    &old,
+                    latest.clone(),
+                    9999
+                )
+                .is_err()
+        );
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                enabled.execution_revision,
+                Some(&latest),
+                crate::automations::Trigger::Scheduled {
+                    occurrence: latest.clone(),
+                },
+                Some(Occurrence {
+                    due_ms: 10_000,
+                    local: "2026-09-27T09:01".into(),
+                }),
+                false,
+                9999,
+            )
+            .unwrap();
+        assert!(claim.accepted.is_some());
+        let history = registry
+            .automation_history(automation.id, None, 10)
+            .unwrap();
+        assert_eq!(history.firings.len(), 2);
+        assert_eq!(history.firings.iter().filter(|firing| firing.skip == Some(crate::automations::SkipReason::MissedDeadline)).count(), 1);
     }
 
     #[test]
@@ -1717,6 +2328,124 @@ mod tests {
                 .blocked
                 .is_none()
         );
+    }
+
+    fn completed_reusable_run(
+        registry: &mut Registry,
+        definition: Definition,
+    ) -> (Automation, Firing, crate::agent_execution::Agent) {
+        use crate::agent_execution::{HostedSession, State, Update};
+        let automation = registry
+            .create_automation(definition, 100, test_identity())
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let accepted = claim.accepted.unwrap();
+        let session = crate::chat::fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            automation.definition.agent.target.directory.clone(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        let agent = registry
+            .bind_agent(accepted.agent.id, None, HostedSession::Chat(session))
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "fixture-turn".into(),
+                },
+                205,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                210,
+            )
+            .unwrap();
+        let firing = registry
+            .reconcile_automation_run(accepted.run.id, 220)
+            .unwrap()
+            .unwrap();
+        (automation, firing, agent)
+    }
+
+    #[test]
+    fn interactive_takeover_between_idle_receipt_and_release_keeps_the_firing_owned() {
+        let (mut registry, _directory, definition) = fixture();
+        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition);
+        registry.claim_agent_interaction(agent.id, None).unwrap();
+        assert!(
+            registry
+                .finish_automation_release(firing.id, &agent, 230)
+                .unwrap_err()
+                .contains("Interactive")
+        );
+        assert_eq!(
+            registry.automation(automation.id).unwrap().active_firing,
+            Some(firing.id)
+        );
+        let closed = registry.close_agent(&agent.origin, agent.id).unwrap();
+        registry
+            .finish_automation_release(firing.id, &closed, 240)
+            .unwrap();
+        assert!(
+            registry
+                .automation(automation.id)
+                .unwrap()
+                .active_firing
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn changing_launch_or_removing_definition_cannot_orphan_an_idle_reused_provider() {
+        let (mut registry, _directory, definition) = fixture();
+        let (automation, firing, agent) = completed_reusable_run(&mut registry, definition.clone());
+        registry
+            .finish_automation_release(firing.id, &agent, 230)
+            .unwrap();
+        let mut changed = definition;
+        changed.agent.model = Some("another-model".into());
+        assert!(
+            registry
+                .edit_automation(automation.id, 1, changed.clone(), 240, test_identity())
+                .is_err()
+        );
+        assert!(registry.remove_automation(automation.id, 1, 240).is_err());
+        registry.close_agent(&agent.origin, agent.id).unwrap();
+        let updated = registry
+            .edit_automation(automation.id, 1, changed, 250, test_identity())
+            .unwrap();
+        assert!(updated.reuse_agent.is_none());
+        registry
+            .remove_automation(automation.id, updated.revision, 260)
+            .unwrap();
+        assert!(registry.automation(automation.id).is_err());
+        let historical = registry.automation_run_detail(firing.id).unwrap();
+        assert_eq!(historical.firing.id, firing.id);
+        assert_eq!(historical.firing.state, FiringState::Succeeded);
+        assert_eq!(historical.definition, automation.definition);
     }
 
     #[test]

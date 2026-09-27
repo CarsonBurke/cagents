@@ -164,12 +164,17 @@ impl Worker {
         }
     }
 
-    pub fn status(&mut self) -> io::Result<Status> {
-        if let Some(child) = &mut self.child {
-            if child.try_wait()?.is_some() {
-                self.child.take();
-            }
+    pub fn reaped(&mut self) -> io::Result<bool> {
+        if let Some(child) = &mut self.child
+            && child.try_wait()?.is_some()
+        {
+            self.child.take();
         }
+        Ok(self.child.is_none())
+    }
+
+    pub fn status(&mut self) -> io::Result<Status> {
+        self.reaped()?;
         match read_record::<Receipt>(&self.directory.join("receipt")) {
             Ok(receipt) => {
                 if receipt.firing != self.firing || receipt.revision != self.revision {
@@ -189,6 +194,21 @@ impl Worker {
             if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
                 if receipt.firing == self.firing && receipt.revision == self.revision {
                     return Ok(Status::Complete(receipt.outcome));
+                }
+            }
+            if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
+                if started.firing != self.firing || started.revision != self.revision {
+                    return Err(io::Error::other(
+                        "Precheck start proof belongs to another firing",
+                    ));
+                }
+                if started.boot != crate::daemon::read_boot_id().map_err(io::Error::other)? {
+                    // A different kernel boot proves old descendants extinct,
+                    // but says nothing about command effects before shutdown.
+                    return Ok(Status::Complete(Outcome::Stopped {
+                        state: FiringState::Interrupted, skip: None,
+                        diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
+                    }));
                 }
             }
             return Ok(Status::CleanupUnconfirmed);
@@ -577,5 +597,34 @@ mod tests {
         assert!(Worker::recover(root.path(), firing, 2).status().is_err());
         std::os::unix::fs::symlink(directory.join("receipt"), directory.join("alias")).unwrap();
         assert!(read_record::<Receipt>(&directory.join("alias")).is_err());
+    }
+
+    #[test]
+    fn another_kernel_boot_proves_cleanup_but_never_a_successful_precheck() {
+        let root = tempfile::tempdir().unwrap();
+        let firing = Uuid::new_v4();
+        let directory = root.path().join(firing.to_string());
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        create_record(&directory, "lease", &()).unwrap();
+        create_record(
+            &directory,
+            "started",
+            &Started {
+                firing,
+                revision: 1,
+                boot: crate::model::BootId::new("previous-kernel-boot"),
+                pid: std::process::id(),
+                start: 1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            Worker::recover(root.path(), firing, 1).status().unwrap(),
+            Status::Complete(Outcome::Stopped {
+                state: FiringState::Interrupted,
+                ..
+            })
+        ));
+        assert!(Worker::recover(root.path(), firing, 2).status().is_err());
     }
 }

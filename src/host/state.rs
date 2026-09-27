@@ -225,6 +225,7 @@ pub(crate) struct HostState {
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) automations: Option<super::automations::Handle>,
     pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
     /// Connections that asked for shared-model edges, kept separately from
     /// `watchers` because watching terminals and watching the model are
@@ -279,6 +280,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
+            automations: None,
             execution_gates: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             notifications: None,

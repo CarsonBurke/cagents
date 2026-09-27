@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod automations;
+pub(super) use automations::Claimed;
 mod execution;
 
 const SCHEMA_VERSION: u32 = 2;
@@ -270,6 +271,13 @@ impl Registry {
                     )
                     .map_err(|error| error.to_string())?
                     > 0;
+                if removed || recorded {
+                    automations::close_project(
+                        &transaction,
+                        &key,
+                        crate::chat::now_ms().unwrap_or(0),
+                    )?;
+                }
                 removed || recorded
             }
             ModelEdit::CreateChannel {

@@ -17,6 +17,77 @@ pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;
 pub const MISFIRE_GRACE_MS: u64 = 15 * 60 * 1000;
 
+/// Management calls are user-authorized, never inherited from an agent's
+/// child-execution capability. Revisions fence stale editors and confirmations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Request {
+    List {
+        after: Option<Uuid>,
+        limit: usize,
+    },
+    Show {
+        id: Uuid,
+    },
+    Create {
+        definition: Definition,
+    },
+    Edit {
+        id: Uuid,
+        revision: u64,
+        definition: Definition,
+    },
+    SetEnabled {
+        id: Uuid,
+        revision: u64,
+        enabled: bool,
+        confirmed: bool,
+    },
+    Remove {
+        id: Uuid,
+        revision: u64,
+    },
+    RunNow {
+        id: Uuid,
+        execution_revision: u64,
+        request: Uuid,
+        confirmed: bool,
+    },
+    Cancel {
+        id: Uuid,
+        firing: Uuid,
+    },
+    History {
+        id: Uuid,
+        before: Option<HistoryCursor>,
+        limit: usize,
+    },
+    ShowFiring {
+        id: Uuid,
+    },
+    ShowRun {
+        run: RunId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Response {
+    Listed(Vec<Summary>),
+    Automation(Automation),
+    Firing(Firing),
+    History(HistoryPage),
+    Detail(RunDetail),
+    Removed,
+    CancellationRequested,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub definition: Definition,
+    pub firing: Firing,
+    pub agent: Option<agent_execution::Agent>,
+    pub run: Option<agent_execution::Run>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -240,6 +311,7 @@ pub enum SkipReason {
     PrecheckExit,
     MissedDeadline,
     Overlap,
+    Capacity,
     DefinitionChanged,
     Disabled,
 }
@@ -254,6 +326,9 @@ pub struct Firing {
     /// A terminal provider result still owns the automation until its session
     /// is proved closed (fresh) or idle at the exact source (reuse).
     pub release_pending: bool,
+    /// An explicit precheck cancellation fences later provider acceptance even
+    /// if the shell's successful receipt raced with the cancellation request.
+    pub cancel_requested: bool,
     pub created_ms: u64,
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
