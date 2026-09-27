@@ -23,11 +23,11 @@ pub(in crate::host) fn inspect(
     };
     let mut blockers = Vec::new();
     if let Some(registry) = registry {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        blockers.extend(registry.agent_update_blockers().map_err(upgrade_error)?);
         blockers.extend(
             registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .agent_update_blockers()
+                .automation_update_blockers()
                 .map_err(upgrade_error)?,
         );
     }
