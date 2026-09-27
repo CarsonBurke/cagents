@@ -828,18 +828,25 @@ impl State {
             .as_ref()
             .and_then(|path| self.file_index(path))
             .and_then(|index| files.iter().position(|file| *file == index));
-        let next = match (current, direction.signum()) {
-            (Some(position), 1) => (position + 1).min(files.len() - 1),
-            (Some(position), _) => position.saturating_sub(1),
-            (None, 1) => 0,
-            (None, _) => files.len() - 1,
+        let visible = |index: &&usize| !self.hide_viewed || !self.files[**index].viewed;
+        let next = if direction > 0 {
+            files
+                .iter()
+                .skip(current.map_or(0, |position| position + 1))
+                .find(visible)
+        } else {
+            files[..current.unwrap_or(files.len())]
+                .iter()
+                .rev()
+                .find(visible)
         };
-        let index = files[next];
+        let Some(&index) = next else {
+            return;
+        };
         if self.selected.as_ref() == Some(&self.files[index].entry.path) {
             return;
         }
-        self.selected = Some(self.files[index].entry.path.clone());
-        self.emit_open(index);
+        self.select_file(self.files[index].entry.path.clone());
     }
 
     /// Flips the marks optimistically and sends them to GitHub in one
@@ -2322,6 +2329,37 @@ pub(crate) mod tests {
         assert!(!state.refreshing);
         assert!(state.files[0].viewed);
         assert_eq!(state.files[0].sync, ViewedSync::Pending);
+    }
+
+    #[test]
+    fn file_navigation_skips_hidden_viewed_rows_and_reveals_collapsed_ancestors() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(
+                vec![
+                    entry("a.rs", ChangeKind::Modified),
+                    entry("b.rs", ChangeKind::Modified),
+                    entry("src/c.rs", ChangeKind::Modified),
+                ],
+                vec![],
+            ),
+        );
+        drop(state.update(Action::SetFileListMode(FileListMode::Flat)));
+        state.files[1].viewed = true;
+        state.hide_viewed = true;
+        state.select_file(path("a.rs"));
+        state.collapsed_directories.insert(path("src"));
+        drop(state.update(Action::NextFile));
+        assert_eq!(state.selected, Some(path("src/c.rs")));
+        assert!(!state.collapsed_directories.contains(&path("src")));
+        drop(state.update(Action::PreviousFile));
+        assert_eq!(state.selected, Some(path("a.rs")));
+        // An optimistic mark hides the current file before advancing; retain
+        // its position so navigation does not jump back to the first file.
+        state.select_file(path("b.rs"));
+        drop(state.update(Action::NextFile));
+        assert_eq!(state.selected, Some(path("src/c.rs")));
     }
 
     #[test]
