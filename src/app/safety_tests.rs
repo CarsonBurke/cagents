@@ -488,9 +488,14 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
             occurred_at_unix_ms: 1,
         },
     };
-    let close = app.update(Message::ConfirmTerminalClose);
-    tests::settle_settings_task(&mut app, close);
+    // Drive only the preference writer; the exact owner receipt is supplied
+    // below, without executing a real daemon close from this unit fixture.
+    drop(app.update(Message::ConfirmTerminalClose));
+    let save = app.save_settings_task(false);
+    tests::settle_settings_task(&mut app, save);
     assert!(!settings::load(&path).unwrap().confirm_terminal_close);
+    report_close(&mut app, terminal_close::CloseOutcome::Closed);
+    assert!(app.terminal_close.is_none());
     let enable = app.update(Message::SettingsChanged {
         field: SettingsField::ConfirmTerminalClose,
         value: "true".into(),
