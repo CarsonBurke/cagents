@@ -795,6 +795,7 @@ fn perform_update(
             &archive,
             &checksums,
             current.replaces_daemon,
+            &guard,
         )
     })();
     let reopen_result = guard
@@ -877,6 +878,7 @@ fn run_installer(
     archive: &File,
     checksums: &File,
     restart_daemon: bool,
+    guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let files = [
         installer.as_raw_fd(),
@@ -897,6 +899,7 @@ fn run_installer(
     if restart_daemon {
         command.arg("--restart-daemon");
     }
+    guard.inherit_for_install(&mut command)?;
     // SAFETY: descriptor flags only; sealed anonymous files cannot be replaced
     // between checksum verification and the installer's own second verification.
     unsafe {
