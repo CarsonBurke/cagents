@@ -1255,6 +1255,7 @@ mod tests {
                     execution_instance: uuid::Uuid::new_v4(),
                     console_recipe: (provider != crate::agent::Provider::Codex)
                         .then(|| session.launch.clone()),
+                    paired_terminal: None,
                     session: chat::Session {
                         id: session.id,
                         native_continuity: Default::default(),
@@ -1412,6 +1413,7 @@ mod tests {
                 super::super::chat::Record {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
+                    paired_terminal: None,
                     session: chat::Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,

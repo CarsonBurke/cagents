@@ -19,6 +19,11 @@ while IFS= read -r frame; do
     *'"type":"control_request"'*)
       id=${frame#*'"request_id":"'}; id=${id%%'"'*}
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      case "$frame" in
+        *'"subtype":"interrupt"'*)
+          printf '{"type":"result","uuid":"interrupted-%s","subtype":"success","is_error":false,"session_id":"%s"}\n' "$n" "$session"
+          ;;
+      esac
       ;;
     *'"type":"user"'*)
       n=$((n + 1))

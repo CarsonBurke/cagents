@@ -827,7 +827,7 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn reserve_spawn(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view(terminal_id, false)
+        self.reserve_spawn_for_view(terminal_id, None)
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
@@ -873,7 +873,7 @@ impl HostState {
     fn reserve_spawn_for_view(
         &mut self,
         terminal_id: TerminalId,
-        paired: bool,
+        paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
         if self.shutting_down {
             return Err(ProtocolError::new(
@@ -885,9 +885,11 @@ impl HostState {
         if self.chat_spawning.contains_key(&terminal_id)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
-                    && !(paired
-                        && record.returning_terminal
-                        && record.session.launch.provider == crate::agent::Provider::Codex)
+                    && !paired.is_some_and(|terminal| {
+                        record.accepts_execution_console(terminal)
+                            || (record.returning_terminal
+                                && record.session.launch.provider == crate::agent::Provider::Codex)
+                    })
             })
         {
             return Err(ProtocolError::new(
@@ -2715,7 +2717,7 @@ fn start_terminal_view(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reserve_spawn_for_view(terminal_id, paired)?;
+        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.

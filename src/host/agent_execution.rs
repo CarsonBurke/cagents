@@ -850,6 +850,25 @@ fn create_console(
         true,
     )
     .map_err(|error| error.message)?;
+    let console_handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .terminals
+            .get(&session.id)
+            .filter(|record| {
+                super::chat::matches_paired_terminal(
+                    &record.session,
+                    &descriptor.session,
+                    state.proof(),
+                )
+            })
+            .map(|record| record.handle.clone())
+            .ok_or_else(|| {
+                ConsoleError::Uncertain(
+                    "The spawned console ownership changed before publication".into(),
+                )
+            })?
+    };
     // Publish the in-memory pair before the durable view: concurrent explicit
     // close must already know which terminal belongs to this exact actor.
     let publish = (|| {
@@ -864,6 +883,7 @@ fn create_console(
                 .filter(|record| record.handle.same_actor(handle))
                 .ok_or("The provider closed while publishing its console")?;
             record.session.terminal = Some(descriptor.session.clone());
+            record.paired_terminal = Some(console_handle.clone());
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let expected = registry
@@ -877,7 +897,7 @@ fn create_console(
         // A failed durable publication must not leave the holder pointing at a
         // destroyed terminal. Roll back its acknowledged pair first. If that
         // reply is uncertain, retain both owners for explicit close/recovery.
-        if let Err(rollback) = handle.update_native_source(retained_before, None) {
+        if let Err(rollback) = handle.update_native_source(retained_before.clone(), None) {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(record) = state
                 .chats
@@ -885,25 +905,38 @@ fn create_console(
                 .filter(|record| record.handle.same_actor(handle))
             {
                 record.session.terminal = Some(descriptor.session.clone());
+                record.paired_terminal = Some(console_handle.clone());
             }
             return Err(ConsoleError::Uncertain(format!(
                 "{error}; console ownership rollback is unconfirmed: {rollback}. Both owners were retained; close or recover the agent before retrying."
             )));
         }
-        let terminal = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .terminals
-            .get(&session.id)
-            .filter(|record| record.session == descriptor.session)
-            .map(|record| record.handle.clone());
-        if let Some(terminal) = &terminal
+        // Keep the exact terminal owned until its process teardown is proved.
+        // An uncertain shutdown must retain both handles for explicit cleanup.
+        let terminal = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            match state.terminals.get(&session.id) {
+                Some(record)
+                    if super::chat::matches_paired_terminal(
+                        &record.session,
+                        &descriptor.session,
+                        state.proof(),
+                    ) && record.handle.same_worker(&console_handle) =>
+                {
+                    Some((record.session.clone(), record.handle.clone()))
+                }
+                Some(_) => {
+                    return Err(ConsoleError::Uncertain(format!(
+                        "{error}; console ownership changed before rollback; its replacement was retained"
+                    )));
+                }
+                None => None,
+            }
+        };
+        if let Some((_, terminal)) = &terminal
             && let Err(close) = terminal.shutdown()
         {
-            let mut retained = session.clone();
-            retained.launch.session_id = handle.confirmed_session_id();
-            chat::protocol::align_resume_identity(&mut retained.launch)?;
-            retained.native_continuity = handle.native_continuity();
+            let mut retained = retained_before.clone();
             retained.terminal = Some(descriptor.session.clone());
             let pairing =
                 handle.update_native_source(retained, Some(descriptor.session.launch.clone()));
@@ -920,10 +953,11 @@ fn create_console(
             {
                 record.session.terminal = None;
                 record.console_recipe = None;
+                record.paired_terminal = None;
             }
-            if terminal.as_ref().is_some_and(|handle| {
+            if terminal.as_ref().is_some_and(|(source, handle)| {
                 state.terminals.get(&session.id).is_some_and(|record| {
-                    record.session == descriptor.session && record.handle.same_worker(handle)
+                    record.session == *source && record.handle.same_worker(handle)
                 })
             }) {
                 state.retire_terminal(session.id);

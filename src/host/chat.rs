@@ -23,6 +23,7 @@ use std::{
 pub(super) struct Record {
     pub(super) execution_instance: uuid::Uuid,
     pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
+    pub(super) paired_terminal: Option<crate::terminal::TerminalHandle>,
     pub session: Session,
     pub handle: Handle,
     // Retain the exact CLI/account that authorized a shared Codex attachment.
@@ -39,10 +40,41 @@ impl Record {
     /// The private recipe is installed only by the execution service after
     /// accepting this actor. A CLI basename or user-supplied argv is no proof.
     pub(super) fn owns_execution_console(&self) -> bool {
-        self.session.terminal.as_ref().is_some_and(|terminal| {
-            terminal.id == self.session.id && self.console_recipe.as_ref() == Some(&terminal.launch)
-        })
+        self.session
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| self.accepts_execution_console(terminal))
     }
+
+    pub(super) fn accepts_execution_console(
+        &self,
+        terminal: &crate::model::TerminalSession,
+    ) -> bool {
+        terminal.id == self.session.id
+            && terminal.owned_codex_listener.is_none()
+            && self.console_recipe.as_ref() == Some(&terminal.launch)
+    }
+}
+
+/// Terminal records keep their launch continuity; published descriptors project
+/// Live/Detached for each subscriber. Compare the full remaining descriptor and
+/// any published daemon proof; callers must also match the private worker.
+pub(super) fn matches_paired_terminal(
+    actual: &crate::model::TerminalSession,
+    source: &crate::model::TerminalSession,
+    proof: &HostSessionProof,
+) -> bool {
+    if source
+        .continuity
+        .live_proof()
+        .as_ref()
+        .is_some_and(|source| source != proof)
+    {
+        return false;
+    }
+    let mut actual = actual.clone();
+    actual.continuity = source.continuity.clone();
+    actual == *source
 }
 
 // Transition evidence is not an actor: no transcript, socket, store or execution
@@ -1216,9 +1248,15 @@ fn start_with_execution(
             after_generation: handle.observe_next_update(),
             ..Observation::default()
         };
+        let paired_terminal = session
+            .terminal
+            .as_ref()
+            .and_then(|source| state.terminals.get(&source.id))
+            .map(|record| record.handle.clone());
         let record = Record {
             execution_instance,
             console_recipe: None,
+            paired_terminal,
             session,
             handle,
             source_process,
@@ -1357,7 +1395,12 @@ fn codex_terminal_view(
         .terminals
         .get(&chat_id)
         .and_then(|terminal| terminal.handle.observe_agent_process());
+    let paired_terminal = state
+        .terminals
+        .get(&chat_id)
+        .map(|record| record.handle.clone());
     let record = state.chats.get_mut(&chat_id).expect("checked actor");
+    record.paired_terminal = paired_terminal;
     record.session.terminal = Some(descriptor.session.clone());
     record.session.launch.session_id = session.launch.session_id;
     record.source_process = process;
@@ -1963,7 +2006,44 @@ fn process_inner(
             };
             handle.close().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
-            let (record, terminal) = {
+            let terminal = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let record = state
+                    .chats
+                    .get(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle));
+                let paired = record
+                    .and_then(|record| record.session.terminal.as_ref())
+                    .filter(|terminal| terminal.id == chat_id);
+                match paired.and_then(|source| {
+                    state
+                        .terminals
+                        .get(&source.id)
+                        .map(|record| (source, record))
+                }) {
+                    Some((source, record))
+                        if matches_paired_terminal(&record.session, source, state.proof())
+                            && state.chats[&chat_id]
+                                .paired_terminal
+                                .as_ref()
+                                .is_some_and(|expected| record.handle.same_worker(expected)) =>
+                    {
+                        Some((record.session.clone(), record.handle.clone()))
+                    }
+                    Some(_) => {
+                        return Err(unavailable(
+                            "The paired terminal descriptor changed; its replacement was not stopped.",
+                        ));
+                    }
+                    None => None,
+                }
+            };
+            // A console is part of the owned execution. Retain both records
+            // until its shutdown is proved, so a failed close remains retryable.
+            if let Some((_, terminal)) = &terminal {
+                terminal.shutdown().map_err(unavailable)?;
+            }
+            let record = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if !state
                     .chats
@@ -1974,24 +2054,25 @@ fn process_inner(
                         "The thread changed while its previous actor was closing.",
                     ));
                 }
-                let paired = state
-                    .chats
-                    .get(&chat_id)
-                    .filter(|record| record.handle.same_actor(&handle))
-                    .and_then(|record| record.session.terminal.as_ref())
-                    .filter(|terminal| terminal.id == chat_id)
-                    .map(|terminal| terminal.id);
+                if let Some((source, handle)) = &terminal
+                    && state.terminals.get(&source.id).is_none_or(|record| {
+                        record.session != *source || !record.handle.same_worker(handle)
+                    })
+                {
+                    return Err(unavailable(
+                        "The paired terminal changed while its previous worker was closing.",
+                    ));
+                }
                 state.inventory_generation += 1;
                 let record = state.chats.remove(&chat_id);
                 if let Some(notifications) = &state.notifications {
                     notifications.retire(chat_id);
                 }
-                let terminal = paired.and_then(|id| state.retire_terminal(id));
-                (record, terminal)
+                if let Some((source, _)) = terminal {
+                    state.retire_terminal(source.id);
+                }
+                record
             };
-            if let Some(terminal) = terminal {
-                let _ = terminal.handle.shutdown();
-            }
             if let Some(record) = &record {
                 super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
             }
@@ -3501,6 +3582,7 @@ for line in sys.stdin:
                 Record {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
+                    paired_terminal: None,
                     session: session.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -3592,6 +3674,23 @@ for line in sys.stdin:
         codex_terminal_view(&host, 2, chat_id, &handle, session, recipe).unwrap();
         let replacement = host.lock().unwrap().terminals[&terminal.id].handle.clone();
         assert!(!replacement.same_worker(&worker));
+        // A recreated terminal can have the same public ID, launch recipe and
+        // daemon proof. A stale private pairing must not authorize its close.
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&chat_id)
+            .unwrap()
+            .paired_terminal = Some(worker.clone());
+        assert!(process(&host, 2, ClientRequest::ChatClose { chat_id }).is_err());
+        assert!(!replacement.is_completed());
+        assert!(host.lock().unwrap().chats.contains_key(&chat_id));
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&chat_id)
+            .unwrap()
+            .paired_terminal = Some(replacement.clone());
         process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
         assert!(handle.is_completed());
         assert!(worker.is_completed());
@@ -3716,6 +3815,7 @@ for line in sys.stdin:
             Record {
                 execution_instance: uuid::Uuid::nil(),
                 console_recipe: None,
+                paired_terminal: None,
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -3814,6 +3914,7 @@ for line in sys.stdin:
                 Record {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
+                    paired_terminal: None,
                     session: Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,

@@ -222,6 +222,7 @@ fn restore_reserved(
     let record = Record {
         execution_instance,
         console_recipe: execution_console,
+        paired_terminal: paired,
         session,
         handle,
         source_process: None,
