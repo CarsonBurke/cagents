@@ -753,7 +753,7 @@ fn process_request(
             handle.shutdown().map_err(send_error)?;
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .close_terminal_attention(terminal_id);
+                .close_terminal_attention(terminal_id, Some(&handle));
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::CloseTerminalChecked {
@@ -768,7 +768,7 @@ fn process_request(
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .close_terminal_attention(terminal_id);
+                    .close_terminal_attention(terminal_id, Some(&handle));
                 super::chat::close_for_terminal(host, terminal_id)?;
             }
             Ok((

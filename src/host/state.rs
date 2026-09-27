@@ -823,11 +823,21 @@ impl HostState {
         Some(record)
     }
 
-    pub(super) fn close_terminal_attention(&mut self, terminal_id: TerminalId) {
+    pub(super) fn close_terminal_attention(
+        &mut self,
+        terminal_id: TerminalId,
+        expected: Option<&TerminalHandle>,
+    ) {
         // Completed descriptors may remain available for history. Explicit
         // closure still withdraws their alerts and fences in-flight observers.
-        if self.terminals.contains_key(&terminal_id) {
-            self.notification_closed.insert(terminal_id);
+        // Shutdown waits outside this lock: an old receipt must not suppress a
+        // replacement worker that acquired the same durable session meanwhile.
+        match self.terminals.get(&terminal_id) {
+            Some(record) if expected.is_some_and(|handle| record.handle.same_worker(handle)) => {
+                self.notification_closed.insert(terminal_id);
+            }
+            Some(_) => return,
+            None => {}
         }
         if let Some(notifications) = &self.notifications {
             notifications.retire(terminal_id);
@@ -3044,7 +3054,7 @@ mod tests {
         let mut host = test_host();
         host.register_client(1);
         host.reserve_spawn(id).unwrap();
-        host.finish_spawn(1, session, handle.clone(), false)
+        host.finish_spawn(1, session.clone(), handle.clone(), false)
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !handle.is_completed() {
@@ -3055,7 +3065,7 @@ mod tests {
             !host.notification_closed.contains(&id),
             "natural completion retains attention"
         );
-        host.close_terminal_attention(id);
+        host.close_terminal_attention(id, Some(&handle));
         assert!(host.notification_closed.contains(&id));
         assert!(
             host.terminals.contains_key(&id),
@@ -3066,6 +3076,20 @@ mod tests {
             !host.notification_closed.contains(&id),
             "fence storage follows record lifetime"
         );
+        let replacement =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        host.reserve_spawn(id).unwrap();
+        host.finish_spawn(1, session, replacement.clone(), false)
+            .unwrap();
+        host.close_terminal_attention(id, Some(&handle));
+        host.close_terminal_attention(id, None);
+        assert!(
+            !host.notification_closed.contains(&id),
+            "stale closure must not fence a replacement worker"
+        );
+        replacement.shutdown().unwrap();
+        host.close_terminal_attention(id, Some(&replacement));
+        assert!(host.notification_closed.contains(&id));
     }
 
     #[test]
