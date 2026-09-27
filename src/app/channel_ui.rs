@@ -16,23 +16,33 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let Some(mut client) = connect(&socket)? else {
-        return Ok(());
+        return no_daemon_close_result(&sessions);
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
     let terminal_ids = channel_terminal_ids(&sessions, &chats);
     for kind in &sessions {
-        if let CardKind::Chat(session) = kind
-            && let Some(live) = chats.iter().find(|live| live.id == session.id)
-        {
+        if let CardKind::Chat(session) = kind {
+            let Some(live) = chats.iter().find(|live| live.id == session.id) else {
+                if may_have_retained_owner(session) {
+                    client
+                        .close_retained_chat(session.clone())
+                        .map_err(|error| error.to_string())?;
+                }
+                continue;
+            };
             if let Err(error) = client.close_chat(live.clone()) {
                 // Another window or a natural exit can win this race.
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
                 let Some(fresh) = connect(&socket)? else {
-                    return Ok(());
+                    return if may_have_retained_owner(live) {
+                        Err(error.to_string())
+                    } else {
+                        no_daemon_close_result(&sessions)
+                    };
                 };
                 client = fresh;
                 if client
@@ -42,6 +52,13 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                     .any(|chat| chat.id == live.id)
                 {
                     return Err(error.to_string());
+                }
+                if may_have_retained_owner(live) {
+                    // Disappearance from actor inventory can mean retained
+                    // ownership, not process exit. Demand its close receipt.
+                    client
+                        .close_retained_chat(live.clone())
+                        .map_err(|error| error.to_string())?;
                 }
             }
         }
@@ -59,7 +76,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
             });
         if let Err(error) = result {
             let Some(fresh) = connect(&socket)? else {
-                return Ok(());
+                return no_daemon_close_result(&sessions);
             };
             client = fresh;
             let still_running = client
@@ -78,8 +95,27 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     Ok(())
 }
 
-/// A connection to the daemon, or `None` when no daemon is running: then none
-/// of the sessions it hosted survives to be closed.
+fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
+    session.owned_codex_listener.is_some()
+        || matches!(
+            session.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        )
+}
+
+fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
+    if sessions
+        .iter()
+        .any(|kind| matches!(kind, CardKind::Chat(session) if may_have_retained_owner(session)))
+    {
+        Err("Reconnect the daemon to confirm the retained native provider has stopped".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// A connection to the daemon, or `None` when no daemon is running. Retained
+/// native owners can outlive it, so callers must not treat this as their exit.
 fn connect(socket: &std::path::Path) -> Result<Option<crate::control::ControlClient>, String> {
     match crate::control::ControlClient::connect(socket) {
         Ok(client) => Ok(Some(client)),
@@ -867,6 +903,28 @@ mod tests {
     use crate::sidebar::RowDeletion;
 
     #[test]
+    fn missing_daemon_is_not_close_proof_for_a_retained_native_card() {
+        let mut session = chat_session();
+        assert!(no_daemon_close_result(&[CardKind::Chat(session.clone())]).is_ok());
+        session.launch.provider = crate::agent::Provider::Codex;
+        session.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        assert!(no_daemon_close_result(&[CardKind::Chat(session)]).is_err());
+        let mut unnamed = chat_session();
+        unnamed.launch.provider = crate::agent::Provider::Codex;
+        unnamed.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+            socket: "/owned/control.sock".into(),
+            allocator: crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("owner"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+                boot_id: "boot".into(),
+            },
+        });
+        assert!(no_daemon_close_result(&[CardKind::Chat(unnamed)]).is_err());
+    }
+
+    #[test]
     fn deleting_a_channel_closes_paired_sources_once_and_skips_exited_terminals() {
         use crate::model::{TerminalContinuity, TerminalExit};
         let app = super::super::tests::context_inspector_test_app(true);
@@ -1019,6 +1077,7 @@ mod tests {
 
     fn chat_session() -> crate::chat::Session {
         crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {

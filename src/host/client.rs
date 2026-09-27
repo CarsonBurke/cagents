@@ -273,7 +273,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
-fn process_request(
+pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
@@ -418,6 +418,12 @@ fn process_request(
                 Vec::new(),
                 false,
             ))
+        }
+        ClientRequest::ChatCloseRetained { session } => {
+            super::chat::close_retained_native(host, &session).map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+            })?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatRecoverAccount { .. }
@@ -1271,6 +1277,7 @@ mod tests {
                     paired_terminal: Some(terminal),
                     session: chat::Session {
                         id: session.id,
+                        native_continuity: Default::default(),
                         owned_codex_listener: None,
                         proof: Some(proof),
                         terminal: Some(session.clone()),
@@ -1427,6 +1434,7 @@ mod tests {
                     console_recipe: None,
                     paired_terminal: None,
                     session: chat::Session {
+                        native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {

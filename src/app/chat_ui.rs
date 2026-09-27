@@ -176,6 +176,7 @@ pub enum Action {
     CompletionScrolled(Target, f32),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
+    RetainedCloseFinished(Target, chat::Session, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history.
     Scrolled(Target, view::Scroll),
@@ -208,6 +209,7 @@ impl Action {
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
+                | Self::RetainedCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::AccountPicker(_, false)
@@ -1850,6 +1852,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             .map(|pair| pair[1].clone())
     });
     Ok(chat::Session {
+        native_continuity: Default::default(),
         owned_codex_listener: session.owned_codex_listener.clone(),
         id: session.id,
         launch: chat::Launch {
@@ -2908,11 +2911,19 @@ impl Cagents {
     /// conversation can be doing - never started, connecting, failed,
     /// disconnected, or live - keeps its card on screen.
     ///
-    /// Two cases wait for a daemon answer instead: a return to the terminal
+    /// A retained native owner with no live connection waits for exact cleanup
+    /// proof, keeping its saved descriptor available for a failed-close retry.
+    /// Two other cases wait for a daemon answer: a return to the terminal
     /// already under way closes the card as soon as it lands, and a chat parked
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if matches!(
+            self.chat_ui.phases.get(&card),
+            Some(Phase::Closing { restart: None, .. })
+        ) {
+            return Task::none();
+        }
         if let Some(Phase::Returning {
             close_requested, ..
         }) = self.chat_ui.phases.get_mut(&card)
@@ -2960,6 +2971,33 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if runtime.connected() => runtime.handle().cloned(),
             _ => None,
         };
+        if !pending
+            && handle.is_none()
+            && session.proof.is_some()
+            && (session.owns_codex_listener()
+                || matches!(
+                    session.native_continuity,
+                    chat::NativeContinuity::Durable { .. }
+                ))
+        {
+            let target = self.chat_ui.next_target(card);
+            self.chat_ui.phases.insert(
+                card,
+                Phase::Closing {
+                    target,
+                    restart: None,
+                },
+            );
+            return cosmic::task::future(async move {
+                let saved = session.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || retire_conversation(None, Some(saved)))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
+            });
+        }
         let Some(remove) = self.remove_chat_card(card, None) else {
             return Task::none();
         };
@@ -3773,6 +3811,7 @@ impl Cagents {
                             }
                             let unrestricted = bypasses_approvals(&recipe);
                             let fresh = chat::Session {
+                                native_continuity: Default::default(),
                                 owned_codex_listener: None,
                                 id: crate::model::TerminalId::new(),
                                 launch: chat::Launch {
@@ -5030,6 +5069,27 @@ impl Cagents {
                     task
                 };
             }
+            Action::RetainedCloseFinished(target, session, result) => {
+                if self
+                    .chat_ui
+                    .finish(target, |phase| {
+                        matches!(phase, Phase::Closing { restart: None, .. })
+                    })
+                    .is_none()
+                {
+                    return Task::none();
+                }
+                if self.chat_return_session(target.card).as_ref() != Some(&session) {
+                    return Task::none();
+                }
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
+                }
+                return self
+                    .remove_chat_card(target.card, None)
+                    .unwrap_or_else(Task::none);
+            }
             Action::CloseFinished(target, result) => {
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It
@@ -5742,6 +5802,20 @@ mod tests {
     /// for good: off the strip, tombstoned, and held by nothing.
     fn close_chat(app: &mut Cagents, card: CardId) {
         let _ = app.update(Message::CloseCard(card));
+        if let Some(Phase::Closing {
+            target,
+            restart: None,
+        }) = app.chat_ui.phases.get(&card)
+        {
+            let target = *target;
+            let source = app.chat_return_session(card).unwrap();
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                target,
+                source,
+                Ok(()),
+            )));
+        }
         assert_eq!(
             app.workspace.pending_close(),
             None,
@@ -5764,6 +5838,41 @@ mod tests {
             "no active operation outlives the card"
         );
         assert!(!app.chat_start_pending(card));
+    }
+
+    #[test]
+    fn failed_retained_native_close_keeps_saved_identity_until_exact_acknowledgment() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let saved = app.chat_return_session(card).unwrap();
+        let _ = app.begin_chat_close(card);
+        let target = app.chat_ui.phases[&card].target();
+        let _ = app.begin_chat_close(card); // A repeated click cannot discard the pending identity.
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved.clone(),
+            Err("cleanup remains unconfirmed".into()),
+        )));
+        assert_eq!(app.chat_return_session(card).as_ref(), Some(&saved));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.begin_chat_close(card);
+        let retry = app.chat_ui.phases[&card].target();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved.clone(),
+            Ok(()),
+        )));
+        assert!(
+            app.card_state(card).unwrap().existence.is_open(),
+            "stale acknowledgment cannot complete a retry"
+        );
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            retry,
+            saved,
+            Ok(()),
+        )));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
     }
 
     /// The errors the shell has recorded. `status` is drained into the notice
@@ -5828,18 +5937,27 @@ mod tests {
     fn a_chat_whose_start_failed_closes() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
-        close_chat(&mut app, card);
-        // With no connection, the daemon's inventory is what settles it.
-        let retirement = retired(&mut app, card);
-        let _ = app.update(Message::ChatUi(Action::Retired(
-            retirement,
+        let saved = app.chat_return_session(card).unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        let target = app.chat_ui.phases[&card].target();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved.clone(),
             Err("fixture: daemon unreachable".into()),
         )));
+        assert_eq!(app.chat_return_session(card), Some(saved));
+        assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(
             !errors(&app).is_empty(),
             "a conversation that may still run is reported"
         );
         assert!(!app.chat_ui.transition_pending());
+        app.notices.entries.clear();
+        close_chat(&mut app, card);
+        assert!(
+            app.chat_ui.retiring.is_empty(),
+            "the acknowledged close already proved retirement"
+        );
     }
 
     /// A successful close committed a removal the workspace had never been
@@ -5935,7 +6053,10 @@ mod tests {
         )));
         app.notices.entries.clear();
         close_chat(&mut app, card);
-        retired(&mut app, card);
+        assert!(
+            app.chat_ui.retiring.is_empty(),
+            "the acknowledged close needs no second retirement"
+        );
     }
 
     #[test]
@@ -6662,11 +6783,16 @@ mod tests {
         assert!(terminal_cards(&app).is_empty());
         assert!(!errors(&app).is_empty(), "the refusal says why");
         app.notices.entries.clear();
-        // The close asked for meanwhile still happens, and retires the chat.
+        // The queued close retains ownership until the daemon proves cleanup.
         assert_eq!(app.workspace.pending_close(), None);
         let _ = app.update(Message::CommitClose(card));
-        assert!(!app.workspace.order().any(|id| id == card));
-        retired(&mut app, card);
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(matches!(
+            app.chat_ui.phases.get(&card),
+            Some(Phase::Closing { restart: None, .. })
+        ));
+        close_chat(&mut app, card);
+        assert!(app.chat_ui.retiring.is_empty());
 
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
@@ -6997,11 +7123,22 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = failed_chat(&mut app);
         let _ = app.update(Message::CloseCard(card));
+        let closing = app.chat_ui.phases[&card].target();
+        let saved = app.chat_return_session(card).unwrap();
         let _ = app.update(Message::RetryCard(card));
         assert!(
-            !app.chat_start_pending(card),
-            "retry after close starts nothing"
+            matches!(app.chat_ui.phases.get(&card), Some(Phase::Closing { target, restart: None }) if *target == closing),
+            "retry cannot replace a pending exact close with a new provider start"
         );
+        assert_eq!(app.chat_return_session(card), Some(saved.clone()));
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            closing,
+            saved,
+            Ok(()),
+        )));
+        let _ = app.update(Message::RetryCard(card));
+        assert!(!app.chat_start_pending(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
 
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target) = starting_chat(&mut app);

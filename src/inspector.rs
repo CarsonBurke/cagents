@@ -1995,6 +1995,7 @@ mod tests {
             .environment
             .insert("API_KEY".into(), "private-secret".into());
         card.kind = CardKind::Chat(crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {

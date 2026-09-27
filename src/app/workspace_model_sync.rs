@@ -889,6 +889,7 @@ mod tests {
             .push(local(target, project, "Execution", 1));
         durable.active_channel = Some(active);
         let session = crate::chat::Session {
+            native_continuity: Default::default(),
             id: TerminalId::new(),
             proof: Some(crate::model::HostSessionProof {
                 host_session_id: crate::model::HostSessionId::new("execution-host"),

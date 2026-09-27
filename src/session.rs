@@ -2854,6 +2854,7 @@ mod tests {
                 unreachable!()
             };
             let chat = |provider: crate::agent::Provider, id: TerminalId| crate::chat::Session {
+                native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
@@ -2914,6 +2915,7 @@ mod tests {
         terminal.launch.arguments.clear();
         terminal.transcript_path = None;
         let mut chat = crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: terminal.id,
             launch: crate::chat::Launch {
@@ -3696,6 +3698,7 @@ mod tests {
             id: TerminalId::new(),
             proof: None,
             terminal: None,
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,
@@ -4407,6 +4410,7 @@ mod tests {
             unreachable!()
         };
         let chat = |session_id: Option<&str>| crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {

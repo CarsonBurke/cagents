@@ -2859,6 +2859,11 @@ fn validate_chat_identity(
     session: &crate::chat::Session,
     previous: Option<PersistedCardKind>,
 ) -> Result<()> {
+    if !session.has_valid_native_continuity() {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card} has invalid native continuity evidence"
+        )));
+    }
     if session.owned_codex_listener.is_some() && !session.owns_codex_listener() {
         return Err(StoreError::InvalidState(format!(
             "chat card {card} has invalid owned listener evidence"
@@ -2884,6 +2889,12 @@ fn validate_chat_identity(
             Some("identity")
         } else if stored.launch.provider != session.launch.provider {
             Some("provider")
+        } else if matches!(
+            stored.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        ) && stored.native_continuity != session.native_continuity
+        {
+            Some("native continuity")
         } else if stored.owned_codex_listener != session.owned_codex_listener
             && !(stored.owned_codex_listener.is_none()
                 && session.owns_codex_listener()
@@ -2901,6 +2912,7 @@ fn validate_chat_identity(
         {
             Some("launch recipe")
         } else if stored.terminal != session.terminal
+            && !session.retains_native_pair_from(&stored)
             && !(stored.terminal.is_none()
                 && session
                     .terminal
@@ -3769,12 +3781,21 @@ fn load_card_connection(
         PersistedCardKind::Terminal => {
             CardKind::Terminal(load_terminal(connection, id, current_boot, proof)?)
         }
-        PersistedCardKind::Chat => CardKind::Chat(from_json(
-            "chat card",
-            content.as_deref().ok_or_else(|| {
-                StoreError::corrupt_row(format!("chat card {id}"), "missing payload")
-            })?,
-        )?),
+        PersistedCardKind::Chat => {
+            let session: crate::chat::Session = from_json(
+                "chat card",
+                content.as_deref().ok_or_else(|| {
+                    StoreError::corrupt_row(format!("chat card {id}"), "missing payload")
+                })?,
+            )?;
+            if !session.has_valid_native_continuity() {
+                return Err(StoreError::corrupt_row(
+                    format!("chat card {id}"),
+                    "invalid native continuity evidence",
+                ));
+            }
+            CardKind::Chat(session)
+        }
         PersistedCardKind::Browser => CardKind::Browser(load_browser(connection, id)?),
         PersistedCardKind::PullRequests => CardKind::PullRequests(from_json(
             "pull request card",
@@ -4346,6 +4367,7 @@ mod tests {
         ];
         source.resume_hint = crate::model::agent_recovery::hint_from_launch(&source.launch);
         let chat = crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,
             launch: crate::chat::Launch {
@@ -4715,6 +4737,7 @@ mod tests {
                     .insert("CLAUDE_CONFIG_DIR".into(), home.into());
             }
             crate::chat::Session {
+                native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id,
                 launch: crate::chat::Launch {
@@ -4853,6 +4876,7 @@ mod tests {
 
         // Any other endpoint is a different launch.
         let elsewhere = crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             ..asked.clone()
@@ -5031,6 +5055,7 @@ mod tests {
             let source = paired.terminal.unwrap();
             let proof = source.continuity.live_proof().unwrap();
             let mut native = crate::chat::Session {
+                native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id: TerminalId::new(),
                 launch: paired.launch,
@@ -5110,6 +5135,85 @@ mod tests {
                 .unwrap();
             assert_eq!(restored.kind, CardKind::Chat(paired));
         }
+    }
+
+    #[test]
+    fn durable_native_adoption_persists_exact_pair_and_refuses_capability_loss() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("native.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, mut chat) = agent_workspace(crate::agent::Provider::Codex);
+        let mut terminal = chat.terminal.take().unwrap();
+        let proof = terminal.continuity.live_proof().unwrap();
+        chat.proof = Some(proof.clone());
+        let conversation = chat.launch.session_id.take();
+        chat.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        assert!(chat.claim_owned_codex_listener(&directory.path().join("daemon-tmp"), &proof));
+        chat.launch.session_id = conversation;
+        chat.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        terminal.launch = chat.launch.terminal_recipe().unwrap();
+        terminal.owned_codex_listener = chat.owned_codex_listener.clone();
+        chat.terminal = Some(terminal);
+        workspace.cards[0].kind = CardKind::Chat(chat.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        let mut successor = chat.clone();
+        let mut next_proof = proof.clone();
+        next_proof.host_incarnation = "next-daemon".into();
+        successor.proof = Some(next_proof.clone());
+        successor.terminal.as_mut().unwrap().continuity = TerminalContinuity::Live {
+            host_session_id: next_proof.host_session_id.clone(),
+            boot_id: next_proof.boot_id.clone(),
+            host_incarnation: next_proof.host_incarnation.clone(),
+        };
+        workspace.cards[0].kind = CardKind::Chat(successor.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, Some(&next_proof))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(successor.clone())
+        );
+        for continuity in [
+            crate::chat::NativeContinuity::ReconnectOnly,
+            crate::chat::NativeContinuity::Durable {
+                provider_version: "0.158.0".into(),
+            },
+        ] {
+            let mut wrong = successor.clone();
+            wrong.native_continuity = continuity;
+            workspace.cards[0].kind = CardKind::Chat(wrong);
+            assert!(matches!(
+                card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+                StoreError::InvalidState(_)
+            ));
+        }
+        let mut wrong = successor.clone();
+        wrong
+            .terminal
+            .as_mut()
+            .unwrap()
+            .launch
+            .arguments
+            .push("--yolo".into());
+        workspace.cards[0].kind = CardKind::Chat(wrong);
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, Some(&next_proof))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(successor)
+        );
     }
 
     #[test]

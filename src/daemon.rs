@@ -1,4 +1,6 @@
 #[cfg(feature = "host")]
+pub(crate) mod holder_registry;
+#[cfg(feature = "host")]
 pub(crate) mod owned_children;
 
 use std::{

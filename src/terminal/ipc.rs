@@ -88,6 +88,7 @@ use crate::{
 /// Version 27 reports screen loss after authenticated crash adoption and adds
 /// exact-recipe cleanup for retained completed terminals.
 /// Version 28 adds durable agent commands, execution identity, and hosted consoles.
+/// Version 29 carries native-provider crash-continuity capabilities.
 /// Version 30 makes notification activation and lifecycle identity typed.
 /// Version 31 adds explicit user automation management and durable run routing.
 pub const PROTOCOL_VERSION: u16 = 31;
@@ -252,6 +253,11 @@ pub enum ClientRequest {
     },
     ChatClose {
         chat_id: TerminalId,
+    },
+    /// Closes only the exact authenticated retained native owner. Used when
+    /// restoring its actor is impossible; absence is not teardown evidence.
+    ChatCloseRetained {
+        session: crate::chat::Session,
     },
     ChatList,
     /// Acknowledge activity without enabling or reading presentation.

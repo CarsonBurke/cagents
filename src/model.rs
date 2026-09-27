@@ -1257,6 +1257,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Chat(crate::chat::Session {
+                    native_continuity: Default::default(),
                     owned_codex_listener: None,
                     id: TerminalId::new(),
                     launch: crate::chat::Launch {
