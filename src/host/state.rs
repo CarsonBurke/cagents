@@ -3561,6 +3561,8 @@ mod tests {
             host.activate_notification(target.clone(), None, None),
             "primary"
         );
+        delivery.close_after_drain();
+        editor.close_after_drain();
         assert!(matches!(delivery.pop().unwrap().message,
             ServerMessage::NotificationActivated { target: actual } if actual == target));
         assert!(editor.pop().is_none());
