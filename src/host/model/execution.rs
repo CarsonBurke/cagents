@@ -62,6 +62,41 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Accepted work can be queued behind the daemon's update write gate before
+    /// it owns a hosted actor. Do not lose it from impact merely because there
+    /// is no terminal/chat to project yet. Call outside HostState; final update
+    /// admission also holds the control write gate to exclude new acceptance.
+    pub(crate) fn agent_update_blockers(&self) -> Result<Vec<String>, String> {
+        let mut query = self.db.prepare(
+            "SELECT a.record FROM agents a WHERE a.closed = 0 AND (
+                 EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
+                 OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND
+                     (r.state = 'accepted' OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
+             ) ORDER BY a.id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([MAX_RUNNING as u64 + 1], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let mut blockers = records
+            .iter()
+            .take(MAX_RUNNING)
+            .map(|record| {
+                let agent: Agent = decode(record)?;
+                Ok(format!(
+                    "{} agent {} has accepted work or launch ownership awaiting confirmation",
+                    agent.spec.provider.label(),
+                    agent.id
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if records.len() > MAX_RUNNING {
+            blockers.push("Additional agent launches must settle before updating".into());
+        }
+        Ok(blockers)
+    }
+
     /// Caller has authenticated every retained descriptor with the actual
     /// holder. A same-ID recipe is not sufficient evidence for this operation.
     /// Authority and public/private ownership advance in one transaction; a
@@ -1331,6 +1366,56 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn update_blockers_include_accepted_dispatch_and_unbound_provider_work() {
+        let (mut registry, _directory, mut request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let assert_blocked = |registry: &Registry| {
+            let blockers = registry.agent_update_blockers().unwrap();
+            assert_eq!(blockers.len(), 1);
+            assert!(blockers[0].contains(&accepted.agent.id.to_string()));
+        };
+        assert_blocked(&registry);
+        registry.claim_agent_dispatch(&accepted, 2).unwrap();
+        assert_blocked(&registry);
+        let session = source();
+        registry
+            .reserve_agent_launch(accepted.agent.id, &session)
+            .unwrap();
+        assert_blocked(&registry);
+        registry
+            .bind_agent(accepted.agent.id, None, session)
+            .unwrap();
+        assert_blocked(&registry);
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "confirmed".into(),
+                },
+                3,
+            )
+            .unwrap();
+        assert!(registry.agent_update_blockers().unwrap().is_empty());
+
+        request.idempotency_key = "unbound-provider".into();
+        let unbound = registry.submit_agent(&Origin::User, &request, 4).unwrap();
+        registry
+            .update_agent_run(
+                unbound.run.id,
+                unbound.run.revision,
+                Update::Started {
+                    provider_key: "unbound".into(),
+                },
+                5,
+            )
+            .unwrap();
+        let blockers = registry.agent_update_blockers().unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains(&unbound.agent.id.to_string()));
     }
 
     #[test]
