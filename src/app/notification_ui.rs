@@ -221,14 +221,25 @@ impl Cagents {
             sessions,
             focused,
         };
-        *self
-            .notification_ui
-            .presence
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = presence.clone();
+        let focus_changed = {
+            let mut previous = self
+                .notification_ui
+                .presence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let changed = previous.focused != focused;
+            *previous = presence.clone();
+            changed
+        };
         self.notification_ui
             .changed(|pending| pending.presence = Some(presence));
-        if let Some(focused) = focused {
+        // A snapshot can arrive while focus stays on this agent. When the
+        // user opted into alerts while watching it, acknowledging that fresh
+        // snapshot would immediately withdraw the desktop alert. Returning
+        // to a pane still acknowledges it, as does explicit portal activation.
+        if let Some(focused) = focused
+            && (focus_changed || !self.settings.notifications.while_focused)
+        {
             let ids = self
                 .notification_ui
                 .snapshot
@@ -400,6 +411,54 @@ mod tests {
         let pending = app.notification_ui.pending.lock().unwrap();
         assert_eq!(pending.presence.as_ref().unwrap().focused, Some(session));
         assert_eq!(pending.acknowledged, BTreeSet::from([id]));
+    }
+
+    #[test]
+    fn opted_in_focused_alert_survives_snapshot_and_is_read_on_return() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.settings.notifications.while_focused = true;
+        app.refresh_ui.focused = true;
+        app.sync_notification_presence();
+        let session = card_session(&app.durable.cards[0]).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let snapshot = Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id,
+                event: crate::notifications::Event {
+                    session,
+                    provider: Provider::Claude,
+                    directory: "/tmp".into(),
+                    evidence: crate::notifications::Evidence {
+                        key: "focused-completion".into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .is_empty(),
+            "notification snapshots must not withdraw an explicitly requested focused alert"
+        );
+
+        app.refresh_ui.focused = false;
+        app.sync_notification_presence();
+        app.refresh_ui.focused = true;
+        app.sync_notification_presence();
+        assert_eq!(
+            app.notification_ui.pending.lock().unwrap().acknowledged,
+            BTreeSet::from([id])
+        );
     }
 
     #[test]
