@@ -3,6 +3,51 @@
 use super::*;
 use crate::daemon::holder_registry::{self as registry, Kind};
 
+/// Diagnostic data only: it never authorizes attaching, launching or cleanup.
+/// Keep hashes rather than another copy of launch environments for every alias.
+#[derive(Default)]
+pub(in crate::host) struct AdoptionFailures(std::collections::VecDeque<AdoptionFailure>);
+
+struct AdoptionFailure {
+    id: TerminalId,
+    sources: Vec<[u8; 32]>,
+    reason: String,
+}
+
+impl AdoptionFailures {
+    const LIMIT: usize = 128;
+    const MESSAGE_BYTES: usize = 4096;
+
+    fn source_key(source: &Session) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        Some(Sha256::digest(serde_json::to_vec(source).ok()?).into())
+    }
+
+    fn remember(&mut self, id: TerminalId, sources: Vec<[u8; 32]>, reason: &str) {
+        self.clear(id);
+        if self.0.len() == Self::LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back(AdoptionFailure {
+            id,
+            sources,
+            reason: reason[..reason.floor_char_boundary(Self::MESSAGE_BYTES)].into(),
+        });
+    }
+
+    pub(super) fn get(&self, source: &Session) -> Option<&str> {
+        let key = Self::source_key(source)?;
+        self.0
+            .iter()
+            .find(|failure| failure.id == source.id && failure.sources.contains(&key))
+            .map(|failure| failure.reason.as_str())
+    }
+
+    pub(super) fn clear(&mut self, id: TerminalId) {
+        self.0.retain(|failure| failure.id != id);
+    }
+}
+
 pub(super) fn restore(
     host: &SharedHost,
     client: ClientId,
@@ -66,6 +111,33 @@ fn restore_reserved(
     if &recovery.source != source && !recovery.previous_sources.contains(source) {
         return Err("Native holder does not recognize this exact issued descriptor".into());
     }
+    // Only the authenticated holder's complete issued descriptors can retrieve
+    // this failure. An unrecognized caller cannot replace another card's reason.
+    let sources = recovery
+        .previous_sources
+        .iter()
+        .chain(std::iter::once(&recovery.source))
+        .filter_map(AdoptionFailures::source_key)
+        .collect();
+    let result = restore_authenticated(host, client, source, proof, record, recovery);
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    match &result {
+        Ok(_) => state.native_adoption_failures.clear(source.id),
+        Err(reason) => state
+            .native_adoption_failures
+            .remember(source.id, sources, reason),
+    }
+    result
+}
+
+fn restore_authenticated(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    proof: &HostSessionProof,
+    record: registry::Record,
+    recovery: chat::native_holder::Recovery,
+) -> Result<ServerResponse, String> {
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()
@@ -320,6 +392,44 @@ pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adoption_diagnostics_are_bounded_exact_and_retired() {
+        let source = crate::chat::fresh_session(
+            Provider::Codex,
+            TerminalId::new(),
+            "/var/tmp".into(),
+            &crate::account::Account::system(Provider::Codex),
+        )
+        .unwrap();
+        let mut failures = AdoptionFailures::default();
+        let key = AdoptionFailures::source_key(&source).unwrap();
+        failures.remember(source.id, vec![key], &"é".repeat(4096));
+        assert_eq!(
+            failures.get(&source).unwrap().len(),
+            AdoptionFailures::MESSAGE_BYTES
+        );
+        let mut altered = source.clone();
+        altered.launch.recipe.arguments.push("--different".into());
+        assert!(failures.get(&altered).is_none());
+        failures.remember(source.id, vec![key], "latest provider refusal");
+        assert_eq!(failures.0.len(), 1);
+        assert_eq!(failures.get(&source), Some("latest provider refusal"));
+        for _ in 0..AdoptionFailures::LIMIT {
+            failures.remember(TerminalId::new(), vec![], "unavailable");
+        }
+        assert_eq!(failures.0.len(), AdoptionFailures::LIMIT);
+        assert!(
+            failures.get(&source).is_none(),
+            "oldest diagnostic is evicted"
+        );
+        failures.remember(source.id, vec![key], "reattachment failed");
+        failures.clear(source.id);
+        assert!(
+            failures.get(&source).is_none(),
+            "successful restore/cleanup clears the refusal"
+        );
+    }
 
     #[test]
     fn crash_adoption_preserves_unnamed_aliases_for_a_later_planned_upgrade() {
