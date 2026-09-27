@@ -3396,11 +3396,11 @@ next_column = ["Alt+W", "Alt+Right"]
             document["keyboard_shortcuts"]
                 .as_table_mut()
                 .unwrap()
-                .insert("future_action".into(), vec!["Alt+F17", "Alt+F12"].into());
+                .insert("future_action".into(), vec!["Alt+M", "Alt+F12"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.new_terminal = vec!["alt+f17".into()];
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+m".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert_eq!(
             saved(&path)["keyboard_shortcuts"]["future_action"],
@@ -3774,11 +3774,11 @@ next_column = ["Alt+W", "Alt+Right"]
             document["keyboard_shortcuts"]
                 .as_table_mut()
                 .unwrap()
-                .insert("future_action".into(), vec!["Alt+F17"].into());
+                .insert("future_action".into(), vec!["Alt+M"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.new_terminal = vec!["alt+f17".into()];
+        desired.keyboard_shortcuts.new_terminal = vec!["alt+m".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert!(
             saved(&path)["keyboard_shortcuts"]
