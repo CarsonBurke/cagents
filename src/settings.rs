@@ -713,11 +713,14 @@ pub struct AppSettings {
     pub language_servers: Vec<LanguageServerSettings>,
     #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
+    #[serde(default)]
+    pub notifications: crate::notifications::Preferences,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
@@ -2257,6 +2260,22 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_preferences_default_for_existing_files_and_roundtrip() {
+        let mut settings = AppSettings::default();
+        let mut old: toml::Table = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        old.remove("notifications");
+        let restored: AppSettings = toml::from_str(&toml::to_string(&old).unwrap()).unwrap();
+        assert_eq!(
+            restored.notifications,
+            crate::notifications::Preferences::default()
+        );
+        settings.notifications.enabled = false;
+        settings.notifications.while_focused = true;
+        let restored: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.notifications, settings.notifications);
+    }
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn path_in(directory: &tempfile::TempDir) -> PathBuf {

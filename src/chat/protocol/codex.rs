@@ -1183,8 +1183,31 @@ impl Adapter for Codex {
                 }
             }
             "turn/started" | "turn/completed" => {
+                if method == "turn/started" {
+                    step.events.push(Event::TurnStarted);
+                }
                 self.materialized = true;
                 let turn = &params["turn"];
+                if method == "turn/completed" {
+                    step.events.push(Event::TurnSettled);
+                    use crate::notifications::Kind;
+                    let outcome = match turn["status"].as_str() {
+                        Some("completed") => Some(Kind::Succeeded),
+                        Some("failed") => Some(Kind::Failed),
+                        Some("interrupted") => Some(Kind::Cancelled),
+                        _ => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        step.events.push(Event::TurnFinished {
+                            key: Some(format!(
+                                "codex:{}:{}",
+                                string(params, "threadId")?,
+                                string(turn, "id")?
+                            )),
+                            outcome,
+                        });
+                    }
+                }
                 self.busy = method == "turn/started";
                 step.events.push(Event::Waiting(false));
                 self.turn = if self.busy {
@@ -2105,6 +2128,35 @@ fn skill_mentions(text: &str) -> Vec<Mention<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_requires_explicit_settlement_of_the_bound_thread() {
+        use crate::notifications::Kind;
+        for (status, expected) in [
+            ("completed", Some(Kind::Succeeded)),
+            ("failed", Some(Kind::Failed)),
+            ("interrupted", Some(Kind::Cancelled)),
+            ("future", None),
+        ] {
+            let mut adapter = adapter();
+            let other = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"other","turn":{"id":"turn","status":status,"items":[]}}})).unwrap();
+            assert!(
+                !other
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            let step = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":status,"items":[]}}})).unwrap();
+            let outcome = step.events.iter().find_map(|event| match event {
+                Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
+                _ => None,
+            });
+            assert_eq!(
+                outcome,
+                expected.map(|kind| (Some("codex:thread-exact:turn"), kind))
+            );
+        }
+    }
 
     #[test]
     fn an_explicit_default_remote_starts_new_threads_on_the_shared_server() {

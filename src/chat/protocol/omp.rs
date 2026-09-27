@@ -110,6 +110,8 @@ struct Omp {
     /// is running and is not ended for a reply that failed meanwhile.
     started: bool,
     busy: bool,
+    turn_outcome: Option<crate::notifications::Kind>,
+    agent_turn_active: bool,
     expected_session: Option<String>,
     session_id: Option<String>,
     state_request: Option<String>,
@@ -761,6 +763,19 @@ impl Adapter for Omp {
                 }
             }
             "message_start" | "message_end" => {
+                // Only an assistant stop reason describes the turn outcome;
+                // a failed tool can be recovered from in the same turn.
+                if text(&frame, "type") == "message_end"
+                    && text(&frame["message"], "role") == "assistant"
+                {
+                    use crate::notifications::Kind;
+                    self.turn_outcome = match text(&frame["message"], "stopReason") {
+                        "error" => Some(Kind::Failed),
+                        "aborted" => Some(Kind::Cancelled),
+                        "stop" | "length" => Some(Kind::Succeeded),
+                        _ => None,
+                    };
+                }
                 step.events.extend(
                     self.message_items(&frame["message"])
                         .into_iter()
@@ -867,6 +882,11 @@ impl Adapter for Omp {
                 }));
             }
             "agent_start" | "auto_compaction_start" => {
+                if text(&frame, "type") == "agent_start" {
+                    step.events.push(Event::TurnStarted);
+                    self.turn_outcome = None;
+                    self.agent_turn_active = true;
+                }
                 self.busy = true;
                 step.events.push(Event::Status {
                     busy: true,
@@ -878,9 +898,32 @@ impl Adapter for Omp {
                     .into(),
                 });
             }
+            "agent_end" if frame["isTerminal"].as_bool() == Some(false) => {
+                // OMP can yield for maintenance or asynchronous delivery and
+                // resume the same run. Older runtimes omit this field, so only
+                // an explicit false excludes the terminal boundary below.
+                self.busy = true;
+                step.events.push(Event::Status {
+                    busy: true,
+                    detail: "Working".into(),
+                });
+            }
             "agent_end" | "auto_compaction_end" => {
+                let finished = text(&frame, "type") == "agent_end" && self.agent_turn_active;
+                let outcome = if finished {
+                    self.agent_turn_active = false;
+                    self.turn_outcome.take()
+                } else {
+                    None
+                };
                 self.busy = false;
                 step = self.refresh();
+                if finished {
+                    step.events.push(Event::TurnSettled);
+                }
+                if finished && let Some(outcome) = outcome {
+                    step.events.push(Event::TurnFinished { key: None, outcome });
+                }
                 step.events.push(Event::Status {
                     busy: false,
                     detail: "Ready".into(),
@@ -1086,6 +1129,84 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_waits_for_agent_end_and_ignores_compaction_and_tools() {
+        use crate::notifications::Kind;
+        for (reason, expected) in [
+            ("stop", Some(Kind::Succeeded)),
+            ("error", Some(Kind::Failed)),
+            ("aborted", Some(Kind::Cancelled)),
+            ("toolUse", None),
+        ] {
+            let mut adapter = Omp::default();
+            adapter.receive(json!({"type":"agent_start"})).unwrap();
+            let message = adapter.receive(json!({"type":"message_end","message":{"role":"assistant","stopReason":reason,"content":[]}})).unwrap();
+            assert!(
+                !message
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            let compact = adapter
+                .receive(json!({"type":"auto_compaction_end"}))
+                .unwrap();
+            assert!(
+                !compact
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            let ended = adapter.receive(json!({"type":"agent_end"})).unwrap();
+            assert_eq!(
+                ended.events.iter().find_map(|event| match event {
+                    Event::TurnFinished { outcome, .. } => Some(*outcome),
+                    _ => None,
+                }),
+                expected
+            );
+            let duplicate = adapter.receive(json!({"type":"agent_end"})).unwrap();
+            assert!(
+                !duplicate
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_agent_end_does_not_announce_or_settle_the_run() {
+        let mut adapter = Omp::default();
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        adapter.receive(json!({"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[]}})).unwrap();
+        let intermediate = adapter
+            .receive(json!({"type":"agent_end","isTerminal":false}))
+            .unwrap();
+        assert!(
+            !intermediate
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. } | Event::TurnSettled))
+        );
+        assert!(adapter.busy);
+        let terminal = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(terminal.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            terminal
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnSettled))
+        );
+    }
 
     /// oh-my-pi lists a skill as the command `skill:name`, which it runs from
     /// anywhere in a message, and loads only the first a message names.

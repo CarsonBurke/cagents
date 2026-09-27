@@ -174,6 +174,59 @@ fn settings_category_controls<'a>(
     accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
 ) -> Vec<Group<'a, Message>> {
     match category {
+        SettingsCategory::Notifications => {
+            use crate::notifications::Field;
+            let fields = [
+                (
+                    Field::Enabled,
+                    "System notifications",
+                    "Show desktop alerts for agent lifecycle events, including while all windows are closed.",
+                ),
+                (
+                    Field::Success,
+                    "Successful completion",
+                    "Notify when a provider confirms that a turn finished.",
+                ),
+                (
+                    Field::Failure,
+                    "Failure or cancellation",
+                    "Notify when a turn fails or is cancelled.",
+                ),
+                (
+                    Field::Waiting,
+                    "Waiting for you",
+                    "Notify when an agent needs input or approval.",
+                ),
+                (
+                    Field::WhileFocused,
+                    "Notify while focused",
+                    "Also notify while you are watching that agent. Off by default.",
+                ),
+            ];
+            let mut controls: Vec<_> = fields
+                .into_iter()
+                .map(|(field, label, detail)| {
+                    setting_field(
+                        label,
+                        detail,
+                        crate::settings_widgets::toggle(
+                            label,
+                            draft.notifications.get(field),
+                            move |enabled| Message::SettingsChanged {
+                                field: SettingsField::Notifications(field),
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    )
+                })
+                .collect();
+            controls.push(setting_field("Test notification", "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; test results appear in notices.", widget::button::standard("Send test notification").on_press(Message::NotificationUi(notification_ui::Action::Test)).into()));
+            vec![settings_group(
+                "Agent notifications",
+                "Alerts contain the provider and folder name, never prompts or output.",
+                controls,
+            )]
+        }
         SettingsCategory::Accounts => {
             let mut settings: Vec<Setting<'a, Message>> = accounts
                 .iter()
@@ -657,6 +710,7 @@ fn settings_category_controls<'a>(
 
 fn category_icon(category: SettingsCategory) -> &'static str {
     match category {
+        SettingsCategory::Notifications => "preferences-system-notifications-symbolic",
         SettingsCategory::General => "preferences-system-symbolic",
         SettingsCategory::Appearance => "preferences-desktop-display-symbolic",
         SettingsCategory::Terminal => "utilities-terminal-symbolic",

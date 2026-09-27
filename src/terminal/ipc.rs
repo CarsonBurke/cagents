@@ -84,7 +84,8 @@ use crate::{
 /// terminal descriptors; postcard fields require a matched daemon and UI.
 /// Version 23 carries explicit environment removals in launch recipes.
 /// Version 24 adds provider-confirmed account recovery and removed-account errors.
-pub const PROTOCOL_VERSION: u16 = 24;
+/// Version 26 adds daemon-owned durable lifecycle attention and notification control.
+pub const PROTOCOL_VERSION: u16 = 26;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -327,6 +328,20 @@ pub enum ClientRequest {
         text: String,
         origin: PasteOrigin,
     },
+    WatchNotifications {
+        presence: crate::notifications::Presence,
+    },
+    NotificationPresence {
+        presence: crate::notifications::Presence,
+    },
+    ReadNotifications,
+    NotificationPreferencesChanged {
+        preferences: Option<crate::notifications::Preferences>,
+        test: bool,
+    },
+    AcknowledgeNotification {
+        id: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +543,10 @@ pub enum ServerMessage {
         /// Unix milliseconds at which the daemon read the report.
         observed_at: u64,
     },
+    NotificationsChanged,
+    NotificationActivated {
+        session: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -601,6 +620,9 @@ pub enum ServerResponse {
     },
     BuildInfo {
         version: String,
+    },
+    Notifications {
+        snapshot: crate::notifications::Snapshot,
     },
 }
 

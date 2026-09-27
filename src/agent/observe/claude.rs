@@ -148,16 +148,24 @@ fn session_for_process(rows: &[Value], pid: i32) -> ProbeResult<Option<String>> 
     Ok(identity)
 }
 
-pub(super) type ProcessCensus = BTreeMap<i32, (PathBuf, ActivityState, Option<String>)>;
+pub(super) type ProcessCensus =
+    BTreeMap<i32, (PathBuf, ActivityState, Option<String>, Option<String>)>;
 
 pub(super) fn activity(census: &ProcessCensus, pid: i32, cwd: &Path) -> Option<ActivityState> {
-    let (observed_cwd, state, _) = census.get(&pid)?;
+    let (observed_cwd, state, _, _) = census.get(&pid)?;
     (observed_cwd == cwd).then_some(*state)
 }
 
 pub(super) fn title(census: &ProcessCensus, pid: i32, cwd: &Path) -> Option<String> {
-    let (observed_cwd, _, title) = census.get(&pid)?;
+    let (observed_cwd, _, title, _) = census.get(&pid)?;
     (observed_cwd == cwd).then(|| title.clone()).flatten()
+}
+
+pub(super) fn session<'a>(census: &'a ProcessCensus, pid: i32, cwd: &Path) -> Option<&'a str> {
+    let (observed_cwd, _, _, session) = census.get(&pid)?;
+    (observed_cwd == cwd)
+        .then_some(session.as_deref())
+        .flatten()
 }
 
 pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<ProcessCensus> {
@@ -205,12 +213,16 @@ fn census_rows(rows: &[Value]) -> ProbeResult<ProcessCensus> {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
+        let session = row["sessionId"]
+            .as_str()
+            .filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+            .map(str::to_owned);
         match census.entry(pid) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((cwd, state, title));
+                entry.insert((cwd, state, title, session));
             }
             std::collections::btree_map::Entry::Occupied(entry) => {
-                if entry.get() != &(cwd, state, title) {
+                if entry.get() != &(cwd, state, title, session) {
                     return Err(());
                 }
             }

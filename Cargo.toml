@@ -21,6 +21,8 @@ latency-harness = ["ui"]
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
 host = [
+    "dep:ashpd",
+    "dep:futures-util",
     "dep:base64",
     "dep:image",
     "dep:ksni",
@@ -119,6 +121,7 @@ crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.14", optional = true }
+futures-util = { version = "0.3", optional = true }
 # Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
 # an SVG, by rasterizing to RGBA off the UI thread, so a document in a
 # worktree opens in place instead of handing the reader to an external viewer.

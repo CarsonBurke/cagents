@@ -74,6 +74,7 @@ type Cursors = BTreeMap<FileKey, (Instant, Arc<Mutex<Cursor>>)>;
 #[derive(Default)]
 pub(super) struct Rollouts {
     cursors: Mutex<Cursors>,
+    attention: Mutex<super::attention::Tails>,
 }
 
 impl Rollouts {
@@ -81,9 +82,20 @@ impl Rollouts {
     /// `started` where that is known, from the rollouts it writes: working
     /// while any of its threads is mid-turn. `None` when it writes none, as a
     /// client of a shared server does, or when they cannot be listed.
+    #[cfg(test)]
     pub(super) fn state(&self, pid: i32, started: Option<u64>) -> Option<ActivityState> {
+        self.observe(pid, 0, started).map(|(state, _)| state)
+    }
+
+    pub(super) fn observe(
+        &self,
+        pid: i32,
+        process_start: u64,
+        started: Option<u64>,
+    ) -> Option<(ActivityState, Option<crate::notifications::Evidence>)> {
         let process = Path::new("/proc").join(pid.to_string());
         let mut state = None;
+        let mut evidence = None;
         for entry in std::fs::read_dir(process.join("fd")).ok()?.take(MAX_FDS) {
             let Ok(entry) = entry else { continue };
             let Ok(target) = std::fs::read_link(entry.path()) else {
@@ -113,8 +125,16 @@ impl Rollouts {
             };
             let turn = self.turn(&file, name.to_owned());
             state = Some(merge(state, activity(turn, started)));
+            if let Ok(Some(observed)) = self
+                .attention
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read_for_process(&file, super::attention::Format::Codex, (pid, process_start))
+            {
+                evidence = Some(observed);
+            }
         }
-        state
+        state.map(|state| (state, evidence))
     }
 
     fn turn(&self, file: &File, name: OsString) -> Option<Turn> {

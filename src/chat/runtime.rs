@@ -38,6 +38,7 @@ type CommandRequest = (Command, crossbeam_channel::Sender<Result<(), String>>);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
+    Attention(crate::notifications::Evidence),
     Presentation,
     Observed {
         generation: u64,
@@ -208,6 +209,8 @@ impl Handle {
                     retained: 0,
                     dirty: false,
                     activity: ActivityState::Idle,
+                    attention: TurnAttention::default(),
+                    attention_baselined: false,
                     last_present: Instant::now(),
                     first_frame: false,
                     started: Instant::now(),
@@ -263,6 +266,12 @@ impl Handle {
                 // exited instead of waiting out an acknowledgement nobody will send.
                 draining.store(true, Ordering::Release);
                 if let Err(error) = result {
+                    if !actor.attention.settled {
+                        (actor.notify)(Update::Attention(crate::notifications::Evidence {
+                            key: actor.attention.key.clone(),
+                            kind: crate::notifications::Kind::Failed,
+                        }));
+                    }
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
                         String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
@@ -631,10 +640,43 @@ struct Actor {
     retained: usize,
     dirty: bool,
     activity: ActivityState,
+    attention: TurnAttention,
+    attention_baselined: bool,
     last_present: Instant,
     first_frame: bool,
     started: Instant,
     write_started: Option<Instant>,
+}
+
+struct TurnAttention {
+    key: String,
+    settled: bool,
+}
+
+impl Default for TurnAttention {
+    fn default() -> Self {
+        Self {
+            key: uuid::Uuid::new_v4().to_string(),
+            settled: false,
+        }
+    }
+}
+
+impl TurnAttention {
+    fn apply(&mut self, event: &Event) -> Option<crate::notifications::Evidence> {
+        match event {
+            Event::TurnStarted => *self = Self::default(),
+            Event::TurnSettled => self.settled = true,
+            Event::TurnFinished { key, outcome } => {
+                return Some(crate::notifications::Evidence {
+                    key: key.clone().unwrap_or_else(|| self.key.clone()),
+                    kind: *outcome,
+                });
+            }
+            _ => {}
+        }
+        None
+    }
 }
 impl Actor {
     fn run(&mut self, initial: Step) -> Result<(), String> {
@@ -1037,6 +1079,15 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if matches!(
+            event,
+            Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
+        ) {
+            if let Some(evidence) = self.attention.apply(&event) {
+                (self.notify)(Update::Attention(evidence));
+            }
+            return;
+        }
         if matches!(&event, Event::Reset { .. }) {
             *self
                 .confirmed_session
@@ -1067,8 +1118,15 @@ impl Actor {
         let activity = state.activity();
         let generation = state.generation;
         drop(state);
+        let baselined = std::mem::replace(&mut self.attention_baselined, true);
         if activity != self.activity {
             self.activity = activity;
+            if activity == ActivityState::Waiting && baselined {
+                (self.notify)(Update::Attention(crate::notifications::Evidence {
+                    key: format!("{}:waiting:{generation}", self.attention.key),
+                    kind: crate::notifications::Kind::Waiting,
+                }));
+            }
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
@@ -1144,6 +1202,7 @@ pub(super) fn observed_at() -> Option<u64> {
 }
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     match event {
+        Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -1431,6 +1490,36 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn late_outcome_does_not_settle_a_new_turn_with_continuous_activity() {
+        use super::*;
+        let mut attention = TurnAttention::default();
+        let old = attention.key.clone();
+        attention.apply(&Event::TurnSettled);
+        assert!(
+            attention.settled,
+            "idle transport loss must not duplicate an outcome"
+        );
+        // Aggregate activity may remain Working because background tasks run
+        // across the result and the next accepted user prompt.
+        attention.apply(&Event::TurnStarted);
+        let current = attention.key.clone();
+        assert_ne!(current, old);
+        assert!(!attention.settled);
+        let delayed = attention
+            .apply(&Event::TurnFinished {
+                key: Some(old.clone()),
+                outcome: crate::notifications::Kind::Cancelled,
+            })
+            .unwrap();
+        assert_eq!(delayed.key, old);
+        assert_eq!(attention.key, current);
+        assert!(
+            !attention.settled,
+            "current transport failure still needs an outcome"
+        );
+    }
+
     use super::super::Role;
     use super::*;
     use serde_json::{Value, json};
@@ -2209,7 +2298,9 @@ mod tests {
             .filter_map(|update| match update {
                 Update::Activity { state, .. } => Some(state),
                 Update::Presentation => panic!("hidden close must not request presentation"),
-                Update::Observed { .. } | Update::AccountUsage { .. } => None,
+                Update::Observed { .. } | Update::AccountUsage { .. } | Update::Attention(_) => {
+                    None
+                }
             })
             .collect();
         assert_eq!(

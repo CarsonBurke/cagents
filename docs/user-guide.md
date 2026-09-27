@@ -233,6 +233,28 @@ Pending sign-ins, registered accounts, homes referenced by linked accounts, and
 arbitrary external directories are preserved. Missing, unreadable, or newer
 account registries prevent this orphan cleanup.
 
+**Notifications** controls background agent completion, failure or cancellation,
+and requests for attention. Alerts are suppressed while their pane is focused
+unless **Notify for the focused pane** is enabled. They name the provider and
+folder, without copying prompts or output. **Send test notification** reports
+whether the desktop portal accepted the request; desktop settings control its
+presentation and sound.
+
+The daemon delivers alerts even with every window closed. Clicking one opens its
+owning window and selects the session. Native chats use explicit provider turn
+outcomes. Terminal Codex sessions use main CLI rollout completion/cancellation
+records; Claude sessions use their exact main transcript's `end_turn` and
+PID-scoped waiting state. Unsupported providers or log formats remain activity
+indicators; idle alone never means success. Initial history is not announced.
+
+Attention and recent event identities are retained in a bounded private journal.
+Reconnects do not create one alert per window or replay historical completions.
+When the desktop is unavailable, attention remains visible on reopening. Events
+from the current daemon retry with bounded backoff, or when a window reconnects;
+restored historical records are never reannounced. A process
+crash between receipt, journal write and desktop acknowledgement can still lose
+or repeat an alert: desktop delivery and local persistence are not one transaction.
+
 ## Editor
 
 - Files save automatically after a pause. Conflicts, save errors, and

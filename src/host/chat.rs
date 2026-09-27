@@ -334,6 +334,19 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     };
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
+    if let Update::Attention(evidence) = &update {
+        if let Some(record) = state.chats.get(&id)
+            && let Some(notifications) = &state.notifications
+        {
+            notifications.record(crate::notifications::Event {
+                session: id,
+                provider: record.session.launch.provider,
+                directory: record.session.launch.recipe.working_directory.clone(),
+                evidence: evidence.clone(),
+            });
+        }
+        return;
+    }
     let HostState { chats, clients, .. } = &mut *state;
     let Some(record) = chats.get_mut(&id) else {
         return;
@@ -1805,6 +1818,9 @@ pub(super) fn process(
                     .map(|terminal| terminal.id);
                 state.inventory_generation += 1;
                 let record = state.chats.remove(&chat_id);
+                if let Some(notifications) = &state.notifications {
+                    notifications.retire(chat_id);
+                }
                 let terminal = paired.and_then(|id| state.retire_terminal(id));
                 (record, terminal)
             };

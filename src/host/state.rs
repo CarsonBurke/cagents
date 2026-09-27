@@ -13,9 +13,10 @@ use crate::{
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
-        ProtocolError, ProtocolErrorCode, ServerMessage, ShutdownCapability, ShutdownOperation,
-        ShutdownOutcome, ShutdownPreflight, TerminalDescriptor, TerminalSnapshot,
-        TerminalSpawnOptions, TerminalVisibility, WireTerminalEvent,
+        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
+        WireTerminalEvent,
     },
     workspace_model::{ModelEdit, WorkspaceModel},
 };
@@ -226,6 +227,10 @@ pub(crate) struct HostState {
     /// independent subscriptions with independent clients - the CLI reads the
     /// model without subscribing at all.
     model_watchers: BTreeSet<ClientId>,
+    pub(super) notifications: Option<super::notifications::Handle>,
+    pub(super) notification_closed: BTreeSet<TerminalId>,
+    notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
+    notification_activation: BTreeMap<String, TerminalId>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -266,6 +271,10 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             model_watchers: BTreeSet::new(),
+            notifications: None,
+            notification_closed: BTreeSet::new(),
+            notification_watchers: BTreeMap::new(),
+            notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
             shutdown_requested: false,
@@ -308,6 +317,11 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        if self.notification_watchers.remove(&client_id).is_some()
+            && let Some(notifications) = &self.notifications
+        {
+            notifications.presence(client_id, None);
+        }
         self.clients.remove(&client_id);
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
@@ -320,6 +334,91 @@ impl HostState {
     /// a daemon that cannot open the store still has terminals to host.
     pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
         self.model = Some(registry);
+    }
+
+    pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
+        self.notifications.as_ref().map_or_else(
+            || crate::notifications::Snapshot {
+                diagnostic: Some("The daemon notification service is unavailable".into()),
+                ..Default::default()
+            },
+            super::notifications::Handle::snapshot,
+        )
+    }
+
+    pub(super) fn watch_notifications(
+        &mut self,
+        client: ClientId,
+        presence: crate::notifications::Presence,
+    ) -> Option<TerminalId> {
+        let activation = self.notification_activation.remove(&presence.window);
+        if let Some(notifications) = &self.notifications {
+            notifications.presence(client, Some(presence.clone()));
+        }
+        self.notification_watchers.insert(client, presence);
+        activation
+    }
+
+    pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
+        for (&client, current) in &mut self.notification_watchers {
+            if current.window == presence.window {
+                *current = presence.clone();
+                if let Some(notifications) = &self.notifications {
+                    notifications.presence(client, Some(presence.clone()));
+                }
+            }
+        }
+    }
+
+    pub(super) fn notifications_changed(&self) {
+        for client in self.notification_watchers.keys() {
+            if let Some(delivery) = self.clients.get(client) {
+                let _ = delivery.push(ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: self.proof().clone(),
+                    message: ServerMessage::NotificationsChanged,
+                });
+            }
+        }
+    }
+
+    pub(super) fn activate_notification(
+        &mut self,
+        session: TerminalId,
+        remembered_window: Option<&str>,
+    ) -> String {
+        let owner = self
+            .notification_watchers
+            .iter()
+            .filter(|(_, presence)| presence.sessions.contains(&session))
+            .max_by_key(|(_, presence)| {
+                (
+                    presence.focused == Some(session),
+                    Some(presence.window.as_str()) == remembered_window,
+                )
+            });
+        if let Some((&client, presence)) = owner {
+            let window = presence.window.clone();
+            if let Some(delivery) = self.clients.get(&client) {
+                let _ = delivery.push(ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: self.proof().clone(),
+                    message: ServerMessage::NotificationActivated { session },
+                });
+            }
+            return window;
+        }
+        let window = remembered_window
+            .unwrap_or(crate::instance::PRIMARY_WINDOW)
+            .to_owned();
+        if self.notification_activation.len() < 32
+            || self.notification_activation.contains_key(&window)
+        {
+            self.notification_activation.insert(window.clone(), session);
+        }
+        window
     }
 
     /// Subscribes `client_id` to shared-model edges and returns the model.
@@ -415,6 +514,11 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        if self.notification_watchers.remove(&client_id).is_some()
+            && let Some(notifications) = &self.notifications
+        {
+            notifications.presence(client_id, None);
+        }
         for receipt in self.chat_handoffs.values_mut() {
             receipt.detach(client_id);
         }
@@ -702,6 +806,10 @@ impl HostState {
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
         let record = self.terminals.remove(&terminal_id)?;
+        self.notification_closed.remove(&terminal_id);
+        if let Some(notifications) = &self.notifications {
+            notifications.retire(terminal_id);
+        }
         let clients: Vec<_> = self
             .subscriptions
             .by_terminal
@@ -713,6 +821,27 @@ impl HostState {
         }
         self.inventory_generation += 1;
         Some(record)
+    }
+
+    pub(super) fn close_terminal_attention(
+        &mut self,
+        terminal_id: TerminalId,
+        expected: Option<&TerminalHandle>,
+    ) {
+        // Completed descriptors may remain available for history. Explicit
+        // closure still withdraws their alerts and fences in-flight observers.
+        // Shutdown waits outside this lock: an old receipt must not suppress a
+        // replacement worker that acquired the same durable session meanwhile.
+        match self.terminals.get(&terminal_id) {
+            Some(record) if expected.is_some_and(|handle| record.handle.same_worker(handle)) => {
+                self.notification_closed.insert(terminal_id);
+            }
+            Some(_) => return,
+            None => {}
+        }
+        if let Some(notifications) = &self.notifications {
+            notifications.retire(terminal_id);
+        }
     }
 
     fn reserve_spawn_for_view(
@@ -820,6 +949,7 @@ impl HostState {
         session.resume_hint =
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
+        self.notification_closed.remove(&terminal_id);
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -2849,6 +2979,117 @@ mod tests {
             crate::account::login::callback_failed(&text),
             "a hibernated login must retain its callback failure"
         );
+    }
+
+    #[test]
+    fn notification_activation_prefers_the_focused_owner_and_restores_closed_window_routes() {
+        use crate::notifications::Presence;
+        let session = TerminalId::new();
+        let mut host = test_host();
+        let focused = host.register_client(1);
+        host.register_client(2);
+        host.watch_notifications(
+            1,
+            Presence {
+                window: "primary".into(),
+                sessions: vec![session],
+                focused: Some(session),
+            },
+        );
+        host.watch_notifications(
+            2,
+            Presence {
+                window: "second".into(),
+                sessions: vec![session],
+                focused: None,
+            },
+        );
+        assert_eq!(
+            host.activate_notification(session, Some("second")),
+            "primary"
+        );
+        assert!(
+            matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { session: found } if found == session)
+        );
+        drop(host.unregister_client(1));
+        drop(host.unregister_client(2));
+        assert_eq!(
+            host.activate_notification(session, Some("second")),
+            "second"
+        );
+        host.register_client(3);
+        let presence = Presence {
+            window: "second".into(),
+            sessions: vec![session],
+            focused: None,
+        };
+        assert_eq!(host.watch_notifications(3, presence.clone()), Some(session));
+        assert_eq!(host.watch_notifications(3, presence), None);
+    }
+
+    #[test]
+    fn explicit_close_fences_attention_without_discarding_completed_history() {
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "exit 0".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let id = TerminalId::new();
+        let session = TerminalSession {
+            id,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let mut host = test_host();
+        host.register_client(1);
+        host.reserve_spawn(id).unwrap();
+        host.finish_spawn(1, session.clone(), handle.clone(), false)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline, "fixture did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !host.notification_closed.contains(&id),
+            "natural completion retains attention"
+        );
+        host.close_terminal_attention(id, Some(&handle));
+        assert!(host.notification_closed.contains(&id));
+        assert!(
+            host.terminals.contains_key(&id),
+            "completed history remains readable"
+        );
+        host.retire_terminal(id);
+        assert!(
+            !host.notification_closed.contains(&id),
+            "fence storage follows record lifetime"
+        );
+        let replacement =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        host.reserve_spawn(id).unwrap();
+        host.finish_spawn(1, session, replacement.clone(), false)
+            .unwrap();
+        host.close_terminal_attention(id, Some(&handle));
+        host.close_terminal_attention(id, None);
+        assert!(
+            !host.notification_closed.contains(&id),
+            "stale closure must not fence a replacement worker"
+        );
+        replacement.shutdown().unwrap();
+        host.close_terminal_attention(id, Some(&replacement));
+        assert!(host.notification_closed.contains(&id));
     }
 
     #[test]

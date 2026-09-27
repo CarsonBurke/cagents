@@ -341,6 +341,26 @@ fn observe(host: &Weak<Mutex<HostState>>, candidate: &Candidate) -> Outcome {
             (Default::default(), Outcome::Failed)
         }
     };
+    if let Some(evidence) = observation.attention {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.shutting_down
+            && !state.notification_closed.contains(&candidate.id)
+            && state.proof() == &candidate.proof
+            && state
+                .terminals
+                .get(&candidate.id)
+                .is_some_and(|record| record.handle.same_worker(&candidate.handle))
+            && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
+            && let Some(notifications) = &state.notifications
+        {
+            notifications.record(crate::notifications::Event {
+                session: candidate.id,
+                provider: candidate.process.provider,
+                directory: candidate.process.launch.working_directory.clone(),
+                evidence,
+            });
+        }
+    }
     candidate.handle.apply_agent_activity(
         candidate.process.clone(),
         observation.activity,
