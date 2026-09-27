@@ -39,6 +39,11 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
              run TEXT PRIMARY KEY REFERENCES agent_runs(id),
              claimed_at INTEGER NOT NULL
          ) STRICT;
+         CREATE TABLE IF NOT EXISTS agent_launches (
+             agent TEXT PRIMARY KEY REFERENCES agents(id),
+             session_id TEXT NOT NULL UNIQUE,
+             source TEXT NOT NULL
+         ) STRICT;
          CREATE TABLE IF NOT EXISTS agent_authorities (
              token TEXT PRIMARY KEY,
              session_id TEXT NOT NULL UNIQUE,
@@ -51,6 +56,61 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Private launch intent commits before creating a provider. It is never
+    /// part of WorkspaceModel or an adoptable UI descriptor.
+    pub(crate) fn reserve_agent_launch(
+        &mut self,
+        id: AgentId,
+        source: &HostedSession,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let agent = read_agent(&tx, id)?;
+        if agent.closed || agent.session.is_some() {
+            return Err("Agent already has a hosted session".into());
+        }
+        require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
+        tx.execute(
+            "INSERT INTO agent_launches(agent, session_id, source) VALUES (?1, ?2, ?3)",
+            params![id.to_string(), source.id().to_string(), encode(source)?],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn pending_agent_launch(
+        &self,
+        id: AgentId,
+    ) -> Result<Option<HostedSession>, String> {
+        self.db
+            .query_row(
+                "SELECT source FROM agent_launches WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .map(|record| decode(&record))
+            .transpose()
+    }
+
+    /// Only the synchronous launch caller may clear this after proving no
+    /// child was created. Restart recovery never calls this inference.
+    pub(crate) fn clear_unspawned_agent_launch(
+        &mut self,
+        id: AgentId,
+        source: &HostedSession,
+    ) -> Result<(), String> {
+        self.db
+            .execute(
+                "DELETE FROM agent_launches WHERE agent = ?1 AND source = ?2",
+                params![id.to_string(), encode(source)?],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     /// A post-commit once-only fence, shared by interactive and scheduled
     /// dispatch. The caller performs no launch/send until this commit returns.
     /// An accepted-but-unproved run is never redispatched after a restart.
@@ -564,8 +624,26 @@ impl Registry {
         if agent.closed || agent.session.as_ref() != expected {
             return Err("The agent session changed before attachment was saved".into());
         }
+        let pending: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_launches WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(pending) = pending
+            && !decode::<HostedSession>(&pending)?.same_process(&session)
+        {
+            return Err("The provider does not match the committed launch intent".into());
+        }
         require_channel(&tx, agent.channel, &agent.spec.target.repository)?;
         agent.session = Some(session);
+        tx.execute(
+            "DELETE FROM agent_launches WHERE agent = ?1",
+            [id.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
             [],
@@ -666,7 +744,7 @@ impl Registry {
         }
         let record: Option<String> = tx
             .query_row(
-                "SELECT record FROM agents WHERE session_id = ?1 AND closed = 0",
+                "SELECT a.record FROM agents a LEFT JOIN agent_launches p ON p.agent = a.id WHERE (a.session_id = ?1 OR p.session_id = ?1) AND a.closed = 0",
                 [source.id().to_string()],
                 |row| row.get(0),
             )
@@ -675,9 +753,21 @@ impl Registry {
         let mut changed = false;
         if let Some(record) = record {
             let mut agent: Agent = decode(&record)?;
+            let pending: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM agent_launches WHERE agent = ?1",
+                    [agent.id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let pending = pending
+                .map(|record| decode::<HostedSession>(&record))
+                .transpose()?;
             if agent
                 .session
                 .as_ref()
+                .or(pending.as_ref())
                 .is_some_and(|expected| expected.same_process(source))
             {
                 let records = tx.prepare("SELECT record FROM agent_runs WHERE agent = ?1 AND state IN ('accepted', 'running', 'waiting')")
@@ -686,6 +776,9 @@ impl Registry {
                 for record in records {
                     let mut run: Run = decode(&record)?;
                     run.state = State::Cancelled;
+                    if pending.is_some() {
+                        run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
+                    }
                     run.finished_ms = Some(now_ms);
                     run.revision = run
                         .revision
@@ -695,6 +788,11 @@ impl Registry {
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
                 }
                 agent.closed = true;
+                tx.execute(
+                    "DELETE FROM agent_launches WHERE agent = ?1",
+                    [agent.id.to_string()],
+                )
+                .map_err(|e| e.to_string())?;
                 tx.execute(
                     "UPDATE agents SET closed = 1, record = ?2 WHERE id = ?1",
                     params![agent.id.to_string(), encode(&agent)?],
@@ -714,6 +812,9 @@ impl Registry {
 
     /// Called after confirmed runtime teardown, never before requesting it.
     pub(crate) fn close_agent(&mut self, origin: &Origin, id: AgentId) -> Result<Agent, String> {
+        if self.pending_agent_launch(id)?.is_some() {
+            return Err("The pending provider launch has not been conclusively retired".into());
+        }
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)

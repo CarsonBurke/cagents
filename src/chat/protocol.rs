@@ -24,6 +24,9 @@ pub enum TransportSpec {
 
 #[derive(Clone)]
 pub struct ProcessSpec {
+    /// Private spawn evidence and an optional caller-validated directory. Never
+    /// serialized into launch recipes or provider configuration.
+    pub(crate) execution: Option<std::sync::Arc<ExecutionContext>>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -46,6 +49,7 @@ impl std::fmt::Debug for ProcessSpec {
 impl From<&crate::model::LaunchRecipe> for ProcessSpec {
     fn from(recipe: &crate::model::LaunchRecipe) -> Self {
         Self {
+            execution: None,
             transport: TransportSpec::JsonLines,
             program: recipe.program.clone(),
             arguments: recipe.arguments.clone(),
@@ -53,6 +57,46 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
             environment: recipe.environment.clone(),
             unset_environment: crate::account::launch_credential_overrides(recipe),
         }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ExecutionContext {
+    pub directory: Option<std::sync::Arc<std::fs::File>>,
+    spawned: std::sync::atomic::AtomicBool,
+}
+
+impl ExecutionContext {
+    pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
+        Self {
+            directory,
+            ..Default::default()
+        }
+    }
+    /// Call synchronously as soon as a child (including a launch holder) exists,
+    /// before any asynchronous worker can create another provider process.
+    pub(crate) fn spawned(&self) {
+        self.spawned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn did_spawn(&self) -> bool {
+        self.spawned.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        let held = directory.metadata().map_err(|e| e.to_string())?;
+        let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !held.is_dir()
+            || !current.is_dir()
+            || held.dev() != current.dev()
+            || held.ino() != current.ino()
+        {
+            return Err("The approved agent directory changed before provider dispatch".into());
+        }
+        Ok(())
     }
 }
 impl ProcessSpec {

@@ -36,7 +36,8 @@ you close the window or restart the UI.
 - **Embedded browser.** An optional Servo browser pane. The browserless build
   opens links in your system browser instead.
 - **Scriptable CLI.** `cagents` controls the daemon, terminals, projects, and
-  channels with human-readable or JSON output.
+  channels with human-readable or JSON output. [Hosted agent execution](docs/agent-execution.md)
+  submits durable prompts and reads structured results without an open window.
 
 ## Install
 

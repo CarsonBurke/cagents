@@ -1031,6 +1031,7 @@ impl Worker {
                 crate::agent_execution::bundled::install(
                     crate::agent::Provider::from_program(&session.launch.program),
                     &skill_environment,
+                    &session.launch.working_directory,
                 );
                 if let Some(path) = crate::agent_execution::bundled::matched_path(
                     command.get_env("PATH").and_then(|value| value.to_str()),

@@ -63,7 +63,7 @@ pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin,
     Ok(origin)
 }
 
-fn selected_account(spec: &Spec) -> Result<Account, String> {
+pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
     let store = Store::installation().ok_or("Account registry is unavailable")?;
     let accounts = store.load().map_err(|e| e.to_string())?;
     if accounts.is_newer() {
@@ -126,6 +126,22 @@ pub(super) fn submit(
 /// commits before the worker can spawn a process or submit a provider prompt.
 /// Schedulers call this after committing their atomic firing/acceptance row.
 pub(super) fn dispatch_accepted(host: &SharedHost, accepted: Accepted) -> Result<(), String> {
+    dispatch_accepted_with_directory(host, accepted, None)
+}
+
+pub(super) fn dispatch_accepted_in_directory(
+    host: &SharedHost,
+    accepted: Accepted,
+    directory: Arc<std::fs::File>,
+) -> Result<(), String> {
+    dispatch_accepted_with_directory(host, accepted, Some(directory))
+}
+
+fn dispatch_accepted_with_directory(
+    host: &SharedHost,
+    accepted: Accepted,
+    directory: Option<Arc<std::fs::File>>,
+) -> Result<(), String> {
     let registry = registry(host)?;
     if !registry
         .lock()
@@ -139,7 +155,7 @@ pub(super) fn dispatch_accepted(host: &SharedHost, accepted: Accepted) -> Result
     std::thread::Builder::new()
         .name("agent-dispatch".into())
         .spawn(move || {
-            if let Err((state, diagnostic)) = dispatch(&host, &accepted) {
+            if let Err((state, diagnostic)) = dispatch(&host, &accepted, directory) {
                 finish_failure(&host, run, state, diagnostic);
             }
         })
@@ -152,7 +168,11 @@ pub(super) fn dispatch_accepted(host: &SharedHost, accepted: Accepted) -> Result
     Ok(())
 }
 
-fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String)> {
+fn dispatch(
+    host: &SharedHost,
+    accepted: &Accepted,
+    directory: Option<Arc<std::fs::File>>,
+) -> Result<(), (State, String)> {
     let before = |message| (State::Failed, message);
     let control = host
         .lock()
@@ -164,6 +184,10 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
     let gate = agent_gate(host, accepted.agent.id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
+    let context = Arc::new(chat::protocol::ExecutionContext::new(directory));
+    context
+        .verify_directory(&accepted.agent.spec.target.directory)
+        .map_err(before)?;
     registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -193,26 +217,66 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let session = chat::fresh_session(
+        let mut session = chat::fresh_session(
             accepted.agent.spec.provider,
             TerminalId::new(),
             accepted.agent.spec.target.directory.clone(),
             &account,
         )
         .map_err(before)?;
-        let response = super::chat::process(
-            host,
-            EXECUTION_CLIENT,
-            ClientRequest::ChatStart {
-                session,
-                source: None,
-                terminate_source: false,
-                execution_environment: Default::default(),
-            },
-        )
-        .map_err(|e| before(e.message))?;
+        // Use each provider's existing launch policy before it can receive a
+        // prompt. Post-start settings controls are unsupported by some adapters
+        // and an asynchronous acknowledgement must not race the first turn.
+        if let Some(model) = &accepted.agent.spec.model {
+            session
+                .launch
+                .recipe
+                .arguments
+                .extend(["--model".into(), model.clone()]);
+        }
+        if let Some(mode) = &accepted.agent.spec.permission_mode {
+            let flag = match accepted.agent.spec.provider {
+                crate::agent::Provider::Claude => "--permission-mode",
+                crate::agent::Provider::Omp => "--approval-mode",
+                crate::agent::Provider::Codex => "--ask-for-approval",
+            };
+            session
+                .launch
+                .recipe
+                .arguments
+                .extend([flag.into(), mode.clone()]);
+        }
+        let proof = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone();
+        session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
+        session.proof = Some(proof);
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reserve_agent_launch(accepted.agent.id, &HostedSession::Chat(session.clone()))
+            .map_err(before)?;
+        let intent = HostedSession::Chat(session.clone());
+        let response = super::chat::start_execution(host, EXECUTION_CLIENT, session, context.clone())
+            .map_err(|error| {
+                // start_execution returns only after its synchronous spawn
+                // attempt ended. A holder must mark the witness at holder-child
+                // creation, before a background task could spawn the provider.
+                if !context.did_spawn() {
+                    match registry.lock().unwrap_or_else(|p| p.into_inner())
+                        .clear_unspawned_agent_launch(accepted.agent.id, &intent) {
+                        Ok(()) => before(error.message),
+                        Err(clear) => (State::Interrupted, format!("{}; cannot clear unspawned launch intent: {clear}", error.message)),
+                    }
+                } else {
+                    (State::Interrupted, format!("Provider startup did not establish confirmed ownership: {}. The private launch intent is retained; no prompt was resent.", error.message))
+                }
+            })?;
         let ServerResponse::ChatAttached { session, .. } = response else {
-            return Err(before(
+            return Err((
+                State::Interrupted,
                 "Provider start returned an unexpected response".into(),
             ));
         };
@@ -221,27 +285,53 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
             .unwrap_or_else(|p| p.into_inner())
             .chats
             .get(&session.id)
-            .ok_or_else(|| before("The new agent closed before attachment".into()))?
+            .ok_or_else(|| {
+                (
+                    State::Interrupted,
+                    "The new agent disappeared before attachment; its launch intent is retained"
+                        .into(),
+                )
+            })?
             .handle
             .clone();
-        if let Err(error) = registry
+        let binding = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .bind_agent(
                 accepted.agent.id,
                 None,
                 HostedSession::Chat(session.clone()),
-            )
-        {
-            let _ = handle.close();
-            return Err(before(error));
+            );
+        if let Err(error) = binding {
+            // Teardown is synchronous and uses the same exact actor retirement
+            // path as UI close. A failed teardown retains the private launch
+            // identity and interrupted capacity instead of losing ownership.
+            match super::chat::process(
+                host,
+                EXECUTION_CLIENT,
+                ClientRequest::ChatClose {
+                    chat_id: session.id,
+                },
+            ) {
+                Ok(_) => {
+                    return Err(before(format!(
+                        "Cannot bind provider: {error}; provider teardown confirmed"
+                    )));
+                }
+                Err(close) => {
+                    return Err((
+                        State::Interrupted,
+                        format!(
+                            "Cannot bind provider: {error}; teardown is unconfirmed: {}",
+                            close.message
+                        ),
+                    ));
+                }
+            }
         }
         announce(host, &registry);
         (session, handle)
     };
-    if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
-        create_console(host, &registry, accepted.agent.id, &session, &handle).map_err(before)?;
-    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let snapshot = handle.snapshot(None).expect("unconditional snapshot");
@@ -249,6 +339,11 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
             return Err(before("Provider exited before accepting the prompt".into()));
         }
         if snapshot.ready {
+            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+                return Err(before(
+                    "The hosted provider is not idle; no additional prompt was submitted".into(),
+                ));
+            }
             break;
         }
         if Instant::now() >= deadline {
@@ -258,19 +353,12 @@ fn dispatch(host: &SharedHost, accepted: &Accepted) -> Result<(), (State, String
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if let Some(model) = &accepted.agent.spec.model {
-        handle
-            .command(Command::SetModel {
-                model: model.clone(),
-                reasoning: None,
-            })
-            .map_err(before)?;
+    if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
+        create_console(host, &registry, accepted.agent.id, &session, &handle).map_err(before)?;
     }
-    if let Some(mode) = &accepted.agent.spec.permission_mode {
-        handle
-            .command(Command::SetPermissionMode { mode: mode.clone() })
-            .map_err(before)?;
-    }
+    context
+        .verify_directory(&accepted.agent.spec.target.directory)
+        .map_err(before)?;
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
     handle
@@ -434,7 +522,11 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     if agent.closed {
         return Ok(agent);
     }
-    if let Some(source) = &agent.session {
+    let pending = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending_agent_launch(id)?;
+    if let Some(source) = agent.session.as_ref().or(pending.as_ref()) {
         match source {
             HostedSession::Chat(session) => {
                 let hosted = {

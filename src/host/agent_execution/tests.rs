@@ -58,6 +58,7 @@ fn install_claude(path: &Path) {
     std::fs::write(path, r#"#!/bin/sh
 set -eu
 printf 'spawn\n' >> "$HOME/../spawns"
+printf '%s\n' "$@" > "$HOME/../claude-arguments"
 n=0
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 while [ "$#" -gt 0 ]; do
@@ -146,7 +147,12 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     {
         return;
     }
-    let (host, request, path) = fixture();
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.model = Some("fixture-model".into());
+    spec.permission_mode = Some("plan".into());
     let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
     // A second connection sees the accepted durable identity independently of
     // provider progress; no child is launched inside the acceptance transaction.
@@ -166,6 +172,9 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     assert!(!retry.created);
     assert_eq!(retry.run.id, accepted.run.id);
     let root = path.parent().unwrap();
+    let arguments = std::fs::read_to_string(root.join("claude-arguments")).unwrap();
+    assert!(arguments.contains("--model\nfixture-model\n"));
+    assert!(arguments.contains("--permission-mode\nplan\n"));
     assert_eq!(
         std::fs::read_to_string(root.join("spawns")).unwrap(),
         "spawn\n"
@@ -246,6 +255,8 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
         unreachable!()
     };
     spec.provider = Provider::Codex;
+    spec.model = Some("fixture-model".into());
+    spec.permission_mode = Some("on-request".into());
     let server_root = root.clone();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -312,6 +323,8 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                     json!({"userAgent":"codex/0.157.1", "codexHome":server_root.join("home/.codex")})
                 }
                 "thread/start" => {
+                    assert_eq!(frame["params"]["model"], "fixture-model");
+                    assert_eq!(frame["params"]["approvalPolicy"], "on-request");
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),
@@ -360,4 +373,228 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
     assert_eq!(server.join().unwrap(), 1);
+}
+
+#[test]
+fn failed_post_spawn_binding_retires_exact_provider_without_losing_launch_identity() {
+    if isolated("failed_post_spawn_binding_retires_exact_provider_without_losing_launch_identity")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_binding BEFORE UPDATE OF record ON agents
+         WHEN json_extract(NEW.record, '$.session') IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'injected descriptor write failure'); END;",
+        )
+        .unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Cancelled, "{run:?}");
+    assert!(run.provider_key.is_none(), "no prompt reached the provider");
+    assert!(
+        run.result
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("no prompt was submitted")
+    );
+    let registry = registry(&host).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        host.lock().unwrap().chats.is_empty(),
+        "exact provider teardown precedes retirement"
+    );
+    assert!(!path.parent().unwrap().join("prompts").exists());
+}
+
+#[test]
+fn unavailable_console_keeps_failed_idle_provider_bound_and_explicitly_closeable() {
+    if isolated("unavailable_console_keeps_failed_idle_provider_bound_and_explicitly_closeable")
+        .is_some()
+    {
+        return;
+    }
+    // The isolated unit-test executable has no matched CLI sibling. Exercise
+    // the actual allocation failure without spawning any user installation.
+    assert!(
+        !std::env::current_exe()
+            .unwrap()
+            .with_file_name("cagents")
+            .exists()
+    );
+    let (host, mut request, path) = fixture();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.surface = Surface::Terminal;
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Failed, "{run:?}");
+    assert!(
+        run.result
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("matched cagents CLI")
+    );
+    let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+    assert!(agent.session.is_some());
+    assert!(agent.console.is_none());
+    assert!(!agent.closed);
+    let repeated = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(agent.id),
+            prompt: "A follow-up".into(),
+            idempotency_key: "second".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, repeated.run.id).state, State::Failed);
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),
+        "spawn\n",
+        "retry keeps the same actor"
+    );
+    assert!(!path.parent().unwrap().join("prompts").exists());
+    assert!(
+        close(&host, &Authority::default(), agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+}
+
+#[test]
+fn rejected_pre_spawn_launch_clears_private_intent_and_can_be_closed() {
+    if isolated("rejected_pre_spawn_launch_clears_private_intent_and_can_be_closed").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    std::fs::remove_file(path.parent().unwrap().join("bin/claude")).unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Failed, "{run:?}");
+    assert!(run.provider_key.is_none());
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(!path.parent().unwrap().join("spawns").exists());
+}
+
+#[test]
+fn replaced_scheduled_directory_refuses_dispatch_before_spawning() {
+    if isolated("replaced_scheduled_directory_refuses_dispatch_before_spawning").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let directory = path.parent().unwrap().join("project");
+    let held = Arc::new(std::fs::File::open(&directory).unwrap());
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    std::fs::rename(&directory, directory.with_file_name("original-project")).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    dispatch_accepted_in_directory(&host, accepted.clone(), held).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Failed);
+    assert!(run.result.diagnostic.unwrap().contains("directory changed"));
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .pending_agent_launch(accepted.agent.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!path.parent().unwrap().join("spawns").exists());
+    assert!(
+        close(&host, &Authority::default(), accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+}
+
+#[test]
+fn changed_target_refuses_new_work_but_keeps_interrupt_and_close_available() {
+    if isolated("changed_target_refuses_new_work_but_keeps_interrupt_and_close_available").is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let directory = path.parent().unwrap().join("project");
+    let held = Arc::new(std::fs::File::open(&directory).unwrap());
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    dispatch_accepted_in_directory(&host, accepted.clone(), held).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+    let handle = host
+        .lock()
+        .unwrap()
+        .chats
+        .get(&agent.session.as_ref().unwrap().id())
+        .unwrap()
+        .handle
+        .clone();
+    std::fs::rename(&directory, directory.with_file_name("original-project")).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let error = handle
+        .command(Command::Prompt {
+            text: "Must not run in replacement".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        })
+        .unwrap_err();
+    assert!(error.contains("directory changed"));
+    handle.command(Command::Interrupt).unwrap();
+    assert!(
+        close(&host, &Authority::default(), agent.id)
+            .unwrap()
+            .closed
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(),
+        "prompt\n"
+    );
 }
