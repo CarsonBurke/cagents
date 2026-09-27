@@ -253,6 +253,7 @@ pub(crate) struct HostState {
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
+    pub(super) native_adoption_failures: super::chat::AdoptionFailures,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
@@ -306,6 +307,7 @@ impl HostState {
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
+            native_adoption_failures: Default::default(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),

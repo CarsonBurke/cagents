@@ -226,6 +226,32 @@ exec "$CAGENTS_UPGRADE_EXE" --exact '{TEST}' --nocapture
                 crate::host::model::Registry::at(&root.join("recovery.sqlite3")).unwrap(),
             );
             let successor = Arc::new(Mutex::new(state));
+            // Startup discovery failed before the UI asked for an upgrade
+            // mapping. Preserve the precise refusal for every issued alias.
+            super::super::chat::restore_orphaned_native(&successor).unwrap();
+            for issued_source in [&source, &stale_source] {
+                let refusal = super::super::client::process_request(
+                    &successor,
+                    0,
+                    crate::terminal::ipc::ClientRequest::ResolveUpgradeChat {
+                        source: issued_source.clone(),
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    refusal.message.contains("fixture history is unavailable"),
+                    "{refusal:?}"
+                );
+            }
+            let mut unrelated = source.clone();
+            unrelated.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            let refusal = super::super::client::process_request(
+                &successor,
+                0,
+                crate::terminal::ipc::ClientRequest::ResolveUpgradeChat { source: unrelated },
+            )
+            .unwrap_err();
+            assert!(!refusal.message.contains("fixture history is unavailable"));
             let failure = super::super::client::process_request(
                 &successor,
                 0,

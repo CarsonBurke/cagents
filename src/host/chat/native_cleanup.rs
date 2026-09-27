@@ -208,6 +208,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             state.chats.remove(&source.id);
         }
         state.native_closing.remove(&source.id);
+        state.native_adoption_failures.clear(source.id);
         if let Some(notifications) = &state.notifications {
             notifications.retire(source.id);
         }
