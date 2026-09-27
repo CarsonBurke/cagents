@@ -19,6 +19,7 @@ pub struct Observer {
     receiver: async_channel::Receiver<Action>,
     listener: Option<UiActivationListener>,
     started: bool,
+    presence_wake: Option<crossbeam_channel::Sender<()>>,
 }
 
 impl Default for Observer {
@@ -39,6 +40,7 @@ impl Default for Observer {
             receiver,
             listener: None,
             started: false,
+            presence_wake: None,
         }
     }
 }
@@ -109,6 +111,42 @@ impl Observer {
         if self.started {
             return Ok(());
         }
+        if self.presence_wake.is_none() {
+            let (wake, receiver) = crossbeam_channel::bounded(1);
+            let presence = self.presence.clone();
+            let actions = self.sender.clone();
+            let stopped = self.sender.clone();
+            std::thread::Builder::new()
+                .name("ceditor-focus".into())
+                .spawn(move || {
+                    run_presence_updates(
+                        receiver,
+                        &presence,
+                        |presence| {
+                            let result = (|| {
+                                let socket = crate::terminal_ipc::daemon_socket_path()
+                                    .map_err(|e| e.to_string())?;
+                                ControlClient::connect(&socket)
+                                    .map_err(|e| e.to_string())?
+                                    .notification_presence(presence)
+                                    .map_err(|e| e.to_string())
+                            })();
+                            if let Err(error) = &result {
+                                let _ = actions.try_send(Action::Failed(error.clone()));
+                            }
+                            result.is_ok()
+                        },
+                        || stopped.is_closed(),
+                    );
+                })
+                .map_err(|error| error.to_string())?;
+            self.presence_wake = Some(wake);
+        }
+        let wake = self
+            .presence_wake
+            .as_ref()
+            .expect("created control worker")
+            .clone();
         let sender = self.sender.clone();
         let presence = self.presence.clone();
         std::thread::Builder::new()
@@ -126,6 +164,9 @@ impl Observer {
                                 presence.lock().unwrap_or_else(|p| p.into_inner()).clone(),
                             )
                             .map_err(|error| error.to_string())?;
+                        // Registration can race a focus edge on another socket.
+                        // Reapply latest presence after this watch is installed.
+                        let _ = wake.try_send(());
                         sender
                             .send_blocking(Action::Snapshot(snapshot))
                             .map_err(|error| error.to_string())?;
@@ -170,33 +211,86 @@ impl Observer {
     }
 
     pub fn focus(&self, target: Option<Target>) -> cosmic::iced::Task<Action> {
-        let presence = {
+        {
             let mut presence = self.presence.lock().unwrap_or_else(|p| p.into_inner());
             if presence.focused_target == target {
                 return cosmic::iced::Task::none();
             }
             presence.focused_target = target;
-            presence.clone()
-        };
-        if !self.started {
-            return cosmic::iced::Task::none();
         }
-        cosmic::iced::Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal_ipc::daemon_socket_path()
-                        .map_err(|error| error.to_string())?;
-                    ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?
-                        .notification_presence(presence)
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result)
-            },
-            |result| result.err().map(Action::Failed),
-        )
-        .and_then(cosmic::iced::Task::done)
+        if let Some(wake) = &self.presence_wake {
+            let _ = wake.try_send(());
+        }
+        cosmic::iced::Task::none()
+    }
+}
+
+fn run_presence_updates(
+    receiver: crossbeam_channel::Receiver<()>,
+    presence: &Mutex<Presence>,
+    mut deliver: impl FnMut(Presence) -> bool,
+    stopped: impl Fn() -> bool,
+) {
+    while receiver.recv().is_ok() {
+        loop {
+            if stopped() {
+                return;
+            }
+            // Read after the previous RPC completed, never capture a stale
+            // presence in an independently scheduled blocking task.
+            let latest = presence.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if deliver(latest) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn delayed_presence_rpc_cannot_overwrite_a_later_focus_edge() {
+        let presence = Arc::new(Mutex::new(Presence {
+            window: "first".into(),
+            ..Default::default()
+        }));
+        let (wake, receiver) = crossbeam_channel::bounded(1);
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let recorded = values.clone();
+        let current = presence.clone();
+        let worker = std::thread::spawn(move || {
+            run_presence_updates(
+                receiver,
+                &current,
+                |value| {
+                    if value.window == "first" {
+                        entered.send(()).unwrap();
+                        blocked.recv().unwrap();
+                    }
+                    recorded.lock().unwrap().push(value.window);
+                    true
+                },
+                || false,
+            )
+        });
+        wake.send(()).unwrap();
+        entry
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        presence.lock().unwrap().window = "second".into();
+        wake.try_send(()).unwrap();
+        presence.lock().unwrap().window = "latest".into();
+        assert!(
+            wake.try_send(()).is_err(),
+            "pending edge coalesces into latest presence"
+        );
+        release.send(()).unwrap();
+        drop(wake);
+        worker.join().unwrap();
+        assert_eq!(*values.lock().unwrap(), ["first", "latest"]);
     }
 }
