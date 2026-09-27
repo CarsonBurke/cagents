@@ -18,6 +18,7 @@ mod notification_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
@@ -3444,6 +3445,7 @@ pub enum Message {
     BranchUi(branch_ui::Action),
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
+    ReviewRequests(review_request_ui::Action),
     GitUi(git_ui::Action),
     NotificationUi(notification_ui::Action),
     AccountUi(account_ui::Action),
@@ -5105,10 +5107,14 @@ impl Cagents {
     /// Shows a pull request in the review pane for its project: the open
     /// pull request card for that repository in this workspace, or a new one.
     fn review_pull_request(&mut self, project: ProjectId, number: u64) -> Task<Message> {
-        let Some(target) = self.pull_request_target(project, number) else {
+        let target = self.pull_request_target(project, number);
+        let Some(repository) = self
+            .sidebar_model
+            .project(project)
+            .map(|project| project.repository.clone())
+        else {
             return Task::none();
         };
-        let repository = target.worktree.clone();
         let existing = self.durable.cards.iter().find(|card| {
             card.existence.is_open()
                 && self
@@ -5125,8 +5131,13 @@ impl Cagents {
             None => self.add_pull_requests_card(repository),
         };
         let focus = cosmic::task::message(Message::FocusCard(card));
-        let open = self.apply_pull_request_review(card, pull_request_review::Action::Open(target));
-        Task::batch([created, focus, open])
+        let source = self.ensure_pull_request_source(card);
+        let action = target.map_or(
+            pull_request_review::Action::OpenNumber(number),
+            pull_request_review::Action::Open,
+        );
+        let open = self.apply_pull_request_review(card, action);
+        Task::batch([created, focus, source, open])
     }
 
     fn browse_pull_requests(&mut self, project: ProjectId) -> Task<Message> {
@@ -10936,6 +10947,7 @@ impl Application for Cagents {
                             self.observe_git_repository(&loaded, generation),
                             self.open_pending_pull_requests(project_id),
                             self.prune_pull_request_refs(project_id),
+                            self.update_review_requests(review_request_ui::Action::Tick),
                         ]);
                         if open_cards {
                             if !self.refuse_in_deleting_worktree(&worktree) {
@@ -12791,6 +12803,7 @@ impl Application for Cagents {
             Message::AccountUi(action) => self.update_account_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
+            Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
@@ -13069,6 +13082,7 @@ impl Application for Cagents {
             self.chat_subscription(),
             self.notification_subscription(),
             self.refresh_subscription(),
+            self.review_request_subscription(),
             self.git_subscription(),
             self.account_subscription(),
             self.document_tone_subscription(),

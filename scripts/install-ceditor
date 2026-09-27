@@ -6,24 +6,47 @@ prefix=${HOME:?HOME must be set}/.local
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prefix) [ "$#" -ge 2 ] || { printf '%s\n' '--prefix requires a path' >&2; exit 2; }; shift; prefix=$1 ;;
-        --help) printf '%s\n' 'Usage: scripts/install-ceditor [--prefix PATH]' '' 'Build and install only the standalone native editor (default: ~/.local).' 'Installs its executable, desktop entry, and icon without touching cagents.'; exit 0 ;;
+        --help) printf '%s\n' 'Usage: scripts/install-ceditor [--prefix PATH]' '' 'Build and install the standalone editor with private matched alert companions (default: ~/.local).' 'Switches the private set atomically; does not replace public cagents executables.'; exit 0 ;;
         *) printf '%s\n' "Unknown option: $1" >&2; exit 2 ;;
     esac
     shift
 done
 case "$prefix" in /*) ;; *) printf '%s\n' '--prefix must be absolute' >&2; exit 2 ;; esac
+# Keep host and UI implementation graphs in separate invocations.
+cargo build --locked --release --no-default-features --bin cagents
+cargo build --locked --release --no-default-features --features host --bin cagentsd
 cargo build --locked --release --package ceditor
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
 if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
     target=$target/$CARGO_BUILD_TARGET
 fi
-install -d "$prefix/bin"
-staged=$(mktemp "$prefix/bin/.ceditor-install.XXXXXX")
-trap 'rm -f -- "$staged"' EXIT
+# current_exe resolves the public symlink into this immutable private set, so
+# daemon startup and owned consoles always find companions from the same build.
+private=$prefix/lib/ceditor
+install -d "$prefix/bin" "$private/releases"
+staged=$(mktemp -d "$private/releases/build.XXXXXX")
+link=$private/.current-$(basename "$staged")
+public=$prefix/bin/.ceditor-$(basename "$staged")
+committed=0
+cleanup() {
+    rm -f -- "$link" "$public"
+    if [ "$committed" = 0 ]; then rm -rf -- "$staged"; fi
+}
+trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-install -m755 "$target/release/ceditor" "$staged"
-mv -fT -- "$staged" "$prefix/bin/ceditor"
+install -d "$staged/bin"
+for binary in ceditor cagents cagentsd; do
+    install -m755 "$target/release/$binary" "$staged/bin/$binary"
+done
+printf '%s\n' 'ceditor companions v1' > "$staged/bin/.ceditor-companions"
+chmod 644 "$staged/bin/.ceditor-companions"
+ln -s "releases/$(basename "$staged")" "$link"
+mv -fT -- "$link" "$private/current"
+committed=1
+ln -s ../lib/ceditor/current/bin/ceditor "$public"
+mv -fT -- "$public" "$prefix/bin/ceditor"
+# Retain older sets: a running daemon or window may still own that exact build.
 install -Dm644 packaging/io.github.cagents.ceditor.desktop "$prefix/share/applications/io.github.cagents.ceditor.desktop"
 install -Dm644 packaging/io.github.cagents.ceditor.svg "$prefix/share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg"
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then

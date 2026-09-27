@@ -3,10 +3,52 @@
 //! The daemon owns delivery and the durable journal. Windows report focus and
 //! acknowledge attention; they do not each send a desktop notification.
 
+pub mod review;
+#[cfg(feature = "ui")]
+pub mod ui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::{agent::Provider, model::TerminalId};
+
+/// Durable activation and lifecycle identity. Optional source-process metadata
+/// describes focus and window ownership, not the notice's retirement authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Target {
+    Session(TerminalId),
+    PullRequest(review::ReviewRequest),
+}
+
+impl Target {
+    pub(crate) fn storage_key(&self) -> String {
+        match self {
+            Self::Session(id) => id.to_string(),
+            Self::PullRequest(request) => request.storage_key(),
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum Application {
+    #[default]
+    Cagents,
+    Ceditor,
+}
+
+/// A real shell window, distinct from the lifecycle identity being opened.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Destination {
+    pub application: Application,
+    pub window: String,
+}
+
+impl Destination {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::instance::validate_window_slot(&self.window).map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -14,6 +56,7 @@ pub enum Kind {
     Failed,
     Cancelled,
     Waiting,
+    ReviewRequested,
 }
 
 impl Kind {
@@ -23,6 +66,7 @@ impl Kind {
             Self::Failed => "Agent failed",
             Self::Cancelled => "Agent cancelled",
             Self::Waiting => "Agent needs your attention",
+            Self::ReviewRequested => "Your review was requested",
         }
     }
 }
@@ -36,10 +80,92 @@ pub struct Evidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
-    pub session: TerminalId,
-    pub provider: Provider,
-    pub directory: PathBuf,
+    pub target: Target,
+    /// Focus and preferred-window metadata only, never lifecycle authority.
+    pub source_session: Option<TerminalId>,
+    pub provider: Option<Provider>,
+    pub directory: Option<PathBuf>,
+    #[serde(default)]
+    pub destination: Option<Destination>,
     pub evidence: Evidence,
+}
+
+impl Event {
+    pub fn session(
+        session: TerminalId,
+        provider: Provider,
+        directory: PathBuf,
+        evidence: Evidence,
+    ) -> Self {
+        Self {
+            target: Target::Session(session),
+            source_session: Some(session),
+            provider: Some(provider),
+            directory: Some(directory),
+            destination: None,
+            evidence,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.evidence.key.len() > 1024
+            || self
+                .directory
+                .as_ref()
+                .is_some_and(|directory| directory.as_os_str().len() > 4096)
+        {
+            return Err("Notification metadata exceeds its size limit".into());
+        }
+        if let Some(destination) = &self.destination {
+            destination.validate()?;
+        }
+        if let Target::PullRequest(request) = &self.target {
+            request.validate()?;
+            if self.evidence.kind != Kind::ReviewRequested
+                || self.evidence.key != request.request
+                || self.source_session.is_some()
+                || self.provider.is_some()
+                || self.directory.is_some()
+                || self.destination.is_none()
+            {
+                return Err("Review alerts require exact request and application authority, without provider metadata".into());
+            }
+        } else if self.evidence.kind == Kind::ReviewRequested {
+            return Err("Review alerts require a pull-request target".into());
+        }
+        Ok(())
+    }
+
+    pub fn target(&self) -> Target {
+        self.target.clone()
+    }
+    pub fn source_session(&self) -> Option<TerminalId> {
+        self.source_session
+    }
+
+    /// Only the JSON journal accepts the old shape. Keeping wire decoding
+    /// explicit avoids untagged/self-describing serde requirements in postcard.
+    pub(crate) fn from_journal(value: &str) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Legacy {
+            session: TerminalId,
+            provider: Provider,
+            directory: PathBuf,
+            evidence: Evidence,
+        }
+        let json: serde_json::Value = serde_json::from_str(value)?;
+        if json.get("target").is_some() {
+            serde_json::from_value(json)
+        } else {
+            let old: Legacy = serde_json::from_value(json)?;
+            Ok(Self::session(
+                old.session,
+                old.provider,
+                old.directory,
+                old.evidence,
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +176,7 @@ pub struct Preferences {
     pub failure: bool,
     pub waiting: bool,
     pub while_focused: bool,
+    pub review_requests: bool,
 }
 
 impl Default for Preferences {
@@ -60,6 +187,7 @@ impl Default for Preferences {
             failure: true,
             waiting: true,
             while_focused: false,
+            review_requests: true,
         }
     }
 }
@@ -79,11 +207,49 @@ pub struct Snapshot {
     pub diagnostic: Option<String>,
 }
 
+/// Reading a target clears its existing alert on a focus edge. An opted-in
+/// fresh alert for the target already being watched remains visible.
+pub fn focused_notice_ids(
+    snapshot: &Snapshot,
+    target: Option<&Target>,
+    source_session: Option<TerminalId>,
+    focus_changed: bool,
+    while_focused: bool,
+) -> Vec<uuid::Uuid> {
+    if !focus_changed && while_focused {
+        return Vec::new();
+    }
+    snapshot
+        .notices
+        .iter()
+        .filter(|notice| {
+            !notice.acknowledged
+                && (target.is_some_and(|target| &notice.event.target == target)
+                    || source_session
+                        .is_some_and(|session| notice.event.source_session() == Some(session)))
+        })
+        .map(|notice| notice.id)
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     pub window: String,
+    #[serde(default)]
+    pub application: Application,
+    #[serde(default)]
+    pub focused_target: Option<Target>,
     pub sessions: Vec<TerminalId>,
     pub focused: Option<TerminalId>,
+}
+
+impl Presence {
+    pub fn destination(&self) -> Destination {
+        Destination {
+            application: self.application,
+            window: self.window.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,6 +259,7 @@ pub enum Field {
     Failure,
     Waiting,
     WhileFocused,
+    ReviewRequests,
 }
 
 impl Preferences {
@@ -103,6 +270,7 @@ impl Preferences {
             Field::Failure => self.failure,
             Field::Waiting => self.waiting,
             Field::WhileFocused => self.while_focused,
+            Field::ReviewRequests => self.review_requests,
         }
     }
     pub fn set(&mut self, field: Field, value: bool) {
@@ -112,14 +280,15 @@ impl Preferences {
             Field::Failure => &mut self.failure,
             Field::Waiting => &mut self.waiting,
             Field::WhileFocused => &mut self.while_focused,
+            Field::ReviewRequests => &mut self.review_requests,
         } = value;
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     Changed,
-    Activated(TerminalId),
+    Activated(Target),
 }
 
 impl Preferences {
@@ -130,15 +299,23 @@ impl Preferences {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
                 Kind::Waiting => self.waiting,
+                Kind::ReviewRequested => self.review_requests,
             }
     }
 }
 
 /// Only bounded, non-content context may cross into desktop notifications.
 pub fn context(event: &Event) -> String {
+    if let Target::PullRequest(request) = &event.target {
+        return format!(
+            "{}/{} #{}",
+            request.owner, request.repository, request.number
+        );
+    }
     let directory = event
         .directory
-        .file_name()
+        .as_ref()
+        .and_then(|directory| directory.file_name())
         .unwrap_or_default()
         .to_string_lossy();
     let directory: String = directory
@@ -146,16 +323,93 @@ pub fn context(event: &Event) -> String {
         .filter(|c| !c.is_control())
         .take(120)
         .collect();
-    if directory.is_empty() {
-        event.provider.label().to_owned()
-    } else {
-        format!("{} · {directory}", event.provider.label())
+    match (event.provider, directory.is_empty()) {
+        (Some(provider), true) => provider.label().to_owned(),
+        (Some(provider), false) => format!("{} · {directory}", provider.label()),
+        (None, _) => directory,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_session_journal_and_typed_wire_have_one_target() {
+        let session = TerminalId::new();
+        let legacy = serde_json::json!({"session":session,"provider":Provider::Claude,"directory":"/project","evidence":{"key":"turn","kind":"Succeeded"}});
+        let event = Event::from_journal(&legacy.to_string()).unwrap();
+        assert_eq!(event.target(), Target::Session(session));
+        assert_eq!(event.source_session(), Some(session));
+        let event = Event {
+            target: Target::Session(session),
+            source_session: None,
+            provider: None,
+            directory: Some("/project".into()),
+            destination: None,
+            evidence: event.evidence,
+        };
+        let bytes = postcard::to_stdvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
+        assert_eq!(
+            Event::from_journal(&serde_json::to_string(&event).unwrap()).unwrap(),
+            event
+        );
+        assert_eq!(context(&event), "project");
+    }
+
+    #[test]
+    fn typed_focus_acknowledges_only_read_requests_and_preserves_opted_in_fresh_alerts() {
+        let target = Target::PullRequest(review::ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "reader".into(),
+            request: "current".into(),
+        });
+        let id = uuid::Uuid::new_v4();
+        let snapshot = Snapshot {
+            notices: vec![Notice {
+                id,
+                event: Event {
+                    target: target.clone(),
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: Some(Destination {
+                        application: Application::Ceditor,
+                        window: "editor".into(),
+                    }),
+                    evidence: Evidence {
+                        key: "current".into(),
+                        kind: Kind::ReviewRequested,
+                    },
+                },
+                delivered: true,
+                acknowledged: false,
+                window: None,
+            }],
+            diagnostic: None,
+        };
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&target), None, true, true),
+            [id]
+        );
+        assert!(focused_notice_ids(&snapshot, Some(&target), None, false, true).is_empty());
+        assert_eq!(
+            focused_notice_ids(&snapshot, Some(&target), None, false, false),
+            [id]
+        );
+        let mut different = target.clone();
+        let Target::PullRequest(request) = &mut different else {
+            unreachable!()
+        };
+        request.request = "new-request".into();
+        assert!(focused_notice_ids(&snapshot, Some(&different), None, true, false).is_empty());
+        assert!(focused_notice_ids(&snapshot, None, None, true, false).is_empty());
+    }
 
     #[test]
     fn preferences_filter_each_outcome_and_focused_sessions() {
@@ -182,9 +436,14 @@ mod tests {
     #[test]
     fn context_is_bounded_and_does_not_include_parent_paths() {
         let event = Event {
-            session: TerminalId::new(),
-            provider: Provider::Codex,
-            directory: PathBuf::from(format!("/private/account/{}\n", "x".repeat(200))),
+            target: Target::Session(TerminalId::new()),
+            source_session: None,
+            provider: Some(Provider::Codex),
+            directory: Some(PathBuf::from(format!(
+                "/private/account/{}\n",
+                "x".repeat(200)
+            ))),
+            destination: None,
             evidence: Evidence {
                 key: "turn".into(),
                 kind: Kind::Succeeded,

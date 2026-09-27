@@ -19,7 +19,7 @@ const PRODUCT: &str = "ceditor";
 /// UI binary uses the same default.
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 
-/// Native file editor and Git diff viewer. No cagents daemon is started.
+/// Native file editor and Git diff viewer with optional shared review alerts.
 #[derive(Parser)]
 #[command(
     version,
@@ -32,6 +32,8 @@ struct Arguments {
     /// Print the independent settings file path without opening a window
     #[arg(long)]
     settings_path: bool,
+    #[arg(long, hide = true)]
+    notification_window: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -72,6 +74,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let flags = app::Flags {
+        notification_window: arguments.notification_window,
         paths: arguments.paths,
         settings_path,
     };
@@ -93,7 +96,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
             let (shell, initialize) = Shell::init((core, flags.clone()));
-            (shell, iced::Task::batch([open.discard(), initialize]))
+            (
+                shell,
+                iced::Task::batch([
+                    open.map(|_| cosmic::Action::App(app::Message::StartupWindowOpened)),
+                    initialize,
+                ]),
+            )
         },
         Shell::update,
         Shell::view,

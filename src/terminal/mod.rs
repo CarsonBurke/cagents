@@ -14,7 +14,9 @@ mod widget;
 mod worker;
 pub use ipc::TerminalSpawnOptions;
 
-pub use hosted::{HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready};
+pub use hosted::{
+    HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
+};
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
     RowSnapshot, ScrollSnapshot, Underline,

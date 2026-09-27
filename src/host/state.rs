@@ -241,7 +241,8 @@ pub(crate) struct HostState {
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
-    notification_activation: BTreeMap<String, TerminalId>,
+    notification_activation:
+        BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -383,8 +384,8 @@ impl HostState {
         &mut self,
         client: ClientId,
         presence: crate::notifications::Presence,
-    ) -> Option<TerminalId> {
-        let activation = self.notification_activation.remove(&presence.window);
+    ) -> Option<crate::notifications::Target> {
+        let activation = self.notification_activation.remove(&presence.destination());
         if let Some(notifications) = &self.notifications {
             notifications.presence(client, Some(presence.clone()));
         }
@@ -394,7 +395,7 @@ impl HostState {
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
         for (&client, current) in &mut self.notification_watchers {
-            if current.window == presence.window {
+            if current.destination() == presence.destination() {
                 *current = presence.clone();
                 if let Some(notifications) = &self.notifications {
                     notifications.presence(client, Some(presence.clone()));
@@ -416,42 +417,63 @@ impl HostState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn activate_notification(
         &mut self,
-        session: TerminalId,
+        target: crate::notifications::Target,
+        source_session: Option<TerminalId>,
         remembered_window: Option<&str>,
     ) -> String {
+        self.activate_notification_destination(target, source_session, remembered_window, None)
+            .window
+    }
+
+    pub(super) fn activate_notification_destination(
+        &mut self,
+        target: crate::notifications::Target,
+        source_session: Option<TerminalId>,
+        remembered_window: Option<&str>,
+        preferred: Option<&crate::notifications::Destination>,
+    ) -> crate::notifications::Destination {
+        use crate::notifications::{Application, Destination};
         let owner = self
             .notification_watchers
             .iter()
-            .filter(|(_, presence)| presence.sessions.contains(&session))
+            .filter(|(_, presence)| {
+                source_session.is_some_and(|session| presence.sessions.contains(&session))
+                    || preferred.is_some_and(|destination| *destination == presence.destination())
+            })
             .max_by_key(|(_, presence)| {
                 (
-                    presence.focused == Some(session),
+                    source_session.is_some_and(|session| presence.focused == Some(session)),
                     Some(presence.window.as_str()) == remembered_window,
                 )
             });
         if let Some((&client, presence)) = owner {
-            let window = presence.window.clone();
+            let destination = presence.destination();
             if let Some(delivery) = self.clients.get(&client) {
                 let _ = delivery.push(ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: None,
                     proof: self.proof().clone(),
-                    message: ServerMessage::NotificationActivated { session },
+                    message: ServerMessage::NotificationActivated { target },
                 });
             }
-            return window;
+            return destination;
         }
-        let window = remembered_window
-            .unwrap_or(crate::instance::PRIMARY_WINDOW)
-            .to_owned();
+        let destination = preferred.cloned().unwrap_or_else(|| Destination {
+            application: Application::Cagents,
+            window: remembered_window
+                .unwrap_or(crate::instance::PRIMARY_WINDOW)
+                .to_owned(),
+        });
         if self.notification_activation.len() < 32
-            || self.notification_activation.contains_key(&window)
+            || self.notification_activation.contains_key(&destination)
         {
-            self.notification_activation.insert(window.clone(), session);
+            self.notification_activation
+                .insert(destination.clone(), target);
         }
-        window
+        destination
     }
 
     /// Subscribes `client_id` to shared-model edges and returns the model.
@@ -3456,6 +3478,8 @@ mod tests {
             1,
             Presence {
                 window: "primary".into(),
+                application: Default::default(),
+                focused_target: None,
                 sessions: vec![session],
                 focused: Some(session),
             },
@@ -3464,31 +3488,94 @@ mod tests {
             2,
             Presence {
                 window: "second".into(),
+                application: Default::default(),
+                focused_target: None,
                 sessions: vec![session],
                 focused: None,
             },
         );
         assert_eq!(
-            host.activate_notification(session, Some("second")),
+            host.activate_notification(
+                crate::notifications::Target::Session(session),
+                Some(session),
+                Some("second")
+            ),
             "primary"
         );
         assert!(
-            matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { session: found } if found == session)
+            matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { target: found } if found == crate::notifications::Target::Session(session))
         );
         drop(host.unregister_client(1));
         drop(host.unregister_client(2));
         assert_eq!(
-            host.activate_notification(session, Some("second")),
+            host.activate_notification(
+                crate::notifications::Target::Session(session),
+                Some(session),
+                Some("second")
+            ),
             "second"
         );
         host.register_client(3);
         let presence = Presence {
             window: "second".into(),
+            application: Default::default(),
+            focused_target: None,
             sessions: vec![session],
             focused: None,
         };
-        assert_eq!(host.watch_notifications(3, presence.clone()), Some(session));
+        assert_eq!(
+            host.watch_notifications(3, presence.clone()),
+            Some(crate::notifications::Target::Session(session))
+        );
         assert_eq!(host.watch_notifications(3, presence), None);
+    }
+
+    #[test]
+    fn review_activation_survives_cold_editor_reconnect_without_crossing_shells() {
+        use crate::notifications::{
+            Application, Destination, Presence, Target, review::ReviewRequest,
+        };
+        let mut host = test_host();
+        let target = Target::PullRequest(ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "request".into(),
+        });
+        let destination = Destination {
+            application: Application::Ceditor,
+            window: "shared-slot".into(),
+        };
+        host.register_client(1);
+        let agents = Presence {
+            window: destination.window.clone(),
+            ..Default::default()
+        };
+        host.watch_notifications(1, agents.clone());
+        assert_eq!(
+            host.activate_notification_destination(target.clone(), None, None, Some(&destination)),
+            destination
+        );
+        assert_eq!(
+            host.watch_notifications(1, agents),
+            None,
+            "same slot in Cagents has no editor authority"
+        );
+        host.register_client(2);
+        let editor = Presence {
+            window: destination.window.clone(),
+            application: Application::Ceditor,
+            ..Default::default()
+        };
+        assert_eq!(host.watch_notifications(2, editor.clone()), Some(target));
+        assert_eq!(
+            host.watch_notifications(2, editor),
+            None,
+            "activation is consumed once"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::repository::{
 
 #[cfg(feature = "ui")]
 pub mod avatar;
+pub mod review_requests;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -1219,6 +1220,28 @@ pub trait GitHubReviewApi: Send + Sync {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<PullRequest, GitHubError>;
+
+    fn review_request_page(
+        &self,
+        _repository: &GitHubRepoKey,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<review_requests::Page, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Review request discovery is unavailable".into(),
+        ))
+    }
+
+    fn review_request_history_page(
+        &self,
+        _key: &PullRequestKey,
+        _before: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<review_requests::HistoryPage, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Review request history is unavailable".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2239,6 +2262,24 @@ impl<E: ProcessExecutor> GitHubService<E> {
 }
 
 impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
+    fn review_request_page(
+        &self,
+        repository: &GitHubRepoKey,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<review_requests::Page, GitHubError> {
+        GitHubService::review_request_page(self, repository, cursor, cancellation)
+    }
+
+    fn review_request_history_page(
+        &self,
+        key: &PullRequestKey,
+        before: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<review_requests::HistoryPage, GitHubError> {
+        GitHubService::review_request_history_page(self, key, before, cancellation)
+    }
+
     fn pull_request(
         &self,
         key: &PullRequestKey,
@@ -3061,6 +3102,54 @@ mod tests {
         let pull_requests = parse_pull_request_list(output, &repository()).unwrap();
         assert_eq!(pull_requests[0].state.0, "FUTURE_STATE");
         assert_eq!(pull_requests[0].mergeable.as_ref().unwrap().0, "FUTURE");
+    }
+
+    #[test]
+    fn review_request_reads_preserve_current_authority_and_page_history_without_review_heuristics()
+    {
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"viewer":{"id":"USER_1","login":"reader"},"repository":{"pullRequests":{"nodes":[{"number":7,"title":"Review","url":"https://github.com/owner/repo/pull/7","viewerLatestReviewRequest":{"id":"REQ_2","asCodeOwner":true,"requestedReviewer":{"__typename":"EnterpriseTeam","id":"TEAM_1"}}}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}"#),
+            success(br#"{"data":{"viewer":{"id":"USER_1","login":"reader"},"repository":{"pullRequest":{"viewerLatestReviewRequest":{"id":"REQ_2","asCodeOwner":true,"requestedReviewer":{"__typename":"EnterpriseTeam","id":"TEAM_1"}},"timelineItems":{"nodes":[{"id":"EVENT_2","createdAt":"2026-09-26T00:00:00Z","requestedReviewer":{"__typename":"EnterpriseTeam","id":"TEAM_1"}}],"pageInfo":{"hasPreviousPage":true,"startCursor":"older"}}}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", executor.clone());
+        let page = service
+            .review_request_page(&repository(), None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("next"));
+        let current = page.entries[0]
+            .viewer_latest_review_request
+            .as_ref()
+            .unwrap();
+        assert_eq!(current.id, "REQ_2");
+        assert_eq!(
+            current.requested_reviewer.as_ref().unwrap().kind,
+            "EnterpriseTeam"
+        );
+        let history = service
+            .review_request_history_page(
+                &PullRequestKey::new(repository(), 7).unwrap(),
+                Some("current-cursor"),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(history.current.as_ref(), Some(current));
+        assert_eq!(history.previous_cursor.as_deref(), Some("older"));
+        let commands = executor.commands.lock().unwrap();
+        let args = commands[1]
+            .arguments
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|args| args == ["-F", "number=7"]));
+        assert!(
+            args.iter()
+                .any(|arg| arg.as_ref() == "before=current-cursor")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("REVIEW_REQUESTED_EVENT"))
+        );
+        assert!(!args.iter().any(|arg| arg.contains("viewerLatestReview{")));
     }
 
     #[test]

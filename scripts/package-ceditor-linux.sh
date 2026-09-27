@@ -55,12 +55,18 @@ case $VERSION in
     ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe package version: $VERSION" ;;
 esac
 
-# Build the editor alone: combining workspace packages would unify host/UI features.
+# Build each implementation graph separately; never unify host/UI features.
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
+    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --no-default-features --bin cagents
+    cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
+        --target-dir "$TARGET_DIR" --no-default-features --features host --bin cagentsd
     cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release \
         --target-dir "$TARGET_DIR" --package ceditor
 fi
-[ -x "$TARGET_DIR/release/ceditor" ] || fail "missing release binary: $TARGET_DIR/release/ceditor"
+for binary in ceditor cagents cagentsd; do
+    [ -x "$TARGET_DIR/release/$binary" ] || fail "missing release binary: $TARGET_DIR/release/$binary"
+done
 
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ceditor-package.XXXXXX")
 cleanup() {
@@ -73,8 +79,16 @@ PACKAGE_ROOT=$WORK_DIR/$TOP_LEVEL
 ARCHIVE_NAME=ceditor-$VERSION-$RELEASE_TARGET.tar.gz
 install -d -m 0755 "$PACKAGE_ROOT/bin" "$PACKAGE_ROOT/share/applications" \
     "$PACKAGE_ROOT/share/icons/hicolor/scalable/apps" "$PACKAGE_ROOT/share/doc/ceditor" "$DIST_DIR"
-install -m 0755 "$TARGET_DIR/release/ceditor" "$PACKAGE_ROOT/bin/ceditor"
-strip --strip-unneeded "$PACKAGE_ROOT/bin/ceditor"
+PRIVATE=$PACKAGE_ROOT/lib/ceditor
+install -d -m 0755 "$PRIVATE/releases/$VERSION/bin"
+for binary in ceditor cagents cagentsd; do
+    install -m 0755 "$TARGET_DIR/release/$binary" "$PRIVATE/releases/$VERSION/bin/$binary"
+    strip --strip-unneeded "$PRIVATE/releases/$VERSION/bin/$binary"
+done
+printf '%s\n' 'ceditor companions v1' > "$PRIVATE/releases/$VERSION/bin/.ceditor-companions"
+chmod 644 "$PRIVATE/releases/$VERSION/bin/.ceditor-companions"
+ln -s "releases/$VERSION" "$PRIVATE/current"
+ln -s ../lib/ceditor/current/bin/ceditor "$PACKAGE_ROOT/bin/ceditor"
 install -m 0644 "$ROOT_DIR/packaging/$DESKTOP_ID.desktop" "$PACKAGE_ROOT/share/applications/$DESKTOP_ID.desktop"
 install -m 0644 "$ROOT_DIR/packaging/$DESKTOP_ID.svg" "$PACKAGE_ROOT/share/icons/hicolor/scalable/apps/$DESKTOP_ID.svg"
 install -m 0644 "$ROOT_DIR/LICENSE" "$PACKAGE_ROOT/share/doc/ceditor/LICENSE"

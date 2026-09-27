@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::state::{ClientId, HostState, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot},
+    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target},
 };
 
 const MAX_PENDING: usize = 2048;
@@ -37,8 +37,8 @@ impl Drop for Portal {
 
 #[derive(Default)]
 struct Pending {
-    events: BTreeMap<TerminalId, Event>,
-    retired: BTreeSet<TerminalId>,
+    events: BTreeMap<Target, Event>,
+    retired: BTreeSet<Target>,
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
@@ -65,20 +65,21 @@ impl Handle {
     }
 
     pub fn record(&self, event: Event) {
-        if event.evidence.key.len() > 1024 || event.directory.as_os_str().len() > 4096 {
+        if event.validate().is_err() {
             return;
         }
         self.change(|pending| {
             // Producers fence worker identity before enqueueing. A newer
             // worker may reuse this session while retirement is still queued;
             // apply that retirement first, then its new event in the broker.
-            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.session) {
-                pending.events.insert(event.session, event);
+            if pending.events.len() < MAX_PENDING || pending.events.contains_key(&event.target()) {
+                pending.events.insert(event.target(), event);
             }
         });
     }
 
     pub fn retire(&self, session: TerminalId) {
+        let session = Target::Session(session);
         self.change(|pending| {
             pending.events.remove(&session);
             if pending.retired.len() < MAX_PENDING {
@@ -131,7 +132,10 @@ pub(super) struct Broker {
 }
 
 impl Broker {
-    pub fn start(host: &SharedHost) -> std::io::Result<Self> {
+    pub fn start(
+        host: &SharedHost,
+        application: crate::notifications::Application,
+    ) -> std::io::Result<Self> {
         let (wake, receiver) = mpsc::channel(1);
         let handle = Handle(Arc::new(Shared {
             pending: Mutex::default(),
@@ -148,7 +152,7 @@ impl Broker {
                     .enable_all()
                     .build();
                 match runtime {
-                    Ok(runtime) => runtime.block_on(run(shared, host, receiver)),
+                    Ok(runtime) => runtime.block_on(run(shared, host, receiver, application)),
                     Err(error) => publish(
                         &shared,
                         &host,
@@ -238,12 +242,15 @@ fn preferences() -> Result<Preferences, String> {
     )
 }
 
-async fn connect(shared: Weak<Shared>) -> Result<Portal, String> {
+async fn connect(
+    shared: Weak<Shared>,
+    application: crate::notifications::Application,
+) -> Result<Portal, String> {
     tokio::time::timeout(PORTAL_TIMEOUT, async move {
         // A host daemon is not launched from the UI desktop file's cgroup.
         // Registration gives the portal the same application identity as UI.
         let _ = ashpd::register_host_app(
-            crate::instance::APPLICATION_ID
+            crate::instance::notification_desktop_id(application)
                 .parse()
                 .map_err(|error| format!("Invalid application identity: {error}"))?,
         )
@@ -266,6 +273,11 @@ async fn connect(shared: Weak<Shared>) -> Result<Portal, String> {
             let _ = ready.send(Ok(()));
             futures_util::pin_mut!(actions);
             while let Some(action) = actions.next().await {
+                tracing::debug!(
+                    id = action.id(),
+                    action = action.name(),
+                    "desktop notification action received"
+                );
                 let Some(shared) = shared.upgrade() else {
                     break;
                 };
@@ -374,9 +386,11 @@ mod tests {
         }));
         let session = TerminalId::new();
         let event = |key: &str| Event {
-            session,
-            provider: crate::agent::Provider::Codex,
-            directory: "/fixture".into(),
+            target: crate::notifications::Target::Session(session),
+            source_session: Some(session),
+            provider: Some(crate::agent::Provider::Codex),
+            directory: Some("/fixture".into()),
+            destination: None,
             evidence: crate::notifications::Evidence {
                 key: key.into(),
                 kind: crate::notifications::Kind::Succeeded,
@@ -387,8 +401,11 @@ mod tests {
         assert!(handle.0.pending.lock().unwrap().events.is_empty());
         handle.record(event("new"));
         let pending = handle.0.pending.lock().unwrap();
-        assert!(pending.retired.contains(&session));
-        assert_eq!(pending.events[&session].evidence.key, "new");
+        assert!(pending.retired.contains(&Target::Session(session)));
+        assert_eq!(
+            pending.events[&Target::Session(session)].evidence.key,
+            "new"
+        );
     }
 
     #[test]
@@ -425,7 +442,12 @@ mod tests {
     }
 }
 
-async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: mpsc::Receiver<()>) {
+async fn run(
+    shared: Weak<Shared>,
+    host: Weak<Mutex<HostState>>,
+    mut receiver: mpsc::Receiver<()>,
+    application: crate::notifications::Application,
+) {
     let path =
         crate::instance::project_dirs().map(|dirs| dirs.data_dir().join("agent-attention.sqlite3"));
     let mut journal = path
@@ -441,7 +463,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
     let mut proxy = None;
     // Only events observed during this daemon lifetime are eligible for retry.
     // Restored attention stays visible in the UI without announcing old backlog.
-    let mut delivery = BTreeMap::<crate::model::TerminalId, Notice>::new();
+    let mut delivery = BTreeMap::<Target, Notice>::new();
     let mut withdrawals = BTreeSet::new();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
@@ -491,7 +513,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     retry_delay = RETRY_DELAY;
                 }
                 let changed = presence.get(client).is_none_or(|old| {
-                    old.sessions != update.sessions || old.window != update.window
+                    old.sessions != update.sessions || old.destination() != update.destination()
                 });
                 let sessions = if changed {
                     update.sessions.clone()
@@ -523,7 +545,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
             if let Some(old) = snapshot
                 .notices
                 .iter()
-                .find(|notice| notice.event.session == session)
+                .find(|notice| notice.event.target() == session)
             {
                 queue_withdrawal(&mut withdrawals, old.id);
             }
@@ -545,22 +567,25 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
             if stopped(&shared) {
                 return;
             }
-            let focused = presence
-                .values()
-                .any(|window| window.focused == Some(event.session));
+            let focused = presence.values().any(|window| {
+                event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&event.target)
+            });
             let suppressed = !policy.allows(event.evidence.kind, focused);
             match journal.record(event, suppressed) {
                 Ok(Some(notice)) => {
-                    delivery.remove(&notice.event.session);
+                    delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot
                         .notices
                         .iter()
-                        .find(|old| old.event.session == notice.event.session)
+                        .find(|old| old.event.target() == notice.event.target())
                     {
                         queue_withdrawal(&mut withdrawals, old.id);
                     }
                     if !suppressed {
-                        delivery.insert(notice.event.session, notice);
+                        delivery.insert(notice.event.target(), notice);
                     }
                 }
                 Ok(None) => {}
@@ -582,16 +607,20 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
         // A delayed completion stops being a desktop alert once the user has
         // returned to that pane or disabled its category.
         delivery.retain(|_, notice| {
-            let focused = presence
-                .values()
-                .any(|window| window.focused == Some(notice.event.session));
+            let focused = presence.values().any(|window| {
+                notice
+                    .event
+                    .source_session()
+                    .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&notice.event.target)
+            });
             policy.allows(notice.event.evidence.kind, focused)
         });
         if (!delivery.is_empty() || !withdrawals.is_empty() || pending.test)
             && proxy.is_none()
             && Instant::now() >= next_attempt
         {
-            match connect(shared.clone()).await {
+            match connect(shared.clone(), application).await {
                 Ok(connected) => {
                     proxy = Some(connected);
                     snapshot.diagnostic = None;
@@ -615,7 +644,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                 }
                 match send(&backend.proxy, &notice).await {
                     Ok(()) => {
-                        delivery.remove(&notice.event.session);
+                        delivery.remove(&notice.event.target());
                         if let Err(error) = journal.delivered(notice.id) {
                             snapshot.diagnostic = Some(error);
                         }
@@ -689,22 +718,29 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     let window = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .activate_notification(notice.event.session, notice.window.as_deref());
+                        .activate_notification_destination(
+                            notice.event.target(),
+                            notice.event.source_session(),
+                            notice.window.as_deref(),
+                            notice.event.destination.as_ref(),
+                        );
                     // Activation and the matched executable handshake can wait;
                     // they never run under the daemon's session lock.
-                    match crate::instance::activate_window_with_token(&window, token.as_deref()) {
+                    match crate::instance::activate_destination(&window, token.as_deref()) {
                         Ok(true) => {}
                         Ok(false) => {
-                            if let Err(error) = crate::instance::launch_notification_window(
+                            if let Err(error) = crate::instance::launch_notification_destination(
                                 &window,
                                 token.as_deref(),
                             ) {
+                                tracing::warn!(%error, "could not launch notification destination");
                                 snapshot.diagnostic = Some(format!(
                                     "Could not open the notification's window: {error}"
                                 ));
                             }
                         }
                         Err(error) => {
+                            tracing::warn!(%error, "could not activate notification destination");
                             snapshot.diagnostic = Some(format!(
                                 "Could not activate the notification's window: {error}"
                             ))

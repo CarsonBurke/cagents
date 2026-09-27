@@ -42,9 +42,11 @@ use std::{
 };
 
 mod checkout;
+mod notification_ui;
 
 #[derive(Clone)]
 pub struct Flags {
+    pub notification_window: Option<String>,
     pub paths: Vec<PathBuf>,
     pub settings_path: PathBuf,
 }
@@ -149,6 +151,9 @@ pub enum Message {
     Sidebar(SidebarAction),
     /// One step of a tab's pull request review; see [`Tab::review`].
     PullRequestReview(CardId, pull_request_review::Action),
+    ReviewRequests(pull_request_review::request_ui::monitor::Action),
+    Notification(notification_ui::Action),
+    StartupWindowOpened,
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
     Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
@@ -446,6 +451,8 @@ impl Editor {
 pub struct Editor {
     core: Core,
     tabs: Vec<Tab>,
+    review_requests: pull_request_review::request_ui::monitor::Monitor,
+    notifications: notification_ui::State,
     active: Option<CardId>,
     selection_epoch: u64,
     settings: AppSettings,
@@ -2948,6 +2955,8 @@ impl Application for Editor {
         let mut app = Self {
             core,
             tabs: Vec::new(),
+            review_requests: Default::default(),
+            notifications: Default::default(),
             active: None,
             selection_epoch: 0,
             settings,
@@ -2997,7 +3006,23 @@ impl Application for Editor {
             preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
             preference_generation: 0,
         };
+        match cagents::notifications::ui::Observer::bind_editor(flags.notification_window.clone()) {
+            Ok(mut observer) => {
+                if flags.notification_window.is_some()
+                    && let Err(error) = observer.start()
+                {
+                    app.notice = Some(error);
+                }
+                app.notifications.observer = observer;
+            }
+            Err(error) => app.notice = Some(format!("Review activation unavailable: {error}")),
+        }
         let mut tasks = vec![
+            app.notifications
+                .observer
+                .next()
+                .map(|action| Message::Notification(notification_ui::Action::Observed(action)))
+                .map(cosmic::Action::App),
             app.appearance(),
             app.lsp_next(),
             app.load_checkout_journal(),
@@ -3134,6 +3159,16 @@ impl Application for Editor {
                 return Task::none();
             }
             match message {
+                Message::Notification(action) => self.notification_action(action),
+                Message::StartupWindowOpened => {
+                    let ready = if self.notifications.observer.is_bound() {
+                        Ok(())
+                    } else {
+                        Err("the editor activation listener could not be opened".to_owned())
+                    };
+                    let _ = cagents::instance::report_ui_startup(&ready);
+                    Task::none()
+                }
                 Message::Checkout(action) => self.checkout_action(action),
                 Message::WindowResized(size) => {
                     self.window_size = size;
@@ -3146,7 +3181,7 @@ impl Application for Editor {
                             self.tab_history.finish(self.active);
                         }
                     }
-                    Task::none()
+                    self.notification_focus()
                 }
                 Message::RefreshVisible => {
                     // A colour-only theme change reaches the hook but not the
@@ -3846,6 +3881,26 @@ impl Application for Editor {
                     task
                 }
                 Message::PullRequestReview(id, action) => self.handle_review(id, action),
+                Message::ReviewRequests(action) => {
+                    let repositories = self
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| tab.review.review_request_repository().cloned())
+                        .collect::<Vec<_>>();
+                    let task = self
+                        .review_requests
+                        .update(action, repositories)
+                        .map(Message::ReviewRequests)
+                        .map(cosmic::Action::App);
+                    let report = self.report_review_requests();
+                    for tab in &mut self.tabs {
+                        tab.review.clear_external_review_requests();
+                        for (repository, snapshot) in self.review_requests.snapshots() {
+                            tab.review.apply_review_requests(repository, snapshot);
+                        }
+                    }
+                    Task::batch([task, report])
+                }
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
                         if !tab.snapshot_loading {
@@ -4402,6 +4457,8 @@ impl Application for Editor {
             self.can_refresh_visible() && (previous_tabs.0 != self.active || !was_refresh_visible);
         Task::batch([
             task,
+            self.notification_focus(),
+            self.open_requested_review(),
             if tabs_changed {
                 self.reveal_active_tab()
             } else {
@@ -4446,7 +4503,24 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        Subscription::batch([events, refresh, frames, self.document_tone_subscription()])
+        let review_requests = if self
+            .tabs
+            .iter()
+            .any(|tab| tab.review.review_request_repository().is_some())
+        {
+            iced::time::every(Duration::from_secs(10)).map(|_| {
+                Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::Tick)
+            })
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([
+            events,
+            refresh,
+            frames,
+            review_requests,
+            self.document_tone_subscription(),
+        ])
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
@@ -5800,6 +5874,8 @@ mod tests {
         Editor {
             core: Core::default(),
             tabs: Vec::new(),
+            review_requests: Default::default(),
+            notifications: Default::default(),
             active: None,
             selection_epoch: 0,
             settings: AppSettings::default(),
@@ -6712,6 +6788,67 @@ mod tests {
             true,
         ));
         app.active.unwrap()
+    }
+
+    #[test]
+    fn review_alert_waits_for_its_repository_and_ignores_superseded_verification() {
+        use cagents::notifications::{Target, review::ReviewRequest, ui::Action as Observed};
+        use notification_ui::Action;
+        let mut app = editor();
+        let request = ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "o".into(),
+            repository: "r".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "first".into(),
+        };
+        drop(
+            app.notification_action(Action::Observed(Observed::Activated(Target::PullRequest(
+                request.clone(),
+            )))),
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Open this review's repository")
+        );
+        let other = add(&mut app, "/other", None);
+        let wanted = add(&mut app, "/wanted", None);
+        drop(app.tab_mut(wanted).unwrap().review.set_source(Some(
+            pull_request_review::ReviewSource {
+                repository: request.repository_key(),
+                worktree: "/wanted".into(),
+            },
+        )));
+        drop(app.select_tab(other));
+        let newer = ReviewRequest {
+            request: "second".into(),
+            ..request.clone()
+        };
+        drop(
+            app.notification_action(Action::Observed(Observed::Activated(Target::PullRequest(
+                newer.clone(),
+            )))),
+        );
+        drop(app.notification_action(Action::Verified {
+            request,
+            result: Ok(()),
+        }));
+        assert_eq!(
+            app.active,
+            Some(other),
+            "older async verification cannot open an obsolete request"
+        );
+        drop(app.notification_action(Action::Verified {
+            request: newer,
+            result: Ok(()),
+        }));
+        assert_eq!(app.active, Some(wanted));
+        assert!(app.sidebar_open);
+        assert_eq!(app.sidebar_panel, WorktreePanel::PullRequests);
     }
 
     /// Alt+Down and its siblings are ordinary editing chords elsewhere, so

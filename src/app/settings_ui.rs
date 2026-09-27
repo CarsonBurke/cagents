@@ -198,6 +198,11 @@ fn settings_category_controls<'a>(
                     "Notify when an agent needs input or approval.",
                 ),
                 (
+                    Field::ReviewRequests,
+                    "Review requests",
+                    "Notify when GitHub requests your review, including requests discovered beyond the first page.",
+                ),
+                (
                     Field::WhileFocused,
                     "Notify while focused",
                     "Also notify while you are watching that agent. Off by default.",
