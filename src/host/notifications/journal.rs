@@ -73,7 +73,7 @@ impl Journal {
             .optional()
             .map_err(|error| error.to_string())?;
         if let Some(window) = &window {
-            transaction.execute("INSERT INTO owners(session,window,ordinal) VALUES (?1,?2,?3) ON CONFLICT(session) DO UPDATE SET window=excluded.window,ordinal=excluded.ordinal", params![session, window, ordinal]).map_err(|error| error.to_string())?;
+            transaction.execute("INSERT INTO owners(session,window,ordinal) VALUES (?1,?2,(SELECT coalesce(max(ordinal),0)+1 FROM owners)) ON CONFLICT(session) DO UPDATE SET window=excluded.window,ordinal=excluded.ordinal", params![session, window]).map_err(|error| error.to_string())?;
         }
         let notice = Notice {
             id: Uuid::new_v4(),
@@ -256,6 +256,19 @@ mod tests {
         drop(journal);
         let journal = Journal::open(&path).unwrap();
         assert_eq!(journal.list().unwrap(), vec![notice]);
+    }
+
+    #[test]
+    fn new_run_owner_uses_owner_recency_even_when_attention_is_infrequent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        journal.remember_window([session], "chosen").unwrap();
+        let mut run = event(session, "first-attention");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        journal.record(run, false).unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
     }
 
     #[test]

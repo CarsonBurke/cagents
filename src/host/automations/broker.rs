@@ -61,6 +61,9 @@ struct Inner {
     // One lazy startup census catches receipts left after a committed result
     // followed by daemon loss. Each wake visits at most 32 owned directories.
     cleanup: Mutex<Option<std::fs::ReadDir>>,
+    // The journal is bounded. Polling must not resurrect a blocked run after
+    // newer unrelated events evict its durable replay identity.
+    attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
 }
 
 #[derive(Clone)]
@@ -74,13 +77,16 @@ pub(in crate::host) struct Broker {
 impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
         let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
+        let registry = agent_execution::registry(host)?;
+        let attention = initial_attention(&registry.lock().unwrap_or_else(|p| p.into_inner()))?;
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
-            registry: agent_execution::registry(host)?,
+            registry,
             root,
             wake: Wake::default(),
             workers: Mutex::new(BTreeMap::new()),
             cleanup: Mutex::new(Some(cleanup)),
+            attention: Mutex::new(attention),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -324,6 +330,13 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
+        let runs: std::collections::BTreeSet<_> =
+            active.iter().filter_map(|firing| firing.run).collect();
+        self.0
+            .attention
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|run, _| runs.contains(run));
         let mut checking = false;
         let candidates = self
             .0
@@ -382,9 +395,12 @@ impl Handle {
                     .unwrap_or_else(|p| p.into_inner())
                     .automation_run_detail(firing.id)?;
                 if let Some(event) = run_attention(&detail) {
-                    if let Some(notifications) =
-                        &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+                    let mut attention = self.0.attention.lock().unwrap_or_else(|p| p.into_inner());
+                    if attention.get(&run) != Some(&event.evidence)
+                        && let Some(notifications) =
+                            &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
                     {
+                        attention.insert(run, event.evidence.clone());
                         notifications.record(event);
                     }
                 }
@@ -646,6 +662,22 @@ impl Handle {
     }
 }
 
+fn initial_attention(
+    registry: &crate::host::model::Registry,
+) -> Result<BTreeMap<crate::model::RunId, crate::notifications::Evidence>, String> {
+    let mut attention = BTreeMap::new();
+    // Existing terminal/waiting states are history, even if cleanup remains
+    // blocked. Startup cannot reannounce them after journal eviction.
+    for firing in registry.active_automation_firings()? {
+        if let Some(run) = firing.run
+            && let Some(event) = run_attention(&registry.automation_run_detail(firing.id)?)
+        {
+            attention.insert(run, event.evidence);
+        }
+    }
+    Ok(attention)
+}
+
 fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifications::Event> {
     use crate::{
         agent_execution::{HostedSession, Origin, State},
@@ -676,8 +708,123 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
         provider: Some(agent.spec.provider),
         directory: agent.spec.target.directory.clone(),
         evidence: Evidence {
-            key: run.id.to_string(),
+            key: if kind == Kind::Waiting {
+                format!("{}:waiting:{}", run.id, run.revision)
+            } else {
+                run.id.to_string()
+            },
             kind,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automation_attention_baselines_history_but_distinguishes_new_waiting_edges() {
+        use crate::{
+            agent_execution::{State, Update},
+            automations::DirectoryIdentity,
+            host::model::Registry,
+            model::ProjectKind,
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: "/fixture".into(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Fixture", "prompt":"Fixture prompt",
+            "agent":{"provider":"Claude","account":null,"target":{"repository":"/fixture","directory":"/fixture","channel":null},"surface":"Chat","model":null,"permission_mode":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        })).unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let accepted = claim.accepted.unwrap();
+        assert!(run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).is_none());
+        let run = registry
+            .update_agent_run(
+                accepted.run.id,
+                1,
+                Update::Started {
+                    provider_key: "turn".into(),
+                },
+                300,
+            )
+            .unwrap();
+        let run = registry
+            .update_agent_run(run.id, run.revision, Update::Waiting, 400)
+            .unwrap();
+        let first =
+            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
+        assert_eq!(
+            initial_attention(&registry).unwrap()[&run.id],
+            first.evidence
+        );
+        let run = registry
+            .update_agent_run(run.id, run.revision, Update::Resumed, 500)
+            .unwrap();
+        let run = registry
+            .update_agent_run(run.id, run.revision, Update::Waiting, 600)
+            .unwrap();
+        let second =
+            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
+        assert_ne!(first.evidence.key, second.evidence.key);
+        assert_eq!(first.target(), second.target());
+        registry
+            .update_agent_run(
+                run.id,
+                run.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: Default::default(),
+                },
+                700,
+            )
+            .unwrap();
+        let finished =
+            run_attention(&registry.automation_run_detail(claim.firing.id).unwrap()).unwrap();
+        assert_eq!(
+            finished.evidence.kind,
+            crate::notifications::Kind::Succeeded
+        );
+        assert_eq!(
+            finished.source_session(),
+            None,
+            "pre-attachment evidence needs no fabricated session"
+        );
+        assert_eq!(
+            initial_attention(&registry).unwrap()[&run.id],
+            finished.evidence
+        );
+    }
 }
