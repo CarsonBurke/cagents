@@ -418,9 +418,8 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     }
     // A newly opened UI may already be current while an older daemon still
     // owns the sessions. Its own CLI must perform the preview and checkpoint.
-    if let Some(owner) = installed_daemon_owner(&layout)? {
-        installation.version = owner.version;
-    }
+    installation.version =
+        installation_worker_version(&layout, &served, installed_daemon_owner(&layout)?.as_ref());
     if served
         == installation
             .prefix
@@ -439,6 +438,21 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
         &version,
         &UpdateRequest::Installed { root: served },
     )
+}
+
+fn installation_worker_version(
+    window: &InstallLayout,
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+) -> String {
+    // Once the candidate already owns the daemon, the old window's worker
+    // must perform the remaining UI-only replacement. A current worker would
+    // correctly reject replacing its own installation with itself.
+    daemon
+        .filter(|owner| owner.version_root != served)
+        .unwrap_or(window)
+        .version
+        .clone()
 }
 
 fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout>, UpdateError> {
@@ -1416,6 +1430,39 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_update_selects_the_worker_for_both_directions_of_version_skew() {
+        let layout = |version: &str| InstallLayout {
+            prefix: "/owned/install".into(),
+            version_root: PathBuf::from("/owned/install/versions").join(version),
+            version: version.into(),
+        };
+        let old = layout("old");
+        let new = layout("new");
+        // A newer UI cannot speak the old service's protocol.
+        assert_eq!(
+            installation_worker_version(&new, &new.version_root, Some(&old)),
+            "old"
+        );
+        // Once that service is already new, the old UI still needs replacement:
+        // selecting the new worker would reject its candidate as itself.
+        assert_eq!(
+            installation_worker_version(&old, &new.version_root, Some(&new)),
+            "old"
+        );
+        // Repeated staging must use the actual owner, not the window or current.
+        let staged = layout("third");
+        assert_eq!(
+            installation_worker_version(&old, &staged.version_root, Some(&new)),
+            "new"
+        );
+        // Without a service, the old window's worker can start the candidate.
+        assert_eq!(
+            installation_worker_version(&old, &new.version_root, None),
+            "old"
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn release(version: &str) -> GitHubRelease {
