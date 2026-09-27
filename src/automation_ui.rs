@@ -342,7 +342,12 @@ pub struct State {
 
 impl State {
     pub fn can_open_run(&self) -> bool {
-        self.pending.is_none() && self.draft.is_none() && self.confirmation.is_none()
+        self.draft.is_none()
+            && self.confirmation.is_none()
+            && !matches!(
+                self.pending,
+                Some((_, Pending::Save | Pending::Mutate | Pending::OpenRun))
+            )
     }
     pub fn set_choices(&mut self, targets: Vec<TargetChoice>, accounts: Vec<AccountChoice>) {
         self.targets = targets;
@@ -447,6 +452,20 @@ impl State {
                 }
             }
             return None;
+        }
+        if let Action::InspectRun(run) = action {
+            if !self.can_open_run() {
+                return None;
+            }
+            // Notification activation can race a restored card's initial list
+            // read. Supersede reads using the request sequence; never discard
+            // a user's draft, consent, or an in-flight mutation.
+            self.selected = None;
+            self.all_history = false;
+            self.run = None;
+            self.history.clear();
+            self.history_next = None;
+            return self.request(Pending::Run, Request::ShowRun { run });
         }
         if self.pending.is_some() {
             return None;
@@ -728,14 +747,6 @@ impl State {
                 }
             }
             Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
-            Action::InspectRun(run) => {
-                self.selected = None;
-                self.all_history = false;
-                self.run = None;
-                self.history.clear();
-                self.history_next = None;
-                return self.request(Pending::Run, Request::ShowRun { run });
-            }
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(
@@ -1255,6 +1266,53 @@ mod tests {
             channel: None,
             blocked: None,
         }
+    }
+
+    #[test]
+    fn run_activation_supersedes_startup_reads_and_ignores_their_late_replies() {
+        let mut state = State::default();
+        let Some(Effect::Request { sequence: old, .. }) = state.update(Action::Refresh) else {
+            panic!("startup list request expected");
+        };
+        assert!(state.can_open_run());
+        let run = crate::model::RunId::new();
+        let Some(Effect::Request { sequence, request }) = state.update(Action::InspectRun(run))
+        else {
+            panic!("exact notification run request expected");
+        };
+        assert!(matches!(request, Request::ShowRun { run: requested } if requested == run));
+        assert_ne!(sequence, old);
+        state.update(Action::Received {
+            sequence: old,
+            result: std::sync::Arc::new(Ok(Response::Listed(Vec::new()))),
+        });
+        assert!(matches!(state.pending, Some((current, Pending::Run)) if current == sequence));
+    }
+
+    #[test]
+    fn run_activation_does_not_discard_edits_consent_or_mutations() {
+        let run = crate::model::RunId::new();
+        for pending in [Pending::Save, Pending::Mutate, Pending::OpenRun] {
+            let mut state = State {
+                pending: Some((1, pending)),
+                ..State::default()
+            };
+            assert!(!state.can_open_run());
+            assert!(state.update(Action::InspectRun(run)).is_none());
+            assert!(state.pending.is_some());
+        }
+        let mut state = State {
+            selected: Some(automation()),
+            ..State::default()
+        };
+        state.update(Action::Enable);
+        assert!(!state.can_open_run());
+        assert!(state.update(Action::InspectRun(run)).is_none());
+        assert!(state.confirmation.is_some());
+        state.update(Action::Edit);
+        assert!(!state.can_open_run());
+        assert!(state.update(Action::InspectRun(run)).is_none());
+        assert!(state.draft.is_some());
     }
 
     #[test]
