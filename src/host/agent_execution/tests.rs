@@ -88,6 +88,110 @@ done
 }
 
 #[test]
+fn omp_service_waits_for_correlated_result_and_reuses_one_provider() {
+    if isolated("omp_service_waits_for_correlated_result_and_reuses_one_provider").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    let program = root.join("bin/omp");
+    std::fs::write(&program, r#"#!/bin/sh
+set -eu
+printf 'spawn\n' >> "$HOME/../omp-spawns"
+printf '%s\n' "$@" > "$HOME/../omp-arguments"
+printf '{"type":"ready"}\n'
+n=0
+while IFS= read -r frame; do
+  id=${frame#*'"id":"'}; id=${id%%'"'*}
+  kind=${frame#*'"type":"'}; kind=${kind%%'"'*}
+  data='{}'
+  case "$kind" in
+    negotiate_protocol) ;;
+    get_state) data='{"sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","isStreaming":false}' ;;
+    get_available_models) data='{"models":[]}' ;;
+    get_available_commands) data='{"commands":[]}' ;;
+    get_messages_page) data='{"messages":[],"nextCursor":null}' ;;
+    get_session_stats) data='{"tokens":{"input":7,"output":3},"cost":0.0001}' ;;
+    prompt)
+      n=$((n + 1))
+      printf 'prompt\n' >> "$HOME/../omp-prompts"
+      printf '{"type":"agent_start"}\n'
+      printf '{"type":"message_end","message":{"id":"message-%s","role":"assistant","content":[{"type":"text","text":"OMP_RESULT_%s"}],"stopReason":"stop","timestamp":%s}}\n' "$n" "$n" "$n"
+      printf '{"type":"agent_end","isTerminal":false}\n'
+      printf '{"type":"agent_end","isTerminal":true}\n'
+      printf 'settled\n' > "$HOME/../omp-before-result"
+      while [ ! -e "$HOME/../omp-release-result" ]; do /bin/sleep 0.01; done
+      printf '{"type":"prompt_result","id":"%s","status":"completed","agentInvoked":true}\n' "$id"
+      printf '{"type":"agent_end","isTerminal":true}\n'
+      ;;
+    abort) ;;
+    *) exit 17 ;;
+  esac
+  printf '{"type":"response","id":"%s","command":"%s","success":true,"data":%s}\n' "$id" "$kind" "$data"
+done
+"#).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Omp;
+    spec.model = Some("fixture/model".into());
+    spec.permission_mode = Some("write".into());
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("omp-before-result").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "OMP did not settle its first turn: {:?}",
+            registry(&host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .agent_run(accepted.run.id)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let before = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent_run(accepted.run.id)
+        .unwrap();
+    assert!(
+        !before.state.is_terminal(),
+        "agent_end is not correlated prompt completion"
+    );
+    std::fs::write(root.join("omp-release-result"), b"release").unwrap();
+    let done = settled(&host, accepted.run.id);
+    assert_eq!(done.state, State::Succeeded, "{done:?}");
+    assert_eq!(done.result.text, "OMP_RESULT_1");
+    assert_eq!(done.result.usage.input_tokens, 7);
+    assert_eq!(done.result.usage.output_tokens, 3);
+    let followup = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "follow-up".into(),
+            idempotency_key: "omp-followup".into(),
+        },
+    )
+    .unwrap();
+    let second = settled(&host, followup.run.id);
+    assert_eq!(second.state, State::Succeeded);
+    assert_eq!(second.result.text, "OMP_RESULT_2");
+    assert_ne!(second.provider_key, done.provider_key);
+    assert_eq!(
+        std::fs::read_to_string(root.join("omp-spawns")).unwrap(),
+        "spawn\n"
+    );
+    let arguments = std::fs::read_to_string(root.join("omp-arguments")).unwrap();
+    assert!(arguments.contains("--model\nfixture/model\n"));
+    assert!(arguments.contains("--approval-mode\nwrite\n"));
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
 fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     if isolated("automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement").is_some()
     {

@@ -77,6 +77,12 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
     }
     let homes = Homes::installation();
     match &spec.account {
+        // OMP manages its own logins and therefore has no system row in the
+        // Accounts UI. Its normal launch is still a concrete system selection,
+        // including after acceptance has frozen that choice into the spec.
+        Some(id) if *id == Account::system(spec.provider).id() => {
+            Ok(Account::system(spec.provider))
+        }
         Some(id) => accounts
             .accounts(homes.as_ref())
             .into_iter()
