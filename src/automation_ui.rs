@@ -1161,6 +1161,7 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
     let mut button = widget::button::custom(widget::text::body(label.clone()))
         .name(label)
         .padding(12)
+        .class(crate::sidebar::sidebar_button_style(false))
         .height(Length::Shrink);
     if enabled {
         button = button.on_press(action);
