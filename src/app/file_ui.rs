@@ -98,7 +98,12 @@ impl Cagents {
         // Prefer the exact file, even when dirty. Only dedicated, clean file
         // panes are candidates for replacement; repository browsing is separate.
         let candidates = self.workspace.order().filter_map(|card| {
-            if self.workspace.visibility(card) != Some(VisibilityClass::Visible) {
+            // A newly focused editor may still be entering the viewport. Its
+            // reveal animation must not turn a rapid second link into another
+            // pane; unrelated offscreen panes remain ineligible.
+            if self.workspace.focused() != Some(card)
+                && self.workspace.visibility(card) != Some(VisibilityClass::Visible)
+            {
                 return None;
             }
             let owner = self
@@ -311,6 +316,11 @@ mod tests {
         assert!(runtime(&app, editor).is_directory_only());
         assert_eq!(app.durable.card_scopes.get(&editor), Some(&scope));
         assert_eq!(app.card_state(editor).unwrap().width_fraction, 1.0 / 3.0);
+        assert_ne!(
+            app.workspace.visibility(editor),
+            Some(VisibilityClass::Visible),
+            "exercise reuse before the focused editor's reveal animation finishes"
+        );
 
         let task = app.update(Message::OpenDocumentLink(
             terminal,

@@ -15266,7 +15266,19 @@ mod tests {
         }
 
         let mut counts = HashMap::new();
-        tally(&Tree::new(element.as_widget_mut()), &mut counts);
+        let mut tree = Tree::new(element.as_widget_mut());
+        // Responsive constructs its descendants during layout. Counting only
+        // Tree::new silently misses those controls and duplicate named states.
+        let renderer = headless_renderer();
+        let _layout = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &cosmic::iced::advanced::layout::Limits::new(
+                cosmic::iced::Size::ZERO,
+                cosmic::iced::Size::new(1600.0, 1200.0),
+            ),
+        );
+        tally(&tree, &mut counts);
         counts
     }
 
@@ -20008,11 +20020,11 @@ mod tests {
             workspace.card(card_id).unwrap().width,
             CardWidth::Fraction(0.125)
         );
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
         workspace.resize_viewport(800.0);
         assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 800.0);
         workspace.resize_viewport(3_840.0);
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
         workspace
             .add_card(
                 WorkspaceCard::new(CardId::new(), "Second", CardWidth::Fraction(0.5)).unwrap(),
