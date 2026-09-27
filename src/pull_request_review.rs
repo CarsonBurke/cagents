@@ -1216,7 +1216,16 @@ impl State {
             )
             .into(),
         ]);
-        widget::column::with_children(vec![controls.into(), list])
+        let viewed = self.files.iter().filter(|file| file.viewed).count();
+        let toolbar = widget::row::with_children(vec![
+            design::caption(format!("{viewed}/{} viewed", self.files.len()))
+                .width(Length::Fill)
+                .into(),
+            controls,
+        ])
+        .align_y(Alignment::Center)
+        .padding([0, spacing.space_xs]);
+        widget::column::with_children(vec![toolbar.into(), list])
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
