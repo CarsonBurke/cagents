@@ -29,7 +29,10 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+#[cfg(feature = "ui")]
+mod review_cache;
+
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -359,6 +362,8 @@ pub struct StateStore {
     path: PathBuf,
     boot_id: BootId,
     recovery: RecoveryReport,
+    #[cfg(feature = "ui")]
+    review_cache_epoch: String,
 }
 
 impl StateStore {
@@ -449,6 +454,8 @@ impl StateStore {
             path: path.to_path_buf(),
             boot_id,
             recovery,
+            #[cfg(feature = "ui")]
+            review_cache_epoch: crate::pull_request_review::cache::write_epoch().to_owned(),
         })
     }
 
@@ -1958,6 +1965,34 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         if current < 8 {
             transaction.execute_batch(
                 "ALTER TABLE terminal_recipes ADD COLUMN owned_codex_listener TEXT;",
+            )?;
+        }
+        if current < 9 {
+            transaction.execute_batch(
+                "CREATE TABLE review_cache (
+                    repository TEXT NOT NULL,
+                    number INTEGER NOT NULL CHECK(number > 0),
+                    head TEXT NOT NULL,
+                    viewer TEXT NOT NULL,
+                    record TEXT NOT NULL,
+                    saved_ms INTEGER NOT NULL,
+                    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+                    write_epoch TEXT NOT NULL,
+                    write_order INTEGER NOT NULL,
+                    PRIMARY KEY(repository, number)
+                 ) STRICT;
+                 CREATE TABLE review_cache_files (
+                    repository TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    head TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    entry TEXT NOT NULL,
+                    viewed INTEGER NOT NULL CHECK(viewed IN (0, 1)),
+                    unverified INTEGER NOT NULL CHECK(unverified IN (0, 1)),
+                    PRIMARY KEY(repository, number, head, path),
+                    FOREIGN KEY(repository, number) REFERENCES review_cache(repository, number) ON DELETE CASCADE
+                 ) STRICT;",
             )?;
         }
         let violation = transaction
