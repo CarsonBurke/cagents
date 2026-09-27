@@ -16180,11 +16180,11 @@ mod tests {
     }
 
     fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
-        let mut fresh = frame(app);
-        assert_tree_is_faithful(
-            tree,
-            &cosmic::iced::advanced::widget::Tree::new(fresh.as_widget_mut()),
-        );
+        // Responsive widgets construct their children during layout. Compare
+        // two presented frames so their complete widget trees are available.
+        let mut fresh = cosmic::iced::advanced::widget::Tree::empty();
+        present(app, &mut headless_renderer(), &mut fresh);
+        assert_tree_is_faithful(tree, &fresh);
     }
 
     /// A repository card whose durable state and runtime both say repository,
