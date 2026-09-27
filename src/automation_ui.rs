@@ -1156,7 +1156,12 @@ fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static
     button.into()
 }
 fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static, Action> {
-    let mut button = widget::button::standard(label);
+    // List and history entries can span several lines. Standard buttons reserve
+    // a single-line height, hiding target and scheduling details.
+    let mut button = widget::button::custom(widget::text::body(label.clone()))
+        .name(label)
+        .padding(12)
+        .height(Length::Shrink);
     if enabled {
         button = button.on_press(action);
     }
