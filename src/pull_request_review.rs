@@ -35,7 +35,7 @@ use crate::{
         RepositoryError, RepositoryService, ValidatedBranchName, build_file_tree,
         line_change_counts,
     },
-    sidebar::{CheckStatus, WorktreePullRequestState, sidebar_button_style},
+    sidebar::{CheckStatus, FileListMode, WorktreePullRequestState, sidebar_button_style},
     ui_controls::{icon_control, symbolic_icon},
 };
 
@@ -146,6 +146,9 @@ pub enum Action {
     ToggleDirectory(RepoPath),
     NextFile,
     PreviousFile,
+    NextUnviewed,
+    SetFileListMode(FileListMode),
+    ToggleHideViewed,
     ToggleViewed(RepoPath),
     SetDirectoryViewed {
         directory: RepoPath,
@@ -246,6 +249,8 @@ pub struct State {
     files: Vec<ReviewFile>,
     files_truncated: bool,
     rows: Vec<Row>,
+    file_list_mode: FileListMode,
+    hide_viewed: bool,
     collapsed_directories: BTreeSet<RepoPath>,
     selected: Option<RepoPath>,
     notice: Option<String>,
@@ -294,6 +299,8 @@ impl State {
             files: Vec::new(),
             files_truncated: false,
             rows: Vec::new(),
+            file_list_mode: FileListMode::Tree,
+            hide_viewed: false,
             collapsed_directories: BTreeSet::new(),
             selected: None,
             notice: None,
@@ -450,6 +457,19 @@ impl State {
             }
             Action::PreviousFile => {
                 self.step_file(-1);
+                ActionTask::none()
+            }
+            Action::NextUnviewed => {
+                self.next_unviewed();
+                ActionTask::none()
+            }
+            Action::SetFileListMode(mode) => {
+                self.file_list_mode = mode;
+                self.rebuild_rows();
+                ActionTask::none()
+            }
+            Action::ToggleHideViewed => {
+                self.hide_viewed = !self.hide_viewed;
                 ActionTask::none()
             }
             Action::ToggleViewed(path) => {
@@ -696,7 +716,7 @@ impl State {
             }
         }
         self.files_truncated = loaded.files.truncated;
-        self.rows = tree_rows(&self.files);
+        self.rebuild_rows();
         if authority_changed {
             self.authority_revision = self.authority_revision.wrapping_add(1);
         }
@@ -725,6 +745,38 @@ impl State {
         self.files.iter().position(|file| &file.entry.path == path)
     }
 
+    fn rebuild_rows(&mut self) {
+        self.rows = tree_rows(&self.files);
+        if self.file_list_mode == FileListMode::Flat {
+            self.rows.retain(|row| row.file.is_some());
+            for row in &mut self.rows {
+                row.depth = 0;
+                row.label = row.path.display().into_owned().into_boxed_str();
+            }
+            self.rows.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+    }
+
+    /// Wrap once through the displayed ordering, including collapsed folders.
+    fn next_unviewed(&mut self) {
+        let files: Vec<usize> = self.rows.iter().filter_map(|row| row.file).collect();
+        let start = self
+            .selected
+            .as_ref()
+            .and_then(|path| {
+                files
+                    .iter()
+                    .position(|index| self.files[*index].entry.path == *path)
+            })
+            .map_or(0, |index| index + 1);
+        let next = (0..files.len())
+            .map(|offset| files[(start + offset) % files.len()])
+            .find(|index| !self.files[*index].viewed);
+        if let Some(index) = next {
+            self.select_file(self.files[index].entry.path.clone());
+        }
+    }
+
     /// Files under a directory, in tree order.
     fn files_under(&self, directory: &RepoPath) -> Vec<usize> {
         let Some(start) = self
@@ -746,6 +798,8 @@ impl State {
         let Some(index) = self.file_index(&path) else {
             return;
         };
+        self.collapsed_directories
+            .retain(|directory| !path.as_path().starts_with(directory.as_path()));
         self.selected = Some(path);
         self.emit_open(index);
     }
@@ -1065,6 +1119,14 @@ impl State {
         let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> =
             Vec::with_capacity(self.rows.len());
         for (index, row) in visible_review_rows(&self.rows, &self.collapsed_directories) {
+            if self.hide_viewed
+                && match row.file {
+                    Some(file) => self.files[file].viewed,
+                    None => tallies[index].0 == tallies[index].1,
+                }
+            {
+                continue;
+            }
             let element = match row.file {
                 Some(file) => self.file_row(row, &self.files[file], modal_open),
                 None => {
@@ -1081,6 +1143,9 @@ impl State {
         if rows.is_empty() {
             let message = match &self.load {
                 LoadState::Loading => "",
+                LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
+                    "All files viewed."
+                }
                 LoadState::Ready => "This pull request changes no files.",
                 LoadState::Idle | LoadState::Failed(_) => "",
             };
@@ -1094,7 +1159,7 @@ impl State {
                 });
             }
         }
-        widget::scrollable(
+        let list: Element<'_, Action> = widget::scrollable(
             widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
                 .padding(design::with_vertical_rail(Padding::from([
                     spacing.space_xxxs,
@@ -1105,7 +1170,49 @@ impl State {
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+        let (mode_icon, mode_label, next_mode) = match self.file_list_mode {
+            FileListMode::Tree => ("view-list-symbolic", "View as list", FileListMode::Flat),
+            FileListMode::Flat => (
+                "view-list-tree-symbolic",
+                "View as tree",
+                FileListMode::Tree,
+            ),
+        };
+        let controls = crate::ui_controls::toolbar_actions(vec![
+            icon_control(
+                symbolic_icon(mode_icon),
+                mode_label,
+                false,
+                !modal_open,
+                Some(Action::SetFileListMode(next_mode)),
+            )
+            .into(),
+            icon_control(
+                symbolic_icon("view-filter-symbolic"),
+                if self.hide_viewed {
+                    "Show viewed files"
+                } else {
+                    "Hide viewed files"
+                },
+                self.hide_viewed,
+                !modal_open,
+                Some(Action::ToggleHideViewed),
+            )
+            .into(),
+            icon_control(
+                symbolic_icon("go-next-symbolic"),
+                "Next unviewed file",
+                false,
+                !modal_open && self.files.iter().any(|file| !file.viewed),
+                Some(Action::NextUnviewed),
+            )
+            .into(),
+        ]);
+        widget::column::with_children(vec![controls.into(), list])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn file_row<'a>(
@@ -1129,6 +1236,23 @@ impl State {
         }
         if !counts.is_empty() {
             trailing.push(design::change_counts(&counts));
+        }
+        let (comments, unresolved) = self.discussion_counts(&row.path.display());
+        if comments > 0 {
+            trailing.push(
+                widget::tooltip(
+                    design::caption(if unresolved > 0 {
+                        format!("{comments} · {unresolved} open")
+                    } else {
+                        format!("{comments}")
+                    }),
+                    design::caption(format!(
+                        "{comments} comments, {unresolved} unresolved threads"
+                    )),
+                    widget::tooltip::Position::Top,
+                )
+                .into(),
+            );
         }
         trailing.push(viewed_control(
             Mark::from_file(file),
@@ -2198,6 +2322,48 @@ pub(crate) mod tests {
         assert!(!state.refreshing);
         assert!(state.files[0].viewed);
         assert_eq!(state.files[0].sync, ViewedSync::Pending);
+    }
+
+    #[test]
+    fn next_unviewed_wraps_past_viewed_and_collapsed_files_in_both_layouts() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(
+                vec![
+                    entry("a.rs", ChangeKind::Modified),
+                    entry("src/b.rs", ChangeKind::Modified),
+                    entry("z.rs", ChangeKind::Modified),
+                ],
+                vec![],
+            ),
+        );
+        state.files[0].viewed = true;
+        state.collapsed_directories.insert(path("src"));
+        state.select_file(path("z.rs"));
+        drop(state.update(Action::NextUnviewed));
+        assert_eq!(state.selected, Some(path("src/b.rs")));
+        assert!(!state.collapsed_directories.contains(&path("src")));
+        state.collapsed_directories.insert(path("src"));
+        drop(state.update(Action::SetFileListMode(FileListMode::Flat)));
+        assert!(
+            state
+                .rows
+                .iter()
+                .all(|row| row.file.is_some() && row.depth == 0)
+        );
+        assert_eq!(&*state.rows[1].label, "src/b.rs");
+        drop(state.update(Action::NextUnviewed));
+        assert_eq!(state.selected, Some(path("z.rs")));
+        state.files.iter_mut().for_each(|file| file.viewed = true);
+        drop(state.update(Action::NextUnviewed));
+        assert_eq!(state.selected, Some(path("z.rs")));
+        drop(state.update(Action::SetFileListMode(FileListMode::Tree)));
+        assert!(state.collapsed_directories.contains(&path("src")));
+        assert!(state.rows.iter().any(|row| row.file.is_none()));
+        state.files.clear();
+        state.rebuild_rows();
+        drop(state.update(Action::NextUnviewed));
     }
 
     #[test]
