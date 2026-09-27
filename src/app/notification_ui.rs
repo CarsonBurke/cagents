@@ -273,13 +273,13 @@ impl Cagents {
                 for notice in &snapshot.notices {
                     if !notice.acknowledged
                         && !self.notification_ui.acknowledged.contains(&notice.id)
+                        && let Some(session) = notice.event.source_session()
                         && let Some(card) = self
                             .durable
                             .cards
                             .iter()
                             .find(|card| {
-                                card.existence.is_open()
-                                    && card_session(card) == notice.event.source_session()
+                                card.existence.is_open() && card_session(card) == Some(session)
                             })
                             .map(|card| card.id)
                     {

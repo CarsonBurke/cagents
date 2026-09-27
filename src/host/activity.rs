@@ -353,13 +353,12 @@ fn observe(host: &Weak<Mutex<HostState>>, candidate: &Candidate) -> Outcome {
             && candidate.handle.cached_agent_process().as_ref() == Some(&candidate.process)
             && let Some(notifications) = &state.notifications
         {
-            notifications.record(crate::notifications::Event {
-                target: crate::notifications::Target::Session(candidate.id),
-                source_session: Some(candidate.id),
-                provider: Some(candidate.process.provider),
-                directory: candidate.process.launch.working_directory.clone(),
+            notifications.record(crate::notifications::Event::session(
+                candidate.id,
+                candidate.process.provider,
+                candidate.process.launch.working_directory.clone(),
                 evidence,
-            });
+            ));
         }
     }
     candidate.handle.apply_agent_activity(

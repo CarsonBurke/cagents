@@ -11,8 +11,8 @@ use crate::{
     model::{RunId, TerminalId},
 };
 
-/// Durable activation and lifecycle identity. A source process is only context:
-/// retiring it must never retire an accepted run's result.
+/// Durable activation and lifecycle identity. Optional source-process metadata
+/// describes focus and window ownership, not the notice's retirement authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Target {
     Session(TerminalId),

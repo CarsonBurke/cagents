@@ -272,6 +272,22 @@ mod tests {
     }
 
     #[test]
+    fn owner_recency_survives_infrequent_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        journal.remember_window([session], "chosen").unwrap();
+        journal
+            .record(event(session, "first-attention"), false)
+            .unwrap();
+        journal
+            .remember_window([TerminalId::new()], "other")
+            .unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
     fn newer_journal_schema_is_rejected_without_schema_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention.sqlite3");
