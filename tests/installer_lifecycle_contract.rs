@@ -101,6 +101,24 @@ fn release_fixture(
     restart: Option<&str>,
     download: Option<&str>,
 ) {
+    coordinated_release_fixture(
+        compatible,
+        terminals,
+        publish_failure,
+        restart,
+        download,
+        "installed",
+    );
+}
+
+fn coordinated_release_fixture(
+    compatible: bool,
+    terminals: usize,
+    publish_failure: Option<&str>,
+    restart: Option<&str>,
+    download: Option<&str>,
+    coordinator: &str,
+) {
     let home = tempfile::tempdir().unwrap();
     let data = home.path().join("data with spaces");
     let prefix = data.join("cagents-install");
@@ -115,7 +133,8 @@ fn release_fixture(
     let status = r#"#!/bin/sh
 CLI=old
 case "$*" in
-  'coordinate-install '*|'verify-install-guard')
+  'coordinate-install '*|'verify-install-guard'*)
+    case "$FIXTURE_COORDINATOR:$CLI" in installed:new|candidate:old|none:*) exit 64 ;; esac
     exec "$FIXTURE_REAL_CLI" "$@"
     ;;
   '--json daemon status')
@@ -243,7 +262,9 @@ esac
     fs::create_dir(&tools).unwrap();
     // Fail after current switches, exercising the real rollback trap.
     if let Some(failure) = publish_failure {
-        let fail = if failure == "signal" {
+        let fail = if failure == "outer-signal" {
+            "kill -TERM \"$(cat \"$FIXTURE_OUTER_PID_FILE\")\"; sleep 1; exit 8"
+        } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
             "exit 8"
@@ -368,6 +389,8 @@ esac
         .env("XDG_RUNTIME_DIR", &runtime)
         .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
         .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
+        .env("FIXTURE_COORDINATOR", coordinator)
+        .env("FIXTURE_OUTER_PID_FILE", home.path().join("outer-pid"))
         .env(
             "CAGENTS_REPOSITORY",
             if download == Some("public") {
@@ -390,8 +413,25 @@ esac
         .env("FIXTURE_RESTART", restart.unwrap_or_default())
         .env("FIXTURE_TERMINALS", terminals.to_string())
         .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    fs::write(home.path().join("outer-pid"), output.id().to_string()).unwrap();
+    let output = output.wait_with_output().unwrap();
+    if coordinator == "none" {
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("install a current release first")
+        );
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(!prefix.join("versions/9.9.9").exists());
+        assert!(fs::read_to_string(actions).unwrap_or_default().is_empty());
+        return;
+    }
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
             Some("success" | "relaunch" | "decline" | "decline-legacy") => {
@@ -520,6 +560,21 @@ esac
             Some(_) => panic!("unknown fixture download mode"),
         }
     );
+}
+
+#[test]
+fn candidate_coordinator_supports_upgrading_an_older_installed_cli() {
+    coordinated_release_fixture(true, 2, None, None, None, "candidate");
+}
+
+#[test]
+fn unsupported_coordinators_refuse_before_mutating_the_installation() {
+    coordinated_release_fixture(true, 2, None, None, None, "none");
+}
+
+#[test]
+fn interrupting_the_outer_installer_waits_for_inner_rollback() {
+    coordinated_release_fixture(true, 2, Some("outer-signal"), None, None, "installed");
 }
 
 #[test]

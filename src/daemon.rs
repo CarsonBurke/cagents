@@ -876,10 +876,19 @@ mod tests {
         let mut child = std::process::Command::new("/bin/sh");
         child.args([
             "-c",
-            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; printf ready",
+            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; test -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 43; printf ready",
             "descriptor-probe",
             &fd.to_string(),
         ]);
+        for name in [
+            crate::instance::INSTALL_GUARD_ENV,
+            "CAGENTS_ARCHIVE",
+            "CAGENTS_CHECKSUMS",
+            "CAGENTS_REPOSITORY",
+        ] {
+            child.env(name, "installer-only");
+        }
+        crate::install_guard::sanitize_child_environment(&mut child);
         // SAFETY: this child-only hook calls async-signal-safe descriptor syscalls.
         // Clearing CLOEXEC models installer assets intentionally passed to a worker.
         unsafe {

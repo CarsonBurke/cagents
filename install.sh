@@ -597,10 +597,24 @@ fi
 # The verified candidate owns the UI launch fence before any installation
 # mutation. Re-entry reuses these downloaded assets and is authorized only by
 # the actual inherited lock, never by this environment marker alone.
-COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
-tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$COORDINATOR" \
+CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
     || fail 'could not extract the verified update coordinator'
-chmod 0700 "$COORDINATOR"
+chmod 0700 "$CANDIDATE_COORDINATOR"
+supports_install_guard() {
+    [ -x "$1" ] \
+        && "$1" coordinate-install --help >/dev/null 2>&1 \
+        && "$1" verify-install-guard --help >/dev/null 2>&1
+}
+if supports_install_guard "$PREFIX/current/bin/cagents"; then
+    # A newer installed coordinator also makes rollback to an older release
+    # safe when that candidate predates the window-coordination commands.
+    COORDINATOR=$PREFIX/current/bin/cagents
+elif supports_install_guard "$CANDIDATE_COORDINATOR"; then
+    COORDINATOR=$CANDIDATE_COORDINATOR
+else
+    fail 'neither the installed CLI nor this release supports safe window coordination; install a current release first, then retry this version; installation was not changed'
+fi
 if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
     "$COORDINATOR" verify-install-guard >/dev/null \
         || fail 'inherited application update fence is invalid; installation was not changed'
@@ -632,9 +646,25 @@ else
         1) set -- "$@" --relaunch-agents ;;
         0) set -- "$@" --no-relaunch-agents ;;
     esac
+    # Keep the downloaded assets until the coordinator finishes cancellation
+    # and window relaunch. A signal interrupts wait, so retry it after forwarding.
+    COORDINATOR_PID=
+    COORDINATOR_INTERRUPTED=0
+    trap 'COORDINATOR_INTERRUPTED=1; if [ -n "$COORDINATOR_PID" ]; then kill -TERM "$COORDINATOR_PID" 2>/dev/null || :; fi' HUP INT TERM
     CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
-        "$COORDINATOR" coordinate-install --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
-    exit $?
+        "$COORDINATOR" coordinate-install --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@" &
+    COORDINATOR_PID=$!
+    if [ "$COORDINATOR_INTERRUPTED" -eq 1 ]; then
+        kill -TERM "$COORDINATOR_PID" 2>/dev/null || :
+    fi
+    while :; do
+        COORDINATOR_INTERRUPTED=0
+        if wait "$COORDINATOR_PID"; then COORDINATOR_STATUS=0; else COORDINATOR_STATUS=$?; fi
+        [ "$COORDINATOR_INTERRUPTED" -eq 1 ] || break
+    done
+    COORDINATOR_PID=
+    trap 'exit 1' HUP INT TERM
+    exit "$COORDINATOR_STATUS"
 fi
 
 if [ -L "$PREFIX" ]; then

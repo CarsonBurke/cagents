@@ -1694,6 +1694,7 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
 }
 
 pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
+    crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
     let timeout = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?

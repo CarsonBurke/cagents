@@ -1060,6 +1060,7 @@ fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError>
     }
 
     let mut command = Command::new(&daemon_binary);
+    crate::install_guard::sanitize_child_environment(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

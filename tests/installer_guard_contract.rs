@@ -12,7 +12,7 @@ use std::{
         },
     },
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -43,7 +43,7 @@ fn verify(runtime: &Path, lease: Option<&File>) -> Output {
 
 #[test]
 fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
-    for status in ["0", "7"] {
+    for status in ["0", "7", "cancel"] {
         let root = tempfile::tempdir().unwrap();
         let runtime = root.path().join("runtime");
         fs::create_dir(&runtime).unwrap();
@@ -105,13 +105,14 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         let ui = bin.join("cagents-ui");
         fs::write(
             &ui,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
+            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}\" || exit 92\nprintf '%s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&ui, fs::Permissions::from_mode(0o700)).unwrap();
         let installer = root.path().join("installer.sh");
-        fs::write(&installer, "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\nprintf 'installed\\n' >> \"$HOME/events\"\nexit \"$1\"\n").unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_cagents"))
+        fs::write(&installer, "#!/bin/sh\n\"$FIXTURE_REAL_CLI\" verify-install-guard >/dev/null || exit 91\ntrap 'printf \"rolled-back\\n\" >> \"$HOME/events\"; exit 7' TERM\nprintf 'installed\\n' >> \"$HOME/events\"\nif [ \"$1\" = cancel ]; then while :; do sleep 0.05; done; fi\nexit \"$1\"\n").unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cagents"));
+        command
             .arg("coordinate-install")
             .arg("--prefix")
             .arg(&prefix)
@@ -124,14 +125,48 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+            .env("CAGENTS_ARCHIVE", "/stale/installer/archive")
+            .env("CAGENTS_CHECKSUMS", "/stale/installer/checksums")
+            .env("CAGENTS_REPOSITORY", "fixture/source")
             .env("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_cagents"))
-            .output()
-            .unwrap();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Ignored SIGCHLD survives exec; the coordinator must reset it before
+        // relying on its unreaped child as process-group cleanup authority.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        if status == "cancel" {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read_to_string(&events).is_ok_and(|text| text.contains("installed")) {
+                assert!(Instant::now() < deadline, "installer did not start");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("coordinator did not finish");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
         server.join().unwrap();
         assert_eq!(output.status.success(), status == "0", "{output:?}");
         assert_eq!(
             fs::read_to_string(events).unwrap(),
-            "update-prepare\nupdate-commit\ninstalled\n"
+            if status == "cancel" {
+                "update-prepare\nupdate-commit\ninstalled\nrolled-back\n"
+            } else {
+                "update-prepare\nupdate-commit\ninstalled\n"
+            }
         );
         assert!(
             fs::read_to_string(root.path().join("reopened"))
