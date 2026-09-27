@@ -982,7 +982,14 @@ pub(crate) mod handoff {
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_ok());
-            save(br#"{"version":4,"terminals":[],"chats":[]}"#);
+            save(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version": VERSION + 1,
+                    "terminals": [],
+                    "chats": [],
+                }))
+                .unwrap(),
+            );
             assert!(store.startup_timeout().is_err());
             save(br#"{"version":1,"terminals":[],"chats":["#);
             assert!(store.startup_timeout().is_err());
