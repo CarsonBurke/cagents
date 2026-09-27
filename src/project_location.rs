@@ -14,6 +14,22 @@ pub struct ProjectLocation {
     pub kind: ProjectKind,
 }
 
+/// Preserve an already-open folder identity before interpreting new Git
+/// metadata. Otherwise checkouts and linked worktrees resolve to one Git key.
+pub(crate) fn resolve(
+    path: &Path,
+    model: Option<&crate::workspace_model::WorkspaceModel>,
+) -> Result<ProjectLocation, String> {
+    let from = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if let Some(project) = model.and_then(|model| model.project(&from)) {
+        return Ok(ProjectLocation {
+            key: from,
+            kind: project.kind,
+        });
+    }
+    discover(&from)
+}
+
 /// Git projects use the common metadata directory; plain folders use their
 /// canonical directory. Only Git's specific no-repository answer permits the
 /// latter, and existing metadata must not be hidden by that fallback.
