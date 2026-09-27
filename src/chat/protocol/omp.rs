@@ -121,6 +121,13 @@ struct Omp {
     calls: HashMap<String, Call>,
     call_order: VecDeque<String>,
     usage: chat::Usage,
+    execution: Option<Execution>,
+}
+struct Execution {
+    run: crate::model::RunId,
+    request: String,
+    observing: bool,
+    settled: bool,
 }
 struct Chunk {
     next: usize,
@@ -170,6 +177,37 @@ impl Call {
     }
 }
 impl Omp {
+    fn finish_execution(
+        &mut self,
+        request: &str,
+        outcome: crate::notifications::Kind,
+        step: &mut Step,
+    ) {
+        if !self
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.request == request)
+        {
+            return;
+        }
+        let execution = self.execution.take().unwrap();
+        use crate::agent_execution::ProviderEvent;
+        if !execution.settled {
+            step.events.push(Event::Execution {
+                run: execution.run,
+                event: ProviderEvent::Settled,
+            });
+        }
+        step.events.push(Event::Execution {
+            run: execution.run,
+            event: ProviderEvent::Finished { outcome },
+        });
+        step.events.push(Event::TurnFinished {
+            key: Some(format!("omp-request:{request}")),
+            outcome,
+        });
+    }
+
     fn request(&mut self, kind: &str) -> Value {
         self.sequence = self.sequence.wrapping_add(1);
         let id = format!("cagents-{}", self.sequence);
@@ -499,6 +537,48 @@ impl Omp {
     }
 }
 impl Adapter for Omp {
+    fn command_for_run(
+        &mut self,
+        run: crate::model::RunId,
+        command: Command,
+    ) -> Result<Step, String> {
+        if self.busy
+            || self.execution.is_some()
+            || !matches!(
+                &command,
+                Command::Prompt {
+                    mode: PromptMode::Send,
+                    ..
+                }
+            )
+        {
+            return Err("A correlated OMP run requires one idle direct prompt".into());
+        }
+        let mut step = self.command(command)?;
+        let request = step
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "prompt")
+            .and_then(|frame| frame["id"].as_str())
+            .ok_or("OMP did not create the prompt request")?
+            .to_owned();
+        self.execution = Some(Execution {
+            run,
+            request: request.clone(),
+            observing: false,
+            settled: false,
+        });
+        step.events.insert(
+            0,
+            Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Started {
+                    key: format!("omp-request:{request}"),
+                },
+            },
+        );
+        Ok(step)
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         Ok(Step::default())
     }
@@ -552,6 +632,11 @@ impl Adapter for Omp {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        let execution_scope = self
+            .execution
+            .as_ref()
+            .filter(|execution| execution.observing && !execution.settled)
+            .map(|execution| execution.run);
         match text(&frame, "type") {
             "ready" => {
                 let mut request = self.request("negotiate_protocol");
@@ -621,6 +706,11 @@ impl Adapter for Omp {
                         message: text(&frame, "error").into(),
                         fatal,
                     });
+                    self.finish_execution(
+                        text(&frame, "id"),
+                        crate::notifications::Kind::Failed,
+                        &mut step,
+                    );
                     return Ok(step);
                 }
                 let data = &frame["data"];
@@ -757,7 +847,12 @@ impl Adapter for Omp {
                     }
                     "set_model" | "set_thinking_level" | "compact" => step = self.refresh(),
                     "prompt" if data["agentInvoked"].as_bool() == Some(false) => {
-                        step = self.refresh()
+                        step = self.refresh();
+                        self.finish_execution(
+                            text(&frame, "id"),
+                            crate::notifications::Kind::Succeeded,
+                            &mut step,
+                        );
                     }
                     _ => {}
                 }
@@ -886,6 +981,13 @@ impl Adapter for Omp {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
                     self.agent_turn_active = true;
+                    if let Some(execution) = self
+                        .execution
+                        .as_mut()
+                        .filter(|execution| !execution.settled)
+                    {
+                        execution.observing = true;
+                    }
                 }
                 self.busy = true;
                 step.events.push(Event::Status {
@@ -921,8 +1023,24 @@ impl Adapter for Omp {
                 if finished {
                     step.events.push(Event::TurnSettled);
                 }
-                if finished && let Some(outcome) = outcome {
+                if finished
+                    && self.execution.is_none()
+                    && let Some(outcome) = outcome
+                {
                     step.events.push(Event::TurnFinished { key: None, outcome });
+                }
+                if finished
+                    && let Some(execution) = self
+                        .execution
+                        .as_mut()
+                        .filter(|execution| execution.observing && !execution.settled)
+                {
+                    execution.settled = true;
+                    execution.observing = false;
+                    step.events.push(Event::Execution {
+                        run: execution.run,
+                        event: crate::agent_execution::ProviderEvent::Settled,
+                    });
                 }
                 step.events.push(Event::Status {
                     busy: false,
@@ -931,10 +1049,46 @@ impl Adapter for Omp {
             }
             "extension_ui_request" => return self.extension(&frame),
             "available_commands_update" => step.events.extend(commands(&frame)),
-            "prompt_result" if frame["agentInvoked"].as_bool() == Some(false) => {
-                step = self.refresh()
+            "prompt_result" => {
+                if self.execution.as_ref().is_some_and(|execution| {
+                    frame["id"].as_str() == Some(execution.request.as_str())
+                }) {
+                    let outcome = match frame["status"].as_str() {
+                        Some("completed") => crate::notifications::Kind::Succeeded,
+                        Some("aborted") => crate::notifications::Kind::Cancelled,
+                        Some("error") => crate::notifications::Kind::Failed,
+                        _ => {
+                            return Err(
+                                "OMP completed an accepted prompt with an unknown outcome".into()
+                            );
+                        }
+                    };
+                    if let Some(message) = frame["error"]["message"].as_str() {
+                        step.events.push(Event::Error {
+                            message: message.into(),
+                            fatal: false,
+                        });
+                    }
+                    self.finish_execution(text(&frame, "id"), outcome, &mut step);
+                }
+                if frame["agentInvoked"].as_bool() == Some(false) {
+                    let refresh = self.refresh();
+                    step.writes.extend(refresh.writes);
+                    step.events.extend(refresh.events);
+                }
             }
             _ => {}
+        }
+        if let Some(run) = execution_scope
+            && matches!(
+                text(&frame, "type"),
+                "message_start" | "message_update" | "message_end" | "agent_end" | "prompt_result"
+            )
+        {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Scope,
+            });
         }
         Ok(step)
     }
@@ -1129,6 +1283,108 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_prompt_finishes_only_from_its_correlated_prompt_result() {
+        use crate::agent_execution::ProviderEvent;
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            ..Omp::default()
+        };
+        let run = crate::model::RunId::new();
+        let prompt = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "owned prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = prompt.writes[0]["id"].clone();
+        let old_end = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(
+            !old_end
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Execution { .. }))
+        );
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        let intermediate = adapter
+            .receive(json!({"type":"agent_end","isTerminal":false}))
+            .unwrap();
+        assert!(!intermediate.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Settled | ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
+        let end = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(end.events.iter().any(|event| matches!(event,
+            Event::Execution { run: actual, event: ProviderEvent::Settled } if *actual == run)));
+        assert!(!end.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            } | Event::TurnFinished { .. }
+        )));
+        let unrelated = adapter
+            .receive(
+                json!({"type":"prompt_result","id":"old","status":"completed","agentInvoked":true}),
+            )
+            .unwrap();
+        assert!(
+            !unrelated
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Execution { .. }))
+        );
+        let result = adapter
+            .receive(
+                json!({"type":"prompt_result","id":request,"status":"aborted","agentInvoked":true}),
+            )
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(event,
+            Event::Execution { run: actual, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Cancelled } } if *actual == run)));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
+        assert!(adapter.execution.is_none());
+        let next = crate::model::RunId::new();
+        adapter
+            .command_for_run(
+                next,
+                Command::Prompt {
+                    text: "next prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let late = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(
+            !late
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Execution { .. } | Event::TurnFinished { .. }))
+        );
+        assert_eq!(adapter.execution.as_ref().unwrap().run, next);
+        assert!(!adapter.execution.as_ref().unwrap().settled);
+    }
 
     #[test]
     fn attention_waits_for_agent_end_and_ignores_compaction_and_tools() {

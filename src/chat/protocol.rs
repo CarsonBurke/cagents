@@ -72,6 +72,13 @@ pub struct Step {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    fn command_for_run(
+        &mut self,
+        _run: crate::model::RunId,
+        _command: Command,
+    ) -> Result<Step, String> {
+        Err("This provider transport does not support correlated agent runs".into())
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {

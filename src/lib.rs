@@ -6,6 +6,7 @@ pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 pub mod account;
 pub mod agent;
+pub mod agent_execution;
 #[cfg(feature = "ui")]
 pub mod app;
 #[cfg(feature = "integrated-browser")]

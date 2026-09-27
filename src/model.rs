@@ -76,6 +76,8 @@ id_type!(ChannelId);
 id_type!(TerminalId);
 id_type!(BrowserId);
 id_type!(OperationId);
+id_type!(AgentId);
+id_type!(RunId);
 
 macro_rules! evidence_type {
     ($name:ident) => {
