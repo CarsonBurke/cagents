@@ -846,6 +846,25 @@ fn create_console(
         true,
     )
     .map_err(|error| error.message)?;
+    let console_handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .terminals
+            .get(&session.id)
+            .filter(|record| {
+                super::chat::matches_paired_terminal(
+                    &record.session,
+                    &descriptor.session,
+                    state.proof(),
+                )
+            })
+            .map(|record| record.handle.clone())
+            .ok_or_else(|| {
+                ConsoleError::Uncertain(
+                    "The spawned console ownership changed before publication".into(),
+                )
+            })?
+    };
     // Publish the in-memory pair before the durable view: concurrent explicit
     // close must already know which terminal belongs to this exact actor.
     let publish = (|| {
@@ -857,6 +876,7 @@ fn create_console(
                 .filter(|record| record.handle.same_actor(handle))
                 .ok_or("The provider closed while publishing its console")?;
             record.session.terminal = Some(descriptor.session.clone());
+            record.paired_terminal = Some(console_handle.clone());
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let expected = registry
@@ -869,14 +889,27 @@ fn create_console(
     if let Err(error) = publish {
         // Keep the exact terminal owned until its process teardown is proved.
         // An uncertain shutdown must retain both handles for explicit cleanup.
-        let terminal = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .terminals
-            .get(&session.id)
-            .filter(|record| record.session == descriptor.session)
-            .map(|record| record.handle.clone());
-        if let Some(terminal) = &terminal
+        let terminal = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            match state.terminals.get(&session.id) {
+                Some(record)
+                    if super::chat::matches_paired_terminal(
+                        &record.session,
+                        &descriptor.session,
+                        state.proof(),
+                    ) && record.handle.same_worker(&console_handle) =>
+                {
+                    Some((record.session.clone(), record.handle.clone()))
+                }
+                Some(_) => {
+                    return Err(ConsoleError::Uncertain(format!(
+                        "{error}; console ownership changed before rollback; its replacement was retained"
+                    )));
+                }
+                None => None,
+            }
+        };
+        if let Some((_, terminal)) = &terminal
             && let Err(close) = terminal.shutdown()
         {
             return Err(ConsoleError::Uncertain(format!(
@@ -892,10 +925,11 @@ fn create_console(
             {
                 record.session.terminal = None;
                 record.console_recipe = None;
+                record.paired_terminal = None;
             }
-            if terminal.as_ref().is_some_and(|handle| {
+            if terminal.as_ref().is_some_and(|(source, handle)| {
                 state.terminals.get(&session.id).is_some_and(|record| {
-                    record.session == descriptor.session && record.handle.same_worker(handle)
+                    record.session == *source && record.handle.same_worker(handle)
                 })
             }) {
                 state.retire_terminal(session.id);

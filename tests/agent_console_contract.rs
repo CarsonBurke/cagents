@@ -90,7 +90,14 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Explicit close includes the provider's bounded interrupt/teardown
+        // budget, which is deliberately longer than ordinary RPCs.
+        let timeout = if arguments.starts_with(&["agent", "close"]) {
+            80
+        } else {
+            20
+        };
+        let deadline = Instant::now() + Duration::from_secs(timeout);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
                 let _ = child.kill();
