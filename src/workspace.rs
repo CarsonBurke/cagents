@@ -1189,6 +1189,10 @@ impl Workspace {
         if (self.viewport_width - viewport_width).abs() > f32::EPSILON {
             self.viewport_width = viewport_width;
             self.rebuild_geometry();
+            // Native layout feedback can report the measured width before
+            // Resized. Retarget fractional panes here too; the later resize
+            // sees an equal width and deliberately performs no further work.
+            self.reveal_focused();
             self.camera
                 .clamp(self.geometry.max_offset(self.viewport_width));
         }
@@ -2448,6 +2452,29 @@ mod tests {
         assert_eq!(workspace.camera().target(), target);
         assert!(workspace.camera().offset() > 100.0);
         assert!(workspace.camera().is_animating());
+    }
+
+    #[test]
+    fn initial_scroll_feedback_retargets_restored_fractional_focus_for_measured_width() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 7], 1_340.0);
+        let last = workspace.order().last().unwrap();
+        workspace.focus(last).unwrap();
+        let restored = workspace.camera().target();
+        workspace.native_scroll(restored, 1_340.0);
+        workspace.record_programmatic_scroll(restored);
+        assert!(!workspace.is_animating());
+
+        workspace.native_scroll(restored, 1_642.0);
+        workspace.resize_viewport(1_642.0);
+        let target = workspace
+            .geometry()
+            .focus_offset(last, 1_642.0, restored)
+            .unwrap();
+        assert!(target > restored);
+        assert_eq!(workspace.camera().target(), target);
+        assert!(workspace.is_animating());
+        workspace.tick(Duration::from_millis(16));
+        assert!(workspace.camera().offset() > restored);
     }
 
     #[test]
