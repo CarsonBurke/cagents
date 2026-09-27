@@ -3,7 +3,7 @@ use crate::{
     agent::Provider,
     agent_execution::{Operation, Reply, Target},
     host::state::HostState,
-    model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
+    model::{HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
     workspace_model::ModelEdit,
 };
 use std::{os::unix::fs::PermissionsExt, path::Path};
@@ -25,6 +25,7 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
         "config",
         "cache",
         "tmp",
+        "run",
         "project",
     ] {
         std::fs::create_dir_all(root.join(path)).unwrap();
@@ -44,6 +45,7 @@ fn isolated(name: &str) -> Option<tempfile::TempDir> {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("TMPDIR", root.join("tmp"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
         .env(
             "PATH",
             format!("{}:/usr/bin:/bin", root.join("bin").display()),
@@ -661,7 +663,7 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
         .unwrap();
     let mut state = HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new("execution-fixture"),
-        boot_id: BootId::new("boot"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
         host_incarnation: HostIncarnation::new("incarnation"),
     });
     state.install_model(registry);
