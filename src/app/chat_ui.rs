@@ -2338,16 +2338,23 @@ impl Cagents {
         if source.launch.session_id.is_none() {
             return None;
         }
-        let choices = self.chat_accounts(source.launch.provider, &source.launch.recipe)?;
+        let choices = self
+            .chat_accounts(source.launch.provider, &source.launch.recipe)
+            .into_iter()
+            .flat_map(|accounts| accounts.choices)
+            .filter(|choice| !choice.selected)
+            .collect::<Vec<_>>();
         let pending = self.chat_start_pending(card);
         let mut content: Vec<Element<'_, Message>> = vec![design::caption(if pending {
             "Checking the saved conversation on the selected account…"
         } else { "Continue this saved conversation on another account. Its identity stays unchanged until the provider confirms it." }).into()];
-        for choice in choices
-            .choices
-            .into_iter()
-            .filter(|choice| !choice.selected)
-        {
+        if choices.is_empty() && !pending {
+            content.push(
+                design::caption("Add or sign in to another account in Accounts to continue.")
+                    .into(),
+            );
+        }
+        for choice in choices {
             content.push(
                 widget::button::standard(format!(
                     "{}{}",
@@ -2364,6 +2371,11 @@ impl Cagents {
                 .into(),
             );
         }
+        content.push(
+            widget::button::standard("Open Accounts")
+                .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                .into(),
+        );
         Some(
             widget::container(
                 widget::scrollable(widget::column::with_children(content).spacing(6))
@@ -7478,6 +7490,22 @@ mod tests {
             app.chat_ui.last_models.get(&Provider::Codex),
             Some(&("gpt-b".to_owned(), None))
         );
+    }
+
+    #[test]
+    fn removed_account_without_available_alternatives_still_offers_accounts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let session = chat_runtime(&app, card).session.clone();
+        assert!(
+            app.chat_accounts(session.launch.provider, &session.launch.recipe)
+                .is_none()
+        );
+        app.chat_ui.removed_accounts.insert(card);
+        assert!(app.account_recovery_controls(card).is_some());
+        let _ = app.update(Message::AccountUi(account_ui::Action::OpenPane));
+        assert!(app.utility_card(&CardKind::Accounts).is_some());
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
     }
 
     #[test]
