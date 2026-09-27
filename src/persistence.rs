@@ -4895,6 +4895,8 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 DROP TABLE review_cache_files;
+                 DROP TABLE review_cache;
                  PRAGMA user_version = 7;",
             )
             .unwrap();
@@ -5340,6 +5342,8 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE projects DROP COLUMN kind_json;
                  ALTER TABLE terminal_recipes DROP COLUMN owned_codex_listener;
+                 DROP TABLE review_cache_files;
+                 DROP TABLE review_cache;
                  PRAGMA user_version = 6;",
             )
             .unwrap();
