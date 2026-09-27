@@ -870,6 +870,13 @@ fn create_console(
     let publish = (|| {
         {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state
+                .terminals
+                .get(&session.id)
+                .is_none_or(|record| !record.handle.same_worker(&console_handle))
+            {
+                return Err("The console changed before publishing its provider pairing".into());
+            }
             let record = state
                 .chats
                 .get_mut(&session.id)

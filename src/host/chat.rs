@@ -2004,7 +2004,9 @@ fn process_inner(
             // A console is part of the owned execution. Retain both records
             // until its shutdown is proved, so a failed close remains retryable.
             if let Some((_, terminal)) = &terminal {
-                terminal.shutdown().map_err(unavailable)?;
+                terminal
+                    .shutdown()
+                    .map_err(|error| unavailable(error.to_string()))?;
             }
             let record = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
