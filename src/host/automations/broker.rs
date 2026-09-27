@@ -58,6 +58,9 @@ struct Inner {
     root: PathBuf,
     wake: Wake,
     workers: Mutex<BTreeMap<Uuid, Worker>>,
+    // One lazy startup census catches receipts left after a committed result
+    // followed by daemon loss. Each wake visits at most 32 owned directories.
+    cleanup: Mutex<Option<std::fs::ReadDir>>,
 }
 
 #[derive(Clone)]
@@ -70,12 +73,14 @@ pub(in crate::host) struct Broker {
 
 impl Broker {
     pub(super) fn start(host: &SharedHost, root: PathBuf) -> Result<Self, String> {
+        let cleanup = std::fs::read_dir(&root).map_err(|error| error.to_string())?;
         let handle = Handle(Arc::new(Inner {
             host: Arc::downgrade(host),
             registry: agent_execution::registry(host)?,
             root,
             wake: Wake::default(),
             workers: Mutex::new(BTreeMap::new()),
+            cleanup: Mutex::new(Some(cleanup)),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -320,18 +325,48 @@ impl Handle {
             .active_automation_firings()?;
         let owners: std::collections::BTreeSet<_> = active.iter().map(|firing| firing.id).collect();
         let mut checking = false;
-        self.0
+        let candidates = self
+            .0
             .workers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|id, worker| {
-                if owners.contains(id) {
-                    return true;
+            .keys()
+            .filter(|id| !owners.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in candidates {
+            // A manual request can add a worker after the active census. The
+            // absent snapshot entry alone never authorizes deleting its proof.
+            if self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retired_automation_precheck(id)?
+                .is_none()
+            {
+                continue;
+            }
+            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(worker) = workers.get_mut(&id) else {
+                continue;
+            };
+            match worker.retire() {
+                Ok(true) => {
+                    workers.remove(&id);
                 }
-                let keep = !worker.reaped().unwrap_or(false);
-                checking |= keep;
-                keep
-            });
+                Ok(false) => {} // Reap/reclaim again on the next bounded tick.
+                Err(error) => {
+                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
+                    // A reaped owner may leave inaccessible files for the next
+                    // startup census; never spin on permanent storage errors.
+                    if worker.reaped().unwrap_or(false) {
+                        workers.remove(&id);
+                    }
+                }
+            }
+        }
+        checking |= self.sweep_prechecks()?;
         for firing in active {
             if let Some(run) = firing.run {
                 let reconciled = self
@@ -340,6 +375,19 @@ impl Handle {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .reconcile_automation_run(run, now)?;
+                let detail = self
+                    .0
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .automation_run_detail(firing.id)?;
+                if let Some(event) = run_attention(&detail) {
+                    if let Some(notifications) =
+                        &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
+                    {
+                        notifications.record(event);
+                    }
+                }
                 if let Some(firing) = reconciled.filter(|firing| firing.release_pending) {
                     checking |= self.release_run(host, &firing, now)?;
                 }
@@ -541,4 +589,95 @@ impl Handle {
         }
         Ok(false)
     }
+
+    fn sweep_prechecks(&self) -> Result<bool, String> {
+        let (entries, more) = {
+            let mut scan = self.0.cleanup.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(iterator) = scan.as_mut() else {
+                return Ok(false);
+            };
+            let entries = iterator
+                .take(32)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let more = entries.len() == 32;
+            if !more {
+                *scan = None;
+            }
+            (entries, more)
+        };
+        for entry in entries {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            let revision = self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retired_automation_precheck(id)?;
+            let Some(revision) = revision else {
+                continue;
+            };
+            let mut worker = Worker::recover(&self.0.root, id, revision);
+            match worker.retire() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(id)
+                        .or_insert(worker);
+                }
+                Err(error) => {
+                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
+                }
+            }
+        }
+        Ok(more)
+    }
+}
+
+fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifications::Event> {
+    use crate::{
+        agent_execution::{HostedSession, Origin, State},
+        notifications::{Event, Evidence, Kind, Target},
+    };
+    let run = detail.run.as_ref()?;
+    let agent = detail.agent.as_ref()?;
+    if run.agent != agent.id
+        || detail.firing.run != Some(run.id)
+        || !matches!(agent.origin, Origin::Automation { id } if id == detail.firing.automation)
+    {
+        return None;
+    }
+    let kind = match run.state {
+        State::Succeeded => Kind::Succeeded,
+        State::Failed | State::Interrupted => Kind::Failed,
+        State::Cancelled => Kind::Cancelled,
+        State::Waiting => Kind::Waiting,
+        _ => return None,
+    };
+    let source_session = agent.session.as_ref().map(|session| match session {
+        HostedSession::Chat(session) => session.id,
+        HostedSession::Terminal(session) => session.id,
+    });
+    Some(Event {
+        target: Target::AgentRun(run.id),
+        source_session,
+        provider: Some(agent.spec.provider),
+        directory: agent.spec.target.directory.clone(),
+        evidence: Evidence {
+            key: run.id.to_string(),
+            kind,
+        },
+    })
 }

@@ -222,6 +222,12 @@ pub fn run() -> Result<(), HostError> {
             .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
             .map_err(io::Error::other)?;
     }
+    let _agent_activity = activity::Monitor::start(&host)?;
+    let listener = UnixListener::bind(&paths.socket)?;
+    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let _tray = crate::tray::start();
+
     let automation_broker = match automations::start(&host) {
         Ok(broker) => Some(broker),
         Err(error) => {
@@ -229,11 +235,6 @@ pub fn run() -> Result<(), HostError> {
             None
         }
     };
-    let _agent_activity = activity::Monitor::start(&host)?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    let _tray = crate::tray::start();
 
     let next_client_id = AtomicU64::new(1);
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);

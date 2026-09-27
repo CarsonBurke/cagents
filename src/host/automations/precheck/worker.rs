@@ -173,6 +173,74 @@ impl Worker {
         Ok(self.child.is_none())
     }
 
+    /// The caller has proved in SQLite that this exact firing released its
+    /// slot. Its durable result now replaces the on-disk receipt. Never remove
+    /// an owner's directory while its process or inherited lease is live.
+    pub fn retire(&mut self) -> io::Result<bool> {
+        if !self.reaped()? {
+            return Ok(false);
+        }
+        if !self.directory.try_exists()? {
+            return Ok(true);
+        }
+        crate::secure_file::reject_symlink_components(&self.directory)?;
+        crate::secure_file::validate_owned_directory(&self.directory)?;
+        let lease = match private_file(&self.directory.join("lease")) {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A crash after unlinking the final lease can leave only an
+                // empty directory. remove_dir refuses any remaining content.
+                fs::remove_dir(&self.directory)?;
+                return Ok(true);
+            }
+            Err(error) => return Err(error),
+        };
+        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        // Only our bounded, flat proof files are reclaimable. An unexpected
+        // directory or symlink is never traversed as part of housekeeping.
+        let entries = fs::read_dir(&self.directory)?
+            .take(9)
+            .collect::<io::Result<Vec<_>>>()?;
+        if entries.len() > 8 {
+            return Err(io::Error::other("Unexpected precheck file count"));
+        }
+        for entry in &entries {
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| io::Error::other("Unexpected precheck file"))?;
+            let known = matches!(name, "request" | "started" | "receipt" | "cancel" | "lease")
+                || [".request-", ".started-", ".receipt-"]
+                    .iter()
+                    .any(|prefix| {
+                        name.strip_prefix(prefix)
+                            .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+                    });
+            if !known {
+                return Err(io::Error::other("Unexpected precheck file"));
+            }
+            private_file(&entry.path())?;
+        }
+        for entry in entries {
+            if entry.file_name() != "lease" {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        fs::remove_file(self.directory.join("lease"))?;
+        fs::remove_dir(&self.directory)?;
+        if let Some(parent) = self.directory.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(true)
+    }
+
     pub fn status(&mut self) -> io::Result<Status> {
         self.reaped()?;
         match read_record::<Receipt>(&self.directory.join("receipt")) {
@@ -576,6 +644,17 @@ mod tests {
             worker.status().unwrap(),
             Status::Complete(Outcome::Passed)
         ));
+        assert!(
+            !worker.retire().unwrap(),
+            "receipt publication is not owner exit"
+        );
+        assert!(directory.join("receipt").exists());
+        drop(lease);
+        assert!(worker.retire().unwrap());
+        assert!(
+            !directory.exists(),
+            "settled proof files are reclaimed after owner exit"
+        );
     }
 
     #[test]

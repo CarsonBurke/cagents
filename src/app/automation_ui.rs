@@ -59,6 +59,23 @@ impl Cagents {
         }
         match self.automation_ui.update(action) {
             None => Task::none(),
+            Some(Effect::ReadRun(run)) => {
+                let ids = self
+                    .notification_ui
+                    .snapshot
+                    .notices
+                    .iter()
+                    .filter(|notice| {
+                        notice.event.target() == crate::notifications::Target::AgentRun(run)
+                            && !notice.acknowledged
+                    })
+                    .map(|notice| notice.id)
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    self.notification_ui.acknowledge(id);
+                }
+                Task::none()
+            }
             Some(Effect::Request { sequence, request }) => cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ensure_daemon_ready()
@@ -85,6 +102,15 @@ impl Cagents {
                 {
                     self.status = Some(TransientNotice::error(
                         "This run has no live automation agent. Its result remains in history.",
+                    ));
+                    return Task::none();
+                }
+                if self
+                    .card_state(CardId::from_uuid(agent.id.as_uuid()))
+                    .is_some_and(|card| !card.existence.is_open())
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This agent's pane was closed in this window. Its result remains available in run history.",
                     ));
                     return Task::none();
                 }

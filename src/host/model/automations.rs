@@ -87,6 +87,27 @@ pub(super) fn close_project(
 }
 
 impl Registry {
+    /// Cleanup can discard private precheck files only after the firing has
+    /// settled and released its durable ownership slot. Interrupted work still
+    /// owning the slot deliberately retains every proof file.
+    pub(crate) fn retired_automation_precheck(&self, id: Uuid) -> Result<Option<u64>, String> {
+        let record: Option<String> = self
+            .db
+            .query_row(
+                "SELECT f.record FROM automation_firings f JOIN automations a ON a.id=f.automation
+             WHERE f.id=?1 AND (a.active_firing IS NULL OR a.active_firing<>f.id)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let firing: Firing = decode(&record)?;
+        Ok((!firing.state.is_active() && !firing.release_pending).then_some(firing.revision))
+    }
+
     /// A confirmed retry reads its original receipt even after removal of the
     /// definition or target. Reusing the key for another revision is an error.
     pub(crate) fn previous_manual_automation_firing(
@@ -1864,6 +1885,11 @@ mod tests {
                 202,
             )
             .unwrap();
+        assert_eq!(
+            registry.retired_automation_precheck(firings[0]).unwrap(),
+            None,
+            "uncertain cleanup keeps every precheck proof even with a terminal history state"
+        );
         assert!(
             registry
                 .claim_automation(extra.id, 1, None, trigger.clone(), None, true, 203)
@@ -1880,6 +1906,10 @@ mod tests {
                 204,
             )
             .unwrap();
+        assert_eq!(
+            registry.retired_automation_precheck(firings[1]).unwrap(),
+            Some(1)
+        );
         assert!(
             registry
                 .claim_automation(extra.id, 1, None, trigger, None, true, 205)

@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     control::ControlClient,
-    notifications::{Preferences, Presence, Snapshot, Update},
+    notifications::{Preferences, Presence, Snapshot, Target, Update},
 };
 use std::{
     collections::BTreeSet,
@@ -13,7 +13,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub enum Action {
     Snapshot(Snapshot),
-    Activated(TerminalId),
+    Activated(Target),
     Test,
     Failed(String),
 }
@@ -67,7 +67,7 @@ impl State {
         });
     }
 
-    fn acknowledge(&mut self, id: uuid::Uuid) {
+    pub(super) fn acknowledge(&mut self, id: uuid::Uuid) {
         if self.acknowledged.insert(id) {
             self.changed(|pending| {
                 pending.acknowledged.insert(id);
@@ -245,7 +245,9 @@ impl Cagents {
                 .snapshot
                 .notices
                 .iter()
-                .filter(|notice| notice.event.session == focused && !notice.acknowledged)
+                .filter(|notice| {
+                    notice.event.source_session() == Some(focused) && !notice.acknowledged
+                })
                 .map(|notice| notice.id)
                 .collect::<Vec<_>>();
             for id in ids {
@@ -277,7 +279,7 @@ impl Cagents {
                             .iter()
                             .find(|card| {
                                 card.existence.is_open()
-                                    && card_session(card) == Some(notice.event.session)
+                                    && card_session(card) == notice.event.source_session()
                             })
                             .map(|card| card.id)
                     {
@@ -289,7 +291,7 @@ impl Cagents {
                 self.sync_notification_presence();
                 Task::none()
             }
-            Action::Activated(session) => {
+            Action::Activated(Target::Session(session)) => {
                 let Some(card) = self
                     .durable
                     .cards
@@ -338,6 +340,17 @@ impl Cagents {
                 );
                 Task::batch([scope, focus, self.activate_main_window(None)])
             }
+            Action::Activated(Target::AgentRun(run)) => {
+                if self.modal_is_open() || !self.automation_ui.can_open_run() {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the open automation edit or request, then open the run notification again.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let open = self.open_utility_card(CardKind::Automations);
+                let read = self.update_automation_ui(crate::automation_ui::Action::InspectRun(run));
+                Task::batch([open, read, self.activate_main_window(None)])
+            }
             Action::Test => {
                 self.notification_ui
                     .preferences(self.settings.notifications, true);
@@ -369,6 +382,37 @@ fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_run_activation_opens_history_without_mounting_a_provider() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let original = app
+            .durable
+            .cards
+            .iter()
+            .filter(|card| matches!(card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+            .count();
+        let run = crate::model::RunId::new();
+        drop(app.update_notifications(Action::Activated(Target::AgentRun(run))));
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .any(|card| card.kind == CardKind::Automations && card.existence.is_open())
+        );
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .filter(|card| matches!(card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                .count(),
+            original
+        );
+        assert!(
+            !app.automation_ui.can_open_run(),
+            "exact history read is pending"
+        );
+    }
     use crate::{
         agent::Provider,
         model::{ChannelId, ProjectChannel},
@@ -382,8 +426,9 @@ mod tests {
         let notice = crate::notifications::Notice {
             id,
             event: crate::notifications::Event {
-                session,
-                provider: Provider::Claude,
+                target: crate::notifications::Target::Session(session),
+                source_session: Some(session),
+                provider: Some(Provider::Claude),
                 directory: "/tmp".into(),
                 evidence: crate::notifications::Evidence {
                     key: "complete".into(),
@@ -425,8 +470,9 @@ mod tests {
             notices: vec![crate::notifications::Notice {
                 id,
                 event: crate::notifications::Event {
-                    session,
-                    provider: Provider::Claude,
+                    target: crate::notifications::Target::Session(session),
+                    source_session: Some(session),
+                    provider: Some(Provider::Claude),
                     directory: "/tmp".into(),
                     evidence: crate::notifications::Evidence {
                         key: "focused-completion".into(),
@@ -488,11 +534,11 @@ mod tests {
             cards: vec![card],
             focused: Some(card),
         });
-        drop(app.update_notifications(Action::Activated(session)));
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert_eq!(app.durable.active_channel, Some(channel));
         assert_eq!(app.workspace.focused(), Some(card));
         let count = app.durable.cards.len();
-        drop(app.update_notifications(Action::Activated(TerminalId::new())));
+        drop(app.update_notifications(Action::Activated(Target::Session(TerminalId::new()))));
         assert_eq!(app.durable.active_channel, Some(channel));
         assert_eq!(app.workspace.focused(), Some(card));
         assert_eq!(

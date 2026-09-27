@@ -354,8 +354,9 @@ fn observe(host: &Weak<Mutex<HostState>>, candidate: &Candidate) -> Outcome {
             && let Some(notifications) = &state.notifications
         {
             notifications.record(crate::notifications::Event {
-                session: candidate.id,
-                provider: candidate.process.provider,
+                target: crate::notifications::Target::Session(candidate.id),
+                source_session: Some(candidate.id),
+                provider: Some(candidate.process.provider),
                 directory: candidate.process.launch.working_directory.clone(),
                 evidence,
             });

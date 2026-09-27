@@ -84,6 +84,7 @@ pub enum Action {
     History,
     MoreHistory,
     Run(Uuid),
+    InspectRun(crate::model::RunId),
     CancelRun,
     OpenSession,
     Received {
@@ -101,6 +102,7 @@ impl Action {
 pub enum Effect {
     Request { sequence: u64, request: Request },
     OpenRun(RunDetail),
+    ReadRun(crate::model::RunId),
 }
 
 #[derive(Clone, Copy)]
@@ -336,6 +338,9 @@ pub struct State {
 }
 
 impl State {
+    pub fn can_open_run(&self) -> bool {
+        self.pending.is_none() && self.draft.is_none() && self.confirmation.is_none()
+    }
     pub fn set_choices(&mut self, targets: Vec<TargetChoice>, accounts: Vec<AccountChoice>) {
         self.targets = targets;
         self.accounts = accounts;
@@ -406,7 +411,9 @@ impl State {
                         self.run = Some(detail.clone());
                         return Some(Effect::OpenRun(detail));
                     }
+                    let run = detail.run.as_ref().map(|run| run.id);
                     self.run = Some(detail);
+                    return run.map(Effect::ReadRun);
                 }
                 Ok(Response::Firing(firing)) => {
                     if let crate::automations::Trigger::Manual { request } = firing.trigger {
@@ -680,6 +687,7 @@ impl State {
                 }
             }
             Action::Run(id) => return self.request(Pending::Run, Request::ShowFiring { id }),
+            Action::InspectRun(run) => return self.request(Pending::Run, Request::ShowRun { run }),
             Action::CancelRun => {
                 if let Some(run) = &self.run {
                     return self.request(

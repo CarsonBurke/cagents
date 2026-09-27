@@ -564,7 +564,7 @@ pub enum ServerMessage {
     },
     NotificationsChanged,
     NotificationActivated {
-        session: TerminalId,
+        target: crate::notifications::Target,
     },
 }
 
