@@ -279,7 +279,11 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
     let deadline = Instant::now() + Duration::from_secs(5);
     let snapshot = loop {
         let snapshot = client.read_notifications().unwrap();
-        if snapshot.notices.iter().any(|current| current.id == notice.id) {
+        if snapshot
+            .notices
+            .iter()
+            .any(|current| current.id == notice.id)
+        {
             break snapshot;
         }
         assert!(
