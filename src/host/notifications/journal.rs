@@ -21,7 +21,7 @@ impl Journal {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if version > 2 {
+        if version > 3 {
             return Err("Notification journal was created by a newer cagents version".into());
         }
         connection
@@ -36,7 +36,7 @@ impl Journal {
                 session TEXT NOT NULL, evidence TEXT NOT NULL, ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
                 UNIQUE(session, evidence));
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
-            PRAGMA user_version=2;").map_err(|error| error.to_string())?;
+            PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
 
@@ -293,7 +293,7 @@ mod tests {
         let path = directory.path().join("attention.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version=3; CREATE TABLE future(value TEXT);")
+            .execute_batch("PRAGMA user_version=4; CREATE TABLE future(value TEXT);")
             .unwrap();
         drop(connection);
         assert!(Journal::open(&path).err().unwrap().contains("newer"));
@@ -301,7 +301,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let notices: i32 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name='notices'",
