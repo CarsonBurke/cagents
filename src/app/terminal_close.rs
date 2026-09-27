@@ -68,6 +68,8 @@ impl Cagents {
         self.terminal_close
             .as_ref()
             .is_some_and(|intent| intent.card == card && intent.pending)
+            || ended_terminal(self.card_state(card))
+                .is_some_and(|session| self.terminal_close_attempts.contains(&session.id))
     }
 
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
@@ -120,6 +122,31 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
+            if !self.terminal_close_attempts.insert(session.id) {
+                return Task::none();
+            }
+            return cosmic::task::future(async move {
+                let source = session.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let socket = crate::terminal::ensure_daemon_ready()
+                        .map_err(|error| error.to_string())?;
+                    let mut client =
+                        ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                    client
+                        .release_completed_terminal(source)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::CompletedTerminalClosed {
+                    card,
+                    session,
+                    result,
+                }
+            });
+        }
         if let Some(intent) = &self.terminal_close {
             // A silent close is still in flight. Preserve subsequent close
             // clicks until that card is settled, instead of dropping them.
@@ -392,8 +419,7 @@ impl Cagents {
                 if intent.active || intent.detail.is_some() {
                     self.core.set_keyboard_nav(intent.restore_keyboard_nav);
                 }
-                self.closed_terminal_cards.insert(intent.card);
-                return self.request_card_removal(intent.card);
+                return self.close_card_as(intent.card, allow_active, false);
             }
             self.terminal_close.as_mut().unwrap().detail =
                 Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
@@ -607,6 +633,46 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     #[test]
+    fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(7),
+                signal: None,
+                occurred_at_unix_ms: 0,
+            },
+        };
+        let source = session.clone();
+        let _pending = app.begin_card_close(card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.terminal_close_pending(card));
+        let _ = app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source.clone(),
+            result: Err("holder unavailable".into()),
+        });
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.terminal_close_pending(card));
+        let _pending = app.begin_card_close(card);
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!();
+        };
+        session.id = TerminalId::new();
+        let _ = app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source,
+            result: Ok(()),
+        });
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.closed_terminal_cards.contains(&card));
+    }
+
+    #[test]
     fn an_invisible_pending_close_does_not_block_the_whole_workspace() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -719,7 +785,12 @@ pub(super) fn close_hosted_terminal(
             TerminalContinuity::Exited { .. }
             | TerminalContinuity::RelaunchAvailable {
                 last_exit: Some(_), ..
-            } => return Ok(CloseOutcome::Closed),
+            } => {
+                client
+                    .release_completed_terminal(descriptor.session.clone())
+                    .map_err(|error| error.to_string())?;
+                return Ok(CloseOutcome::Closed);
+            }
             continuity if continuity.live_proof().as_ref() == Some(proof) => {}
             _ => return Ok(CloseOutcome::Stale),
         }

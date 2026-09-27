@@ -756,6 +756,45 @@ fn process_request(
                 .close_terminal_attention(terminal_id, Some(&handle));
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::ReleaseCompletedTerminal { session } => {
+            if !matches!(
+                session.continuity,
+                crate::model::TerminalContinuity::Exited { .. }
+                    | crate::model::TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            ) {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Only an ended terminal result may be retired",
+                    false,
+                ));
+            }
+            let handle = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                match state.terminals.get(&session.id) {
+                    None => None,
+                    Some(record)
+                        if record.session.launch == session.launch
+                            && record.handle.is_completed() =>
+                    {
+                        Some(record.handle.clone())
+                    }
+                    Some(_) => {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The terminal changed or still owns work; nothing was closed",
+                            false,
+                        ));
+                    }
+                }
+            };
+            if let Some(handle) = handle {
+                handle.shutdown().map_err(send_error)?;
+            }
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::CloseTerminalChecked {
             terminal_id,
             allow_active,
@@ -984,6 +1023,88 @@ mod tests {
     use super::*;
     use crate::model::TerminalId;
     use std::sync::Mutex;
+
+    #[test]
+    fn completed_release_refuses_live_or_changed_sessions() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalExit, TerminalSession,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("completed-release"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(proof)));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/cat".into();
+        recipe.arguments.clear();
+        let mut session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let handle = crate::terminal::TerminalHandle::spawn(
+            session.clone(),
+            crate::terminal::TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state
+                .finish_spawn(1, session.clone(), handle.clone(), true)
+                .unwrap();
+        }
+        session.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 0,
+            },
+        };
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal {
+                    session: session.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            !handle.is_completed(),
+            "a forged completed receipt cannot stop a running process"
+        );
+        handle.shutdown().unwrap();
+        let mut changed = session.clone();
+        changed.launch.arguments.push("different".into());
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal { session: changed }
+            )
+            .is_err()
+        );
+        assert!(
+            process_request(
+                &host,
+                1,
+                ClientRequest::ReleaseCompletedTerminal { session }
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {

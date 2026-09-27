@@ -32,6 +32,8 @@ pub struct TerminalConfig {
     /// Take over the terminal a previous daemon left to its holder, which
     /// waits on this socket, instead of starting the session's launch.
     pub adoption: Option<std::path::PathBuf>,
+    #[cfg(feature = "host")]
+    pub holder_recovery: Option<super::holder::Recovery>,
 }
 
 impl Default for TerminalConfig {
@@ -50,6 +52,8 @@ impl Default for TerminalConfig {
             transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
             adoption: None,
+            #[cfg(feature = "host")]
+            holder_recovery: None,
         }
     }
 }

@@ -1706,7 +1706,11 @@ fn close_sessions_in_scope(
             terminal.session.id,
             &terminal.session.launch.working_directory,
             &scope,
-        ) || matches!(
+        ) {
+            continue;
+        }
+        let id = terminal.session.id;
+        let result = if matches!(
             terminal.session.continuity,
             TerminalContinuity::Exited { .. }
                 | TerminalContinuity::RelaunchAvailable {
@@ -1714,16 +1718,18 @@ fn close_sessions_in_scope(
                     ..
                 }
         ) {
-            continue;
-        }
-        let id = terminal.session.id;
-        let result = client
-            .close_terminal_checked(id, true)
-            .map_err(|error| error.to_string())
-            .and_then(|outcome| match outcome {
-                crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                other => Err(format!("terminal {id} did not confirm close: {other:?}")),
-            });
+            client
+                .release_completed_terminal(terminal.session)
+                .map_err(|error| error.to_string())
+        } else {
+            client
+                .close_terminal_checked(id, true)
+                .map_err(|error| error.to_string())
+                .and_then(|outcome| match outcome {
+                    crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                })
+        };
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.

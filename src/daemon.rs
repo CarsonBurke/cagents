@@ -479,18 +479,47 @@ pub(crate) fn replacement_owner(
     socket: &Path,
     proof: &HostSessionProof,
 ) -> Result<u32, PlatformError> {
+    let pid = lease_owner(&socket.with_file_name("cagentsd.lock"), proof)?;
+    let stream = UnixStream::connect(socket)?;
+    let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credential and length are writable buffers of the declared size.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    if credential.uid != current_uid() || u32::try_from(credential.pid).ok() != Some(pid) {
+        return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
+    }
+    Ok(pid)
+}
+
+/// Validate the exclusive owner before its public listener exists. Holders use
+/// this during startup adoption, and compare it to the connecting peer's PID.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn lease_owner(
+    lock_path: &Path,
+    proof: &HostSessionProof,
+) -> Result<u32, PlatformError> {
     #[derive(Deserialize)]
     struct RecoveryMetadata {
         pid: u32,
         proof: HostSessionProof,
     }
 
-    let lock_path = socket.with_file_name("cagentsd.lock");
     let lock = OpenOptions::new()
         .read(true)
         .custom_flags(O_NOFOLLOW)
-        .open(&lock_path)?;
-    validate_lock_file(&lock_path, &lock.metadata()?, current_uid())?;
+        .open(lock_path)?;
+    validate_lock_file(lock_path, &lock.metadata()?, current_uid())?;
     // SAFETY: flock receives a live descriptor and no pointers.
     if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
         // SAFETY: this descriptor owns the lock just acquired.
@@ -506,25 +535,6 @@ pub(crate) fn replacement_owner(
         return Err(io::Error::other("daemon lease does not match its discovery proof").into());
     }
     let _pidfd = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
-    let stream = UnixStream::connect(socket)?;
-    let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: credential and length are valid writable buffers of the declared size.
-    if unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credential as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-    if credential.uid != current_uid() || u32::try_from(credential.pid).ok() != Some(metadata.pid) {
-        return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
-    }
     Ok(metadata.pid)
 }
 

@@ -686,6 +686,16 @@ impl ControlClient {
         self.finish_attachment(terminal_id, action)
     }
 
+    pub fn release_completed_terminal(
+        &mut self,
+        session: crate::model::TerminalSession,
+    ) -> Result<(), ControlError> {
+        match self.request(ClientRequest::ReleaseCompletedTerminal { session }, None)? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("completed terminal release", &response)),
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,

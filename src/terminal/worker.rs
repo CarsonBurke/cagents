@@ -2,7 +2,7 @@ mod carry;
 mod close_processes;
 #[cfg(test)]
 mod close_tests;
-mod holder;
+pub(crate) mod holder;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -85,6 +85,7 @@ enum Command {
         socket: PathBuf,
         reply: Sender<Result<Carried, String>>,
     },
+    PreserveForRestart(Sender<Result<(), String>>),
     ObserveAgentProcess(Sender<Option<AgentProcess>>),
     ApplyAgentActivity {
         process: AgentProcess,
@@ -192,6 +193,8 @@ struct PublishedState {
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
     conversation_title: Mutex<Option<String>>,
     completed: AtomicBool,
+    /// Final result ownership survives emulator teardown and daemon crashes.
+    retained_holder: Mutex<Option<holder::Holder>>,
     /// The newest generation a wake has already announced to the subscriber
     /// side of this protocol.
     ///
@@ -225,6 +228,7 @@ impl PublishedState {
             semantic_events: OnceLock::new(),
             conversation_title: Mutex::new(None),
             completed: AtomicBool::new(false),
+            retained_holder: Mutex::new(None),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
             wake,
@@ -648,6 +652,10 @@ impl TerminalHandle {
     /// Inspection and the close decision are one serialized PTY-owner command.
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
+        if self.is_completed() {
+            self.release_completed_holder();
+            return TerminalCloseResult::Closed;
+        }
         let (reply, result) = crossbeam_channel::bounded(1);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         if let Err(error) = self.try_command(Command::CloseChecked {
@@ -681,13 +689,61 @@ impl TerminalHandle {
     }
 
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
-        self.send_command(Command::Shutdown)?;
+        let sent = self.send_command(Command::Shutdown);
         if let Ok(mut worker) = self.inner.worker.lock()
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
         {
             let _ = worker.join();
         }
+        self.release_completed_holder();
+        if self.is_completed() { Ok(()) } else { sent }
+    }
+
+    fn release_completed_holder(&self) {
+        let holder = self
+            .inner
+            .published
+            .retained_holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(holder);
+    }
+
+    pub(crate) fn preserve_completed_for_restart(&self) {
+        let holder = self
+            .inner
+            .published
+            .retained_holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(mut holder) = holder {
+            holder.leave_for_successor();
+        }
+    }
+
+    /// Failed checkpoint restoration must never release an adopted registered
+    /// holder. Serialize with completion, then transfer any final retained
+    /// screen; a live parser that cannot serialize is honestly screen-lost.
+    pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        if self
+            .send_command(Command::PreserveForRestart(reply))
+            .is_ok()
+            && let Ok(result) = result.recv()
+        {
+            result?;
+        }
+        if let Ok(mut worker) = self.inner.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            worker
+                .join()
+                .map_err(|_| "terminal worker failed while preserving its holder")?;
+        }
+        self.preserve_completed_for_restart();
         Ok(())
     }
 
@@ -776,6 +832,7 @@ struct Worker {
 /// The thread that reads a terminal's PTY into its worker.
 struct Reader {
     thread: JoinHandle<()>,
+    start: Option<Sender<()>>,
     /// Closing this releases the reader, however long a read would block.
     wake: OwnedFd,
     done: Receiver<()>,
@@ -785,6 +842,18 @@ struct Reader {
 impl Reader {
     /// Starts reading `master`, delivering `pending` before anything it reads.
     fn start(
+        terminal_id: crate::model::TerminalId,
+        master: &holder::PtyMaster,
+        capacity: usize,
+        pending: Vec<u8>,
+    ) -> Result<Self, String> {
+        let mut reader = Self::prepare(terminal_id, master, capacity, pending)?;
+        reader.activate();
+        Ok(reader)
+    }
+
+    /// Allocate the reader without consuming PTY output until ownership commits.
+    fn prepare(
         terminal_id: crate::model::TerminalId,
         master: &holder::PtyMaster,
         capacity: usize,
@@ -809,19 +878,29 @@ impl Reader {
             let _ = pty_tx.send(PtyMessage::Bytes(pending));
         }
         let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
+        let (start, started) = crossbeam_channel::bounded(1);
         let thread = thread::Builder::new()
             .name(format!("terminal-pty-reader-{terminal_id:?}"))
             .spawn(move || {
                 let _done = done_tx;
-                read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+                if started.recv().is_ok() {
+                    read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+                }
             })
             .map_err(|error| format!("start PTY reader: {error}"))?;
         Ok(Self {
             thread,
+            start: Some(start),
             wake,
             done,
             output,
         })
+    }
+
+    fn activate(&mut self) {
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
     }
 }
 
@@ -907,34 +986,51 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (held, output) = match &config.adoption {
-            Some(socket) => {
-                let adopted = holder::adopt(socket, child_exit_tx)?;
-                // Drawing the screen again is not news, except for the title
-                // it sets: whatever it provoked, a reply or a bell, happened
-                // when its predecessor drew it.
-                terminal.vt_write(&adopted.screen);
-                effects
-                    .borrow_mut()
-                    .retain(|effect| matches!(effect, Effect::Title(_)));
-                (adopted.held, adopted.output)
-            }
-            None => {
-                let environment = crate::account::Account::PROVIDERS
-                    .into_iter()
-                    .filter_map(|provider| {
-                        let name = crate::account::home_variable(provider)?;
-                        Some((name.to_owned(), command.get_env(name)?.to_str()?.to_owned()))
-                    })
-                    .collect();
-                let _account = crate::account::registry::authorize_spawn(&environment, None)
-                    .map_err(|error| error.to_string())?;
-                (
-                    holder::spawn(command, pty_size(current_size), child_exit_tx)?,
-                    Vec::new(),
-                )
-            }
-        };
+        let (mut held, output) =
+            match &config.adoption {
+                Some(socket) => {
+                    let adopted = holder::adopt_recoverable(
+                        socket,
+                        child_exit_tx,
+                        config.holder_recovery.clone(),
+                    )?;
+                    // Drawing the screen again is not news, except for the title
+                    // it sets: whatever it provoked, a reply or a bell, happened
+                    // when its predecessor drew it.
+                    terminal.vt_write(&adopted.screen);
+                    effects
+                        .borrow_mut()
+                        .retain(|effect| matches!(effect, Effect::Title(_)));
+                    if adopted.screen_lost {
+                        // A crash has no emulator snapshot. Nudge full-screen
+                        // clients to redraw on their surviving controlling PTY.
+                        adopted.held.master.request_redraw().map_err(|error| {
+                            format!("request surviving terminal redraw: {error}")
+                        })?;
+                    }
+                    (adopted.held, adopted.output)
+                }
+                None => {
+                    let environment = crate::account::Account::PROVIDERS
+                        .into_iter()
+                        .filter_map(|provider| {
+                            let name = crate::account::home_variable(provider)?;
+                            Some((name.to_owned(), command.get_env(name)?.to_str()?.to_owned()))
+                        })
+                        .collect();
+                    let _account = crate::account::registry::authorize_spawn(&environment, None)
+                        .map_err(|error| error.to_string())?;
+                    (
+                        holder::spawn_recoverable(
+                            command,
+                            pty_size(current_size),
+                            child_exit_tx,
+                            config.holder_recovery.clone(),
+                        )?,
+                        Vec::new(),
+                    )
+                }
+            };
         // The holder reaps the root, so its pid identifies it only while the
         // pidfd still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.
@@ -949,7 +1045,7 @@ impl Worker {
         let writer = File::from(duplicate("writing")?);
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
-        let reader = Reader::start(session.id, &held.master, config.pty_capacity, output)?;
+        let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
 
         let transcript = session
             .transcript_path
@@ -975,6 +1071,8 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
+        held.holder.commit_adoption()?;
+        reader.activate();
 
         let events = Arc::new(events);
         let _ = published.semantic_events.set(Arc::downgrade(&events));
@@ -1158,9 +1256,22 @@ impl Worker {
                 intentional,
             });
         }
+        if !shutting_down && exited && self.holder.registered() {
+            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+                .and_then(|screen| self.holder.cache_screen(&screen))
+            {
+                self.error("retain completed terminal screen", error);
+            }
+            *self
+                .published
+                .retained_holder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.holder);
+        } else {
+            drop(self.holder);
+        }
         drop(self.writer);
         drop(self.master);
-        drop(self.holder);
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
     }
@@ -1347,6 +1458,18 @@ impl Worker {
                 let succeeded = carried.is_ok();
                 let _ = reply.send(carried);
                 return succeeded;
+            }
+            Command::PreserveForRestart(reply) => {
+                if !self.holder.registered() {
+                    let _ = reply.send(Err(
+                        "legacy terminal has no persistent holder endpoint".into()
+                    ));
+                    return false;
+                }
+                self.carried = true;
+                self.holder.leave_for_successor();
+                let _ = reply.send(Ok(()));
+                return true;
             }
             Command::ObserveAgent(sender) => {
                 self.refresh_resume_hint(true);
@@ -2692,7 +2815,7 @@ mod tests {
         fs,
         os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use tempfile::tempdir;
@@ -2794,6 +2917,206 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn completed_worker_survives_two_daemon_crashes_without_relaunching() {
+        const FIXTURE: &str = "CAGENTS_COMPLETED_WORKER_FIXTURE";
+        const STAGE: &str = "CAGENTS_COMPLETED_WORKER_STAGE";
+        if let Some(directory) = std::env::var_os(FIXTURE) {
+            let directory = PathBuf::from(directory);
+            let stage = std::env::var(STAGE).unwrap();
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new(format!("worker-{stage}")),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: crate::model::HostIncarnation::new(format!("worker-{stage}")),
+            };
+            let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+            let holders = paths.directory.join("holders");
+            let (mut recovery, adoption) = if stage == "0" {
+                let mut source = shell_session(
+                    "echo launched >> \"$LAUNCH_COUNT\"; echo completed-worker-result; exit 7",
+                );
+                source.launch.environment.insert(
+                    "LAUNCH_COUNT".into(),
+                    directory.join("launches").to_string_lossy().into_owned(),
+                );
+                (
+                    crate::terminal::holder::Recovery {
+                        source,
+                        previous_sources: Vec::new(),
+                        relaunches: Vec::new(),
+                        options: crate::terminal::TerminalSpawnOptions::default(),
+                        execution_environment: None,
+                    },
+                    None,
+                )
+            } else {
+                let records = crate::terminal::holder::discover(&holders, &proof.boot_id).unwrap();
+                assert_eq!(records.len(), 1);
+                let socket = crate::terminal::holder::socket(&holders, records[0].terminal);
+                let (mut recovery, lost) = holder::inspect(&socket, &records[0], &proof).unwrap();
+                assert!(
+                    !lost,
+                    "a completed parser saved its final screen before the crash"
+                );
+                recovery.previous_sources.push(recovery.source.clone());
+                (recovery, Some(socket))
+            };
+            recovery.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            };
+            let handle = TerminalHandle::spawn(
+                recovery.source.clone(),
+                TerminalConfig {
+                    holder_recovery: Some(recovery),
+                    adoption,
+                    ..TerminalConfig::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+            wait_for_text(&handle, "completed-worker-result");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !handle.is_completed() {
+                assert!(Instant::now() < deadline, "worker did not finish");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                handle
+                    .events()
+                    .try_iter()
+                    .any(|event| matches!(event, TerminalEvent::Completed { exit_code: 7, .. }))
+            );
+            assert!(
+                handle
+                    .inner
+                    .published
+                    .retained_holder
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join("launches")).unwrap(),
+                "launched\n"
+            );
+            if stage == "1" {
+                // Failed restore cleanup can race a worker that has already
+                // completed. Its disconnected command path still joins and
+                // preserves the final holder instead of releasing it.
+                handle.preserve_for_restart().unwrap();
+            }
+            if stage == "2" {
+                handle.shutdown().unwrap();
+                assert!(
+                    crate::terminal::holder::discover(
+                        &holders,
+                        &crate::daemon::read_boot_id().unwrap()
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                return;
+            }
+            fs::write(directory.join(format!("ready-{stage}")), "ready").unwrap();
+            loop {
+                thread::park();
+            }
+        }
+
+        struct Cleanup {
+            daemon: Option<std::process::Child>,
+            records: Vec<crate::terminal::holder::Record>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(child) = self.daemon.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                for record in &self.records {
+                    if record.holder.is_current() {
+                        // Exact start identity was checked, and this test alone owns the holder.
+                        unsafe {
+                            libc::kill(record.holder.pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+        let directory = tempdir().unwrap();
+        let holders = directory
+            .path()
+            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join("holders");
+        let mut cleanup = Cleanup {
+            daemon: None,
+            records: Vec::new(),
+        };
+        for stage in 0..3 {
+            cleanup.daemon = Some(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::worker::tests::completed_worker_survives_two_daemon_crashes_without_relaunching", "--nocapture"])
+                .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", directory.path())
+                .env("XDG_RUNTIME_DIR", directory.path()).env(FIXTURE, directory.path())
+                .env(STAGE, stage.to_string()).spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            if stage == 2 {
+                loop {
+                    if let Some(status) = cleanup.daemon.as_mut().unwrap().try_wait().unwrap() {
+                        assert!(status.success());
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "completed cleanup did not finish"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                while !directory.path().join(format!("ready-{stage}")).exists() {
+                    assert!(
+                        cleanup
+                            .daemon
+                            .as_mut()
+                            .unwrap()
+                            .try_wait()
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "completed worker did not become ready"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let records = crate::terminal::holder::discover(
+                    &holders,
+                    &crate::daemon::read_boot_id().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(records.len(), 1);
+                if stage == 0 {
+                    cleanup.records = records.clone();
+                }
+                assert_eq!(records[0], cleanup.records[0]);
+                cleanup.daemon.as_mut().unwrap().kill().unwrap();
+                cleanup.daemon.as_mut().unwrap().wait().unwrap();
+            }
+            cleanup.daemon = None;
+        }
+        assert_eq!(
+            fs::read_to_string(directory.path().join("launches")).unwrap(),
+            "launched\n"
+        );
+        assert!(
+            crate::terminal::holder::discover(&holders, &crate::daemon::read_boot_id().unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -270,7 +270,7 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
 }
 
 #[cfg(feature = "host")]
-fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
+pub(crate) fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
     let stat = std::str::from_utf8(stat).ok()?;
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
     let group = fields.nth(2)?.parse().ok()?;

@@ -8,6 +8,9 @@ use crate::{
 };
 
 pub(super) struct RecoveredTerminal {
+    /// An authenticated held terminal may have completed while orphaned. Attach
+    /// its final grid and exit status instead of launching its recipe again.
+    pub(super) attach_completed: bool,
     pub(super) session: TerminalSession,
     pub(super) expected_host: Option<HostSessionProof>,
     pub(super) recovery_lease: Option<crate::daemon::RecoveryLease>,
@@ -50,6 +53,7 @@ pub(super) fn reconcile(
 ) -> Result<RecoveredTerminal, String> {
     if session.continuity.live_proof().is_none() {
         return Ok(RecoveredTerminal {
+            attach_completed: false,
             session,
             expected_host: None,
             recovery_lease: None,
@@ -95,6 +99,7 @@ fn reconcile_at(
             )?;
         if terminal.session.continuity.can_resume_live(&expected) {
             return Ok(RecoveredTerminal {
+                attach_completed: false,
                 session: terminal.session.clone(),
                 expected_host: Some(expected),
                 recovery_lease,
@@ -120,14 +125,19 @@ fn reconcile_at(
                 source.id == session.id
                     && source.launch == session.launch
                     && source.continuity.live_proof().as_ref() == Some(&expected)
-            }) && terminal.session.continuity.can_resume_live(&proof)
+            }) && (terminal.session.continuity.can_resume_live(&proof)
+                || matches!(
+                    &terminal.session.continuity,
+                    crate::model::TerminalContinuity::RelaunchAvailable { .. }
+                ))
         })
     {
         crate::daemon::replacement_owner(socket, &proof)
             .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
-        // Only the replacement daemon's committed checkpoint can authorize
-        // adopting a new process. Ordinary ID coincidence remains forbidden.
+        // A committed checkpoint or authenticated holder receipt authorizes
+        // this exact lineage. Ordinary ID coincidence remains forbidden.
         return Ok(RecoveredTerminal {
+            attach_completed: !restored.session.continuity.can_resume_live(&proof),
             session: restored.session.clone(),
             expected_host: Some(proof),
             recovery_lease,
@@ -158,6 +168,7 @@ fn reconcile_at(
         crate::daemon::replacement_owner(socket, &proof)
             .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
         return Ok(RecoveredTerminal {
+            attach_completed: false,
             session: restored.session.clone(),
             expected_host: Some(proof),
             recovery_lease,
@@ -193,6 +204,7 @@ fn reconcile_at(
         }
         if candidate.session.continuity.can_resume_live(&proof) {
             return Ok(RecoveredTerminal {
+                attach_completed: false,
                 session: candidate.session.clone(),
                 expected_host: Some(proof),
                 recovery_lease,
@@ -257,6 +269,7 @@ fn reconcile_at(
         last_exit: None,
     };
     Ok(RecoveredTerminal {
+        attach_completed: false,
         session: replacement,
         expected_host: Some(proof),
         recovery_lease,
@@ -460,6 +473,25 @@ mod tests {
         let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
         server.join().unwrap();
         assert_eq!(recovered.session, restored);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn completed_holder_lineage_attaches_the_result_instead_of_replaying_the_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("replacement");
+        let original = session(directory.path(), &proof("old"));
+        let _lease = lease(directory.path(), &owner);
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(original.id, original.launch.clone(), None);
+        descriptor.upgrade_sources = vec![original.clone()];
+        // The final worker grid may precede the asynchronously delivered exit
+        // event. Its completed descriptor still authorizes attachment only.
+        let server = discovery(&socket, owner.clone(), vec![descriptor], 1);
+        let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert!(recovered.attach_completed);
         assert_eq!(recovered.expected_host, Some(owner));
     }
 

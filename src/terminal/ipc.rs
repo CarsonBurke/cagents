@@ -84,6 +84,8 @@ use crate::{
 /// terminal descriptors; postcard fields require a matched daemon and UI.
 /// Version 23 carries explicit environment removals in launch recipes.
 /// Version 24 adds provider-confirmed account recovery and removed-account errors.
+/// Version 25 reports screen loss after authenticated crash adoption and adds
+/// exact-recipe cleanup for retained completed terminals.
 /// Version 26 adds daemon-owned durable lifecycle attention and notification control.
 pub const PROTOCOL_VERSION: u16 = 26;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
@@ -258,6 +260,11 @@ pub enum ClientRequest {
     CloseTerminalChecked {
         terminal_id: TerminalId,
         allow_active: bool,
+    },
+    /// Retires only an already completed result with the exact saved recipe.
+    /// This grants no authority to stop a live replacement.
+    ReleaseCompletedTerminal {
+        session: TerminalSession,
     },
     /// Rearm hidden output observation without granting presentation credit.
     TerminalAcknowledge {
@@ -725,6 +732,9 @@ pub enum ProtocolErrorCode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TerminalDescriptor {
+    /// The process survived an unplanned daemon loss, but its old screen did not.
+    #[serde(default)]
+    pub screen_lost_after_crash: bool,
     pub session: TerminalSession,
     pub generation: u64,
     pub event_sequence: u64,
@@ -771,6 +781,7 @@ impl TerminalDescriptor {
                 },
             },
             generation: 0,
+            screen_lost_after_crash: false,
             event_sequence: 0,
             oldest_event_sequence: 1,
             attached: false,

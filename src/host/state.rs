@@ -49,6 +49,7 @@ pub(crate) type ClientId = u64;
 pub(crate) type SharedHost = Arc<Mutex<HostState>>;
 
 pub(crate) struct TerminalRecord {
+    screen_lost_after_crash: bool,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
@@ -201,6 +202,7 @@ impl Subscriptions {
 }
 
 pub(crate) struct HostState {
+    recover_holders: bool,
     /// Shared, never mutated: a redraw broadcast hands the same proof to every
     /// subscriber's queue, and cloning three `String`s per subscriber per frame
     /// made per-frame allocation scale with the number of attached views.
@@ -261,8 +263,12 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    pub(super) fn enable_holder_recovery(&mut self) {
+        self.recover_holders = true;
+    }
     pub(crate) fn new(proof: HostSessionProof) -> Self {
         Self {
+            recover_holders: false,
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -782,6 +788,7 @@ impl HostState {
             }
         };
         Ok(TerminalDescriptor {
+            screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),
             agent_activity: record.handle.agent_activity(),
@@ -953,6 +960,7 @@ impl HostState {
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
+                screen_lost_after_crash: false,
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
@@ -1815,6 +1823,25 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
     else {
         return Ok(());
     };
+    // Completed workers have already cached their final screen in their holder.
+    // They are not relaunched from the checkpoint, but remain discoverable even
+    // if another checkpoint component prevents this replacement from starting.
+    let restarting = checkpoint
+        .terminals
+        .iter()
+        .map(|terminal| terminal.source.id)
+        .collect::<BTreeSet<_>>();
+    let completed = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .terminals
+        .values()
+        .filter(|record| record.handle.is_completed() && !restarting.contains(&record.session.id))
+        .map(|record| record.handle.clone())
+        .collect::<Vec<_>>();
+    for handle in completed {
+        handle.preserve_completed_for_restart();
+    }
     for terminal in &mut frozen {
         terminal.stop()?;
     }
@@ -1926,6 +1953,20 @@ fn carry_terminals(
             }
             Err(error) => error,
         };
+        // Completion can race the carry, or VT serialization can fail while
+        // its process still runs. A registered holder can keep either result
+        // without converting ownership into permission to execute a recipe.
+        if crate::terminal::holder::evidence(&holder_socket(holders, id))
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.holder.is_current())
+            && handle.preserve_for_restart().is_ok()
+        {
+            tracing::warn!(terminal = %id, %error,
+                "upgrade preserves the registered holder without a new parser snapshot");
+            carried.push(terminal);
+            continue;
+        }
         let fallback = handle.prepare_upgrade().and_then(|snapshot| {
             let mut source = terminal.source.clone();
             source.resume_hint.clone_from(&snapshot.hint);
@@ -1994,6 +2035,69 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
         std::path::Path::new("/proc"),
         holder_directory().ok().as_deref(),
     )
+}
+
+/// A holder's private record is discovery only. The live holder must return
+/// matching process evidence and the previous daemon's issued lineage before
+/// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
+pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
+    let directory = crate::terminal::holder::directory()?;
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    let records = crate::terminal::holder::discover(&directory, &proof.boot_id)?;
+    for record in records {
+        if crate::daemon::termination_requested() {
+            break;
+        }
+        if host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .terminals
+            .contains_key(&record.terminal)
+        {
+            continue;
+        }
+        let socket = crate::terminal::holder::socket(&directory, record.terminal);
+        let restored = (|| {
+            let (recovery, screen_lost) =
+                crate::terminal::inspect_holder(&socket, &record, &proof)?;
+            let source = recovery.source.clone();
+            let previous_sources = recovery.previous_sources.clone();
+            let relaunches = recovery.relaunches.clone();
+            let mut session = source.clone();
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.clone(),
+                last_exit: None,
+            };
+            start_terminal_view(
+                host,
+                0,
+                session,
+                recovery.options.clone(),
+                recovery.execution_environment.clone(),
+                false,
+                Some(socket.clone()),
+                Some(recovery),
+            )
+            .map_err(|error| error.message)?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .adopt_upgrade_lineage(&source, &previous_sources, &relaunches)
+                .map_err(|error| error.message)?;
+            if let Some(terminal) = state.terminals.get_mut(&record.terminal) {
+                terminal.screen_lost_after_crash = screen_lost;
+                terminal.session.resume_hint = source.resume_hint;
+            }
+            Ok::<_, String>(())
+        })();
+        if let Err(error) = restored {
+            tracing::warn!(terminal = %record.terminal, %error, "could not adopt orphaned terminal; preserved its holder");
+        }
+    }
+    Ok(())
 }
 
 /// Sentinel restore failure for an operator-requested stop; see
@@ -2179,6 +2283,48 @@ fn adopt_carried_terminal(
     if let Some(holders) = holders {
         let socket = holder_socket(holders, id);
         for attempt in 1..=ADOPTION_ATTEMPTS {
+            let previous = (|| {
+                if let Some(record) = crate::terminal::holder::evidence(&socket)? {
+                    let proof = host
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .proof()
+                        .clone();
+                    let (recovery, screen_lost) =
+                        crate::terminal::inspect_holder(&socket, &record, &proof)?;
+                    // A failed prior restore may already have rotated the
+                    // holder's owner. Preserve that intermediate receipt too.
+                    if !std::iter::once(&recovery.source)
+                        .chain(&recovery.previous_sources)
+                        .any(|source| {
+                            source.id == terminal.source.id
+                                && source.launch == terminal.source.launch
+                                && source.continuity.live_proof()
+                                    == terminal.source.continuity.live_proof()
+                        })
+                    {
+                        return Err("holder does not retain the checkpoint's issued lineage".into());
+                    }
+                    return Ok((recovery, screen_lost));
+                }
+                Ok::<_, String>((
+                    crate::terminal::holder::Recovery {
+                        source: terminal.source.clone(),
+                        previous_sources: terminal.previous_sources.clone(),
+                        relaunches: terminal.relaunches.clone(),
+                        options: terminal.options.clone(),
+                        execution_environment: None,
+                    },
+                    false,
+                ))
+            })();
+            let (previous, screen_lost) = match previous {
+                Ok(previous) => previous,
+                Err(failure) => {
+                    error = failure;
+                    break;
+                }
+            };
             let mut session = terminal.source.clone();
             session.continuity = TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
@@ -2188,13 +2334,17 @@ fn adopt_carried_terminal(
                 host,
                 0,
                 session,
-                terminal.options.clone(),
-                None,
+                previous.options.clone(),
+                previous.execution_environment.clone(),
                 false,
                 Some(socket.clone()),
+                Some(previous.clone()),
             ) {
                 Ok(_) => {
                     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(record) = state.terminals.get_mut(&id) {
+                        record.screen_lost_after_crash = screen_lost;
+                    }
                     // The worker learns a conversation's identity only from
                     // output it sees, which the previous daemon already saw.
                     if let Some(record) = state.terminals.get_mut(&id)
@@ -2206,9 +2356,9 @@ fn adopt_carried_terminal(
                             .clone_from(&terminal.source.resume_hint);
                     }
                     if let Err(error) = state.adopt_upgrade_lineage(
-                        &terminal.source,
-                        &terminal.previous_sources,
-                        &terminal.relaunches,
+                        &previous.source,
+                        &previous.previous_sources,
+                        &previous.relaunches,
                     ) {
                         tracing::warn!(terminal = %id, error = %error.message,
                             "adopted a carried terminal but could not record its lineage");
@@ -2224,6 +2374,22 @@ fn adopt_carried_terminal(
                 break;
             }
             thread::sleep(ADOPTION_RETRY);
+        }
+        // A completed root is absent from the process scan, but its live
+        // registered holder still owns the result. Adoption failure must not
+        // reinterpret that result as permission to execute its recipe again.
+        match crate::terminal::holder::evidence(&socket) {
+            Ok(Some(record)) if record.holder.is_current() => {
+                tracing::warn!(terminal = %id, %error,
+                    "registered holder still owns this terminal; recipe fallback is refused");
+                return false;
+            }
+            Err(evidence_error) => {
+                tracing::warn!(terminal = %id, %error, %evidence_error,
+                    "holder ownership could not be validated; recipe fallback is refused");
+                return false;
+            }
+            _ => {}
         }
     }
     let recipe = match crate::upgrade::checkpoint_recipe(&terminal.source, &terminal.relaunches) {
@@ -2286,11 +2452,17 @@ fn close_failed_restore(
                 .terminals
                 .get(&id)
                 .map(|record| record.handle.clone());
-            if let Some(handle) = handle
-                && let Err(error) = handle.carry(holder_socket(holders, id))
-            {
-                tracing::warn!(terminal = %id, %error,
-                    "could not return an adopted terminal to its holder after a failed restore");
+            if let Some(handle) = handle {
+                if handle.is_completed() {
+                    handle.preserve_completed_for_restart();
+                } else if let Err(error) = handle.carry(holder_socket(holders, id)) {
+                    tracing::warn!(terminal = %id, %error,
+                        "could not return an adopted terminal to its holder after a failed restore");
+                    // Completion can race the carry request. Synchronize with
+                    // teardown before taking its final holder, or deliberately
+                    // orphan the still-live registered PTY without a screen.
+                    handle.preserve_for_restart()?;
+                }
             }
         }
     }
@@ -2370,6 +2542,7 @@ pub(super) fn spawn_terminal_view(
         execution_environment,
         paired,
         None,
+        None,
     )
 }
 
@@ -2383,6 +2556,7 @@ fn start_terminal_view(
     mut execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     paired: bool,
     adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -2392,7 +2566,7 @@ fn start_terminal_view(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
-    {
+    let holder_recovery = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2412,7 +2586,29 @@ fn start_terminal_view(
                 return Err(error);
             }
         }
-    }
+        state.recover_holders.then(|| {
+            let mut source = session.clone();
+            source.continuity = TerminalContinuity::DetachedSameBoot {
+                host_session_id: state.proof.host_session_id.clone(),
+                boot_id: state.proof.boot_id.clone(),
+                host_incarnation: state.proof.host_incarnation.clone(),
+            };
+            let (previous_sources, relaunches) = previous
+                .map(|previous| {
+                    let mut sources = previous.previous_sources;
+                    sources.push(previous.source);
+                    (sources, previous.relaunches)
+                })
+                .unwrap_or_default();
+            crate::terminal::holder::Recovery {
+                source,
+                previous_sources,
+                relaunches,
+                options: options.clone(),
+                execution_environment: retained_environment.clone(),
+            }
+        })
+    };
 
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
@@ -2425,6 +2621,7 @@ fn start_terminal_view(
         theme: options.theme,
         execution_environment,
         adoption,
+        holder_recovery,
         ..TerminalConfig::default()
     };
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
@@ -3555,7 +3752,7 @@ for line in sys.stdin:
             },
         };
         let chat = source.id;
-        let mut retain = |deadline| {
+        let retain = |deadline| {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             state.chat_handoffs.insert(
                 chat,

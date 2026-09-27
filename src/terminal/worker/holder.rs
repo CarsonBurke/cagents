@@ -10,9 +10,9 @@
 //! directly, so no terminal byte is ever relayed. The holder only reaps the
 //! root, reports its wait status, and waits to be released.
 //!
-//! A holder that loses its daemon without being released releases itself. Its
-//! master closes with it, which hangs the terminal up exactly as the daemon's
-//! own exit did before holders existed.
+//! A discoverable holder that loses its daemon buffers output and waits for a
+//! successor. Explicit release still hangs up the terminal. Older anonymous
+//! holders retain their original release-on-disconnect behavior.
 //!
 //! A daemon that is being replaced can instead [detach](Holder::detach) a
 //! holder. The holder then keeps its terminal running, holds the output that
@@ -45,12 +45,13 @@ use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{ChildExit, close_processes::signal};
+use crate::terminal::holder::{self as registry, Record, Recovery};
 
 /// The argument that makes an image serve as a holder. Deliberately not a
 /// word a test filter or a person would type.
 const ARGUMENT: &str = "--cagents-terminal-holder";
 /// Protocol 1 holders could not be detached.
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 /// The holders a daemon can adopt: any that speak detaching.
 const ADOPTABLE: std::ops::RangeInclusive<u32> = 2..=PROTOCOL;
 /// A spawn request carries the root's whole environment; nothing legitimate
@@ -71,9 +72,8 @@ const RELEASE_SETTLE: Duration = Duration::from_millis(100);
 
 /// What process listings show for a holder, within the kernel's 15 bytes.
 const PROCESS_NAME: &std::ffi::CStr = c"cagents-holder";
-/// How long a detached holder waits for a successor before it hangs its
-/// terminal up. A replacement daemon adopts within seconds; this bounds a
-/// replacement that never comes, without stranding the terminal forever.
+/// Grace period for anonymous legacy handoffs. Registered holders retain
+/// their live processes or completed result until explicit release.
 const ADOPTION_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Output a detached holder keeps for its successor. Past this it stops
 /// reading, so the terminal's writers block rather than lose anything.
@@ -93,10 +93,16 @@ enum Request {
         /// from its own image, so a binary encoding cannot straddle versions.
         command: String,
         size: PtySize,
+        #[serde(default)]
+        recovery: Option<Recovery>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
     Release,
+    /// Final bounded emulator image, retained only after the root exits.
+    CacheScreen { screen: String, screen_lost: bool },
+    /// The successor allocated its parser and can now own the replay bytes.
+    CommitAdoption,
     /// The daemon is going away without ending the terminal. The holder
     /// listens on `socket` for a successor and answers [`Report::Detached`].
     Detach {
@@ -107,11 +113,20 @@ enum Request {
     },
     /// A successor, connected to a detached holder's socket, takes the
     /// terminal over. Answered with [`Report::Attached`].
-    Attach { protocol: u32 },
+    Inspect {
+        proof: crate::model::HostSessionProof,
+    },
+    Attach {
+        protocol: u32,
+        #[serde(default)]
+        recovery: Option<Recovery>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Report {
+    ScreenCached,
+    AdoptionCommitted,
     /// Carries the PTY master, then a pidfd for the root.
     Started {
         protocol: u32,
@@ -124,6 +139,11 @@ enum Report {
     },
     /// The holder listens for a successor; this connection ends here.
     Detached,
+    Inspected {
+        record: Record,
+        recovery: Recovery,
+        screen_lost: bool,
+    },
     /// Carries the PTY master, then a pidfd for the root, to a successor.
     Attached {
         protocol: u32,
@@ -135,6 +155,8 @@ enum Report {
         /// Output that arrived while detached, base64. Output after it is
         /// still unread on the terminal.
         output: String,
+        #[serde(default)]
+        screen_lost: bool,
     },
 }
 
@@ -147,10 +169,20 @@ pub(super) struct Held {
 
 /// Starts a holder that spawns `command` on a new PTY of `size`. The root's
 /// exit is delivered to `exits`, once.
+#[cfg(test)]
 pub(super) fn spawn(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
+) -> Result<Held, String> {
+    spawn_recoverable(command, size, exits, None)
+}
+
+pub(super) fn spawn_recoverable(
+    command: CommandBuilder,
+    size: PtySize,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
 ) -> Result<Held, String> {
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
@@ -191,6 +223,7 @@ pub(super) fn spawn(
     // The holder is this daemon's unreaped child until `Holder` reaps it.
     let pidfd = open_pidfd(process.id() as libc::pid_t);
     let mut holder = Holder::new(control, Some(process));
+    holder.registered = recovery.is_some();
     holder.pidfd = Some(pidfd.map_err(|error| format!("watch terminal holder: {error}"))?);
 
     let command = postcard::to_stdvec(&command)
@@ -200,7 +233,17 @@ pub(super) fn spawn(
         .control
         .set_read_timeout(Some(START_TIMEOUT))
         .and_then(|()| holder.control.set_write_timeout(Some(START_TIMEOUT)))
-        .and_then(|()| send(&holder.control, &Request::Spawn { command, size }, &[]))
+        .and_then(|()| {
+            send(
+                &holder.control,
+                &Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                },
+                &[],
+            )
+        })
         .and_then(|()| receive::<Report>(&holder.control))
         .and_then(|report| {
             holder.control.set_read_timeout(None)?;
@@ -240,16 +283,32 @@ pub(super) struct Adopted {
     /// Output that followed that screen, which precedes anything still
     /// unread on the terminal.
     pub(super) output: Vec<u8>,
+    pub(super) screen_lost: bool,
 }
 
 /// Takes over the terminal of a holder a previous daemon
 /// [detached](Holder::detach) onto `socket`. A root that exited meanwhile
 /// has its exit delivered to `exits` straight away.
-pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, String> {
+#[cfg(test)]
+fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, String> {
+    adopt_recoverable(socket, exits, None)
+}
+
+pub(super) fn adopt_recoverable(
+    socket: &Path,
+    exits: Sender<ChildExit>,
+    recovery: Option<Recovery>,
+) -> Result<Adopted, String> {
+    let evidence = registry::evidence(socket)?;
     let failed =
         |error: io::Error| format!("adopt terminal holder at {}: {error}", socket.display());
     let control = UnixStream::connect(socket).map_err(failed)?;
     let peer = peer_credentials(&control).map_err(failed)?;
+    if evidence.as_ref().is_some_and(|record| {
+        peer.pid != record.holder.pid || !record.holder.is_current() || recovery.is_none()
+    }) {
+        return Err("holder adoption requires matching live process evidence and lineage".into());
+    }
     // SAFETY: getuid cannot fail.
     if peer.uid != unsafe { libc::getuid() } {
         return Err(format!(
@@ -259,6 +318,8 @@ pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, 
     }
     let pidfd = peer_pidfd(&control, peer.pid).map_err(failed)?;
     let mut holder = Holder::new(control, None);
+    // A refused or malformed handshake grants no authority to release it.
+    holder.detached = true;
     holder.pidfd = Some(pidfd);
     let attached = holder
         .control
@@ -266,7 +327,10 @@ pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, 
         .and_then(|()| {
             send(
                 &holder.control,
-                &Request::Attach { protocol: PROTOCOL },
+                &Request::Attach {
+                    protocol: PROTOCOL,
+                    recovery,
+                },
                 &[],
             )
         })
@@ -284,6 +348,7 @@ pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, 
         exited,
         screen,
         output,
+        screen_lost,
     } = report
     else {
         return Err(format!(
@@ -297,6 +362,11 @@ pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, 
             socket.display()
         ));
     }
+    if evidence.as_ref().is_some_and(|record| {
+        record.root.pid != pid || (exited.is_none() && !record.root.is_current())
+    }) {
+        return Err("holder root process no longer matches discovery evidence".into());
+    }
     let decode = |encoded: String| {
         STANDARD
             .decode(encoded)
@@ -304,10 +374,15 @@ pub(super) fn adopt(socket: &Path, exits: Sender<ChildExit>) -> Result<Adopted, 
     };
     let (screen, output) = (decode(screen)?, decode(output)?);
     holder.protocol = protocol;
+    holder.detached = false;
+    holder.adoption_pending = evidence.is_some();
+    holder.registered = evidence.is_some();
+    holder.screen_lost = screen_lost;
     Ok(Adopted {
         held: watched(holder, pid, descriptors, exited, exits)?,
         screen,
         output,
+        screen_lost,
     })
 }
 
@@ -386,6 +461,9 @@ fn watch(
                 let _ = acknowledge.try_send(Ok(()));
                 return;
             }
+            Ok(Some((Report::ScreenCached | Report::AdoptionCommitted, _))) => {
+                let _ = acknowledge.try_send(Ok(()));
+            }
             Ok(Some((Report::Failed(message), _))) => {
                 let _ = acknowledge.try_send(Err(message));
             }
@@ -443,9 +521,62 @@ pub(super) struct Holder {
     /// The holder's answer to a detach, relayed by the watch.
     acknowledged: Option<Receiver<Result<(), String>>>,
     detached: bool,
+    adoption_pending: bool,
+    registered: bool,
+    screen_lost: bool,
 }
 
 impl Holder {
+    pub(super) fn registered(&self) -> bool {
+        self.registered
+    }
+
+    pub(super) fn leave_for_successor(&mut self) {
+        self.detached = true;
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(super) fn cache_screen(&mut self, screen: &[u8]) -> Result<(), String> {
+        if !self.registered || screen.len() > MAX_SCREEN {
+            return Err("completed holder screen is not retainable".into());
+        }
+        self.control
+            .set_write_timeout(Some(HANDOVER_TIMEOUT))
+            .and_then(|()| {
+                send(
+                    &self.control,
+                    &Request::CacheScreen {
+                        screen: STANDARD.encode(screen),
+                        screen_lost: self.screen_lost,
+                    },
+                    &[],
+                )
+            })
+            .and_then(|()| self.control.set_write_timeout(None))
+            .map_err(|error| error.to_string())?;
+        self.acknowledged
+            .as_ref()
+            .ok_or("holder acknowledgement unavailable")?
+            .recv_timeout(HANDOVER_TIMEOUT)
+            .map_err(|error| error.to_string())?
+    }
+    pub(super) fn commit_adoption(&mut self) -> Result<(), String> {
+        if !self.adoption_pending {
+            return Ok(());
+        }
+        self.control
+            .set_write_timeout(Some(HANDOVER_TIMEOUT))
+            .and_then(|()| send(&self.control, &Request::CommitAdoption, &[]))
+            .and_then(|()| self.control.set_write_timeout(None))
+            .map_err(|error| error.to_string())?;
+        self.acknowledged
+            .as_ref()
+            .ok_or("holder acknowledgement unavailable")?
+            .recv_timeout(HANDOVER_TIMEOUT)
+            .map_err(|error| error.to_string())??;
+        self.adoption_pending = false;
+        Ok(())
+    }
     fn new(control: UnixStream, process: Option<Child>) -> Self {
         Self {
             control,
@@ -456,6 +587,9 @@ impl Holder {
             release: None,
             acknowledged: None,
             detached: false,
+            adoption_pending: false,
+            registered: false,
+            screen_lost: false,
         }
     }
 
@@ -475,7 +609,11 @@ impl Holder {
             return Err("terminal screen is too large to detach".to_owned());
         }
         // A socket left by an earlier attempt would refuse the holder's bind.
-        match std::fs::remove_file(socket) {
+        match if self.protocol < 3 {
+            std::fs::remove_file(socket)
+        } else {
+            Ok(())
+        } {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 return Err(format!("clear {}: {error}", socket.display()));
             }
@@ -528,6 +666,12 @@ fn hung_up(pipe: &std::io::PipeReader) -> bool {
 
 impl Drop for Holder {
     fn drop(&mut self) {
+        if self.adoption_pending {
+            // A failed emulator/reader setup must leave the original process
+            // adoptable. It never acquired authority to close that session.
+            self.detached = true;
+            let _ = self.control.shutdown(std::net::Shutdown::Both);
+        }
         if !self.detached {
             // First, so the watch takes the holder's exit for the release it is.
             drop(self.release.take());
@@ -565,6 +709,27 @@ impl Drop for Holder {
 pub(super) struct PtyMaster(OwnedFd);
 
 impl PtyMaster {
+    /// Ask the kernel to notify this PTY's foreground group. A numeric
+    /// tcgetpgrp/kill pair could instead signal a reused process-group ID.
+    pub(super) fn request_redraw(&self) -> io::Result<()> {
+        let mut original: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: the owned PTY and writable winsize outlive both ioctls.
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCGWINSZ, &mut original) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut changed = original;
+        changed.ws_xpixel ^= 1;
+        // Pixel-only change keeps text rows/columns stable while forcing
+        // SIGWINCH; restore the exact original size before returning.
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCSWINSZ, &changed) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::ioctl(self.0.as_raw_fd(), libc::TIOCSWINSZ, &original) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(super) fn resize(&self, size: PtySize) -> io::Result<()> {
         let size = libc::winsize {
             ws_row: size.rows,
@@ -729,6 +894,48 @@ extern "C" fn serve_if_requested() {
     });
 }
 
+struct Residence {
+    directory: PathBuf,
+    listener: UnixListener,
+    record: Record,
+}
+
+impl Residence {
+    fn create(recovery: &Recovery, pid: i32) -> Result<Self, String> {
+        let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
+        recovery.validate(&boot, recovery.source.id)?;
+        let directory = registry::directory()?;
+        crate::secure_file::prepare_private_directory(&directory)
+            .map_err(|error| error.to_string())?;
+        let record = Record {
+            version: PROTOCOL,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot,
+            terminal: recovery.source.id,
+            holder: registry::Process::read(std::process::id() as i32)
+                .map_err(|error| error.to_string())?,
+            root: registry::Process::read(pid).map_err(|error| error.to_string())?,
+        };
+        let socket = registry::socket(&directory, record.terminal);
+        let listener = UnixListener::bind(&socket).map_err(|error| error.to_string())?;
+        if let Err(error) = record.create(&directory) {
+            let _ = std::fs::remove_file(socket);
+            return Err(error.to_string());
+        }
+        Ok(Self {
+            directory,
+            listener,
+            record,
+        })
+    }
+}
+
+impl Drop for Residence {
+    fn drop(&mut self) {
+        self.record.remove(&self.directory);
+    }
+}
+
 fn serve(control: UnixStream) -> i32 {
     // SAFETY: plain process attribute changes, made before anything else
     // runs. A write to a daemon that went away must fail rather than kill the
@@ -747,10 +954,40 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size) = match receive::<Request>(&control) {
-        Ok(Some((Request::Spawn { command, size }, _))) => (command, size),
+    let (command, size, mut recovery) = match receive::<Request>(&control) {
+        Ok(Some((
+            Request::Spawn {
+                command,
+                size,
+                recovery,
+            },
+            _,
+        ))) => (command, size, recovery),
         _ => return 1,
     };
+    if let Some(recovery) = &recovery {
+        let authority = (|| {
+            let boot = crate::daemon::read_boot_id()?;
+            recovery
+                .validate(&boot, recovery.source.id)
+                .map_err(io::Error::other)?;
+            let peer = peer_credentials(&control)?;
+            if peer.uid != unsafe { libc::getuid() } {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            authorize_successor(
+                peer.pid,
+                &recovery
+                    .source
+                    .continuity
+                    .live_proof()
+                    .ok_or(io::ErrorKind::PermissionDenied)?,
+            )
+        })();
+        if let Err(error) = authority {
+            return fail(format!("authorize terminal holder: {error}"));
+        }
+    }
     let command = match STANDARD
         .decode(command)
         .map_err(|error| error.to_string())
@@ -793,21 +1030,85 @@ fn serve(control: UnixStream) -> i32 {
     let Some(master) = pair.master.as_raw_fd() else {
         return fail("PTY descriptor unavailable".into());
     };
+    let residence = match recovery
+        .as_ref()
+        .map(|recovery| Residence::create(recovery, pid))
+        .transpose()
+    {
+        Ok(residence) => residence,
+        Err(error) => {
+            // This newly spawned child has never been handed to a daemon.
+            // Closing the PTY alone cannot stop an HUP-ignoring startup job.
+            // Its unreaped PID still identifies the session's process group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = signal(&pidfd, libc::SIGKILL);
+            let _ = reap(pid);
+            return fail(format!("register terminal holder: {error}"));
+        }
+    };
     let started = Report::Started {
         protocol: PROTOCOL,
         pid,
     };
-    if send(&control, &started, &[master, pidfd.as_raw_fd()]).is_err() {
-        return 1;
-    }
+    let mut lost = send(&control, &started, &[master, pidfd.as_raw_fd()]).is_err();
 
     let mut exit = None;
+    let mut cached_screen = None;
+    let mut pending_replay: Option<(String, Vec<u8>, bool)> = None;
     let mut control = control;
     loop {
-        let Some((socket, screen)) = attend(&control, pid, &pidfd, &mut exit) else {
-            break;
+        let disposition = if lost {
+            Attendance::Lost
+        } else {
+            attend(
+                &control,
+                pid,
+                &pidfd,
+                &mut exit,
+                &mut cached_screen,
+                &mut pending_replay,
+            )
         };
-        let listener = match UnixListener::bind(&socket) {
+        let (socket, screen, output, screen_lost) = match disposition {
+            Attendance::Release => break,
+            Attendance::Lost => match &residence {
+                Some(residence) => {
+                    let (screen, output, lost) = pending_replay.take().unwrap_or_else(|| {
+                        (
+                            cached_screen
+                                .as_ref()
+                                .map(|(screen, _)| screen.clone())
+                                .unwrap_or_default(),
+                            Vec::new(),
+                            cached_screen.as_ref().is_none_or(|(_, lost)| *lost),
+                        )
+                    });
+                    (
+                        registry::socket(&residence.directory, residence.record.terminal),
+                        screen,
+                        output,
+                        lost,
+                    )
+                }
+                None => break,
+            },
+            Attendance::Detach { socket, screen } => (socket, screen, Vec::new(), false),
+        };
+        let listener = match &residence {
+            Some(residence)
+                if socket == registry::socket(&residence.directory, residence.record.terminal) =>
+            {
+                residence.listener.try_clone()
+            }
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "holder endpoint cannot change",
+            )),
+            None => UnixListener::bind(&socket),
+        };
+        let listener = match listener {
             Ok(listener) => listener,
             Err(error) => {
                 let refusal = Report::Failed(format!("listen on {}: {error}", socket.display()));
@@ -817,15 +1118,34 @@ fn serve(control: UnixStream) -> i32 {
                 continue;
             }
         };
-        if send(&control, &Report::Detached, &[]).is_err() {
+        if !screen_lost && send(&control, &Report::Detached, &[]).is_err() && residence.is_none() {
             let _ = std::fs::remove_file(&socket);
             break;
         }
         drop(control);
-        let successor = await_successor(&listener, master, pid, &pidfd, &mut exit, &screen);
-        let _ = std::fs::remove_file(&socket);
+        let successor = await_successor(
+            &listener,
+            master,
+            pid,
+            &pidfd,
+            &mut exit,
+            &screen,
+            residence.as_ref().map(|residence| &residence.record),
+            &mut recovery,
+            screen_lost,
+            output,
+        );
+        if residence.is_none() {
+            let _ = std::fs::remove_file(&socket);
+        }
         match successor {
-            Some(successor) => control = successor,
+            Some((successor, output)) => {
+                if residence.is_some() {
+                    pending_replay = Some((screen, output, screen_lost));
+                }
+                control = successor;
+                lost = false;
+            }
             None => break,
         }
     }
@@ -837,12 +1157,20 @@ fn serve(control: UnixStream) -> i32 {
 
 /// Serves an attached daemon until it releases the terminal, which answers
 /// `None`, or asks for it to be detached onto a socket, with its screen.
+enum Attendance {
+    Release,
+    Lost,
+    Detach { socket: PathBuf, screen: String },
+}
+
 fn attend(
     control: &UnixStream,
     pid: libc::pid_t,
     pidfd: &File,
     exit: &mut Option<libc::c_int>,
-) -> Option<(PathBuf, String)> {
+    cached_screen: &mut Option<(String, bool)>,
+    pending_replay: &mut Option<(String, Vec<u8>, bool)>,
+) -> Attendance {
     loop {
         let mut targets = [
             libc::pollfd {
@@ -866,30 +1194,67 @@ fn attend(
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return None;
+            return Attendance::Lost;
         }
         if targets[1].revents != 0 {
             // A root this holder cannot reap leaves nothing to report: ending
             // the holder lets the daemon report that exit as unknown instead
             // of polling a pidfd that stays ready forever.
-            let wait_status = reap(pid)?;
+            let Some(wait_status) = reap(pid) else {
+                return Attendance::Release;
+            };
             *exit = Some(wait_status);
             let _ = send(control, &Report::Exited { wait_status }, &[]);
         }
         if targets[0].revents != 0 {
-            // A release, a hangup and anything unintelligible all end the
-            // holder: only a daemon that can still talk to it may keep it.
-            return match receive::<Request>(control) {
-                Ok(Some((Request::Detach { socket, screen }, _))) => Some((socket, screen)),
-                _ => None,
+            let request = receive::<Request>(control);
+            if matches!(&request, Ok(Some((Request::CommitAdoption, _)))) {
+                if send(control, &Report::AdoptionCommitted, &[]).is_ok() {
+                    *pending_replay = None;
+                    continue;
+                }
+                return Attendance::Lost;
+            }
+            if let Ok(Some((
+                Request::CacheScreen {
+                    screen,
+                    screen_lost,
+                },
+                _,
+            ))) = &request
+            {
+                if exit.is_some() && screen.len() <= MAX_SCREEN.div_ceil(3) * 4 {
+                    *cached_screen = Some((screen.clone(), *screen_lost));
+                    if send(control, &Report::ScreenCached, &[]).is_ok() {
+                        continue;
+                    }
+                    return Attendance::Lost;
+                }
+                if send(
+                    control,
+                    &Report::Failed("only a completed bounded screen can be retained".into()),
+                    &[],
+                )
+                .is_ok()
+                {
+                    continue;
+                }
+                return Attendance::Lost;
+            }
+            return match request {
+                Ok(Some((Request::Detach { socket, screen }, _))) => {
+                    Attendance::Detach { socket, screen }
+                }
+                Ok(Some((Request::Release, _))) => Attendance::Release,
+                _ => Attendance::Lost,
             };
         }
     }
 }
 
-/// Keeps a detached terminal until a successor attaches, which it returns,
-/// or [`ADOPTION_GRACE`] passes. Output read meanwhile goes to the
-/// successor.
+/// Registered holders retain live processes and completed results until an
+/// authenticated successor attaches. Only legacy anonymous handoffs expire.
+/// Output is bounded by backpressure and is delivered to the successor.
 fn await_successor(
     listener: &UnixListener,
     master: RawFd,
@@ -897,15 +1262,18 @@ fn await_successor(
     pidfd: &File,
     exit: &mut Option<libc::c_int>,
     screen: &str,
-) -> Option<UnixStream> {
-    let deadline = Instant::now() + ADOPTION_GRACE;
-    let mut output = Vec::new();
+    record: Option<&Record>,
+    recovery: &mut Option<Recovery>,
+    screen_lost: bool,
+    mut output: Vec<u8>,
+) -> Option<(UnixStream, Vec<u8>)> {
+    let deadline = orphan_deadline(record.is_some(), Instant::now());
     let mut buffer = vec![0u8; 64 << 10];
     // The master reads EIO once the terminal's last process has closed it.
     let mut open = true;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let remaining = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
             return None;
         }
         let reading = open && output.len() < DETACHED_OUTPUT;
@@ -930,7 +1298,9 @@ fn await_successor(
                 revents: 0,
             },
         ];
-        let timeout = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let timeout = remaining.map_or(-1, |remaining| {
+            remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int
+        });
         // SAFETY: all three pollfds live for the duration of the call.
         if unsafe { libc::poll(targets.as_mut_ptr(), 3, timeout) } == -1 {
             if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -956,11 +1326,27 @@ fn await_successor(
         }
         if targets[0].revents != 0
             && let Ok((successor, _)) = listener.accept()
-            && hand_over(&successor, master, pid, pidfd, *exit, screen, &output).is_ok()
+            && hand_over(
+                &successor,
+                master,
+                pid,
+                pidfd,
+                *exit,
+                screen,
+                &output,
+                record,
+                recovery,
+                screen_lost,
+            )
+            .is_ok_and(|attached| attached)
         {
-            return Some(successor);
+            return Some((successor, output));
         }
     }
+}
+
+fn orphan_deadline(registered: bool, now: Instant) -> Option<Instant> {
+    (!registered).then(|| now + ADOPTION_GRACE)
 }
 
 /// Gives a connecting successor the terminal, if it is this user's and asks
@@ -973,24 +1359,158 @@ fn hand_over(
     exit: Option<libc::c_int>,
     screen: &str,
     output: &[u8],
-) -> io::Result<()> {
+    record: Option<&Record>,
+    recovery: &mut Option<Recovery>,
+    screen_lost: bool,
+) -> io::Result<bool> {
     // SAFETY: getuid cannot fail.
-    if peer_credentials(successor)?.uid != unsafe { libc::getuid() } {
+    let peer = peer_credentials(successor)?;
+    if peer.uid != unsafe { libc::getuid() } {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     successor.set_read_timeout(Some(HANDOVER_TIMEOUT))?;
-    let Some((Request::Attach { .. }, _)) = receive::<Request>(successor)? else {
-        return Err(io::ErrorKind::InvalidData.into());
+    successor.set_write_timeout(Some(HANDOVER_TIMEOUT))?;
+    let proposed = match receive::<Request>(successor)? {
+        Some((Request::Inspect { proof }, _)) => {
+            let (Some(record), Some(recovery)) = (record, recovery.as_ref()) else {
+                return Err(io::ErrorKind::InvalidData.into());
+            };
+            authorize_successor(peer.pid, &proof)?;
+            let mut recovery = recovery.clone();
+            // Size belongs to the live PTY, not the original spawn recipe.
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: master is this holder's live PTY and size is writable.
+            if unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut size) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            recovery.options.columns = size.ws_col.max(1);
+            recovery.options.rows = size.ws_row.max(1);
+            if size.ws_xpixel > 0 {
+                recovery.options.cell_width_px =
+                    u32::from(size.ws_xpixel / size.ws_col.max(1)).max(1);
+            }
+            if size.ws_ypixel > 0 {
+                recovery.options.cell_height_px =
+                    u32::from(size.ws_ypixel / size.ws_row.max(1)).max(1);
+            }
+            send(
+                successor,
+                &Report::Inspected {
+                    record: record.clone(),
+                    recovery,
+                    screen_lost,
+                },
+                &[],
+            )?;
+            return Ok(false);
+        }
+        Some((
+            Request::Attach {
+                protocol,
+                recovery: proposed,
+            },
+            _,
+        )) if protocol >= PROTOCOL => proposed,
+        _ => return Err(io::ErrorKind::InvalidData.into()),
     };
+    if let (Some(record), Some(current)) = (record, recovery.as_ref()) {
+        let next = proposed.as_ref().ok_or(io::ErrorKind::PermissionDenied)?;
+        next.validate(&record.boot, record.terminal)
+            .map_err(io::Error::other)?;
+        authorize_successor(
+            peer.pid,
+            &next
+                .source
+                .continuity
+                .live_proof()
+                .ok_or(io::ErrorKind::PermissionDenied)?,
+        )?;
+        if next.source.launch != current.source.launch
+            || !next.previous_sources.iter().any(|source| {
+                source.id == current.source.id
+                    && source.launch == current.source.launch
+                    && source.continuity.live_proof() == current.source.continuity.live_proof()
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "holder adoption does not preserve its issued lineage",
+            ));
+        }
+    }
     let attached = Report::Attached {
         protocol: PROTOCOL,
         pid,
         exited: exit,
         screen: screen.to_owned(),
         output: STANDARD.encode(output),
+        screen_lost,
     };
     send(successor, &attached, &[master, pidfd.as_raw_fd()])?;
-    successor.set_read_timeout(None)
+    successor.set_read_timeout(None)?;
+    successor.set_write_timeout(None)?;
+    if proposed.is_some() {
+        *recovery = proposed;
+    }
+    Ok(true)
+}
+
+/// Reads only the memory of a proven orphan holder; does not adopt or release it.
+pub(crate) fn inspect(
+    socket: &Path,
+    expected: &Record,
+    proof: &crate::model::HostSessionProof,
+) -> Result<(Recovery, bool), String> {
+    let control = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    let peer = peer_credentials(&control).map_err(|error| error.to_string())?;
+    if peer.uid != crate::daemon::current_uid()
+        || peer.pid != expected.holder.pid
+        || !expected.holder.is_current()
+    {
+        return Err("holder socket does not belong to the recorded process".into());
+    }
+    control
+        .set_read_timeout(Some(HANDOVER_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    control
+        .set_write_timeout(Some(HANDOVER_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    send(
+        &control,
+        &Request::Inspect {
+            proof: proof.clone(),
+        },
+        &[],
+    )
+    .map_err(|error| error.to_string())?;
+    let Some((
+        Report::Inspected {
+            record,
+            recovery,
+            screen_lost,
+        },
+        descriptors,
+    )) = receive::<Report>(&control).map_err(|error| error.to_string())?
+    else {
+        return Err("holder did not return discovery evidence".into());
+    };
+    if !descriptors.is_empty() || record != *expected {
+        return Err("holder discovery evidence changed".into());
+    }
+    recovery.validate(&record.boot, record.terminal)?;
+    Ok((recovery, screen_lost))
+}
+
+fn authorize_successor(pid: i32, proof: &crate::model::HostSessionProof) -> io::Result<()> {
+    let paths = crate::daemon::RuntimePaths::discover().map_err(io::Error::other)?;
+    let owner = crate::daemon::lease_owner(&paths.lock, proof).map_err(io::Error::other)?;
+    if u32::try_from(pid).ok() != Some(owner) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "holder caller does not own the daemon lease",
+        ));
+    }
+    Ok(())
 }
 
 /// Reaps the root once its pidfd says it exited, returning its wait status.
@@ -1147,6 +1667,101 @@ fn receive_with_descriptors(
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_adoption_commit_acknowledgement_keeps_unconsumed_replay() {
+        let (successor, holder) = UnixStream::pair().unwrap();
+        successor.shutdown(std::net::Shutdown::Read).unwrap();
+        send(&successor, &Request::CommitAdoption, &[]).unwrap();
+        let mut replay = Some(("screen".to_owned(), b"orphan-output".to_vec(), false));
+        let expected = replay.clone();
+        // An already reaped child has no pollable pidfd; the descriptor is ignored.
+        let placeholder = File::open("/dev/null").unwrap();
+        let result = attend(
+            &holder,
+            0,
+            &placeholder,
+            &mut Some(0),
+            &mut None,
+            &mut replay,
+        );
+        assert!(matches!(result, Attendance::Lost));
+        assert_eq!(replay, expected);
+
+        let (successor, holder) = UnixStream::pair().unwrap();
+        send(&successor, &Request::CommitAdoption, &[]).unwrap();
+        send(&successor, &Request::Release, &[]).unwrap();
+        let result = attend(
+            &holder,
+            0,
+            &placeholder,
+            &mut Some(0),
+            &mut None,
+            &mut replay,
+        );
+        assert!(matches!(result, Attendance::Release));
+        assert!(matches!(
+            receive::<Report>(&successor).unwrap(),
+            Some((Report::AdoptionCommitted, _))
+        ));
+        assert!(replay.is_none());
+    }
+
+    #[test]
+    fn registered_orphans_keep_live_and_completed_results_without_a_deadline() {
+        let now = Instant::now();
+        assert_eq!(orphan_deadline(false, now), Some(now + ADOPTION_GRACE));
+        assert_eq!(orphan_deadline(true, now), None);
+        assert_eq!(orphan_deadline(true, now + ADOPTION_GRACE * 100), None);
+    }
+
+    #[test]
+    fn an_adopter_that_stops_reading_cannot_hold_the_output_loop_forever() {
+        let (successor, holder) = UnixStream::pair().unwrap();
+        let limit: libc::c_int = 4096;
+        // Keep the kernel buffer much smaller than the bounded replay frame.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    holder.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&limit as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&limit) as _,
+                )
+            },
+            0
+        );
+        send(
+            &successor,
+            &Request::Attach {
+                protocol: PROTOCOL,
+                recovery: None,
+            },
+            &[],
+        )
+        .unwrap();
+        let descriptor = tempfile::tempfile().unwrap();
+        let started = Instant::now();
+        let error = hand_over(
+            &holder,
+            descriptor.as_raw_fd(),
+            1,
+            &descriptor,
+            None,
+            "",
+            &vec![b'x'; DETACHED_OUTPUT],
+            None,
+            &mut None,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert!(started.elapsed() < HANDOVER_TIMEOUT * 2 + Duration::from_secs(1));
+    }
+
     fn command(script: &str) -> CommandBuilder {
         let mut command = CommandBuilder::new("/bin/sh");
         command.args(["-c", script]);
@@ -1167,7 +1782,36 @@ mod tests {
         let mut file = File::from(master.duplicate().unwrap());
         let mut output = Vec::new();
         let mut buffer = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !String::from_utf8_lossy(&output).contains(needle) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "did not receive {needle:?}: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let mut ready = libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Bound test fixture waits even when a shell defers its signal trap.
+            let polled = unsafe {
+                libc::poll(
+                    &mut ready,
+                    1,
+                    remaining.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if polled == 0 {
+                continue;
+            }
+            if polled < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll fixture: {}", io::Error::last_os_error());
+            }
             match file.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => output.extend_from_slice(&buffer[..read]),
@@ -1265,6 +1909,44 @@ mod tests {
     }
 
     #[test]
+    fn crash_redraw_notifies_the_live_foreground_without_changing_dimensions() {
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let held = spawn(
+            command("trap 'echo redraw; stty size' WINCH; echo ready; while :; do read line; done"),
+            size(),
+            exits,
+        )
+        .unwrap();
+        read_until(&held.master, "ready");
+        held.master.request_redraw().unwrap();
+        // Some shells defer traps while their read builtin waits for a whole
+        // line. Release that wait; only SIGWINCH can print the redraw marker.
+        let mut input = File::from(held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut input, b"\n").unwrap();
+        let output = read_until(&held.master, "24 80");
+        assert!(output.contains("redraw"));
+        let mut actual: libc::winsize = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::ioctl(held.master.as_raw_fd(), libc::TIOCGWINSZ, &mut actual) },
+            0
+        );
+        assert_eq!(
+            (
+                actual.ws_col,
+                actual.ws_row,
+                actual.ws_xpixel,
+                actual.ws_ypixel
+            ),
+            (
+                size().cols,
+                size().rows,
+                size().pixel_width,
+                size().pixel_height
+            )
+        );
+    }
+
+    #[test]
     fn the_root_leads_its_own_session_apart_from_its_holder() {
         let (exits, _exited) = crossbeam_channel::bounded(1);
         let held = spawn(command("read line"), size(), exits).unwrap();
@@ -1325,6 +2007,280 @@ mod tests {
         let status = process.wait().unwrap();
         assert_eq!(status.code(), Some(0));
         wait_gone(root);
+    }
+
+    #[test]
+    fn registered_holder_survives_sigkill_and_repeated_adoption_without_restarting_root() {
+        const CHILD: &str = "CAGENTS_HOLDER_CRASH_FIXTURE";
+        if let Some(ready) = std::env::var_os(CHILD) {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: crate::model::HostIncarnation::new(
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            };
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+            let source = crate::model::TerminalSession {
+                id: crate::model::TerminalId::new(),
+                launch: recipe,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::DetachedSameBoot {
+                    host_session_id: proof.host_session_id.clone(),
+                    boot_id: proof.boot_id.clone(),
+                    host_incarnation: proof.host_incarnation.clone(),
+                },
+            };
+            let recovery = Recovery {
+                source,
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                options: crate::terminal::TerminalSpawnOptions::default(),
+                execution_environment: None,
+            };
+            let (exits, _exited) = crossbeam_channel::bounded(1);
+            assert!(
+                spawn_recoverable(command("exit 0"), size(), exits, Some(recovery.clone()))
+                    .is_err(),
+                "a complete proof without the daemon lease cannot register a holder"
+            );
+            let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+            let (exits, _exited) = crossbeam_channel::bounded(1);
+            let held = spawn_recoverable(
+                command("echo ready; while read line; do if [ \"$line\" = finish ]; then echo completed-result; exit 7; fi; echo still-running:$line; done"),
+                size(),
+                exits,
+                Some(recovery),
+            )
+            .unwrap();
+            read_until(&held.master, "ready");
+            held.master
+                .resize(PtySize {
+                    cols: 120,
+                    rows: 40,
+                    ..size()
+                })
+                .unwrap();
+            std::fs::write(ready, "ready").unwrap();
+            loop {
+                thread::park();
+            }
+        }
+
+        struct Cleanup {
+            daemon: Child,
+            holder: Option<File>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.daemon.kill();
+                let _ = self.daemon.wait();
+                if let Some(holder) = &self.holder {
+                    let _ = signal(holder, libc::SIGKILL);
+                }
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let daemon = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "terminal::worker::holder::tests::registered_holder_survives_sigkill_and_repeated_adoption_without_restarting_root", "--nocapture"])
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", directory.path())
+            .env("XDG_RUNTIME_DIR", directory.path()).env(CHILD, &ready)
+            .spawn().unwrap();
+        let mut cleanup = Cleanup {
+            daemon,
+            holder: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                cleanup.daemon.try_wait().unwrap().is_none(),
+                "fixture exited before acknowledgement"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not acknowledge its session"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let holders = directory
+            .path()
+            .join(crate::instance::RUNTIME_SUBDIRECTORY)
+            .join("holders");
+        let boot = crate::daemon::read_boot_id().unwrap();
+        let records = registry::discover(&holders, &boot).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "discovery must exist before startup is acknowledged"
+        );
+        let record = records[0].clone();
+        cleanup.holder = Some(open_pidfd(record.holder.pid).unwrap());
+        cleanup.daemon.kill().unwrap();
+        cleanup.daemon.wait().unwrap();
+        assert!(record.holder.is_current());
+        assert!(record.root.is_current());
+        let runtime = directory.path().join(crate::instance::RUNTIME_SUBDIRECTORY);
+        let paths = crate::daemon::RuntimePaths {
+            directory: runtime.clone(),
+            socket: runtime.join(crate::terminal::ipc::SOCKET_FILE_NAME),
+            lock: runtime.join("cagentsd.lock"),
+        };
+        let replacement = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("replacement"),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("replacement"),
+        };
+        let socket = registry::socket(&holders, record.terminal);
+        assert!(
+            inspect(&socket, &record, &replacement).is_err(),
+            "same uid without the daemon lease is not adoption authority"
+        );
+        let lease = crate::daemon::HostLease::acquire(&paths, &replacement).unwrap();
+        let mut reused = record.clone();
+        reused.holder.start += 1;
+        assert!(
+            inspect(&socket, &reused, &replacement).is_err(),
+            "a reused PID is not the recorded holder"
+        );
+        let (mut recovery, screen_lost) = inspect(&socket, &record, &replacement).unwrap();
+        assert!(screen_lost);
+        assert_eq!((recovery.options.columns, recovery.options.rows), (120, 40));
+        let original = recovery.source.clone();
+        recovery.previous_sources.push(original.clone());
+        recovery.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("replacement"),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("replacement"),
+        };
+        let mut changed = recovery.clone();
+        changed.source.launch.arguments.push("different".into());
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        assert!(adopt_recoverable(&socket, exits, Some(changed)).is_err());
+        assert!(
+            record.root.is_current(),
+            "refusing a changed launch must not release the holder"
+        );
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let adopted = adopt_recoverable(&socket, exits, Some(recovery.clone())).unwrap();
+        assert_eq!(adopted.held.child.pid(), record.root.pid);
+        assert!(adopted.screen_lost);
+        let Held {
+            master,
+            child,
+            mut holder,
+        } = adopted.held;
+        holder.commit_adoption().unwrap();
+        let mut writer = File::from(master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"first\n").unwrap();
+        assert!(read_until(&master, "still-running:first").contains("still-running:first"));
+        drop(master);
+        drop(child);
+        // Simulate the next daemon's abrupt descriptor loss without Release.
+        holder.detached = true;
+        holder.control.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(holder);
+        std::io::Write::write_all(&mut writer, b"rollback-replay\n").unwrap();
+        drop(writer);
+        drop(lease);
+        let third = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("third"),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("third"),
+        };
+        let lease = crate::daemon::HostLease::acquire(&paths, &third).unwrap();
+        let (mut next, _) = inspect(&socket, &record, &third).unwrap();
+        assert_eq!(next.previous_sources, vec![original]);
+        next.previous_sources.push(next.source.clone());
+        next.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: crate::model::HostSessionId::new("third"),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("third"),
+        };
+        // The same successor can retry allocation under its existing lease.
+        next.previous_sources.push(next.source.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (exits, _) = crossbeam_channel::bounded(1);
+            let attempt = adopt_recoverable(&socket, exits, Some(next.clone())).unwrap();
+            let replayed =
+                String::from_utf8_lossy(&attempt.output).contains("still-running:rollback-replay");
+            // No commit: dropping failed parser setup must preserve every byte
+            // already returned in Attached as well as the surviving process.
+            drop(attempt);
+            if replayed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orphan never buffered the fixture output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let mut adopted = adopt_recoverable(&socket, exits, Some(next)).unwrap();
+        assert!(String::from_utf8_lossy(&adopted.output).contains("still-running:rollback-replay"));
+        assert_eq!(adopted.held.child.pid(), record.root.pid);
+        adopted.held.holder.commit_adoption().unwrap();
+        let mut writer = File::from(adopted.held.master.duplicate().unwrap());
+        std::io::Write::write_all(&mut writer, b"finish\n").unwrap();
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            7
+        );
+        drop(writer);
+        adopted.held.holder.detached = true;
+        adopted
+            .held
+            .holder
+            .control
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
+        drop(adopted);
+        drop(lease);
+        let final_proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("completed"),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("completed"),
+        };
+        let _lease = crate::daemon::HostLease::acquire(&paths, &final_proof).unwrap();
+        let (mut completed, _) = inspect(&socket, &record, &final_proof).unwrap();
+        completed.previous_sources.push(completed.source.clone());
+        completed.source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: final_proof.host_session_id,
+            boot_id: boot,
+            host_incarnation: final_proof.host_incarnation,
+        };
+        let (exits, exited) = crossbeam_channel::bounded(1);
+        let mut restored = adopt_recoverable(&socket, exits, Some(completed)).unwrap();
+        assert_eq!(restored.held.child.pid(), record.root.pid);
+        assert_eq!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .exit_code(),
+            7
+        );
+        assert!(String::from_utf8_lossy(&restored.output).contains("completed-result"));
+        restored.held.holder.commit_adoption().unwrap();
+        drop(restored);
+        wait_gone(record.root.pid);
+        wait_gone(record.holder.pid);
+        assert!(
+            registry::discover(&holders, &crate::daemon::read_boot_id().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!socket.exists(), "explicit release removes its endpoint");
     }
 
     #[test]
@@ -1402,7 +2358,9 @@ mod tests {
             held,
             screen,
             output,
+            screen_lost,
         } = adopt(&socket, exits).unwrap();
+        assert!(!screen_lost);
         assert_eq!(held.child.pid(), root);
         assert!(held.child.unreaped());
         assert_eq!(screen, b"screen");

@@ -119,16 +119,31 @@ must still wait for `daemon status` to report stopped. Prefer the installer's
 `--restart-daemon` flow when replacing an installed release.
 
 A terminal is carried by handing it to its holder process, which keeps its
-processes running and waits for the next daemon, for up to 15 minutes, to adopt
-it. Carried terminals are never frozen, so their jobs do not block an upgrade.
+processes running and waits for the next daemon to adopt it. Carried terminals
+are never frozen, so their jobs do not block an upgrade.
 The next daemon adopts them before relaunching any other terminal. If a
 terminal cannot be carried, the old daemon checkpoints it the way it
 checkpoints the terminals it restarts, and one whose running job a restart
 would lose ends with the old daemon. If a terminal cannot be adopted, the new
 daemon restarts it from its safe recipe once nothing of it survives; otherwise
-it is logged and not restarted beside its surviving processes, which its
-holder hangs up when its wait ends. Carrying needs the old daemon to support it, so an upgrade
+it is logged and not restarted beside its surviving processes. Legacy anonymous
+holders expire after 15 minutes. Carrying needs the old daemon to support it, so an upgrade
 from a build without it restarts every terminal.
+
+New holders register a private endpoint before the daemon acknowledges terminal
+creation. After an unexpected daemon exit, a replacement from the same installation
+and boot can authenticate and adopt the original PTY and processes. Live terminals
+and completed results remain available until restored and explicitly closed; there
+is no timeout that silently kills a running job or discards a completed result.
+Each detached holder buffers at most 1 MiB of output, then applies PTY backpressure.
+This retains one small holder process per terminal until cleanup. A completed
+worker also retains its final screen (at most 8 MiB) in the holder, so another
+daemon crash cannot turn a completed command into a new execution. Closing its
+card or removing its owning project explicitly releases that retained result.
+The live emulator's screen before an unexpected crash is unavailable; the UI
+warns once for the affected pane, preserves subsequent output, and requests that
+foreground programs redraw through the PTY. That redraw temporarily toggles one
+pixel-size bit and restores the exact rows, columns, and pixel dimensions.
 
 The rest of this section concerns the sessions that are restarted.
 
@@ -169,8 +184,9 @@ lease.
 
 ### When the daemon stops without an upgrade
 
-A daemon that crashes, is killed or does not survive a reboot leaves no
-checkpoint, so the application recovers each terminal card from its saved
+A daemon that crashes or is killed first restores authenticated same-boot
+holders as described above. After a reboot, or for older sessions without a
+surviving holder, the application recovers each terminal card from its saved
 record instead. The daemon keeps that record current for every terminal,
 including ones not on screen, by observing the foreground agent periodically.
 
