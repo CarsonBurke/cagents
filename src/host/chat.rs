@@ -56,7 +56,8 @@ impl Record {
 
 /// Terminal records keep their launch continuity; published descriptors project
 /// Live/Detached for each subscriber. Compare the full remaining descriptor and
-/// any published daemon proof; callers must also match the private worker.
+/// any published daemon proof. Resume hints are observed metadata that can be
+/// enriched while the same worker runs; callers must match the private worker.
 pub(super) fn matches_paired_terminal(
     actual: &crate::model::TerminalSession,
     source: &crate::model::TerminalSession,
@@ -72,6 +73,7 @@ pub(super) fn matches_paired_terminal(
     }
     let mut actual = actual.clone();
     actual.continuity = source.continuity.clone();
+    actual.resume_hint = source.resume_hint.clone();
     actual == *source
 }
 
@@ -2021,7 +2023,8 @@ fn process_inner(
                 }
                 if let Some((source, handle)) = &terminal
                     && state.terminals.get(&source.id).is_none_or(|record| {
-                        record.session != *source || !record.handle.same_worker(handle)
+                        !matches_paired_terminal(&record.session, source, state.proof())
+                            || !record.handle.same_worker(handle)
                     })
                 {
                     return Err(unavailable(
@@ -3649,6 +3652,16 @@ for line in sys.stdin:
             .get_mut(&chat_id)
             .unwrap()
             .paired_terminal = Some(replacement.clone());
+        {
+            let mut state = host.lock().unwrap();
+            let terminal = state.terminals.get_mut(&terminal.id).unwrap();
+            let mut observed = terminal.session.launch.clone();
+            observed.program = "codex".into();
+            observed.arguments = vec!["resume".into(), identity.into()];
+            terminal.session.resume_hint =
+                crate::model::agent_recovery::hint_from_launch(&observed);
+            assert!(terminal.session.resume_hint.is_some());
+        }
         process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
         assert!(handle.is_completed());
         assert!(worker.is_completed());
