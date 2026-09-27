@@ -1054,7 +1054,7 @@ impl Editor {
                 symbolic_icon("emblem-system-symbolic"),
                 "Settings",
                 self.settings_open,
-                self.closing.is_none() && self.file_dialog.is_none(),
+                !self.modal_open(),
                 Some(Message::Settings),
             )
             .into(),
@@ -4668,18 +4668,20 @@ impl Application for Editor {
                         tab.git,
                         review_panel(&tab.review, self.modal_open())
                             .map(move |action| Message::PullRequestReview(id, action)),
+                        self.settings_footer(),
                         Message::Sidebar,
                     )
                 } else {
-                    sidebar::worktree_sidebar(
+                    sidebar::worktree_sidebar_with_footer(
                         &tab.sidebar,
                         &tab.navigation,
                         width,
                         self.modal_open(),
                         panel,
                         tab.git,
+                        self.settings_footer(),
+                        Message::Sidebar,
                     )
-                    .map(Message::Sidebar)
                 };
                 workspace.push(cagents::interaction::reveal_leading_width(
                     sidebar, width, progress,
