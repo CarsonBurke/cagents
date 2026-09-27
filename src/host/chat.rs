@@ -14,6 +14,7 @@ use crate::{
     },
 };
 pub(super) use native_cleanup::{NativeClose, close_retained as close_retained_native};
+pub(super) use native_recovery::AdoptionFailures;
 pub(super) use native_recovery::restore_orphaned_native;
 use std::{
     collections::BTreeMap,
@@ -2291,10 +2292,14 @@ pub(super) fn resolve_upgrade(
     source: &Session,
 ) -> Result<Session, ProtocolError> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let sources = state
-        .upgrade_chats
-        .get(&source.id)
-        .ok_or_else(|| unavailable("No durable upgrade replacement exists for this native chat"))?;
+    let sources = state.upgrade_chats.get(&source.id).ok_or_else(|| {
+        unavailable(
+            state
+                .native_adoption_failures
+                .get(source)
+                .unwrap_or("No durable upgrade replacement exists for this native chat"),
+        )
+    })?;
     if !sources.iter().any(|previous| {
         let saved = &previous.source;
         !(source.proof.is_none()

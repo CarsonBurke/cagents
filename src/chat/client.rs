@@ -272,7 +272,7 @@ fn restore(
         super::NativeContinuity::Durable { .. }
     ) {
         return Err(StartFailure::from(format!(
-            "The saved native server could not be proved alive. Its uncertain work was not restarted or resubmitted. {}",
+            "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
         )));
     }
