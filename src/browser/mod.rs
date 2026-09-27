@@ -9,6 +9,7 @@
 
 mod fallback;
 mod handle;
+mod import;
 mod input;
 mod lifecycle;
 mod runtime;
@@ -17,6 +18,7 @@ mod widget;
 
 pub use fallback::{RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory, WaylandSubsurfaceLease};
 pub use handle::BrowserHandle;
+pub use import::{ImportReport, ImportRequest};
 pub use types::{
     BackendSelection, BrowserBackend, BrowserError, BrowserEvent, BrowserInput, BrowserKeyLocation,
     BrowserLifecycle, BrowserModifiers, BrowserMouseButton, BrowserRestoreState, ButtonState,

@@ -1,6 +1,8 @@
 mod account_ui;
 mod agent_ui;
 mod branch_ui;
+#[cfg(feature = "integrated-browser")]
+mod browser_import_ui;
 mod channel_ui;
 mod chat_ui;
 mod chrome_ui;
@@ -3269,6 +3271,8 @@ pub enum Message {
     BrowserForward(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserReload(CardId),
+    #[cfg(feature = "integrated-browser")]
+    BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserAddressChanged {
@@ -3839,6 +3843,8 @@ pub struct Cagents {
     // joins them explicitly, and field drop order is the final backstop.
     #[cfg(feature = "integrated-browser")]
     browser_teardowns: Vec<JoinHandle<()>>,
+    #[cfg(feature = "integrated-browser")]
+    browser_import: browser_import_ui::State,
     terminal_teardowns: Vec<JoinHandle<()>>,
     #[cfg(feature = "integrated-browser")]
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
@@ -6931,6 +6937,15 @@ impl Cagents {
 
     #[cfg(feature = "integrated-browser")]
     fn handle_browser_event(&mut self, id: CardId, event: BrowserEvent) -> Task<Message> {
+        if !self.browser_import.offered
+            && !self.modal_is_open()
+            && matches!(
+                event,
+                BrowserEvent::LifecycleChanged(crate::browser::BrowserLifecycle::Visible)
+            )
+        {
+            let _ = self.update_browser_import(browser_import_ui::Action::Open);
+        }
         let mut tasks = Vec::new();
         let mut durable_changed = false;
         match event {
@@ -8617,6 +8632,10 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
+        #[cfg(feature = "integrated-browser")]
+        if self.browser_import.open() {
+            return true;
+        }
         self.update_ui.confirmation.is_some()
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
@@ -9956,6 +9975,8 @@ impl Application for Cagents {
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,
@@ -11987,6 +12008,8 @@ impl Application for Cagents {
             #[cfg(feature = "integrated-browser")]
             Message::BrowserEvent { card, event } => self.handle_browser_event(card, event),
             #[cfg(feature = "integrated-browser")]
+            Message::BrowserImport(action) => self.update_browser_import(action),
+            #[cfg(feature = "integrated-browser")]
             Message::ClipboardRead {
                 card,
                 request,
@@ -12944,6 +12967,10 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        #[cfg(feature = "integrated-browser")]
+        if let Some(dialog) = self.browser_import_dialog() {
+            return Some(dialog);
+        }
         if let Some(count) = self.update_ui.confirmation {
             return Some(dialog_ui::overlay(dialog_ui::surface(
                 widget::column::with_children(vec![
@@ -19183,6 +19210,8 @@ mod tests {
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_import: browser_import_ui::State::default(),
             terminal_teardowns: Vec::new(),
             #[cfg(feature = "integrated-browser")]
             browser_factory: None,

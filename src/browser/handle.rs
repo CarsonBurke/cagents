@@ -24,6 +24,7 @@ static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub(crate) enum Command {
+    Import(super::ImportRequest),
     Navigate(Url),
     Back,
     Forward,
@@ -369,6 +370,9 @@ impl std::fmt::Debug for BrowserHandle {
 }
 
 impl BrowserHandle {
+    pub fn import_cookies(&self, request: super::ImportRequest) -> Result<(), BrowserError> {
+        self.mailbox.send(Command::Import(request))
+    }
     /// Registers a browser card on the shared Servo engine thread, starting
     /// that thread if it is not already running.
     pub fn spawn(

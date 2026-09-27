@@ -166,6 +166,7 @@ struct Engine {
     /// last webview closes would make the next card's engine unwind there and
     /// report [`ENGINE_PANIC_REASON`]. A closed webview is not runtime shutdown.
     servo: Option<servo::Servo>,
+    import: Option<super::import::Pending>,
     /// `None` once the registry has released this engine's channel.
     registrations: Option<Receiver<Registration>>,
     wake_tx: Sender<()>,
@@ -214,6 +215,7 @@ impl Engine {
             generation,
             cards: Vec::new(),
             servo: None,
+            import: None,
             registrations: Some(registrations),
             wake_tx,
             wake_rx,
@@ -269,6 +271,11 @@ impl Engine {
                 Some(op) => self.dispatch_command(op - card_base),
             }
 
+            if let (Some(import), Some(servo)) = (&mut self.import, &self.servo)
+                && import.step(servo)
+            {
+                self.import = None;
+            }
             self.reap();
             self.drain_wayland();
             // An empty card list is not a reason to leave. The runtime cannot
@@ -284,6 +291,9 @@ impl Engine {
     /// The soonest cadence any card still needs, or `None` to block until a
     /// command, a registration or a Servo wake actually arrives.
     fn timeout(&self) -> Option<Duration> {
+        if self.import.is_some() {
+            return Some(Duration::from_millis(1));
+        }
         self.cards.iter().filter_map(Card::select_timeout).min()
     }
 
@@ -410,6 +420,20 @@ impl Engine {
         let Ok(command) = card.mailbox.receiver().try_recv() else {
             return;
         };
+        if let Command::Import(request) = command {
+            if self.import.is_some() {
+                let _ = request
+                    .result
+                    .send(Err("Another browser import is already running.".into()));
+            } else if self.servo.is_none() {
+                let _ = request
+                    .result
+                    .send(Err("Open an in-app browser tab before importing.".into()));
+            } else {
+                self.import = Some(request.into());
+            }
+            return;
+        }
         if card.command(command) == CardRequest::CreateSession {
             self.create_session(index);
         }
@@ -542,6 +566,11 @@ impl Card {
 
     fn command(&mut self, command: Command) -> CardRequest {
         match command {
+            Command::Import(request) => {
+                let _ = request.result.send(Err(
+                    "The browser import did not reach its shared runtime.".into(),
+                ));
+            }
             Command::WakeCoalesced => {
                 return self.apply_coalesced(self.mailbox.drain_coalesced());
             }
@@ -1636,6 +1665,7 @@ mod tests {
             generation: 0,
             cards: vec![card],
             servo: None,
+            import: None,
             registrations: Some(engine_registrations),
             wake_tx,
             wake_rx,

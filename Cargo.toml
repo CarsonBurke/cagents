@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/ceditor"]
+members = [".", "crates/ceditor", "crates/browser-import"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
@@ -66,6 +66,9 @@ ui = [
 integrated-browser = [
     "full",
     "ui",
+    "dep:cagents-browser-import",
+    "dep:cookie",
+    "dep:net_traits",
     "dep:dpi",
     "dep:euclid",
     "dep:keyboard-types",
@@ -96,6 +99,9 @@ bench = false
 required-features = ["host"]
 
 [dependencies]
+cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
+cookie = { version = "0.18", optional = true }
+net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 yaml-rust = { version = "0.4.5", optional = true }
 unicode-width = { version = "0.2.2", optional = true }
 unicode-casefold = { version = "0.2", optional = true }

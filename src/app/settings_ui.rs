@@ -507,6 +507,14 @@ fn settings_category_controls<'a>(
             "Link handling",
             "Choose the default browser for links. Modified clicks explicitly choose either browser.",
             vec![
+                #[cfg(feature = "integrated-browser")]
+                setting_field(
+                    "Browser logins",
+                    "Choose sites from local browser profiles to import into this app session.",
+                    widget::button::standard("Import browser logins")
+                        .on_press(Message::BrowserImport(browser_import_ui::Action::Open))
+                        .into(),
+                ),
                 settings_choice(
                     "Open links in",
                     "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",
