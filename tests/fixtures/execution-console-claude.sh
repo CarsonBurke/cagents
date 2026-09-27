@@ -21,6 +21,7 @@ while IFS= read -r frame; do
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       case "$frame" in
         *'"subtype":"interrupt"'*)
+          printf '{"type":"control_cancel_request","request_id":"console-approval"}\n'
           printf '{"type":"result","uuid":"interrupted-%s","subtype":"success","is_error":false,"session_id":"%s"}\n' "$n" "$session"
           ;;
       esac
