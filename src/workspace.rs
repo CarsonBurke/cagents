@@ -232,6 +232,19 @@ impl CardGeometry {
     pub fn width(self) -> f32 {
         self.end - self.start
     }
+
+    fn width_within_boundaries(self) -> f32 {
+        let width = self.width();
+        // Layout widgets reconstruct the right edge as start + width. The
+        // subtraction above can round upward, so its inverse addition may
+        // exceed our canonical edge. Correct only that one-unit overshoot;
+        // changing the disjointness tolerance would hide real overlaps.
+        if width.is_finite() && width > 0.0 && self.start + width > self.end {
+            width.next_down()
+        } else {
+            width
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -645,7 +658,7 @@ struct PendingClose {
 #[derive(Debug, Clone)]
 struct LayoutTransition {
     from_total_width: f32,
-    from_positions: Option<Vec<f32>>,
+    from_bounds: Option<Vec<(f32, f32)>>,
     from_widths: Vec<f32>,
     geometry: StripGeometry,
     elapsed: Duration,
@@ -1109,11 +1122,14 @@ impl Workspace {
                             .map_or(card.width(), CardGeometry::width)
                     })
                     .collect(),
-                from_positions: Some(
+                from_bounds: Some(
                     self.geometry
                         .cards()
                         .iter()
-                        .map(|card| previous.card(card.id).map_or(card.start, |old| old.start))
+                        .map(|card| {
+                            let old = previous.card(card.id).unwrap_or(*card);
+                            (old.start, old.end)
+                        })
                         .collect(),
                 ),
                 geometry: self.geometry.clone(),
@@ -1258,7 +1274,7 @@ impl Workspace {
                 Some(MountedCard {
                     id: card.id,
                     start: card.start,
-                    width: card.width(),
+                    width: card.width_within_boundaries(),
                     visibility,
                 })
             })
@@ -1348,7 +1364,7 @@ impl Workspace {
         }
         let mut transition = LayoutTransition {
             from_total_width: previous.total_width(),
-            from_positions: None,
+            from_bounds: None,
             from_widths,
             geometry: self.geometry.clone(),
             elapsed: Duration::ZERO,
@@ -1382,11 +1398,18 @@ impl Workspace {
             .zip(&transition.from_widths)
             .enumerate()
         {
-            if let Some(positions) = &transition.from_positions {
-                cursor = positions[index] + (target.start - positions[index]) * eased;
+            if let Some(bounds) = &transition.from_bounds {
+                // Adjacent panes share their old and target boundaries. Use
+                // identical arithmetic for those edges: deriving the right
+                // edge from an independently interpolated width can overlap
+                // the next pane by one f32 unit at fractional restored widths.
+                let (start, end) = bounds[index];
+                card.start = start + (target.start - start) * eased;
+                card.end = end + (target.end - end) * eased;
+            } else {
+                card.start = cursor;
+                card.end = cursor + from + (target.width() - from) * eased;
             }
-            card.start = cursor;
-            card.end = cursor + from + (target.width() - from) * eased;
             *end = card.end;
             cursor = card.end + config.gap;
         }
@@ -1659,6 +1682,66 @@ mod tests {
         assert!(workspace.projection(800.0).mounted_are_disjoint());
         workspace.tick(LAYOUT_DURATION);
         assert_eq!(workspace.presentation_geometry(), workspace.geometry());
+    }
+
+    #[test]
+    fn restored_fractional_panes_remain_disjoint_through_every_close_frame() {
+        // Restored from the native ten-pane layout that panicked while closing
+        // its second pane. Keep the f32 values serialized by the workspace.
+        let fractions: Vec<f32> = serde_json::from_str(
+            "[0.66666668653488159,0.5,0.5634920597076416,0.579365074634552,
+              0.5,0.3333333432674408,0.3333333432674408,0.3333333432674408,0.5,0.5]",
+        )
+        .unwrap();
+        let widths = fractions
+            .into_iter()
+            .map(CardWidth::Fraction)
+            .collect::<Vec<_>>();
+        for viewport in [799.75, 1200.5, 1640.0, 1641.0, 1642.0, 1643.0, 1902.25] {
+            for closing in 0..widths.len() {
+                let mut workspace = workspace_with_widths(&widths, viewport);
+                let removed = workspace.order().nth(closing).unwrap();
+                workspace.focus(removed).unwrap();
+                workspace.tick(LAYOUT_DURATION);
+                workspace.request_close(removed).unwrap();
+                workspace.commit_close(removed).unwrap();
+                for frame in 0..=220 {
+                    let geometry = workspace.presentation_geometry();
+                    for pair in geometry.cards().windows(2) {
+                        assert!(
+                            pair[0].end <= pair[1].start,
+                            "viewport {viewport}, closing {closing}, frame {frame}: {} > {}",
+                            pair[0].end,
+                            pair[1].start
+                        );
+                    }
+                    assert!(workspace.projection(viewport).mounted_are_disjoint());
+                    workspace.tick(Duration::from_millis(1));
+                }
+                assert_eq!(workspace.presentation_geometry(), workspace.geometry());
+                assert!(!workspace.order().any(|card| card == removed));
+                workspace.check_invariants().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_narrow_pane_preserves_shared_projection_boundaries() {
+        let mut workspace = workspace_with_widths(
+            &[
+                CardWidth::Fraction(0.2),
+                CardWidth::Fraction(1.2),
+                CardWidth::Fraction(0.6),
+            ],
+            1000.0,
+        );
+        let removed = workspace.order().next().unwrap();
+        workspace.request_close(removed).unwrap();
+        workspace.commit_close(removed).unwrap();
+        for _ in 0..=220 {
+            assert!(workspace.projection(1000.0).mounted_are_disjoint());
+            workspace.tick(Duration::from_millis(1));
+        }
     }
 
     #[test]
