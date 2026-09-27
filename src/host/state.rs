@@ -241,7 +241,7 @@ pub(crate) struct HostState {
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
-    notification_activation: BTreeMap<String, TerminalId>,
+    notification_activation: BTreeMap<String, crate::notifications::Target>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -381,7 +381,7 @@ impl HostState {
         &mut self,
         client: ClientId,
         presence: crate::notifications::Presence,
-    ) -> Option<TerminalId> {
+    ) -> Option<crate::notifications::Target> {
         let activation = self.notification_activation.remove(&presence.window);
         if let Some(notifications) = &self.notifications {
             notifications.presence(client, Some(presence.clone()));
@@ -416,16 +416,19 @@ impl HostState {
 
     pub(super) fn activate_notification(
         &mut self,
-        session: TerminalId,
+        target: crate::notifications::Target,
+        source_session: Option<TerminalId>,
         remembered_window: Option<&str>,
     ) -> String {
         let owner = self
             .notification_watchers
             .iter()
-            .filter(|(_, presence)| presence.sessions.contains(&session))
+            .filter(|(_, presence)| {
+                source_session.is_some_and(|session| presence.sessions.contains(&session))
+            })
             .max_by_key(|(_, presence)| {
                 (
-                    presence.focused == Some(session),
+                    source_session.is_some_and(|session| presence.focused == Some(session)),
                     Some(presence.window.as_str()) == remembered_window,
                 )
             });
@@ -436,7 +439,7 @@ impl HostState {
                     version: PROTOCOL_VERSION,
                     request_id: None,
                     proof: self.proof().clone(),
-                    message: ServerMessage::NotificationActivated { session },
+                    message: ServerMessage::NotificationActivated { target },
                 });
             }
             return window;
@@ -447,7 +450,7 @@ impl HostState {
         if self.notification_activation.len() < 32
             || self.notification_activation.contains_key(&window)
         {
-            self.notification_activation.insert(window.clone(), session);
+            self.notification_activation.insert(window.clone(), target);
         }
         window
     }
@@ -3467,16 +3470,24 @@ mod tests {
             },
         );
         assert_eq!(
-            host.activate_notification(session, Some("second")),
+            host.activate_notification(
+                crate::notifications::Target::Session(session),
+                Some(session),
+                Some("second")
+            ),
             "primary"
         );
         assert!(
-            matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { session: found } if found == session)
+            matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { target: found } if found == crate::notifications::Target::Session(session))
         );
         drop(host.unregister_client(1));
         drop(host.unregister_client(2));
         assert_eq!(
-            host.activate_notification(session, Some("second")),
+            host.activate_notification(
+                crate::notifications::Target::Session(session),
+                Some(session),
+                Some("second")
+            ),
             "second"
         );
         host.register_client(3);
@@ -3485,7 +3496,10 @@ mod tests {
             sessions: vec![session],
             focused: None,
         };
-        assert_eq!(host.watch_notifications(3, presence.clone()), Some(session));
+        assert_eq!(
+            host.watch_notifications(3, presence.clone()),
+            Some(crate::notifications::Target::Session(session))
+        );
         assert_eq!(host.watch_notifications(3, presence), None);
     }
 

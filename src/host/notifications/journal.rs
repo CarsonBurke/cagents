@@ -4,7 +4,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::notifications::{Event, Notice};
+use crate::notifications::{Event, Notice, Target};
 
 const MAX_SESSIONS: usize = 2048;
 const KEYS_PER_SESSION: usize = 32;
@@ -21,7 +21,7 @@ impl Journal {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if version > 1 {
+        if version > 2 {
             return Err("Notification journal was created by a newer cagents version".into());
         }
         connection
@@ -36,7 +36,7 @@ impl Journal {
                 session TEXT NOT NULL, evidence TEXT NOT NULL, ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
                 UNIQUE(session, evidence));
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
-            PRAGMA user_version=1;").map_err(|error| error.to_string())?;
+            PRAGMA user_version=2;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
 
@@ -46,7 +46,7 @@ impl Journal {
         if event.evidence.key.len() > 1024 || event.directory.as_os_str().len() > 4096 {
             return Err("Agent attention metadata exceeds its size limit".into());
         }
-        let session = event.session.to_string();
+        let session = event.target().storage_key();
         let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
         let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
         let transaction = self.0.transaction().map_err(|error| error.to_string())?;
@@ -60,14 +60,21 @@ impl Journal {
             return Ok(None);
         }
         let ordinal = transaction.last_insert_rowid();
+        let owner = event
+            .source_session()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| session.clone());
         let window = transaction
             .query_row(
                 "SELECT window FROM owners WHERE session=?1",
-                [&session],
+                [&owner],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|error| error.to_string())?;
+        if let Some(window) = &window {
+            transaction.execute("INSERT INTO owners(session,window,ordinal) VALUES (?1,?2,(SELECT coalesce(max(ordinal),0)+1 FROM owners)) ON CONFLICT(session) DO UPDATE SET window=excluded.window,ordinal=excluded.ordinal", params![session, window]).map_err(|error| error.to_string())?;
+        }
         let notice = Notice {
             id: Uuid::new_v4(),
             event,
@@ -86,6 +93,7 @@ impl Journal {
                 [],
             )
             .map_err(|error| error.to_string())?;
+        transaction.execute("DELETE FROM owners WHERE session NOT IN (SELECT session FROM owners ORDER BY ordinal DESC LIMIT ?1)", [MAX_SESSIONS]).map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(Some(notice))
     }
@@ -108,7 +116,7 @@ impl Journal {
                     row.map_err(|error| error.to_string())?;
                 Ok(Notice {
                     id: id.parse().map_err(|error: uuid::Error| error.to_string())?,
-                    event: serde_json::from_str(&event).map_err(|error| error.to_string())?,
+                    event: Event::from_journal(&event).map_err(|error| error.to_string())?,
                     delivered,
                     acknowledged,
                     window,
@@ -146,19 +154,22 @@ impl Journal {
         Ok(session)
     }
 
-    pub fn retire(&mut self, session: crate::model::TerminalId) -> Result<(), String> {
+    pub fn retire(&mut self, target: Target) -> Result<(), String> {
         let transaction = self.0.transaction().map_err(|error| error.to_string())?;
         transaction
             .execute(
                 "DELETE FROM notices WHERE session=?1",
-                [session.to_string()],
+                [target.storage_key()],
             )
             .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM seen WHERE session=?1", [session.to_string()])
+            .execute("DELETE FROM seen WHERE session=?1", [target.storage_key()])
             .map_err(|error| error.to_string())?;
         transaction
-            .execute("DELETE FROM owners WHERE session=?1", [session.to_string()])
+            .execute(
+                "DELETE FROM owners WHERE session=?1",
+                [target.storage_key()],
+            )
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
@@ -188,8 +199,9 @@ mod tests {
 
     fn event(session: TerminalId, key: &str) -> Event {
         Event {
-            session,
-            provider: Provider::Codex,
+            target: crate::notifications::Target::Session(session),
+            source_session: Some(session),
+            provider: Some(Provider::Codex),
             directory: "/project".into(),
             evidence: Evidence {
                 key: key.into(),
@@ -199,12 +211,50 @@ mod tests {
     }
 
     #[test]
+    fn version_one_journal_keeps_legacy_attention_and_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.remember_window([session], "saved").unwrap();
+        let notice = journal
+            .record(event(session, "old"), true)
+            .unwrap()
+            .unwrap();
+        let legacy = serde_json::json!({"session":session,"provider":Provider::Codex,"directory":"/project","evidence":{"key":"old","kind":"Succeeded"}});
+        journal
+            .0
+            .execute("UPDATE notices SET event=?1", [legacy.to_string()])
+            .unwrap();
+        journal.0.execute_batch("PRAGMA user_version=1").unwrap();
+        drop(journal);
+        let journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.list().unwrap(), vec![notice]);
+    }
+
+    #[test]
+    fn owner_recency_survives_infrequent_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        journal.remember_window([session], "chosen").unwrap();
+        journal
+            .record(event(session, "first-attention"), false)
+            .unwrap();
+        journal
+            .remember_window([TerminalId::new()], "other")
+            .unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
     fn newer_journal_schema_is_rejected_without_schema_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version=2; CREATE TABLE future(value TEXT);")
+            .execute_batch("PRAGMA user_version=3; CREATE TABLE future(value TEXT);")
             .unwrap();
         drop(connection);
         assert!(Journal::open(&path).err().unwrap().contains("newer"));
@@ -212,7 +262,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let notices: i32 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name='notices'",
@@ -245,7 +295,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(journal.list().unwrap(), vec![notice]);
-        journal.retire(session).unwrap();
+        journal.retire(Target::Session(session)).unwrap();
         assert!(journal.list().unwrap().is_empty());
     }
 
@@ -282,7 +332,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(journal.list().unwrap(), vec![next]);
-        journal.retire(session).unwrap();
+        journal.retire(Target::Session(session)).unwrap();
         assert!(journal.list().unwrap().is_empty());
     }
 

@@ -330,7 +330,7 @@ pub(super) fn process_request(
                     },
                     activation
                         .into_iter()
-                        .map(|session| ServerMessage::NotificationActivated { session })
+                        .map(|target| ServerMessage::NotificationActivated { target })
                         .collect(),
                     false,
                 ))
