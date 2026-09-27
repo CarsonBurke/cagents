@@ -35,9 +35,40 @@ pub struct Monitor {
     generation: u64,
     // Keep the global slot until even a cancelled worker acknowledges completion.
     busy: Option<(GitHubRepoKey, u64)>,
+    observed: Vec<crate::notifications::review::ReviewRequest>,
 }
 
 impl Monitor {
+    /// Only the bounded page just validated by this coordinator may report
+    /// alerts. Historical snapshot rows are not replayed on every UI tick.
+    pub fn take_observed(&mut self) -> Vec<crate::notifications::review::ReviewRequest> {
+        std::mem::take(&mut self.observed)
+    }
+
+    pub fn target(
+        &self,
+        repository: &GitHubRepoKey,
+        number: u64,
+    ) -> Option<crate::notifications::Target> {
+        let (repository, entry) = self
+            .entries
+            .iter()
+            .find(|(key, _)| key.same_repository(repository))?;
+        let viewer = entry.scan.viewer.as_ref()?;
+        let request = entry.scan.requested.get(&number)?;
+        Some(crate::notifications::Target::PullRequest(
+            crate::notifications::review::ReviewRequest {
+                host: repository.host.clone(),
+                port: repository.port,
+                owner: repository.owner.clone(),
+                repository: repository.name.clone(),
+                number,
+                viewer: viewer.id.clone(),
+                request: request.current.id.clone(),
+            },
+        ))
+    }
+
     pub fn snapshots(&self) -> impl Iterator<Item = (&GitHubRepoKey, &Arc<Snapshot>)> {
         self.entries
             .iter()
@@ -59,6 +90,7 @@ impl Monitor {
             })
             .collect::<std::collections::HashSet<_>>();
         let state = self;
+        state.observed.clear();
         state
             .entries
             .retain(|repository, _| repositories.iter().any(|key| key == repository));
@@ -93,10 +125,55 @@ impl Monitor {
                 .get_mut(&repository)
                 .filter(|entry| entry.generation == generation)
             {
-                let applied = result.and_then(|reply| match reply {
-                    Reply::Page(page) => entry.scan.page(&work, page),
-                    Reply::History(page) => entry.scan.history(&work, page),
+                let mut observed_numbers = Vec::new();
+                let applied = result.and_then(|reply| {
+                    let viewer = match &reply {
+                        Reply::Page(page) => &page.viewer,
+                        Reply::History(page) => &page.viewer,
+                    };
+                    let observed_viewer = viewer.id.clone();
+                    observed_numbers = match &reply {
+                        Reply::Page(page) => {
+                            page.entries.iter().map(|entry| entry.number).collect()
+                        }
+                        Reply::History(_) => match &work {
+                            Work::History { number, .. } => vec![*number],
+                            _ => Vec::new(),
+                        },
+                    };
+                    let result = match reply {
+                        Reply::Page(page) => entry.scan.page(&work, page),
+                        Reply::History(page) => entry.scan.history(&work, page),
+                    };
+                    if entry
+                        .scan
+                        .viewer
+                        .as_ref()
+                        .is_none_or(|viewer| viewer.id != observed_viewer)
+                    {
+                        observed_numbers.clear();
+                    }
+                    result
                 });
+                if applied.is_ok()
+                    && let Some(viewer) = &entry.scan.viewer
+                {
+                    state
+                        .observed
+                        .extend(observed_numbers.into_iter().filter_map(|number| {
+                            entry.scan.requested.get(&number).map(|request| {
+                                crate::notifications::review::ReviewRequest {
+                                    host: repository.host.clone(),
+                                    port: repository.port,
+                                    owner: repository.owner.clone(),
+                                    repository: repository.name.clone(),
+                                    number,
+                                    viewer: viewer.id.clone(),
+                                    request: request.current.id.clone(),
+                                }
+                            })
+                        }));
+                }
                 if applied.is_err() {
                     entry.scan.failed_history(&work);
                 }

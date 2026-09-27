@@ -14,6 +14,11 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
+    ReviewVerified {
+        request: crate::notifications::review::ReviewRequest,
+        result: Result<(), String>,
+    },
+    ReviewsReported(Result<(), String>),
     Test,
     Failed(String),
 }
@@ -28,6 +33,8 @@ struct Pending {
 
 pub(super) struct State {
     pub snapshot: Snapshot,
+    pending_review: Option<crate::notifications::review::ReviewRequest>,
+    verifying_review: bool,
     presence: Arc<Mutex<Presence>>,
     pending: Arc<Mutex<Pending>>,
     wake: Option<crossbeam_channel::Sender<()>>,
@@ -41,6 +48,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             snapshot: Snapshot::default(),
+            pending_review: None,
+            verifying_review: false,
             presence: Arc::new(Mutex::new(Presence::default())),
             pending: Arc::new(Mutex::new(Pending::default())),
             wake: None,
@@ -216,8 +225,19 @@ impl Cagents {
             .and_then(|id| self.card_state(id))
             .filter(|card| self.pane_is_active(card.id))
             .and_then(card_session);
+        let focused_target = focus.1.then_some(focus.0).flatten().and_then(|id| {
+            let CardRuntime::PullRequests(pane) = self.cards.get(&id)? else {
+                return None;
+            };
+            let target = pane.review.target()?;
+            self.refresh_ui
+                .review_requests
+                .target(&target.repository, target.pull_request.number)
+        });
         let presence = Presence {
             window: instance::window_slot().into(),
+            application: Default::default(),
+            focused_target,
             sessions,
             focused,
         };
@@ -256,6 +276,43 @@ impl Cagents {
         }
     }
 
+    pub(super) fn open_pending_review_alert(&mut self) -> Task<Message> {
+        let Some(request) = self.notification_ui.pending_review.as_ref() else {
+            return Task::none();
+        };
+        if self.notification_ui.verifying_review || self.modal_is_open() {
+            return Task::none();
+        }
+        if !self.github_availability.values().any(|availability| {
+            availability
+                .repository_key()
+                .is_some_and(|key| key.same_repository(&request.repository_key()))
+        }) {
+            self.status = Some(TransientNotice::warning(
+                "Open this review's repository to continue. The alert will be checked against your current GitHub account before opening.",
+            ));
+            return Task::none();
+        }
+        self.notification_ui.verifying_review = true;
+        let request = request.clone();
+        let checked = request.clone();
+        iced::Task::perform(
+            crate::notifications::review::verify(checked),
+            move |result| {
+                Message::NotificationUi(Action::ReviewVerified {
+                    request: request.clone(),
+                    result: result.map(|_| ()),
+                })
+            },
+        )
+        .map(cosmic::Action::App)
+    }
+
+    pub(super) fn review_alert_focus_changed(&mut self) {
+        self.notification_ui.last_focus = None;
+        self.sync_notification_presence();
+    }
+
     pub(super) fn update_notifications(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Snapshot(snapshot) => {
@@ -290,6 +347,67 @@ impl Cagents {
                 self.notification_ui.last_focus = None;
                 self.sync_notification_presence();
                 Task::none()
+            }
+            Action::ReviewsReported(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::warning(format!("Review alerts: {error}")));
+                }
+                Task::none()
+            }
+            Action::Activated(Target::PullRequest(request)) => {
+                self.notification_ui.pending_review = Some(request);
+                self.notification_ui.verifying_review = false;
+                Task::batch([
+                    self.activate_main_window(None),
+                    self.open_pending_review_alert(),
+                ])
+            }
+            Action::ReviewVerified { request, result } => {
+                if self.notification_ui.pending_review.as_ref() != Some(&request) {
+                    return Task::none();
+                }
+                self.notification_ui.verifying_review = false;
+                if let Err(error) = result {
+                    self.notification_ui.pending_review = None;
+                    self.status = Some(TransientNotice::warning(error));
+                    return self.activate_main_window(None);
+                }
+                let project =
+                    self.github_availability
+                        .iter()
+                        .find_map(|(project, availability)| {
+                            availability
+                                .repository_key()
+                                .is_some_and(|key| key.same_repository(&request.repository_key()))
+                                .then_some(*project)
+                        });
+                if self.modal_is_open() {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the open dialog, then open this review from Pull requests.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let Some(project) = project else {
+                    self.status = Some(TransientNotice::warning(
+                        "This review's repository is no longer open. Open it to continue reviewing.",
+                    ));
+                    return self.activate_main_window(None);
+                };
+                self.notification_ui.pending_review = None;
+                let target = Target::PullRequest(request.clone());
+                let ids = self
+                    .notification_ui
+                    .snapshot
+                    .notices
+                    .iter()
+                    .filter(|notice| notice.event.target == target)
+                    .map(|notice| notice.id)
+                    .collect::<Vec<_>>();
+                for id in ids {
+                    self.notification_ui.acknowledge(id);
+                }
+                let open = self.review_pull_request(project, request.number);
+                Task::batch([self.activate_main_window(None), open])
             }
             Action::Activated(Target::Session(session)) => {
                 let Some(card) = self
@@ -387,7 +505,8 @@ mod tests {
                 target: crate::notifications::Target::Session(session),
                 source_session: Some(session),
                 provider: Some(Provider::Claude),
-                directory: "/tmp".into(),
+                directory: Some("/tmp".into()),
+                destination: None,
                 evidence: crate::notifications::Evidence {
                     key: "complete".into(),
                     kind: crate::notifications::Kind::Succeeded,
@@ -431,7 +550,8 @@ mod tests {
                     target: crate::notifications::Target::Session(session),
                     source_session: Some(session),
                     provider: Some(Provider::Claude),
-                    directory: "/tmp".into(),
+                    directory: Some("/tmp".into()),
+                    destination: None,
                     evidence: crate::notifications::Evidence {
                         key: "focused-completion".into(),
                         kind: crate::notifications::Kind::Succeeded,

@@ -241,7 +241,8 @@ pub(crate) struct HostState {
     pub(super) notifications: Option<super::notifications::Handle>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
-    notification_activation: BTreeMap<String, crate::notifications::Target>,
+    notification_activation:
+        BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -382,7 +383,7 @@ impl HostState {
         client: ClientId,
         presence: crate::notifications::Presence,
     ) -> Option<crate::notifications::Target> {
-        let activation = self.notification_activation.remove(&presence.window);
+        let activation = self.notification_activation.remove(&presence.destination());
         if let Some(notifications) = &self.notifications {
             notifications.presence(client, Some(presence.clone()));
         }
@@ -392,7 +393,7 @@ impl HostState {
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
         for (&client, current) in &mut self.notification_watchers {
-            if current.window == presence.window {
+            if current.destination() == presence.destination() {
                 *current = presence.clone();
                 if let Some(notifications) = &self.notifications {
                     notifications.presence(client, Some(presence.clone()));
@@ -414,17 +415,31 @@ impl HostState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn activate_notification(
         &mut self,
         target: crate::notifications::Target,
         source_session: Option<TerminalId>,
         remembered_window: Option<&str>,
     ) -> String {
+        self.activate_notification_destination(target, source_session, remembered_window, None)
+            .window
+    }
+
+    pub(super) fn activate_notification_destination(
+        &mut self,
+        target: crate::notifications::Target,
+        source_session: Option<TerminalId>,
+        remembered_window: Option<&str>,
+        preferred: Option<&crate::notifications::Destination>,
+    ) -> crate::notifications::Destination {
+        use crate::notifications::{Application, Destination};
         let owner = self
             .notification_watchers
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
+                    || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
                 (
@@ -433,7 +448,7 @@ impl HostState {
                 )
             });
         if let Some((&client, presence)) = owner {
-            let window = presence.window.clone();
+            let destination = presence.destination();
             if let Some(delivery) = self.clients.get(&client) {
                 let _ = delivery.push(ServerEnvelope {
                     version: PROTOCOL_VERSION,
@@ -442,17 +457,21 @@ impl HostState {
                     message: ServerMessage::NotificationActivated { target },
                 });
             }
-            return window;
+            return destination;
         }
-        let window = remembered_window
-            .unwrap_or(crate::instance::PRIMARY_WINDOW)
-            .to_owned();
+        let destination = preferred.cloned().unwrap_or_else(|| Destination {
+            application: Application::Cagents,
+            window: remembered_window
+                .unwrap_or(crate::instance::PRIMARY_WINDOW)
+                .to_owned(),
+        });
         if self.notification_activation.len() < 32
-            || self.notification_activation.contains_key(&window)
+            || self.notification_activation.contains_key(&destination)
         {
-            self.notification_activation.insert(window.clone(), target);
+            self.notification_activation
+                .insert(destination.clone(), target);
         }
-        window
+        destination
     }
 
     /// Subscribes `client_id` to shared-model edges and returns the model.
@@ -3457,6 +3476,8 @@ mod tests {
             1,
             Presence {
                 window: "primary".into(),
+                application: Default::default(),
+                focused_target: None,
                 sessions: vec![session],
                 focused: Some(session),
             },
@@ -3465,6 +3486,8 @@ mod tests {
             2,
             Presence {
                 window: "second".into(),
+                application: Default::default(),
+                focused_target: None,
                 sessions: vec![session],
                 focused: None,
             },
@@ -3493,6 +3516,8 @@ mod tests {
         host.register_client(3);
         let presence = Presence {
             window: "second".into(),
+            application: Default::default(),
+            focused_target: None,
             sessions: vec![session],
             focused: None,
         };

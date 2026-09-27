@@ -303,11 +303,48 @@ pub(super) fn process_request(
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
+        ClientRequest::ObserveReviewRequests { observed } => {
+            observed.validate().map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            })?;
+            let notifications = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notifications
+                .clone()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Notification delivery is unavailable",
+                        true,
+                    )
+                })?;
+            for event in observed.events() {
+                notifications.record(event);
+            }
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::WatchNotifications { presence }
         | ClientRequest::NotificationPresence { presence } => {
             crate::instance::validate_window_slot(&presence.window).map_err(|error| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, error.to_string(), false)
             })?;
+            if let Some(crate::notifications::Target::PullRequest(request)) =
+                &presence.focused_target
+            {
+                request.validate().map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?;
+            }
+            if presence.application == crate::notifications::Application::Ceditor
+                && (!presence.sessions.is_empty() || presence.focused.is_some())
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Editor notification windows cannot claim provider sessions",
+                    false,
+                ));
+            }
             if presence.sessions.len() > super::state::MAX_TERMINALS * 2
                 || presence
                     .focused

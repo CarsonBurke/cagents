@@ -5107,10 +5107,14 @@ impl Cagents {
     /// Shows a pull request in the review pane for its project: the open
     /// pull request card for that repository in this workspace, or a new one.
     fn review_pull_request(&mut self, project: ProjectId, number: u64) -> Task<Message> {
-        let Some(target) = self.pull_request_target(project, number) else {
+        let target = self.pull_request_target(project, number);
+        let Some(repository) = self
+            .sidebar_model
+            .project(project)
+            .map(|project| project.repository.clone())
+        else {
             return Task::none();
         };
-        let repository = target.worktree.clone();
         let existing = self.durable.cards.iter().find(|card| {
             card.existence.is_open()
                 && self
@@ -5127,8 +5131,13 @@ impl Cagents {
             None => self.add_pull_requests_card(repository),
         };
         let focus = cosmic::task::message(Message::FocusCard(card));
-        let open = self.apply_pull_request_review(card, pull_request_review::Action::Open(target));
-        Task::batch([created, focus, open])
+        let source = self.ensure_pull_request_source(card);
+        let action = target.map_or(
+            pull_request_review::Action::OpenNumber(number),
+            pull_request_review::Action::Open,
+        );
+        let open = self.apply_pull_request_review(card, action);
+        Task::batch([created, focus, source, open])
     }
 
     fn browse_pull_requests(&mut self, project: ProjectId) -> Task<Message> {
