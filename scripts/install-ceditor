@@ -39,6 +39,8 @@ install -d "$staged/bin"
 for binary in ceditor cagents cagentsd; do
     install -m755 "$target/release/$binary" "$staged/bin/$binary"
 done
+printf '%s\n' 'ceditor companions v1' > "$staged/bin/.ceditor-companions"
+chmod 644 "$staged/bin/.ceditor-companions"
 ln -s "releases/$(basename "$staged")" "$link"
 mv -fT -- "$link" "$private/current"
 committed=1

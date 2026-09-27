@@ -194,7 +194,12 @@ pub fn run() -> Result<(), HostError> {
                                     not be shared between windows")
         }
     }
-    let notification_broker = match notifications::Broker::start(&host) {
+    let notification_application = crate::instance::notification_daemon_application(
+        &std::env::current_exe()?,
+        std::env::args_os()
+            .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
+    )?;
+    let notification_broker = match notifications::Broker::start(&host, notification_application) {
         Ok(broker) => Some(broker),
         Err(error) => {
             tracing::warn!(%error, "agent notifications are unavailable");

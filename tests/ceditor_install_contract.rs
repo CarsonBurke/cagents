@@ -49,6 +49,10 @@ if [ "$1" = metadata ]; then printf '{"target_directory":"%s"}\n' "$CED_TEST_TAR
     );
     let served = prefix.join("bin/ceditor");
     let old = served.canonicalize().unwrap();
+    assert_eq!(
+        fs::read_to_string(old.with_file_name(".ceditor-companions")).unwrap(),
+        "ceditor companions v1\n"
+    );
     for name in ["ceditor", "cagents", "cagentsd"] {
         assert_eq!(
             fs::read_to_string(old.with_file_name(name)).unwrap(),
