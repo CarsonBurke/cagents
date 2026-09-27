@@ -19,6 +19,9 @@ use std::{
 };
 
 pub(super) struct Record {
+    pub(super) execution_instance: uuid::Uuid,
+    pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
+    pub(super) paired_terminal: Option<crate::terminal::TerminalHandle>,
     pub session: Session,
     pub handle: Handle,
     // Retain the exact CLI/account that authorized a shared Codex attachment.
@@ -29,6 +32,49 @@ pub(super) struct Record {
     // A failed terminal spawn must keep the closed actor's execution context
     // retryable and must not disappear through recovery or daemon upgrade.
     pub(super) returning_terminal: bool,
+}
+
+impl Record {
+    /// The private recipe is installed only by the execution service after
+    /// accepting this actor. A CLI basename or user-supplied argv is no proof.
+    pub(super) fn owns_execution_console(&self) -> bool {
+        self.session
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| self.accepts_execution_console(terminal))
+    }
+
+    pub(super) fn accepts_execution_console(
+        &self,
+        terminal: &crate::model::TerminalSession,
+    ) -> bool {
+        terminal.id == self.session.id
+            && terminal.owned_codex_listener.is_none()
+            && self.console_recipe.as_ref() == Some(&terminal.launch)
+    }
+}
+
+/// Terminal records keep their launch continuity; published descriptors project
+/// Live/Detached for each subscriber. Compare the full remaining descriptor and
+/// any published daemon proof. Resume hints are observed metadata that can be
+/// enriched while the same worker runs; callers must match the private worker.
+pub(super) fn matches_paired_terminal(
+    actual: &crate::model::TerminalSession,
+    source: &crate::model::TerminalSession,
+    proof: &HostSessionProof,
+) -> bool {
+    if source
+        .continuity
+        .live_proof()
+        .as_ref()
+        .is_some_and(|source| source != proof)
+    {
+        return false;
+    }
+    let mut actual = actual.clone();
+    actual.continuity = source.continuity.clone();
+    actual.resume_hint = source.resume_hint.clone();
+    actual == *source
 }
 
 // Transition evidence is not an actor: no transcript, socket, store or execution
@@ -593,11 +639,51 @@ fn confirm_fresh_session(
 fn start(
     host: &SharedHost,
     client: ClientId,
+    session: Session,
+    source: Option<HostSessionProof>,
+    terminate_source: bool,
+    selection: Option<PendingBinding>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+) -> Result<ServerResponse, ProtocolError> {
+    start_with_execution(
+        host,
+        client,
+        session,
+        source,
+        terminate_source,
+        selection,
+        execution_environment,
+        None,
+    )
+}
+
+pub(super) fn start_execution(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    context: Arc<chat::protocol::ExecutionContext>,
+) -> Result<ServerResponse, ProtocolError> {
+    start_with_execution(
+        host,
+        client,
+        session,
+        None,
+        false,
+        None,
+        Default::default(),
+        Some(context),
+    )
+}
+
+fn start_with_execution(
+    host: &SharedHost,
+    client: ClientId,
     mut session: Session,
     source: Option<HostSessionProof>,
     terminate_source: bool,
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -1047,6 +1133,52 @@ fn start(
                 ));
             }
         }
+        spec.execution = execution.clone();
+        if let Some(context) = &spec.execution {
+            context
+                .verify_directory(&spec.working_directory)
+                .map_err(unavailable)?;
+        }
+        // Capability is transient process context, never a public launch
+        // recipe. A fresh provider may delegate only as its real session.
+        if !matches!(
+            spec.transport,
+            chat::protocol::TransportSpec::UnixWebSocket { .. }
+        ) && let Ok(registry) = super::agent_execution::registry(host)
+        {
+            let authority = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
+                    session.clone(),
+                ))
+                .map_err(unavailable)?;
+            if let Some(token) = authority.token() {
+                spec.environment
+                    .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
+            }
+        }
+        let execution_instance = uuid::Uuid::new_v4();
+        let bundle_account = if !matches!(
+            spec.transport,
+            chat::protocol::TransportSpec::UnixWebSocket { .. }
+        ) {
+            let lease = crate::account::registry::authorize_spawn(&spec.environment, None)
+                .map_err(|error| unavailable(error.to_string()))?;
+            crate::agent_execution::bundled::install(
+                Some(session.launch.provider),
+                &spec.environment,
+                &spec.working_directory,
+            );
+            if let Some(path) = crate::agent_execution::bundled::matched_path(
+                spec.environment.get("PATH").map(String::as_str),
+            ) {
+                spec.environment.insert("PATH".into(), path);
+            }
+            Some(lease)
+        } else {
+            None
+        };
         let weak = Arc::downgrade(host);
         let id = session.id;
         let handle = Handle::start(
@@ -1055,13 +1187,28 @@ fn start(
             initial,
             store,
             session.launch.session_id.clone(),
-            move |update| changed(&weak, id, update),
+            move |update| {
+                if let Update::Execution { run, update } = update {
+                    if let Some(host) = weak.upgrade() {
+                        super::agent_execution::observed(
+                            &host,
+                            id,
+                            execution_instance,
+                            run,
+                            update,
+                        );
+                    }
+                } else {
+                    changed(&weak, id, update);
+                }
+            },
         )
         .map_err(|message| {
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| unavailable(message))
         })?;
+        drop(bundle_account);
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -1094,7 +1241,15 @@ fn start(
             after_generation: handle.observe_next_update(),
             ..Observation::default()
         };
+        let paired_terminal = session
+            .terminal
+            .as_ref()
+            .and_then(|source| state.terminals.get(&source.id))
+            .map(|record| record.handle.clone());
         let record = Record {
+            execution_instance,
+            console_recipe: None,
+            paired_terminal,
             session,
             handle,
             source_process,
@@ -1105,6 +1260,9 @@ fn start(
         };
         let response = session_snapshot(&record);
         state.chats.insert(id, record);
+        if let Some(context) = &execution {
+            context.installed();
+        }
         state.inventory_generation += 1;
         Ok(response)
     })();
@@ -1211,7 +1369,12 @@ fn codex_terminal_view(
         .terminals
         .get(&chat_id)
         .and_then(|terminal| terminal.handle.observe_agent_process());
+    let paired_terminal = state
+        .terminals
+        .get(&chat_id)
+        .map(|record| record.handle.clone());
     let record = state.chats.get_mut(&chat_id).expect("checked actor");
+    record.paired_terminal = paired_terminal;
     record.session.terminal = Some(descriptor.session.clone());
     record.session.launch.session_id = session.launch.session_id;
     record.source_process = process;
@@ -1406,6 +1569,16 @@ fn confirm_account_conversation(
 }
 
 pub(super) fn process(
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+) -> Result<ServerResponse, ProtocolError> {
+    super::agent_execution::interactive(host, client, request, |request| {
+        process_inner(host, client, request)
+    })
+}
+
+fn process_inner(
     host: &SharedHost,
     client: ClientId,
     request: ClientRequest,
@@ -1798,7 +1971,46 @@ pub(super) fn process(
             };
             handle.close().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
-            let (record, terminal) = {
+            let terminal = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let record = state
+                    .chats
+                    .get(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle));
+                let paired = record
+                    .and_then(|record| record.session.terminal.as_ref())
+                    .filter(|terminal| terminal.id == chat_id);
+                match paired.and_then(|source| {
+                    state
+                        .terminals
+                        .get(&source.id)
+                        .map(|record| (source, record))
+                }) {
+                    Some((source, record))
+                        if matches_paired_terminal(&record.session, source, state.proof())
+                            && state.chats[&chat_id]
+                                .paired_terminal
+                                .as_ref()
+                                .is_some_and(|expected| record.handle.same_worker(expected)) =>
+                    {
+                        Some((record.session.clone(), record.handle.clone()))
+                    }
+                    Some(_) => {
+                        return Err(unavailable(
+                            "The paired terminal descriptor changed; its replacement was not stopped.",
+                        ));
+                    }
+                    None => None,
+                }
+            };
+            // A console is part of the owned execution. Retain both records
+            // until its shutdown is proved, so a failed close remains retryable.
+            if let Some((_, terminal)) = &terminal {
+                terminal
+                    .shutdown()
+                    .map_err(|error| unavailable(error.to_string()))?;
+            }
+            let record = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if !state
                     .chats
@@ -1809,23 +2021,28 @@ pub(super) fn process(
                         "The thread changed while its previous actor was closing.",
                     ));
                 }
-                let paired = state
-                    .chats
-                    .get(&chat_id)
-                    .filter(|record| record.handle.same_actor(&handle))
-                    .and_then(|record| record.session.terminal.as_ref())
-                    .filter(|terminal| terminal.id == chat_id)
-                    .map(|terminal| terminal.id);
+                if let Some((source, handle)) = &terminal
+                    && state.terminals.get(&source.id).is_none_or(|record| {
+                        !matches_paired_terminal(&record.session, source, state.proof())
+                            || !record.handle.same_worker(handle)
+                    })
+                {
+                    return Err(unavailable(
+                        "The paired terminal changed while its previous worker was closing.",
+                    ));
+                }
                 state.inventory_generation += 1;
                 let record = state.chats.remove(&chat_id);
                 if let Some(notifications) = &state.notifications {
                     notifications.retire(chat_id);
                 }
-                let terminal = paired.and_then(|id| state.retire_terminal(id));
-                (record, terminal)
+                if let Some((source, _)) = terminal {
+                    state.retire_terminal(source.id);
+                }
+                record
             };
-            if let Some(terminal) = terminal {
-                let _ = terminal.handle.shutdown();
+            if let Some(record) = &record {
+                super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
             }
             drop(record);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
@@ -2147,14 +2364,29 @@ pub(super) fn close_for_terminal(
             .chats
             .get(&terminal_id)
             .filter(|record| {
-                record.session.launch.provider == Provider::Codex
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
                     && record
                         .session
                         .terminal
                         .as_ref()
                         .is_some_and(|terminal| terminal.id == terminal_id)
             })
-            .map(|record| record.handle.clone())
+            .map(|record| {
+                let owned = record.paired_terminal.as_ref().is_some_and(|expected| {
+                    state
+                        .terminals
+                        .get(&terminal_id)
+                        .is_some_and(|actual| actual.handle.same_worker(expected))
+                });
+                if !owned {
+                    return Err(unavailable(
+                        "The terminal worker no longer belongs to this provider pairing",
+                    ));
+                }
+                Ok(record.handle.clone())
+            })
+            .transpose()?
     };
     if let Some(handle) = handle {
         close_terminal_actor(host, terminal_id, &handle)?;
@@ -2171,13 +2403,19 @@ pub(super) fn close_terminal_actor(
 ) -> Result<(), ProtocolError> {
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state
+    let removed = if state
         .chats
         .get(&terminal_id)
         .is_some_and(|record| record.handle.same_actor(handle))
     {
-        state.chats.remove(&terminal_id);
         state.inventory_generation += 1;
+        state.chats.remove(&terminal_id)
+    } else {
+        None
+    };
+    drop(state);
+    if let Some(record) = removed {
+        super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     Ok(())
 }
@@ -3303,6 +3541,9 @@ for line in sys.stdin:
             state.chats.insert(
                 chat_id,
                 Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
                     session: session.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -3394,6 +3635,33 @@ for line in sys.stdin:
         codex_terminal_view(&host, 2, chat_id, &handle, session, recipe).unwrap();
         let replacement = host.lock().unwrap().terminals[&terminal.id].handle.clone();
         assert!(!replacement.same_worker(&worker));
+        // A recreated terminal can have the same public ID, launch recipe and
+        // daemon proof. A stale private pairing must not authorize its close.
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&chat_id)
+            .unwrap()
+            .paired_terminal = Some(worker.clone());
+        assert!(process(&host, 2, ClientRequest::ChatClose { chat_id }).is_err());
+        assert!(!replacement.is_completed());
+        assert!(host.lock().unwrap().chats.contains_key(&chat_id));
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&chat_id)
+            .unwrap()
+            .paired_terminal = Some(replacement.clone());
+        {
+            let mut state = host.lock().unwrap();
+            let terminal = state.terminals.get_mut(&terminal.id).unwrap();
+            let mut observed = terminal.session.launch.clone();
+            observed.program = "codex".into();
+            observed.arguments = vec!["resume".into(), identity.into()];
+            terminal.session.resume_hint =
+                crate::model::agent_recovery::hint_from_launch(&observed);
+            assert!(terminal.session.resume_hint.is_some());
+        }
         process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
         assert!(handle.is_completed());
         assert!(worker.is_completed());
@@ -3515,6 +3783,9 @@ for line in sys.stdin:
         host.lock().unwrap().chats.insert(
             chat_id,
             Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -3611,6 +3882,9 @@ for line in sys.stdin:
             state.chats.insert(
                 chat_id,
                 Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
                     session: Session {
                         owned_codex_listener: None,
                         id: chat_id,

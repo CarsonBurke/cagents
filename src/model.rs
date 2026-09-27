@@ -76,6 +76,8 @@ id_type!(ChannelId);
 id_type!(TerminalId);
 id_type!(BrowserId);
 id_type!(OperationId);
+id_type!(AgentId);
+id_type!(RunId);
 
 macro_rules! evidence_type {
     ($name:ident) => {
@@ -883,7 +885,7 @@ mod activity_tests {
 #[path = "agent_recovery.rs"]
 pub mod agent_recovery;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
     /// Native Codex listener provenance retained while this is its CLI view.

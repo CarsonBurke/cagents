@@ -239,7 +239,7 @@ fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
-fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
+pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
             ProtocolErrorCode::TerminalUnavailable,
@@ -293,6 +293,16 @@ fn process_request(
     ensure_control_open(host)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Agent {
+            authority,
+            operation,
+        } => {
+            let reply =
+                super::agent_execution::process(host, authority, operation).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                })?;
+            Ok((ServerResponse::Agent(reply), Vec::new(), false))
+        }
         ClientRequest::WatchNotifications { presence }
         | ClientRequest::NotificationPresence { presence } => {
             crate::instance::validate_window_slot(&presence.window).map_err(|error| {
@@ -793,7 +803,10 @@ fn process_request(
                     }
                 };
                 let paired = state.chats.get(&session.id).map(|record| {
-                    if record.session.launch.provider != crate::agent::Provider::Codex
+                    if !record.paired_terminal.as_ref().is_some_and(|expected| {
+                        handle.as_ref().is_some_and(|actual| actual.same_worker(expected))
+                    }) || (record.session.launch.provider != crate::agent::Provider::Codex
+                        && !record.owns_execution_console())
                         || !record.session.terminal.as_ref().is_some_and(|terminal| {
                             terminal.id == session.id && terminal.launch == session.launch
                         })
@@ -1153,6 +1166,15 @@ mod tests {
 
     #[test]
     fn completed_terminal_requires_confirmation_for_its_exact_native_actor() {
+        assert_completed_native_confirmation(crate::agent::Provider::Codex);
+    }
+
+    #[test]
+    fn completed_console_requires_confirmation_for_its_exact_native_actor() {
+        assert_completed_native_confirmation(crate::agent::Provider::Claude);
+    }
+
+    fn assert_completed_native_confirmation(provider: crate::agent::Provider) {
         use crate::{
             chat::{
                 self,
@@ -1227,18 +1249,22 @@ mod tests {
             state.register_client(1);
             state.reserve_spawn(session.id).unwrap();
             state
-                .finish_spawn(1, session.clone(), terminal, false)
+                .finish_spawn(1, session.clone(), terminal.clone(), false)
                 .unwrap();
             state.chats.insert(
                 session.id,
                 super::super::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    console_recipe: (provider != crate::agent::Provider::Codex)
+                        .then(|| session.launch.clone()),
+                    paired_terminal: Some(terminal),
                     session: chat::Session {
                         id: session.id,
                         owned_codex_listener: None,
                         proof: Some(proof),
                         terminal: Some(session.clone()),
                         launch: chat::Launch {
-                            provider: crate::agent::Provider::Codex,
+                            provider,
                             recipe,
                             session_id: Some("exact-thread".into()),
                         },
@@ -1386,6 +1412,9 @@ mod tests {
             state.chats.insert(
                 chat_id,
                 super::super::chat::Record {
+                    execution_instance: uuid::Uuid::nil(),
+                    console_recipe: None,
+                    paired_terminal: None,
                     session: chat::Session {
                         owned_codex_listener: None,
                         id: chat_id,

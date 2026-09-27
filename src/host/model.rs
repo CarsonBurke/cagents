@@ -24,6 +24,8 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod execution;
+
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
 /// in microseconds; the timeout exists for the WAL checkpoint, not for a rival.
@@ -45,6 +47,7 @@ pub(crate) struct Applied {
 
 pub(crate) struct Registry {
     db: Connection,
+    path: PathBuf,
 }
 
 impl Registry {
@@ -66,7 +69,17 @@ impl Registry {
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         configure(&db)?;
         migrate(&db)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            path: path.to_owned(),
+        })
+    }
+
+    /// Independent WAL connection for low-rate execution transactions. The
+    /// caller can hold its own mutex without stalling terminal delivery behind
+    /// the global host lock while SQLite commits or waits for another writer.
+    pub(crate) fn execution_connection(&self) -> Result<Self, String> {
+        Self::at(&self.path)
     }
 
     /// The whole model, ordered by the ranks the registry assigned.
@@ -144,6 +157,7 @@ impl Registry {
             .map(PathBuf::from)
             .collect();
         Ok(WorkspaceModel {
+            agents: self.agents(None)?,
             identity,
             sequence: sequence as u64,
             projects,
@@ -160,6 +174,9 @@ impl Registry {
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
         let changed = match edit {
+            ModelEdit::AgentsChanged => {
+                return Err("Agent model changes are committed by the execution service".into());
+            }
             ModelEdit::OpenProject {
                 repository,
                 name,
@@ -410,16 +427,16 @@ fn prepare_private_file(path: &Path) -> io::Result<()> {
 ///
 /// `foreign_keys` is load-bearing rather than hygienic: closing a project
 /// removes its channels through the cascade, so an unenforced foreign key would
-/// silently leave channels behind that no sidebar can reach. `NORMAL` is the
-/// documented companion to WAL and is durable across an application crash,
-/// which is the failure this store has to survive.
+/// silently leave channels behind that no sidebar can reach. `FULL` makes
+/// execution acceptance durable before launching a child or submitting its
+/// prompt, including a power failure after the external side effect begins.
 fn configure(db: &Connection) -> Result<(), String> {
     db.busy_timeout(BUSY_TIMEOUT)
         .map_err(|error| error.to_string())?;
     db.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;",
+         PRAGMA synchronous = FULL;",
     )
     .map_err(|error| error.to_string())?;
     let foreign_keys: i64 = db
@@ -440,15 +457,23 @@ fn configure(db: &Connection) -> Result<(), String> {
     let synchronous: i64 = db
         .pragma_query_value(None, "synchronous", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if synchronous != 1 {
+    if synchronous != 2 {
         return Err(format!(
-            "SQLite synchronous mode is {synchronous}, but NORMAL (1) is required"
+            "SQLite synchronous mode is {synchronous}, but FULL (2) is required"
         ));
     }
     Ok(())
 }
 
 fn migrate(db: &Connection) -> Result<(), String> {
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if version > 1 {
+        return Err(format!(
+            "workspace registry schema {version} is newer than supported schema 1"
+        ));
+    }
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS projects(
              repository TEXT PRIMARY KEY,
@@ -496,6 +521,7 @@ fn migrate(db: &Connection) -> Result<(), String> {
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
+    execution::migrate(db)?;
     Ok(())
 }
 

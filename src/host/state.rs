@@ -224,6 +224,15 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
+    pub(super) execution_startups: BTreeMap<
+        crate::model::AgentId,
+        (
+            crate::agent_execution::HostedSession,
+            Arc<crate::chat::protocol::ExecutionContext>,
+        ),
+    >,
     /// Connections that asked for shared-model edges, kept separately from
     /// `watchers` because watching terminals and watching the model are
     /// independent subscriptions with independent clients - the CLI reads the
@@ -276,6 +285,9 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            execution_registry: None,
+            execution_gates: BTreeMap::new(),
+            execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             notifications: None,
             notification_closed: BTreeSet::new(),
@@ -339,6 +351,13 @@ impl HostState {
     /// constructed for a test must not reach into the user's data directory, and
     /// a daemon that cannot open the store still has terminals to host.
     pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+        self.execution_registry = match registry.execution_connection() {
+            Ok(connection) => Some(Arc::new(Mutex::new(connection))),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the agent execution registry");
+                None
+            }
+        };
         self.model = Some(registry);
     }
 
@@ -475,7 +494,7 @@ impl HostState {
     /// broadcast, because a redraw broadcast returns early for a subscriber that
     /// is not visible and a sidebar edge is not a repaint - a hidden window that
     /// missed one would show a channel that no longer exists until it restarted.
-    fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
+    pub(super) fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -808,7 +827,7 @@ impl HostState {
 
     #[cfg(test)]
     pub(crate) fn reserve_spawn(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view(terminal_id, false)
+        self.reserve_spawn_for_view(terminal_id, None)
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
@@ -854,7 +873,7 @@ impl HostState {
     fn reserve_spawn_for_view(
         &mut self,
         terminal_id: TerminalId,
-        paired: bool,
+        paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
         if self.shutting_down {
             return Err(ProtocolError::new(
@@ -866,9 +885,11 @@ impl HostState {
         if self.chat_spawning.contains_key(&terminal_id)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
-                    && !(paired
-                        && record.returning_terminal
-                        && record.session.launch.provider == crate::agent::Provider::Codex)
+                    && !paired.is_some_and(|terminal| {
+                        record.accepts_execution_console(terminal)
+                            || (record.returning_terminal
+                                && record.session.launch.provider == crate::agent::Provider::Codex)
+                    })
             })
         {
             return Err(ProtocolError::new(
@@ -2570,7 +2591,7 @@ fn start_terminal_view(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reserve_spawn_for_view(terminal_id, paired)?;
+        state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.
@@ -2610,8 +2631,58 @@ fn start_terminal_view(
         })
     };
 
+    let agent_authority = if paired {
+        match super::agent_execution::registry(shared) {
+            Ok(registry) => registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retained_agent_authority(terminal_id)
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    } else if adoption.is_none() {
+        match super::agent_execution::registry(shared) {
+            Ok(registry) => {
+                let mut source = session.clone();
+                let proof = shared
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                source.continuity = TerminalContinuity::Live {
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
+                };
+                source.resume_hint =
+                    crate::model::agent_recovery::observed_hint_from_launch(&source.launch);
+                match registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .fresh_agent_authority(&crate::agent_execution::HostedSession::Terminal(source))
+                {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        shared
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .cancel_spawn(terminal_id);
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            error,
+                            false,
+                        ));
+                    }
+                }
+            }
+            Err(_) => Default::default(),
+        }
+    } else {
+        Default::default()
+    };
     let weak = Arc::downgrade(shared);
     let config = TerminalConfig {
+        agent_authority,
         columns: options.columns,
         rows: options.rows,
         cell_width_px: options.cell_width_px,

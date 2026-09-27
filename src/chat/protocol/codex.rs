@@ -286,6 +286,7 @@ fn create_inner(
             skills_stale: false,
             skill_paths: Vec::new(),
             materialized: launch.session_id.is_some(),
+            execution: None,
         }),
     ))
 }
@@ -310,6 +311,17 @@ struct PendingRequest {
     fields: Vec<Field>,
     kind: RequestKind,
 }
+fn execution_end(run: crate::model::RunId, outcome: crate::notifications::Kind, step: &mut Step) {
+    use crate::agent_execution::ProviderEvent;
+    for event in [
+        ProviderEvent::Scope,
+        ProviderEvent::Settled,
+        ProviderEvent::Finished { outcome },
+    ] {
+        step.events.push(Event::Execution { run, event });
+    }
+}
+
 enum RequestKind {
     Decision,
     Permissions,
@@ -349,6 +361,17 @@ struct Codex {
     /// which is how a message's input names one exactly.
     skill_paths: Vec<(String, String)>,
     materialized: bool,
+    execution: Option<Execution>,
+}
+
+struct Execution {
+    run: crate::model::RunId,
+    request: String,
+    turn: Option<String>,
+    /// A shared server may deliver completion before its turn/start response.
+    /// Do not guess which observed turn belongs to this accepted request.
+    early: BTreeMap<String, Value>,
+    early_bytes: usize,
 }
 impl Drop for Codex {
     fn drop(&mut self) {
@@ -359,6 +382,53 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn finish_execution(&mut self, turn: &Value, step: &mut Step) -> Result<(), String> {
+        let Some(execution) = self.execution.as_mut() else {
+            return Ok(());
+        };
+        let id = string(turn, "id")?;
+        if execution.turn.is_none() {
+            let bytes = serde_json::to_vec(turn)
+                .map_err(|error| error.to_string())?
+                .len();
+            if execution.early.len() >= 8
+                || execution.early_bytes.saturating_add(bytes)
+                    > crate::agent_execution::MAX_RESULT_BYTES
+            {
+                return Err(
+                    "Codex completed turns exceeded pending request correlation capacity".into(),
+                );
+            }
+            execution.early_bytes += bytes;
+            execution.early.insert(id.to_owned(), turn.clone());
+            return Ok(());
+        }
+        if execution.turn.as_deref() != Some(id) {
+            return Ok(());
+        }
+        let outcome = match turn["status"].as_str() {
+            Some("completed") => crate::notifications::Kind::Succeeded,
+            Some("failed") => crate::notifications::Kind::Failed,
+            Some("interrupted") => crate::notifications::Kind::Cancelled,
+            _ => return Err("Codex completed an accepted run with an unknown outcome".into()),
+        };
+        let execution = self.execution.take().unwrap();
+        // Full completed-turn items also cover output that arrived before the
+        // request acknowledgement. They upsert the same transcript identities.
+        for value in array(turn, "items")? {
+            step.events
+                .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
+        }
+        if let Some(message) = turn["error"]["message"].as_str() {
+            step.events.push(Event::Error {
+                message: message.into(),
+                fatal: false,
+            });
+        }
+        execution_end(execution.run, outcome, step);
+        Ok(())
+    }
+
     /// The first queued prompt needs the catalog to resolve skill mentions
     /// into typed inputs. Attachment and catalog responses can arrive in
     /// either order; subsequent catalog refreshes leave the session usable.
@@ -811,6 +881,48 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn command_for_run(
+        &mut self,
+        run: crate::model::RunId,
+        command: Command,
+    ) -> Result<Step, String> {
+        if self.execution.is_some()
+            || !matches!(
+                &command,
+                Command::Prompt {
+                    mode: PromptMode::Send,
+                    ..
+                }
+            )
+        {
+            return Err("A correlated Codex run requires one idle direct prompt".into());
+        }
+        let mut step = self.command(command)?;
+        let request = step
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .and_then(|frame| frame["id"].as_str())
+            .ok_or("Codex did not create the prompt request")?
+            .to_owned();
+        self.execution = Some(Execution {
+            run,
+            request: request.clone(),
+            turn: None,
+            early: BTreeMap::new(),
+            early_bytes: 0,
+        });
+        step.events.insert(
+            0,
+            Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Started {
+                    key: format!("codex-request:{request}"),
+                },
+            },
+        );
+        Ok(step)
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = Step::default();
         self.ready = false;
@@ -918,6 +1030,12 @@ impl Adapter for Codex {
                     ),
                     fatal,
                 });
+                if self.execution.as_ref().is_some_and(|execution| {
+                    frame["id"].as_str() == Some(execution.request.as_str())
+                }) {
+                    let execution = self.execution.take().unwrap();
+                    execution_end(execution.run, crate::notifications::Kind::Failed, &mut step);
+                }
                 return Ok(step);
             }
             let result = frame
@@ -1125,6 +1243,24 @@ impl Adapter for Codex {
                         busy: true,
                         detail: "Codex turn started".into(),
                     });
+                    if let Some(execution) = self.execution.as_mut()
+                        && frame["id"].as_str() == Some(execution.request.as_str())
+                    {
+                        let turn = string(&result["turn"], "id")?.to_owned();
+                        execution.turn = Some(turn.clone());
+                        let completed = execution.early.remove(&turn);
+                        execution.early.clear();
+                        execution.early_bytes = 0;
+                        if let Some(completed) = completed {
+                            self.finish_execution(&completed, &mut step)?;
+                            self.busy = false;
+                            self.turn = None;
+                            step.events.push(Event::Status {
+                                busy: false,
+                                detail: turn_detail(&completed["status"]),
+                            });
+                        }
+                    }
                 }
                 // The one visible effect of compaction is the context figure,
                 // and no notification announces that it has moved, so the
@@ -1245,6 +1381,9 @@ impl Adapter for Codex {
                             .unwrap_or_else(|| turn["error"].to_string()),
                         fatal: false,
                     });
+                }
+                if method == "turn/completed" {
+                    self.finish_execution(turn, &mut step)?;
                 }
             }
             "item/started" | "item/completed" => {
@@ -2244,7 +2383,70 @@ mod tests {
             skills_stale: false,
             skill_paths: Vec::new(),
             materialized: true,
+            execution: None,
         }
+    }
+
+    #[test]
+    fn accepted_run_waits_for_its_exact_turn_even_when_completion_precedes_ack() {
+        use crate::agent_execution::ProviderEvent;
+        let mut adapter = adapter();
+        let run = crate::model::RunId::new();
+        let prompt = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "owned prompt".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = prompt
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let complete = |id: &str, answer: &str| {
+            json!({"method":"turn/completed","params":{
+                "threadId":"thread-exact","turn":{"id":id,"status":"completed","items":[
+                    {"id":format!("{id}-answer"),"type":"agentMessage","text":answer}
+                ]}
+            }})
+        };
+        for frame in [
+            complete("another-client", "Unrelated answer"),
+            complete("owned", "Owned answer"),
+        ] {
+            let observed = adapter.receive(frame).unwrap();
+            assert!(
+                !observed
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Execution { .. }))
+            );
+        }
+        let acknowledged = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"owned"}}}))
+            .unwrap();
+        assert!(acknowledged.events.iter().any(|event| matches!(event,
+            Event::Execution { run: actual, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *actual == run)));
+        let texts = acknowledged
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    role: Role::Assistant,
+                    content: ItemContent::Text { text, .. },
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Owned answer"]);
+        assert!(!adapter.busy);
+        assert!(adapter.execution.is_none());
     }
 
     fn account_fixture(name: &str) -> Value {

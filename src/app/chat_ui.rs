@@ -1991,57 +1991,7 @@ fn fresh_chat_session(
     working_directory: PathBuf,
     account: &Account,
 ) -> Result<chat::Session, String> {
-    let mut recipe = LaunchRecipe {
-        unset_environment: account
-            .credential_overrides()
-            .iter()
-            .map(|name| (*name).into())
-            .collect(),
-        program: provider.executable().into(),
-        arguments: Vec::new(),
-        working_directory,
-        environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
-    };
-    if account.provider == provider
-        && let (Some(variable), Some(home)) =
-            (account::home_variable(provider), account.resolved_home())
-    {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
-    }
-    recipe
-        .environment
-        .retain(|name, _| !recipe.unset_environment.contains(name));
-    match provider {
-        // A shared listener lets CLI and native views use the same thread.
-        Provider::Codex => recipe
-            .arguments
-            .extend(["--remote".into(), "unix://".into()]),
-        Provider::Omp => {
-            let root = provider
-                .session_root(&recipe)
-                .ok_or("Cannot locate the configured account for a new conversation")?;
-            recipe.arguments.extend([
-                "--session-dir".into(),
-                root.join("sessions/native").to_string_lossy().into_owned(),
-            ]);
-        }
-        Provider::Claude => {}
-    }
-    Ok(chat::Session {
-        owned_codex_listener: None,
-        id,
-        launch: chat::Launch {
-            provider,
-            recipe,
-            session_id: None,
-        },
-        proof: None,
-        terminal: None,
-    })
+    chat::fresh_session(provider, id, working_directory, account)
 }
 
 /// What a draft for `provider` shows before anything runs: the models the
@@ -7900,6 +7850,43 @@ mod tests {
             Err(chat::StartFailure::fresh("fixture: daemon gone")),
         );
         assert!(app.chat_offers_fresh_conversation(card));
+    }
+
+    #[test]
+    fn unnamed_hosted_chat_attachment_finishes_hydration_without_replacing_identity() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let session = chat_runtime(&app, card).session.clone();
+        assert!(session.launch.session_id.is_none());
+        assert!(!session.is_unstarted());
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                busy: true,
+                ..Snapshot::default()
+            },
+        ));
+        answer_start(&mut app, target, Ok(handle));
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.is_draft());
+        assert!(runtime.handle().unwrap().snapshot().busy);
+        // Hidden cards attach for activity without building presentation state.
+        // Revealing the adopted card must render that existing busy snapshot.
+        app.chat_runtime_mut(target).unwrap().show(true);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.snapshot.busy);
+        assert_eq!(runtime.session, session);
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+        assert!(!app.chat_start_pending(card));
     }
 
     /// A saved conversation nothing ever ran reopens as a draft, and any

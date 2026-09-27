@@ -99,7 +99,10 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
         // Reading the model afterwards is how an adopting window learns where
         // the new channel sorts, and it is one request on a connection that is
         // otherwise idle until the next edge.
-        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
+        let ranked = matches!(
+            edit,
+            ModelEdit::CreateChannel { .. } | ModelEdit::AgentsChanged
+        );
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
             .map_err(|error| error.to_string())?;
@@ -501,6 +504,12 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id);
         }
+        for agent in &model.agents {
+            if let Some(task) = self.adopt_execution_agent(agent) {
+                changed = true;
+                tasks.push(task);
+            }
+        }
         self.workspace_model = model;
         if changed {
             self.sort_durable_channels();
@@ -509,6 +518,97 @@ impl Cagents {
             tasks.push(self.sync_chrome());
         }
         Task::batch(tasks)
+    }
+
+    /// Adoption records the daemon's exact descriptor without launching a
+    /// replacement, switching channels, or taking focus from current work.
+    fn adopt_execution_agent(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+    ) -> Option<Task<Message>> {
+        if agent.closed
+            || self.channel_ui.is_deleting(agent.channel)
+            || self.channel_ui.was_deleted(agent.channel)
+        {
+            return None;
+        }
+        let selected;
+        let session = if agent.spec.surface == crate::agent_execution::Surface::Terminal {
+            selected = crate::agent_execution::HostedSession::Terminal(agent.console.clone()?);
+            &selected
+        } else {
+            agent.session.as_ref()?
+        };
+        let channel_index = self
+            .durable
+            .channels
+            .iter()
+            .position(|channel| channel.id == agent.channel)?;
+        let card_id = CardId::from_uuid(agent.id.as_uuid());
+        // Includes tombstones: an explicit local close is never undone by an
+        // old model read, a reconnect, or another window observing this agent.
+        if self.durable.cards.iter().any(|card| card.id == card_id) {
+            return None;
+        }
+        let kind = match session {
+            crate::agent_execution::HostedSession::Chat(session) => CardKind::Chat(session.clone()),
+            crate::agent_execution::HostedSession::Terminal(session) => {
+                CardKind::Terminal(session.clone())
+            }
+        };
+        let card = CardState {
+            id: card_id,
+            generation: self.durable.generation,
+            title: format!("{} agent", agent.spec.provider.label()),
+            width_fraction: self.settings.default_column_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind,
+        };
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.cards.push(card.clone());
+        durable
+            .card_scopes
+            .insert(card_id, agent.spec.target.directory.clone());
+        let channel = &mut durable.channels[channel_index];
+        channel.cards.push(card_id);
+        channel.focused.get_or_insert(card_id);
+        self.cards.insert(card_id, CardRuntime::Loading);
+        self.lifecycle.register(
+            card_id,
+            Exposure::Offscreen,
+            Residency::Cold,
+            Instant::now(),
+        );
+        // Native chats keep a lightweight attachment even offscreen, just as
+        // initialize_runtimes does after a window restart. The deferred
+        // lifecycle hydrator only starts terminal/browser surfaces; leaving a
+        // newly adopted chat Loading there would never subscribe to its actor.
+        let attach = match session {
+            crate::agent_execution::HostedSession::Chat(session) => {
+                self.open_chat(card_id, session.clone(), crate::chat::Intent::Restore)
+            }
+            crate::agent_execution::HostedSession::Terminal(_) => Task::none(),
+        };
+        if self.durable.active_channel != Some(agent.channel) {
+            return Some(attach);
+        }
+        let item = WorkspaceCard::new(
+            card_id,
+            card.title,
+            CardWidth::Fraction(card.width_fraction),
+        )
+        .expect("execution title and default width are valid");
+        let task = self
+            .workspace
+            .add_card(item, self.workspace.cards().len(), false)
+            .map(|update| self.apply_viewport(update, true, false))
+            .unwrap_or_else(|error| {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                Task::none()
+            });
+        Some(Task::batch([attach, task]))
     }
 
     /// Takes the shared half of a channel this window already has.
@@ -766,6 +866,117 @@ impl Cagents {
 mod tests {
     use super::*;
 
+    #[test]
+    fn headless_execution_adopts_exact_target_without_stealing_focus_or_resurrecting_tombstones() {
+        use crate::agent::Provider;
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        let (mut app, project, repository) = app_with_project();
+        let active = ChannelId::new();
+        let target = ChannelId::new();
+        let focus = app.workspace.focused();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(local(active, project, "Active", 0));
+        durable
+            .channels
+            .push(local(target, project, "Execution", 1));
+        durable.active_channel = Some(active);
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("execution-host"),
+                boot_id: crate::model::BootId::new("execution-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("execution-incarnation"),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: PathBuf::from("/repo/worktree"),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut agent = Agent {
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository,
+                    directory: PathBuf::from("/repo/worktree"),
+                    channel: Some(target),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+            },
+            channel: target,
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 0,
+            closed: false,
+        };
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert!(
+            app.chat_start_pending(card),
+            "even an unnamed accepted conversation in a hidden channel attaches to its proven actor"
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert_eq!(app.durable.active_channel, Some(active));
+        assert_eq!(app.workspace.focused(), focus);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == target)
+                .unwrap()
+                .cards,
+            vec![card]
+        );
+        assert_eq!(
+            app.durable.card_scopes.get(&card),
+            Some(&PathBuf::from("/repo/worktree"))
+        );
+        assert!(
+            matches!(&app.durable.cards.iter().find(|entry| entry.id == card).unwrap().kind, CardKind::Chat(actual) if actual == &session)
+        );
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|entry| entry.id == card)
+            .unwrap()
+            .existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("user closed".into()),
+            },
+        };
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .filter(|entry| entry.id == card)
+                .count(),
+            1
+        );
+        agent.id = crate::model::AgentId::new();
+        agent.spec.surface = Surface::Terminal;
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "wait for the exact paired console descriptor"
+        );
+    }
+
     /// A window whose project is keyed the way a real one is: by the common Git
     /// directory, which is what `ProjectState.repository` holds and therefore
     /// what the shared model keys a channel on. Keying the fixture on the work
@@ -816,6 +1027,7 @@ mod tests {
             projects: Vec::new(),
             channels,
             closed_projects: Vec::new(),
+            agents: Vec::new(),
         }
     }
 

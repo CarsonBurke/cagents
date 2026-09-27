@@ -296,6 +296,7 @@ impl Cagents {
         // Only a terminal the daemon still hosts can be attached. An exited one
         // would have to be relaunched, and relaunching is a user's decision.
         session.continuity.live_proof().is_some()
+            && crate::agent_execution::console_agent(&session.launch).is_none()
             // A terminal in the middle of a native-chat handoff is already this
             // window's, even before the card that will hold it is written.
             && !self.pending_terminal_handoffs.contains_key(&session.id)

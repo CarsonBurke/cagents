@@ -259,7 +259,15 @@ struct Claude {
     busy: bool,
     interruption: Option<bool>,
     attention_generation: u64,
-    deferred_attention: HashMap<u64, (Option<String>, crate::notifications::Kind)>,
+    deferred_attention: HashMap<
+        u64,
+        (
+            Option<String>,
+            crate::notifications::Kind,
+            Option<crate::model::RunId>,
+        ),
+    >,
+    execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
@@ -1041,6 +1049,46 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn command_for_run(
+        &mut self,
+        run: crate::model::RunId,
+        command: Command,
+    ) -> Result<Step, String> {
+        if self.execution.is_some()
+            || self.busy
+            || !matches!(
+                &command,
+                Command::Prompt {
+                    mode: PromptMode::Send,
+                    ..
+                }
+            )
+        {
+            return Err("A correlated Claude prompt requires an idle conversation".into());
+        }
+        let mut step = self.command(command)?;
+        let key = step
+            .writes
+            .iter()
+            .find_map(|frame| {
+                (frame["type"] == "user")
+                    .then(|| frame["uuid"].as_str())
+                    .flatten()
+            })
+            .ok_or("Claude did not assign an identity to the prompt")?
+            .to_owned();
+        self.execution = Some(run);
+        step.events.insert(
+            0,
+            Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Started {
+                    key: format!("claude:{key}"),
+                },
+            },
+        );
+        Ok(step)
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = self.control(
             json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[]}),
@@ -1215,6 +1263,18 @@ impl Adapter for Claude {
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        if let Some(run) = self.execution
+            && matches!(
+                string(&frame, "type"),
+                "assistant" | "stream_event" | "result"
+            )
+            && frame["parent_tool_use_id"].is_null()
+        {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Scope,
+            });
+        }
         if let Some(id) = frame["session_id"].as_str().filter(|id| !id.is_empty()) {
             validate_id(id)?;
             if self
@@ -1272,15 +1332,21 @@ impl Adapter for Claude {
                     && let Some(generation) = request["_cagents_turn"].as_u64()
                 {
                     let accepted = string(response, "subtype") == "success";
-                    if let Some((key, outcome)) = self.deferred_attention.remove(&generation) {
-                        step.events.push(Event::TurnFinished {
-                            key,
-                            outcome: if accepted {
-                                crate::notifications::Kind::Cancelled
-                            } else {
-                                outcome
-                            },
-                        });
+                    if let Some((key, outcome, execution)) =
+                        self.deferred_attention.remove(&generation)
+                    {
+                        let outcome = if accepted {
+                            crate::notifications::Kind::Cancelled
+                        } else {
+                            outcome
+                        };
+                        step.events.push(Event::TurnFinished { key, outcome });
+                        if let Some(run) = execution {
+                            step.events.push(Event::Execution {
+                                run,
+                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                            });
+                        }
                     } else if generation == self.attention_generation && self.interruption.is_some()
                     {
                         self.interruption = accepted.then_some(true);
@@ -1402,11 +1468,24 @@ impl Adapter for Claude {
                     } else {
                         Kind::Succeeded
                     };
+                    let execution = self.execution.take();
+                    if let Some(run) = execution {
+                        step.events.push(Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Settled,
+                        });
+                    }
                     if interruption == Some(false) {
                         self.deferred_attention
-                            .insert(self.attention_generation, (key, outcome));
+                            .insert(self.attention_generation, (key, outcome, execution));
                     } else {
                         step.events.push(Event::TurnFinished { key, outcome });
+                        if let Some(run) = execution {
+                            step.events.push(Event::Execution {
+                                run,
+                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                            });
+                        }
                     }
                 }
                 self.attention_generation = self.attention_generation.wrapping_add(1);
@@ -3819,6 +3898,50 @@ mod tests {
             .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
             .unwrap();
         assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn correlated_run_keeps_its_identity_when_interrupt_ack_follows_the_next_prompt() {
+        use crate::agent_execution::ProviderEvent;
+        let mut adapter = Claude {
+            ready: true,
+            ..Claude::default()
+        };
+        let first = crate::model::RunId::new();
+        let prompt = |text: &str| Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        adapter
+            .command_for_run(first, prompt("first prompt"))
+            .unwrap();
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
+        let settled = adapter
+            .receive(json!({"type":"result","uuid":"first-result","is_error":false}))
+            .unwrap();
+        assert!(settled.events.iter().any(|event| matches!(event,
+            Event::Execution { run, event: ProviderEvent::Settled } if *run == first)));
+        assert!(!settled.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
+        let second = crate::model::RunId::new();
+        adapter
+            .command_for_run(second, prompt("second prompt"))
+            .unwrap();
+        let ack = adapter.receive(reply(request_id, json!({}))).unwrap();
+        assert!(ack.events.iter().any(|event| matches!(event,
+            Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Cancelled } } if *run == first)));
+        let second_result = adapter
+            .receive(json!({"type":"result","uuid":"second-result","is_error":false}))
+            .unwrap();
+        assert!(second_result.events.iter().any(|event| matches!(event,
+            Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *run == second)));
     }
 
     #[test]
