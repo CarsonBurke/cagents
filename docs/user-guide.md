@@ -158,6 +158,11 @@ rows; the counts make that scope visible. An open, focused review refreshes
 every 30 seconds, keeping its file marks and discussion current.
 The same refresh updates its title, checks, review decision, and base branch.
 
+Large reviews mount only visible file rows and their folder ancestors. Viewed
+marks load in pages as you scroll or navigate; unfetched marks stay visibly
+unknown and cannot be toggled. **Load more viewed states** also fetches a page
+on demand. A failed page can be retried without losing the open diff.
+
 Previously opened reviews retain their file list, viewed marks, and selected
 file locally. If GitHub is unavailable, enter `#123` in the browser and choose
 **Open #123** to read its cached diff. The header identifies the cached viewer;
@@ -198,6 +203,16 @@ The app rechecks the repository, signed-in account, commit, and pending comment
 contents before sending. If a request's answer is lost, it asks you to check
 GitHub rather than silently posting it again. The same controls are available
 in ceditor's Pull requests panel.
+
+Use **Create worktree from reviewed commit** in the PR header to work on that
+exact revision. The suggested branch includes the PR number and commit prefix;
+choose a new branch and destination before confirming. A later force-push does
+not change the checkout. Cagents uses its regular worktree creation flow;
+Ceditor previews the resolved destination, creates the worktree, and offers
+**Open worktree**. Both preserve the original checkout and record interrupted
+creation for reconciliation instead of silently repeating it.
+Ceditor's **Worktrees** footer opens recent operation results, including a
+completed worktree recovered after a restart, with an **Open worktree** action.
 
 ## Worktrees
 

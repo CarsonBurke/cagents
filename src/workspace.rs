@@ -274,19 +274,7 @@ impl StripGeometry {
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
             let width = if cards.len() == 1 && viewport_width > 0.0 {
-                let available =
-                    (viewport_width - config.leading_padding - config.trailing_padding).max(0.0);
-                let preferred = card
-                    .width
-                    .resolve(viewport_width, config.width_limits)
-                    .clamp(config.width_limits.minimum.min(available), available);
-                // Fill compact viewports and gradually return to the stored
-                // width as another minimum-width pane would fit beside this
-                // one. A hard breakpoint would make the pane jump on resize.
-                let wide = ((available - config.width_limits.minimum * 2.0)
-                    / config.width_limits.minimum)
-                    .clamp(0.0, 1.0);
-                available + (preferred - available) * wide
+                available
             } else if expand {
                 // Fill spare space proportionally without changing the user's
                 // preferences. Adding another pane can restore those widths.
@@ -320,8 +308,7 @@ impl StripGeometry {
         } else {
             cursor + config.trailing_padding
         };
-        // Keep the strip at least as wide as the viewport even when a lone
-        // pane uses its configured width and leaves room beside it.
+        // An empty strip still owns the viewport.
         let total_width = total_width.max(viewport_width);
 
         Self {
@@ -2210,10 +2197,10 @@ mod tests {
     }
 
     #[test]
-    fn lone_pane_uses_its_width_on_large_screens_and_fills_narrow_screens() {
+    fn lone_pane_fills_every_viewport_without_losing_its_saved_width() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.35)], 1_000.0);
         let first = workspace.focused().unwrap();
-        for (width, expected) in [(960.0, 960.0), (1_440.0, 504.0), (800.0, 800.0)] {
+        for (width, expected) in [(960.0, 960.0), (1_440.0, 1_440.0), (800.0, 800.0)] {
             workspace.resize_viewport(width);
             let geometry = workspace.geometry();
             let card = geometry.card(first).unwrap();
@@ -2246,16 +2233,16 @@ mod tests {
         let second = geometry.card_at(1).unwrap().id;
         workspace.request_close(second).unwrap();
         workspace.commit_close(second).unwrap();
-        assert!((workspace.geometry().card(first).unwrap().width() - 504.0).abs() < 0.001);
+        assert!((workspace.geometry().card(first).unwrap().width() - 1_440.0).abs() < 0.001);
 
         workspace
             .set_card_width(first, CardWidth::Fraction(0.5))
             .unwrap();
-        assert_eq!(workspace.geometry().card(first).unwrap().width(), 720.0);
+        assert_eq!(workspace.geometry().card(first).unwrap().width(), 1_440.0);
         workspace.resize_viewport(800.0);
         assert_eq!(workspace.geometry().card(first).unwrap().width(), 800.0);
         workspace.resize_viewport(1_440.0);
-        assert_eq!(workspace.geometry().card(first).unwrap().width(), 720.0);
+        assert_eq!(workspace.geometry().card(first).unwrap().width(), 1_440.0);
 
         workspace.resize_viewport(959.0);
         let before = workspace.geometry().card(first).unwrap().width();
@@ -2268,7 +2255,7 @@ mod tests {
         assert_eq!(fixed.geometry().max_offset(320.0), 0.0);
 
         let narrow = workspace_with_widths(&[CardWidth::Fraction(0.125)], 1_440.0);
-        assert_eq!(narrow.geometry().card_at(0).unwrap().width(), 480.0);
+        assert_eq!(narrow.geometry().card_at(0).unwrap().width(), 1_440.0);
     }
 
     #[test]

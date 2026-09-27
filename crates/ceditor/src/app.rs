@@ -41,6 +41,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod checkout;
+
 #[derive(Clone)]
 pub struct Flags {
     pub paths: Vec<PathBuf>,
@@ -114,6 +116,7 @@ struct FileOperationDialog {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Checkout(checkout::Action),
     Choose(bool),
     Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
@@ -473,6 +476,11 @@ pub struct Editor {
     notice: Option<String>,
     notices_open: bool,
     file_dialog: Option<FileOperationDialog>,
+    checkout_dialog: Option<checkout::Dialog>,
+    checkout_journal: Option<checkout::Journal>,
+    checkout_history: Vec<cagents::repository::WorktreeOperationReport>,
+    checkout_history_open: bool,
+    checkout_error: Option<String>,
     closing: Option<CardId>,
     close_confirmed: bool,
     exiting: bool,
@@ -1029,17 +1037,24 @@ impl Editor {
             || self.quick_open
             || self.closing.is_some()
             || self.file_dialog.is_some()
+            || self.checkout_dialog.is_some()
+            || self.checkout_history_open
             || self.notices_open
             || self.pending_discard().is_some()
     }
 
     fn settings_footer(&self) -> Element<'_, Message> {
         widget::row::with_children(vec![
+            widget::button::text("Worktrees")
+                .on_press_maybe(
+                    (!self.modal_open()).then_some(Message::Checkout(checkout::Action::History)),
+                )
+                .into(),
             icon_control(
                 symbolic_icon("emblem-system-symbolic"),
                 "Settings",
                 self.settings_open,
-                self.closing.is_none() && self.file_dialog.is_none(),
+                !self.modal_open(),
                 Some(Message::Settings),
             )
             .into(),
@@ -2389,6 +2404,7 @@ impl Editor {
             return Task::none();
         };
         let mut tasks = Vec::new();
+        let mut checkout_target = None;
         for effect in tab.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -2421,7 +2437,11 @@ impl Editor {
                 // The shell keeps no session state for the review, so the
                 // selection has nothing to update here.
                 pull_request_review::Effect::SelectionChanged(_) => {}
+                pull_request_review::Effect::Checkout(target) => checkout_target = Some(target),
             }
+        }
+        if let Some(target) = checkout_target {
+            self.begin_checkout(target);
         }
         Task::batch(tasks)
     }
@@ -2955,6 +2975,11 @@ impl Application for Editor {
             notice,
             notices_open: false,
             file_dialog: None,
+            checkout_dialog: None,
+            checkout_journal: None,
+            checkout_history: Vec::new(),
+            checkout_history_open: false,
+            checkout_error: None,
             closing: None,
             close_confirmed: false,
             exiting: false,
@@ -2972,7 +2997,11 @@ impl Application for Editor {
             preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
             preference_generation: 0,
         };
-        let mut tasks = vec![app.appearance(), app.lsp_next()];
+        let mut tasks = vec![
+            app.appearance(),
+            app.lsp_next(),
+            app.load_checkout_journal(),
+        ];
         if let Some(window) = app.core.main_window_id() {
             tasks.push(app.set_window_title("ceditor".to_owned(), window));
         }
@@ -3060,6 +3089,9 @@ impl Application for Editor {
                 if self.file_dialog.is_some() {
                     return self.update(Message::CancelFileOperation);
                 }
+                if self.checkout_dialog.is_some() || self.checkout_history_open {
+                    return self.checkout_action(checkout::Action::Cancel);
+                }
                 if self.quick_open {
                     return self.update(Message::CloseQuickOpen);
                 }
@@ -3102,6 +3134,7 @@ impl Application for Editor {
                 return Task::none();
             }
             match message {
+                Message::Checkout(action) => self.checkout_action(action),
                 Message::WindowResized(size) => {
                     self.window_size = size;
                     Task::none()
@@ -3258,6 +3291,15 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    if self
+                        .checkout_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.busy())
+                    {
+                        self.notice =
+                            Some("Cancel or finish the worktree operation before closing.".into());
+                        return Task::none();
+                    }
                     // Shutdown removes runtime tabs to honor dirty-buffer guards;
                     // keep the user's pre-shutdown tab order and selection.
                     self.save_session_now();
@@ -4626,18 +4668,20 @@ impl Application for Editor {
                         tab.git,
                         review_panel(&tab.review, self.modal_open())
                             .map(move |action| Message::PullRequestReview(id, action)),
+                        self.settings_footer(),
                         Message::Sidebar,
                     )
                 } else {
-                    sidebar::worktree_sidebar(
+                    sidebar::worktree_sidebar_with_footer(
                         &tab.sidebar,
                         &tab.navigation,
                         width,
                         self.modal_open(),
                         panel,
                         tab.git,
+                        self.settings_footer(),
+                        Message::Sidebar,
                     )
-                    .map(Message::Sidebar)
                 };
                 workspace.push(cagents::interaction::reveal_leading_width(
                     sidebar, width, progress,
@@ -4700,6 +4744,9 @@ impl Application for Editor {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if self.checkout_dialog.is_some() || self.checkout_history_open {
+            return self.checkout_view();
+        }
         if let Some(pending) = self.pending_discard() {
             return Some(dialog_overlay(
                 sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
@@ -5241,6 +5288,96 @@ mod tests {
         directory
     }
 
+    #[test]
+    fn pr_checkout_confirms_a_pinned_commit_and_keeps_the_original_worktree() {
+        use cagents::pull_request_review::CheckoutTarget;
+        let repository = git_fixture();
+        let root = repository.path();
+        let data = tempfile::tempdir().unwrap();
+        let destination = data.path().join("checkouts/review");
+        let original = git(root, &["rev-parse", "HEAD"]);
+        let mut app = editor();
+        app.settings_path = data.path().join("editor/settings.toml");
+        let task = app.load_checkout_journal();
+        run_tasks(&mut app, task);
+        assert!(app.checkout_journal.is_some(), "{:?}", app.notice);
+        app.begin_checkout(CheckoutTarget {
+            repository: root.to_path_buf(),
+            number: 17,
+            head: cagents::repository::Oid::parse(&original).unwrap(),
+        });
+        drop(app.update(Message::Checkout(checkout::Action::Destination(
+            destination.display().to_string(),
+        ))));
+        let task = app.update(Message::Checkout(checkout::Action::Resolve));
+        run_tasks(&mut app, task);
+        assert!(!destination.exists(), "confirmation is read-only");
+        std::fs::write(root.join("tracked.txt"), "new head\n").unwrap();
+        git(root, &["commit", "-am", "Move main after confirmation"]);
+        let moved = git(root, &["rev-parse", "HEAD"]);
+        let task = app.update(Message::Checkout(checkout::Action::Create));
+        run_tasks(&mut app, task);
+        assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), moved);
+        assert_eq!(
+            std::fs::read_to_string(destination.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        let task = app.update(Message::Checkout(checkout::Action::Create));
+        run_tasks(&mut app, task);
+        assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
+        // A crash can lose the completion UI after Git and the durable journal
+        // have committed. Reopening exposes the existing result without replay.
+        let mut reopened = editor();
+        reopened.settings_path = app.settings_path.clone();
+        let task = reopened.load_checkout_journal();
+        run_tasks(&mut reopened, task);
+        let report = reopened
+            .checkout_history
+            .iter()
+            .find(|r| {
+                r.state == cagents::repository::WorktreeOperationState::Created
+                    && r.request
+                        .as_ref()
+                        .is_some_and(|r| r.destination == destination)
+            })
+            .expect("completed checkout survives restart");
+        let id = report.operation_id;
+        drop(reopened.update(Message::Checkout(checkout::Action::History)));
+        assert!(reopened.checkout_history_open);
+        let task = reopened.update(Message::Checkout(checkout::Action::OpenRecorded(id)));
+        run_tasks(&mut reopened, task);
+        assert!(!reopened.checkout_history_open);
+        assert!(
+            reopened
+                .tabs
+                .iter()
+                .any(|tab| tab.runtime.descriptor.worktree == destination)
+        );
+        assert_eq!(git(&destination, &["rev-parse", "HEAD"]), original);
+    }
+
+    #[test]
+    fn checkout_journal_failure_remains_visible_in_the_dialog() {
+        let mut app = editor();
+        drop(
+            app.update(Message::Checkout(checkout::Action::JournalLoaded(Err(
+                "journal path is not writable".into(),
+            )))),
+        );
+        app.begin_checkout(cagents::pull_request_review::CheckoutTarget {
+            repository: PathBuf::from("/review"),
+            number: 1,
+            head: cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
+        });
+        assert_eq!(
+            app.checkout_error.as_deref(),
+            Some("journal path is not writable")
+        );
+        assert!(app.checkout_view().is_some());
+        assert!(app.checkout_journal.is_none());
+    }
+
     /// Execute actual application tasks, including mutation completion and
     /// subsequent snapshot/file refreshes, without a window or network remote.
     fn run_tasks(app: &mut Editor, task: Task<Message>) {
@@ -5690,6 +5827,11 @@ mod tests {
             notice: None,
             notices_open: false,
             file_dialog: None,
+            checkout_dialog: None,
+            checkout_journal: None,
+            checkout_history: Vec::new(),
+            checkout_history_open: false,
+            checkout_error: None,
             closing: None,
             close_confirmed: false,
             exiting: false,

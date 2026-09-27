@@ -14,6 +14,9 @@ use crate::interaction::tooltip;
 /// these nonstandard names. Static handles retain renderer cache identity.
 pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     use std::sync::LazyLock;
+    static BRANCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1A3.5 3.5 0 0 1 8.5 9H4"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static CHANGES: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><path d="M3 1.75h7l3 3v9.5H3zM10 2v3h3M5.5 8h5M8 5.5v5M5.5 12h5"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -144,6 +147,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5h11M2.5 13.5h11M8 4.4V7.1M5.9 5.2 8 7.3l2.1-2.1M8 11.6V8.9M5.9 10.8 8 8.7l2.1 2.1"/></g></svg>"#.as_slice()).symbolic(true)
     });
     match name {
+        "git-branch-symbolic" => BRANCH.clone(),
         "edit-find-symbolic" | "system-search-symbolic" => SEARCH.clone(),
         "document-edit-symbolic" => CHANGES.clone(),
         "text-editor-symbolic" => EDIT.clone(),

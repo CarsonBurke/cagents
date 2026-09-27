@@ -43,8 +43,10 @@ use crate::{
 type ActionTask = iced::Task<Action>;
 
 pub mod cache;
+pub mod checkout;
 pub mod discussion;
 pub mod discussion_ui;
+pub mod file_pages;
 
 /// Indent per tree level, matching the sidebar's file tree.
 const TREE_INDENT: u16 = 12;
@@ -65,9 +67,26 @@ pub struct ReviewTarget {
     pub pull_request: Arc<PullRequest>,
 }
 
+/// A checkout always starts from the exact commit shown by the review. The
+/// private fetch ref can move when another window refreshes the same PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutTarget {
+    pub repository: PathBuf,
+    pub number: u64,
+    pub head: crate::repository::Oid,
+}
+
+impl CheckoutTarget {
+    pub fn suggested_branch(&self) -> String {
+        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+    }
+}
+
 /// Whether a file's local viewed mark matches GitHub's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewedSync {
+    /// This file's remote viewed state has not been fetched.
+    Unknown,
     /// GitHub agrees with the mark shown.
     Settled,
     /// A mutation is in flight; the mark shown is the optimistic one.
@@ -91,6 +110,7 @@ pub struct Loaded {
     pub pull_request: PullRequest,
     pub context: ReviewContext,
     pub files: PullRequestFiles,
+    pub next_file_cursor: Option<String>,
     pub range: PullRequestRange,
     pub entries: Vec<DiffEntry>,
 }
@@ -118,6 +138,7 @@ pub enum ViewedOutcome {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    FilePage(file_pages::PageAction),
     BrowserFenced {
         generation: u64,
         action: Box<Action>,
@@ -187,6 +208,7 @@ pub enum Action {
         results: Vec<(RepoPath, bool, ViewedOutcome)>,
     },
     OpenUrl(Url),
+    Checkout,
     DismissNotice,
 }
 
@@ -196,7 +218,8 @@ impl Action {
     pub fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Loaded { .. }
+            Self::FilePage(file_pages::PageAction::Loaded { .. })
+                | Self::Loaded { .. }
                 | Self::ListLoaded { .. }
                 | Self::TargetLoaded { .. }
                 | Self::Cached { .. }
@@ -223,6 +246,7 @@ pub enum Effect {
     NextChange,
     PreviousChange,
     OpenUrl(Url),
+    Checkout(CheckoutTarget),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
 }
@@ -367,6 +391,9 @@ pub struct State {
     range: Option<PullRequestRange>,
     files: Vec<ReviewFile>,
     files_truncated: bool,
+    pages: file_pages::Pages,
+    file_scroll_id: widget::Id,
+    reveal_row: Option<(usize, usize)>,
     rows: Vec<Row>,
     file_list_mode: FileListMode,
     hide_viewed: bool,
@@ -428,9 +455,11 @@ impl State {
             .files
             .into_iter()
             .map(|file| ReviewFile {
-                entry: file.entry,
+                entry: file.entry.clone(),
                 viewed: file.viewed,
-                sync: if file.unverified {
+                sync: if snapshot.unknown_paths.contains(&file.entry.path) {
+                    ViewedSync::Unknown
+                } else if file.unverified {
                     ViewedSync::Unverified
                 } else {
                     ViewedSync::Settled
@@ -481,6 +510,12 @@ impl State {
                     viewed: file.viewed,
                     unverified: file.sync != ViewedSync::Settled,
                 })
+                .collect(),
+            unknown_paths: self
+                .files
+                .iter()
+                .filter(|file| file.sync == ViewedSync::Unknown)
+                .map(|file| file.entry.path.clone())
                 .collect(),
             selected: self.selected.clone(),
             saved_ms: std::time::SystemTime::now()
@@ -542,6 +577,9 @@ impl State {
             range: None,
             files: Vec::new(),
             files_truncated: false,
+            pages: file_pages::Pages::default(),
+            file_scroll_id: widget::Id::unique(),
+            reveal_row: None,
             rows: Vec::new(),
             file_list_mode: FileListMode::Tree,
             hide_viewed: false,
@@ -637,11 +675,31 @@ impl State {
 
     pub fn update(&mut self, action: Action) -> ActionTask {
         let task = self.update_inner(action);
-        ActionTask::batch([task, self.persist_cache()])
+        let generation = self.generation;
+        let authority_revision = self.authority_revision;
+        let reveal = self
+            .reveal_row
+            .take()
+            .map_or_else(ActionTask::none, |(position, depth)| {
+                file_pages::reveal_row(self.file_scroll_id.clone(), position, depth).map(
+                    move |action| Action::Fenced {
+                        generation,
+                        authority_revision,
+                        action: Box::new(Action::FilePage(action)),
+                    },
+                )
+            });
+        ActionTask::batch([
+            task,
+            reveal,
+            self.load_file_page(false),
+            self.persist_cache(),
+        ])
     }
 
     fn update_inner(&mut self, action: Action) -> ActionTask {
         match action {
+            Action::FilePage(action) => self.page_action(action),
             Action::Cached { generation, result } => {
                 if generation != self.generation || !self.cache_loading || self.context.is_some() {
                     return ActionTask::none();
@@ -856,6 +914,9 @@ impl State {
                 else {
                     return ActionTask::none();
                 };
+                if self.files[index].sync == ViewedSync::Unknown {
+                    return ActionTask::none();
+                }
                 let viewed = !self.files[index].viewed;
                 let task = self.set_viewed(vec![index], viewed);
                 if viewed {
@@ -903,6 +964,20 @@ impl State {
             }
             Action::OpenUrl(url) => {
                 self.effects.push(Effect::OpenUrl(url));
+                ActionTask::none()
+            }
+            Action::Checkout => {
+                if !self.refreshing
+                    && let (Some(target), Some(context), Some(range)) =
+                        (&self.target, &self.context, &self.range)
+                    && context.head_oid == range.head.as_str()
+                {
+                    self.effects.push(Effect::Checkout(CheckoutTarget {
+                        repository: target.worktree.clone(),
+                        number: target.pull_request.number,
+                        head: range.head.clone(),
+                    }));
+                }
                 ActionTask::none()
             }
             Action::DismissNotice => {
@@ -1073,6 +1148,9 @@ impl State {
         self.context = None;
         self.range = None;
         self.files.clear();
+        self.pages = file_pages::Pages::default();
+        self.file_scroll_id = widget::Id::unique();
+        self.reveal_row = None;
         self.files_truncated = false;
         self.rows.clear();
         self.collapsed_directories.clear();
@@ -1104,6 +1182,7 @@ impl State {
         };
         self.last_refresh = Some(Instant::now());
         self.load_generation = self.load_generation.wrapping_add(1);
+        self.pages.loading = false;
         let generation = self.generation;
         let load = self.load_generation;
         let cancellation = self.cancellation.clone();
@@ -1153,7 +1232,26 @@ impl State {
                 || previous.base_oid != loaded.context.base_oid
                 || previous.viewer != loaded.context.viewer
         });
+        self.pages = file_pages::Pages {
+            cursor: loaded.next_file_cursor.clone(),
+            offset: self.pages.offset,
+            height: self.pages.height,
+            ..Default::default()
+        };
         self.files = join_files(&loaded.entries, &loaded.files);
+        if loaded.next_file_cursor.is_some() {
+            let known: BTreeSet<&str> = loaded
+                .files
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect();
+            for file in &mut self.files {
+                if !known.contains(file.entry.path.display().as_ref()) {
+                    file.sync = ViewedSync::Unknown;
+                }
+            }
+        }
         for file in &mut self.files {
             if !authority_changed
                 && let Some((viewed, ViewedSync::Pending)) = previous.get(&file.entry.path)
@@ -1225,7 +1323,15 @@ impl State {
             .map(|offset| files[(start + offset) % files.len()])
             .find(|index| !self.files[*index].viewed);
         if let Some(index) = next {
-            self.select_file(self.files[index].entry.path.clone());
+            if self.files[index].sync == ViewedSync::Unknown {
+                self.pages.wanted = Some(self.files[index].entry.path.clone());
+                self.pages.seek_unviewed = true;
+            } else {
+                self.select_file(self.files[index].entry.path.clone());
+            }
+        } else {
+            self.pages.seek_unviewed = false;
+            self.pages.wanted = None;
         }
     }
 
@@ -1252,7 +1358,10 @@ impl State {
         };
         self.collapsed_directories
             .retain(|directory| !path.as_path().starts_with(directory.as_path()));
+        self.pages.seek_unviewed = false;
+        self.pages.wanted = None;
         self.selected = Some(path);
+        self.reveal_selected_file();
         self.cache_dirty = true;
         self.emit_open(index);
     }
@@ -1267,6 +1376,20 @@ impl State {
             old_path: entry.old_path.clone(),
             basis: range.basis(),
         });
+    }
+
+    fn reveal_selected_file(&mut self) {
+        let Some(selected) = &self.selected else {
+            return;
+        };
+        let displayed = self.displayed_file_rows(&directory_tallies(&self.rows, &self.files));
+        let Some(position) = displayed
+            .iter()
+            .position(|index| self.rows[*index].path == *selected)
+        else {
+            return;
+        };
+        self.reveal_row = Some((position, self.rows[displayed[position]].depth));
     }
 
     /// Moves the selection through the tree's file rows. With nothing
@@ -1306,13 +1429,21 @@ impl State {
     /// sequential task: a directory of fifty files is fifty `gh` runs, and
     /// running them at once would only contend for the same permits.
     fn set_viewed(&mut self, indices: Vec<usize>, viewed: bool) -> ActionTask {
+        if indices
+            .iter()
+            .any(|index| self.files[*index].sync == ViewedSync::Unknown)
+        {
+            return ActionTask::none();
+        }
         let (Some(target), Some(context)) = (&self.target, &self.context) else {
             return ActionTask::none();
         };
         let mut paths = Vec::new();
         for index in indices {
             let file = &mut self.files[index];
-            if file.sync == ViewedSync::Pending || file.viewed == viewed {
+            if matches!(file.sync, ViewedSync::Pending | ViewedSync::Unknown)
+                || file.viewed == viewed
+            {
                 continue;
             }
             file.viewed = viewed;
@@ -1466,6 +1597,14 @@ impl State {
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
             icon_control(
+                symbolic_icon("git-branch-symbolic"),
+                "Create worktree from reviewed commit",
+                false,
+                !modal_open && !busy && self.context.is_some() && self.range.is_some(),
+                Some(self.fenced(Action::Checkout)),
+            )
+            .into(),
+            icon_control(
                 symbolic_icon("view-refresh-symbolic"),
                 if busy {
                     "Refreshing pull request"
@@ -1579,62 +1718,9 @@ impl State {
     /// directory. Folders start open and may be folded independently.
     pub fn file_list(&self, modal_open: bool) -> Element<'_, Action> {
         let spacing = cosmic::theme::spacing();
-        let tallies = directory_tallies(&self.rows, &self.files);
-        let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> =
-            Vec::with_capacity(self.rows.len());
-        for (index, row) in visible_review_rows(&self.rows, &self.collapsed_directories) {
-            if self.hide_viewed
-                && match row.file {
-                    Some(file) => self.files[file].viewed,
-                    None => tallies[index].0 == tallies[index].1,
-                }
-            {
-                continue;
-            }
-            let element = match row.file {
-                Some(file) => self.file_row(row, &self.files[file], modal_open),
-                None => {
-                    let (viewed, total) = tallies[index];
-                    self.directory_row(row, viewed, total, modal_open)
-                }
-            };
-            rows.push(crate::sticky_tree::Row {
-                depth: row.depth,
-                directory: row.file.is_none(),
-                element,
-            });
-        }
-        if rows.is_empty() {
-            let message = match &self.load {
-                LoadState::Loading => "",
-                LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
-                    "All files viewed."
-                }
-                LoadState::Ready => "This pull request changes no files.",
-                LoadState::Idle | LoadState::Failed(_) => "",
-            };
-            if !message.is_empty() {
-                rows.push(crate::sticky_tree::Row {
-                    depth: 0,
-                    directory: false,
-                    element: widget::container(design::caption(message))
-                        .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
-                        .into(),
-                });
-            }
-        }
-        let list: Element<'_, Action> = widget::scrollable(
-            widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
-                .padding(design::with_vertical_rail(Padding::from([
-                    spacing.space_xxxs,
-                    spacing.space_xxs,
-                ])))
-                .width(Length::Fill),
-        )
-        .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
+        let list: Element<'_, Action> =
+            iced::widget::responsive(move |size| self.file_scrollable(modal_open, size.height))
+                .into();
         let (mode_icon, mode_label, next_mode) = match self.file_list_mode {
             FileListMode::Tree => ("view-list-symbolic", "View as list", FileListMode::Flat),
             FileListMode::Flat => (
@@ -1682,10 +1768,143 @@ impl State {
         ])
         .align_y(Alignment::Center)
         .padding([0, spacing.space_xs]);
-        widget::column::with_children(vec![toolbar.into(), list])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        let unknown = self
+            .files
+            .iter()
+            .filter(|file| file.sync == ViewedSync::Unknown)
+            .count();
+        // Keep the scrollable in a stable child slot when pagination finishes
+        // or fails. Moving it within the column discards its scroll state.
+        let mut status = Vec::new();
+        if unknown > 0 {
+            status.push(design::caption(format!("{unknown} viewed states not loaded")).into());
+        }
+        if let Some(error) = &self.pages.error {
+            status.push(design::caption(error).into());
+        }
+        if self.pages.cursor.is_some() {
+            status.push(
+                widget::button::text(if self.pages.loading {
+                    "Loading viewed states…"
+                } else if self.pages.error.is_some() {
+                    "Retry viewed states"
+                } else {
+                    "Load more viewed states"
+                })
+                .on_press_maybe(
+                    (!self.pages.loading && !modal_open)
+                        .then_some(Action::FilePage(file_pages::PageAction::More)),
+                )
+                .into(),
+            );
+        }
+        widget::column::with_children(vec![
+            toolbar.into(),
+            widget::container(widget::column::with_children(status)).into(),
+            list,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn displayed_file_rows(&self, tallies: &[(usize, usize, usize)]) -> Vec<usize> {
+        visible_review_rows(&self.rows, &self.collapsed_directories)
+            .filter(|(index, row)| {
+                !self.hide_viewed
+                    || match row.file {
+                        Some(file) => !self.files[file].viewed,
+                        None => tallies[*index].0 != tallies[*index].1,
+                    }
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
+        let spacing = cosmic::theme::spacing();
+        let tallies = directory_tallies(&self.rows, &self.files);
+        let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> = Vec::new();
+        let displayed = self.displayed_file_rows(&tallies);
+        let window = file_pages::window_rows(&self.rows, &displayed, self.pages.offset, height);
+        let mut previous = 0;
+        for position in window {
+            let index = displayed[position];
+            let row = &self.rows[index];
+            if position > previous {
+                rows.push(crate::sticky_tree::Row {
+                    depth: row.depth,
+                    directory: false,
+                    element: widget::Space::new()
+                        .height(Length::Fixed(
+                            (position - previous) as f32 * design::DENSE_ROW_HEIGHT,
+                        ))
+                        .into(),
+                });
+            }
+            previous = position + 1;
+            let element = match row.file {
+                Some(file) => self.file_row(row, &self.files[file], modal_open),
+                None => {
+                    let (viewed, total, unknown) = tallies[index];
+                    self.directory_row(row, viewed, total, unknown, modal_open)
+                }
+            };
+            rows.push(crate::sticky_tree::Row {
+                depth: row.depth,
+                directory: row.file.is_none(),
+                element,
+            });
+        }
+        if previous < displayed.len() {
+            rows.push(crate::sticky_tree::Row {
+                depth: 0,
+                directory: false,
+                element: widget::Space::new()
+                    .height(Length::Fixed(
+                        (displayed.len() - previous) as f32 * design::DENSE_ROW_HEIGHT,
+                    ))
+                    .into(),
+            });
+        }
+        if rows.is_empty() {
+            let message = match &self.load {
+                LoadState::Loading => "",
+                LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
+                    "All files viewed."
+                }
+                LoadState::Ready => "This pull request changes no files.",
+                LoadState::Idle | LoadState::Failed(_) => "",
+            };
+            if !message.is_empty() {
+                rows.push(crate::sticky_tree::Row {
+                    depth: 0,
+                    directory: false,
+                    element: widget::container(design::caption(message))
+                        .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                        .into(),
+                });
+            }
+        }
+        widget::scrollable(
+            widget::container(crate::sticky_tree::rows(rows, design::DENSE_ROW_HEIGHT))
+                .padding(design::with_vertical_rail(Padding::from([
+                    spacing.space_xxxs,
+                    spacing.space_xxs,
+                ])))
+                .width(Length::Fill),
+        )
+        .id(self.file_scroll_id.clone())
+        .on_scroll(|viewport| {
+            Action::FilePage(file_pages::PageAction::Viewport {
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+            })
+        })
+        .class(cosmic::style::iced::Scrollable::Minimal)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn file_row<'a>(
@@ -1729,9 +1948,15 @@ impl State {
         }
         trailing.push(viewed_control(
             Mark::from_file(file),
-            "Mark viewed",
+            if file.sync == ViewedSync::Unknown {
+                "Viewed state not loaded"
+            } else {
+                "Mark viewed"
+            },
             "Mark not viewed",
-            self.context.is_some() && file.sync != ViewedSync::Pending && !modal_open,
+            self.context.is_some()
+                && !matches!(file.sync, ViewedSync::Pending | ViewedSync::Unknown)
+                && !modal_open,
             self.fenced(Action::ToggleViewed(row.path.clone())),
         ));
         let name = design::body(&*row.label)
@@ -1783,10 +2008,15 @@ impl State {
         row: &'a Row,
         viewed: usize,
         total: usize,
+        unknown: usize,
         modal_open: bool,
     ) -> Element<'a, Action> {
         let spacing = cosmic::theme::spacing();
-        let mark = Mark::from_tally(viewed, total);
+        let mark = if unknown > 0 {
+            Mark::Mixed
+        } else {
+            Mark::from_tally(viewed, total)
+        };
         let collapsed = self.collapsed_directories.contains(&row.path);
         let content = widget::row::with_children(vec![
             widget::Space::new()
@@ -1827,7 +2057,7 @@ impl State {
                 mark,
                 "Mark folder viewed",
                 "Mark folder not viewed",
-                self.context.is_some() && !modal_open && total > 0,
+                self.context.is_some() && !modal_open && total > 0 && unknown == 0,
                 self.fenced(Action::SetDirectoryViewed {
                     directory: row.path.clone(),
                     viewed: mark != Mark::Checked,
@@ -2073,6 +2303,9 @@ enum Mark {
 
 impl Mark {
     fn from_file(file: &ReviewFile) -> Self {
+        if file.sync == ViewedSync::Unknown {
+            return Self::Mixed;
+        }
         if file.viewed {
             Self::Checked
         } else {
@@ -2138,8 +2371,8 @@ fn change_text_style(kind: &ChangeKind) -> fn(&cosmic::Theme) -> iced::widget::t
 ///
 /// One pass with a stack of open directories, so a tree of hundreds of files
 /// costs hundreds of steps per frame rather than directories times files.
-fn directory_tallies(rows: &[Row], files: &[ReviewFile]) -> Vec<(usize, usize)> {
-    let mut tallies = vec![(0usize, 0usize); rows.len()];
+fn directory_tallies(rows: &[Row], files: &[ReviewFile]) -> Vec<(usize, usize, usize)> {
+    let mut tallies = vec![(0usize, 0usize, 0usize); rows.len()];
     let mut open: Vec<(usize, usize)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         while open.last().is_some_and(|(_, depth)| *depth >= row.depth) {
@@ -2152,6 +2385,7 @@ fn directory_tallies(rows: &[Row], files: &[ReviewFile]) -> Vec<(usize, usize)> 
                     let tally = &mut tallies[*directory];
                     tally.0 += viewed;
                     tally.1 += 1;
+                    tally.2 += usize::from(files[file].sync == ViewedSync::Unknown);
                 }
             }
             None => open.push((index, row.depth)),
@@ -2338,7 +2572,7 @@ fn load_review(
         )
     })?;
     let mut attempts = 0;
-    let (pull_request, context, files, range) = loop {
+    let (pull_request, context, page, range) = loop {
         let context = api
             .review_context(&key, cancellation)
             .map_err(|error| error.to_string())?;
@@ -2355,8 +2589,18 @@ fn load_review(
         let base_branch = ValidatedBranchName::parse(pull_request.base_ref_name.as_str())
             .map_err(|error| error.to_string())?;
         let files = api
-            .pull_request_files(&key, cancellation)
+            .pull_request_file_page(&key, None, cancellation)
             .map_err(|error| error.to_string())?;
+        if !file_pages::matches_context(&files, &context) {
+            if attempts == 0 {
+                attempts += 1;
+                continue;
+            }
+            return Err(
+                "The viewer or pull request changed while loading viewed marks. Refresh to retry."
+                    .into(),
+            );
+        }
         let head = Oid::parse(context.head_oid.as_str()).map_err(|error| error.to_string())?;
         match git.fetch_pull_request_range(
             &target.worktree, &remote, target.pull_request.number, &base_branch, &head, cancellation,
@@ -2378,7 +2622,11 @@ fn load_review(
     Ok(Loaded {
         pull_request,
         context,
-        files,
+        files: PullRequestFiles {
+            files: page.files,
+            truncated: false,
+        },
+        next_file_cursor: page.next_cursor,
         range,
         entries,
     })
@@ -2432,6 +2680,15 @@ impl GitHubReviewApi for ScriptedApi {
         _cancellation: &CancellationToken,
     ) -> Result<ReviewContext, crate::github::GitHubError> {
         unreachable!("tests install loads directly")
+    }
+
+    fn pull_request_file_page(
+        &self,
+        _key: &PullRequestKey,
+        _cursor: Option<&str>,
+        _cancellation: &CancellationToken,
+    ) -> Result<crate::github::PullRequestFilePage, crate::github::GitHubError> {
+        unreachable!("tests install pages directly")
     }
 
     fn pull_request_files(
@@ -2641,6 +2898,7 @@ pub(crate) mod tests {
                 viewer_is_author: false,
                 pending: None,
             },
+            next_file_cursor: None,
             files: PullRequestFiles {
                 files,
                 truncated: false,
@@ -2952,7 +3210,7 @@ pub(crate) mod tests {
             .iter()
             .position(|row| row.path == RepoPath::parse("src").unwrap())
             .unwrap();
-        assert_eq!(tallies[src], (1, 2));
+        assert_eq!(tallies[src], (1, 2, 0));
     }
 
     #[test]
@@ -2975,7 +3233,7 @@ pub(crate) mod tests {
             .iter()
             .position(|row| row.file.is_none() && row.path == path("src"))
             .unwrap();
-        assert_eq!(tallies[src], (1, 2));
+        assert_eq!(tallies[src], (1, 2, 0));
         assert_eq!(Mark::from_tally(1, 2), Mark::Mixed);
         assert_eq!(state.files_under(&path("src")).len(), 2);
         assert_eq!(state.progress(), (1, 3));
@@ -3283,6 +3541,31 @@ pub(crate) mod tests {
         // Already closed: nothing to tell the shell.
         drop(state.update(Action::Close));
         assert_eq!(state.take_effects(), vec![]);
+    }
+
+    #[test]
+    fn checkout_uses_the_loaded_commit_and_refuses_stale_or_offline_authority() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(vec![entry("a.rs", ChangeKind::Modified)], vec![]),
+        );
+        state.take_effects();
+        let action = state.fenced(Action::Checkout);
+        drop(state.update(action.clone()));
+        let effects = state.take_effects();
+        let [Effect::Checkout(target)] = effects.as_slice() else {
+            panic!("checkout effect");
+        };
+        assert_eq!(target.repository, PathBuf::from("/repo"));
+        assert_eq!(target.head.as_str(), "a".repeat(40));
+        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        state.context = None;
+        drop(state.update(Action::Checkout));
+        assert!(state.take_effects().is_empty());
+        state.authority_revision += 1;
+        drop(state.update(action));
+        assert!(state.take_effects().is_empty());
     }
 
     /// A refresh after the head moved re-fetches the range; a file still in

@@ -1675,6 +1675,20 @@ fn pull_request_head(
         .unwrap_or_default()
 }
 
+fn lone_chat_width(available: f32, preferred: CardWidth) -> f32 {
+    let available = if available.is_finite() {
+        available.max(0.0)
+    } else {
+        0.0
+    };
+    let limits = crate::workspace::WidthLimits::default();
+    let preferred = preferred
+        .resolve(available, limits)
+        .clamp(limits.minimum.min(available), available);
+    let wide = ((available - limits.minimum * 2.0) / limits.minimum).clamp(0.0, 1.0);
+    available + (preferred - available) * wide
+}
+
 /// The GitHub base branch a comparison has already proved, or empty.
 ///
 /// A remote-tracking ref is reduced with the remote names this worktree
@@ -5336,6 +5350,7 @@ impl Cagents {
         ];
         let mut selection: Option<Option<u64>> = None;
         let mut links = Vec::new();
+        let mut checkout = None;
         for effect in pane.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -5361,6 +5376,11 @@ impl Cagents {
                     pane.runtime.update(RepositoryAction::BackToFiles { card }),
                 )),
                 pull_request_review::Effect::OpenUrl(url) => links.push(url),
+                pull_request_review::Effect::Checkout(target) => {
+                    checkout = pane
+                        .project(&self.sidebar_model)
+                        .map(|project| (project, target));
+                }
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -5376,6 +5396,21 @@ impl Cagents {
         }
         for url in links {
             tasks.push(self.open_clicked_link(url));
+        }
+        if let Some((project_id, target)) = checkout {
+            self.worktree_dialog = Some(WorktreeDialog {
+                project_id,
+                repository: target.repository.clone(),
+                branch: target.suggested_branch(),
+                base: target.head.as_str().to_owned(),
+                destination: String::new(),
+                advanced: true,
+                resolving: None,
+                error: None,
+            });
+            tasks.push(
+                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App),
+            );
         }
         Task::batch(tasks)
     }
@@ -7232,6 +7267,45 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// The workspace always fills its viewport. Only a lone native chat
+    /// keeps a readable, centered surface within that full-width pane.
+    fn workspace_card_view(
+        &self,
+        id: CardId,
+        focused: bool,
+        splitter: bool,
+    ) -> Element<'_, Message> {
+        if !self
+            .card_state(id)
+            .is_some_and(|card| matches!(card.kind, CardKind::Chat(_)))
+        {
+            return self.card_view(id, focused, splitter);
+        }
+        let preferred = self
+            .workspace
+            .card(id)
+            .map_or(CardWidth::Fraction(0.5), |card| card.width);
+        // Keep the same widget root when a neighbor opens or closes, so
+        // composer selection, focus, and transcript state survive re-layout.
+        let lone = self.workspace.cards().len() == 1;
+        iced::widget::responsive(move |size| {
+            let width = if lone {
+                lone_chat_width(size.width, preferred)
+            } else {
+                size.width
+            };
+            widget::container(
+                widget::container(self.card_view(id, focused, splitter))
+                    .width(Length::Fixed(width))
+                    .height(Length::Fill),
+            )
+            .center_x(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        })
+        .into()
     }
 
     fn card_view<'a>(
@@ -13590,7 +13664,7 @@ impl Application for Cagents {
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
-                    self.card_view(
+                    self.workspace_card_view(
                         context.id,
                         context.focused,
                         has_multiple_panes && card_beside_inspector != Some(context.id),
@@ -15248,7 +15322,19 @@ mod tests {
         }
 
         let mut counts = HashMap::new();
-        tally(&Tree::new(element.as_widget_mut()), &mut counts);
+        let mut tree = Tree::new(element.as_widget_mut());
+        // Responsive constructs its descendants during layout. Counting only
+        // Tree::new silently misses those controls and duplicate named states.
+        let renderer = headless_renderer();
+        let _layout = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &cosmic::iced::advanced::layout::Limits::new(
+                cosmic::iced::Size::ZERO,
+                cosmic::iced::Size::new(1600.0, 1200.0),
+            ),
+        );
+        tally(&tree, &mut counts);
         counts
     }
 
@@ -16151,11 +16237,11 @@ mod tests {
     }
 
     fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
-        let mut fresh = frame(app);
-        assert_tree_is_faithful(
-            tree,
-            &cosmic::iced::advanced::widget::Tree::new(fresh.as_widget_mut()),
-        );
+        // Responsive widgets construct their children during layout. Compare
+        // two presented frames so their complete widget trees are available.
+        let mut fresh = cosmic::iced::advanced::widget::Tree::empty();
+        present(app, &mut headless_renderer(), &mut fresh);
+        assert_tree_is_faithful(tree, &fresh);
     }
 
     /// A repository card whose durable state and runtime both say repository,
@@ -19993,11 +20079,11 @@ mod tests {
             workspace.card(card_id).unwrap().width,
             CardWidth::Fraction(0.125)
         );
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
         workspace.resize_viewport(800.0);
         assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 800.0);
         workspace.resize_viewport(3_840.0);
-        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 3_840.0);
         workspace
             .add_card(
                 WorkspaceCard::new(CardId::new(), "Second", CardWidth::Fraction(0.5)).unwrap(),
@@ -21219,6 +21305,18 @@ mod tests {
     }
 
     #[test]
+    fn lone_native_chat_uses_readable_width_without_a_compact_breakpoint_jump() {
+        let preferred = CardWidth::Fraction(0.35);
+        assert_eq!(lone_chat_width(800.0, preferred), 800.0);
+        assert!((lone_chat_width(1440.0, preferred) - 504.0).abs() < 0.001);
+        assert_eq!(lone_chat_width(320.0, CardWidth::Fixed(2000.0)), 320.0);
+        assert_eq!(lone_chat_width(1440.0, CardWidth::Fraction(0.125)), 480.0);
+        assert!(
+            (lone_chat_width(961.0, preferred) - lone_chat_width(959.0, preferred)).abs() < 3.0
+        );
+    }
+
+    #[test]
     fn a_sidebar_pull_request_opens_one_review_pane_per_repository() {
         let (mut app, project) = pull_request_test_app(&[7, 8]);
 
@@ -21365,6 +21463,65 @@ mod tests {
             present(&app, &mut renderer, &mut tree);
             assert_frame_is_faithful(&app, &tree);
         }
+    }
+
+    #[test]
+    fn thousand_file_review_mounts_a_bounded_tree_and_draws_repeated_frames() {
+        use crate::pull_request_review::{Action, tests as review};
+        use cosmic::iced::advanced::widget::Tree;
+        let (mut app, project) = pull_request_test_app(&[1]);
+        drop(app.update(open_pull_request(project, 1)));
+        let card = pull_request_cards(&app)[0].0;
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("review pane")
+        };
+        let mut snapshot = review::loaded(
+            (0..1000)
+                .map(|i| {
+                    review::entry(
+                        &format!("src/file-{i:04}.rs"),
+                        crate::repository::ChangeKind::Modified,
+                    )
+                })
+                .collect(),
+            (0..100)
+                .map(|i| review::remote_file(&format!("src/file-{i:04}.rs"), false))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        review::finish_load(&mut pane.review, snapshot);
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        fn nodes(tree: &Tree) -> usize {
+            1 + tree.children.iter().map(nodes).sum::<usize>()
+        }
+        let mut timings = Vec::new();
+        for frame in 0..12 {
+            let start = Instant::now();
+            present(&app, &mut renderer, &mut tree);
+            timings.push(start.elapsed());
+            assert!(
+                nodes(&tree) < 5000,
+                "offscreen file widgets must not be mounted: {}",
+                nodes(&tree)
+            );
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: Action::FilePage(
+                    crate::pull_request_review::file_pages::PageAction::Viewport {
+                        offset: frame as f32 * 70.0 * design::DENSE_ROW_HEIGHT,
+                        height: 1000.0,
+                    },
+                ),
+            }));
+        }
+        timings.sort();
+        eprintln!(
+            "1000-file review, full layout/draw: median {:?}, max {:?}, mounted nodes {}",
+            timings[6],
+            timings[11],
+            nodes(&tree)
+        );
     }
 
     /// Restoring is the shell's doing, not a keystroke aimed at a dialog, so

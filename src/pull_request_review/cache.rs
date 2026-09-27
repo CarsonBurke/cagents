@@ -33,6 +33,8 @@ pub struct Snapshot {
     pub pull_request: PullRequest,
     pub range: PullRequestRange,
     pub files: Vec<File>,
+    #[serde(default)]
+    pub unknown_paths: BTreeSet<RepoPath>,
     pub selected: Option<RepoPath>,
     pub saved_ms: u64,
 }
@@ -53,7 +55,8 @@ impl Snapshot {
             return Err("Invalid cached pull request identity or range".into());
         }
         let paths: BTreeSet<_> = self.files.iter().map(|file| &file.entry.path).collect();
-        if paths.len() != self.files.len()
+        if self.unknown_paths.iter().any(|path| !paths.contains(path))
+            || paths.len() != self.files.len()
             || self
                 .selected
                 .as_ref()
@@ -82,6 +85,7 @@ pub(crate) fn fixture() -> Snapshot {
         viewer: "me".into(),
         pull_request: pull_request(1),
         range: loaded(Vec::new(), Vec::new()).range,
+        unknown_paths: BTreeSet::new(),
         selected: Some(entry.path.clone()),
         files: vec![File {
             entry,
