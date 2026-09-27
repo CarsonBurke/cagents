@@ -535,6 +535,20 @@ impl ScrollSync {
     fn is_latest(self, offset: f32) -> bool {
         (offset - self.latest).abs() <= SCROLL_SYNC_EPSILON
     }
+
+    fn take_recognized_after_clamp(&mut self, offset: f32, maximum: f32) -> bool {
+        if (offset - maximum).abs() > SCROLL_SYNC_EPSILON {
+            return false;
+        }
+        let Some(index) = self.offsets[..self.len]
+            .iter()
+            .position(|issued| *issued > maximum)
+        else {
+            return false;
+        };
+        self.offsets[index] = f32::NAN;
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1185,10 +1199,25 @@ impl Workspace {
 
     pub fn native_scroll(&mut self, offset: f32, viewport_width: f32) -> ViewportUpdate {
         let old_offset = self.camera.offset();
+        let offset = finite_nonnegative(offset);
         let viewport_width = finite_nonnegative(viewport_width);
-        if (self.viewport_width - viewport_width).abs() > f32::EPSILON {
+        let width_changed = (self.viewport_width - viewport_width).abs() > f32::EPSILON;
+        // The first layout uses the previous content geometry with the newly
+        // measured viewport. Native scrolling may clamp an issued offset to
+        // that temporary maximum before reporting either Scrolled or Resized.
+        // Recognize this acknowledgement before replacing the old geometry.
+        let previous_maximum = self.presentation_geometry().max_offset(viewport_width);
+        let clamped_programmatic = width_changed
+            && self
+                .scroll_sync
+                .as_mut()
+                .is_some_and(|sync| sync.take_recognized_after_clamp(offset, previous_maximum));
+        if width_changed {
             self.viewport_width = viewport_width;
             self.rebuild_geometry();
+            if clamped_programmatic {
+                self.camera.jump_to(offset);
+            }
             // Native layout feedback can report the measured width before
             // Resized. Retarget fractional panes here too; the later resize
             // sees an equal width and deliberately performs no further work.
@@ -1197,8 +1226,12 @@ impl Workspace {
                 .clamp(self.geometry.max_offset(self.viewport_width));
         }
 
-        let offset = finite_nonnegative(offset)
-            .min(self.presentation_geometry().max_offset(self.viewport_width));
+        if clamped_programmatic {
+            return self
+                .refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON);
+        }
+
+        let offset = offset.min(self.presentation_geometry().max_offset(self.viewport_width));
         let recognized = self
             .scroll_sync
             .as_mut()
@@ -2475,6 +2508,60 @@ mod tests {
         assert!(workspace.is_animating());
         workspace.tick(Duration::from_millis(16));
         assert!(workspace.camera().offset() > restored);
+    }
+
+    #[test]
+    fn initial_clamped_scroll_acknowledges_old_geometry_before_revealing_restored_focus() {
+        let mut widths = [CardWidth::Fraction(0.5); 7];
+        widths[4] = CardWidth::Fraction(2.0 / 3.0);
+        let mut workspace = workspace_with_widths(&widths, 1_340.0);
+        let last = workspace.order().last().unwrap();
+        workspace.focus(last).unwrap();
+        let restored = workspace.camera().target();
+        assert!((restored - 3_573.333_5).abs() < SCROLL_SYNC_EPSILON);
+        workspace.native_scroll(restored, 1_340.0);
+        workspace.record_programmatic_scroll(restored);
+
+        // Actual startup ordering: the native layout still has 1340px-based
+        // pane widths, but its viewport is 1640px wide. The requested offset
+        // is clamped before the model receives the measured width.
+        let clamped = workspace.geometry().max_offset(1_640.0);
+        assert!((clamped - 3_273.333_5).abs() < SCROLL_SYNC_EPSILON);
+        workspace.native_scroll(clamped, 1_640.0);
+        workspace.resize_viewport(1_640.0);
+        let target = workspace
+            .geometry()
+            .focus_offset(last, 1_640.0, clamped)
+            .unwrap();
+        assert_eq!(workspace.camera().offset(), clamped);
+        assert_eq!(workspace.camera().target(), target);
+        assert!(target > restored);
+        // A redraw can report the same native offset before the first frame.
+        workspace.native_scroll(clamped, 1_640.0);
+        assert_eq!(workspace.camera().target(), target);
+        workspace.tick(Duration::from_millis(16));
+        assert!(workspace.camera().offset() > clamped);
+
+        // The acknowledgement was consumed, not a persistent permission to
+        // disregard real user scrolling through the same coordinate later.
+        workspace.native_scroll(clamped, 1_640.0);
+        assert_eq!(workspace.camera().offset(), clamped);
+        assert!(!workspace.is_animating());
+    }
+
+    #[test]
+    fn width_change_does_not_disguise_unmatched_user_scroll_as_clamped_feedback() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 7], 1_340.0);
+        let last = workspace.order().last().unwrap();
+        workspace.focus(last).unwrap();
+        let restored = workspace.camera().target();
+        workspace.native_scroll(restored, 1_340.0);
+        workspace.record_programmatic_scroll(restored);
+
+        workspace.native_scroll(1_000.0, 1_640.0);
+        assert_eq!(workspace.camera().offset(), 1_000.0);
+        assert_eq!(workspace.camera().target(), 1_000.0);
+        assert!(!workspace.is_animating());
     }
 
     #[test]
