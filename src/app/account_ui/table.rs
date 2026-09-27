@@ -1014,9 +1014,8 @@ fn in_use_warning<'a>(cards: usize, linked: bool) -> Element<'a, Message> {
             )
         } else {
             format!(
-                "{count} open {} on this account {} signed out with it.",
-                if count == 1 { "card runs" } else { "cards run" },
-                if count == 1 { "and is" } else { "and are" },
+                "{count} open {} this account. Running processes are not stopped, but may lose access after sign-out.",
+                if count == 1 { "card uses" } else { "cards use" },
             )
         })
         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
@@ -1039,7 +1038,7 @@ fn menu<'a>(
                 "This only removes the home from cagents. Its login, sessions and files stay where they are.".to_owned()
             } else {
                 format!(
-                    "{} signs this account out and cagents deletes its files. Conversations started on it can no longer be resumed here.",
+                    "{} signs this account out and cagents deletes its files. Resuming saved conversations will require choosing another account that can access them.",
                     probe::cli_name(account.account.provider)
                 )
             })

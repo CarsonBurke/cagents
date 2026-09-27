@@ -740,6 +740,13 @@ fn start(
         }
     }
     // All adapter validation happens before a source terminal can be changed.
+    // Claude reads the selected home's transcript while building its adapter.
+    // Classify a removed account before that read can mask it as missing
+    // history. Codex also supports a live socket attachment, whose account is
+    // deliberately not reauthorized; its transport is checked below instead.
+    if session.launch.provider != Provider::Codex {
+        check_launch_account(&session.launch)?;
+    }
     let allocator = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -788,7 +795,14 @@ fn start(
         } else {
             chat::protocol::create(&session.launch)
         }
-        .map_err(error)?;
+        .map_err(|message| {
+            // Removal may have won after the early check while the adapter
+            // was reading history. Do not hold the lifecycle lease across
+            // those reads, but preserve the actionable account classification.
+            check_launch_account(&session.launch)
+                .err()
+                .unwrap_or_else(|| error(message))
+        })?;
     if !matches!(
         &spec.transport,
         chat::protocol::TransportSpec::UnixWebSocket { .. }
@@ -2152,6 +2166,73 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn removed_claude_account_is_reported_before_missing_resume_history() {
+        const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_HISTORY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::chat::tests::removed_claude_account_is_reported_before_missing_resume_history", "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("PATH", "/usr/bin:/bin")
+                .status().unwrap().success());
+            return;
+        }
+        let homes = crate::account::home::Homes::installation().unwrap();
+        let store = crate::account::registry::Store::installation().unwrap();
+        let (key, home) = store
+            .create_pending(&homes, Provider::Claude, 1, || {
+                homes.create(Provider::Claude, None)
+            })
+            .unwrap();
+        let session = Session {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            proof: None,
+            terminal: None,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "/bin/false".into(),
+                    arguments: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        home.to_str().unwrap().into(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("3a888c9d-7e33-47ad-9c0f-d538f63b9099".into()),
+            },
+        };
+        store
+            .remove_home(&homes, Provider::Claude, key, false)
+            .unwrap();
+        assert!(!home.exists());
+        // Without the account preflight this exact adapter preparation error
+        // used to hide Recovery::Account and leave the UI without its chooser.
+        assert!(
+            chat::protocol::create(&session.launch)
+                .err()
+                .unwrap()
+                .contains("history project directory is unavailable")
+        );
+        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("removed-history"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        })));
+        let failure = start(&host, 1, session, None, false, None, Default::default()).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::AccountRemoved);
+        assert!(
+            !home.exists(),
+            "preparation never recreates the removed home"
+        );
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+    }
 
     /// A conversation opened on a stopped agent terminal starts with the
     /// daemon's own provider configuration, so an upgrade restores it the same
