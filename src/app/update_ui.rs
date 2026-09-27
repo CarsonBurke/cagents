@@ -188,7 +188,7 @@ impl Cagents {
         if let Some(installed) = &self.update_ui.superseded {
             return Some((
                 format!("installed:{}", installed.display()),
-                "A newer build is installed and ready to use.".into(),
+                "An installed update is ready to finish.".into(),
                 Action::Restart,
             ));
         }
