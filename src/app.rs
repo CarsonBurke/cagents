@@ -2606,6 +2606,9 @@ pub enum SettingsField {
     ShortcutReviewToggleViewed,
     ShortcutReviewNextFile,
     ShortcutReviewPreviousFile,
+    ShortcutReviewNextUnviewed,
+    ShortcutReviewNextChange,
+    ShortcutReviewPreviousChange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2636,6 +2639,9 @@ struct ShortcutDraft {
     review_toggle_viewed: String,
     review_next_file: String,
     review_previous_file: String,
+    review_next_unviewed: String,
+    review_next_change: String,
+    review_previous_change: String,
 }
 
 impl ShortcutDraft {
@@ -2654,6 +2660,9 @@ impl ShortcutDraft {
             review_toggle_viewed: settings::format_chords(&shortcuts.review_toggle_viewed),
             review_next_file: settings::format_chords(&shortcuts.review_next_file),
             review_previous_file: settings::format_chords(&shortcuts.review_previous_file),
+            review_next_unviewed: settings::format_chords(&shortcuts.review_next_unviewed),
+            review_next_change: settings::format_chords(&shortcuts.review_next_change),
+            review_previous_change: settings::format_chords(&shortcuts.review_previous_change),
         }
     }
 }
@@ -2838,6 +2847,15 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutReviewPreviousFile => {
                 self.keyboard_shortcuts.review_previous_file = value;
+            }
+            SettingsField::ShortcutReviewNextUnviewed => {
+                self.keyboard_shortcuts.review_next_unviewed = value;
+            }
+            SettingsField::ShortcutReviewNextChange => {
+                self.keyboard_shortcuts.review_next_change = value;
+            }
+            SettingsField::ShortcutReviewPreviousChange => {
+                self.keyboard_shortcuts.review_previous_change = value;
             }
         }
     }
@@ -3087,6 +3105,18 @@ fn settings_update(
         }
         SettingsField::ShortcutReviewPreviousFile => {
             next.keyboard_shortcuts.review_previous_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewNextUnviewed => {
+            next.keyboard_shortcuts.review_next_unviewed = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewNextChange => {
+            next.keyboard_shortcuts.review_next_change = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewPreviousChange => {
+            next.keyboard_shortcuts.review_previous_change = settings::parse_chords(value);
             Ok(())
         }
     };
@@ -5301,6 +5331,13 @@ impl Cagents {
                         basis,
                     },
                 ))),
+                pull_request_review::Effect::NextChange => tasks.push(repository_task(
+                    pane.runtime.update(RepositoryAction::NextChange { card }),
+                )),
+                pull_request_review::Effect::PreviousChange => tasks.push(repository_task(
+                    pane.runtime
+                        .update(RepositoryAction::PreviousChange { card }),
+                )),
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     pane.runtime.update(RepositoryAction::BackToFiles { card }),
                 )),
@@ -9729,6 +9766,9 @@ impl Cagents {
                         | SettingsField::ShortcutReviewToggleViewed
                         | SettingsField::ShortcutReviewNextFile
                         | SettingsField::ShortcutReviewPreviousFile
+                        | SettingsField::ShortcutReviewNextUnviewed
+                        | SettingsField::ShortcutReviewNextChange
+                        | SettingsField::ShortcutReviewPreviousChange
                 ) {
                     self.card_chrome.clear();
                 }
@@ -9820,7 +9860,10 @@ impl Cagents {
                     | SettingsField::PullRequestOpenTarget
                     | SettingsField::ShortcutReviewToggleViewed
                     | SettingsField::ShortcutReviewNextFile
-                    | SettingsField::ShortcutReviewPreviousFile => Task::none(),
+                    | SettingsField::ShortcutReviewPreviousFile
+                    | SettingsField::ShortcutReviewNextUnviewed
+                    | SettingsField::ShortcutReviewNextChange
+                    | SettingsField::ShortcutReviewPreviousChange => Task::none(),
                 };
                 Task::batch([save, effect])
             }
@@ -12538,7 +12581,10 @@ impl Application for Cagents {
                     Some(
                         shortcut @ (workspace_widget::GlobalShortcut::ReviewToggleViewed
                         | workspace_widget::GlobalShortcut::ReviewNextFile
-                        | workspace_widget::GlobalShortcut::ReviewPreviousFile),
+                        | workspace_widget::GlobalShortcut::ReviewPreviousFile
+                        | workspace_widget::GlobalShortcut::ReviewNextUnviewed
+                        | workspace_widget::GlobalShortcut::ReviewNextChange
+                        | workspace_widget::GlobalShortcut::ReviewPreviousChange),
                     ) => {
                         let Some(card) = self.workspace.focused().filter(|card| {
                             matches!(self.cards.get(card), Some(CardRuntime::PullRequests(_)))
@@ -12551,6 +12597,15 @@ impl Application for Cagents {
                             }
                             workspace_widget::GlobalShortcut::ReviewNextFile => {
                                 pull_request_review::Action::NextFile
+                            }
+                            workspace_widget::GlobalShortcut::ReviewNextUnviewed => {
+                                pull_request_review::Action::NextUnviewed
+                            }
+                            workspace_widget::GlobalShortcut::ReviewNextChange => {
+                                pull_request_review::Action::NextChange
+                            }
+                            workspace_widget::GlobalShortcut::ReviewPreviousChange => {
+                                pull_request_review::Action::PreviousChange
                             }
                             _ => pull_request_review::Action::PreviousFile,
                         };

@@ -244,6 +244,9 @@ pub(crate) enum EditorShortcut {
     ReviewToggleViewed,
     ReviewNextFile,
     ReviewPreviousFile,
+    ReviewNextUnviewed,
+    ReviewNextChange,
+    ReviewPreviousChange,
 }
 impl crate::preferences::EditorShortcuts {
     fn set(&mut self, action: EditorShortcut, value: String) {
@@ -260,6 +263,9 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::ReviewToggleViewed => self.review_toggle_viewed = value,
             EditorShortcut::ReviewNextFile => self.review_next_file = value,
             EditorShortcut::ReviewPreviousFile => self.review_previous_file = value,
+            EditorShortcut::ReviewNextUnviewed => self.review_next_unviewed = value,
+            EditorShortcut::ReviewNextChange => self.review_next_change = value,
+            EditorShortcut::ReviewPreviousChange => self.review_previous_change = value,
         }
     }
 
@@ -277,6 +283,9 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::ReviewToggleViewed => &self.review_toggle_viewed,
             EditorShortcut::ReviewNextFile => &self.review_next_file,
             EditorShortcut::ReviewPreviousFile => &self.review_previous_file,
+            EditorShortcut::ReviewNextUnviewed => &self.review_next_unviewed,
+            EditorShortcut::ReviewNextChange => &self.review_next_change,
+            EditorShortcut::ReviewPreviousChange => &self.review_previous_change,
         }
     }
 
@@ -295,6 +304,9 @@ impl crate::preferences::EditorShortcuts {
             (&self.review_toggle_viewed, true),
             (&self.review_next_file, true),
             (&self.review_previous_file, true),
+            (&self.review_next_unviewed, true),
+            (&self.review_next_change, true),
+            (&self.review_previous_change, true),
         ] {
             // A review action may stay unbound: its default is dropped when
             // an older table already used the chord for something else.
@@ -394,6 +406,18 @@ impl Editor {
             (
                 EditorShortcut::ReviewPreviousFile,
                 pull_request_review::Action::PreviousFile,
+            ),
+            (
+                EditorShortcut::ReviewNextUnviewed,
+                pull_request_review::Action::NextUnviewed,
+            ),
+            (
+                EditorShortcut::ReviewNextChange,
+                pull_request_review::Action::NextChange,
+            ),
+            (
+                EditorShortcut::ReviewPreviousChange,
+                pull_request_review::Action::PreviousChange,
             ),
         ] {
             if self.shortcut_pressed(shortcut, event) {
@@ -2379,6 +2403,14 @@ impl Editor {
                         basis,
                     },
                 ))),
+                pull_request_review::Effect::NextChange => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::NextChange { card: id }),
+                )),
+                pull_request_review::Effect::PreviousChange => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::PreviousChange { card: id }),
+                )),
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     tab.runtime
                         .update(RepositoryAction::BackToFiles { card: id }),
@@ -5033,6 +5065,24 @@ impl Editor {
                             "Opens the previous changed file of the open pull request.",
                             EditorShortcut::ReviewPreviousFile,
                             &self.shortcut_draft.review_previous_file,
+                        ),
+                        shortcut_setting(
+                            "Next unviewed file",
+                            "Opens the next unviewed file of the open pull request.",
+                            EditorShortcut::ReviewNextUnviewed,
+                            &self.shortcut_draft.review_next_unviewed,
+                        ),
+                        shortcut_setting(
+                            "Next changed hunk",
+                            "Opens the next changed hunk of the open pull request.",
+                            EditorShortcut::ReviewNextChange,
+                            &self.shortcut_draft.review_next_change,
+                        ),
+                        shortcut_setting(
+                            "Previous changed hunk",
+                            "Opens the previous changed hunk of the open pull request.",
+                            EditorShortcut::ReviewPreviousChange,
+                            &self.shortcut_draft.review_previous_change,
                         ),
                         // Fixed, not configurable: the completion request is wired
                         // to the chord directly rather than through the shortcut

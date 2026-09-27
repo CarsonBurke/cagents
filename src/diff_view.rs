@@ -50,6 +50,8 @@ pub struct SplitDiffRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffModel {
+    /// Complete line extents, retained for constant-time review anchor checks.
+    pub line_counts: [usize; 2],
     /// Exact source baseline, including original line endings and final newline.
     pub before: Arc<str>,
     pub inline_rows: Vec<InlineDiffRow>,
@@ -833,6 +835,7 @@ fn build_diff_rows(
             })
             .collect::<Result<Vec<_>, Cancelled>>()?;
         let mut model = DiffModel {
+            line_counts: [lines.len(); 2],
             before: Arc::clone(before),
             inline_rows: Vec::with_capacity(lines.len()),
             split_rows: Vec::with_capacity(lines.len()),
@@ -1030,6 +1033,7 @@ fn build_diff_rows(
     )?;
 
     Ok(DiffModel {
+        line_counts: [before_lines.len(), after_lines.len()],
         before: Arc::clone(before),
         inline_rows,
         split_rows,
