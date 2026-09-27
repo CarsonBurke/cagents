@@ -5757,13 +5757,18 @@ impl Cagents {
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
+        // A successful attachment completes hydration even when the provider
+        // has not enriched the already-saved descriptor yet.
+        self.lifecycle.remove(card);
+        if let Some(state) = self.card_state_mut(card) {
+            state.residency = Residency::Hot;
+        }
         if unchanged {
             return None;
         }
         let conversion = self
             .card_state(card)
             .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
-        self.lifecycle.remove(card);
         if let Some(state) = self.card_state_mut(card) {
             // A tab still carrying the default title names the provider it was
             // opened with; a provider switch on a fresh chat renames it so the

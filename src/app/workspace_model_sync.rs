@@ -581,8 +581,18 @@ impl Cagents {
             Residency::Cold,
             Instant::now(),
         );
+        // Native chats keep a lightweight attachment even offscreen, just as
+        // initialize_runtimes does after a window restart. The deferred
+        // lifecycle hydrator only starts terminal/browser surfaces; leaving a
+        // newly adopted chat Loading there would never subscribe to its actor.
+        let attach = match session {
+            crate::agent_execution::HostedSession::Chat(session) => {
+                self.open_chat(card_id, session.clone(), crate::chat::Intent::Restore)
+            }
+            crate::agent_execution::HostedSession::Terminal(_) => Task::none(),
+        };
         if self.durable.active_channel != Some(agent.channel) {
-            return Some(Task::none());
+            return Some(attach);
         }
         let item = WorkspaceCard::new(
             card_id,
@@ -598,7 +608,7 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
             });
-        Some(task)
+        Some(Task::batch([attach, task]))
     }
 
     /// Takes the shared half of a channel this window already has.
@@ -872,7 +882,11 @@ mod tests {
         durable.active_channel = Some(active);
         let session = crate::chat::Session {
             id: TerminalId::new(),
-            proof: None,
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("execution-host"),
+                boot_id: crate::model::BootId::new("execution-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("execution-incarnation"),
+            }),
             terminal: None,
             owned_codex_listener: None,
             launch: crate::chat::Launch {
@@ -910,6 +924,11 @@ mod tests {
         };
         let card = CardId::from_uuid(agent.id.as_uuid());
         assert!(app.adopt_execution_agent(&agent).is_some());
+        assert!(
+            app.chat_start_pending(card),
+            "even an unnamed accepted conversation in a hidden channel attaches to its proven actor"
+        );
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
         assert_eq!(app.durable.active_channel, Some(active));
         assert_eq!(app.workspace.focused(), focus);
         assert_eq!(
