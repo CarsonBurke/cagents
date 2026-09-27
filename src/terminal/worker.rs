@@ -195,6 +195,7 @@ struct PublishedState {
     completed: AtomicBool,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
+    holder_identity: OnceLock<super::holder::Record>,
     /// The newest generation a wake has already announced to the subscriber
     /// side of this protocol.
     ///
@@ -229,6 +230,7 @@ impl PublishedState {
             conversation_title: Mutex::new(None),
             completed: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
+            holder_identity: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
             wake,
@@ -349,6 +351,11 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    /// Captured from the authenticated original holder before worker startup;
+    /// never rediscovered by a reusable terminal ID.
+    pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
+        self.inner.published.holder_identity.get()
+    }
     pub fn spawn(
         session: TerminalSession,
         config: TerminalConfig,
@@ -698,6 +705,34 @@ impl TerminalHandle {
         }
         self.release_completed_holder();
         if self.is_completed() { Ok(()) } else { sent }
+    }
+
+    /// The caller first fences the exact source against this retained worker.
+    /// A holder receipt, not an absent worker, proves the paired cleanup after
+    /// a daemon restart or lost reply.
+    pub(crate) fn close_with_receipt(
+        &self,
+        source: &TerminalSession,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<(), String> {
+        super::holder::cleanup::authorize(proof)?;
+        let expected = self
+            .holder_identity()
+            .ok_or("The paired terminal has no authenticated holder identity")?;
+        match self.close_checked(true) {
+            super::ipc::TerminalCloseResult::Closed => {}
+            other => return Err(format!("Paired terminal close is unconfirmed: {other:?}")),
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if super::holder::cleanup::confirmed(source, expected, proof)? {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("The exact terminal holder has not proved its release".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn release_completed_holder(&self) {
@@ -1091,6 +1126,9 @@ impl Worker {
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
         held.holder.commit_adoption()?;
+        if let Some(record) = held.holder.record() {
+            let _ = published.holder_identity.set(record.clone());
+        }
         reader.activate();
 
         let events = Arc::new(events);
@@ -1276,6 +1314,7 @@ impl Worker {
             });
         }
         if !shutting_down && exited && self.holder.registered() {
+            self.holder.prove_cleanup();
             if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
                 .and_then(|screen| self.holder.cache_screen(&screen))
             {
@@ -1441,6 +1480,7 @@ impl Worker {
                     Ok((_, mut family)) => match family.kill(deadline) {
                         Ok(()) => {
                             self.checked_shutdown = true;
+                            self.holder.prove_cleanup();
                             TerminalCloseResult::Closed
                         }
                         Err(detail) => TerminalCloseResult::Unknown(detail),

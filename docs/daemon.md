@@ -140,6 +140,13 @@ This retains one small holder process per terminal until cleanup. A completed
 worker also retains its final screen (at most 8 MiB) in the holder, so another
 daemon crash cannot turn a completed command into a new execution. Closing its
 card or removing its owning project explicitly releases that retained result.
+Retained native/terminal pairs bind the terminal holder's exact process incarnation,
+not only a reusable session ID. Private release receipts allow an interrupted
+Close to finish after daemon restart. A terminal receipt proves its root and PTY
+owner were released (active close also stops the inspected terminal family); it
+makes no claim about previously disowned processes outside that family. Native
+provider holders separately reap all owned provider/tool descendants before
+confirming their release.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
@@ -254,12 +261,23 @@ that no prompt or approval was automatically resent.
 
 A replacement daemon must hold the installation's exclusive lease and match
 the private holder's boot, process identities, and exact issued descriptor
-lineage. Reconnecting to a proved server remains possible after its account
-directory is removed; that exception cannot authorize a new process or recreate
-the removed directory. A missing, exited, or mismatched holder refuses automatic
+lineage. Removed account storage does not invalidate the proved server's process
+identity, but successful attachment still requires that server to confirm the
+thread. Codex 0.157.1 can return metadata for an unloaded thread or a live turn
+waiting on approval while refusing to attach because its rollout is missing,
+even when no history page is requested. That failure preserves the holder
+and reports unavailable history; metadata alone is not live continuity. This
+exception cannot authorize a new process or recreate the removed directory.
+A missing, exited, or mismatched holder refuses automatic
 recipe execution. Failed local actor installation preserves the retained server
 for another authenticated attempt. Paired terminal views must independently
 recover their own holder before the native pair is published.
+
+When unavailable history prevents attachment, Close still authenticates the
+exact retained owner and tears it down without loading history. The card keeps
+its descriptor until cleanup is confirmed. Private teardown receipts retain
+hashes of issued descriptors, allowing a lost close response to be retried after
+a daemon restart without interpreting a missing process as successful cleanup.
 
 Execution consoles retain their exact daemon-issued recipe in the native
 holder, independently of the provider listener. The holder acknowledges pair

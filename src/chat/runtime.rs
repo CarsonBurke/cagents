@@ -36,7 +36,11 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
-    UpdateSource(super::Session, Option<crate::model::LaunchRecipe>),
+    UpdateSource(
+        super::Session,
+        Option<crate::model::LaunchRecipe>,
+        Option<crate::terminal::holder::Record>,
+    ),
     Provider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -579,6 +583,7 @@ impl Handle {
         &self,
         source: super::Session,
         execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
         if !matches!(
             self.native_continuity(),
@@ -589,7 +594,10 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((ActorCommand::UpdateSource(source, execution_console), reply))
+            .try_send((
+                ActorCommand::UpdateSource(source, execution_console, paired_holder),
+                reply,
+            ))
             .map_err(|error| format!("Native ownership queue unavailable: {error}"))?;
         self.wake();
         response
@@ -1354,12 +1362,14 @@ impl Actor {
             }
             let (run, command) = match command {
                 ActorCommand::Provider { run, command } => (run, command),
-                ActorCommand::UpdateSource(source, execution_console) => {
+                ActorCommand::UpdateSource(source, execution_console, paired_holder) => {
                     let result = self
                         .native_holder
                         .as_mut()
                         .ok_or("Native holder is unavailable".to_string())
-                        .and_then(|holder| holder.update_source(source, execution_console));
+                        .and_then(|holder| {
+                            holder.update_source(source, execution_console, paired_holder)
+                        });
                     let failed = result.is_err();
                     let _ = reply.send(result);
                     // A partial control reply must never be reused.

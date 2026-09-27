@@ -3,7 +3,7 @@
 
 mod cleanup;
 mod transport;
-pub(crate) use cleanup::Detached;
+pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
 pub(crate) use transport::{Holder, adopt, inspect, spawn};
 
 use crate::{
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct Recovery {
     pub source: super::Session,
     pub execution_console: Option<crate::model::LaunchRecipe>,
+    #[serde(default)]
+    pub paired_holder: Option<crate::terminal::holder::Record>,
     pub previous_sources: Vec<super::Session>,
     pub confirmed_thread: Option<String>,
     pub server_version: Option<String>,
@@ -28,6 +30,17 @@ pub(crate) struct Recovery {
 
 impl Recovery {
     fn validate(&self, boot: &BootId) -> Result<(), String> {
+        if self.paired_holder.as_ref().is_some_and(|record| {
+            self.source
+                .terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.id != record.terminal)
+                || record.kind != crate::daemon::holder_registry::Kind::Terminal
+                || record.application != crate::instance::APPLICATION_ID
+                || &record.boot != boot
+        }) {
+            return Err("Native holder has inconsistent terminal holder identity".into());
+        }
         let valid = |source: &super::Session| {
             source.id == self.source.id
                 && source.launch.provider == Provider::Codex
@@ -159,7 +172,22 @@ impl Recovery {
         &mut self,
         source: super::Session,
         execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
+        if source.terminal.is_some() != paired_holder.is_some()
+            || paired_holder.as_ref().is_some_and(|record| {
+                record.terminal != source.id
+                    || record.kind != crate::daemon::holder_registry::Kind::Terminal
+                    || record.application != crate::instance::APPLICATION_ID
+                    || source
+                        .proof
+                        .as_ref()
+                        .is_none_or(|proof| proof.boot_id != record.boot)
+                    || self.paired_holder.as_ref().is_some_and(|old| old != record)
+            })
+        {
+            return Err("Paired view does not retain the exact original terminal holder".into());
+        }
         let mut expected = self.source.clone();
         expected.terminal = source.terminal.clone();
         if (execution_console.is_some() && source.terminal.is_none())
@@ -182,6 +210,7 @@ impl Recovery {
             self.source = source;
         }
         self.execution_console = execution_console;
+        self.paired_holder = paired_holder;
         Ok(())
     }
 
@@ -262,6 +291,7 @@ mod tests {
                 }),
             },
             execution_console: None,
+            paired_holder: None,
             previous_sources: Vec::new(),
             confirmed_thread: None,
             server_version: None,
@@ -346,6 +376,18 @@ mod tests {
         }
     }
 
+    fn terminal_holder(source: &super::super::Session) -> crate::terminal::holder::Record {
+        crate::terminal::holder::Record {
+            version: 4,
+            kind: crate::daemon::holder_registry::Kind::Terminal,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: source.proof.as_ref().unwrap().boot_id.clone(),
+            terminal: source.id,
+            holder: crate::terminal::holder::Process { pid: 80, start: 20 },
+            root: crate::terminal::holder::Process { pid: 81, start: 21 },
+        }
+    }
+
     #[test]
     fn console_pair_requires_exact_private_evidence_and_survives_adoption() {
         let mut recovery = recovery();
@@ -382,12 +424,21 @@ mod tests {
             owned_codex_listener: None,
             recovery_origin: None,
         });
-        assert!(recovery.update_source(paired.clone(), None).is_err());
+        let holder = terminal_holder(&paired);
+        assert!(
+            recovery
+                .update_source(paired.clone(), None, Some(holder.clone()))
+                .is_err()
+        );
         let mut wrong = recipe.clone();
         wrong.program = "/unrelated/cagents".into();
-        assert!(recovery.update_source(paired.clone(), Some(wrong)).is_err());
+        assert!(
+            recovery
+                .update_source(paired.clone(), Some(wrong), Some(holder.clone()))
+                .is_err()
+        );
         recovery
-            .update_source(paired.clone(), Some(recipe.clone()))
+            .update_source(paired.clone(), Some(recipe.clone()), Some(holder.clone()))
             .unwrap();
         let mut successor = paired.proof.clone().unwrap();
         successor.host_incarnation = crate::model::HostIncarnation::new("console-successor");
@@ -395,7 +446,7 @@ mod tests {
         let mut updated = recovery.source.clone();
         updated.terminal.as_mut().unwrap().continuity = live(&successor);
         recovery
-            .update_source(updated, Some(recipe.clone()))
+            .update_source(updated, Some(recipe.clone()), Some(holder.clone()))
             .unwrap();
         assert_eq!(recovery.execution_console, Some(recipe));
         recovery.validate(&successor.boot_id).unwrap();
@@ -428,13 +479,22 @@ mod tests {
             owned_codex_listener: paired.owned_codex_listener.clone(),
             recovery_origin: None,
         });
-        recovery.update_source(paired.clone(), None).unwrap();
+        let holder = terminal_holder(&paired);
+        assert!(
+            recovery.update_source(paired.clone(), None, None).is_err(),
+            "legacy descriptor cannot invent original pair provenance"
+        );
+        recovery
+            .update_source(paired.clone(), None, Some(holder.clone()))
+            .unwrap();
         let mut proof = paired.proof.clone().unwrap();
         proof.host_incarnation = crate::model::HostIncarnation::new("next-daemon");
         recovery.adopt(&paired, proof.clone()).unwrap();
         let mut successor = recovery.source.clone();
         successor.terminal.as_mut().unwrap().continuity = live(&proof);
-        recovery.update_source(successor.clone(), None).unwrap();
+        recovery
+            .update_source(successor.clone(), None, Some(holder.clone()))
+            .unwrap();
         assert!(successor.retains_native_pair_from(&paired));
         assert!(recovery.previous_sources.contains(&paired));
         assert_eq!(recovery.source, successor);
@@ -443,10 +503,47 @@ mod tests {
         recovery.adopt(&successor, proof.clone()).unwrap();
         let mut forged = successor.clone();
         forged.launch.session_id = Some("different-thread".into());
-        assert!(recovery.update_source(forged, None).is_err());
+        assert!(
+            recovery
+                .update_source(forged, None, Some(holder.clone()))
+                .is_err()
+        );
         let mut forged = successor.clone();
         forged.terminal.as_mut().unwrap().id = crate::model::TerminalId::new();
-        assert!(recovery.update_source(forged, None).is_err());
+        assert!(
+            recovery
+                .update_source(forged, None, Some(holder.clone()))
+                .is_err()
+        );
+        let mut replacement = holder.clone();
+        replacement.holder.start += 1;
+        assert!(
+            recovery
+                .update_source(successor.clone(), None, Some(replacement))
+                .is_err(),
+            "an identical public descriptor cannot transfer pair authority to another holder"
+        );
+        assert_eq!(recovery.paired_holder, Some(holder.clone()));
+        assert_eq!(recovery.source, successor);
+
+        // A completed CLI may be reopened only after its exact teardown has
+        // been proved by the host and the holder acknowledges an unpaired
+        // source. Identical public IDs cannot silently replace pair authority.
+        let mut unpaired = successor.clone();
+        unpaired.terminal = None;
+        recovery
+            .update_source(unpaired.clone(), None, None)
+            .unwrap();
+        assert!(recovery.paired_holder.is_none());
+        assert!(recovery.previous_sources.contains(&successor));
+        let mut reopened_holder = holder;
+        reopened_holder.holder.start += 1;
+        reopened_holder.root.start += 1;
+        recovery
+            .update_source(successor.clone(), None, Some(reopened_holder.clone()))
+            .unwrap();
+        assert_eq!(recovery.paired_holder, Some(reopened_holder));
+        assert!(recovery.previous_sources.contains(&unpaired));
         assert_eq!(recovery.source, successor);
     }
 

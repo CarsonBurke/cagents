@@ -131,6 +131,7 @@ enum Request {
     UpdateSource {
         source: Session,
         execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
     },
     Inspect {
         proof: HostSessionProof,
@@ -210,6 +211,7 @@ impl Holder {
         &mut self,
         source: Session,
         execution_console: Option<crate::model::LaunchRecipe>,
+        paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
         send(
@@ -217,6 +219,7 @@ impl Holder {
             &Request::UpdateSource {
                 source,
                 execution_console,
+                paired_holder,
             },
             TIMEOUT,
         )?;
@@ -228,18 +231,26 @@ impl Holder {
     }
 
     pub fn close(&mut self) -> Result<(), String> {
-        if self.identity.consume_receipt()? {
+        self.close_inner(false)
+    }
+
+    pub(super) fn close_inner(&mut self, retain: bool) -> Result<(), String> {
+        if self.identity.receipt(retain)? {
             self.control.take();
             self.release_on_drop = false;
             return Ok(());
         }
         let Some(control) = self.control.as_ref() else {
-            return self.identity.close();
+            return if retain {
+                self.identity.close_retaining_receipt()
+            } else {
+                self.identity.close()
+            };
         };
         send(control, &Request::Release, TIMEOUT)?;
         match receive(control, TIMEOUT)? {
             Some(Report::Released) => {
-                if !self.identity.consume_receipt()? {
+                if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
@@ -283,6 +294,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     let recovery = Recovery {
         source,
         execution_console: None,
+        paired_holder: None,
         previous_sources: Vec::new(),
         confirmed_thread: None,
         server_version: None,
@@ -632,6 +644,7 @@ impl Residence {
                 .proof
                 .as_ref()
                 .ok_or("Native holder has no release proof")?,
+            &self.recovery,
         )?;
         self.record
             .remove_record(&self.directory)
@@ -682,7 +695,11 @@ impl Residence {
                 Request::UpdateSource {
                     source,
                     execution_console,
-                } => match self.recovery.update_source(source, execution_console) {
+                    paired_holder,
+                } => match self
+                    .recovery
+                    .update_source(source, execution_console, paired_holder)
+                {
                     Ok(()) => Report::SourceUpdated,
                     Err(error) => Report::Failed(error),
                 },

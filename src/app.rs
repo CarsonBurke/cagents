@@ -6188,6 +6188,7 @@ impl Cagents {
         if self
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
+            || self.chat_start_pending(card)
             || self.refuse_for_deleting_card(card)
         {
             return Task::none();

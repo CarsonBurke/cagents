@@ -10,7 +10,10 @@ pub(super) fn restore(
 ) -> Result<ServerResponse, String> {
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down || state.chat_spawning.contains_key(&source.id) {
+        if state.shutting_down
+            || state.chat_spawning.contains_key(&source.id)
+            || state.native_closing.contains_key(&source.id)
+        {
             return Err(
                 "Native holder adoption is unavailable while another transition is pending".into(),
             );
@@ -85,6 +88,7 @@ fn restore_reserved(
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
     let mut session = recovery.source.clone();
     let execution_console = recovery.execution_console.clone();
+    let paired_holder = recovery.paired_holder.clone();
     let expected_thread = recovery.confirmed_thread.clone();
     let mut sources = recovery.previous_sources.clone();
     sources.push(recovery.source.clone());
@@ -144,8 +148,18 @@ fn restore_reserved(
         }
     })();
     if let Err(error) = confirmed {
-        let _ = handle.close();
-        return Err(error);
+        // A responsive process is not proof of an attachable conversation.
+        // In particular, Codex can retain metadata while removed account
+        // storage makes its rollout unavailable. Preserve its owner without
+        // claiming a live attachment or recreating the missing account.
+        return match handle.close() {
+            Ok(()) => Err(format!(
+                "Cannot reattach the retained native conversation: {error}. Provider ownership was preserved; no replacement was started or prompt resent"
+            )),
+            Err(cleanup) => Err(format!(
+                "Cannot reattach the retained native conversation: {error}. Local attachment cleanup is unconfirmed: {cleanup}; no replacement was started or prompt resent"
+            )),
+        };
     }
     let paired = (|| {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -162,7 +176,9 @@ fn restore_reserved(
             .terminals
             .get(&terminal.id)
             .filter(|current| {
-                current.session.launch == terminal.launch
+                current.handle.holder_identity().is_some()
+                    && current.handle.holder_identity() == paired_holder.as_ref()
+                    && current.session.launch == terminal.launch
                     && current.session.owned_codex_listener == terminal.owned_codex_listener
                     && current.session.continuity.live_proof().as_ref() == Some(proof)
             })
@@ -177,7 +193,13 @@ fn restore_reserved(
             return Err(error);
         }
     };
-    if let Err(error) = handle.update_native_source(session.clone(), execution_console.clone()) {
+    if let Err(error) = handle.update_native_source(
+        session.clone(),
+        execution_console.clone(),
+        paired
+            .as_ref()
+            .and_then(|handle| handle.holder_identity().cloned()),
+    ) {
         let _ = handle.close();
         return Err(error);
     }

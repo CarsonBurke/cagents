@@ -251,6 +251,7 @@ pub(crate) struct HostState {
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
+    pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
@@ -302,6 +303,7 @@ impl HostState {
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
+            native_closing: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             agent_activity_wake: Arc::new(super::activity::Wake::default()),
             control_gate: Arc::new(RwLock::new(())),
@@ -312,6 +314,10 @@ impl HostState {
 
     pub(crate) fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    pub(super) fn has_committed_upgrade(&self) -> bool {
+        self.upgrade.is_some()
     }
 
     /// The shared proof, for a broadcast that must not clone it per subscriber.
@@ -1899,10 +1905,11 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?
     };
     for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-        if matches!(
+        let durable = matches!(
             handle.native_continuity(),
             crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        );
+        if durable {
             handle.preserve_for_restart()?;
         } else {
             handle.close()?;
@@ -1910,10 +1917,19 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
         if handle.owns_work() {
             return Err("Native provider shutdown remains unconfirmed; checkpoint retained".into());
         }
-        chat.launch.session_id = handle.confirmed_session_id();
-        chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
-            "Closed provider did not retain its exact conversation identity; checkpoint retained",
-        )?;
+        if durable {
+            // The retained server and every issued alias refer to this exact
+            // launch. A terminal resume recipe describes a new server, not
+            // the live owner the successor must authenticate.
+            if chat.launch.session_id != handle.confirmed_session_id() {
+                return Err("Retained provider changed its confirmed conversation during upgrade; checkpoint retained".into());
+            }
+        } else {
+            chat.launch.session_id = handle.confirmed_session_id();
+            chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
+                "Closed provider did not retain its exact conversation identity; checkpoint retained",
+            )?;
+        }
     }
     // Carried last: a holder left waiting by an upgrade that then fails
     // outlives its daemon for nothing, and only the final save follows this.
@@ -2693,9 +2709,56 @@ pub(super) fn spawn_terminal_view(
     )
 }
 
+/// Returns the exact worker published with the descriptor. A subsequent lookup
+/// by ID cannot establish ownership: another caller may already have replaced it.
+pub(super) fn spawn_terminal_view_owned(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        None,
+        None,
+    )
+}
+
 /// Starts a terminal's worker, spawning its process or, given `adoption`,
 /// adopting the one a predecessor daemon's holder waits with there.
 fn start_terminal_view(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+    adoption: Option<std::path::PathBuf>,
+    previous: Option<crate::terminal::holder::Recovery>,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    start_terminal_view_owned(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        paired,
+        adoption,
+        previous,
+    )
+    .map(|(descriptor, _)| descriptor)
+}
+
+/// Starts a terminal's worker, spawning its process or, given `adoption`,
+/// adopting the one a predecessor daemon's holder waits with there.
+fn start_terminal_view_owned(
     shared: &SharedHost,
     client_id: ClientId,
     session: TerminalSession,
@@ -2704,7 +2767,7 @@ fn start_terminal_view(
     paired: bool,
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
-) -> Result<TerminalDescriptor, ProtocolError> {
+) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     if let Some(environment) = &mut execution_environment {
@@ -2854,6 +2917,11 @@ fn start_terminal_view(
                 .get_mut(&terminal_id)
                 .expect("finished spawn")
                 .execution_environment = retained_environment;
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished spawn")
+                .options = options.clone();
         }
         if native_handoff {
             // A chat connection cannot consume PTY events. The GUI attaches a
@@ -2869,13 +2937,6 @@ fn start_terminal_view(
             return Err(error);
         }
     };
-    shared
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .terminals
-        .get_mut(&terminal_id)
-        .expect("finished spawn")
-        .options = options;
     // Initial publication can happen before the record is subscribable. Clear
     // that edge after insertion; the Spawn response carries the same snapshot,
     // and later generations can now produce a fresh wake.
@@ -2905,16 +2966,20 @@ fn start_terminal_view(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.terminals.remove(&terminal_id);
-        state.inventory_generation += 1;
-        state.subscriptions.detach(client_id, terminal_id);
+        if state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_worker(&redraw_handle))
+        {
+            state.retire_terminal(terminal_id);
+        }
         return Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
             format!("could not start terminal event monitor: {error}"),
             true,
         ));
     }
-    Ok(descriptor)
+    Ok((descriptor, redraw_handle))
 }
 
 fn apply_visibility(
@@ -3228,6 +3293,9 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
         false,
     )
 }
+
+#[cfg(test)]
+mod native_upgrade_tests;
 
 #[cfg(test)]
 mod tests {

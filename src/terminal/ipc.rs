@@ -252,6 +252,11 @@ pub enum ClientRequest {
     ChatClose {
         chat_id: TerminalId,
     },
+    /// Closes only the exact authenticated retained native owner. Used when
+    /// restoring its actor is impossible; absence is not teardown evidence.
+    ChatCloseRetained {
+        session: crate::chat::Session,
+    },
     ChatList,
     /// Acknowledge activity without enabling or reading presentation.
     ChatAcknowledge {

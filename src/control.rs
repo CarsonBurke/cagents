@@ -46,6 +46,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
     .saturating_add(crate::chat::TERMINATE_GRACE)
     .saturating_add(Duration::from_secs(8));
+// Retained-owner cleanup can retire both the native holder and its paired PTY.
+const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -647,6 +649,23 @@ impl ControlClient {
             self.attached_chats.remove(&chat_id);
         }
         closed
+    }
+
+    /// Proves teardown without reopening provider history or creating an actor.
+    pub fn close_retained_chat(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<(), ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatCloseRetained { session },
+            Instant::now() + RETAINED_CHAT_CLOSE_TIMEOUT,
+        )? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "retained native owner teardown",
+                &response,
+            )),
+        }
     }
 
     pub fn resolve_upgrade_chat(
@@ -3982,6 +4001,86 @@ mod tests {
                 ..
             })
         ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn retained_chat_close_sends_exact_source_without_attaching_and_requires_receipt() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+            },
+            proof: Some(pinned.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: crate::chat::NativeContinuity::Durable {
+                provider_version: "0.157.1".into(),
+            },
+        };
+        let expected = session.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            for accepted in [false, true] {
+                let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::ChatCloseRetained {
+                        session: expected.clone()
+                    }
+                );
+                thread::sleep(Duration::from_millis(50));
+                let message = if accepted {
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                } else {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "Owner teardown is unconfirmed",
+                        true,
+                    ))
+                };
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: pinned.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert!(matches!(
+            client.close_retained_chat(session.clone()),
+            Err(ControlError::Remote { .. })
+        ));
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        client.close_retained_chat(session).unwrap();
+        assert!(client.attached_chats.is_empty());
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         server.join().unwrap();
     }
 

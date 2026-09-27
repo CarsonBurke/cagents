@@ -311,21 +311,9 @@ pub fn run() -> Result<(), HostError> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .graceful_shutdown();
-    let chats = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .chats
-        .values()
-        .map(|record| record.handle.clone())
-        .collect::<Vec<_>>();
-    if let Err(error) = state::finish_upgrade(&host) {
+    if let Err(error) = finish_chat_shutdown(&host) {
         tracing::error!(%error, "upgrade handoff remains unconfirmed; checkpoint retained");
         runtime_error = Some(io::Error::other(error));
-    }
-    for chat in chats {
-        if let Err(error) = chat.close() {
-            tracing::warn!(%error, "provider shutdown was not confirmed");
-        }
     }
     for delivery in &deliveries {
         let _ = delivery.push(ServerEnvelope {
@@ -346,6 +334,39 @@ pub fn run() -> Result<(), HostError> {
         Some(error) => Err(error.into()),
         None => Ok(()),
     }
+}
+
+fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
+    let (chats, upgrading) = {
+        let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            state
+                .chats
+                .values()
+                .map(|record| record.handle.clone())
+                .collect::<Vec<_>>(),
+            state.has_committed_upgrade(),
+        )
+    };
+    let result = state::finish_upgrade(host);
+    for chat in chats {
+        // A committed upgrade transfers ownership, including when the final
+        // checkpoint write fails. Explicit Stop/Close still tears down the
+        // provider; exiting the upgrading daemon must not undo preservation.
+        let closed = if upgrading
+            && matches!(
+                chat.native_continuity(),
+                crate::chat::NativeContinuity::Durable { .. }
+            ) {
+            chat.preserve_for_restart()
+        } else {
+            chat.close()
+        };
+        if let Err(error) = closed {
+            tracing::warn!(%error, "provider shutdown was not confirmed");
+        }
+    }
+    result
 }
 
 #[cfg(test)]

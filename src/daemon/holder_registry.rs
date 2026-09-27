@@ -67,6 +67,13 @@ pub(crate) fn socket(directory: &Path, terminal: TerminalId) -> PathBuf {
 }
 
 impl Record {
+    fn supported_version(&self) -> bool {
+        match self.kind {
+            Kind::Terminal => matches!(self.version, 3 | 4),
+            Kind::Native => self.version == 3,
+        }
+    }
+
     fn path(&self, directory: &Path) -> PathBuf {
         directory.join(format!("{}.json", self.terminal))
     }
@@ -149,7 +156,7 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
         Err(error) => return Err(error.to_string()),
     };
     let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
-    if record.version != 3
+    if !record.supported_version()
         || record.kind != kind
         || record.application != crate::instance::APPLICATION_ID
         || record.boot != boot
@@ -181,7 +188,7 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
                 continue;
             }
         };
-        if record.version != 3
+        if !record.supported_version()
             || record.kind != kind
             || record.application != crate::instance::APPLICATION_ID
             || record.path(directory) != path
@@ -238,6 +245,32 @@ mod tests {
         old.remove_record(directory.path()).unwrap();
         assert_eq!(read(&successor.path(directory.path())).unwrap(), successor);
         assert!(endpoint.exists());
+    }
+
+    #[test]
+    fn terminal_receipt_protocol_is_discovered_without_widening_native_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut terminal = record();
+        terminal.version = 4;
+        terminal.create(directory.path()).unwrap();
+        assert_eq!(
+            evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
+            Some(terminal.clone())
+        );
+        assert_eq!(
+            discover(directory.path(), &terminal.boot, Kind::Terminal).unwrap(),
+            vec![terminal.clone()]
+        );
+        let mut native = record();
+        native.kind = Kind::Native;
+        native.version = 4;
+        native.create(directory.path()).unwrap();
+        assert!(evidence(&socket(directory.path(), native.terminal), Kind::Native).is_err());
+        assert!(
+            discover(directory.path(), &native.boot, Kind::Native)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

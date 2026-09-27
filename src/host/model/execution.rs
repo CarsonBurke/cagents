@@ -247,6 +247,36 @@ impl Registry {
             .transpose()
     }
 
+    /// Durable descriptors that require exact holder-receipt validation before
+    /// teardown can retire them, including a launch not yet publicly bound.
+    pub(crate) fn retained_agent_sources(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Vec<HostedSession>, String> {
+        let mut sources = Vec::new();
+        if let Some(source) = self.retained_agent_authority_source(id)? {
+            sources.push(source);
+        }
+        if let Some(agent) = self.agent_for_session(id)?
+            && let Some(source) = agent.session
+        {
+            sources.push(source);
+        }
+        let pending: Option<String> = self
+            .db
+            .query_row(
+                "SELECT source FROM agent_launches WHERE session_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(pending) = pending {
+            sources.push(decode(&pending)?);
+        }
+        Ok(sources)
+    }
+
     pub(crate) fn claim_agent_interaction(
         &mut self,
         id: AgentId,
