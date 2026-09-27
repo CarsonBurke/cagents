@@ -1,7 +1,7 @@
 use cagents::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents::{
     design,
-    github::{self, GitHubService},
+    github::GitHubService,
     lsp::{
         LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
         LspStatus,
@@ -100,19 +100,7 @@ fn review_source_for_remotes(
     root: &Path,
     remotes: &[cagents::repository::RemoteRecord],
 ) -> Option<ReviewSource> {
-    let key = remotes
-        .iter()
-        .filter_map(|remote| github::remote_repository_key(remote.fetch_url.as_deref()?))
-        .collect::<Vec<_>>();
-    let repository = key
-        .iter()
-        .find(|key| github::remote_for_repository(remotes, key).as_deref() == Some("origin"))
-        .or_else(|| key.first())?
-        .clone();
-    Some(ReviewSource {
-        repository,
-        worktree: root.to_path_buf(),
-    })
+    ReviewSource::from_remotes(root, remotes)
 }
 
 struct FileOperationDialog {
@@ -492,10 +480,38 @@ enum PreferenceFile {
     Assistance,
     Shortcuts,
     Session,
+    Review,
 }
 
 impl PreferenceFile {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
+}
+
+struct ReviewPreferenceStore {
+    store: pull_request_review::cache::JsonStore,
+    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+}
+
+impl pull_request_review::cache::Store for ReviewPreferenceStore {
+    fn load(
+        &self,
+        key: &cagents::github::PullRequestKey,
+    ) -> Result<Option<pull_request_review::cache::Snapshot>, String> {
+        self.store.load(key)
+    }
+
+    fn save(
+        &self,
+        snapshot: &pull_request_review::cache::Snapshot,
+        order: u64,
+    ) -> Result<(), String> {
+        let mut lane = self.lane.lock().unwrap_or_else(|error| error.into_inner());
+        // Writes are per-PR deltas. JsonStore rejects stale writes for that
+        // key; a newer write to a different PR must not discard this one.
+        self.store.save(snapshot, order)?;
+        lane[PreferenceFile::Review as usize] = lane[PreferenceFile::Review as usize].max(order);
+        Ok(())
+    }
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -1470,7 +1486,13 @@ impl Editor {
         let mut review = pull_request_review::State::new(
             Arc::new(GitHubService::system("gh")),
             RepositoryService::system("git"),
-        );
+        )
+        .with_cache(Some(Arc::new(ReviewPreferenceStore {
+            store: pull_request_review::cache::JsonStore::new(
+                self.settings_path.with_file_name("review.json"),
+            ),
+            lane: Arc::clone(&self.preference_lane),
+        })));
         let review_task = review
             .set_source(review_source(&descriptor_root, opened.snapshot.as_ref()))
             .map(move |action| Message::PullRequestReview(id, action))
@@ -6514,7 +6536,7 @@ mod tests {
         assert!(app.handle_shortcut(&next).is_none(), "still none open");
 
         let target = pull_request_review::ReviewTarget {
-            repository: github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            repository: cagents::github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
             worktree: "/workspace".into(),
             pull_request: Arc::new(
                 serde_json::from_value(serde_json::json!({
