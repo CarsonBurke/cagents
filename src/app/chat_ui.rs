@@ -7852,6 +7852,38 @@ mod tests {
         assert!(app.chat_offers_fresh_conversation(card));
     }
 
+    #[test]
+    fn unnamed_hosted_chat_attachment_finishes_hydration_without_replacing_identity() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let session = chat_runtime(&app, card).session.clone();
+        assert!(session.launch.session_id.is_none());
+        assert!(!session.is_unstarted());
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.lifecycle
+            .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
+        let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+        let target = chat_runtime_attempt(&app, card);
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                busy: true,
+                ..Snapshot::default()
+            },
+        ));
+        answer_start(&mut app, target, Ok(handle));
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.is_draft());
+        assert!(runtime.snapshot.busy);
+        assert_eq!(runtime.session, session);
+        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+        assert!(!app.chat_start_pending(card));
+    }
+
     /// A saved conversation nothing ever ran reopens as a draft, and any
     /// actor an unanswered start left for it is given up; one that did run
     /// reconnects as before.
