@@ -21406,6 +21406,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn thousand_file_review_mounts_a_bounded_tree_and_draws_repeated_frames() {
+        use crate::pull_request_review::{Action, tests as review};
+        use cosmic::iced::advanced::widget::Tree;
+        let (mut app, project) = pull_request_test_app(&[1]);
+        drop(app.update(open_pull_request(project, 1)));
+        let card = pull_request_cards(&app)[0].0;
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("review pane")
+        };
+        let mut snapshot = review::loaded(
+            (0..1000)
+                .map(|i| {
+                    review::entry(
+                        &format!("src/file-{i:04}.rs"),
+                        crate::repository::ChangeKind::Modified,
+                    )
+                })
+                .collect(),
+            (0..100)
+                .map(|i| review::remote_file(&format!("src/file-{i:04}.rs"), false))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        review::finish_load(&mut pane.review, snapshot);
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        fn nodes(tree: &Tree) -> usize {
+            1 + tree.children.iter().map(nodes).sum::<usize>()
+        }
+        let mut timings = Vec::new();
+        for frame in 0..12 {
+            let start = Instant::now();
+            present(&app, &mut renderer, &mut tree);
+            timings.push(start.elapsed());
+            assert!(
+                nodes(&tree) < 5000,
+                "offscreen file widgets must not be mounted: {}",
+                nodes(&tree)
+            );
+            drop(app.update(Message::PullRequestReview {
+                card,
+                action: Action::FilePage(
+                    crate::pull_request_review::file_pages::PageAction::Viewport {
+                        offset: frame as f32 * 70.0 * design::DENSE_ROW_HEIGHT,
+                        height: 1000.0,
+                    },
+                ),
+            }));
+        }
+        timings.sort();
+        eprintln!(
+            "1000-file review, full layout/draw: median {:?}, max {:?}, mounted nodes {}",
+            timings[6],
+            timings[11],
+            nodes(&tree)
+        );
+    }
+
     /// Restoring is the shell's doing, not a keystroke aimed at a dialog, so
     /// a dialog on screen when the project loads must not swallow it.
     #[test]

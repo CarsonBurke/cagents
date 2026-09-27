@@ -848,6 +848,17 @@ pub struct PullRequestFiles {
     pub truncated: bool,
 }
 
+/// One independently requested file page, pinned to the viewer and diff revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestFilePage {
+    pub files: Vec<PullRequestFile>,
+    pub next_cursor: Option<String>,
+    pub pull_request_id: String,
+    pub head_oid: String,
+    pub base_oid: String,
+    pub viewer: String,
+}
+
 /// The viewer's unsubmitted review, if one exists. GitHub keeps at most one
 /// per viewer per pull request, and only its owner can see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1099,6 +1110,13 @@ pub trait GitHubReviewApi: Send + Sync {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<ReviewContext, GitHubError>;
+
+    fn pull_request_file_page(
+        &self,
+        key: &PullRequestKey,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestFilePage, GitHubError>;
 
     fn pull_request_files(
         &self,
@@ -2316,6 +2334,39 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
             viewer: viewer.login,
             viewer_is_author: page.viewer_did_author,
             pending,
+        })
+    }
+
+    fn pull_request_file_page(
+        &self,
+        key: &PullRequestKey,
+        cursor: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestFilePage, GitHubError> {
+        key.validate()?;
+        let mut variables = Self::pull_request_variables(key);
+        if let Some(cursor) = cursor {
+            variables.push(("cursor", cursor.into()));
+        }
+        let data = self.graphql(&key.repository,
+            "query($owner:String!,$name:String!,$number:Int!,$cursor:String){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid files(first:100,after:$cursor){nodes{path additions deletions changeType viewerViewedState} pageInfo{hasNextPage endCursor}}}}}",
+            variables, cancellation)?;
+        let pr = data
+            .pointer("/repository/pullRequest")
+            .ok_or_else(|| GitHubError::Inspection("GitHub returned no pull request.".into()))?;
+        let connection: Connection<PullRequestFile> = decode_value(&pr["files"])?;
+        let next = if connection.page_info.has_next_page {
+            Some(next_cursor(&connection.page_info, cursor)?)
+        } else {
+            None
+        };
+        Ok(PullRequestFilePage {
+            files: connection.nodes,
+            next_cursor: next,
+            pull_request_id: decode_value(&pr["id"])?,
+            head_oid: decode_value(&pr["headRefOid"])?,
+            base_oid: decode_value(&pr["baseRefOid"])?,
+            viewer: decode_value(&data["viewer"]["login"])?,
         })
     }
 
@@ -3578,6 +3629,26 @@ mod tests {
             .unwrap();
         assert!(context.viewer_is_author);
         assert_eq!(context.pending, None);
+    }
+
+    #[test]
+    fn a_file_page_returns_its_authority_without_fetching_the_next_page() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(br#"{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"id":"PR_1","headRefOid":"head","baseRefOid":"base","files":{"nodes":[{"path":"a.rs","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":true,"endCursor":"next"}}}}}}"#)]));
+        let service = GitHubService::new("gh", fake.clone());
+        let page = service
+            .pull_request_file_page(
+                &pull_request_key(),
+                Some("previous"),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(page.viewer, "me");
+        assert_eq!(page.head_oid, "head");
+        assert_eq!(page.base_oid, "base");
+        assert_eq!(page.next_cursor.as_deref(), Some("next"));
+        let commands = fake.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(argument_strings(&commands[0]).contains(&"cursor=previous".to_owned()));
     }
 
     #[test]
