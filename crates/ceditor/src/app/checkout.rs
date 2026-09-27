@@ -345,8 +345,10 @@ impl Editor {
             );
             return Some(dialog_overlay(
                 dialog_surface(
-                    widget::scrollable(widget::column::with_children(rows).spacing(12))
-                        .height(Length::Fixed(480.0)),
+                    widget::container(widget::scrollable(
+                        widget::column::with_children(rows).spacing(12),
+                    ))
+                    .max_height(480.0),
                     640.0,
                 ),
                 Message::Checkout(Action::Cancel),
