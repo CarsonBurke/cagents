@@ -212,7 +212,7 @@ impl Handle {
     }
 
     /// Caller holds the daemon control read gate, either the IPC dispatcher or
-    /// the scheduled wrapper below. Never recursively acquire std's RwLock.
+    /// the scheduler tick below. Never recursively acquire std's RwLock.
     fn launch(&self, host: &SharedHost, claim: Claimed) -> Result<(), String> {
         if !claim.created || !claim.firing.state.is_active() {
             return Ok(());
@@ -285,16 +285,6 @@ impl Handle {
         Ok(())
     }
 
-    fn launch_scheduled(&self, host: &SharedHost, claim: Claimed) -> Result<(), String> {
-        let control = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .control_gate
-            .clone();
-        let _control = control.read().unwrap_or_else(|p| p.into_inner());
-        self.launch(host, claim)
-    }
-
     fn run(&self) {
         loop {
             let observed = {
@@ -322,6 +312,22 @@ impl Handle {
     }
 
     fn tick(&self, host: &SharedHost) -> Result<Duration, String> {
+        let control = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .control_gate
+            .clone();
+        // Final update admission must exclude claims and receipt acceptance,
+        // not just the eventual process spawn. Never wait behind shutdown's
+        // writer: it may be joining this coordinator while dropping Broker.
+        let _control = match control.try_read() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(Duration::from_millis(250)),
+        };
+        if crate::host::client::ensure_control_open(host).is_err() {
+            return Ok(Duration::from_millis(250));
+        }
         let now = service::now()?;
         let active = self
             .0
@@ -463,7 +469,7 @@ impl Handle {
                 checking |= claim.created
                     && claim.firing.state == FiringState::Prechecking
                     && claim.definition.precheck.is_some();
-                self.launch_scheduled(host, claim)?;
+                self.launch(host, claim)?;
             } else {
                 self.0
                     .registry
@@ -514,7 +520,7 @@ impl Handle {
         let disposition = if agent.closed {
             Ok(agent_execution::Reconciliation::Closed)
         } else {
-            agent_execution::reconcile_agent_run(
+            agent_execution::reconcile_agent_run_under_control(
                 host,
                 &run,
                 detail.definition.session_mode == SessionMode::Fresh,
@@ -722,6 +728,92 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_write_gate_defers_precheck_observation_without_blocking_scheduler_shutdown() {
+        use crate::{
+            host::model::Registry,
+            model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
+            workspace_model::ModelEdit,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: "/fixture".into(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Pending check", "prompt":"Fixture prompt",
+            "agent":{"provider":"Claude","account":null,"target":{"repository":"/fixture","directory":"/fixture","channel":null},"surface":"Chat","model":null,"permission_mode":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":{"command":"exit 0","timeout_seconds":1}
+        })).unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let claim = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                Trigger::Manual {
+                    request: Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        let host = Arc::new(Mutex::new(HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("test"),
+            boot_id: BootId::new("test"),
+            host_incarnation: HostIncarnation::new("test"),
+        })));
+        let registry = Arc::new(Mutex::new(registry));
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: registry.clone(),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+        }));
+        let gate = host.lock().unwrap().control_gate.clone();
+        let exclusive = gate.write().unwrap();
+        assert_eq!(handle.tick(&host).unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_firing(claim.firing.id)
+                .unwrap()
+                .state,
+            FiringState::Prechecking
+        );
+        drop(exclusive);
+        handle.tick(&host).unwrap();
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_firing(claim.firing.id)
+                .unwrap()
+                .state,
+            FiringState::Interrupted,
+            "after admission releases, the missing cleanup receipt is observed honestly"
+        );
+    }
 
     #[test]
     fn automation_attention_baselines_history_but_distinguishes_new_waiting_edges() {

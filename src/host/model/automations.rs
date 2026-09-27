@@ -336,6 +336,37 @@ impl Registry {
         rows.into_iter().map(|record| decode(&record)).collect()
     }
 
+    /// Precheck-only ownership has no hosted session in ordinary update
+    /// inventory. Include uncertain cleanup until its exact receipt releases
+    /// the active slot. Caller queries outside HostState under the update gate.
+    pub(crate) fn automation_update_blockers(&self) -> Result<Vec<String>, String> {
+        let limit = crate::automations::MAX_CONCURRENT_PRECHECKS;
+        let mut query = self.db.prepare(
+            "SELECT f.record FROM automations a JOIN automation_firings f ON f.id = a.active_firing
+             WHERE f.run_id IS NULL ORDER BY f.created_ms, f.id LIMIT ?1",
+        ).map_err(|error| error.to_string())?;
+        let records = query
+            .query_map([limit as u64 + 1], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        let mut blockers = records
+            .iter()
+            .take(limit)
+            .map(|record| {
+                let firing: Firing = decode(record)?;
+                Ok(format!(
+                    "Automation ‘{}’ ({}) has a precheck or cleanup still pending",
+                    firing.name, firing.id
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if records.len() > limit {
+            blockers.push("Additional automation prechecks must settle before updating".into());
+        }
+        Ok(blockers)
+    }
+
     /// A dead owner without a durable cleanup receipt is not a failed shell:
     /// descendants or command effects may remain. Preserve the capacity claim.
     pub(crate) fn interrupt_automation_precheck(
@@ -1978,6 +2009,7 @@ mod tests {
             firings.push(claim.firing.id);
         }
         assert_eq!(registry.active_automation_firings().unwrap().len(), 4);
+        assert_eq!(registry.automation_update_blockers().unwrap().len(), 4);
         let extra = registry
             .create_automation(definition, 100, test_identity())
             .unwrap();
@@ -1996,6 +2028,11 @@ mod tests {
                 202,
             )
             .unwrap();
+        assert_eq!(
+            registry.automation_update_blockers().unwrap().len(),
+            4,
+            "uncertain cleanup remains visible in planned update impact"
+        );
         assert_eq!(
             registry.retired_automation_precheck(firings[0]).unwrap(),
             None,
@@ -2047,6 +2084,7 @@ mod tests {
         assert!(owner.blocked.is_none());
         assert!(!owner.enabled);
         assert_eq!(registry.active_automation_firings().unwrap().len(), 3);
+        assert_eq!(registry.automation_update_blockers().unwrap().len(), 3);
     }
 
     #[test]
