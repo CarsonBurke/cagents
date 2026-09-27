@@ -43,6 +43,7 @@ use crate::{
 type ActionTask = iced::Task<Action>;
 
 pub mod cache;
+pub mod checkout;
 pub mod discussion;
 pub mod discussion_ui;
 pub mod file_pages;
@@ -64,6 +65,21 @@ pub struct ReviewTarget {
     pub repository: GitHubRepoKey,
     pub worktree: PathBuf,
     pub pull_request: Arc<PullRequest>,
+}
+
+/// A checkout always starts from the exact commit shown by the review. The
+/// private fetch ref can move when another window refreshes the same PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutTarget {
+    pub repository: PathBuf,
+    pub number: u64,
+    pub head: crate::repository::Oid,
+}
+
+impl CheckoutTarget {
+    pub fn suggested_branch(&self) -> String {
+        format!("pr/{}-{}", self.number, &self.head.as_str()[..8])
+    }
 }
 
 /// Whether a file's local viewed mark matches GitHub's.
@@ -192,6 +208,7 @@ pub enum Action {
         results: Vec<(RepoPath, bool, ViewedOutcome)>,
     },
     OpenUrl(Url),
+    Checkout,
     DismissNotice,
 }
 
@@ -229,6 +246,7 @@ pub enum Effect {
     NextChange,
     PreviousChange,
     OpenUrl(Url),
+    Checkout(CheckoutTarget),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
 }
@@ -948,6 +966,20 @@ impl State {
                 self.effects.push(Effect::OpenUrl(url));
                 ActionTask::none()
             }
+            Action::Checkout => {
+                if !self.refreshing
+                    && let (Some(target), Some(context), Some(range)) =
+                        (&self.target, &self.context, &self.range)
+                    && context.head_oid == range.head.as_str()
+                {
+                    self.effects.push(Effect::Checkout(CheckoutTarget {
+                        repository: target.worktree.clone(),
+                        number: target.pull_request.number,
+                        head: range.head.clone(),
+                    }));
+                }
+                ActionTask::none()
+            }
             Action::DismissNotice => {
                 self.notice = None;
                 ActionTask::none()
@@ -1564,6 +1596,14 @@ impl State {
         .center(Length::Fixed(ROW_ICON_WIDTH))
         .into();
         let controls = crate::ui_controls::toolbar_actions(vec![
+            icon_control(
+                symbolic_icon("git-branch-symbolic"),
+                "Create worktree from reviewed commit",
+                false,
+                !modal_open && !busy && self.context.is_some() && self.range.is_some(),
+                Some(self.fenced(Action::Checkout)),
+            )
+            .into(),
             icon_control(
                 symbolic_icon("view-refresh-symbolic"),
                 if busy {
@@ -3501,6 +3541,31 @@ pub(crate) mod tests {
         // Already closed: nothing to tell the shell.
         drop(state.update(Action::Close));
         assert_eq!(state.take_effects(), vec![]);
+    }
+
+    #[test]
+    fn checkout_uses_the_loaded_commit_and_refuses_stale_or_offline_authority() {
+        let (mut state, _) = state();
+        open_with(
+            &mut state,
+            loaded(vec![entry("a.rs", ChangeKind::Modified)], vec![]),
+        );
+        state.take_effects();
+        let action = state.fenced(Action::Checkout);
+        drop(state.update(action.clone()));
+        let effects = state.take_effects();
+        let [Effect::Checkout(target)] = effects.as_slice() else {
+            panic!("checkout effect");
+        };
+        assert_eq!(target.repository, PathBuf::from("/repo"));
+        assert_eq!(target.head.as_str(), "a".repeat(40));
+        assert_eq!(target.suggested_branch(), "pr/1-aaaaaaaa");
+        state.context = None;
+        drop(state.update(Action::Checkout));
+        assert!(state.take_effects().is_empty());
+        state.authority_revision += 1;
+        drop(state.update(action));
+        assert!(state.take_effects().is_empty());
     }
 
     /// A refresh after the head moved re-fetches the range; a file still in

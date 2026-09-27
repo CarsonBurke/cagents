@@ -5331,6 +5331,7 @@ impl Cagents {
         ];
         let mut selection: Option<Option<u64>> = None;
         let mut links = Vec::new();
+        let mut checkout = None;
         for effect in pane.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -5356,6 +5357,11 @@ impl Cagents {
                     pane.runtime.update(RepositoryAction::BackToFiles { card }),
                 )),
                 pull_request_review::Effect::OpenUrl(url) => links.push(url),
+                pull_request_review::Effect::Checkout(target) => {
+                    checkout = pane
+                        .project(&self.sidebar_model)
+                        .map(|project| (project, target));
+                }
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -5371,6 +5377,21 @@ impl Cagents {
         }
         for url in links {
             tasks.push(self.open_clicked_link(url));
+        }
+        if let Some((project_id, target)) = checkout {
+            self.worktree_dialog = Some(WorktreeDialog {
+                project_id,
+                repository: target.repository.clone(),
+                branch: target.suggested_branch(),
+                base: target.head.as_str().to_owned(),
+                destination: String::new(),
+                advanced: true,
+                resolving: None,
+                error: None,
+            });
+            tasks.push(
+                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App),
+            );
         }
         Task::batch(tasks)
     }
