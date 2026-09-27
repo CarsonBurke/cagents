@@ -9,6 +9,7 @@ pub(super) struct State {
     checking: bool,
     applying: bool,
     polling: bool,
+    poll_retry: bool,
     inspecting: bool,
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
@@ -300,10 +301,13 @@ impl Cagents {
             .map(|_| Message::UpdateUi(Action::InspectInstallation));
         // Release discovery talks to GitHub and drives the installer, neither
         // of which a development instance may do.
-        if crate::instance::NAME == "development" && !self.update_ui.updating() {
+        if crate::instance::NAME == "development"
+            && !self.update_ui.updating()
+            && !self.update_ui.poll_retry
+        {
             return installation;
         }
-        let progress = if self.update_ui.updating() {
+        let progress = if self.update_ui.updating() || self.update_ui.poll_retry {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
         } else {
             iced::time::every(Duration::from_secs(6 * 60 * 60))
@@ -596,6 +600,8 @@ impl Cagents {
                 }
                 match result {
                     Ok(Some(job)) => {
+                        self.update_ui.poll_retry = false;
+                        self.update_ui.error = None;
                         if matches!(job.phase, UpdatePhase::Failed) {
                             self.update_ui.error = Some(job.message.clone());
                             self.status = Some(TransientNotice::error(job.message.clone()));
@@ -612,14 +618,22 @@ impl Cagents {
                         self.update_ui.job = Some(job);
                     }
                     Ok(None) => {
-                        self.update_ui.job = None;
+                        self.update_ui.poll_retry = self.update_ui.updating();
+                        if !self.update_ui.poll_retry {
+                            self.update_ui.job = None;
+                        } else if let Some(job) = &mut self.update_ui.job {
+                            job.confirmation = None;
+                        }
                         self.update_ui.confirmation = None;
                         if expected_job.is_some() {
                             self.update_ui.error = Some("Update status is unavailable".into());
                         }
                     }
                     Err(error) => {
-                        self.update_ui.job = None;
+                        self.update_ui.poll_retry = true;
+                        if let Some(job) = &mut self.update_ui.job {
+                            job.confirmation = None;
+                        }
                         self.update_ui.confirmation = None;
                         self.update_ui.error = Some(error);
                     }
@@ -684,6 +698,48 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let confirmation = crate::update::UpdateConfirmation {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            preview: crate::update::impact::Preview {
+                candidate: crate::update::impact::Candidate {
+                    version: "new".into(),
+                    protocol: 32,
+                    digest: "verified".into(),
+                },
+                replaces_daemon: false,
+                daemon: None,
+            },
+            expires_at_unix_ms: u64::MAX,
+        };
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Ready".into(),
+            log_path: "/fixture/update.log".into(),
+            confirmation: Some(confirmation.clone()),
+        };
+        app.update_ui.job = Some(job.clone());
+        app.update_ui.confirmation = Some(confirmation);
+        drop(app.update_update_ui(Action::Polled(
+            Some(job.id.clone()),
+            Err("temporary read failure".into()),
+        )));
+        assert!(app.update_ui.poll_retry && app.update_ui.updating());
+        assert_eq!(app.update_ui.job.as_ref().unwrap().id, job.id);
+        assert!(app.update_ui.confirmation.is_none());
+        assert!(app.update_ui.job.as_ref().unwrap().confirmation.is_none());
+        drop(app.update_update_ui(Action::ReviewJob));
+        assert!(app.update_ui.confirmation.is_none());
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job)))));
+        assert!(!app.update_ui.poll_retry);
+        assert!(app.update_ui.error.is_none());
+        assert!(app.update_ui.confirmation.is_some());
+    }
 
     #[test]
     fn update_banner_moves_to_retained_notices_and_new_builds_announce_again() {
