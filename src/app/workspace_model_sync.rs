@@ -856,6 +856,108 @@ impl Cagents {
 mod tests {
     use super::*;
 
+    #[test]
+    fn headless_execution_adopts_exact_target_without_stealing_focus_or_resurrecting_tombstones() {
+        use crate::agent::Provider;
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        let (mut app, project, repository) = app_with_project();
+        let active = ChannelId::new();
+        let target = ChannelId::new();
+        let focus = app.workspace.focused();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(local(active, project, "Active", 0));
+        durable
+            .channels
+            .push(local(target, project, "Execution", 1));
+        durable.active_channel = Some(active);
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: Provider::Claude,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: PathBuf::from("/repo/worktree"),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let mut agent = Agent {
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository,
+                    directory: PathBuf::from("/repo/worktree"),
+                    channel: Some(target),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+            },
+            channel: target,
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 0,
+            closed: false,
+        };
+        let card = CardId::from_uuid(agent.id.as_uuid());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(app.durable.active_channel, Some(active));
+        assert_eq!(app.workspace.focused(), focus);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == target)
+                .unwrap()
+                .cards,
+            vec![card]
+        );
+        assert_eq!(
+            app.durable.card_scopes.get(&card),
+            Some(&PathBuf::from("/repo/worktree"))
+        );
+        assert!(
+            matches!(&app.durable.cards.iter().find(|entry| entry.id == card).unwrap().kind, CardKind::Chat(actual) if actual == &session)
+        );
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|entry| entry.id == card)
+            .unwrap()
+            .existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("user closed".into()),
+            },
+        };
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .filter(|entry| entry.id == card)
+                .count(),
+            1
+        );
+        agent.id = crate::model::AgentId::new();
+        agent.spec.surface = Surface::Terminal;
+        assert!(
+            app.adopt_execution_agent(&agent).is_none(),
+            "wait for the exact paired console descriptor"
+        );
+    }
+
     /// A window whose project is keyed the way a real one is: by the common Git
     /// directory, which is what `ProjectState.repository` holds and therefore
     /// what the shared model keys a channel on. Keying the fixture on the work

@@ -4,16 +4,20 @@ use crate::agent::Provider;
 use std::{
     collections::BTreeMap,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const CONTENT: &str = include_str!("../../assets/skills/cagents-agents/SKILL.md");
 const NAME: &str = "cagents-agents";
 
-pub(crate) fn install(provider: Option<Provider>, environment: &BTreeMap<String, String>) {
+pub(crate) fn install(
+    provider: Option<Provider>,
+    environment: &BTreeMap<String, String>,
+    cwd: &Path,
+) {
     let Some(home) = environment
         .get("HOME")
-        .map(Path::new)
+        .map(|home| cwd.join(home))
         .filter(|home| home.is_dir())
     else {
         return;
@@ -29,7 +33,7 @@ pub(crate) fn install(provider: Option<Provider>, environment: &BTreeMap<String,
             .get("CLAUDE_CONFIG_DIR")
             .filter(|root| !root.is_empty());
         roots.push(match selected {
-            Some(root) => (PathBuf::from(root), false),
+            Some(root) => (cwd.join(root), false),
             None => (home.join(".claude"), true),
         });
     }
@@ -113,6 +117,33 @@ pub(crate) fn matched_path(current: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ui")]
+    #[test]
+    fn installed_bundle_is_discovered_by_each_native_provider_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment =
+            BTreeMap::from([("HOME".into(), directory.path().to_str().unwrap().into())]);
+        for provider in Provider::ALL {
+            install(Some(provider), &environment, directory.path());
+            let launch = crate::chat::Launch {
+                provider,
+                session_id: None,
+                recipe: crate::model::LaunchRecipe {
+                    program: provider.executable().into(),
+                    arguments: Vec::new(),
+                    working_directory: directory.path().to_owned(),
+                    environment: environment.clone(),
+                    unset_environment: Default::default(),
+                },
+            };
+            let skills = crate::chat::skills::discover(&launch);
+            assert!(
+                skills.iter().any(|skill| skill.name == NAME),
+                "missing {provider:?} bundle: {skills:?}"
+            );
+        }
+    }
+
     #[test]
     fn native_locations_follow_process_home_and_selected_claude_account() {
         let directory = tempfile::tempdir().unwrap();
@@ -127,7 +158,7 @@ mod tests {
                 selected.to_str().unwrap().into(),
             ),
         ]);
-        install(Some(Provider::Claude), &environment);
+        install(Some(Provider::Claude), &environment, directory.path());
         assert_eq!(
             std::fs::read_to_string(selected.join("skills/cagents-agents/SKILL.md")).unwrap(),
             CONTENT
@@ -135,7 +166,7 @@ mod tests {
         assert!(!home.join(".claude").exists());
         assert!(!home.join(".agents").exists());
         for provider in [Provider::Codex, Provider::Omp] {
-            install(Some(provider), &environment);
+            install(Some(provider), &environment, directory.path());
         }
         assert_eq!(
             std::fs::read_to_string(home.join(".agents/skills/cagents-agents/SKILL.md")).unwrap(),

@@ -101,6 +101,37 @@ impl ControlClient {
     }
 }
 
+impl ControlClient {
+    fn wait_agent(
+        &mut self,
+        authority: Authority,
+        run: RunId,
+        timeout: Duration,
+    ) -> Result<(Reply, bool), ControlError> {
+        let deadline = Instant::now() + timeout;
+        let mut reply =
+            self.agent_before(authority.clone(), Operation::Run(run), Some(deadline))?;
+        loop {
+            if matches!(&reply, Reply::Status { run, .. } if run.state.wait_ready()) {
+                return Ok((reply, false));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok((reply, true));
+            }
+            thread::sleep(Duration::from_millis(200).min(remaining));
+            if Instant::now() >= deadline {
+                return Ok((reply, true));
+            }
+            match self.agent_before(authority.clone(), Operation::Run(run), Some(deadline)) {
+                Ok(current) => reply = current,
+                Err(error) if is_timeout_error(&error) => return Ok((reply, true)),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> {
     if let AgentCommand::Console { agent_id } = command {
         return run_console(agent_id);
@@ -174,53 +205,45 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
     let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    let deadline = wait.map(|timeout| Instant::now() + timeout);
-    loop {
-        let reply = client
-            .agent_before(authority.clone(), operation.clone(), deadline)
-            .map_err(protocol_error)?;
-        let settled = match &reply {
-            Reply::Status { run, .. } => run.state.wait_ready(),
-            _ => true,
+    let (reply, timed_out) = if let Some(timeout) = wait {
+        let Operation::Run(run) = operation else {
+            unreachable!("wait reads a run")
         };
-        if settled
-            || deadline.is_none()
-            || deadline.is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            let timed_out = !settled && deadline.is_some();
-            let human = match &reply {
-                Reply::Accepted(accepted) => format!(
-                    "agent {} run {} {:?}",
-                    accepted.agent.id, accepted.run.id, accepted.run.state
-                ),
-                Reply::Status { agent, run } => format!(
-                    "agent {} run {} {:?}{}\n{}",
-                    agent.id,
-                    run.id,
-                    run.state,
-                    if timed_out { " (wait timed out)" } else { "" },
-                    run.result.text
-                ),
-                Reply::Listed(agents) => agents
-                    .iter()
-                    .map(|entry| format!("{} {} {:?}", entry.agent.id, entry.run, entry.state))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                Reply::Closed(agent) => format!("closed agent {}", agent.id),
-                Reply::Console(_) => "Console updated".into(),
-            };
-            return Ok(CommandOutput {
-                command: name,
-                data: reply_data(reply, timed_out),
-                human,
-            });
-        }
-        // Structured durable status, never terminal output or a provider TUI.
-        thread::sleep(
-            Duration::from_millis(200)
-                .min(deadline.unwrap().saturating_duration_since(Instant::now())),
-        );
-    }
+        client
+            .wait_agent(authority, run, timeout)
+            .map_err(protocol_error)?
+    } else {
+        (
+            client.agent(authority, operation).map_err(protocol_error)?,
+            false,
+        )
+    };
+    let human = match &reply {
+        Reply::Accepted(accepted) => format!(
+            "agent {} run {} {:?}",
+            accepted.agent.id, accepted.run.id, accepted.run.state
+        ),
+        Reply::Status { agent, run } => format!(
+            "agent {} run {} {:?}{}\n{}",
+            agent.id,
+            run.id,
+            run.state,
+            if timed_out { " (wait timed out)" } else { "" },
+            run.result.text
+        ),
+        Reply::Listed(agents) => agents
+            .iter()
+            .map(|entry| format!("{} {} {:?}", entry.agent.id, entry.run, entry.state))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Reply::Closed(agent) => format!("closed agent {}", agent.id),
+        Reply::Console(_) => "Console updated".into(),
+    };
+    Ok(CommandOutput {
+        command: name,
+        data: reply_data(reply, timed_out),
+        human,
+    })
 }
 
 fn reply_data(reply: Reply, timed_out: bool) -> serde_json::Value {
@@ -238,6 +261,136 @@ fn reply_data(reply: Reply, timed_out: bool) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_wait_returns_last_known_run_without_polling_after_deadline() {
+        use crate::agent_execution::{Agent, Origin, Run, State};
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("agent-wait"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        let agent = Agent {
+            id: AgentId::new(),
+            origin: Origin::User,
+            channel: crate::model::ChannelId::new(),
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/repo".into(),
+                    directory: "/repo".into(),
+                    channel: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+            },
+            session: None,
+            console: None,
+            created_ms: 0,
+            closed: false,
+        };
+        let run = Run {
+            id: RunId::new(),
+            agent: agent.id,
+            state: State::Running,
+            revision: 1,
+            accepted_ms: 0,
+            started_ms: Some(1),
+            finished_ms: None,
+            provider_key: Some("exact-turn".into()),
+            result: Default::default(),
+        };
+        let run_id = run.id;
+        let expected = Reply::Status { agent, run };
+        let response = expected.clone();
+        let server = thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connect.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(request.request, ClientRequest::Agent { operation: Operation::Run(id), .. } if id == run_id)
+            );
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Agent(response),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none(),
+                "no request after the polling deadline"
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let (reply, timed_out) = client
+            .wait_agent(Authority::default(), run_id, Duration::from_millis(100))
+            .unwrap();
+        assert!(timed_out);
+        assert_eq!(reply, expected);
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn console_answers_require_explicit_request_action_and_structured_fields() {
+        use crate::agent_execution::ConsoleCommand;
+        let ConsoleCommand::Control(crate::chat::Command::Answer {
+            request_id,
+            action,
+            answers,
+        }) = console_input(
+            r#"/answer request-1 submit [{"field":"choice","values":["review first"]}]"#,
+        )
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request_id, "request-1");
+        assert_eq!(action, "submit");
+        assert_eq!(
+            answers,
+            vec![crate::chat::Answer {
+                field: "choice".into(),
+                values: vec!["review first".into()]
+            }]
+        );
+        assert!(console_input("/answer request-1").is_err());
+        assert!(console_input("/answer request-1 allow not-json").is_err());
+        assert!(console_input("/allow-everything").is_err());
+        assert!(matches!(
+            console_input("/interrupt").unwrap(),
+            ConsoleCommand::Control(crate::chat::Command::Interrupt)
+        ));
+        assert!(
+            matches!(console_input("ordinary follow-up").unwrap(), ConsoleCommand::Submit { prompt, .. } if prompt == "ordinary follow-up")
+        );
+    }
 
     #[test]
     fn cli_preserves_exact_prompt_target_and_retry_key() {

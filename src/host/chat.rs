@@ -605,11 +605,51 @@ fn confirm_fresh_session(
 fn start(
     host: &SharedHost,
     client: ClientId,
+    session: Session,
+    source: Option<HostSessionProof>,
+    terminate_source: bool,
+    selection: Option<PendingBinding>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+) -> Result<ServerResponse, ProtocolError> {
+    start_with_execution(
+        host,
+        client,
+        session,
+        source,
+        terminate_source,
+        selection,
+        execution_environment,
+        None,
+    )
+}
+
+pub(super) fn start_execution(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    context: Arc<chat::protocol::ExecutionContext>,
+) -> Result<ServerResponse, ProtocolError> {
+    start_with_execution(
+        host,
+        client,
+        session,
+        None,
+        false,
+        None,
+        Default::default(),
+        Some(context),
+    )
+}
+
+fn start_with_execution(
+    host: &SharedHost,
+    client: ClientId,
     mut session: Session,
     source: Option<HostSessionProof>,
     terminate_source: bool,
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -1059,6 +1099,12 @@ fn start(
                 ));
             }
         }
+        spec.execution = execution;
+        if let Some(context) = &spec.execution {
+            context
+                .verify_directory(&spec.working_directory)
+                .map_err(unavailable)?;
+        }
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
         if !matches!(
@@ -1088,6 +1134,7 @@ fn start(
             crate::agent_execution::bundled::install(
                 Some(session.launch.provider),
                 &spec.environment,
+                &spec.working_directory,
             );
             if let Some(path) = crate::agent_execution::bundled::matched_path(
                 spec.environment.get("PATH").map(String::as_str),

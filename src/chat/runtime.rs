@@ -110,6 +110,9 @@ impl Handle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
+        if let Some(context) = &spec.execution {
+            context.verify_directory(&spec.working_directory)?;
+        }
         let mut owned_socket = None;
         if let TransportSpec::OwnedUnixWebSocket { socket } = &spec.transport {
             use std::os::unix::fs::DirBuilderExt;
@@ -147,14 +150,32 @@ impl Handle {
                     .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
                     .process_group(0);
                 crate::host::descriptor_limit::inherit(&mut process);
+                if let Some(directory) = spec
+                    .execution
+                    .as_ref()
+                    .and_then(|context| context.directory.clone())
+                {
+                    // SAFETY: fchdir is async-signal-safe; the captured File
+                    // remains open across fork until the provider execs.
+                    unsafe {
+                        process.pre_exec(move || {
+                            if libc::fchdir(directory.as_raw_fd()) == 0 {
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::last_os_error())
+                            }
+                        });
+                    }
+                }
                 let _account = crate::account::registry::authorize_command(&process)
                     .map_err(|error| error.to_string())?;
-                Some(ChildGuard(
-                    process
-                        .spawn()
-                        .map_err(|e| format!("Cannot start {}: {e}", spec.program))?,
-                    false,
-                ))
+                let child = process
+                    .spawn()
+                    .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
+                if let Some(context) = &spec.execution {
+                    context.spawned();
+                }
+                Some(ChildGuard(child, false))
             }
             TransportSpec::UnixWebSocket { .. } => None,
         };
@@ -198,6 +219,8 @@ impl Handle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    launch_context: spec.execution.clone(),
+                    working_directory: spec.working_directory.clone(),
                     child,
                     adapter,
                     state,
@@ -658,6 +681,8 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    launch_context: Option<Arc<super::protocol::ExecutionContext>>,
+    working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
@@ -1000,6 +1025,24 @@ impl Actor {
                 }
             }
             let starts_turn = matches!(&command, Command::Prompt { .. });
+            let authorizes_work = match &command {
+                Command::Prompt { .. }
+                | Command::Compact
+                | Command::Slash { .. }
+                | Command::SetPermissionMode { .. } => true,
+                Command::Answer { action, .. } => !matches!(
+                    action.as_str(),
+                    "deny" | "decline" | "reject" | "cancel" | "abort"
+                ),
+                _ => false,
+            };
+            if authorizes_work
+                && let Some(context) = &self.launch_context
+                && let Err(error) = context.verify_directory(&self.working_directory)
+            {
+                let _ = reply.send(Err(error));
+                continue;
+            }
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -1063,6 +1106,17 @@ impl Actor {
         Ok(())
     }
     fn step(&mut self, step: Step) -> Result<(), String> {
+        // A new Codex thread is created asynchronously after initialize; check
+        // its RPC boundary too. Interrupts, denials and cleanup remain usable
+        // even if the approved directory disappears or is replaced.
+        if step
+            .writes
+            .iter()
+            .any(|frame| frame["method"] == "thread/start")
+            && let Some(context) = &self.launch_context
+        {
+            context.verify_directory(&self.working_directory)?;
+        }
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
@@ -1943,6 +1997,7 @@ mod tests {
             ("LC_ALL".into(), "C.UTF-8".into()),
         ]);
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/python3".into(),
@@ -1967,6 +2022,7 @@ mod tests {
     #[test]
     fn selected_account_removals_win_at_the_native_child_boundary() {
         let spec = ProcessSpec {
+            execution: None,
             transport: TransportSpec::JsonLines,
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), "read line; [ -z \"${ANTHROPIC_API_KEY+x}\" ] && [ \"$CLAUDE_CONFIG_DIR\" = /selected ] && printf '%s\\n' '{\"text\":\"isolated\"}'; cat >/dev/null".into()],
@@ -2068,6 +2124,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("server").join("control.sock");
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::OwnedUnixWebSocket {
                 socket: socket.clone(),
@@ -2119,6 +2176,7 @@ mod tests {
             })
         }
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -2162,6 +2220,7 @@ mod tests {
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/bin/cat".into(),
@@ -2289,6 +2348,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
@@ -2416,6 +2476,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
@@ -2468,6 +2529,7 @@ mod tests {
     #[test]
     fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
@@ -2499,6 +2561,7 @@ mod tests {
     #[test]
     fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
         let spec = ProcessSpec {
+            execution: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
