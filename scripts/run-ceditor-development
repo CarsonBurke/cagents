@@ -3,16 +3,22 @@ set -eu
 caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+alerts=0
 case "${1:-}" in
     --help)
-        printf '%s\n' 'Usage: scripts/run-ceditor-development [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'No daemon, terminal host, Zig, or Servo is required.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
+        printf '%s\n' 'Usage: scripts/run-ceditor-development [--review-alerts] [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'Use --review-alerts to build matched CLI/daemon companions in separate lanes.' 'Without that flag, ordinary editing requires no terminal host, Zig, or Servo.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
         exit 0
         ;;
+    --review-alerts) alerts=1; shift; [ "${1:-}" != -- ] || shift ;;
     --) shift ;;
 esac
+if [ "$alerts" = 1 ]; then
+    cargo build --locked --profile dev-runtime --no-default-features --features development --bin cagents
+    cargo build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+fi
 cargo build --locked --profile dev-runtime --package ceditor --features development
 # Cargo metadata honors target-dir from Cargo config as well as the environment.
-# It does not build or start any cagents binary.
+# Companions are started lazily only when a review alert is observed.
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
 if [ -n "${CARGO_BUILD_TARGET:-}" ]; then

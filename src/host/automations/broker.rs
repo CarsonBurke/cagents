@@ -713,7 +713,8 @@ fn run_attention(detail: &crate::automations::RunDetail) -> Option<crate::notifi
         target: Target::AgentRun(run.id),
         source_session,
         provider: Some(agent.spec.provider),
-        directory: agent.spec.target.directory.clone(),
+        directory: Some(agent.spec.target.directory.clone()),
+        destination: None,
         evidence: Evidence {
             key: if kind == Kind::Waiting {
                 format!("{}:waiting:{}", run.id, run.revision)

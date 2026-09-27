@@ -110,6 +110,15 @@ fn slot_socket_name(slot: &str) -> String {
     }
 }
 
+fn destination_socket_name(destination: &crate::notifications::Destination) -> String {
+    match destination.application {
+        crate::notifications::Application::Cagents => slot_socket_name(&destination.window),
+        crate::notifications::Application::Ceditor => {
+            format!("{ACTIVATION_SOCKET_FILE}.ceditor.{}", destination.window)
+        }
+    }
+}
+
 /// A lock ends with its owning scope, even if a concurrent fork inherited the
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
@@ -1004,13 +1013,32 @@ impl UiActivationListener {
         Self::bind_in(&runtime_directory, events)
     }
 
+    pub fn bind_destination(
+        destination: &crate::notifications::Destination,
+        events: async_channel::Sender<UiActivation>,
+    ) -> io::Result<Self> {
+        destination.validate().map_err(io::Error::other)?;
+        Self::bind_named(
+            &runtime_directory()?,
+            destination_socket_name(destination),
+            events,
+        )
+    }
+
     fn bind_in(
         runtime_directory: &Path,
         events: async_channel::Sender<UiActivation>,
     ) -> io::Result<Self> {
-        require_owned_runtime_directory(runtime_directory)?;
+        Self::bind_named(runtime_directory, slot_socket_name(window_slot()), events)
+    }
 
-        let socket_path = runtime_directory.join(slot_socket_name(window_slot()));
+    fn bind_named(
+        runtime_directory: &Path,
+        socket: String,
+        events: async_channel::Sender<UiActivation>,
+    ) -> io::Result<Self> {
+        require_owned_runtime_directory(runtime_directory)?;
+        let socket_path = runtime_directory.join(socket);
         prepare_activation_socket_path(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
         // SAFETY: fchmod receives the bound listener's live descriptor.
@@ -1089,9 +1117,76 @@ pub fn activate_window_with_token(slot: &str, token: Option<&str>) -> io::Result
     activate_window_at_with_token(&runtime_directory()?, slot, token)
 }
 
+pub fn activate_destination(
+    destination: &crate::notifications::Destination,
+    token: Option<&str>,
+) -> io::Result<bool> {
+    destination.validate().map_err(io::Error::other)?;
+    let runtime = runtime_directory()?;
+    activate_socket_with_token(&runtime, destination_socket_name(destination), token)
+}
+
+// The editor's daemon is a private matched companion. The other shell may be
+// installed separately, so resolve only these fixed application names, never a
+// path carried by an alert. Relative PATH entries cannot redirect activation.
+fn notification_executable(name: &str) -> io::Result<PathBuf> {
+    let current = env::current_exe()?;
+    let sibling = current.with_file_name(name);
+    let search = env::var_os("PATH").unwrap_or_default();
+    resolve_notification_executable(&sibling, env::split_paths(&search).map(|p| p.join(name)))
+}
+
+fn resolve_notification_executable(
+    sibling: &Path,
+    alternatives: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<PathBuf> {
+    for candidate in std::iter::once(sibling.to_owned()).chain(alternatives) {
+        if !candidate.is_absolute() {
+            continue;
+        }
+        let Ok(path) = candidate.canonicalize() else {
+            continue;
+        };
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_file()
+            && meta.mode() & 0o111 != 0
+            && meta.mode() & 0o022 == 0
+            && (meta.uid() == 0 || meta.uid() == unsafe { libc::geteuid() })
+        {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{} is not installed beside the notification service or in an absolute PATH directory; install that application to open this alert",
+            sibling.file_name().unwrap_or_default().to_string_lossy()
+        ),
+    ))
+}
+
+pub fn launch_notification_destination(
+    destination: &crate::notifications::Destination,
+    token: Option<&str>,
+) -> io::Result<()> {
+    destination.validate().map_err(io::Error::other)?;
+    if destination.application == crate::notifications::Application::Cagents {
+        return launch_notification_window(&destination.window, token);
+    }
+    let mut command = process::Command::new(notification_executable("ceditor")?);
+    command.args(["--notification-window", &destination.window]);
+    command.env_remove("XDG_ACTIVATION_TOKEN");
+    if let Some(token) = token.filter(|token| valid_activation_token(token)) {
+        command.env("XDG_ACTIVATION_TOKEN", token);
+    }
+    crate::control::spawn_ui_process(&mut command)
+}
+
 pub fn launch_notification_window(slot: &str, token: Option<&str>) -> io::Result<()> {
     validate_window_slot(slot)?;
-    let mut command = process::Command::new(env::current_exe()?.with_file_name("cagents-ui"));
+    let mut command = process::Command::new(notification_executable("cagents-ui")?);
     command.args(["--window", slot]);
     command.env_remove("XDG_ACTIVATION_TOKEN");
     if let Some(token) = token.filter(|token| valid_activation_token(token)) {
@@ -1117,8 +1212,16 @@ fn activate_window_at_with_token(
     slot: &str,
     token: Option<&str>,
 ) -> io::Result<bool> {
+    activate_socket_with_token(runtime_directory, slot_socket_name(slot), token)
+}
+
+fn activate_socket_with_token(
+    runtime_directory: &Path,
+    socket: String,
+    token: Option<&str>,
+) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
-    let socket_path = runtime_directory.join(slot_socket_name(slot));
+    let socket_path = runtime_directory.join(socket);
     let mut stream = match UnixStream::connect(&socket_path) {
         Ok(stream) => stream,
         Err(error)
@@ -1634,6 +1737,88 @@ mod tests {
                 "cagents-development-ui.activate",
             )
         );
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn notification_launch_resolves_private_siblings_then_safe_installed_shells() {
+        let root = tempfile::tempdir().unwrap();
+        let sibling = root.path().join("private/ceditor");
+        let installed = root.path().join("bin/ceditor");
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, "installed").unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_notification_executable(&sibling, [installed.clone()]).unwrap(),
+            installed
+        );
+        fs::write(&sibling, "matched").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_notification_executable(&sibling, [installed.clone()]).unwrap(),
+            sibling
+        );
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            resolve_notification_executable(&sibling, [installed, PathBuf::from("ceditor")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_application_destinations_use_distinct_real_sockets() {
+        use crate::notifications::{Application, Destination};
+        let runtime = tempdir().unwrap();
+        let agents = Destination {
+            application: Application::Cagents,
+            window: "review".into(),
+        };
+        let editor = Destination {
+            application: Application::Ceditor,
+            window: "review".into(),
+        };
+        let (agents_sender, agents_receiver) = async_channel::bounded(1);
+        let (editor_sender, editor_receiver) = async_channel::bounded(1);
+        let _agents = UiActivationListener::bind_named(
+            runtime.path(),
+            destination_socket_name(&agents),
+            agents_sender,
+        )
+        .unwrap();
+        let _editor = UiActivationListener::bind_named(
+            runtime.path(),
+            destination_socket_name(&editor),
+            editor_sender,
+        )
+        .unwrap();
+        assert!(
+            activate_socket_with_token(
+                runtime.path(),
+                destination_socket_name(&editor),
+                Some("editor-token")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            editor_receiver.recv_blocking().unwrap().token.as_deref(),
+            Some("editor-token")
+        );
+        assert!(agents_receiver.try_recv().is_err());
+        assert!(
+            activate_socket_with_token(
+                runtime.path(),
+                destination_socket_name(&agents),
+                Some("agents-token")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            agents_receiver.recv_blocking().unwrap().token.as_deref(),
+            Some("agents-token")
+        );
+        assert!(editor_receiver.try_recv().is_err());
     }
 
     #[cfg(feature = "ui")]

@@ -65,7 +65,7 @@ impl Handle {
     }
 
     pub fn record(&self, event: Event) {
-        if event.evidence.key.len() > 1024 || event.directory.as_os_str().len() > 4096 {
+        if event.validate().is_err() {
             return;
         }
         self.change(|pending| {
@@ -378,7 +378,8 @@ mod tests {
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(crate::agent::Provider::Codex),
-            directory: "/fixture".into(),
+            directory: Some("/fixture".into()),
+            destination: None,
             evidence: crate::notifications::Evidence {
                 key: key.into(),
                 kind: crate::notifications::Kind::Succeeded,
@@ -496,7 +497,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     retry_delay = RETRY_DELAY;
                 }
                 let changed = presence.get(client).is_none_or(|old| {
-                    old.sessions != update.sessions || old.window != update.window
+                    old.sessions != update.sessions || old.destination() != update.destination()
                 });
                 let sessions = if changed {
                     update.sessions.clone()
@@ -554,6 +555,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                 event
                     .source_session()
                     .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
             match journal.record(event, suppressed) {
@@ -594,6 +596,7 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     .event
                     .source_session()
                     .is_some_and(|session| window.focused == Some(session))
+                    || window.focused_target.as_ref() == Some(&notice.event.target)
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
@@ -699,17 +702,18 @@ async fn run(shared: Weak<Shared>, host: Weak<Mutex<HostState>>, mut receiver: m
                     let window = host
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .activate_notification(
+                        .activate_notification_destination(
                             notice.event.target(),
                             notice.event.source_session(),
                             notice.window.as_deref(),
+                            notice.event.destination.as_ref(),
                         );
                     // Activation and the matched executable handshake can wait;
                     // they never run under the daemon's session lock.
-                    match crate::instance::activate_window_with_token(&window, token.as_deref()) {
+                    match crate::instance::activate_destination(&window, token.as_deref()) {
                         Ok(true) => {}
                         Ok(false) => {
-                            if let Err(error) = crate::instance::launch_notification_window(
+                            if let Err(error) = crate::instance::launch_notification_destination(
                                 &window,
                                 token.as_deref(),
                             ) {

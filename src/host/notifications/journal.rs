@@ -36,6 +36,7 @@ impl Journal {
                 session TEXT NOT NULL, evidence TEXT NOT NULL, ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
                 UNIQUE(session, evidence));
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
             PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
@@ -43,13 +44,26 @@ impl Journal {
     /// Coalesce a session's latest attention while retaining a bounded replay
     /// ledger. A duplicate must not resurrect a dismissed notification.
     pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
-        if event.evidence.key.len() > 1024 || event.directory.as_os_str().len() > 4096 {
-            return Err("Agent attention metadata exceeds its size limit".into());
-        }
+        event.validate()?;
         let session = event.target().storage_key();
         let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
         let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
         let transaction = self.0.transaction().map_err(|error| error.to_string())?;
+        if let Target::PullRequest(request) = &event.target {
+            request.validate()?;
+            // The compact immutable identity outlives bounded notice payloads,
+            // dismissal, request removal, and daemon restarts. A new GitHub
+            // request node still receives its own alert.
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO review_requests_seen(identity) VALUES (?1)",
+                    [&session],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 0 {
+                return Ok(None);
+            }
+        }
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO seen(session,evidence) VALUES (?1,?2)",
@@ -202,7 +216,8 @@ mod tests {
             target: crate::notifications::Target::Session(session),
             source_session: Some(session),
             provider: Some(Provider::Codex),
-            directory: "/project".into(),
+            directory: Some("/project".into()),
+            destination: None,
             evidence: Evidence {
                 key: key.into(),
                 kind: Kind::Succeeded,
@@ -237,6 +252,73 @@ mod tests {
     }
 
     #[test]
+    fn new_run_owner_uses_owner_recency_even_when_attention_is_infrequent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        journal.remember_window([session], "chosen").unwrap();
+        let mut run = event(session, "first-attention");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        journal.record(run, false).unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
+    fn review_identity_survives_notice_eviction_restart_and_new_request() {
+        use crate::notifications::{Target, review::ReviewRequest};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let request = ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "owner".into(),
+            repository: "repo".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "request-one".into(),
+        };
+        let make = |request: ReviewRequest| Event {
+            evidence: Evidence {
+                key: request.request.clone(),
+                kind: Kind::ReviewRequested,
+            },
+            target: Target::PullRequest(request),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: Some(crate::notifications::Destination {
+                application: crate::notifications::Application::Ceditor,
+                window: "review".into(),
+            }),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let first = journal
+            .record(make(request.clone()), false)
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(first.id).unwrap();
+        // Notice payload compaction/removal is independent of this identity.
+        journal
+            .retire(Target::PullRequest(request.clone()))
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(
+            journal
+                .record(make(request.clone()), false)
+                .unwrap()
+                .is_none()
+        );
+        let mut renamed = request.clone();
+        renamed.repository = "renamed".into();
+        assert!(journal.record(make(renamed), false).unwrap().is_none());
+        let mut again = request;
+        again.request = "request-two".into();
+        assert!(journal.record(make(again), false).unwrap().is_some());
+    }
+
+    #[test]
     fn version_one_journal_keeps_legacy_attention_and_owner() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("attention.sqlite3");
@@ -256,19 +338,6 @@ mod tests {
         drop(journal);
         let journal = Journal::open(&path).unwrap();
         assert_eq!(journal.list().unwrap(), vec![notice]);
-    }
-
-    #[test]
-    fn new_run_owner_uses_owner_recency_even_when_attention_is_infrequent() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
-        let session = TerminalId::new();
-        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
-        journal.remember_window([session], "chosen").unwrap();
-        let mut run = event(session, "first-attention");
-        run.target = Target::AgentRun(crate::model::RunId::new());
-        journal.record(run, false).unwrap();
-        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
     }
 
     #[test]

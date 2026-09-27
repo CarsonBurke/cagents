@@ -346,6 +346,9 @@ pub enum ClientRequest {
         text: String,
         origin: PasteOrigin,
     },
+    ObserveReviewRequests {
+        observed: crate::notifications::review::ObservedRequests,
+    },
     WatchNotifications {
         presence: crate::notifications::Presence,
     },

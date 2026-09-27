@@ -47,6 +47,7 @@ pub mod checkout;
 pub mod discussion;
 pub mod discussion_ui;
 pub mod file_pages;
+pub mod request_ui;
 
 /// Indent per tree level, matching the sidebar's file tree.
 const TREE_INDENT: u16 = 12;
@@ -278,17 +279,25 @@ pub enum BrowserFilter {
     Ready,
     Passing,
     Failing,
+    NeedsReview,
+    ReRequested,
 }
 
 impl BrowserFilter {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::All,
         Self::Drafts,
         Self::Ready,
         Self::Passing,
         Self::Failing,
+        Self::NeedsReview,
+        Self::ReRequested,
     ];
-    fn matches(self, pull_request: &PullRequest) -> bool {
+    fn matches(
+        self,
+        pull_request: &PullRequest,
+        request: Option<&crate::github::review_requests::scan::Requested>,
+    ) -> bool {
         match self {
             Self::All => true,
             Self::Drafts => pull_request.is_draft,
@@ -299,6 +308,10 @@ impl BrowserFilter {
             Self::Failing => {
                 CheckStatus::from_checks(&pull_request.check_summaries()) == CheckStatus::Failing
             }
+            Self::NeedsReview => request.is_some(),
+            Self::ReRequested => request.is_some_and(|request| {
+                request.history == crate::github::review_requests::scan::History::ReRequested
+            }),
         }
     }
 }
@@ -317,6 +330,8 @@ impl AsRef<str> for BrowserFilter {
             Self::Ready => "Ready for review",
             Self::Passing => "Checks passing",
             Self::Failing => "Checks failing",
+            Self::NeedsReview => "Needs your review",
+            Self::ReRequested => "Review re-requested",
         }
     }
 }
@@ -374,6 +389,7 @@ pub struct State {
     list_error: Option<String>,
     browser_query: String,
     browser_filter: BrowserFilter,
+    requests: request_ui::State,
     target: Option<ReviewTarget>,
     /// Bumped on every `Open` and `Close`: results from another target are
     /// dropped whatever they carried.
@@ -565,6 +581,7 @@ impl State {
             list_error: None,
             browser_query: String::new(),
             browser_filter: BrowserFilter::default(),
+            requests: request_ui::State::default(),
             target: None,
             generation: 0,
             load_generation: 0,
@@ -597,6 +614,7 @@ impl State {
             return ActionTask::none();
         }
         self.source = source;
+        self.requests.reset();
         self.list_cancellation.cancel();
         self.list_generation = self.list_generation.wrapping_add(1);
         self.list = ListState::Idle;
@@ -2084,7 +2102,7 @@ impl State {
             .into();
         }
         let query = self.browser_query.trim().to_lowercase();
-        let rows: Vec<Element<'a, Action>> = match &self.list {
+        let mut rows: Vec<Element<'a, Action>> = match &self.list {
             ListState::Idle | ListState::Loading => {
                 vec![design::caption("Loading pull requests…").into()]
             }
@@ -2111,7 +2129,8 @@ impl State {
             ListState::Ready(pull_requests) => pull_requests
                 .iter()
                 .filter(|pr| {
-                    self.browser_filter.matches(pr)
+                    self.browser_filter
+                        .matches(pr, self.requests.requested().get(&pr.number))
                         && (query.is_empty()
                             || pr.title.to_lowercase().contains(&query)
                             || pr.number.to_string() == query.trim_start_matches('#')
@@ -2123,15 +2142,61 @@ impl State {
                             }))
                 })
                 .map(|pull_request| {
-                    browser_row(pull_request, false, modal_open).map(|action| {
-                        Action::BrowserFenced {
-                            generation: self.list_generation,
-                            action: Box::new(action),
-                        }
+                    browser_row(
+                        pull_request,
+                        self.requests.label(pull_request.number),
+                        false,
+                        modal_open,
+                    )
+                    .map(|action| Action::BrowserFenced {
+                        generation: self.list_generation,
+                        action: Box::new(action),
                     })
                 })
                 .collect(),
         };
+        // Request discovery is independent of the visible list's first page.
+        // Offer exact numbers discovered later without inventing missing PR DTOs.
+        if matches!(
+            self.browser_filter,
+            BrowserFilter::NeedsReview | BrowserFilter::ReRequested
+        ) {
+            for request in self.requests.requested().values() {
+                let entry = &request.entry;
+                let listed = matches!(&self.list, ListState::Ready(prs) if prs.iter().any(|pr| pr.number == entry.number));
+                if listed
+                    || (self.browser_filter == BrowserFilter::ReRequested
+                        && request.history
+                            != crate::github::review_requests::scan::History::ReRequested)
+                    || !(query.is_empty()
+                        || entry.title.to_lowercase().contains(&query)
+                        || entry.number.to_string() == query.trim_start_matches('#'))
+                {
+                    continue;
+                }
+                rows.push(
+                    button::custom(widget::column::with_children(vec![
+                        design::body(entry.title.as_str()).into(),
+                        design::caption(format!(
+                            "#{} · {}",
+                            entry.number,
+                            self.requests
+                                .label(entry.number)
+                                .unwrap_or("Needs your review")
+                        ))
+                        .into(),
+                    ]))
+                    .class(sidebar_button_style(false))
+                    .width(Length::Fill)
+                    .padding([spacing.space_xxxs, spacing.space_xxs])
+                    .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
+                        generation: self.list_generation,
+                        action: Box::new(Action::OpenNumber(entry.number)),
+                    }))
+                    .into(),
+                );
+            }
+        }
         let count = match &self.list {
             ListState::Ready(pull_requests) if !pull_requests.is_empty() => rows.len(),
             _ => 0,
@@ -2181,6 +2246,14 @@ impl State {
                 }
             ))
             .into(),
+            widget::container(widget::column::with_children(
+                self.requests
+                    .status()
+                    .map(|status| design::caption(status).into())
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ))
+            .into(),
         ])
         .spacing(spacing.space_xxs)
         .padding(spacing.space_xs);
@@ -2218,6 +2291,7 @@ impl State {
 /// and check status beneath.
 pub fn browser_row<'a>(
     pull_request: &'a PullRequest,
+    review_request: Option<&str>,
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, Action> {
@@ -2245,6 +2319,9 @@ pub fn browser_row<'a>(
     }
     if pull_request.is_draft {
         detail.push("Draft".into());
+    }
+    if let Some(label) = review_request {
+        detail.push(label.into());
     }
     match checks {
         CheckStatus::Passing => detail.push("Checks passing".into()),

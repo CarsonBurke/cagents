@@ -158,6 +158,16 @@ rows; the counts make that scope visible. An open, focused review refreshes
 every 30 seconds, keeping its file marks and discussion current.
 The same refresh updates its title, checks, review decision, and base branch.
 
+**Needs your review** means GitHub currently requests the authenticated viewer's
+review. **Re-requested** additionally requires an earlier request for the same
+reviewer identity in GitHub's timeline; a previous comment or a branch's required
+review policy does not count. If history cannot be read, the current request
+still appears without a re-requested label. Background discovery continues in
+bounded pages, so these filters eventually include requests beyond the browser's
+first 50 rows. Changing the authenticated viewer clears the prior viewer's
+request state. Sidebar worktree rows show **Review** or **Review again** for the
+same requests.
+
 Large reviews mount only visible file rows and their folder ancestors. Viewed
 marks load in pages as you scroll or navigate; unfetched marks stay visibly
 unknown and cannot be toggled. **Load more viewed states** also fetches a page
