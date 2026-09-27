@@ -5,7 +5,7 @@ use super::Recovery;
 use crate::{
     chat::{
         Session,
-        protocol::{ProcessSpec, TransportSpec},
+        protocol::{LaunchCleanup, LaunchOutcome, ProcessSpec, TransportSpec},
     },
     daemon::holder_registry::{self as registry, Kind, Process, Record},
     model::HostSessionProof,
@@ -32,6 +32,51 @@ const PROTOCOL: u32 = 2;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
+// This status is emitted only after the helper's owned descendants have all
+// been reaped. Signals, panics and ordinary setup exits are not cleanup proof.
+const CLEANUP_PROVED: i32 = 73;
+
+struct StartupOwner {
+    control: UnixStream,
+    child: std::sync::Mutex<Option<std::process::Child>>,
+    outcome: std::sync::Arc<std::sync::Mutex<LaunchOutcome>>,
+    receipt: std::sync::Arc<std::sync::Mutex<Option<super::cleanup::Startup>>>,
+    retiring: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LaunchCleanup for StartupOwner {
+    fn cleanup(&self) -> Result<LaunchOutcome, String> {
+        self.retiring
+            .store(true, std::sync::atomic::Ordering::Release);
+        // A failed startup never became durable. EOF requests its teardown;
+        // don't reuse a stream whose startup response may be partially read.
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(process) = child.as_mut() {
+            // Only a stopped reaper before handoff leaves a Child here.
+            // No Spawn request has been sent on that path.
+            let _ = process.kill();
+            if process
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                child.take();
+                *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = LaunchOutcome::NoProvider;
+            }
+        }
+        if let Some(receipt) = self
+            .receipt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            && receipt.consume()?
+        {
+            *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) = LaunchOutcome::TeardownProved;
+        }
+        Ok(*self.outcome.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct Spawn {
@@ -122,6 +167,7 @@ pub(crate) struct Holder {
     control: Option<UnixStream>,
     release_on_drop: bool,
     durable: bool,
+    identity: super::Detached,
 }
 
 impl Holder {
@@ -154,8 +200,10 @@ impl Holder {
         }
     }
 
-    pub fn preserve(mut self) {
+    pub fn preserve(mut self) -> super::Detached {
+        self.release_on_drop = false;
         self.control.take();
+        self.identity.clone()
     }
 
     pub fn update_source(
@@ -180,13 +228,22 @@ impl Holder {
     }
 
     pub fn close(&mut self) -> Result<(), String> {
-        let Some(control) = self.control.as_ref() else {
+        if self.identity.consume_receipt()? {
+            self.control.take();
+            self.release_on_drop = false;
             return Ok(());
+        }
+        let Some(control) = self.control.as_ref() else {
+            return self.identity.close();
         };
         send(control, &Request::Release, TIMEOUT)?;
         match receive(control, TIMEOUT)? {
             Some(Report::Released) => {
+                if !self.identity.consume_receipt()? {
+                    return Err("Native holder released without durable cleanup evidence".into());
+                }
                 self.control.take();
+                self.release_on_drop = false;
                 Ok(())
             }
             Some(Report::Failed(error)) => Err(error),
@@ -222,6 +279,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     {
         return Err("Provider listener does not match its ownership evidence".into());
     }
+    let retained_source = source.clone();
     let recovery = Recovery {
         source,
         execution_console: None,
@@ -235,6 +293,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         ),
     };
     recovery.validate(&crate::daemon::read_boot_id().map_err(|error| error.to_string())?)?;
+    let source_proof = retained_source
+        .proof
+        .clone()
+        .ok_or("Native holder source has no daemon proof")?;
     let execution = spec.execution.clone();
     let directory = execution
         .as_ref()
@@ -277,30 +339,65 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             Ok(())
         });
     }
-    let child = holder.spawn().map_err(|error| error.to_string())?;
-    if let Some(context) = &execution {
-        context.spawned();
-    }
-    let pid = child.id() as i32;
-    drop(remote);
-    // Establish reaping before sending a request that can create a provider.
-    // A startup failure must not wait forever for a stuck descendant to stop.
-    let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-    let watch = child.clone();
-    if let Err(error) = std::thread::Builder::new()
+    let owner = std::sync::Arc::new(StartupOwner {
+        control: control.try_clone().map_err(|error| error.to_string())?,
+        child: std::sync::Mutex::new(None),
+        outcome: std::sync::Arc::new(std::sync::Mutex::new(LaunchOutcome::Uncertain)),
+        receipt: Default::default(),
+        retiring: Default::default(),
+    });
+    // Allocate the reaper before creating any child. Once the helper exists,
+    // publishing its exact owner and handing it to this thread cannot require
+    // another thread allocation.
+    let (publish, incoming) = std::sync::mpsc::sync_channel(1);
+    let (reaping, ready) = std::sync::mpsc::sync_channel(1);
+    let watch = owner.clone();
+    std::thread::Builder::new()
         .name("native-holder-reap".into())
         .spawn(move || {
-            if let Some(mut child) = watch.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                let _ = child.wait();
+            if incoming.recv().is_err() {
+                return;
+            }
+            let child = watch.child.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let outcome = watch.outcome.clone();
+            let receipt = watch.receipt.clone();
+            let retiring = watch.retiring.clone();
+            drop(watch); // Reaping must not keep the control connection alive.
+            let _ = reaping.send(());
+            if let Some(mut child) = child {
+                let proved = child
+                    .wait()
+                    .is_ok_and(|status| status.code() == Some(CLEANUP_PROVED));
+                let receipt_proved = retiring.load(std::sync::atomic::Ordering::Acquire)
+                    && receipt
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.consume().unwrap_or(false));
+                if proved || receipt_proved {
+                    *outcome.lock().unwrap_or_else(|p| p.into_inner()) =
+                        LaunchOutcome::TeardownProved;
+                }
             }
         })
-    {
-        if let Some(mut child) = child.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            // No Spawn request was sent, so this process owns no provider yet.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        return Err(error.to_string());
+        .map_err(|error| error.to_string())?;
+    let child = holder.spawn().map_err(|error| error.to_string())?;
+    let pid = child.id() as i32;
+    *owner.child.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
+    if let Some(context) = &execution {
+        context.claim_owner(owner.clone());
+    }
+    if let Ok(holder) = Process::read(pid) {
+        *owner.receipt.lock().unwrap_or_else(|p| p.into_inner()) = Some(super::cleanup::Startup {
+            terminal: retained_source.id,
+            holder,
+            proof: source_proof.clone(),
+        });
+    }
+    drop(remote);
+    if publish.send(()).is_err() || ready.recv().is_err() {
+        let _ = owner.cleanup();
+        return Err("Native holder reaper stopped before provider startup".into());
     }
     let result = (|| {
         send(
@@ -324,13 +421,21 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         }
     })();
     match result {
-        Ok(_record) => Ok(Holder {
+        Ok(record) => Ok(Holder {
             control: Some(control),
             release_on_drop: true,
             durable: false,
+            identity: super::Detached {
+                record,
+                proof: source_proof.clone(),
+                source: retained_source,
+            },
         }),
         Err(error) => {
-            drop(control); // Unconfirmed server cannot enter orphan residence.
+            // The execution context may retain a control clone. Explicit
+            // shutdown starts cleanup before a later Close reconciles it.
+            let _ = owner.cleanup();
+            drop(control);
             Err(error)
         }
     }
@@ -410,6 +515,11 @@ pub(crate) fn adopt(
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
+                    identity: super::Detached {
+                        record: record.clone(),
+                        source: recovery.source.clone(),
+                        proof: proof.clone(),
+                    },
                 },
                 recovery,
             ))
@@ -514,6 +624,14 @@ impl Residence {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        super::cleanup::publish(
+            &self.record,
+            self.recovery
+                .source
+                .proof
+                .as_ref()
+                .ok_or("Native holder has no release proof")?,
+        )?;
         self.record.remove(&self.directory);
         self.released = true;
         Ok(())
@@ -863,7 +981,7 @@ extern "C" fn serve_if_requested() {
         std::process::exit(2);
     }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
-    let result = (|| {
+    let _result = (|| {
         let Some(Request::Spawn {
             protocol: PROTOCOL,
             spawn,
@@ -886,7 +1004,9 @@ extern "C" fn serve_if_requested() {
         }
         Ok(())
     })();
-    std::process::exit(if result.is_ok() { 0 } else { 1 });
+    // Returning from the closure drops Residence/Server, whose teardown waits
+    // for ECHILD. This is an explicit receipt, not an inference from PID death.
+    std::process::exit(CLEANUP_PROVED);
 }
 
 #[cfg(test)]
@@ -936,11 +1056,12 @@ mod tests {
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
         let first = source.proof.clone().unwrap();
         let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
-        let mut holder = spawn(spec, source.clone()).unwrap();
+        let mut holder = spawn(spec.clone(), source.clone()).unwrap();
         assert!(
-            context.did_spawn(),
+            context.outcome() == LaunchOutcome::Uncertain,
             "holder creation owns the launch before acknowledgment"
         );
+        context.installed(); // The fixture now owns the returned Holder.
         let record = registry::evidence(
             &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
             Kind::Native,
@@ -986,15 +1107,155 @@ mod tests {
         let (uncommitted, _) = adopt(&record, &source, &successor).unwrap();
         drop(uncommitted); // Simulate a failed local actor allocation.
         assert!(record.root.is_current());
-        let (mut adopted, saved) = adopt(&record, &source, &successor).unwrap();
+        let (adopted, saved) = adopt(&record, &source, &successor).unwrap();
         assert_eq!(saved.confirmed_thread.as_ref(), Some(&thread));
-        adopted.close().unwrap();
+        let detached = adopted.preserve();
+        assert!(record.root.is_current());
+        let mut stale = detached.clone();
+        stale.proof.host_incarnation = crate::model::HostIncarnation::new("stale-owner");
+        assert!(stale.close().is_err());
+        assert!(record.root.is_current());
+        detached.close().unwrap();
         assert!(!record.root.is_current());
         assert!(
             registry::discover(
                 &registry::directory(Kind::Native).unwrap(),
                 &successor.boot_id,
                 Kind::Native
+            )
+            .unwrap()
+            .is_empty()
+        );
+        // Teardown may finish after the daemon loses the Release reply. Its
+        // exact durable receipt must permit retry without guessing from EOF.
+        source.proof = Some(successor);
+        let mut lost_reply = spawn(spec.clone(), source.clone()).unwrap();
+        context.installed();
+        let root = lost_reply.identity.record.root.clone();
+        let control = lost_reply.control.as_ref().unwrap();
+        control.shutdown(std::net::Shutdown::Read).unwrap();
+        send(control, &Request::Release, TIMEOUT).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if lost_reply.close().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lost Release reply discarded cleanup evidence"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.is_current());
+        assert!(!lost_reply.identity.consume_receipt().unwrap());
+        // Simulate losing local startup installation after the helper created
+        // its record. The startup owner consumes its own late receipt too.
+        let mut uninstalled = spawn(spec, source).unwrap();
+        let root = uninstalled.identity.record.root.clone();
+        uninstalled.release_on_drop = false;
+        drop(uninstalled);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
+            assert!(
+                Instant::now() < deadline,
+                "startup cleanup never became proved"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.is_current());
+        assert!(
+            std::fs::read_dir(registry::directory(Kind::Native).unwrap())
+                .unwrap()
+                .all(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_none_or(|extension| extension != "closed"))
+        );
+    }
+
+    #[test]
+    fn lost_startup_connection_remains_uncertain_without_cleanup_receipt() {
+        let (control, peer) = UnixStream::pair().unwrap();
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(LaunchOutcome::Uncertain));
+        let owner = StartupOwner {
+            control,
+            child: std::sync::Mutex::new(None),
+            outcome: outcome.clone(),
+            receipt: Default::default(),
+            retiring: Default::default(),
+        };
+        drop(peer);
+        assert_eq!(owner.cleanup().unwrap(), LaunchOutcome::Uncertain);
+        assert_eq!(owner.cleanup().unwrap(), LaunchOutcome::Uncertain);
+        // A late exact reaper receipt resolves the same retained owner.
+        *outcome.lock().unwrap() = LaunchOutcome::TeardownProved;
+        assert_eq!(owner.cleanup().unwrap(), LaunchOutcome::TeardownProved);
+    }
+
+    #[test]
+    fn failed_provider_spawn_retains_a_proven_cleanup_receipt() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_FAILED_SPAWN_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::failed_provider_spawn_retains_a_proven_cleanup_receipt", "--nocapture"])
+                .env(STAGE, "1")
+                .env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::default());
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: Some(context.clone()),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: directory
+                .path()
+                .join("missing-provider")
+                .to_string_lossy()
+                .into_owned(),
+            arguments: vec![],
+            working_directory: directory.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        assert!(spawn(spec, source).is_err());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while context.reconcile_cleanup().unwrap() == LaunchOutcome::Uncertain {
+            assert!(
+                Instant::now() < deadline,
+                "failed startup lost its exact cleanup owner"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(context.outcome(), LaunchOutcome::TeardownProved);
+        assert_eq!(
+            context.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
+        assert!(
+            registry::discover(
+                &registry::directory(Kind::Native).unwrap(),
+                &crate::daemon::read_boot_id().unwrap(),
+                Kind::Native,
             )
             .unwrap()
             .is_empty()

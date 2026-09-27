@@ -238,7 +238,10 @@ process tree and bounded private control metadata; it does not run the UI,
 terminal emulator, transcript store, or a second protocol actor. It never sends
 a prompt or answers an approval. Explicit close terminates and reaps the entire
 owned process tree, including tools that changed their process group, before
-acknowledging cleanup.
+acknowledging cleanup. A private cleanup receipt records only the exact process
+and daemon identities after every descendant is reaped. If the Release reply is
+lost, a later close verifies that receipt; a missing socket or process alone is
+never treated as proof. Successful close consumes the receipt.
 
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The current

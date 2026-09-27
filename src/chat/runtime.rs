@@ -107,6 +107,8 @@ struct Inner {
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     preserve_native: Arc<AtomicBool>,
+    release_native: Arc<AtomicBool>,
+    detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
 }
@@ -220,7 +222,7 @@ impl Handle {
             _ => None,
         };
         let adopted_native = expected_native_peer.is_some();
-        let native_installed = Arc::new(AtomicBool::new(!adopted_native));
+        let native_installed = Arc::new(AtomicBool::new(false));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -247,6 +249,8 @@ impl Handle {
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
+        let release_native = Arc::new(AtomicBool::new(false));
+        let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
@@ -267,6 +271,8 @@ impl Handle {
                 spec.environment.clone(),
             ),
             preserve_native: preserve_native.clone(),
+            release_native: release_native.clone(),
+            detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
         });
@@ -386,9 +392,10 @@ impl Handle {
                     .native_holder
                     .as_ref()
                     .is_some_and(|holder| holder.is_durable())
-                    && (preserve_native.load(Ordering::Acquire)
-                        || unexpected_loss
-                        || !native_installed.load(Ordering::Acquire));
+                    && ((preserve_native.load(Ordering::Acquire)
+                        || (unexpected_loss && native_installed.load(Ordering::Acquire)))
+                        && !release_native.load(Ordering::Acquire)
+                        || (adopted_native && !native_installed.load(Ordering::Acquire)));
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
@@ -418,7 +425,8 @@ impl Handle {
                 });
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
-                        holder.preserve();
+                        *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(holder.preserve());
                         true
                     } else if let Err(error) = holder.close() {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
@@ -703,11 +711,21 @@ impl Handle {
         ) {
             return Err("This native provider has no verified durable owner".into());
         }
+        if self.0.release_native.load(Ordering::Acquire) {
+            return Err("Native provider has already been explicitly closed".into());
+        }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close()
+        self.close_inner(true)
     }
 
     pub fn close(&self) -> Result<(), String> {
+        if self.0.native_installed.load(Ordering::Acquire) {
+            self.0.release_native.store(true, Ordering::Release);
+        }
+        self.close_inner(false)
+    }
+
+    fn close_inner(&self, preserving: bool) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         // Serialize explicit closes through the join. A protocol failure is
@@ -736,6 +754,17 @@ impl Handle {
                 holder.close()?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
+            }
+        }
+        if !preserving && self.0.native_installed.load(Ordering::Acquire) {
+            let mut detached = self
+                .0
+                .detached_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(owner) = detached.as_ref() {
+                owner.close()?;
+                detached.take();
             }
         }
         if self.is_completed() {
@@ -877,7 +906,13 @@ impl super::protocol::LaunchCleanup for Handle {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         let deadline = Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE;
-        while !self.is_completed() {
+        while !self.is_completed()
+            && !self.0.worker.try_lock().is_ok_and(|worker| {
+                worker
+                    .as_ref()
+                    .is_none_or(std::thread::JoinHandle::is_finished)
+            })
+        {
             if Instant::now() >= deadline {
                 return Err(
                     "Provider startup has not become quiescent; its cleanup owner is retained"

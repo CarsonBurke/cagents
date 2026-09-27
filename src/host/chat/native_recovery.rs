@@ -79,6 +79,7 @@ fn restore_reserved(
     spec.environment = recovery.execution_environment.0.clone();
     spec.execution =
         directory.map(|identity| Arc::new(chat::protocol::ExecutionContext::restored(identity)));
+    let execution_context = spec.execution.clone();
     let mut initial = adapter.initialize()?;
     let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
@@ -240,6 +241,9 @@ fn restore_reserved(
     let response = session_snapshot(&record);
     record.handle.commit_native_installation();
     let retired = state.chats.insert(id, record);
+    if let Some(context) = execution_context {
+        context.installed();
+    }
     state.upgrade_chats.insert(
         id,
         sources

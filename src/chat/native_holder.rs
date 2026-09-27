@@ -1,7 +1,9 @@
 //! Durable ownership of a native provider server, independent of the daemon's
 //! protocol actor. The holder never submits a prompt or answers an approval.
 
+mod cleanup;
 mod transport;
+pub(crate) use cleanup::Detached;
 pub(crate) use transport::{Holder, adopt, inspect, spawn};
 
 use crate::{
