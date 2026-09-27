@@ -137,6 +137,12 @@ fn consume(
     if !matches(&receipt) {
         return Err("Native cleanup receipt belongs to another owner".into());
     }
+    // Publication precedes discovery retirement. Wait for that final step so
+    // acknowledging cleanup also permits immediate same-session replacement.
+    let socket = registry::socket(&registry::directory(Kind::Native)?, terminal);
+    if registry::evidence(&socket, Kind::Native)?.as_ref() == Some(&receipt.record) {
+        return Ok(false);
+    }
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

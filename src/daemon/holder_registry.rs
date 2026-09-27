@@ -102,6 +102,21 @@ impl Record {
             let _ = fs::remove_file(socket(directory, self.terminal));
         }
     }
+
+    /// Retire discovery after the owner has independently unlinked its exact
+    /// socket inode. Never touch a successor endpoint published in between.
+    pub fn remove_record(&self, directory: &Path) -> io::Result<()> {
+        let path = self.path(directory);
+        match read(&path) {
+            Ok(record) if record == *self => match fs::remove_file(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                result => result,
+            },
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn read(path: &Path) -> io::Result<Record> {
@@ -203,6 +218,26 @@ mod tests {
             holder: process.clone(),
             root: process,
         }
+    }
+
+    #[test]
+    fn record_only_retirement_preserves_replacement_endpoint_and_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = record();
+        old.create(directory.path()).unwrap();
+        let endpoint = socket(directory.path(), old.terminal);
+        fs::write(&endpoint, "replacement endpoint").unwrap();
+        old.remove_record(directory.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&endpoint).unwrap(),
+            "replacement endpoint"
+        );
+        let mut successor = old.clone();
+        successor.holder.start += 1;
+        successor.create(directory.path()).unwrap();
+        old.remove_record(directory.path()).unwrap();
+        assert_eq!(read(&successor.path(directory.path())).unwrap(), successor);
+        assert!(endpoint.exists());
     }
 
     #[test]

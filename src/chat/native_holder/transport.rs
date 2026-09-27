@@ -624,6 +624,7 @@ impl Residence {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        self.listener.retire()?;
         super::cleanup::publish(
             &self.record,
             self.recovery
@@ -632,7 +633,9 @@ impl Residence {
                 .as_ref()
                 .ok_or("Native holder has no release proof")?,
         )?;
-        self.record.remove(&self.directory);
+        self.record
+            .remove_record(&self.directory)
+            .map_err(|error| error.to_string())?;
         self.released = true;
         Ok(())
     }
@@ -805,15 +808,26 @@ impl Listener {
             inode: metadata.ino(),
         })
     }
+
+    fn retire(&self) -> Result<(), String> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.dev() == self.device && metadata.ino() == self.inode => {
+                match std::fs::remove_file(&self.path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    result => result.map_err(|error| error.to_string())?,
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        if std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = self.retire();
     }
 }
 
