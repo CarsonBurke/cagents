@@ -88,7 +88,8 @@ use crate::{
 /// Version 27 reports screen loss after authenticated crash adoption and adds
 /// exact-recipe cleanup for retained completed terminals.
 /// Version 28 adds durable agent commands, execution identity, and hosted consoles.
-pub const PROTOCOL_VERSION: u16 = 28;
+/// Version 29 carries native-provider crash-continuity capabilities.
+pub const PROTOCOL_VERSION: u16 = 29;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

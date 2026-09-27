@@ -1,0 +1,998 @@
+//! Bounded local control for the process owner. Provider JSON goes directly
+//! between the daemon and app-server; this process never sees a prompt.
+
+use super::Recovery;
+use crate::{
+    chat::{
+        Session,
+        protocol::{ProcessSpec, TransportSpec},
+    },
+    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    model::HostSessionProof,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, RawFd},
+        unix::{
+            fs::MetadataExt,
+            net::{UnixListener, UnixStream},
+            process::CommandExt,
+        },
+    },
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+const ARGUMENT: &str = "--cagents-native-holder";
+const PROTOCOL: u32 = 1;
+const TIMEOUT: Duration = Duration::from_secs(5);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_FRAME: usize = 16 << 20;
+
+#[derive(Serialize, Deserialize)]
+struct Spawn {
+    program: String,
+    arguments: Vec<String>,
+    directory: PathBuf,
+    environment: BTreeMap<String, String>,
+    recovery: Recovery,
+}
+
+impl Spawn {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.arguments)
+            .current_dir(&self.directory)
+            .env_clear()
+            .envs(&self.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        crate::host::descriptor_limit::inherit(&mut command);
+        command
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum Request {
+    Spawn {
+        protocol: u32,
+        spawn: Spawn,
+    },
+    Confirm {
+        thread: String,
+        identity: crate::chat::protocol::ServerIdentity,
+        process: Process,
+    },
+    UpdateSource(Session),
+    Inspect {
+        proof: HostSessionProof,
+    },
+    Adopt {
+        source: Session,
+        proof: HostSessionProof,
+    },
+    Release,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Report {
+    Started {
+        protocol: u32,
+        record: Record,
+    },
+    Confirmed,
+    SourceUpdated,
+    Released,
+    Inspected {
+        protocol: u32,
+        record: Record,
+        recovery: Recovery,
+        exited: bool,
+    },
+    Adopted(Recovery),
+    Failed(String),
+}
+
+/// Dropping an intentionally closed actor releases its server. An unexpected
+/// daemon exit instead closes the socket without sending Release.
+pub(crate) struct Holder {
+    control: Option<UnixStream>,
+    release_on_drop: bool,
+    durable: bool,
+}
+
+impl Holder {
+    pub fn is_durable(&self) -> bool {
+        self.durable
+    }
+    pub fn confirm(
+        &mut self,
+        thread: String,
+        identity: crate::chat::protocol::ServerIdentity,
+        process: Process,
+    ) -> Result<(), String> {
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        send(
+            control,
+            &Request::Confirm {
+                thread,
+                identity,
+                process,
+            },
+            TIMEOUT,
+        )?;
+        match receive(control, TIMEOUT)? {
+            Some(Report::Confirmed) => {
+                self.durable = true;
+                Ok(())
+            }
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not acknowledge provider identity".into()),
+        }
+    }
+
+    pub fn preserve(mut self) {
+        self.control.take();
+    }
+
+    pub fn update_source(&mut self, source: Session) -> Result<(), String> {
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        send(control, &Request::UpdateSource(source), TIMEOUT)?;
+        match receive(control, TIMEOUT)? {
+            Some(Report::SourceUpdated) => Ok(()),
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not acknowledge paired view ownership".into()),
+        }
+    }
+
+    pub fn close(&mut self) -> Result<(), String> {
+        let Some(control) = self.control.as_ref() else {
+            return Ok(());
+        };
+        send(control, &Request::Release, TIMEOUT)?;
+        match receive(control, TIMEOUT)? {
+            Some(Report::Released) => {
+                self.control.take();
+                Ok(())
+            }
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not acknowledge server teardown".into()),
+        }
+    }
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            let _ = self.close();
+        }
+    }
+}
+
+pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
+    std::hint::black_box(&SERVE);
+    spec.remove_unset_environment();
+    if source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly {
+        return Err(
+            "A durable native source requires verified adoption, never another server launch"
+                .into(),
+        );
+    }
+    let TransportSpec::OwnedUnixWebSocket { socket } = &spec.transport else {
+        return Err("Native holder requires an owned provider listener".into());
+    };
+    if source
+        .owned_codex_listener
+        .as_ref()
+        .is_none_or(|owned| &owned.socket != socket)
+    {
+        return Err("Provider listener does not match its ownership evidence".into());
+    }
+    let recovery = Recovery {
+        source,
+        previous_sources: Vec::new(),
+        confirmed_thread: None,
+        server_version: None,
+        server_identity: None,
+        server_process: None,
+        execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
+            spec.environment.clone(),
+        ),
+    };
+    recovery.validate(&crate::daemon::read_boot_id().map_err(|error| error.to_string())?)?;
+    let request = Spawn {
+        program: spec.program,
+        arguments: spec.arguments,
+        directory: spec.working_directory,
+        environment: spec.environment,
+        recovery,
+    };
+    // Hold the account lease through the actual child creation and its ACK.
+    // The holder receives this exact final environment, never an inherited one.
+    let command = request.command();
+    let _account =
+        crate::account::registry::authorize_command(&command).map_err(|error| error.to_string())?;
+    let (control, remote) = UnixStream::pair().map_err(|error| error.to_string())?;
+    let fd = remote.as_raw_fd();
+    let mut holder = Command::new("/proc/self/exe");
+    holder
+        .arg0("cagents-native")
+        .arg(ARGUMENT)
+        .arg(fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        holder.pre_exec(move || {
+            crate::daemon::seal_inherited_descriptors()?;
+            if libc::setsid() == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = holder.spawn().map_err(|error| error.to_string())?;
+    let pid = child.id() as i32;
+    drop(remote);
+    // Establish reaping before sending a request that can create a provider.
+    // A startup failure must not wait forever for a stuck descendant to stop.
+    let child = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let watch = child.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("native-holder-reap".into())
+        .spawn(move || {
+            if let Some(mut child) = watch.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = child.wait();
+            }
+        })
+    {
+        if let Some(mut child) = child.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // No Spawn request was sent, so this process owns no provider yet.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(error.to_string());
+    }
+    let result = (|| {
+        send(
+            &control,
+            &Request::Spawn {
+                protocol: PROTOCOL,
+                spawn: request,
+            },
+            START_TIMEOUT,
+        )?;
+        match receive(&control, START_TIMEOUT)? {
+            Some(Report::Started { protocol, record })
+                if protocol == PROTOCOL
+                    && record.holder.pid == pid
+                    && record.holder.is_current() =>
+            {
+                Ok(record)
+            }
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not acknowledge its server".into()),
+        }
+    })();
+    match result {
+        Ok(_record) => Ok(Holder {
+            control: Some(control),
+            release_on_drop: true,
+            durable: false,
+        }),
+        Err(error) => {
+            drop(control); // Unconfirmed server cannot enter orphan residence.
+            Err(error)
+        }
+    }
+}
+
+fn connect(record: &Record) -> Result<UnixStream, String> {
+    let directory = registry::directory(Kind::Native)?;
+    let socket = registry::socket(&directory, record.terminal);
+    if registry::evidence(&socket, Kind::Native)?.as_ref() != Some(record)
+        || !record.holder.is_current()
+    {
+        return Err("Native holder discovery evidence changed".into());
+    }
+    let control = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    let credentials = peer(&control)?;
+    if credentials.uid != crate::daemon::current_uid()
+        || credentials.pid != record.holder.pid
+        || !record.holder.is_current()
+    {
+        return Err("Native holder endpoint belongs to another process".into());
+    }
+    Ok(control)
+}
+
+pub(crate) fn inspect(
+    record: &Record,
+    proof: &HostSessionProof,
+) -> Result<(Recovery, bool), String> {
+    let control = connect(record)?;
+    send(
+        &control,
+        &Request::Inspect {
+            proof: proof.clone(),
+        },
+        TIMEOUT,
+    )?;
+    match receive(&control, TIMEOUT)? {
+        Some(Report::Inspected {
+            protocol,
+            record: actual,
+            recovery,
+            exited,
+        }) if protocol == PROTOCOL && actual == *record => {
+            recovery.validate(&record.boot)?;
+            Ok((recovery, exited))
+        }
+        Some(Report::Failed(error)) => Err(error),
+        _ => Err("Native holder did not return its exact discovery evidence".into()),
+    }
+}
+
+pub(crate) fn adopt(
+    record: &Record,
+    source: &Session,
+    proof: &HostSessionProof,
+) -> Result<(Holder, Recovery), String> {
+    let control = connect(record)?;
+    send(
+        &control,
+        &Request::Adopt {
+            source: source.clone(),
+            proof: proof.clone(),
+        },
+        TIMEOUT,
+    )?;
+    match receive(&control, TIMEOUT)? {
+        Some(Report::Adopted(recovery)) => {
+            recovery.validate(&record.boot)?;
+            if recovery.source.id != source.id
+                || recovery.source.proof.as_ref() != Some(proof)
+                || (&recovery.source != source && !recovery.previous_sources.contains(source))
+            {
+                return Err("Native holder did not preserve exact adoption lineage".into());
+            }
+            Ok((
+                Holder {
+                    control: Some(control),
+                    release_on_drop: false,
+                    durable: true,
+                },
+                recovery,
+            ))
+        }
+        Some(Report::Failed(error)) => Err(error),
+        _ => Err("Native holder did not acknowledge adoption".into()),
+    }
+}
+
+struct Residence {
+    directory: PathBuf,
+    listener: Listener,
+    record: Record,
+    recovery: Recovery,
+    child: Server,
+    released: bool,
+}
+
+impl Residence {
+    fn start(spawn: Spawn) -> Result<Self, String> {
+        let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
+        spawn.recovery.validate(&boot)?;
+        let directory = registry::directory(Kind::Native)?;
+        crate::secure_file::prepare_private_directory(&directory)
+            .map_err(|error| error.to_string())?;
+        let socket = registry::socket(&directory, spawn.recovery.source.id);
+        let listener = Listener::bind(socket)?;
+        let child = match spawn.command().spawn() {
+            Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
+            Err(error) => {
+                return Err(error.to_string());
+            }
+        };
+        let record = Record {
+            version: 3,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot,
+            terminal: spawn.recovery.source.id,
+            holder: Process::read(std::process::id() as i32).map_err(|error| error.to_string())?,
+            root: Process::read(child.id()).map_err(|error| error.to_string())?,
+        };
+        let residence = Self {
+            directory,
+            listener,
+            record,
+            recovery: spawn.recovery,
+            child,
+            released: false,
+        };
+        residence
+            .record
+            .create(&residence.directory)
+            .map_err(|error| error.to_string())?;
+        Ok(residence)
+    }
+
+    fn exited(&self) -> bool {
+        self.recovery
+            .server_process
+            .as_ref()
+            .map_or_else(|| self.child.exited(), |server| !server.is_current())
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        if self.released {
+            return Ok(());
+        }
+        if !self
+            .child
+            .terminate(Duration::from_secs(2))
+            .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "Provider descendants are still stopping; ownership remains with the native holder"
+                    .into(),
+            );
+        }
+        if let Some(owned) = &self.recovery.source.owned_codex_listener {
+            let _ = std::fs::remove_file(&owned.socket);
+            if let Some(parent) = owned.socket.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        self.record.remove(&self.directory);
+        self.released = true;
+        Ok(())
+    }
+
+    fn attend(&mut self, control: UnixStream) -> bool {
+        loop {
+            // Idle control streams need no periodic wake or per-session thread.
+            let mut poll = libc::pollfd {
+                fd: control.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return self.recovery.is_durable();
+            }
+            let request = match receive(&control, TIMEOUT) {
+                Ok(Some(request)) => request,
+                _ => return self.recovery.is_durable(),
+            };
+            let response = match request {
+                Request::Release => match self.release() {
+                    Ok(()) => {
+                        let _ = send(&control, &Report::Released, TIMEOUT);
+                        return false;
+                    }
+                    Err(error) => Report::Failed(error),
+                },
+                Request::Confirm {
+                    thread,
+                    identity,
+                    process,
+                } => {
+                    match self
+                        .verify_server(&process)
+                        .and_then(|()| self.recovery.confirm(thread, identity, process))
+                    {
+                        Ok(()) => Report::Confirmed,
+                        Err(error) => Report::Failed(error),
+                    }
+                }
+                Request::UpdateSource(source) => match self.recovery.update_source(source) {
+                    Ok(()) => Report::SourceUpdated,
+                    Err(error) => Report::Failed(error),
+                },
+                _ => Report::Failed("Unexpected request on an owned native holder".into()),
+            };
+            if send(&control, &response, TIMEOUT).is_err() {
+                return self.recovery.is_durable();
+            }
+        }
+    }
+
+    fn verify_server(&self, server: &Process) -> Result<(), String> {
+        if self
+            .recovery
+            .server_process
+            .as_ref()
+            .is_some_and(|old| old != server)
+        {
+            return Err("The retained app-server process changed".into());
+        }
+        let mut current = server.clone();
+        // A launcher may exec the server or spawn it. This dedicated holder
+        // owns only that provider tree, including reparented descendants.
+        for _ in 0..1024 {
+            let stat = std::fs::read(format!("/proc/{}/stat", current.pid))
+                .map_err(|error| error.to_string())?;
+            let (_, start) = crate::model::agent_recovery::process_identity(&stat)
+                .ok_or("Invalid app-server ancestry")?;
+            let parent: i32 = std::str::from_utf8(&stat)
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')'))
+                .and_then(|(_, fields)| fields.split_whitespace().nth(1))
+                .and_then(|parent| parent.parse().ok())
+                .ok_or("Invalid app-server parent")?;
+            if start != current.start {
+                break;
+            }
+            if parent == self.record.holder.pid
+                && self.record.holder.is_current()
+                && server.is_current()
+            {
+                return Ok(());
+            }
+            if parent <= 1 {
+                break;
+            }
+            current = Process::read(parent).map_err(|error| error.to_string())?;
+        }
+        Err("Codex socket peer is not owned by this native holder".into())
+    }
+
+    fn orphan(&mut self) -> bool {
+        loop {
+            let (control, _) = match self.listener.socket.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            };
+            let request = match receive(&control, TIMEOUT) {
+                Ok(Some(request)) => request,
+                _ => continue,
+            };
+            let proof = match &request {
+                Request::Inspect { proof } | Request::Adopt { proof, .. } => proof,
+                _ => continue,
+            };
+            if authorize(&control, proof).is_err() {
+                continue;
+            }
+            match request {
+                Request::Inspect { .. } => {
+                    let _ = send(
+                        &control,
+                        &Report::Inspected {
+                            protocol: PROTOCOL,
+                            record: self.record.clone(),
+                            recovery: self.recovery.clone(),
+                            exited: self.exited(),
+                        },
+                        TIMEOUT,
+                    );
+                }
+                Request::Adopt { source, proof } => match self.recovery.adopt(&source, proof) {
+                    Ok(()) => {
+                        if send(&control, &Report::Adopted(self.recovery.clone()), TIMEOUT).is_ok()
+                        {
+                            return self.attend(control);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = send(&control, &Report::Failed(error), TIMEOUT);
+                    }
+                },
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Removes even an unregistered startup endpoint, but never a replacement
+/// created after this owner's endpoint was retired.
+struct Listener {
+    socket: UnixListener,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl Listener {
+    fn bind(path: PathBuf) -> Result<Self, String> {
+        let socket = UnixListener::bind(&path).map_err(|error| error.to_string())?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = std::fs::remove_file(path);
+                return Err(error.to_string());
+            }
+        };
+        Ok(Self {
+            socket,
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        if std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for Residence {
+    fn drop(&mut self) {
+        // No completion receipt or discovery retirement until every owned
+        // descendant is reaped. A stuck child leaves this small owner alive.
+        while self.release().is_err() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+struct Server(crate::daemon::owned_children::OwnedChildren);
+impl std::ops::Deref for Server {
+    type Target = crate::daemon::owned_children::OwnedChildren;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Server {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        while !self.terminate(Duration::from_secs(2)).unwrap_or(false) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn authorize(control: &UnixStream, proof: &HostSessionProof) -> Result<(), String> {
+    let credentials = peer(control)?;
+    let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+    let owner =
+        crate::daemon::lease_owner(&paths.lock, proof).map_err(|error| error.to_string())?;
+    if credentials.uid != crate::daemon::current_uid()
+        || u32::try_from(credentials.pid).ok() != Some(owner)
+    {
+        return Err("Native holder caller does not own the daemon lease".into());
+    }
+    Ok(())
+}
+
+fn peer(control: &UnixStream) -> Result<libc::ucred, String> {
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            control.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok(credentials)
+}
+
+fn send(control: &UnixStream, value: &impl Serialize, timeout: Duration) -> Result<(), String> {
+    let data = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if data.len() > MAX_FRAME {
+        return Err("Native holder control frame is too large".into());
+    }
+    let deadline = Instant::now() + timeout;
+    for mut bytes in [&(data.len() as u32).to_be_bytes()[..], &data[..]] {
+        while !bytes.is_empty() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or("Native holder write timed out")?;
+            control
+                .set_write_timeout(Some(remaining))
+                .map_err(|error| error.to_string())?;
+            match (&*control).write(bytes) {
+                Ok(0) => return Err("Native holder control closed".into()),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn receive<T: DeserializeOwned>(
+    control: &UnixStream,
+    timeout: Duration,
+) -> Result<Option<T>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut header = [0; 4];
+    if !read_exact(control, &mut header, deadline)? {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME {
+        return Err("Invalid native holder control frame length".into());
+    }
+    let mut data = vec![0; length];
+    if !read_exact(control, &mut data, deadline)? {
+        return Err("Incomplete native holder control frame".into());
+    }
+    serde_json::from_slice(&data)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn read_exact(
+    control: &UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<bool, String> {
+    let mut read = false;
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("Native holder read timed out")?;
+        control
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| error.to_string())?;
+        match (&*control).read(bytes) {
+            Ok(0) if !read => return Ok(false),
+            Ok(0) => return Err("Incomplete native holder control frame".into()),
+            Ok(count) => {
+                read = true;
+                bytes = &mut bytes[count..];
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(true)
+}
+
+#[used]
+#[unsafe(link_section = ".init_array")]
+static SERVE: extern "C" fn() = serve_if_requested;
+
+extern "C" fn serve_if_requested() {
+    let Ok(arguments) = std::fs::read("/proc/self/cmdline") else {
+        return;
+    };
+    let mut arguments = arguments.split(|&byte| byte == 0).skip(1);
+    if arguments.next() != Some(ARGUMENT.as_bytes()) {
+        return;
+    }
+    let fd = arguments
+        .next()
+        .and_then(|fd| std::str::from_utf8(fd).ok()?.parse::<RawFd>().ok())
+        .filter(|fd| *fd > 2);
+    let Some(fd) = fd else {
+        std::process::exit(2);
+    };
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        libc::prctl(libc::PR_SET_NAME, c"cagents-native".as_ptr());
+    }
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+        std::process::exit(2);
+    }
+    let control = unsafe { UnixStream::from_raw_fd(fd) };
+    let result = (|| {
+        let Some(Request::Spawn {
+            protocol: PROTOCOL,
+            spawn,
+        }) = receive(&control, START_TIMEOUT)?
+        else {
+            return Err("Missing native holder spawn request".to_owned());
+        };
+        let mut residence = Residence::start(spawn)?;
+        send(
+            &control,
+            &Report::Started {
+                protocol: PROTOCOL,
+                record: residence.record.clone(),
+            },
+            START_TIMEOUT,
+        )?;
+        if residence.attend(control.try_clone().map_err(|error| error.to_string())?) {
+            drop(control);
+            while residence.orphan() {}
+        }
+        Ok(())
+    })();
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::spawned_owner_keeps_exact_server_on_failed_adoption_then_acknowledges_close", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let spec = ProcessSpec {
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: "/var/tmp".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let first = source.proof.clone().unwrap();
+        let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        let record = registry::evidence(
+            &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
+            Kind::Native,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(record.root.is_current());
+        let records = registry::discover(
+            &registry::directory(Kind::Native).unwrap(),
+            &first.boot_id,
+            Kind::Native,
+        )
+        .unwrap();
+        assert_eq!(
+            records,
+            vec![record.clone()],
+            "discovery precedes startup acknowledgment"
+        );
+        let thread = uuid::Uuid::new_v4().to_string();
+        holder
+            .confirm(
+                thread.clone(),
+                super::super::tests::server_identity(),
+                record.root.clone(),
+            )
+            .unwrap();
+        holder.preserve();
+        drop(lease);
+        let mut successor = first;
+        successor.host_incarnation = crate::model::HostIncarnation::new("native-successor");
+        assert!(
+            inspect(&record, &successor).is_err(),
+            "same UID without daemon lease is insufficient"
+        );
+        let _lease = crate::daemon::HostLease::acquire(&paths, &successor).unwrap();
+        let (saved, exited) = inspect(&record, &successor).unwrap();
+        assert!(!exited);
+        assert_eq!(saved.confirmed_thread.as_ref(), Some(&thread));
+        let (uncommitted, _) = adopt(&record, &source, &successor).unwrap();
+        drop(uncommitted); // Simulate a failed local actor allocation.
+        assert!(record.root.is_current());
+        let (mut adopted, saved) = adopt(&record, &source, &successor).unwrap();
+        assert_eq!(saved.confirmed_thread.as_ref(), Some(&thread));
+        adopted.close().unwrap();
+        assert!(!record.root.is_current());
+        assert!(
+            registry::discover(
+                &registry::directory(Kind::Native).unwrap(),
+                &successor.boot_id,
+                Kind::Native
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn partial_control_frames_obey_one_deadline_and_reject_oversized_allocation() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&10_u32.to_be_bytes()).unwrap();
+        writer.write_all(b"{").unwrap();
+        let began = Instant::now();
+        assert!(receive::<Request>(&reader, Duration::from_millis(30)).is_err());
+        assert!(began.elapsed() < Duration::from_secs(1));
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer
+            .write_all(&((MAX_FRAME + 1) as u32).to_be_bytes())
+            .unwrap();
+        assert!(
+            receive::<Request>(&reader, TIMEOUT)
+                .err()
+                .unwrap()
+                .contains("length")
+        );
+    }
+
+    #[test]
+    fn subreaper_close_reaps_tools_that_left_the_original_group() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SUBREAPER_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::subreaper_close_reaps_tools_that_left_the_original_group", "--nocapture"])
+                .env(STAGE, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "setsid sh -c 'echo $$ > \"$1\"; exec sleep 60' fixture \"$1\" & wait",
+                "fixture",
+            ])
+            .arg(&ready)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let descendant = loop {
+            if let Some(pid) = std::fs::read_to_string(&ready)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "provider tool never became ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let identity = Process::read(descendant).unwrap();
+        assert!(server.terminate(Duration::from_secs(2)).unwrap());
+        assert!(!identity.is_current());
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) }, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+}

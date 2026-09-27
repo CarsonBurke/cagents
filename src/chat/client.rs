@@ -267,6 +267,15 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
+    if matches!(
+        session.native_continuity,
+        super::NativeContinuity::Durable { .. }
+    ) {
+        return Err(StartFailure::from(format!(
+            "The saved native server could not be proved alive. Its uncertain work was not restarted or resubmitted. {}",
+            refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
+        )));
+    }
     if session.launch.session_id.is_none() {
         return Err(StartFailure::fresh(format!(
             "The daemon that was hosting this conversation is no longer running, and this card never recorded a conversation to resume. {}",
@@ -879,8 +888,15 @@ impl ClientHandle {
     /// recoverable conversation into a permanently blank one.
     pub fn session(&self) -> Session {
         let mut session = self.inner.session.clone();
-        if let Some(id) = self.snapshot().session_id.clone() {
+        let snapshot = self.snapshot();
+        if let Some(id) = snapshot.session_id.clone() {
             session.launch.session_id = Some(id);
+        }
+        if matches!(
+            snapshot.native_continuity,
+            super::NativeContinuity::Durable { .. }
+        ) {
+            session.native_continuity = snapshot.native_continuity.clone();
         }
         session
     }
@@ -1653,6 +1669,7 @@ mod tests {
     /// persisted launch names its session directory and nothing else.
     fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {

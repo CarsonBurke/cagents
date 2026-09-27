@@ -1850,6 +1850,7 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             .map(|pair| pair[1].clone())
     });
     Ok(chat::Session {
+        native_continuity: Default::default(),
         owned_codex_listener: session.owned_codex_listener.clone(),
         id: session.id,
         launch: chat::Launch {
@@ -3773,6 +3774,7 @@ impl Cagents {
                             }
                             let unrestricted = bypasses_approvals(&recipe);
                             let fresh = chat::Session {
+                                native_continuity: Default::default(),
                                 owned_codex_listener: None,
                                 id: crate::model::TerminalId::new(),
                                 launch: chat::Launch {

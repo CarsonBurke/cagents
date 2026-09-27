@@ -1257,6 +1257,7 @@ mod tests {
                         .then(|| session.launch.clone()),
                     session: chat::Session {
                         id: session.id,
+                        native_continuity: Default::default(),
                         owned_codex_listener: None,
                         proof: Some(proof),
                         terminal: Some(session.clone()),
@@ -1412,6 +1413,7 @@ mod tests {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
                     session: chat::Session {
+                        native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {

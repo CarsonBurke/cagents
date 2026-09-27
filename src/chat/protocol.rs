@@ -129,6 +129,14 @@ pub struct Step {
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
 }
+/// Account identity verified during initialize on the actual server connection.
+/// A holder can retain it when the account directory is subsequently removed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerIdentity {
+    pub user_agent: String,
+    pub canonical_home: PathBuf,
+    pub reported_home: String,
+}
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
@@ -142,6 +150,12 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Identity reported by the initialized server on this exact connection.
+    /// Only a holder with a verified provider contract can use it for durable
+    /// ownership; an executable's separate `--version` output is insufficient.
+    fn server_identity(&self) -> Option<&ServerIdentity> {
+        None
+    }
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)

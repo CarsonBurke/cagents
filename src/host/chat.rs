@@ -1,4 +1,5 @@
 use super::state::{ClientId, HostState, SharedHost};
+mod native_recovery;
 use crate::{
     agent::Provider,
     chat::{
@@ -11,6 +12,7 @@ use crate::{
         ServerMessage, ServerResponse, validate_proof,
     },
 };
+pub(super) use native_recovery::restore_orphaned_native;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
@@ -427,6 +429,7 @@ fn session_snapshot(record: &Record) -> ServerResponse {
         .expect("unconditional snapshot");
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
+    session.native_continuity = snapshot.native_continuity.clone();
     ServerResponse::ChatAttached { session, snapshot }
 }
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
@@ -696,6 +699,12 @@ fn start_with_execution(
         return Err(error(
             "A terminal handoff must use the proven source environment, not a client override",
         ));
+    }
+    if matches!(
+        session.native_continuity,
+        chat::NativeContinuity::Durable { .. }
+    ) {
+        return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
     let reservation_id = session.id;
     let mut source_process = None;
@@ -1147,12 +1156,12 @@ fn start_with_execution(
         };
         let weak = Arc::downgrade(host);
         let id = session.id;
-        let handle = Handle::start(
+        let handle = Handle::start_owned(
             spec,
             adapter,
             initial,
             store,
-            session.launch.session_id.clone(),
+            session.clone(),
             move |update| {
                 if let Update::Execution { run, update } = update {
                     if let Some(host) = weak.upgrade() {
@@ -1219,6 +1228,7 @@ fn start_with_execution(
             returning_terminal: false,
         };
         let response = session_snapshot(&record);
+        record.handle.commit_native_installation();
         state.chats.insert(id, record);
         state.inventory_generation += 1;
         Ok(response)
@@ -1299,7 +1309,25 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         true,
-    );
+    )
+    .and_then(|descriptor| {
+        let mut updated = session.clone();
+        updated.launch.session_id = handle.confirmed_session_id();
+        chat::protocol::align_resume_identity(&mut updated.launch).map_err(unavailable)?;
+        updated.native_continuity = handle.native_continuity();
+        updated.terminal = Some(descriptor.session.clone());
+        if let Err(error) = handle.update_native_source(updated) {
+            let retired = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retire_terminal(descriptor.session.id);
+            if let Some(retired) = retired {
+                let _ = retired.handle.shutdown();
+            }
+            return Err(unavailable(error));
+        }
+        Ok(descriptor)
+    });
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let current = state
         .chats
@@ -1346,6 +1374,14 @@ fn client_session(host: &SharedHost, session: Session) -> Session {
 }
 
 fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::Path) -> Session {
+    if matches!(
+        session.native_continuity,
+        chat::NativeContinuity::Durable { .. }
+    ) {
+        // This descriptor can only enter authenticated holder adoption, which
+        // checks its full retained value. The caller's TMPDIR grants no authority.
+        return session;
+    }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let retained = state
         .chats
@@ -1586,6 +1622,7 @@ fn process_inner(
                 .map(|record| {
                     let mut session = record.session.clone();
                     session.launch.session_id = record.handle.session_id();
+                    session.native_continuity = record.handle.native_continuity();
                     session
                 })
                 .collect::<Vec<_>>();
@@ -2009,6 +2046,7 @@ pub(super) fn resolve_upgrade(
     }
     let mut session = record.session.clone();
     session.launch.session_id = record.handle.session_id();
+    session.native_continuity = record.handle.native_continuity();
     Ok(session)
 }
 
@@ -2130,6 +2168,14 @@ pub(super) fn validate_upgrade_environment(
     hosted_source: bool,
     handle: &Handle,
 ) -> Result<(), String> {
+    if matches!(
+        handle.native_continuity(),
+        chat::NativeContinuity::Durable { .. }
+    ) {
+        // The authenticated holder retains the original execution environment;
+        // a successor reconnects and never recreates it from daemon defaults.
+        return Ok(());
+    }
     let restored = upgrade_environment(
         launch,
         hosted_source,
@@ -2148,6 +2194,13 @@ pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
 ) -> Result<(), String> {
+    if matches!(
+        saved.source.native_continuity,
+        chat::NativeContinuity::Durable { .. }
+    ) {
+        native_recovery::restore(host, 0, &saved.source)?;
+        return Ok(());
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = saved.source.clone();
     session.launch = saved.launch.clone();
@@ -2352,6 +2405,7 @@ mod tests {
             .unwrap();
         let session = Session {
             id: TerminalId::new(),
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             proof: None,
             terminal: None,
@@ -2598,6 +2652,7 @@ mod tests {
             .proof()
             .clone();
         let session = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: chat::Launch {
@@ -2690,6 +2745,7 @@ for line in sys.stdin:
             session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
         };
         let source = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: launch.clone(),
@@ -3321,6 +3377,7 @@ for line in sys.stdin:
         let host = Arc::new(Mutex::new(HostState::new(current.clone())));
         let mut session = Session {
             id: TerminalId::new(),
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             launch: chat::Launch {
                 provider: Provider::Codex,
@@ -3412,6 +3469,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let mut session = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: chat_id,
             proof: None,
@@ -3639,6 +3697,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let session = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: chat_id,
             launch: chat::Launch {
@@ -3753,6 +3812,7 @@ for line in sys.stdin:
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
                     session: Session {
+                        native_continuity: Default::default(),
                         owned_codex_listener: None,
                         id: chat_id,
                         launch: chat::Launch {

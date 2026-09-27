@@ -230,6 +230,34 @@ recovery.
 Closed windows keep their recovery lineage across successive full upgrades;
 they do not need to be opened for every release.
 
+## Native provider continuity
+
+A newly owned native Codex server uses a small dedicated holder that remains
+alive when its daemon connection disappears. The holder owns only the provider
+process tree and bounded private control metadata; it does not run the UI,
+terminal emulator, transcript store, or a second protocol actor. It never sends
+a prompt or answers an approval. Explicit close terminates and reaps the entire
+owned process tree, including tools that changed their process group, before
+acknowledging cleanup.
+
+Durable continuity is enabled only after the actual server confirms its exact
+thread, account directory, process identity, and a tested version. The current
+allowlist is Codex **0.157.1**. Other versions and providers retain their existing
+reconnect/resume behavior and do not acquire this durability claim. To extend
+the allowlist in `chat/native_holder.rs`, test a long-running command, a yielded
+command poll, and a pending approval across connection loss, then repeat those
+cases through a killed cagents daemon. Confirm the same server and thread and
+that no prompt or approval was automatically resent.
+
+A replacement daemon must hold the installation's exclusive lease and match
+the private holder's boot, process identities, and exact issued descriptor
+lineage. Reconnecting to a proved server remains possible after its account
+directory is removed; that exception cannot authorize a new process or recreate
+the removed directory. A missing, exited, or mismatched holder refuses automatic
+recipe execution. Failed local actor installation preserves the retained server
+for another authenticated attempt. Paired terminal views must independently
+recover their own holder before the native pair is published.
+
 ## Recovering after a daemon change
 
 When the daemon incarnation changes, cagents authenticates the replacement and

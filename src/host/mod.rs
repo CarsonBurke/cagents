@@ -206,6 +206,7 @@ pub fn run() -> Result<(), HostError> {
     }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
     state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
+    chat::restore_orphaned_native(&host).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
     if let Ok(registry) = agent_execution::registry(&host) {

@@ -18452,6 +18452,7 @@ mod tests {
         let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
         recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
         let original = crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {

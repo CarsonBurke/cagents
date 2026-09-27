@@ -3782,6 +3782,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = |id| crate::chat::Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id,
             launch: crate::chat::Launch {

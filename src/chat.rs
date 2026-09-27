@@ -11,6 +11,8 @@ pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::fro
 #[cfg(feature = "ui")]
 pub mod client;
 #[cfg(feature = "host")]
+pub(crate) mod native_holder;
+#[cfg(feature = "host")]
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
@@ -316,6 +318,19 @@ pub struct Session {
     /// Daemon-issued allocation evidence, independent of the reader's TMPDIR.
     #[serde(default)]
     pub owned_codex_listener: Option<OwnedCodexListener>,
+    /// Promoted only after the private owner acknowledges a verified server
+    /// and exact conversation. A durable source may never silently relaunch.
+    #[serde(default)]
+    pub native_continuity: NativeContinuity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeContinuity {
+    #[default]
+    ReconnectOnly,
+    Durable {
+        provider_version: String,
+    },
 }
 
 /// Account recovery changes only account selection. It never changes the
@@ -413,6 +428,7 @@ impl Session {
             && self.proof.is_none()
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
+            && self.native_continuity == NativeContinuity::ReconnectOnly
     }
 
     /// An endpoint allocated for this exact cagents thread, retained in both views.
@@ -422,6 +438,51 @@ impl Session {
                 .owned_codex_listener
                 .as_ref()
                 .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
+    }
+
+    pub fn has_valid_native_continuity(&self) -> bool {
+        match &self.native_continuity {
+            NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::Durable { provider_version } => {
+                self.owns_codex_listener()
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self
+                        .launch
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= 1024)
+                    && !provider_version.is_empty()
+                    && provider_version.len() <= 64
+                    && provider_version
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            }
+        }
+    }
+
+    /// Authenticated native adoption rotates only daemon ownership. Its paired
+    /// terminal has its own holder lineage and keeps the same logical recipe.
+    pub fn retains_native_pair_from(&self, previous: &Self) -> bool {
+        let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
+            return false;
+        };
+        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+            && self.native_continuity == previous.native_continuity
+            && self.has_valid_native_continuity()
+            && previous
+                .proof
+                .as_ref()
+                .zip(self.proof.as_ref())
+                .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+            && old.id == new.id
+            && new.id == self.id
+            && old.launch == new.launch
+            && old.owned_codex_listener == new.owned_codex_listener
+            && old.continuity.live_proof().as_ref() == previous.proof.as_ref()
+            && new.continuity.live_proof().as_ref() == self.proof.as_ref()
     }
 
     /// Give up the allocation when an unnamed, lost conversation returns to a
@@ -439,6 +500,7 @@ impl Session {
             self.launch.recipe.arguments[index + 1] = "unix://".into();
         }
         self.owned_codex_listener = None;
+        self.native_continuity = NativeContinuity::ReconnectOnly;
     }
 
     /// Whether `started` is this new Codex thread as the daemon started it.
@@ -564,6 +626,8 @@ pub struct Snapshot {
     pub busy: bool,
     pub detail: String,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub native_continuity: NativeContinuity,
     pub title: Option<String>,
     pub error: Option<String>,
     pub exited: bool,
@@ -1202,6 +1266,7 @@ mod tests {
     #[test]
     fn only_a_new_thread_asking_for_its_own_listener_is_claimed() {
         let session = |arguments: &[&str], session_id: Option<&str>| Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: crate::model::TerminalId::new(),
             launch: Launch {

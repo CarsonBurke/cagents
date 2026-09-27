@@ -1493,12 +1493,15 @@ fn prepare_upgrade_with_policy(
                 "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
             ));
         }
-        // A terminal is carried to the next daemon, processes and all, unless
-        // a native conversation shares its identity or it runs in one's exact
-        // environment, which is never written down: those restart as before.
+        // A durable native holder also keeps its paired terminal alive. Its
+        // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            !state.chats.contains_key(id)
-                && record.execution_environment.is_none()
+            (state.chats.get(id).is_some_and(|chat| {
+                matches!(
+                    chat.handle.native_continuity(),
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some_and(|holders| holder_socket_fits(&holder_socket(holders, *id)))
         };
         let carried = state
@@ -1546,7 +1549,16 @@ fn prepare_upgrade_with_policy(
                     "A native provider has unconfirmed work after a failed close; resolve that provider before upgrading",
                 ));
             }
-            let source = record.session.clone();
+            let mut source = record.session.clone();
+            source.native_continuity = record.handle.native_continuity();
+            if matches!(
+                source.native_continuity,
+                crate::chat::NativeContinuity::Durable { .. }
+            ) {
+                source.launch.session_id = record.handle.confirmed_session_id();
+                crate::chat::protocol::align_resume_identity(&mut source.launch)
+                    .map_err(upgrade_error)?;
+            }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
             // An interrupt-driven reset rotates the live conversation past
@@ -1575,6 +1587,10 @@ fn prepare_upgrade_with_policy(
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -1873,7 +1889,14 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?
     };
     for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-        handle.close()?;
+        if matches!(
+            handle.native_continuity(),
+            crate::chat::NativeContinuity::Durable { .. }
+        ) {
+            handle.preserve_for_restart()?;
+        } else {
+            handle.close()?;
+        }
         if handle.owns_work() {
             return Err("Native provider shutdown remains unconfirmed; checkpoint retained".into());
         }
@@ -2137,7 +2160,12 @@ fn restore_upgrade_from(
         return Ok(());
     };
     checkpoint.validate()?;
-    if !checkpoint.chats.is_empty() {
+    if checkpoint.chats.iter().any(|chat| {
+        !matches!(
+            chat.source.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        )
+    }) {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -2147,6 +2175,14 @@ fn restore_upgrade_from(
         ensure_no_surviving_process(&terminal.source, std::process::id(), proc_root)?;
     }
     for chat in &checkpoint.chats {
+        // A private holder authenticates the exact still-running server. Its
+        // presence is the purpose of adoption, not permission to relaunch it.
+        if matches!(
+            chat.source.native_continuity,
+            crate::chat::NativeContinuity::Durable { .. }
+        ) {
+            continue;
+        }
         let terminal = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
@@ -2179,7 +2215,12 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if super::chat::owns_codex_listener(&chat.source)
+                && !matches!(
+                    chat.source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+            {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -2191,6 +2232,26 @@ fn restore_upgrade_from(
             }
             if adopt_carried_terminal(host, terminal, holders, proc_root) {
                 adopted.push(terminal.source.id);
+            }
+        }
+        // Completed paired views are deliberately absent from the execution
+        // checkpoint, but their authenticated holders retain the final screen.
+        // Restore those receipts before requiring a native pair to match.
+        if checkpoint.chats.iter().any(|chat| {
+            chat.source.terminal.is_some()
+                && matches!(
+                    chat.source.native_continuity,
+                    crate::chat::NativeContinuity::Durable { .. }
+                )
+        }) {
+            restore_orphaned_holders(host)?;
+        }
+        for chat in &checkpoint.chats {
+            if matches!(
+                chat.source.native_continuity,
+                crate::chat::NativeContinuity::Durable { .. }
+            ) {
+                super::chat::restore_upgrade(host, chat)?;
             }
         }
         for terminal in &checkpoint.terminals {
@@ -2493,7 +2554,14 @@ fn close_failed_restore(
         )
     };
     for chat in chats {
-        chat.close()?;
+        if matches!(
+            chat.native_continuity(),
+            crate::chat::NativeContinuity::Durable { .. }
+        ) {
+            chat.preserve_for_restart()?;
+        } else {
+            chat.close()?;
+        }
         if chat.owns_work() {
             return Err("Failed restore still has unconfirmed native work".into());
         }
@@ -3499,6 +3567,7 @@ for line in sys.stdin:
         }
         let host = Arc::new(Mutex::new(test_host()));
         let source = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
@@ -3785,6 +3854,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = Session {
+            native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
             launch: Launch {
@@ -4487,6 +4557,7 @@ for line in sys.stdin:
                         recipe: recipe.clone(),
                         session_id: None,
                     },
+                    native_continuity: Default::default(),
                     owned_codex_listener: None,
                     proof: Some(state.proof().clone()),
                     terminal: None,
