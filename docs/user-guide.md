@@ -204,6 +204,16 @@ contents before sending. If a request's answer is lost, it asks you to check
 GitHub rather than silently posting it again. The same controls are available
 in ceditor's Pull requests panel.
 
+Use **Create worktree from reviewed commit** in the PR header to work on that
+exact revision. The suggested branch includes the PR number and commit prefix;
+choose a new branch and destination before confirming. A later force-push does
+not change the checkout. Cagents uses its regular worktree creation flow;
+Ceditor previews the resolved destination, creates the worktree, and offers
+**Open worktree**. Both preserve the original checkout and record interrupted
+creation for reconciliation instead of silently repeating it.
+Ceditor's **Worktrees** footer opens recent operation results, including a
+completed worktree recovered after a restart, with an **Open worktree** action.
+
 ## Worktrees
 
 When creating a worktree, enter a branch name, a Linear issue ID such as

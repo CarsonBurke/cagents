@@ -5772,6 +5772,28 @@ pub fn worktree_sidebar<'a>(
     worktree_panel(model, state, width, modal_open, panel, navigation, true)
 }
 
+/// Standalone panel with application-owned footer actions.
+pub fn worktree_sidebar_with_footer<'a, M: 'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    width: f32,
+    modal_open: bool,
+    panel: WorktreePanel,
+    git: bool,
+    footer: Element<'a, M>,
+    map: impl Fn(SidebarAction) -> M + 'a,
+) -> Element<'a, M> {
+    let (panel, navigation) = standalone_navigation(panel, git);
+    widget::column::with_children(vec![
+        worktree_panel(model, state, width, modal_open, panel, navigation, false).map(map),
+        crate::design::horizontal_rule(),
+        footer,
+    ])
+    .width(Length::Fixed(sidebar_pane_width(width)))
+    .height(Length::Fill)
+    .into()
+}
+
 /// The panel and tab row the standalone sidebar shows for a folder that is,
 /// or is not, a Git worktree.
 fn standalone_navigation(panel: WorktreePanel, git: bool) -> (WorktreePanel, PanelNavigation) {
@@ -5794,13 +5816,16 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
     panel: WorktreePanel,
     git: bool,
     body: Element<'a, M>,
+    footer: Element<'a, M>,
     map: impl Fn(SidebarAction) -> M + 'a,
 ) -> Element<'a, M> {
     let ready = bound_source_control(model, state)
         .filter(|source| matches!(source.data_state, SidebarDataState::Ready));
     let (panel, navigation) = standalone_navigation(panel, git);
     let (Some(source), WorktreePanel::PullRequests) = (ready, panel) else {
-        return worktree_sidebar(model, state, width, modal_open, panel, git).map(map);
+        return worktree_sidebar_with_footer(
+            model, state, width, modal_open, panel, git, footer, map,
+        );
     };
     let worktree = bound_worktree(model, source);
     let view = PanelView::new(panel, navigation, state);
@@ -5830,7 +5855,7 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
         .height(Length::Fill)
         .into(),
         crate::design::horizontal_rule(),
-        footer(false, modal_open).map(move |action| map(action)),
+        footer,
     ])
     .width(Length::Fill)
     .height(Length::Fill);
