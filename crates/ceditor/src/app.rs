@@ -149,6 +149,7 @@ pub enum Message {
     Sidebar(SidebarAction),
     /// One step of a tab's pull request review; see [`Tab::review`].
     PullRequestReview(CardId, pull_request_review::Action),
+    ReviewRequests(pull_request_review::request_ui::monitor::Action),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
     Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
@@ -446,6 +447,7 @@ impl Editor {
 pub struct Editor {
     core: Core,
     tabs: Vec<Tab>,
+    review_requests: pull_request_review::request_ui::monitor::Monitor,
     active: Option<CardId>,
     selection_epoch: u64,
     settings: AppSettings,
@@ -1526,6 +1528,7 @@ impl Editor {
             Arc::new(GitHubService::system("gh")),
             RepositoryService::system("git"),
         )
+        .with_external_review_requests()
         .with_cache(Some(Arc::new(ReviewPreferenceStore {
             store: pull_request_review::cache::JsonStore::new(
                 self.settings_path.with_file_name("review.json"),
@@ -2948,6 +2951,7 @@ impl Application for Editor {
         let mut app = Self {
             core,
             tabs: Vec::new(),
+            review_requests: Default::default(),
             active: None,
             selection_epoch: 0,
             settings,
@@ -3846,6 +3850,25 @@ impl Application for Editor {
                     task
                 }
                 Message::PullRequestReview(id, action) => self.handle_review(id, action),
+                Message::ReviewRequests(action) => {
+                    let repositories = self
+                        .tabs
+                        .iter()
+                        .filter_map(|tab| tab.review.review_request_repository().cloned())
+                        .collect::<Vec<_>>();
+                    let task = self
+                        .review_requests
+                        .update(action, repositories)
+                        .map(Message::ReviewRequests)
+                        .map(cosmic::Action::App);
+                    for tab in &mut self.tabs {
+                        tab.review.clear_external_review_requests();
+                        for (repository, snapshot) in self.review_requests.snapshots() {
+                            tab.review.apply_review_requests(repository, snapshot);
+                        }
+                    }
+                    task
+                }
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
                         if !tab.snapshot_loading {
@@ -4446,7 +4469,24 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        Subscription::batch([events, refresh, frames, self.document_tone_subscription()])
+        let review_requests = if self
+            .tabs
+            .iter()
+            .any(|tab| tab.review.review_request_repository().is_some())
+        {
+            iced::time::every(Duration::from_secs(10)).map(|_| {
+                Message::ReviewRequests(pull_request_review::request_ui::monitor::Action::Tick)
+            })
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([
+            events,
+            refresh,
+            frames,
+            review_requests,
+            self.document_tone_subscription(),
+        ])
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
@@ -5800,6 +5840,7 @@ mod tests {
         Editor {
             core: Core::default(),
             tabs: Vec::new(),
+            review_requests: Default::default(),
             active: None,
             selection_epoch: 0,
             settings: AppSettings::default(),

@@ -296,7 +296,10 @@ impl Cagents {
                 }
                 row.github_status = availability.label().into();
                 self.github_availability.insert(project, availability);
-                return self.open_pending_pull_requests(project);
+                return Task::batch([
+                    self.open_pending_pull_requests(project),
+                    self.update_review_requests(review_request_ui::Action::Tick),
+                ]);
             }
             Action::Changed => {
                 let changes = self
