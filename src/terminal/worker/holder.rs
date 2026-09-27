@@ -909,6 +909,7 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let record = Record {
             version: PROTOCOL,
+            kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
             terminal: recovery.source.id,

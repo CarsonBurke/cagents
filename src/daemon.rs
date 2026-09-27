@@ -1,3 +1,6 @@
+#[cfg(feature = "host")]
+pub(crate) mod holder_registry;
+
 use std::{
     env,
     ffi::c_int,
