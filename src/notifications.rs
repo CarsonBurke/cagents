@@ -9,7 +9,10 @@ pub mod ui;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::{agent::Provider, model::TerminalId};
+use crate::{
+    agent::Provider,
+    model::{RunId, TerminalId},
+};
 
 /// Durable activation and lifecycle identity. Optional source-process metadata
 /// describes focus and window ownership, not the notice's retirement authority.
@@ -17,6 +20,7 @@ use crate::{agent::Provider, model::TerminalId};
 pub enum Target {
     Session(TerminalId),
     PullRequest(review::ReviewRequest),
+    AgentRun(RunId),
 }
 
 impl Target {
@@ -24,6 +28,7 @@ impl Target {
         match self {
             Self::Session(id) => id.to_string(),
             Self::PullRequest(request) => request.storage_key(),
+            Self::AgentRun(id) => format!("run:{id}"),
         }
     }
 }
@@ -57,6 +62,7 @@ pub enum Kind {
     Cancelled,
     Waiting,
     ReviewRequested,
+    Interrupted,
 }
 
 impl Kind {
@@ -67,6 +73,7 @@ impl Kind {
             Self::Cancelled => "Agent cancelled",
             Self::Waiting => "Agent needs your attention",
             Self::ReviewRequested => "Your review was requested",
+            Self::Interrupted => "Agent outcome unknown",
         }
     }
 }
@@ -298,7 +305,7 @@ impl Preferences {
             && match kind {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
-                Kind::Waiting => self.waiting,
+                Kind::Waiting | Kind::Interrupted => self.waiting,
                 Kind::ReviewRequested => self.review_requests,
             }
     }
@@ -342,7 +349,7 @@ mod tests {
         assert_eq!(event.target(), Target::Session(session));
         assert_eq!(event.source_session(), Some(session));
         let event = Event {
-            target: Target::Session(session),
+            target: Target::AgentRun(RunId::new()),
             source_session: None,
             provider: None,
             directory: Some("/project".into()),

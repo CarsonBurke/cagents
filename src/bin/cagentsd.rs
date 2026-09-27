@@ -1,4 +1,13 @@
 fn main() -> std::process::ExitCode {
+    if let Some(result) = cagents::host::run_automation_helper() {
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagents precheck: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     // Both of these come first: the daemon is spawned with stdout and stderr
     // on /dev/null, so without a durable sink a panic in the process that owns
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.

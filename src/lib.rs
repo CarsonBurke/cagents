@@ -9,6 +9,9 @@ pub mod agent;
 pub mod agent_execution;
 #[cfg(feature = "ui")]
 pub mod app;
+#[cfg(feature = "ui")]
+pub mod automation_ui;
+pub mod automations;
 #[cfg(feature = "integrated-browser")]
 pub mod browser;
 #[cfg(feature = "ui")]
@@ -56,6 +59,8 @@ pub mod notifications;
 pub mod performance;
 #[cfg(feature = "ui")]
 pub mod persistence;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;

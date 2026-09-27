@@ -293,6 +293,17 @@ pub(super) fn process_request(
     ensure_control_open(host)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::Automation {
+            authority,
+            operation,
+        } => {
+            let reply =
+                super::automations::service::process_under_control(host, authority, operation)
+                    .map_err(|message| {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    })?;
+            Ok((ServerResponse::Automation(reply), Vec::new(), false))
+        }
         ClientRequest::Agent {
             authority,
             operation,

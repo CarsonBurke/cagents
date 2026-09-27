@@ -521,6 +521,7 @@ pub fn model_for_card(
         CardKind::Repository(_) => ("Repository", "folder-symbolic"),
         CardKind::Settings => ("Settings", "emblem-system-symbolic"),
         CardKind::Accounts => ("Accounts", "avatar-default-symbolic"),
+        CardKind::Automations => ("Automations", "alarm-symbolic"),
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
@@ -859,7 +860,7 @@ pub fn model_for_card(
         }
         // Utility panes show application state, which the pane itself lays
         // out; the inspector has nothing to add beyond its status.
-        CardKind::Settings | CardKind::Accounts => {}
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations => {}
     }
 
     sections.push(Section::new(
@@ -1381,7 +1382,7 @@ fn repository_context<'a>(
                     .first()
                     .map(|worktree| (project, worktree))
             }),
-        CardKind::Settings | CardKind::Accounts => None,
+        CardKind::Settings | CardKind::Accounts | CardKind::Automations => None,
     }
 }
 

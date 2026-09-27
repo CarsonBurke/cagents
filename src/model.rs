@@ -215,6 +215,8 @@ pub enum CardKind {
     /// The window's account usage pane. Like settings it shows global state
     /// and carries no payload.
     Accounts,
+    /// Daemon-owned schedules and their durable execution history.
+    Automations,
 }
 
 impl CardKind {
@@ -222,7 +224,7 @@ impl CardKind {
     /// show application state rather than a session, file or page, so a
     /// window holds at most one of each and they never hibernate.
     pub fn is_utility(&self) -> bool {
-        matches!(self, Self::Settings | Self::Accounts)
+        matches!(self, Self::Settings | Self::Accounts | Self::Automations)
     }
 }
 

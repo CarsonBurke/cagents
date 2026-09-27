@@ -24,7 +24,11 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod automations;
+pub(super) use automations::Claimed;
 mod execution;
+
+const SCHEMA_VERSION: u32 = 2;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -267,6 +271,13 @@ impl Registry {
                     )
                     .map_err(|error| error.to_string())?
                     > 0;
+                if removed || recorded {
+                    automations::close_project(
+                        &transaction,
+                        &key,
+                        crate::chat::now_ms().unwrap_or(0),
+                    )?;
+                }
                 removed || recorded
             }
             ModelEdit::CreateChannel {
@@ -469,9 +480,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     let version: u32 = db
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version > 1 {
+    if version > SCHEMA_VERSION {
         return Err(format!(
-            "workspace registry schema {version} is newer than supported schema 1"
+            "workspace registry schema {version} is newer than supported schema {SCHEMA_VERSION}"
         ));
     }
     db.execute_batch(
@@ -521,7 +532,12 @@ fn migrate(db: &Connection) -> Result<(), String> {
         [Uuid::new_v4().to_string()],
     )
     .map_err(|error| error.to_string())?;
-    execution::migrate(db)?;
+    if version < 1 {
+        execution::migrate(db)?;
+    }
+    if version < 2 {
+        automations::migrate(db)?;
+    }
     Ok(())
 }
 

@@ -383,6 +383,33 @@ fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
+    if matches!(&update, Update::Attention(_)) {
+        // Scheduled outcomes belong to the accepted run, not its temporary
+        // provider process. The scheduler publishes committed run evidence.
+        // Read outside HostState; a failed ownership read cannot safely turn
+        // that evidence into a second, session-scoped notification.
+        if let Ok(registry) = super::agent_execution::registry(&host) {
+            match registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_for_session(id)
+            {
+                Ok(Some(agent))
+                    if matches!(
+                        agent.origin,
+                        crate::agent_execution::Origin::Automation { .. }
+                    ) =>
+                {
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot resolve native attention ownership");
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let proof = state.proof().clone();
     if let Update::Attention(evidence) = &update {

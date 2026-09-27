@@ -32,7 +32,8 @@ fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Browser(_)
         | CardKind::PullRequests(_)
         | CardKind::Settings
-        | CardKind::Accounts => None,
+        | CardKind::Accounts
+        | CardKind::Automations => None,
     }
 }
 

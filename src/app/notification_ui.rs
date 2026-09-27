@@ -448,6 +448,17 @@ impl Cagents {
                 );
                 Task::batch([scope, focus, self.activate_main_window(None)])
             }
+            Action::Activated(Target::AgentRun(run)) => {
+                if self.modal_is_open() || !self.automation_ui.can_open_run() {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the open automation edit or request, then open the run notification again.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let open = self.open_utility_card(CardKind::Automations);
+                let read = self.update_automation_ui(crate::automation_ui::Action::InspectRun(run));
+                Task::batch([open, read, self.activate_main_window(None)])
+            }
             Action::Test => {
                 self.notification_ui
                     .preferences(self.settings.notifications, true);
@@ -479,6 +490,42 @@ fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_run_activation_opens_history_without_mounting_a_provider() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let original = app
+            .durable
+            .cards
+            .iter()
+            .filter(|card| matches!(card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+            .count();
+        let run = crate::model::RunId::new();
+        // Restoring an automation card starts a list read before its cold
+        // notification activation reaches the UI.
+        drop(app.update_automation_ui(crate::automation_ui::Action::Refresh));
+        drop(app.update_notifications(Action::Activated(Target::AgentRun(run))));
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .any(|card| card.kind == CardKind::Automations && card.existence.is_open())
+        );
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .filter(|card| matches!(card.kind, CardKind::Chat(_) | CardKind::Terminal(_)))
+                .count(),
+            original
+        );
+        assert!(matches!(
+            app.card_state(app.workspace.focused().unwrap())
+                .unwrap()
+                .kind,
+            CardKind::Automations
+        ));
+    }
     use crate::{
         agent::Provider,
         model::{ChannelId, ProjectChannel},

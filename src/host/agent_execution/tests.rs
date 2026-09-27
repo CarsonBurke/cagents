@@ -280,15 +280,8 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
         return;
     }
     let (host, request, _) = fixture();
-    let owner = Origin::Automation {
-        id: uuid::Uuid::new_v4(),
-    };
-    let accepted = registry(&host)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .submit_agent(&owner, &request, now())
-        .unwrap();
+    let automation = automation_fixture(&host, &request);
+    let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
     let first = settled(&host, accepted.run.id);
     let session_id = registry(&host)
@@ -314,20 +307,9 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
         reconcile_agent_run(&host, &first, false).unwrap(),
         Reconciliation::Idle
     );
-    let next = registry(&host)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .submit_agent(
-            &owner,
-            &Submit {
-                destination: Destination::Existing(accepted.agent.id),
-                prompt: "follow up".into(),
-                idempotency_key: "next".into(),
-            },
-            now(),
-        )
-        .unwrap();
+    release_fixture(&host, &first);
+    let next = claim_fixture(&host, &automation);
+    assert_eq!(next.agent.id, accepted.agent.id);
     assert!(
         reconcile_agent_run(&host, &first, true)
             .unwrap_err()
@@ -379,15 +361,8 @@ while IFS= read -r frame; do
   esac
 done
 "#).unwrap();
-    let owner = Origin::Automation {
-        id: uuid::Uuid::new_v4(),
-    };
-    let accepted = registry(&host)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .submit_agent(&owner, &request, now())
-        .unwrap();
+    let automation = automation_fixture(&host, &request);
+    let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let active = loop {
@@ -443,14 +418,42 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
         return;
     }
     let (host, request, path) = fixture();
-    let owner = Origin::Automation {
-        id: uuid::Uuid::new_v4(),
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
     };
+    let automation = crate::host::automations::service::create(
+        &host,
+        crate::automations::Definition {
+            name: "Interactive takeover fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Reuse,
+            precheck: None,
+        },
+    )
+    .unwrap();
+    let owner = Origin::Automation { id: automation.id };
     let accepted = registry(&host)
         .unwrap()
         .lock()
         .unwrap()
-        .submit_agent(&owner, &request, now())
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
         .unwrap();
     dispatch_accepted(&host, accepted.clone()).unwrap();
     let done = settled(&host, accepted.run.id);
@@ -535,13 +538,13 @@ fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
             now(),
         )
         .unwrap();
-    dispatch_accepted(&host, next.clone()).unwrap();
+    // The automation coordinator now owns acceptance as well as dispatch.
+    // A fabricated follow-up without its exact firing fails before the
+    // provider-facing takeover guard is reached.
     assert!(
-        settled(&host, next.run.id)
-            .result
-            .diagnostic
-            .unwrap()
-            .contains("Interactive work")
+        dispatch_accepted(&host, next)
+            .unwrap_err()
+            .contains("owning firing")
     );
     assert_eq!(
         std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(),
@@ -598,31 +601,14 @@ fn removed_selected_account_refuses_a_queued_prompt_on_an_existing_actor() {
         unreachable!()
     };
     spec.account = Some(Account::linked(Provider::Claude, key, account_home).id());
-    let owner = Origin::Automation {
-        id: uuid::Uuid::new_v4(),
-    };
-    let accepted = registry(&host)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .submit_agent(&owner, &request, now())
-        .unwrap();
+    let automation = automation_fixture(&host, &request);
+    let accepted = claim_fixture(&host, &automation);
     dispatch_accepted(&host, accepted.clone()).unwrap();
-    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
-    let next = registry(&host)
-        .unwrap()
-        .lock()
-        .unwrap()
-        .submit_agent(
-            &owner,
-            &Submit {
-                destination: Destination::Existing(accepted.agent.id),
-                prompt: "must not dispatch".into(),
-                idempotency_key: "removed-account".into(),
-            },
-            now(),
-        )
-        .unwrap();
+    let first = settled(&host, accepted.run.id);
+    assert_eq!(first.state, State::Succeeded);
+    release_fixture(&host, &first);
+    let next = claim_fixture(&host, &automation);
+    assert_eq!(next.agent.id, accepted.agent.id);
     store
         .update(|accounts| {
             accounts.unregister(key);
@@ -648,6 +634,65 @@ fn removed_selected_account_refuses_a_queued_prompt_on_an_existing_actor() {
         Reconciliation::Closed,
         "removal never blocks exact cleanup"
     );
+}
+
+fn automation_fixture(host: &SharedHost, request: &Submit) -> crate::automations::Automation {
+    let Destination::New(spec) = request.destination.clone() else {
+        unreachable!()
+    };
+    crate::host::automations::service::create(
+        host,
+        crate::automations::Definition {
+            name: "Execution lifecycle fixture".into(),
+            prompt: request.prompt.clone(),
+            agent: spec,
+            schedule: crate::automations::Schedule {
+                pattern: crate::automations::SchedulePattern::Daily { hour: 3, minute: 0 },
+                timezone: "UTC".into(),
+            },
+            session_mode: crate::automations::SessionMode::Reuse,
+            precheck: None,
+        },
+    )
+    .unwrap()
+}
+
+fn claim_fixture(host: &SharedHost, automation: &crate::automations::Automation) -> Accepted {
+    registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_automation(
+            automation.id,
+            automation.execution_revision,
+            None,
+            crate::automations::Trigger::Manual {
+                request: uuid::Uuid::new_v4(),
+            },
+            None,
+            true,
+            now(),
+        )
+        .unwrap()
+        .accepted
+        .unwrap()
+}
+
+fn release_fixture(host: &SharedHost, run: &Run) {
+    assert_eq!(
+        reconcile_agent_run(host, run, false).unwrap(),
+        Reconciliation::Idle
+    );
+    let registry = registry(host).unwrap();
+    let mut registry = registry.lock().unwrap();
+    let firing = registry
+        .reconcile_automation_run(run.id, now())
+        .unwrap()
+        .unwrap();
+    let agent = registry.agent(run.agent).unwrap();
+    registry
+        .finish_automation_release(firing.id, &agent, now())
+        .unwrap();
 }
 
 fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {

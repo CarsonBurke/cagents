@@ -225,6 +225,7 @@ pub(crate) struct HostState {
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
+    pub(super) automations: Option<super::automations::Handle>,
     pub(super) execution_gates: BTreeMap<crate::model::AgentId, Arc<Mutex<()>>>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
@@ -289,6 +290,7 @@ impl HostState {
             watchers: BTreeSet::new(),
             model: None,
             execution_registry: None,
+            automations: None,
             execution_gates: BTreeMap::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
@@ -441,12 +443,16 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
+                    || (matches!(target, crate::notifications::Target::AgentRun(_))
+                        && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {
                 (
                     source_session.is_some_and(|session| presence.focused == Some(session)),
                     Some(presence.window.as_str()) == remembered_window,
+                    source_session.is_some_and(|session| presence.sessions.contains(&session)),
+                    presence.window == crate::instance::PRIMARY_WINDOW,
                 )
             });
         if let Some((&client, presence)) = owner {
@@ -3528,6 +3534,38 @@ mod tests {
             Some(crate::notifications::Target::Session(session))
         );
         assert_eq!(host.watch_notifications(3, presence), None);
+    }
+
+    #[test]
+    fn run_notification_routes_only_to_a_cagents_window_without_a_provider_pane() {
+        let mut host = test_host();
+        let delivery = host.register_client(1);
+        host.watch_notifications(
+            1,
+            crate::notifications::Presence {
+                window: "primary".into(),
+                ..Default::default()
+            },
+        );
+        let editor = host.register_client(2);
+        host.watch_notifications(
+            2,
+            crate::notifications::Presence {
+                window: "primary".into(),
+                application: crate::notifications::Application::Ceditor,
+                ..Default::default()
+            },
+        );
+        let target = crate::notifications::Target::AgentRun(crate::model::RunId::new());
+        assert_eq!(
+            host.activate_notification(target.clone(), None, None),
+            "primary"
+        );
+        delivery.close_after_drain();
+        editor.close_after_drain();
+        assert!(matches!(delivery.pop().unwrap().message,
+            ServerMessage::NotificationActivated { target: actual } if actual == target));
+        assert!(editor.pop().is_none());
     }
 
     #[test]

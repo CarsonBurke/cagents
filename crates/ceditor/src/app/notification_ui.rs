@@ -44,9 +44,9 @@ impl Editor {
                 self.notifications.verifying = false;
                 self.open_requested_review()
             }
-            Action::Observed(notifications::ui::Action::Activated(Target::Session(_))) => {
-                Task::none()
-            }
+            Action::Observed(notifications::ui::Action::Activated(
+                Target::Session(_) | Target::AgentRun(_),
+            )) => Task::none(),
             Action::Observed(notifications::ui::Action::ActivateWindow(token)) => iced::Task::done(
                 cosmic::Action::Cosmic(cosmic::app::Action::Activate(token.unwrap_or_default())),
             ),

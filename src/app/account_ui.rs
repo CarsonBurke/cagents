@@ -1092,6 +1092,29 @@ pub(super) struct ChatAccounts {
 }
 
 impl Cagents {
+    pub(super) fn automation_account_choices(&self) -> Vec<crate::automation_ui::AccountChoice> {
+        let mut choices = self
+            .account_ui
+            .accounts
+            .iter()
+            .filter(|state| !state.account.is_brokered())
+            .map(|state| crate::automation_ui::AccountChoice {
+                label: self.account_ui.display_name(state),
+                provider: state.account.provider,
+                id: state.id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let omp = Account::system(Provider::Omp);
+        if !choices.iter().any(|choice| choice.id == omp.id()) {
+            choices.push(crate::automation_ui::AccountChoice {
+                label: "Omp (provider-managed login)".into(),
+                provider: Provider::Omp,
+                id: omp.id(),
+            });
+        }
+        choices
+    }
+
     /// Whether anything shows account usage, which is the only reason to
     /// ask for it.
     fn accounts_surface_visible(&self) -> bool {

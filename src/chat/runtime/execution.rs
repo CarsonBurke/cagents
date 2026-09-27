@@ -170,8 +170,9 @@ impl Tracker {
             Kind::Succeeded => State::Succeeded,
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
-            Kind::Waiting => return Err("Waiting is not a completed agent run".into()),
-            Kind::ReviewRequested => return Err("A review request is not an agent outcome".into()),
+            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested => {
+                return Err("Attention is not a confirmed provider outcome".into());
+            }
         };
         let mut capture = self
             .runs

@@ -1,5 +1,6 @@
 mod activity;
 mod agent_execution;
+mod automations;
 mod chat;
 mod client;
 mod delivery;
@@ -166,6 +167,12 @@ impl From<PlatformError> for HostError {
     }
 }
 
+/// Dedicated precheck owners must enter before tracing or runtime threads are
+/// started: their descendant cleanup relies on being the sole child reaper.
+pub fn run_automation_helper() -> Option<Result<(), String>> {
+    automations::helper_entry()
+}
+
 pub fn run() -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -226,6 +233,14 @@ pub fn run() -> Result<(), HostError> {
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let _tray = crate::tray::start();
+
+    let automation_broker = match automations::start(&host) {
+        Ok(broker) => Some(broker),
+        Err(error) => {
+            tracing::warn!(%error, "scheduled automations are unavailable");
+            None
+        }
+    };
 
     let next_client_id = AtomicU64::new(1);
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
@@ -307,6 +322,9 @@ pub fn run() -> Result<(), HostError> {
     }
 
     tracing::info!("cagents daemon is shutting down");
+    // Stop deadline acceptance before snapshotting/tearing down provider
+    // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
+    drop(automation_broker);
     let proof = host
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

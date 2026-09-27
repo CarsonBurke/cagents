@@ -21,7 +21,7 @@ impl Journal {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if version > 2 {
+        if version > 3 {
             return Err("Notification journal was created by a newer cagents version".into());
         }
         connection
@@ -37,7 +37,7 @@ impl Journal {
                 UNIQUE(session, evidence));
             CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
-            PRAGMA user_version=2;").map_err(|error| error.to_string())?;
+            PRAGMA user_version=3;").map_err(|error| error.to_string())?;
         Ok(Self(connection))
     }
 
@@ -226,6 +226,45 @@ mod tests {
     }
 
     #[test]
+    fn run_attention_survives_source_retirement_and_replay_keeps_dismissal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.remember_window([session], "owned").unwrap();
+        let mut run = event(session, "accepted-run");
+        run.target = Target::AgentRun(crate::model::RunId::from_uuid(session.as_uuid()));
+        let notice = journal.record(run.clone(), false).unwrap().unwrap();
+        journal
+            .record(event(session, "provider-turn"), false)
+            .unwrap();
+        journal.retire(Target::Session(session)).unwrap();
+        assert_eq!(journal.list().unwrap(), vec![notice.clone()]);
+        assert_eq!(notice.window.as_deref(), Some("owned"));
+        journal.acknowledge(notice.id).unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.record(run, false).unwrap().is_none());
+        let stored = journal.list().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].acknowledged);
+        assert_eq!(stored[0].event.target(), notice.event.target());
+    }
+
+    #[test]
+    fn new_run_owner_uses_owner_recency_even_when_attention_is_infrequent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        journal.remember_window([session], "chosen").unwrap();
+        let mut run = event(session, "first-attention");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        journal.record(run, false).unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
     fn review_identity_survives_notice_eviction_restart_and_new_request() {
         use crate::notifications::{Target, review::ReviewRequest};
         let directory = tempfile::tempdir().unwrap();
@@ -323,7 +362,7 @@ mod tests {
         let path = directory.path().join("attention.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version=3; CREATE TABLE future(value TEXT);")
+            .execute_batch("PRAGMA user_version=4; CREATE TABLE future(value TEXT);")
             .unwrap();
         drop(connection);
         assert!(Journal::open(&path).err().unwrap().contains("newer"));
@@ -331,7 +370,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let notices: i32 = connection
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name='notices'",
