@@ -274,6 +274,9 @@ struct PreparedUpgrade {
     relaunch_agents: bool,
     /// Where carried terminals' holders wait, prepared before the checkpoint.
     holders: Option<std::path::PathBuf>,
+    /// Exact registered owners promised uninterrupted process continuity by a
+    /// confirmed update. Errors must orphan these owners, never release them.
+    continuing: Vec<TerminalHandle>,
 }
 
 impl HostState {
@@ -1457,6 +1460,24 @@ pub(super) fn prepare_upgrade(
     )
 }
 
+/// Typed update consent promises that carried processes continue. Refuse an
+/// unavailable preservation boundary rather than silently choosing relaunch.
+pub(super) fn prepare_preserving_upgrade(
+    host: &SharedHost,
+    capability: ShutdownCapability,
+    relaunch_agents: bool,
+) -> Result<(u64, u64), ProtocolError> {
+    let holders = holder_directory().map_err(upgrade_error)?;
+    prepare_upgrade_with_carry_policy(
+        host,
+        capability,
+        relaunch_agents,
+        Some(&holders),
+        true,
+        crate::upgrade::handoff::Store::discover,
+    )
+}
+
 fn validate_terminal_upgrade_environment(
     recipe: &crate::model::LaunchRecipe,
     execution: &crate::terminal_ipc::ChatExecutionEnvironment,
@@ -1493,18 +1514,43 @@ fn prepare_upgrade_with_policy(
     holders: Option<&std::path::Path>,
     discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
 ) -> Result<(u64, u64), ProtocolError> {
+    prepare_upgrade_with_carry_policy(host, capability, relaunch_agents, holders, false, discover)
+}
+
+fn prepare_upgrade_with_carry_policy(
+    host: &SharedHost,
+    capability: ShutdownCapability,
+    relaunch_agents: bool,
+    holders: Option<&std::path::Path>,
+    require_continuity: bool,
+    discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
+) -> Result<(u64, u64), ProtocolError> {
     use crate::upgrade::handoff::{Carried, Chat, Checkpoint, Phase, Terminal};
     // What can stop a carry is checked now, while the upgrade can still be
     // refused: past this point a terminal that fails to carry is lost if a
     // restart cannot stand in for its running job.
-    let holders = holders.filter(|holders| {
-        crate::secure_file::prepare_private_directory(holders)
-            .inspect_err(|error| {
-                tracing::warn!(holders = %holders.display(), %error,
+    let holders = if require_continuity {
+        let holders = holders.ok_or_else(|| {
+            upgrade_error(
+                "No terminal preservation directory is available; update was not committed",
+            )
+        })?;
+        crate::secure_file::prepare_private_directory(holders).map_err(|error| {
+            upgrade_error(format!(
+                "Cannot prepare terminal preservation: {error}; update was not committed"
+            ))
+        })?;
+        Some(holders)
+    } else {
+        holders.filter(|holders| {
+            crate::secure_file::prepare_private_directory(holders)
+                .inspect_err(|error| {
+                    tracing::warn!(holders = %holders.display(), %error,
                     "cannot prepare the holders' directory; upgrade restarts every terminal")
-            })
-            .is_ok()
-    });
+                })
+                .is_ok()
+        })
+    };
     let (proof, terminals, carried, chats, paired_codex) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -1790,7 +1836,8 @@ fn prepare_upgrade_with_policy(
             relaunch_agents,
         )));
     }
-    let checkpoint = Checkpoint::new(proof, saved, carried, chats);
+    let mut checkpoint = Checkpoint::new(proof, saved, carried, chats);
+    checkpoint.preserve_carried = require_continuity;
     let counts = (
         (checkpoint.terminals.len() + checkpoint.carried.len()) as u64,
         checkpoint.chats.len() as u64,
@@ -1799,6 +1846,23 @@ fn prepare_upgrade_with_policy(
     state
         .validate_upgrade_capability(&capability, Instant::now())
         .map_err(upgrade_error)?;
+    let continuing = if require_continuity {
+        checkpoint
+            .carried
+            .iter()
+            .map(|terminal| {
+                state.terminals.get(&terminal.source.id)
+                .filter(|record| record.handle.holder_identity().is_some())
+                .map(|record| record.handle.clone())
+                .ok_or_else(|| upgrade_error(format!(
+                    "Terminal {} has no registered persistent owner; update was not committed",
+                    terminal.source.id
+                )))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     // Failure leaves control enabled and drops reversible pidfd freeze guards.
     store.save(&checkpoint).map_err(upgrade_error)?;
     state.upgrade = Some(PreparedUpgrade {
@@ -1807,6 +1871,7 @@ fn prepare_upgrade_with_policy(
         frozen,
         relaunch_agents,
         holders: holders.map(std::path::Path::to_owned),
+        continuing,
     });
     state.shutting_down = true;
     state.shutdown_capabilities.clear();
@@ -1889,6 +1954,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
         mut frozen,
         relaunch_agents,
         holders,
+        continuing,
     }) = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1897,102 +1963,122 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
     else {
         return Ok(());
     };
-    // Completed workers have already cached their final screen in their holder.
-    // They are not relaunched from the checkpoint, but remain discoverable even
-    // if another checkpoint component prevents this replacement from starting.
-    let restarting = checkpoint
-        .terminals
-        .iter()
-        .map(|terminal| terminal.source.id)
-        .collect::<BTreeSet<_>>();
-    let completed = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .terminals
-        .values()
-        .filter(|record| record.handle.is_completed() && !restarting.contains(&record.session.id))
-        .map(|record| record.handle.clone())
-        .collect::<Vec<_>>();
-    for handle in completed {
-        handle.preserve_completed_for_restart();
-    }
-    for terminal in &mut frozen {
-        terminal.stop()?;
-    }
-    let chats = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        checkpoint
-            .chats
+    let require_continuity = checkpoint.preserve_carried;
+    let result = (|| {
+        // Completed workers have already cached their final screen in their holder.
+        // They are not relaunched from the checkpoint, but remain discoverable even
+        // if another checkpoint component prevents this replacement from starting.
+        let restarting = checkpoint
+            .terminals
             .iter()
-            .map(|chat| {
-                state
-                    .chats
-                    .get(&chat.source.id)
-                    .map(|record| record.handle.clone())
-                    .ok_or_else(|| {
-                        "Checkpoint native provider disappeared during shutdown".to_string()
-                    })
+            .map(|terminal| terminal.source.id)
+            .collect::<BTreeSet<_>>();
+        let completed = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .terminals
+            .values()
+            .filter(|record| {
+                record.handle.is_completed() && !restarting.contains(&record.session.id)
             })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-        let durable = matches!(
-            handle.native_continuity(),
-            crate::chat::NativeContinuity::Durable { .. }
-        );
-        if durable {
-            handle.preserve_for_restart()?;
-        } else {
-            handle.close()?;
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        for handle in completed {
+            handle.preserve_completed_for_restart();
         }
-        if handle.owns_work() {
-            return Err("Native provider shutdown remains unconfirmed; checkpoint retained".into());
-        }
-        if durable {
-            // The retained server and every issued alias refer to this exact
-            // launch. A terminal resume recipe describes a new server, not
-            // the live owner the successor must authenticate.
-            if chat.launch.session_id != handle.confirmed_session_id() {
-                return Err("Retained provider changed its confirmed conversation during upgrade; checkpoint retained".into());
-            }
-        } else {
-            chat.launch.session_id = handle.confirmed_session_id();
-            chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
-                "Closed provider did not retain its exact conversation identity; checkpoint retained",
-            )?;
-        }
-    }
-    // Carried last: a holder left waiting by an upgrade that then fails
-    // outlives its daemon for nothing, and only the final save follows this.
-    if let Some(holders) = &holders {
-        let mut stopping = Vec::new();
-        carry_terminals(
-            host,
-            &mut checkpoint,
-            &mut stopping,
-            relaunch_agents,
-            holders,
-        );
-        for terminal in &mut stopping {
+        for terminal in &mut frozen {
             terminal.stop()?;
         }
-    }
-    let handles = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .terminals
-        .values()
-        .map(|record| record.handle.clone())
-        .collect::<Vec<_>>();
-    for handle in handles {
-        if let Err(error) = handle.shutdown()
-            && !handle.is_completed()
-        {
-            return Err(error.to_string());
+        let chats = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            checkpoint
+                .chats
+                .iter()
+                .map(|chat| {
+                    state
+                        .chats
+                        .get(&chat.source.id)
+                        .map(|record| record.handle.clone())
+                        .ok_or_else(|| {
+                            "Checkpoint native provider disappeared during shutdown".to_string()
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
+            let durable = matches!(
+                handle.native_continuity(),
+                crate::chat::NativeContinuity::Durable { .. }
+            );
+            if durable {
+                handle.preserve_for_restart()?;
+            } else {
+                handle.close()?;
+            }
+            if handle.owns_work() {
+                return Err(
+                    "Native provider shutdown remains unconfirmed; checkpoint retained".into(),
+                );
+            }
+            if durable {
+                // The retained server and every issued alias refer to this exact
+                // launch. A terminal resume recipe describes a new server, not
+                // the live owner the successor must authenticate.
+                if chat.launch.session_id != handle.confirmed_session_id() {
+                    return Err("Retained provider changed its confirmed conversation during upgrade; checkpoint retained".into());
+                }
+            } else {
+                chat.launch.session_id = handle.confirmed_session_id();
+                chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
+                "Closed provider did not retain its exact conversation identity; checkpoint retained",
+            )?;
+            }
+        }
+        // Carried last: a holder left waiting by an upgrade that then fails
+        // outlives its daemon for nothing, and only the final save follows this.
+        if let Some(holders) = &holders {
+            let mut stopping = Vec::new();
+            carry_terminals(
+                host,
+                &mut checkpoint,
+                &mut stopping,
+                relaunch_agents,
+                holders,
+                require_continuity,
+            )?;
+            for terminal in &mut stopping {
+                terminal.stop()?;
+            }
+        }
+        let handles = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .terminals
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        for handle in handles {
+            if let Err(error) = handle.shutdown()
+                && !handle.is_completed()
+            {
+                return Err(error.to_string());
+            }
+        }
+        checkpoint.phase = crate::upgrade::handoff::Phase::Ready;
+        store.save(&checkpoint)
+    })();
+    if result.is_err() {
+        // The outer shutdown tail still calls shutdown() on every handle.
+        // Transfer these exact registered owners before returning the failure,
+        // including errors before carrying or after the final save. Prepared
+        // checkpoint evidence remains on disk for explicit recovery.
+        for handle in continuing {
+            if let Err(error) = handle.preserve_for_restart() {
+                tracing::error!(%error, "could not preserve a confirmed continuing terminal after failed update");
+            }
         }
     }
-    checkpoint.phase = crate::upgrade::handoff::Phase::Ready;
-    store.save(&checkpoint)
+    result
 }
 
 /// Leaves each carried terminal to its holder, to wait for the next daemon.
@@ -2007,9 +2093,10 @@ fn carry_terminals(
     frozen: &mut Vec<crate::terminal::UpgradeSnapshot>,
     relaunch_agents: bool,
     holders: &std::path::Path,
-) {
+    require_continuity: bool,
+) -> Result<(), String> {
     if checkpoint.carried.is_empty() {
-        return;
+        return Ok(());
     }
     let prepared = crate::secure_file::prepare_private_directory(holders)
         .map_err(|error| format!("prepare {}: {error}", holders.display()));
@@ -2028,6 +2115,11 @@ fn carry_terminals(
             .get(&id)
             .map(|record| record.handle.clone())
         else {
+            if require_continuity {
+                return Err(format!(
+                    "Terminal {id} disappeared during confirmed update; checkpoint retained, no restart authorized"
+                ));
+            }
             tracing::warn!(terminal = %id, "a terminal to carry ended before the upgrade");
             continue;
         };
@@ -2044,6 +2136,11 @@ fn carry_terminals(
             }
             Err(error) => error,
         };
+        if require_continuity {
+            return Err(format!(
+                "Could not carry terminal {id}: {error}. Its exact registered owner and prepared checkpoint were retained; no replacement was launched"
+            ));
+        }
         // Completion can race the carry, or VT serialization can fail while
         // its process still runs. A registered holder can keep either result
         // without converting ownership into permission to execute a recipe.
@@ -2104,6 +2201,7 @@ fn carry_terminals(
             terminal.source.resume_hint = prepared_hints[&terminal.source.id].clone();
         }
     }
+    Ok(())
 }
 
 fn apply_size(
@@ -2337,8 +2435,19 @@ fn restore_upgrade_from(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            if adopt_carried_terminal(host, terminal, holders, proc_root) {
+            if adopt_carried_terminal(
+                host,
+                terminal,
+                holders,
+                proc_root,
+                !checkpoint.preserve_carried,
+            ) {
                 adopted.push(terminal.source.id);
+            } else if checkpoint.preserve_carried {
+                return Err(format!(
+                    "Terminal {} could not be authenticated for continued ownership; no recipe restart was authorized. Its checkpoint was retained for explicit recovery",
+                    terminal.source.id
+                ));
             }
         }
         // Completed paired views are deliberately absent from the execution
@@ -2456,6 +2565,7 @@ fn adopt_carried_terminal(
     terminal: &crate::upgrade::handoff::Carried,
     holders: Option<&std::path::Path>,
     proc_root: &std::path::Path,
+    allow_restart: bool,
 ) -> bool {
     let id = terminal.source.id;
     let mut error = "no directory for holders".to_owned();
@@ -2578,6 +2688,10 @@ fn adopt_carried_terminal(
             }
             _ => {}
         }
+    }
+    if !allow_restart {
+        tracing::warn!(terminal = %id, %error, "confirmed continuation requires its original holder; recipe restart is refused");
+        return false;
     }
     let recipe = match crate::upgrade::checkpoint_recipe(&terminal.source, &terminal.relaunches) {
         Ok(recipe) => recipe,
@@ -3327,6 +3441,8 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 
 #[cfg(test)]
 mod native_upgrade_tests;
+#[cfg(test)]
+mod strict_upgrade_tests;
 
 #[cfg(test)]
 mod tests {

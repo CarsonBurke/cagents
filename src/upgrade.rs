@@ -397,9 +397,9 @@ pub(crate) mod handoff {
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
 
-    /// Checkpoints that carry terminals are version 2; any other is still
-    /// written as version 1, which a daemon from before carrying can replay.
-    const VERSION: u16 = 3;
+    /// Legacy relaunches use 1, carried terminals 2, retained native owners 3,
+    /// and consent that forbids carried recipe fallback 4.
+    const VERSION: u16 = 4;
     const VERSIONS: std::ops::RangeInclusive<u16> = 1..=VERSION;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     const MAX_TERMINALS: usize = 1024;
@@ -478,6 +478,10 @@ pub(crate) mod handoff {
         pub terminals: Vec<Terminal>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub carried: Vec<Carried>,
+        /// These carried processes were promised continuity, not permission to
+        /// execute their recipes if authenticated adoption becomes unavailable.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub preserve_carried: bool,
         pub chats: Vec<Chat>,
     }
 
@@ -495,13 +499,17 @@ pub(crate) mod handoff {
                 phase: Phase::Prepared,
                 terminals,
                 carried,
+                preserve_carried: false,
                 chats,
             }
         }
 
         /// The oldest version that can hold this checkpoint.
         fn format(&self) -> u16 {
-            if self.chats.iter().any(|chat| {
+            if self.preserve_carried {
+                // Older readers may relaunch a missing carried holder.
+                4
+            } else if self.chats.iter().any(|chat| {
                 matches!(
                     chat.source.native_continuity,
                     chat::NativeContinuity::Durable { .. }
