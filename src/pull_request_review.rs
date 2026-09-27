@@ -130,7 +130,7 @@ pub enum Action {
     SetSource(Option<ReviewSource>),
     Cached {
         generation: u64,
-        result: Result<Option<cache::Snapshot>, String>,
+        result: Result<Option<Arc<cache::Snapshot>>, String>,
     },
     CacheSaved {
         generation: u64,
@@ -618,7 +618,7 @@ impl State {
                 }
                 self.cache_loading = false;
                 match result {
-                    Ok(Some(snapshot)) => self.adopt_cache(snapshot),
+                    Ok(Some(snapshot)) => self.adopt_cache(Arc::unwrap_or_clone(snapshot)),
                     Ok(None) => {}
                     Err(error) => {
                         self.notice = Some(format!("Could not read review cache: {error}"))
@@ -993,7 +993,9 @@ impl State {
             return ActionTask::perform(
                 async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        cache.load(&key.map_err(|error| error.to_string())?)
+                        cache
+                            .load(&key.map_err(|error| error.to_string())?)
+                            .map(|snapshot| snapshot.map(Arc::new))
                     })
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()));
@@ -2626,7 +2628,7 @@ pub(crate) mod tests {
         state.cache_loading = true;
         drop(state.update(Action::Cached {
             generation,
-            result: Ok(Some(cache::fixture())),
+            result: Ok(Some(Arc::new(cache::fixture()))),
         }));
         assert_eq!(state.selected, Some(path("src/main.rs")));
         assert_eq!(state.load, LoadState::Ready);
@@ -2653,7 +2655,7 @@ pub(crate) mod tests {
         assert_eq!(state.selected, Some(path("src/main.rs")));
         drop(state.update(Action::Cached {
             generation,
-            result: Ok(Some(cache::fixture())),
+            result: Ok(Some(Arc::new(cache::fixture()))),
         }));
         assert!(
             !state.files[0].viewed,
@@ -2679,7 +2681,7 @@ pub(crate) mod tests {
         drop(state.open(target(2)));
         drop(state.update(Action::Cached {
             generation,
-            result: Ok(Some(cache::fixture())),
+            result: Ok(Some(Arc::new(cache::fixture()))),
         }));
         assert!(state.files.is_empty());
         assert!(state.selected.is_none());
