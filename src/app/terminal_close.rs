@@ -184,7 +184,11 @@ impl Cagents {
     }
 
     pub(super) fn request_card_removal(&mut self, card: CardId) -> Task<Message> {
-        match self.workspace.request_close(card) {
+        let reservation = match self.workspace.pending_close() {
+            Some(handoff) if handoff.unmounting == card => Ok(handoff),
+            _ => self.workspace.request_close(card),
+        };
+        match reservation {
             Ok(handoff) => self.card_removal(handoff),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
@@ -203,6 +207,118 @@ impl Cagents {
             Message::CommitClose(handoff.unmounting),
         )
         .map(cosmic::Action::App)
+    }
+
+    /// Commits the workspace reservation before retiring any runtime or saved
+    /// identity. A failed or stale reservation leaves the card untouched.
+    pub(super) fn commit_card_removal(
+        &mut self,
+        id: CardId,
+        replacement: Option<(LaunchRecipe, (usize, usize))>,
+    ) -> Option<Task<Message>> {
+        let handoff = self.workspace.pending_close();
+        let replacing = replacement.is_some();
+        let update = match self.workspace.commit_close(id) {
+            Ok(update) => update,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                return None;
+            }
+        };
+        // Read before anything persists the scope, which prunes the
+        // closed card from its channel's membership.
+        let emptied = self.channels_emptied_by(&[id]);
+        self.retire_lsp_card(id);
+        self.sidebar_state.clear_agent_activity(id);
+        self.sidebar_state.acknowledge_agent_update(id);
+        self.chat_discard(id);
+        // A draft still waiting out its debounce is the last thing
+        // typed into the pane; closing it is not discarding it.
+        let settings = if matches!(self.cards.get(&id), Some(CardRuntime::Settings)) {
+            self.flush_settings_drafts()
+        } else {
+            Task::none()
+        };
+        let utility = self
+            .card_state(id)
+            .filter(|card| card.kind.is_utility())
+            .map(|card| card.kind.clone());
+        if let Some(runtime) = self.cards.remove(&id) {
+            match runtime {
+                CardRuntime::Terminal(_handle) => {
+                    // Explicit confirmation already obtained the daemon acknowledgement.
+                    // Dropping the surface only detaches; never send a second shutdown.
+                }
+                #[cfg(feature = "integrated-browser")]
+                CardRuntime::Browser(browser) => {
+                    self.begin_browser_teardown(browser.handle);
+                }
+                CardRuntime::Loading
+                | CardRuntime::Failed(_)
+                | CardRuntime::Completed
+                | CardRuntime::Repository(_)
+                | CardRuntime::Chat(_)
+                | CardRuntime::PullRequests(_)
+                | CardRuntime::Settings
+                | CardRuntime::Accounts => {}
+            }
+        }
+        self.lifecycle.remove(id);
+        // A closed card is never reopened, so its filing is spent.
+        Arc::make_mut(&mut self.durable).card_scopes.remove(&id);
+        if let Some(card) = self.card_state_mut(id) {
+            card.existence = Existence::Closed {
+                tombstone: crate::model::Tombstone {
+                    operation_id: None,
+                    closed_at_unix_ms: unix_millis(),
+                    reason: Some("closed by user".into()),
+                },
+            };
+        }
+        let closed = self.apply_viewport(update, true, true);
+        // A chat returned to a terminal is replaced only now that it
+        // is closed, so no state ever holds both.
+        let replacement = replacement
+            .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
+            .unwrap_or_else(Task::none);
+        // The replacement joins the chat's channel, which is then not
+        // empty after all.
+        let emptied = emptied
+            .into_iter()
+            .filter(|&channel| !self.channel_has_open_card(channel))
+            .collect();
+        let reopen = match utility {
+            Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
+                self.reopen_utility = None;
+                self.open_utility_card(kind)
+            }
+            _ => Task::none(),
+        };
+        let focus = if !replacing
+            && handoff
+                .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
+        {
+            iced::widget::operation::focus(
+                self.workspace
+                    .focused()
+                    .map(|card| self.card_keyboard_focus(card))
+                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+            )
+            .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        };
+        Some(
+            Task::batch([
+                closed,
+                replacement,
+                settings,
+                self.delete_channels(emptied),
+                reopen,
+                focus,
+            ])
+            .chain(self.next_queued_card_close()),
+        )
     }
 
     pub(super) fn cancel_terminal_close(&mut self) -> Task<Message> {

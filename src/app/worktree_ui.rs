@@ -1006,6 +1006,14 @@ mod tests {
         let _ = app.update(Message::CancelTerminalClose);
         assert!(app.sidebar_state.worktree_has_panes(project_id, worktree));
 
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(id, "Shell", CardWidth::Fraction(0.5)).unwrap(),
+                0,
+                true,
+            )
+            .unwrap();
+        let _ = app.update(Message::CloseCard(id));
         let _ = app.update(Message::CommitClose(id));
         assert!(
             !app.durable

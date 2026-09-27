@@ -697,7 +697,7 @@ impl Cagents {
                     Vec::new()
                 };
                 let view = runtime.view(
-                    self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
+                    self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
                     place,
                     !self.workspace_inputs_blocked(),

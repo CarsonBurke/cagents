@@ -6135,7 +6135,11 @@ impl Cagents {
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
         // A card whose close is already accepted never starts anything again.
-        if self.chat_close_approved(card) || self.refuse_for_deleting_card(card) {
+        if self
+            .card_state(card)
+            .is_none_or(|state| !state.existence.is_open())
+            || self.refuse_for_deleting_card(card)
+        {
             return Task::none();
         }
         if self.completed_terminal_has_native_owner(card) {
@@ -11760,11 +11764,10 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
-                if (self
+                if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id))
-                    && !self.chat_close_approved(id)
+                    || self.chat_has_parked_runtime(id)
                 {
                     return self.begin_chat_close(id);
                 }
@@ -11784,91 +11787,8 @@ impl Application for Cagents {
                 {
                     return self.begin_card_close(id);
                 }
-                // Read before anything persists the scope, which prunes the
-                // closed card from its channel's membership.
-                let emptied = self.channels_emptied_by(&[id]);
-                // Taken while the chat still has its slot.
-                let replacement = self.take_chat_replacement(id);
-                self.retire_lsp_card(id);
-                self.sidebar_state.clear_agent_activity(id);
-                self.sidebar_state.acknowledge_agent_update(id);
-                self.chat_discard(id);
-                // A draft still waiting out its debounce is the last thing
-                // typed into the pane; closing it is not discarding it.
-                let settings = if matches!(self.cards.get(&id), Some(CardRuntime::Settings)) {
-                    self.flush_settings_drafts()
-                } else {
-                    Task::none()
-                };
-                let utility = self
-                    .card_state(id)
-                    .filter(|card| card.kind.is_utility())
-                    .map(|card| card.kind.clone());
-                if let Some(runtime) = self.cards.remove(&id) {
-                    match runtime {
-                        CardRuntime::Terminal(_handle) => {
-                            // Explicit confirmation already obtained the daemon acknowledgement.
-                            // Dropping the surface only detaches; never send a second shutdown.
-                        }
-                        #[cfg(feature = "integrated-browser")]
-                        CardRuntime::Browser(browser) => {
-                            self.begin_browser_teardown(browser.handle);
-                        }
-                        CardRuntime::Loading
-                        | CardRuntime::Failed(_)
-                        | CardRuntime::Completed
-                        | CardRuntime::Repository(_)
-                        | CardRuntime::Chat(_)
-                        | CardRuntime::PullRequests(_)
-                        | CardRuntime::Settings
-                        | CardRuntime::Accounts => {}
-                    }
-                }
-                self.lifecycle.remove(id);
-                // A closed card is never reopened, so its filing is spent.
-                Arc::make_mut(&mut self.durable).card_scopes.remove(&id);
-                if let Some(card) = self.card_state_mut(id) {
-                    card.existence = Existence::Closed {
-                        tombstone: crate::model::Tombstone {
-                            operation_id: None,
-                            closed_at_unix_ms: unix_millis(),
-                            reason: Some("closed by user".into()),
-                        },
-                    };
-                }
-                let closed = match self.workspace.commit_close(id) {
-                    Ok(update) => self.apply_viewport(update, true, true),
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(error.to_string()));
-                        Task::none()
-                    }
-                };
-                // A chat returned to a terminal is replaced only now that it
-                // is closed, so no state ever holds both.
-                let replacement = replacement
-                    .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
-                    .unwrap_or_else(Task::none);
-                // The replacement joins the chat's channel, which is then not
-                // empty after all.
-                let emptied = emptied
-                    .into_iter()
-                    .filter(|&channel| !self.channel_has_open_card(channel))
-                    .collect();
-                let reopen = match utility {
-                    Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
-                        self.reopen_utility = None;
-                        self.open_utility_card(kind)
-                    }
-                    _ => Task::none(),
-                };
-                Task::batch([
-                    closed,
-                    replacement,
-                    settings,
-                    self.delete_channels(emptied),
-                    reopen,
-                ])
-                .chain(self.next_queued_card_close())
+                self.commit_card_removal(id, None)
+                    .unwrap_or_else(Task::none)
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -15445,6 +15365,7 @@ mod tests {
         let _ =
             app.queue_setting_input(SettingsField::ManagedWorktreeDirectory, "../trees/".into());
         // Closing the pane commits the draft still waiting out its debounce.
+        let _ = app.update(Message::CloseCard(pane));
         let task = app.update(Message::CommitClose(pane));
         assert!(app.settings_pending.is_empty());
         settle_settings_task(&mut app, task);
@@ -15475,6 +15396,7 @@ mod tests {
         ));
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         let pane = app.utility_card(&CardKind::Settings).unwrap();
+        let _ = app.update(Message::CloseCard(pane));
         let _ = app.update(Message::CommitClose(pane));
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         assert_ne!(app.utility_card(&CardKind::Settings), Some(pane));
