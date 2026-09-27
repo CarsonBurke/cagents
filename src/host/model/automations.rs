@@ -165,8 +165,12 @@ impl Registry {
         &self,
         id: Uuid,
     ) -> Result<crate::automations::RunDetail, String> {
-        let firing = read_firing(&self.db, id)?;
-        let definition = read_definition(&self.db, firing.automation, firing.revision)?;
+        let mut firing = read_firing(&self.db, id)?;
+        let mut definition = read_definition(&self.db, firing.automation, firing.revision)?;
+        if firing.name.is_empty() {
+            firing.name = definition.name.clone();
+        }
+        definition.name = firing.name.clone();
         let agent = firing.agent.map(|id| self.agent(id)).transpose()?;
         let run = firing.run.map(|id| self.agent_run(id)).transpose()?;
         if run
@@ -614,6 +618,7 @@ impl Registry {
         let firing = Firing {
             id: Uuid::new_v4(),
             automation: id,
+            name: automation.definition.name.clone(),
             revision,
             trigger,
             state: FiringState::Skipped,
@@ -941,17 +946,19 @@ impl Registry {
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let mut entries = records
+        let mut firings = records
             .into_iter()
-            .map(|(record, name)| decode::<Firing>(&record).map(|firing| (firing, name)))
+            .map(|(record, name)| {
+                decode::<Firing>(&record).map(|mut firing| {
+                    if firing.name.is_empty() {
+                        firing.name = name;
+                    }
+                    firing
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let more = entries.len() > limit;
-        entries.truncate(limit);
-        let names = entries
-            .iter()
-            .map(|(firing, name)| (firing.id, name.clone()))
-            .collect();
-        let firings: Vec<_> = entries.into_iter().map(|(firing, _)| firing).collect();
+        let more = firings.len() > limit;
+        firings.truncate(limit);
         let next = more
             .then(|| {
                 firings.last().map(|last| HistoryCursor {
@@ -960,11 +967,7 @@ impl Registry {
                 })
             })
             .flatten();
-        Ok(HistoryPage {
-            firings,
-            names,
-            next,
-        })
+        Ok(HistoryPage { firings, next })
     }
 }
 
@@ -1145,6 +1148,7 @@ impl Registry {
         let mut firing = Firing {
             id: Uuid::new_v4(),
             automation: id,
+            name: automation.definition.name.clone(),
             revision: automation.execution_revision,
             trigger,
             state: FiringState::Prechecking,
@@ -1715,6 +1719,20 @@ mod tests {
             let automation = registry
                 .create_automation(definition.clone(), 100, test_identity())
                 .unwrap();
+            definition.name.push_str(" renamed");
+            let automation = registry
+                .edit_automation(
+                    automation.id,
+                    automation.revision,
+                    definition.clone(),
+                    150,
+                    test_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                automation.execution_revision, 1,
+                "renaming preserves execution consent"
+            );
             let claim = registry
                 .claim_automation(
                     automation.id,
@@ -1739,7 +1757,17 @@ mod tests {
                     300,
                 )
                 .unwrap();
-            registry.remove_automation(automation.id, 1, 400).unwrap();
+            assert_eq!(
+                registry
+                    .automation_run_detail(claim.firing.id)
+                    .unwrap()
+                    .definition
+                    .name,
+                definition.name
+            );
+            registry
+                .remove_automation(automation.id, automation.revision, 400)
+                .unwrap();
             expected.insert(claim.firing.id, definition.name.clone());
         }
         assert!(registry.automations(None, 100).unwrap().is_empty());
@@ -1748,13 +1776,8 @@ mod tests {
         loop {
             let page = registry.automation_history(None, cursor, 1).unwrap();
             assert_eq!(page.firings.len(), 1);
-            assert_eq!(page.names.len(), 1);
             let firing = &page.firings[0];
-            assert!(
-                observed
-                    .insert(firing.id, page.names[&firing.id].clone())
-                    .is_none()
-            );
+            assert!(observed.insert(firing.id, firing.name.clone()).is_none());
             let Some(next) = page.next else { break };
             cursor = Some(next);
         }

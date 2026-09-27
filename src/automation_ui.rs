@@ -332,7 +332,6 @@ pub struct State {
     confirmation: Option<Confirmation>,
     history: Vec<Firing>,
     history_next: Option<HistoryCursor>,
-    history_names: std::collections::BTreeMap<Uuid, String>,
     all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
@@ -400,7 +399,6 @@ impl State {
                         self.draft = None;
                         self.all_history = false;
                         self.history.clear();
-                        self.history_names.clear();
                         self.history_next = None;
                         self.notice = Some(
                             "Saved. Review the launch settings before enabling or running.".into(),
@@ -410,10 +408,8 @@ impl State {
                 Ok(Response::History(page)) => {
                     if !matches!(pending, Pending::History { append: true }) {
                         self.history.clear();
-                        self.history_names.clear();
                     }
                     self.history.extend(page.firings);
-                    self.history_names.extend(page.names);
                     self.history_next = page.next;
                 }
                 Ok(Response::Detail(detail)) => {
@@ -540,7 +536,6 @@ impl State {
                 self.draft = None;
                 self.all_history = false;
                 self.history.clear();
-                self.history_names.clear();
                 self.history_next = None;
                 self.run = None;
                 return self.request(Pending::Show, Request::Show { id });
@@ -724,7 +719,6 @@ impl State {
                 self.all_history = false;
                 self.run = None;
                 self.history.clear();
-                self.history_names.clear();
                 self.history_next = None;
                 return self.request(Pending::Run, Request::ShowRun { run });
             }
@@ -919,10 +913,7 @@ impl State {
                         content = content.push(button_owned(
                             format!(
                                 "{} · {} · {} · {}",
-                                self.history_names
-                                    .get(&firing.id)
-                                    .map(String::as_str)
-                                    .unwrap_or("Run"),
+                                firing.name,
                                 timestamp(firing.created_ms),
                                 origin,
                                 state_label(firing.state)

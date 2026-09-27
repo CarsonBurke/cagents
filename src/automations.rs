@@ -321,6 +321,9 @@ pub enum SkipReason {
 pub struct Firing {
     pub id: Uuid,
     pub automation: Uuid,
+    /// Presentation at acceptance, independent of the execution revision.
+    #[serde(default)]
+    pub name: String,
     pub revision: u64,
     pub trigger: Trigger,
     pub state: FiringState,
@@ -447,6 +450,5 @@ pub struct HistoryCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub firings: Vec<Firing>,
-    pub names: std::collections::BTreeMap<Uuid, String>,
     pub next: Option<HistoryCursor>,
 }

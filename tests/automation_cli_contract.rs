@@ -385,7 +385,7 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
     let history = fixture.cli(&["automation", "history"]);
     assert_eq!(history["history"]["firings"][0]["id"], firing);
     assert!(
-        history["history"]["names"][firing.as_str()].is_string(),
+        history["history"]["firings"][0]["name"] == "Headless fixture",
         "removed definitions retain their historical names"
     );
     fs::remove_dir_all(&project).unwrap();
