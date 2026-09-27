@@ -818,9 +818,12 @@ fn process_request(
             if let Some(paired) = paired {
                 super::chat::close_terminal_actor(host, session.id, &paired)?;
             }
-            if let Some(handle) = handle {
+            if let Some(handle) = &handle {
                 handle.shutdown().map_err(send_error)?;
             }
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .close_terminal_attention(session.id, handle.as_ref());
             Ok((
                 ServerResponse::TerminalCloseChecked {
                     terminal_id: session.id,
@@ -1264,6 +1267,7 @@ mod tests {
             !actor.is_completed(),
             "a completed PTY does not authorize stopping its native actor"
         );
+        assert!(!host.lock().unwrap().notification_closed.contains(&session.id));
         host.lock()
             .unwrap()
             .chats
@@ -1294,6 +1298,7 @@ mod tests {
         ));
         assert!(actor.is_completed());
         assert!(!host.lock().unwrap().chats.contains_key(&session.id));
+        assert!(host.lock().unwrap().notification_closed.contains(&session.id));
     }
 
     #[test]
