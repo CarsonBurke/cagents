@@ -49,6 +49,12 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
              session_id TEXT NOT NULL UNIQUE,
              source TEXT NOT NULL
          ) STRICT;
+         CREATE TABLE IF NOT EXISTS agent_policies (
+             agent TEXT PRIMARY KEY REFERENCES agents(id),
+             directory TEXT,
+             interactive INTEGER NOT NULL DEFAULT 0 CHECK(interactive IN (0, 1)),
+             interactive_run TEXT
+         ) STRICT;
          PRAGMA user_version = 1;
          COMMIT;",
     )
@@ -56,6 +62,224 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Caller has authenticated every retained descriptor with the actual
+    /// holder. A same-ID recipe is not sufficient evidence for this operation.
+    /// Authority and public/private ownership advance in one transaction; a
+    /// pending launch stays private and no accepted prompt is reauthorized.
+    pub(crate) fn adopt_authenticated_agent_session(
+        &mut self,
+        retained: &[HostedSession],
+        successor: &HostedSession,
+    ) -> Result<bool, String> {
+        if retained.is_empty() || retained.iter().any(|source| source.id() != successor.id()) {
+            return Err("Agent adoption requires exact same-session holder lineage".into());
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let authority: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [successor.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let recognizes = |source: &HostedSession| source == successor || retained.contains(source);
+        if let Some(authority) = &authority
+            && !recognizes(&decode::<HostedSession>(authority)?)
+        {
+            return Err("The issuing capability belongs to another session lineage".into());
+        }
+        let row: Option<String> = tx.query_row("SELECT record FROM agents WHERE session_id = ?1 OR id = (SELECT agent FROM agent_launches WHERE session_id = ?1)", [successor.id().to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+        let mut changed = false;
+        if let Some(row) = row {
+            let mut agent: Agent = decode(&row)?;
+            if agent.closed {
+                return Err("A retired agent cannot regain process authority".into());
+            }
+            if let Some(source) = &agent.session {
+                if !recognizes(source) {
+                    return Err("The durable agent belongs to another session lineage".into());
+                }
+                if let Some(console) = &agent.console {
+                    let HostedSession::Chat(next) = successor else {
+                        return Err("A provider console needs its retained native actor".into());
+                    };
+                    let terminal = next
+                        .terminal
+                        .as_ref()
+                        .filter(|terminal| {
+                            terminal.id == console.id && terminal.launch == console.launch
+                        })
+                        .ok_or("The retained console does not match the durable provider pair")?;
+                    agent.console = Some(terminal.clone());
+                }
+                changed = agent.session.as_ref() != Some(successor);
+                agent.session = Some(successor.clone());
+                tx.execute(
+                    "UPDATE agents SET record = ?2 WHERE id = ?1",
+                    params![agent.id.to_string(), encode(&agent)?],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                let pending: String = tx
+                    .query_row(
+                        "SELECT source FROM agent_launches WHERE agent = ?1",
+                        [agent.id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !recognizes(&decode::<HostedSession>(&pending)?) {
+                    return Err("The private launch belongs to another session lineage".into());
+                }
+                tx.execute(
+                    "UPDATE agent_launches SET source = ?2 WHERE agent = ?1",
+                    params![agent.id.to_string(), encode(successor)?],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        if authority.is_some() {
+            tx.execute(
+                "UPDATE agent_authorities SET source = ?2 WHERE session_id = ?1",
+                params![successor.id().to_string(), encode(successor)?],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if changed {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
+    }
+
+    pub(crate) fn retained_agent_directory(
+        &self,
+        retained: &[HostedSession],
+    ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
+        let Some(first) = retained.first() else {
+            return Ok(None);
+        };
+        let row: Option<String> = self.db.query_row("SELECT record FROM agents WHERE session_id = ?1 OR id = (SELECT agent FROM agent_launches WHERE session_id = ?1)", [first.id().to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+        let Some(row) = row else { return Ok(None) };
+        let agent: Agent = decode(&row)?;
+        let source = agent
+            .session
+            .or(self.pending_agent_launch(agent.id)?)
+            .ok_or("Retained agent has no source evidence")?;
+        if agent.closed || !retained.contains(&source) {
+            return Err("Retained execution policy does not match the authenticated source".into());
+        }
+        self.agent_directory(agent.id)
+    }
+
+    pub(crate) fn pin_agent_directory(
+        &mut self,
+        id: AgentId,
+        identity: crate::agent_execution::DirectoryIdentity,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT directory FROM agent_policies WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        if previous
+            .as_deref()
+            .map(decode::<crate::agent_execution::DirectoryIdentity>)
+            .transpose()?
+            .is_some_and(|previous| previous != identity)
+        {
+            return Err("The agent's approved directory identity cannot change".into());
+        }
+        tx.execute(
+            "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
+            ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
+            params![id.to_string(), encode(&identity)?],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn agent_directory(
+        &self,
+        id: AgentId,
+    ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
+        self.db
+            .query_row(
+                "SELECT directory FROM agent_policies WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .flatten()
+            .map(|value| decode(&value))
+            .transpose()
+    }
+
+    pub(crate) fn agent_for_session(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<Option<Agent>, String> {
+        self.db
+            .query_row(
+                "SELECT record FROM agents WHERE session_id = ?1 AND closed = 0",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|record| decode(&record))
+            .transpose()
+    }
+
+    pub(crate) fn claim_agent_interaction(
+        &mut self,
+        id: AgentId,
+        run: Option<RunId>,
+    ) -> Result<(), String> {
+        self.db.execute("INSERT INTO agent_policies(agent, interactive, interactive_run) VALUES (?1, 1, ?2)
+            ON CONFLICT(agent) DO UPDATE SET interactive = 1, interactive_run = excluded.interactive_run",
+            params![id.to_string(), run.map(|run| run.to_string())]).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn agent_is_interactive(&self, id: AgentId) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT interactive FROM agent_policies WHERE agent = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn agent_dispatch_is_authorized(
+        &self,
+        id: AgentId,
+        run: RunId,
+    ) -> Result<bool, String> {
+        self.db.query_row("SELECT interactive = 0 OR interactive_run = ?2 FROM agent_policies WHERE agent = ?1",
+            params![id.to_string(), run.to_string()], |row| row.get::<_, Option<bool>>(0))
+            .optional().map(|value| value.map(|value| value.unwrap_or(false)).unwrap_or(true)).map_err(|error| error.to_string())
+    }
+
     /// Private launch intent commits before creating a provider. It is never
     /// part of WorkspaceModel or an adoptable UI descriptor.
     pub(crate) fn reserve_agent_launch(
@@ -1024,10 +1248,8 @@ mod tests {
         workspace_model::ModelEdit,
     };
 
-    #[test]
-    fn authority_retirement_and_proved_successor_are_exact_source_fenced() {
-        let (mut registry, _directory, _) = fixture();
-        let source = HostedSession::Chat(crate::chat::Session {
+    fn source() -> HostedSession {
+        HostedSession::Chat(crate::chat::Session {
             id: crate::model::TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: Provider::Claude,
@@ -1047,7 +1269,13 @@ mod tests {
             }),
             terminal: None,
             owned_codex_listener: None,
-        });
+        })
+    }
+
+    #[test]
+    fn authority_retirement_and_proved_successor_are_exact_source_fenced() {
+        let (mut registry, _directory, _) = fixture();
+        let source = source();
         let authority = registry.register_agent_authority(&source).unwrap();
         let mut successor = source.clone();
         let HostedSession::Chat(next) = &mut successor else {
@@ -1075,6 +1303,123 @@ mod tests {
         registry.retire_agent_authority(&successor).unwrap();
         assert!(registry.execution_origin(&authority).is_err());
         assert!(registry.agent_authority_source(&authority).is_err());
+    }
+
+    #[test]
+    fn authenticated_adoption_keeps_pending_launch_private_and_advances_bound_identity_atomically()
+    {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let source = source();
+        registry
+            .reserve_agent_launch(accepted.agent.id, &source)
+            .unwrap();
+        let token = registry.register_agent_authority(&source).unwrap();
+        let mut next = source.clone();
+        let HostedSession::Chat(session) = &mut next else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("next");
+        assert!(
+            !registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&source), &next)
+                .unwrap()
+        );
+        assert!(
+            registry.agent(accepted.agent.id).unwrap().session.is_none(),
+            "pending launch is never published by adoption"
+        );
+        assert_eq!(
+            registry.pending_agent_launch(accepted.agent.id).unwrap(),
+            Some(next.clone())
+        );
+        assert_eq!(
+            registry.agent_authority_source(&token).unwrap(),
+            Some(next.clone())
+        );
+        registry
+            .bind_agent(accepted.agent.id, None, next.clone())
+            .unwrap();
+        let mut final_source = next.clone();
+        let HostedSession::Chat(session) = &mut final_source else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("final");
+        registry.db.execute_batch("CREATE TRIGGER reject_adoption BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture failed ownership commit'); END;").unwrap();
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&next), &final_source)
+                .is_err()
+        );
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().session,
+            Some(next.clone())
+        );
+        assert_eq!(
+            registry.agent_authority_source(&token).unwrap(),
+            Some(next.clone())
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_adoption;")
+            .unwrap();
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&source), &final_source)
+                .is_err(),
+            "a stale unrelated source cannot rotate current authority"
+        );
+        assert!(
+            registry
+                .adopt_authenticated_agent_session(std::slice::from_ref(&next), &final_source)
+                .unwrap()
+        );
+        assert_eq!(
+            registry.agent(accepted.agent.id).unwrap().session,
+            Some(final_source.clone())
+        );
+        assert_eq!(
+            registry.agent_authority_source(&token).unwrap(),
+            Some(final_source)
+        );
+        assert_eq!(
+            registry.agent_run(accepted.run.id).unwrap(),
+            accepted.run,
+            "adoption never resends or settles the accepted prompt"
+        );
+    }
+
+    #[test]
+    fn approved_directory_identity_survives_reopen_and_refuses_replacement() {
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &std::fs::metadata(directory.path()).unwrap(),
+        );
+        registry
+            .pin_agent_directory(accepted.agent.id, identity)
+            .unwrap();
+        let changed = crate::agent_execution::DirectoryIdentity {
+            inode: identity.inode.wrapping_add(1),
+            ..identity
+        };
+        assert!(
+            registry
+                .pin_agent_directory(accepted.agent.id, changed)
+                .is_err()
+        );
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            registry.agent_directory(accepted.agent.id).unwrap(),
+            Some(identity)
+        );
+        let context = crate::chat::protocol::ExecutionContext::restored(identity);
+        context.verify_directory(directory.path()).unwrap();
+        let replacement = tempfile::tempdir().unwrap();
+        assert!(context.verify_directory(replacement.path()).is_err());
     }
 
     fn fixture() -> (Registry, tempfile::TempDir, Submit) {

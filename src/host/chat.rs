@@ -1525,6 +1525,16 @@ pub(super) fn process(
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
+    super::agent_execution::interactive(host, client, request, |request| {
+        process_inner(host, client, request)
+    })
+}
+
+fn process_inner(
+    host: &SharedHost,
+    client: ClientId,
+    request: ClientRequest,
+) -> Result<ServerResponse, ProtocolError> {
     match request {
         ClientRequest::ChatRecoverAccount {
             source,

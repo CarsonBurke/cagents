@@ -87,6 +87,383 @@ done
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[test]
+fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
+    if isolated("automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement").is_some()
+    {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let owner = Origin::Automation {
+        id: uuid::Uuid::new_v4(),
+    };
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&owner, &request, now())
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    let first = settled(&host, accepted.run.id);
+    let session_id = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session_id].handle.clone();
+    let stale = handle.snapshot(None).unwrap().generation;
+    handle.command(Command::Refresh).unwrap();
+    assert!(
+        handle
+            .close_if_idle(stale)
+            .unwrap_err()
+            .contains("state changed")
+    );
+    assert!(!handle.is_completed());
+    assert_eq!(
+        reconcile_agent_run(&host, &first, false).unwrap(),
+        Reconciliation::Idle
+    );
+    let next = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(
+            &owner,
+            &Submit {
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: "follow up".into(),
+                idempotency_key: "next".into(),
+            },
+            now(),
+        )
+        .unwrap();
+    assert!(
+        reconcile_agent_run(&host, &first, true)
+            .unwrap_err()
+            .contains("newer run")
+    );
+    dispatch_accepted(&host, next.clone()).unwrap();
+    let done = settled(&host, next.run.id);
+    assert_eq!(
+        reconcile_agent_run(&host, &done, true).unwrap(),
+        Reconciliation::Closed
+    );
+    assert_eq!(
+        reconcile_agent_run(&host, &done, true).unwrap(),
+        Reconciliation::Closed
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+}
+
+#[test]
+fn cancellation_reaches_only_the_exact_active_provider_run() {
+    if isolated("cancellation_reaches_only_the_exact_active_provider_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    std::fs::write(path.parent().unwrap().join("bin/claude"), r#"#!/bin/sh
+set -eu
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      case "$frame" in
+        *'"subtype":"interrupt"'*)
+          printf 'interrupt\n' >> "$HOME/../interrupts"
+          printf '{"type":"result","uuid":"interrupted-result","is_error":false}\n'
+          ;;
+      esac
+      id=${frame#*'"request_id":"'}
+      id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+  esac
+done
+"#).unwrap();
+    let owner = Origin::Automation {
+        id: uuid::Uuid::new_v4(),
+    };
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&owner, &request, now())
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let active = loop {
+        let run = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_run(accepted.run.id)
+            .unwrap();
+        if run.state == State::Running {
+            break run;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider run did not start: {run:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let session_id = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let handle = host.lock().unwrap().chats[&session_id].handle.clone();
+    assert!(
+        handle
+            .interrupt_run(RunId::new())
+            .unwrap_err()
+            .contains("active turn")
+    );
+    assert!(!path.parent().unwrap().join("interrupts").exists());
+    cancel_agent_run(&host, &active).unwrap();
+    let finished = settled(&host, active.id);
+    assert_eq!(finished.state, State::Cancelled);
+    assert!(cancel_agent_run(&host, &active).is_err());
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("interrupts")).unwrap(),
+        "interrupt\n"
+    );
+    assert_eq!(
+        reconcile_agent_run(&host, &finished, true).unwrap(),
+        Reconciliation::Closed
+    );
+}
+
+#[test]
+fn interactive_work_claims_automation_agent_before_cleanup_or_reuse() {
+    if isolated("interactive_work_claims_automation_agent_before_cleanup_or_reuse").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let owner = Origin::Automation {
+        id: uuid::Uuid::new_v4(),
+    };
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&owner, &request, now())
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    let done = settled(&host, accepted.run.id);
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reconcile_agent_run(&host, &done, false).unwrap(),
+        Reconciliation::Idle,
+        "presentation alone is not takeover"
+    );
+    let gate = agent_gate(&host, accepted.agent.id);
+    let held = gate.lock().unwrap();
+    let other = host.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        sent.send(super::super::chat::process(
+            &other,
+            17,
+            ClientRequest::ChatCommand {
+                chat_id: session.id,
+                command: Command::Prompt {
+                    text: "interactive follow-up".into(),
+                    mode: PromptMode::Send,
+                    attachments: Vec::new(),
+                },
+            },
+        ))
+        .unwrap();
+    });
+    assert!(
+        received.recv_timeout(Duration::from_millis(50)).is_err(),
+        "UI commands share the cleanup gate"
+    );
+    drop(held);
+    received
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    thread.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap()
+        != "prompt\nprompt\n"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "interactive prompt was not received"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        reconcile_agent_run(&host, &done, true).unwrap(),
+        Reconciliation::UserOwned
+    );
+    let next = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(
+            &owner,
+            &Submit {
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: "automatic prompt must not run".into(),
+                idempotency_key: "after-takeover".into(),
+            },
+            now(),
+        )
+        .unwrap();
+    dispatch_accepted(&host, next.clone()).unwrap();
+    assert!(
+        settled(&host, next.run.id)
+            .result
+            .diagnostic
+            .unwrap()
+            .contains("Interactive work")
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(),
+        "prompt\nprompt\n"
+    );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatClose {
+            chat_id: session.id,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn removed_selected_account_refuses_a_queued_prompt_on_an_existing_actor() {
+    if isolated("removed_selected_account_refuses_a_queued_prompt_on_an_existing_actor").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let key = uuid::Uuid::new_v4();
+    let account_home = path.parent().unwrap().join("linked-claude");
+    std::fs::create_dir(&account_home).unwrap();
+    let store = Store::installation().unwrap();
+    store
+        .update(|accounts| {
+            accounts
+                .register(
+                    crate::account::registry::Registered {
+                        key,
+                        provider: Provider::Claude,
+                        linked_home: Some(account_home.clone()),
+                        label: Some("Owned fixture".into()),
+                        email: None,
+                        organization: None,
+                        added_at: 0,
+                    },
+                    &[],
+                )
+                .unwrap();
+        })
+        .unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.account = Some(Account::linked(Provider::Claude, key, account_home).id());
+    let owner = Origin::Automation {
+        id: uuid::Uuid::new_v4(),
+    };
+    let accepted = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(&owner, &request, now())
+        .unwrap();
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let next = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .submit_agent(
+            &owner,
+            &Submit {
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: "must not dispatch".into(),
+                idempotency_key: "removed-account".into(),
+            },
+            now(),
+        )
+        .unwrap();
+    store
+        .update(|accounts| {
+            accounts.unregister(key);
+        })
+        .unwrap();
+    dispatch_accepted(&host, next.clone()).unwrap();
+    let refused = settled(&host, next.run.id);
+    assert_eq!(refused.state, State::Failed);
+    assert!(
+        refused
+            .result
+            .diagnostic
+            .as_deref()
+            .unwrap()
+            .contains("removed")
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("prompts")).unwrap(),
+        "prompt\n"
+    );
+    assert_eq!(
+        reconcile_agent_run(&host, &refused, true).unwrap(),
+        Reconciliation::Closed,
+        "removal never blocks exact cleanup"
+    );
+}
+
 fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
     let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
     let path = root.join("registry.sqlite3");

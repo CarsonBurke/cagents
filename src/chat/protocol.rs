@@ -63,6 +63,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
 #[derive(Default)]
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
+    expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     spawned: std::sync::atomic::AtomicBool,
 }
 
@@ -71,6 +72,27 @@ impl ExecutionContext {
         Self {
             directory,
             ..Default::default()
+        }
+    }
+    pub(crate) fn restored(identity: crate::agent_execution::DirectoryIdentity) -> Self {
+        Self {
+            expected_directory: Some(identity),
+            ..Default::default()
+        }
+    }
+    pub(crate) fn directory_identity(
+        &self,
+    ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
+        match &self.directory {
+            Some(directory) => directory
+                .metadata()
+                .map(|metadata| {
+                    Some(crate::agent_execution::DirectoryIdentity::from_metadata(
+                        &metadata,
+                    ))
+                })
+                .map_err(|error| error.to_string()),
+            None => Ok(self.expected_directory),
         }
     }
     /// Call synchronously as soon as a child (including a launch holder) exists,
@@ -83,16 +105,12 @@ impl ExecutionContext {
         self.spawned.load(std::sync::atomic::Ordering::Acquire)
     }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt;
-        let Some(directory) = &self.directory else {
+        let Some(expected) = self.directory_identity()? else {
             return Ok(());
         };
-        let held = directory.metadata().map_err(|e| e.to_string())?;
         let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if !held.is_dir()
-            || !current.is_dir()
-            || held.dev() != current.dev()
-            || held.ino() != current.ino()
+        if !current.is_dir()
+            || expected != crate::agent_execution::DirectoryIdentity::from_metadata(&current)
         {
             return Err("The approved agent directory changed before provider dispatch".into());
         }

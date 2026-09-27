@@ -201,6 +201,25 @@ pub struct Agent {
     pub closed: bool,
 }
 
+/// Private launch policy stored with the accepted agent, not a path-based
+/// replacement authority. A restart can reconstruct checks without opening a
+/// replacement directory or blocking interruption of an existing provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DirectoryIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl DirectoryIdentity {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
     Accepted,

@@ -35,11 +35,17 @@ const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
-type CommandRequest = (
-    Option<crate::model::RunId>,
-    Command,
-    crossbeam_channel::Sender<Result<(), String>>,
-);
+enum ActorCommand {
+    Provider {
+        run: Option<crate::model::RunId>,
+        command: Command,
+    },
+    CloseIfIdle {
+        generation: u64,
+    },
+    InterruptRun(crate::model::RunId),
+}
+type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String>>);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Update {
@@ -391,7 +397,7 @@ impl Handle {
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
-            .try_send((run, command, reply))
+            .try_send((ActorCommand::Provider { run, command }, reply))
             .map_err(|e| format!("Chat command queue unavailable: {e}"))?;
         self.wake();
         response
@@ -400,6 +406,33 @@ impl Handle {
                 "Provider command acknowledgement timed out; do not retry blindly".to_string()
             })?
     }
+    fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
+        if self.is_completed()
+            || self.0.draining.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+        {
+            return Err("The provider actor is no longer accepting ownership commands".into());
+        }
+        let (reply, response) = crossbeam_channel::bounded(1);
+        self.0
+            .commands
+            .try_send((command, reply))
+            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+        self.wake();
+        response
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "Provider ownership command acknowledgement timed out".to_string())?
+    }
+
+    pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
+        self.ownership_command(ActorCommand::CloseIfIdle { generation })?;
+        self.close()
+    }
+
+    pub(crate) fn interrupt_run(&self, run: crate::model::RunId) -> Result<(), String> {
+        self.ownership_command(ActorCommand::InterruptRun(run))
+    }
+
     fn wake(&self) {
         let _ = self
             .0
@@ -1002,13 +1035,44 @@ impl Actor {
             if self.queued > QUEUE_BACKPRESSURE {
                 break;
             }
-            let Ok((run, command, reply)) = self.incoming.try_recv() else {
+            let Ok((command, reply)) = self.incoming.try_recv() else {
                 break;
             };
-            if closing {
+            if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
             }
+            let (run, command) = match command {
+                ActorCommand::Provider { run, command } => (run, command),
+                ActorCommand::InterruptRun(run) => {
+                    if self.execution.active() != Some(run) {
+                        let _ = reply.send(Err(
+                            "The requested run is no longer the provider's active turn".into(),
+                        ));
+                        continue;
+                    }
+                    (None, Command::Interrupt)
+                }
+                ActorCommand::CloseIfIdle { generation } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let idle = state.generation == generation
+                        && state.ready
+                        && !state.busy
+                        && !state.waiting
+                        && state.requests.is_empty()
+                        && self.pending.is_empty()
+                        && self.output.is_empty();
+                    if idle {
+                        self.stop.store(true, Ordering::Release);
+                    }
+                    let _ = reply.send(if idle {
+                        Ok(())
+                    } else {
+                        Err("Provider state changed before conditional idle close".into())
+                    });
+                    continue;
+                }
+            };
             if matches!(command, Command::LoadEarlier | Command::Refresh) {
                 match page_command(&self.store, &command) {
                     Ok(cached) => {
@@ -1025,6 +1089,15 @@ impl Actor {
                 }
             }
             let starts_turn = matches!(&command, Command::Prompt { .. });
+            if run.is_some() && starts_turn {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
+                    let _ = reply.send(Err(
+                        "The provider is no longer idle for the accepted run".into()
+                    ));
+                    continue;
+                }
+            }
             let authorizes_work = match &command {
                 Command::Prompt { .. }
                 | Command::Compact
