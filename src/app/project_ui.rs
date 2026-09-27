@@ -203,6 +203,48 @@ pub enum Action {
 }
 
 impl Cagents {
+    pub(super) fn selected_project_removal_blocker(&self, project: ProjectId) -> Option<String> {
+        let Some(row) = self.sidebar_model.project(project) else {
+            return Some("The project is no longer open.".into());
+        };
+        if self.project_ui.removing.contains_key(&row.repository)
+            || self.project_ui.closing.contains_key(&project)
+        {
+            return Some("Project removal is already in progress.".into());
+        }
+        self.project_has_unsaved_editors(project)
+            .then(|| "Save or close this project's unsaved editor buffers first.".into())
+    }
+
+    pub(super) fn selected_worktree_deletion_blocker(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<String> {
+        let Some(target) = self.project_target(project, Some(worktree)) else {
+            return Some("The worktree is no longer open.".into());
+        };
+        if self.project_ui.is_deleting(worktree) || self.project_ui.deleting_directory(&target.path)
+        {
+            return Some("Worktree deletion is already in progress.".into());
+        }
+        self.worktree_deletion_blocker(&target)
+    }
+
+    pub(super) fn delete_selected_worktree(
+        &mut self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Task<Message> {
+        if let Some(reason) = self.selected_worktree_deletion_blocker(project, worktree) {
+            self.status = Some(TransientNotice::warning(reason));
+            return Task::none();
+        }
+        let Some(target) = self.project_target(project, Some(worktree)) else {
+            return Task::none();
+        };
+        self.start_worktree_deletion(target)
+    }
     /// Apply a daemon-owned project close in every window. Channels use their
     /// existing checked close path; the project stays visible until those
     /// closes settle, so a refused close remains reachable and retryable.

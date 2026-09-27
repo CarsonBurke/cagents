@@ -853,7 +853,7 @@ fn channel_title_from_prompt(prompt: &str) -> Option<String> {
 /// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
-fn channel_display_title(channel: &ProjectChannel) -> &str {
+pub(super) fn channel_display_title(channel: &ProjectChannel) -> &str {
     if channel.title.is_empty() {
         "New channel"
     } else {

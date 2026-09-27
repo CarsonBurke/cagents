@@ -40,6 +40,17 @@ use crate::{
 };
 use row_interaction::RowInteraction;
 
+mod selection;
+pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
+
+pub fn selection_row_focus_id(row: SelectionRow) -> Id {
+    match row {
+        SelectionRow::Project(id) => entity_id("project.open", id),
+        SelectionRow::Worktree(_, id) => entity_id("worktree.open", id),
+        SelectionRow::Channel(id) => entity_id("channel.open", id),
+    }
+}
+
 /// The rendered bounds of the expanded pane, and the only bounds it has:
 /// `crate::settings` validates persisted widths against these, so a width can
 /// no longer pass validation and then silently render clamped.
@@ -2568,6 +2579,7 @@ struct PaneActivity {
 /// those are immutable snapshots on [`SidebarModel`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
+    rows: selection::Selection,
     query: String,
     filter: SidebarFilter,
     controls_expanded: bool,
@@ -2606,6 +2618,29 @@ pub struct SidebarState {
 }
 
 impl SidebarState {
+    pub fn select_rows(
+        &mut self,
+        row: SelectionRow,
+        intent: SelectionIntent,
+        visible: &[SelectionRow],
+    ) {
+        self.rows.select(row, intent, visible);
+    }
+
+    pub fn selected_rows(&self, visible: &[SelectionRow]) -> Vec<SelectionRow> {
+        self.rows.ordered(visible)
+    }
+
+    pub fn prune_row_selection(&mut self, visible: &[SelectionRow]) {
+        self.rows.retain_visible(visible);
+    }
+
+    pub fn clear_row_selection(&mut self) {
+        self.rows.clear();
+    }
+    pub fn has_row_selection(&self) -> bool {
+        !self.rows.is_empty()
+    }
     pub fn saved_view(&self) -> SidebarView {
         SidebarView {
             query: self.query.clone(),
@@ -3024,7 +3059,10 @@ impl SidebarState {
             | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
             | SidebarAction::Resize { .. }
-            | SidebarAction::ResizeFinished => {}
+            | SidebarAction::ResizeFinished
+            | SidebarAction::SelectRows { .. }
+            | SidebarAction::DeleteSelectedRows
+            | SidebarAction::ClearRowSelection => {}
         }
     }
 }
@@ -3046,6 +3084,12 @@ pub enum FileCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    SelectRows {
+        row: SelectionRow,
+        intent: SelectionIntent,
+    },
+    DeleteSelectedRows,
+    ClearRowSelection,
     DragWindow,
     MaximizeWindow,
     WindowMenu,
@@ -3359,6 +3403,9 @@ pub fn view<'a>(
             .width(Length::Fill)
             .height(Length::Fill),
     );
+    if !state.rows.is_empty() {
+        content = content.push(selection_controls(state, compact, modal_open));
+    }
     content = content
         .push(crate::design::horizontal_rule())
         .push(footer(compact, modal_open))
@@ -3392,6 +3439,54 @@ pub fn view<'a>(
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
+}
+
+fn selection_controls(
+    state: &SidebarState,
+    compact: bool,
+    modal_open: bool,
+) -> Element<'static, SidebarAction> {
+    let count = state.rows.len();
+    let homogeneous = state
+        .rows
+        .first()
+        .and_then(|row| state.rows.group_size(row))
+        .is_some();
+    let mut controls = Vec::with_capacity(3);
+    if !compact {
+        controls.push(
+            design::caption(format!("{count} selected"))
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    controls.push(icon_action(
+        "edit-delete-symbolic",
+        format!("Delete {count} selected rows"),
+        homogeneous
+            .then(|| gated(SidebarAction::DeleteSelectedRows, modal_open))
+            .flatten(),
+        stable_id("selection.delete"),
+    ));
+    controls.push(icon_action(
+        "window-close-symbolic",
+        "Clear row selection",
+        gated(SidebarAction::ClearRowSelection, modal_open),
+        stable_id("selection.clear"),
+    ));
+    let controls: Element<'static, SidebarAction> = if compact {
+        widget::column::with_children(controls)
+            .align_x(Alignment::Center)
+            .into()
+    } else {
+        widget::row::with_children(controls)
+            .align_y(Alignment::Center)
+            .into()
+    };
+    widget::container(controls)
+        .padding(4)
+        .width(Length::Fill)
+        .into()
 }
 
 fn header<'a>(
@@ -4255,6 +4350,7 @@ fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
 /// running is still running, and its cancel is the only way to stop it.
 fn unreachable_project<'a>(
     project: &'a SidebarProject,
+    state: &SidebarState,
     reason: &'a str,
     compact: bool,
     modal_open: bool,
@@ -4298,7 +4394,12 @@ fn unreachable_project<'a>(
         .id(chrome.open_id.clone())
         .name(description.clone())
         .on_press_maybe(reload.clone());
-    let header = grid.mount(crate::interaction::tooltip(control, description.clone()));
+    let header = RowInteraction::selectable(
+        grid.mount(crate::interaction::tooltip(control, description.clone())),
+        SelectionRow::Project(project.id),
+        state,
+        !modal_open,
+    );
     let spacing = cosmic::theme::spacing();
     if compact {
         // The compact rail has no room for the reason, which the tooltip and
@@ -4355,7 +4456,14 @@ fn project_view<'a>(
     let chrome = &entity.chrome;
     let project_id = entity.id;
     if let Some(reason) = entity.unreachable.as_deref() {
-        return unreachable_project(entity, reason, compact, modal_open, sticky_viewport);
+        return unreachable_project(
+            entity,
+            project.state,
+            reason,
+            compact,
+            modal_open,
+            sticky_viewport,
+        );
     }
     let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
@@ -4430,6 +4538,16 @@ fn project_view<'a>(
         entity.kind == ProjectKind::Git,
         entity.github_ready,
         project.editors,
+        project
+            .state
+            .rows
+            .group_size(SelectionRow::Project(project_id)),
+    );
+    let header = RowInteraction::selectable(
+        header,
+        SelectionRow::Project(project_id),
+        project.state,
+        !modal_open,
     );
     let mut column = widget::column::with_capacity(worktree_count + 2).spacing(0);
     for row in operation_rows(entity, modal_open) {
@@ -4438,21 +4556,43 @@ fn project_view<'a>(
 
     if expanded {
         for channel in &project.channels {
-            column = column.push(channel_view(channel, modal_open, false));
+            column = column.push(RowInteraction::selectable(
+                channel_view(
+                    channel,
+                    modal_open,
+                    false,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Channel(channel.id)),
+                ),
+                SelectionRow::Channel(channel.id),
+                project.state,
+                !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+            ));
         }
         for &worktree in &project.worktrees {
-            column = column.push(worktree_view(
-                project_id,
-                worktree,
-                is_primary_worktree(&entity.repository, &worktree.path),
-                selection,
-                modal_open,
-                entity.github_ready,
-                project.editors,
-                project.state.has_agent_update(project_id, worktree.id),
-                project.state.agent_activity(project_id, worktree.id),
-                project.state.worktree_has_panes(project_id, worktree.id),
-                false,
+            column = column.push(RowInteraction::selectable(
+                worktree_view(
+                    project_id,
+                    worktree,
+                    is_primary_worktree(&entity.repository, &worktree.path),
+                    selection,
+                    modal_open,
+                    entity.github_ready,
+                    project.editors,
+                    project.state.has_agent_update(project_id, worktree.id),
+                    project.state.agent_activity(project_id, worktree.id),
+                    project.state.worktree_has_panes(project_id, worktree.id),
+                    false,
+                    project
+                        .state
+                        .rows
+                        .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                ),
+                SelectionRow::Worktree(project_id, worktree.id),
+                project.state,
+                !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
             ));
         }
     }
@@ -4489,6 +4629,16 @@ fn compact_project<'a>(
         entity.kind == ProjectKind::Git,
         entity.github_ready,
         project.editors,
+        project
+            .state
+            .rows
+            .group_size(SelectionRow::Project(entity.id)),
+    );
+    let header = RowInteraction::selectable(
+        header,
+        SelectionRow::Project(entity.id),
+        project.state,
+        !modal_open,
     );
     let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
@@ -4503,21 +4653,43 @@ fn compact_project<'a>(
         column = column.push(row);
     }
     for channel in &project.channels {
-        column = column.push(channel_view(channel, modal_open, true));
+        column = column.push(RowInteraction::selectable(
+            channel_view(
+                channel,
+                modal_open,
+                true,
+                project
+                    .state
+                    .rows
+                    .group_size(SelectionRow::Channel(channel.id)),
+            ),
+            SelectionRow::Channel(channel.id),
+            project.state,
+            !modal_open && channel.deletion != Some(RowDeletion::Deleting),
+        ));
     }
     for &worktree in &project.worktrees {
-        column = column.push(worktree_view(
-            entity.id,
-            worktree,
-            is_primary_worktree(&entity.repository, &worktree.path),
-            selection,
-            modal_open,
-            entity.github_ready,
-            project.editors,
-            project.state.has_agent_update(entity.id, worktree.id),
-            project.state.agent_activity(entity.id, worktree.id),
-            project.state.worktree_has_panes(entity.id, worktree.id),
-            true,
+        column = column.push(RowInteraction::selectable(
+            worktree_view(
+                entity.id,
+                worktree,
+                is_primary_worktree(&entity.repository, &worktree.path),
+                selection,
+                modal_open,
+                entity.github_ready,
+                project.editors,
+                project.state.has_agent_update(entity.id, worktree.id),
+                project.state.agent_activity(entity.id, worktree.id),
+                project.state.worktree_has_panes(entity.id, worktree.id),
+                true,
+                project
+                    .state
+                    .rows
+                    .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+            ),
+            SelectionRow::Worktree(entity.id, worktree.id),
+            project.state,
+            !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
         ));
     }
     column = column.push(new_row_action(
@@ -4746,6 +4918,7 @@ fn channel_view(
     channel: &SidebarChannel,
     modal_open: bool,
     compact: bool,
+    selection_count: Option<usize>,
 ) -> Element<'_, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
@@ -4810,6 +4983,7 @@ fn channel_view(
             crate::interaction::tooltip(action, &*channel.tooltip),
             channel.id,
             inert,
+            selection_count,
         ),
         deletion,
         compact,
@@ -4833,15 +5007,20 @@ fn channel_context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
+    selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let Some(menu) = (!modal_open).then(|| {
+    let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
         items(
             &std::collections::HashMap::new(),
             vec![Item::Button(
-                "Delete channel…".to_owned(),
+                if selection_count.unwrap_or(1) > 1 {
+                    format!("Delete {} selected channels…", selection_count.unwrap())
+                } else {
+                    "Delete channel…".to_owned()
+                },
                 None,
-                ChannelContextCommand(channel_id),
+                ChannelContextCommand(channel_id, selection_count.unwrap_or(1) > 1),
             )],
         )
     }) else {
@@ -4851,13 +5030,17 @@ fn channel_context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChannelContextCommand(ChannelId);
+struct ChannelContextCommand(ChannelId, bool);
 
 impl widget::menu::Action for ChannelContextCommand {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        SidebarAction::DeleteChannel { channel_id: self.0 }
+        if self.1 {
+            SidebarAction::DeleteSelectedRows
+        } else {
+            SidebarAction::DeleteChannel { channel_id: self.0 }
+        }
     }
 }
 
@@ -4962,6 +5145,7 @@ fn worktree_view<'a>(
     activity: Option<crate::agent::ActivityState>,
     has_panes: bool,
     compact: bool,
+    selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
@@ -5083,6 +5267,7 @@ fn worktree_view<'a>(
             true,
             github_ready,
             editors,
+            selection_count,
         ),
         deletion,
         compact,
@@ -5127,12 +5312,15 @@ pub enum ProjectCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand);
+struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand, bool);
 
 impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
+        if self.3 {
+            return SidebarAction::DeleteSelectedRows;
+        }
         SidebarAction::ProjectCommand {
             project_id: self.0,
             worktree_id: self.1,
@@ -5149,9 +5337,10 @@ fn context_controls<'a>(
     git: bool,
     github_ready: bool,
     editors: &'a [SidebarEditor],
+    selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let menu = (!modal_open).then(|| {
+    let menu = (!modal_open && selection_count.is_some()).then(|| {
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
@@ -5173,10 +5362,31 @@ fn context_controls<'a>(
                 ProjectCommand::RepositoryUrl,
             ));
         }
-        if worktree_id.is_some() {
-            commands.push(("Delete worktree…".to_owned(), None, ProjectCommand::Delete));
-        } else {
-            commands.push(("Remove project…".to_owned(), None, ProjectCommand::Remove));
+        if selection_count != Some(1) {
+            commands.clear();
+        }
+        if let Some(count) = selection_count {
+            if worktree_id.is_some() {
+                commands.push((
+                    if count > 1 {
+                        format!("Delete {count} selected worktrees…")
+                    } else {
+                        "Delete worktree…".to_owned()
+                    },
+                    None,
+                    ProjectCommand::Delete,
+                ));
+            } else {
+                commands.push((
+                    if count > 1 {
+                        format!("Remove {count} selected projects…")
+                    } else {
+                        "Remove project…".to_owned()
+                    },
+                    None,
+                    ProjectCommand::Remove,
+                ));
+            }
         }
         let entries = commands
             .iter()
@@ -5184,7 +5394,13 @@ fn context_controls<'a>(
                 Item::Button(
                     label.clone(),
                     icon.clone(),
-                    ContextCommand(project_id, worktree_id, command),
+                    ContextCommand(
+                        project_id,
+                        worktree_id,
+                        command,
+                        selection_count.is_some_and(|count| count > 1)
+                            && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
+                    ),
                 )
             })
             .collect();
@@ -7945,6 +8161,36 @@ struct FilteredProject<'a> {
     state: &'a SidebarState,
 }
 
+/// The selectable rows actually drawn, including disclosure and filter state.
+pub fn visible_selection_rows(
+    model: &SidebarModel,
+    state: &SidebarState,
+    compact: bool,
+) -> Vec<SelectionRow> {
+    let searching = (!compact || state.controls_expanded) && !state.query.trim().is_empty();
+    let mut rows = Vec::new();
+    for project in filtered_projects(model, state, compact) {
+        rows.push(SelectionRow::Project(project.project.id));
+        if compact || searching || !state.collapsed_projects.contains(&project.project.id) {
+            rows.extend(
+                project
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
+                    .map(|channel| SelectionRow::Channel(channel.id)),
+            );
+            rows.extend(
+                project
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| worktree.deletion != Some(RowDeletion::Deleting))
+                    .map(|worktree| SelectionRow::Worktree(project.project.id, worktree.id)),
+            );
+        }
+    }
+    rows
+}
+
 /// A compact query applies only while its search popover is available, so
 /// hiding the popover cannot leave an invisible query filtering the rail.
 fn filtered_projects<'a>(
@@ -8226,6 +8472,11 @@ mod row_interaction {
     }
 
     enum Kind {
+        Selectable {
+            row: super::SelectionRow,
+            selected: bool,
+            enabled: bool,
+        },
         FilteredScroll(SidebarFilter),
         Projects {
             ids: Vec<ProjectId>,
@@ -8246,6 +8497,8 @@ mod row_interaction {
 
     #[derive(Default)]
     struct State {
+        modifiers: keyboard::Modifiers,
+        selection_bounds: Option<Rectangle>,
         origin: Option<(ProjectId, Point)>,
         dragging: bool,
         drop: Option<(Option<ProjectId>, f32)>,
@@ -8276,7 +8529,7 @@ mod row_interaction {
     }
 
     #[derive(Default)]
-    struct FocusWithin(bool);
+    struct FocusWithin(bool, Option<Id>, Option<Rectangle>);
 
     impl Operation for FocusWithin {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -8285,15 +8538,33 @@ mod row_interaction {
 
         fn focusable(
             &mut self,
-            _id: Option<&Id>,
-            _bounds: Rectangle,
+            id: Option<&Id>,
+            bounds: Rectangle,
             state: &mut dyn operation::Focusable,
         ) {
-            self.0 |= state.is_focused();
+            if self.1.as_ref().is_none_or(|target| Some(target) == id) {
+                self.0 |= state.is_focused();
+                self.2 = Some(bounds);
+            }
         }
     }
 
     impl<'a> RowInteraction<'a> {
+        pub(super) fn selectable(
+            content: Element<'a, SidebarAction>,
+            row: super::SelectionRow,
+            state: &super::SidebarState,
+            enabled: bool,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::Selectable {
+                    row,
+                    selected: state.rows.contains(row),
+                    enabled,
+                },
+            })
+        }
         pub(super) fn filtered_scroll(
             content: Element<'a, SidebarAction>,
             filter: SidebarFilter,
@@ -8347,8 +8618,10 @@ mod row_interaction {
 
         fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
             let mut focus = FocusWithin::default();
-            if !matches!(self.kind, Kind::Actions { .. }) {
-                return;
+            match self.kind {
+                Kind::Selectable { row, .. } => focus.1 = Some(super::selection_row_focus_id(row)),
+                Kind::Actions { .. } => {}
+                _ => return,
             }
             for ((child, tree), layout) in self
                 .children
@@ -8360,7 +8633,9 @@ mod row_interaction {
                     .as_widget_mut()
                     .operate(tree, layout, renderer, &mut focus);
             }
-            tree.state.downcast_mut::<State>().focused = focus.0;
+            let state = tree.state.downcast_mut::<State>();
+            state.focused = focus.0;
+            state.selection_bounds = focus.2;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<ProjectId> {
@@ -8589,6 +8864,7 @@ mod row_interaction {
             shell: &mut Shell<'_, SidebarAction>,
             viewport: &Rectangle,
         ) {
+            self.focus(tree, layout, renderer);
             if let Kind::Projects {
                 viewport: sticky, ..
             } = &self.kind
@@ -8597,7 +8873,69 @@ mod row_interaction {
             }
             let reserves = matches!(self.kind, Kind::Actions { reserve } if reserve > 0.0);
             let state = tree.state.downcast_mut::<State>();
+            match event {
+                Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                    state.modifiers = *modifiers
+                }
+                Event::Window(window::Event::Unfocused) => {
+                    state.modifiers = keyboard::Modifiers::empty()
+                }
+                _ => {}
+            }
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
+            if let Kind::Selectable {
+                row, enabled: true, ..
+            } = self.kind
+            {
+                let additive = state.modifiers.control() || state.modifiers.logo();
+                match event {
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                        if hovered
+                            && state
+                                .selection_bounds
+                                .is_some_and(|bounds| cursor.is_over(bounds)) =>
+                    {
+                        let intent = if state.modifiers.shift() {
+                            super::SelectionIntent::Range { extend: additive }
+                        } else if additive {
+                            super::SelectionIntent::Toggle
+                        } else {
+                            super::SelectionIntent::Replace
+                        };
+                        shell.publish(SidebarAction::SelectRows { row, intent });
+                        if additive || state.modifiers.shift() {
+                            shell.capture_event();
+                            return;
+                        }
+                    }
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if hovered => {
+                        shell.publish(SidebarAction::SelectRows {
+                            row,
+                            intent: super::SelectionIntent::Context,
+                        });
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modifiers,
+                        ..
+                    }) if state.focused && modifiers.is_empty() => match key {
+                        keyboard::key::Named::Delete | keyboard::key::Named::Backspace => {
+                            // A Ctrl-click can leave focus on a deselected row.
+                            // Delete acts on the current selection, not that row.
+                            shell.publish(SidebarAction::DeleteSelectedRows);
+                            shell.capture_event();
+                            return;
+                        }
+                        keyboard::key::Named::Escape => {
+                            shell.publish(SidebarAction::ClearRowSelection);
+                            shell.capture_event();
+                            return;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
             if hovered != state.hovered {
                 state.hovered = hovered;
                 shell.request_redraw();
@@ -8609,7 +8947,9 @@ mod row_interaction {
             }
             if matches!(self.kind, Kind::Projects { enabled: true, .. }) {
                 match event {
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if hovered => {
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                        if hovered && state.modifiers.is_empty() =>
+                    {
                         if let Some(point) = cursor.position() {
                             state.origin = self.header_at(layout, point).map(|id| (id, point));
                         }
@@ -8891,6 +9231,24 @@ mod row_interaction {
                         .draw(tree, renderer, theme, style, layout, cursor, viewport);
                 }
             }
+            if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
+                if let Some(clip) = layout.bounds().intersection(viewport) {
+                    renderer.with_layer(clip, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: layout.bounds().shrink(1.0),
+                                border: cosmic::iced::Border {
+                                    color: crate::design::accent_color(theme),
+                                    width: 1.0,
+                                    radius: 3.0.into(),
+                                },
+                                ..Default::default()
+                            },
+                            cosmic::iced::Color::TRANSPARENT,
+                        );
+                    });
+                }
+            }
             if let Some((_, y)) = state.drop {
                 if let Some(clip) = layout.bounds().intersection(viewport) {
                     renderer.with_layer(clip, |renderer| {
@@ -8972,6 +9330,18 @@ mod row_interaction {
                         child.as_widget().a11y_nodes(layout, tree, cursor)
                     }),
             );
+            if let Kind::Selectable { selected, .. } = self.kind {
+                let mut applied = false;
+                let mut select = |node: &mut iced_accessibility::A11yNode| {
+                    if !applied && node.node().role() == iced_accessibility::accesskit::Role::Button
+                    {
+                        node.node_mut().set_selected(selected);
+                        applied = true;
+                    }
+                };
+                accessible.root_mut().iter_mut().for_each(&mut select);
+                accessible.children_mut().iter_mut().for_each(select);
+            }
             // libcosmic buttons report content-coordinate bounds; its scrollable
             // forwards a virtual offset without translating their AccessKit nodes.
             // Translate once at the list boundary, not per nested decorator.
@@ -9105,6 +9475,136 @@ pub(crate) mod tests {
         let pr = project.pull_requests[0].clone();
         project.worktrees[1].set_pull_request(pr);
         project
+    }
+
+    #[test]
+    fn selection_order_matches_visible_rows_including_channels_and_collapses() {
+        let mut entry = project();
+        let channel = ChannelId::new();
+        entry.channels.push(SidebarChannel::new(
+            channel,
+            "Conversation".into(),
+            false,
+            None,
+            false,
+            0,
+            false,
+            1,
+        ));
+        let id = entry.id;
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        let rows = visible_selection_rows(&model, &state, false);
+        assert_eq!(rows[0], SelectionRow::Project(id));
+        assert_eq!(rows[1], SelectionRow::Channel(channel));
+        assert!(matches!(rows[2], SelectionRow::Worktree(..)));
+        state.apply(&SidebarAction::ToggleProject(id));
+        assert_eq!(
+            visible_selection_rows(&model, &state, false),
+            vec![SelectionRow::Project(id)]
+        );
+        assert_eq!(
+            visible_selection_rows(&model, &state, true),
+            rows,
+            "compact rail ignores disclosure"
+        );
+        state.apply(&SidebarAction::SearchChanged("not-present".into()));
+        assert!(visible_selection_rows(&model, &state, false).is_empty());
+    }
+
+    #[test]
+    fn row_modifier_selection_does_not_activate_and_delete_requires_row_focus() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard, widget::operation},
+            keyboard, mouse,
+        };
+        let renderer = headless_renderer();
+        let row = SelectionRow::Project(project_id(1));
+        let state = SidebarState::default();
+        let mut element = RowInteraction::selectable(
+            button::custom(widget::text::body("Project"))
+                .id(selection_row_focus_id(row))
+                .name("Project")
+                .width(120)
+                .height(32)
+                .on_press(SidebarAction::OpenRepositoryPicker)
+                .into(),
+            row,
+            &state,
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(120.0, 32.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let key = || {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Delete),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Delete),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Delete),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        let dispatch = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree, event: Event| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(30.0, 16.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        assert!(
+            dispatch(&mut element, &mut tree, key()).is_empty(),
+            "editor focus must not delete rows"
+        );
+        dispatch(
+            &mut element,
+            &mut tree,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+        );
+        assert_eq!(
+            dispatch(
+                &mut element,
+                &mut tree,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            ),
+            vec![SidebarAction::SelectRows {
+                row,
+                intent: SelectionIntent::Toggle
+            }]
+        );
+        assert!(
+            dispatch(
+                &mut element,
+                &mut tree,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            )
+            .is_empty()
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(selection_row_focus_id(row)),
+        );
+        assert_eq!(
+            dispatch(&mut element, &mut tree, key()),
+            vec![SidebarAction::DeleteSelectedRows],
+            "keyboard deletion must not reselect a focused row that Ctrl-click deselected"
+        );
     }
 
     /// Unvisited history candidates follow sidebar order, worktrees before
@@ -9676,7 +10176,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false);
+            let mut element = channel_view(channel, false, false, Some(1));
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -10108,7 +10608,16 @@ pub(crate) mod tests {
                 .height(32)
                 .into(),
         ]);
-        let mut element = context_controls(content, project_id(1), None, false, true, false, &[]);
+        let mut element = context_controls(
+            content,
+            project_id(1),
+            None,
+            false,
+            true,
+            false,
+            &[],
+            Some(1),
+        );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
         let node = element.as_widget_mut().layout(
@@ -10380,7 +10889,10 @@ pub(crate) mod tests {
             let mut sidebar = Sidebar::scrolling();
             sidebar.scroll(scroll, MENU_ROW);
             let activated = sidebar.click(mouse::Button::Left, MENU_ROW);
-            let Some(SidebarAction::OpenWorktree { worktree_id, .. }) = activated.first() else {
+            let Some(SidebarAction::OpenWorktree { worktree_id, .. }) = activated
+                .iter()
+                .find(|action| matches!(action, SidebarAction::OpenWorktree { .. }))
+            else {
                 panic!("a worktree row sits under the pointer (scroll={scroll}): {activated:?}");
             };
             let under_pointer = *worktree_id;
@@ -10436,10 +10948,10 @@ pub(crate) mod tests {
         let row = (0..40)
             .map(|step| Point::new(56.0, 8.0 * step as f32))
             .find(|point| {
-                matches!(
-                    sidebar.click(mouse::Button::Left, *point).first(),
-                    Some(SidebarAction::OpenChannel { .. })
-                )
+                sidebar
+                    .click(mouse::Button::Left, *point)
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::OpenChannel { .. }))
             })
             .expect("the rail draws the project's channel row");
 
@@ -10796,6 +11308,7 @@ pub(crate) mod tests {
                 true,
                 true,
                 &[],
+                Some(1),
             )
         };
         let renderer = headless_renderer();
