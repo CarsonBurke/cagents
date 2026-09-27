@@ -990,40 +990,41 @@ impl Worker {
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
-        let (mut held, output) =
-            match &config.adoption {
-                Some(socket) => {
-                    let adopted = holder::adopt_recoverable(
-                        socket,
-                        child_exit_tx,
-                        config.holder_recovery.clone(),
-                    )?;
-                    // Drawing the screen again is not news, except for the title
-                    // it sets: whatever it provoked, a reply or a bell, happened
-                    // when its predecessor drew it.
-                    terminal.vt_write(&adopted.screen);
-                    effects
-                        .borrow_mut()
-                        .retain(|effect| matches!(effect, Effect::Title(_)));
-                    if adopted.screen_lost {
-                        // A crash has no emulator snapshot. Nudge full-screen
-                        // clients to redraw on their surviving controlling PTY.
-                        adopted.held.master.request_redraw().map_err(|error| {
-                            format!("request surviving terminal redraw: {error}")
-                        })?;
-                    }
-                    (adopted.held, adopted.output)
+        let (mut held, output) = match &config.adoption {
+            Some(socket) => {
+                let adopted = holder::adopt_recoverable(
+                    socket,
+                    child_exit_tx,
+                    config.holder_recovery.clone(),
+                )?;
+                // Drawing the screen again is not news, except for the title
+                // it sets: whatever it provoked, a reply or a bell, happened
+                // when its predecessor drew it.
+                terminal.vt_write(&adopted.screen);
+                effects
+                    .borrow_mut()
+                    .retain(|effect| matches!(effect, Effect::Title(_)));
+                if adopted.screen_lost {
+                    // A crash has no emulator snapshot. Nudge full-screen
+                    // clients to redraw on their surviving controlling PTY.
+                    adopted
+                        .held
+                        .master
+                        .request_redraw()
+                        .map_err(|error| format!("request surviving terminal redraw: {error}"))?;
                 }
-                None => {
-                    let environment = crate::account::Account::PROVIDERS
-                        .into_iter()
-                        .filter_map(|provider| {
-                            let name = crate::account::home_variable(provider)?;
-                            Some((name.to_owned(), command.get_env(name)?.to_str()?.to_owned()))
-                        })
-                        .collect();
-                    let _account = crate::account::registry::authorize_spawn(&environment, None)
-                        .map_err(|error| error.to_string())?;
+                (adopted.held, adopted.output)
+            }
+            None => {
+                let environment = crate::account::Account::PROVIDERS
+                    .into_iter()
+                    .filter_map(|provider| {
+                        let name = crate::account::home_variable(provider)?;
+                        Some((name.to_owned(), command.get_env(name)?.to_str()?.to_owned()))
+                    })
+                    .collect();
+                let _account = crate::account::registry::authorize_spawn(&environment, None)
+                    .map_err(|error| error.to_string())?;
                 let mut skill_environment: std::collections::BTreeMap<String, String> = environment;
                 if let Some(home) = command.get_env("HOME").and_then(|value| value.to_str()) {
                     skill_environment.insert("HOME".into(), home.into());
@@ -1038,17 +1039,17 @@ impl Worker {
                 ) {
                     command.env("PATH", path);
                 }
-                    (
-                        holder::spawn_recoverable(
-                            command,
-                            pty_size(current_size),
-                            child_exit_tx,
-                            config.holder_recovery.clone(),
-                        )?,
-                        Vec::new(),
-                    )
-                }
-            };
+                (
+                    holder::spawn_recoverable(
+                        command,
+                        pty_size(current_size),
+                        child_exit_tx,
+                        config.holder_recovery.clone(),
+                    )?,
+                    Vec::new(),
+                )
+            }
+        };
         // The holder reaps the root, so its pid identifies it only while the
         // pidfd still reaches an unreaped process: checked after the capture,
         // that proves the capture read the root and not a reused pid.

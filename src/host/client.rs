@@ -803,7 +803,8 @@ fn process_request(
                     }
                 };
                 let paired = state.chats.get(&session.id).map(|record| {
-                    if record.session.launch.provider != crate::agent::Provider::Codex
+                    if (record.session.launch.provider != crate::agent::Provider::Codex
+                        && !record.owns_execution_console())
                         || !record.session.terminal.as_ref().is_some_and(|terminal| {
                             terminal.id == session.id && terminal.launch == session.launch
                         })
@@ -1163,6 +1164,15 @@ mod tests {
 
     #[test]
     fn completed_terminal_requires_confirmation_for_its_exact_native_actor() {
+        assert_completed_native_confirmation(crate::agent::Provider::Codex);
+    }
+
+    #[test]
+    fn completed_console_requires_confirmation_for_its_exact_native_actor() {
+        assert_completed_native_confirmation(crate::agent::Provider::Claude);
+    }
+
+    fn assert_completed_native_confirmation(provider: crate::agent::Provider) {
         use crate::{
             chat::{
                 self,
@@ -1242,13 +1252,16 @@ mod tests {
             state.chats.insert(
                 session.id,
                 super::super::chat::Record {
+                    execution_instance: uuid::Uuid::new_v4(),
+                    console_recipe: (provider != crate::agent::Provider::Codex)
+                        .then(|| session.launch.clone()),
                     session: chat::Session {
                         id: session.id,
                         owned_codex_listener: None,
                         proof: Some(proof),
                         terminal: Some(session.clone()),
                         launch: chat::Launch {
-                            provider: crate::agent::Provider::Codex,
+                            provider,
                             recipe,
                             session_id: Some("exact-thread".into()),
                         },
