@@ -20,7 +20,7 @@ pub struct Observer {
     listener: Option<UiActivationListener>,
     started: bool,
     presence_wake: Option<crossbeam_channel::Sender<()>>,
-    acknowledging: Arc<Mutex<std::collections::BTreeSet<uuid::Uuid>>>,
+    pending_acknowledgements: Arc<Mutex<std::collections::BTreeSet<uuid::Uuid>>>,
 }
 
 impl Default for Observer {
@@ -42,7 +42,7 @@ impl Default for Observer {
             listener: None,
             started: false,
             presence_wake: None,
-            acknowledging: Default::default(),
+            pending_acknowledgements: Default::default(),
         }
     }
 }
@@ -116,6 +116,7 @@ impl Observer {
         if self.presence_wake.is_none() {
             let (wake, receiver) = crossbeam_channel::bounded(1);
             let presence = self.presence.clone();
+            let acknowledgements = self.pending_acknowledgements.clone();
             let actions = self.sender.clone();
             let stopped = self.sender.clone();
             std::thread::Builder::new()
@@ -128,10 +129,16 @@ impl Observer {
                             let result = (|| {
                                 let socket = crate::terminal_ipc::daemon_socket_path()
                                     .map_err(|e| e.to_string())?;
-                                ControlClient::connect(&socket)
-                                    .map_err(|e| e.to_string())?
+                                let mut client =
+                                    ControlClient::connect(&socket).map_err(|e| e.to_string())?;
+                                client
                                     .notification_presence(presence)
-                                    .map_err(|e| e.to_string())
+                                    .map_err(|e| e.to_string())?;
+                                flush_acknowledgements(&acknowledgements, |id| {
+                                    client
+                                        .acknowledge_notification(id)
+                                        .map_err(|e| e.to_string())
+                                })
                             })();
                             if let Err(error) = &result {
                                 let _ = actions.try_send(Action::Failed(error.clone()));
@@ -221,42 +228,19 @@ impl Observer {
     }
 
     pub fn acknowledge(&self, ids: Vec<uuid::Uuid>) -> cosmic::iced::Task<Action> {
-        let ids = {
-            let mut pending = self.acknowledging.lock().unwrap_or_else(|p| p.into_inner());
-            ids.into_iter()
-                .filter(|id| pending.insert(*id))
-                .collect::<Vec<_>>()
+        let changed = {
+            let mut pending = self
+                .pending_acknowledgements
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let before = pending.len();
+            pending.extend(ids);
+            before != pending.len()
         };
-        if ids.is_empty() {
-            return cosmic::iced::Task::none();
+        if changed && let Some(wake) = &self.presence_wake {
+            let _ = wake.try_send(());
         }
-        let pending = self.acknowledging.clone();
-        cosmic::iced::Task::perform(
-            async move {
-                let remove = ids.clone();
-                let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let socket =
-                        crate::terminal_ipc::daemon_socket_path().map_err(|e| e.to_string())?;
-                    let mut client = ControlClient::connect(&socket).map_err(|e| e.to_string())?;
-                    for id in ids {
-                        client
-                            .acknowledge_notification(id)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|result| result);
-                let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
-                for id in remove {
-                    pending.remove(&id);
-                }
-                result.err().map(Action::Failed)
-            },
-            |action| action,
-        )
-        .and_then(cosmic::iced::Task::done)
+        cosmic::iced::Task::none()
     }
 
     pub fn focus(&self, target: Option<Target>) -> cosmic::iced::Task<Action> {
@@ -272,6 +256,26 @@ impl Observer {
         }
         cosmic::iced::Task::none()
     }
+}
+
+fn flush_acknowledgements(
+    pending: &Mutex<std::collections::BTreeSet<uuid::Uuid>>,
+    mut acknowledge: impl FnMut(uuid::Uuid) -> Result<(), String>,
+) -> Result<(), String> {
+    let ids = pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    for id in ids {
+        acknowledge(id)?;
+        pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+    }
+    Ok(())
 }
 
 fn run_presence_updates(
@@ -299,6 +303,39 @@ fn run_presence_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_focus_ack_is_retained_and_retried_without_another_ui_edge() {
+        let id = uuid::Uuid::new_v4();
+        let pending = Arc::new(Mutex::new(std::collections::BTreeSet::from([id])));
+        let (wake, receiver) = crossbeam_channel::bounded(1);
+        wake.send(()).unwrap();
+        drop(wake); // No later focus edge is available to rescue this retry.
+        let mut attempts = Vec::new();
+        run_presence_updates(
+            receiver,
+            &Mutex::new(Presence::default()),
+            |_| {
+                let result = flush_acknowledgements(&pending, |found| {
+                    assert_eq!(found, id);
+                    attempts.push(std::time::Instant::now());
+                    if attempts.len() == 1 {
+                        Err("daemon temporarily unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if result.is_err() {
+                    assert!(pending.lock().unwrap().contains(&id));
+                }
+                result.is_ok()
+            },
+            || false,
+        );
+        assert!(pending.lock().unwrap().is_empty());
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[1].duration_since(attempts[0]) >= std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn delayed_presence_rpc_cannot_overwrite_a_later_focus_edge() {
         let presence = Arc::new(Mutex::new(Presence {
