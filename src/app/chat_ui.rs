@@ -1106,7 +1106,11 @@ enum Connection {
 /// and OMP once its history has loaded. The message waits here until the
 /// conversation takes it, and returns to the composer if it never does.
 struct Queued {
+    /// The reader's wording, restored if startup cannot take the message.
     text: String,
+    /// Resolve draft skill choices before the provider replaces the draft
+    /// catalog; two provider skills may share a name after startup.
+    resolved_text: String,
     attachments: Vec<Attachment>,
     /// The model the draft chose, to be selected before the message is sent.
     /// `None` once it has been, or when the provider's default was chosen.
@@ -1121,6 +1125,16 @@ struct Queued {
     rechecking: bool,
 }
 impl Queued {
+    fn submission_text<'a>(&'a self, snapshot: &Snapshot) -> &'a str {
+        // A provider command learned during startup takes precedence over a
+        // draft skill with the same slash name.
+        if slash_invocation(&self.text, snapshot).is_some() {
+            &self.text
+        } else {
+            &self.resolved_text
+        }
+    }
+
     /// Brings the queue back to [`Cagents::dispatch_queued`] after `wait`,
     /// unless a look back is already scheduled.
     fn look_again(&mut self, target: Target, wait: Duration) -> Task<Message> {
@@ -3370,8 +3384,15 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         session.id = TerminalId::new();
+        let text = runtime.composer.text();
+        let resolved_text = completion::invocations(
+            completion::from_leading_skill(&text, &runtime.snapshot.skills),
+            &runtime.snapshot.skills,
+        )
+        .into_owned();
         runtime.queued = Some(Queued {
-            text: runtime.composer.text(),
+            text,
+            resolved_text,
             attachments: std::mem::take(&mut runtime.attachments),
             model,
             draft: session.clone(),
@@ -3460,7 +3481,7 @@ impl Cagents {
             return Task::none();
         };
         match submission(
-            &queued.text,
+            queued.submission_text(&snapshot),
             &snapshot,
             &queued.attachments,
             PromptMode::Send,
@@ -5653,15 +5674,16 @@ mod tests {
         assert!(runtime.is_draft());
         assert!(runtime.handle().is_none());
         assert!(!app.chat_start_pending(card));
+        assert_eq!(rows[0].insertion, "$review");
         assert!(
             app.chat_runtime_mut(target)
                 .unwrap()
-                .complete(INVOCATION, false)
+                .complete("$review", false)
         );
         write(&mut app, card, "this change");
         assert_eq!(
             chat_runtime(&app, card).composer.text().trim(),
-            format!("{INVOCATION} this change")
+            "$review this change"
         );
         submit(&mut app, card);
         assert!(app.chat_start_pending(card));
@@ -5672,8 +5694,54 @@ mod tests {
                 .unwrap()
                 .text
                 .trim(),
+            "$review this change"
+        );
+        assert_eq!(
+            chat_runtime(&app, card)
+                .queued
+                .as_ref()
+                .unwrap()
+                .resolved_text
+                .trim(),
             format!("{INVOCATION} this change")
         );
+    }
+
+    #[test]
+    fn a_provider_command_takes_precedence_over_a_queued_draft_skill() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = chat_runtime(&app, card);
+        let target = runtime.target;
+        let launch = runtime.session.launch.clone();
+        let _ = app.update(Message::ChatUi(Action::DraftSkills(
+            target,
+            launch,
+            vec![chat::Skill {
+                name: "review".into(),
+                description: String::new(),
+                invocation: "[$review](/skills/review/SKILL.md)".into(),
+            }],
+        )));
+        write(&mut app, card, "/review this change");
+        submit(&mut app, card);
+        let queued = chat_runtime(&app, card).queued.as_ref().unwrap();
+        assert_eq!(
+            queued.resolved_text,
+            "[$review](/skills/review/SKILL.md) this change"
+        );
+        let provider = Snapshot {
+            commands: vec![chat::SlashCommand {
+                name: "review".into(),
+                description: String::new(),
+            }],
+            ..Snapshot::default()
+        };
+        assert_eq!(queued.submission_text(&provider), "/review this change");
+        assert!(matches!(
+            submission(queued.submission_text(&provider), &provider, &[], PromptMode::Send),
+            Ok(Command::Slash { command }) if command == "/review this change"
+        ));
     }
 
     #[test]
