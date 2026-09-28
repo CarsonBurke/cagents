@@ -1,6 +1,8 @@
 use super::state::{ClientId, HostState, SharedHost};
 mod native_cleanup;
 mod native_recovery;
+#[cfg(test)]
+mod startup_tests;
 use crate::{
     agent::Provider,
     chat::{
@@ -1236,11 +1238,11 @@ fn start_with_execution(
             }
         }
         let execution_instance = uuid::Uuid::new_v4();
-        let bundle_account = if !matches!(
+        if !matches!(
             spec.transport,
             chat::protocol::TransportSpec::UnixWebSocket { .. }
         ) {
-            let lease = crate::account::registry::authorize_spawn(&spec.environment, None)
+            let _account = crate::account::registry::authorize_spawn(&spec.environment, None)
                 .map_err(|error| unavailable(error.to_string()))?;
             crate::agent_execution::bundled::install(
                 Some(session.launch.provider),
@@ -1252,10 +1254,11 @@ fn start_with_execution(
             ) {
                 spec.environment.insert("PATH".into(), path);
             }
-            Some(lease)
-        } else {
-            None
-        };
+        }
+        // Installation and process creation each validate the selected account
+        // under their own lease. Release the installation lease before startup:
+        // the native holder synchronously acquires the same non-reentrant lock.
+        // If removal wins between them, startup's validation refuses the launch.
         let weak = Arc::downgrade(host);
         let id = session.id;
         let handle = Handle::start_owned(
@@ -1286,7 +1289,6 @@ fn start_with_execution(
                 .err()
                 .unwrap_or_else(|| unavailable(message))
         })?;
-        drop(bundle_account);
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
