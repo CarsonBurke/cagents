@@ -263,6 +263,9 @@ pub(crate) fn ensure_no_surviving_process(
         }
         for entry in environment.split(|byte| *byte == 0) {
             if entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes() {
+                if detached_browser_helper(&path) {
+                    break;
+                }
                 return Err(format!(
                     "terminal {} still has a live process ({pid}); preserving it",
                     session.id
@@ -274,6 +277,66 @@ pub(crate) fn ensure_no_surviving_process(
         // session. Recovery lineage and exact agent identities do.
     }
     Ok(())
+}
+
+/// Browser tooling starts long-lived services which inherit the launching
+/// terminal's environment. Those markers alone do not make a detached browser
+/// service a surviving terminal. Keep this exception positive and narrow:
+/// arbitrary detached commands (including agents) can still own a conversation.
+/// The exact conversation check above always takes precedence.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn detached_browser_helper(process: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Ok(executable) = fs::read_link(process.join("exe")) else {
+        return false;
+    };
+    let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !matches!(
+        name.strip_suffix(" (deleted)").unwrap_or(name),
+        "agent-browser-linux-x64"
+            | "agent-browser-linux-arm64"
+            | "agent-browser-linux-musl-x64"
+            | "agent-browser-linux-musl-arm64"
+            | "chrome_crashpad_handler"
+    ) {
+        return false;
+    }
+    let Ok(stat) = fs::read_to_string(process.join("stat")) else {
+        return false;
+    };
+    let detached = stat.rsplit_once(')').is_some_and(|(_, fields)| {
+        // Fields after comm start at 3; tty_nr is field 7.
+        fields.split_whitespace().nth(4) == Some("0")
+    });
+    if !detached {
+        return false;
+    }
+    let Ok(null) = fs::metadata("/dev/null") else {
+        return false;
+    };
+    let is_null = |metadata: &fs::Metadata| {
+        metadata.file_type().is_char_device() && metadata.rdev() == null.rdev()
+    };
+    // Crashpad can keep a diagnostic pipe on stderr after double-forking.
+    // Require null input/output and reject any retained terminal descriptor,
+    // including descriptors beyond stdio. Unreadable evidence still blocks.
+    for fd in ["0", "1"] {
+        if !fs::metadata(process.join("fd").join(fd)).is_ok_and(|metadata| is_null(&metadata)) {
+            return false;
+        }
+    }
+    let Ok(descriptors) = fs::read_dir(process.join("fd")) else {
+        return false;
+    };
+    descriptors.into_iter().all(|entry| {
+        entry.is_ok_and(|entry| {
+            fs::metadata(entry.path())
+                .is_ok_and(|metadata| !metadata.file_type().is_char_device() || is_null(&metadata))
+        })
+    })
 }
 
 /// The user manager and PAM helper can deny environ reads even to their owner.
@@ -1238,6 +1301,79 @@ mod tests {
             .push("12345678-1234-4234-8234-123456789abc".into());
         exact.terminals[0].recipe = exact.terminals[0].relaunches[0].recipe.clone();
         assert!(exact.validate().is_err());
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn detached_browser_helpers_do_not_own_inherited_terminal_markers() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = checkpoint(directory.path()).terminals.remove(0).source;
+        let process = directory.path().join("42");
+        fs::create_dir_all(process.join("fd")).unwrap();
+        // A double-forked crash handler need not be its own session leader.
+        fs::write(process.join("stat"), "42 (helper) S 1 41 41 0").unwrap();
+        fs::write(process.join("cmdline"), b"browser-helper\0").unwrap();
+        for fd in ["0", "1", "2"] {
+            symlink("/dev/null", process.join("fd").join(fd)).unwrap();
+        }
+        for marker in ["CAGENTS_TERMINAL_ID", "CAGENTS_RECOVERY_ORIGIN"] {
+            fs::write(process.join("environ"), format!("{marker}={}\0", source.id)).unwrap();
+            for executable in [
+                "agent-browser-linux-x64",
+                "agent-browser-linux-arm64",
+                "agent-browser-linux-musl-x64",
+                "agent-browser-linux-musl-arm64",
+                "chrome_crashpad_handler",
+                "chrome_crashpad_handler (deleted)",
+            ] {
+                symlink(Path::new("/tools").join(executable), process.join("exe")).unwrap();
+                assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+                fs::remove_file(process.join("exe")).unwrap();
+            }
+        }
+
+        // Unknown detached writers, including providers and custom wrappers,
+        // retain protection. argv alone must not grant the helper exception.
+        fs::write(process.join("cmdline"), b"agent-browser-linux-x64\0").unwrap();
+        for executable in ["codex", "claude", "omp", "custom-agent"] {
+            symlink(Path::new("/tools").join(executable), process.join("exe")).unwrap();
+            assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+            fs::remove_file(process.join("exe")).unwrap();
+        }
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+        symlink("/tools/chrome_crashpad_handler", process.join("exe")).unwrap();
+
+        // A diagnostic pipe is normal for detached crash handlers.
+        let (reader, _writer) = std::io::pipe().unwrap();
+        use std::os::fd::AsRawFd;
+        fs::remove_file(process.join("fd/2")).unwrap();
+        symlink(
+            format!("/proc/self/fd/{}", reader.as_raw_fd()),
+            process.join("fd/2"),
+        )
+        .unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+
+        fs::write(process.join("stat"), "42 (helper) S 1 41 41 34816").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+        fs::write(process.join("stat"), "42 (helper) S 1 41 41 0").unwrap();
+        // Retaining a terminal on any descriptor must prevent the exemption.
+        symlink("/dev/ptmx", process.join("fd/7")).unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+        fs::remove_file(process.join("fd/7")).unwrap();
+        fs::remove_file(process.join("fd/0")).unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+        symlink("/dev/null", process.join("fd/0")).unwrap();
+
+        // An exact conversation selector is stronger than helper evidence.
+        let id = "12345678-1234-4234-8234-123456789abc";
+        source.launch.program = "codex".into();
+        source.launch.arguments = vec!["resume".into(), id.into()];
+        fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
+        let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        assert!(error.contains("agent session still has a live process"));
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
