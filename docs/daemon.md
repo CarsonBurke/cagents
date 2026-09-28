@@ -344,7 +344,7 @@ The upgrade policies are covered by repeatable checks described in
 
 Cargo debug builds, and builds with the explicit `development` feature, use a
 separate daemon, session store, application lease, and runtime namespace
-(`cagents-development` in place of `cagents`). They do not register a tray item
-or autostart entry, so a source-tree build can run beside the installed
-production application. Release builds without that feature are production
-builds.
+(`cagents-development` in place of `cagents`). The development daemon shows a
+badged tray item with its own name, so it can run beside the installed
+production application. It does not register an autostart entry. Release builds
+without that feature are production builds.

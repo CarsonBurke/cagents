@@ -1585,7 +1585,7 @@ fn current_uid() -> u32 {
 
 // Source-tree debug builds are development instances by default. The explicit
 // feature keeps the same isolation available to optimized development builds.
-const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
+pub(crate) const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
 
 pub const NAME: &str = if IS_DEVELOPMENT {
     "development"

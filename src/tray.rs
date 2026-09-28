@@ -1,5 +1,4 @@
-#[cfg(any(test, not(any(debug_assertions, feature = "development"))))]
-mod production {
+mod service {
     use std::{
         os::unix::process::CommandExt,
         process::{Command, Stdio},
@@ -18,12 +17,29 @@ mod production {
     };
 
     static ICON: LazyLock<ksni::Icon> = LazyLock::new(|| {
-        let image = image::load_from_memory_with_format(
+        let mut image = image::load_from_memory_with_format(
             include_bytes!("../packaging/dev.cagents.Cagents.png"),
             image::ImageFormat::Png,
         )
         .expect("embedded tray icon must be a valid PNG")
         .into_rgba8();
+        if instance::IS_DEVELOPMENT {
+            // The development and installed daemons can run together. Mark the
+            // development icon so the two tray actions remain easy to tell apart.
+            let (width, height) = image.dimensions();
+            let radius = (width.min(height) / 8) as i32;
+            let center = (width as i32 - radius - 4, height as i32 - radius - 4);
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                let distance = (x as i32 - center.0).pow(2) + (y as i32 - center.1).pow(2);
+                if distance <= radius.pow(2) {
+                    *pixel = if distance > (radius - 3).pow(2) {
+                        image::Rgba([255, 255, 255, 255])
+                    } else {
+                        image::Rgba([241, 139, 36, 255])
+                    };
+                }
+            }
+        }
         let (width, height) = image.dimensions();
         let mut data = image.into_raw();
         for pixel in data.chunks_exact_mut(4) {
@@ -49,11 +65,10 @@ mod production {
             }
             self.pending = true;
             self.status = if stop {
-                "Pending: checking hosted terminals…"
+                "Pending: checking hosted terminals…".into()
             } else {
-                "Pending: opening cagents…"
-            }
-            .into();
+                format!("Pending: opening {}…", instance::APPLICATION_NAME)
+            };
             let updates = self.updates.clone();
             if let Err(error) = thread::Builder::new()
                 .name("cagents-tray-action".into())
@@ -192,11 +207,16 @@ mod production {
         }
 
         fn title(&self) -> String {
-            "cagents daemon".into()
+            format!("{} daemon", instance::APPLICATION_NAME)
         }
 
         fn icon_name(&self) -> String {
-            instance::APPLICATION_ID.into()
+            if instance::IS_DEVELOPMENT {
+                // No icon-theme entry is installed for source-tree builds.
+                String::new()
+            } else {
+                instance::APPLICATION_ID.into()
+            }
         }
 
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -210,8 +230,8 @@ mod production {
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             vec![
                 StandardItem {
-                    label: "Open cagents".into(),
-                    icon_name: instance::APPLICATION_ID.into(),
+                    label: format!("Open {}", instance::APPLICATION_NAME),
+                    icon_name: self.icon_name(),
                     enabled: !self.pending,
                     activate: Box::new(|tray: &mut DaemonTray| tray.run_action(false)),
                     ..Default::default()
@@ -317,13 +337,4 @@ mod production {
     }
 }
 
-#[cfg(not(any(debug_assertions, feature = "development")))]
-pub use production::{TrayGuard, start};
-
-#[cfg(any(debug_assertions, feature = "development"))]
-pub struct TrayGuard;
-
-#[cfg(any(debug_assertions, feature = "development"))]
-pub fn start() -> TrayGuard {
-    TrayGuard
-}
+pub use service::{TrayGuard, start};
