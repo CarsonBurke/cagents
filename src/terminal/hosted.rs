@@ -26,7 +26,7 @@ use super::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope,
         ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions,
-        TerminalVisibility, WireTerminalSize, daemon_socket_path, read_frame, write_frame,
+        TerminalVisibility, WireTerminalSize, daemon_socket_path, write_frame,
     },
 };
 
@@ -1463,6 +1463,9 @@ fn serve_connection(
     }
 
     let handshake_deadline = Instant::now() + DAEMON_READY_TIMEOUT;
+    // Keep partially received frames across the short polling timeout. A
+    // timeout can interrupt either the length prefix or its payload.
+    let mut handshake_codec = FrameCodec::new(MAX_FRAME_BYTES);
     let (proof, mut attached) = loop {
         if stop.is_requested() {
             return ConnectionEnd::Stop;
@@ -1470,7 +1473,7 @@ fn serve_connection(
         if Instant::now() >= handshake_deadline {
             return ConnectionEnd::Retry;
         }
-        let envelope = match read_frame::<ServerEnvelope>(&mut stream) {
+        let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return ConnectionEnd::Retry,
             Err(FrameError::Io(error)) if is_timeout(&error) => {
@@ -2169,7 +2172,7 @@ mod tests {
 
     use crate::{
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
-        terminal::ipc::TerminalDescriptor,
+        terminal::ipc::{TerminalDescriptor, read_frame},
     };
 
     use super::*;
@@ -2713,6 +2716,74 @@ mod tests {
                 TerminalEvent::ResumeHintChanged(_)
             ));
         }
+    }
+
+    #[test]
+    fn terminal_handshake_survives_timeout_mid_frame() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let session = session();
+        let pinned = proof("split-handshake");
+        let handle = HostedTerminalHandle::attach_or_spawn_at(
+            socket,
+            session.clone(),
+            TerminalSpawnOptions::default(),
+            Some(pinned.clone()),
+            |_| {},
+        )
+        .unwrap();
+        let mut stream = accept_connection(&listener);
+        let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        let mut frame = Vec::new();
+        write_frame(
+            &mut frame,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(connect.request_id),
+                proof: pinned.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: pinned.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        stream.write_all(&frame[..2]).unwrap();
+        thread::sleep(HANDSHAKE_POLL_INTERVAL + Duration::from_millis(50));
+        stream.write_all(&frame[2..]).unwrap();
+        let spawn: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        let terminal = TerminalDescriptor {
+            screen_lost_after_crash: false,
+            session,
+            generation: 0,
+            event_sequence: 0,
+            activity: None,
+            agent_activity: None,
+            upgrade_sources: Vec::new(),
+            upgrade_relaunches: Vec::new(),
+            oldest_event_sequence: 1,
+            attached: true,
+            transcript: None,
+        };
+        write_frame(
+            &mut stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(spawn.request_id),
+                proof: pinned.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Spawned { terminal },
+                },
+            },
+        )
+        .unwrap();
+        handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+        assert_eq!(handle.proof(), Some(pinned));
     }
 
     #[test]

@@ -12,6 +12,11 @@ pub use theme::{TerminalPalette, TerminalTheme, ThemeColor};
 mod widget;
 #[cfg(feature = "host")]
 mod worker;
+
+/// The holder may take this long to report a newly spawned process. Keep the
+/// UI's attachment wait longer than this bound.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
 pub use hosted::{
