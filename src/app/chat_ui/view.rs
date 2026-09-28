@@ -1180,9 +1180,13 @@ impl Runtime {
         for (index, attachment) in self.attachments.iter().enumerate() {
             content.push(
                 widget::row::with_children(vec![
-                    crate::design::caption(attachment.path.display().to_string())
-                        .width(Length::Fill)
-                        .into(),
+                    crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
+                        "Pasted image".to_owned()
+                    } else {
+                        attachment.path.display().to_string()
+                    })
+                    .width(Length::Fill)
+                    .into(),
                     icon(
                         "edit-delete-symbolic",
                         "Remove attachment",
@@ -1193,6 +1197,13 @@ impl Runtime {
                 .align_y(Alignment::Center)
                 .spacing(4)
                 .into(),
+            );
+        }
+        if self.pastes_pending > 0 {
+            content.push(
+                design::caption("Pasting…")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
             );
         }
         // Keep the named composer in a fixed sibling slot as provider controls,
@@ -1328,7 +1339,13 @@ impl Runtime {
                             Action::HistoryNewer(target)
                         })));
                     }
-                    word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press))
+                    let binding =
+                        word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
+                    if matches!(binding, Some(text_editor::Binding::Paste)) {
+                        Some(text_editor::Binding::Custom(action(Action::Paste(target))))
+                    } else {
+                        binding
+                    }
                 })
                 .into()
         };
