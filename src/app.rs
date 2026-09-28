@@ -14180,7 +14180,9 @@ fn open_terminal(
         }
     }
     .map_err(|error| error.to_string())?;
-    handle.wait_until_attached(Duration::from_secs(10))?;
+    // The daemon may wait up to its holder startup timeout before it can send
+    // Spawned. Keep the handle alive through that reply and a reconnect grace.
+    handle.wait_until_attached(crate::terminal::SPAWN_START_TIMEOUT + Duration::from_secs(10))?;
     drop(recovery_lease);
     let surface = TerminalSurface::from(handle);
     Ok(StartedTerminal {

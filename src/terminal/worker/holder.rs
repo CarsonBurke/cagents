@@ -46,7 +46,10 @@ use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{ChildExit, close_processes::signal};
-use crate::terminal::holder::{self as registry, Record, Recovery};
+use crate::terminal::{
+    SPAWN_START_TIMEOUT as START_TIMEOUT,
+    holder::{self as registry, Record, Recovery},
+};
 
 /// The argument that makes an image serve as a holder. Deliberately not a
 /// word a test filter or a person would type.
@@ -63,10 +66,6 @@ const MAX_DESCRIPTORS: usize = 4;
 /// How long a released holder has to exit before it is killed. It exits as
 /// soon as it reads the release, so this only bounds a wedged one.
 const RELEASE_GRACE: Duration = Duration::from_millis(500);
-/// How long a new holder has to report its terminal. The root's own exec is
-/// the slow part, and a terminal worker waits on this; it only bounds a holder
-/// that wedged, so it is generous to a slow filesystem.
-const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a released holder's watch waits to see its release, which a
 /// concurrent fork can hold up.
 const RELEASE_SETTLE: Duration = Duration::from_millis(100);

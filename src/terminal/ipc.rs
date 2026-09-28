@@ -1397,14 +1397,24 @@ pub enum FrameError {
 /// perform for cold paths and tests. The buffer also lets a write emit its
 /// length prefix and payload in one `write_all`.
 pub struct FrameCodec {
-    buffer: Vec<u8>,
+    read_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,
+    prefix: [u8; LENGTH_PREFIX_BYTES],
+    prefix_read: usize,
+    payload_length: Option<usize>,
+    payload_read: usize,
     maximum: usize,
 }
 
 impl FrameCodec {
     pub fn new(maximum: usize) -> Self {
         Self {
-            buffer: Vec::new(),
+            read_buffer: Vec::new(),
+            write_buffer: Vec::new(),
+            prefix: [0; LENGTH_PREFIX_BYTES],
+            prefix_read: 0,
+            payload_length: None,
+            payload_read: 0,
             maximum,
         }
     }
@@ -1413,26 +1423,60 @@ impl FrameCodec {
         &mut self,
         reader: &mut impl Read,
     ) -> Result<Option<T>, FrameError> {
-        let Some(length) = read_frame_length(reader)? else {
-            return Ok(None);
+        let length = if let Some(length) = self.payload_length {
+            length
+        } else {
+            while self.prefix_read < LENGTH_PREFIX_BYTES {
+                match reader.read(&mut self.prefix[self.prefix_read..]) {
+                    Ok(0) if self.prefix_read == 0 => return Ok(None),
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated IPC frame length",
+                        )
+                        .into());
+                    }
+                    Ok(read) => self.prefix_read += read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let length = u32::from_be_bytes(self.prefix) as usize;
+            validate_frame_length(length, self.maximum)?;
+            if self.read_buffer.len() < length {
+                self.read_buffer
+                    .try_reserve(length - self.read_buffer.len())
+                    .map_err(|_| FrameError::Allocation { requested: length })?;
+            }
+            self.read_buffer.resize(length, 0);
+            self.payload_length = Some(length);
+            length
         };
-        validate_frame_length(length, self.maximum)?;
-        if self.buffer.len() < length {
-            let additional = length - self.buffer.len();
-            self.buffer
-                .try_reserve(additional)
-                .map_err(|_| FrameError::Allocation { requested: length })?;
+        while self.payload_read < length {
+            match reader.read(&mut self.read_buffer[self.payload_read..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated IPC frame payload",
+                    )
+                    .into());
+                }
+                Ok(read) => self.payload_read += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        self.buffer.resize(length, 0);
-        reader.read_exact(&mut self.buffer[..length])?;
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
-        let value = postcard::from_bytes(&self.buffer[..length])?;
+        let value = postcard::from_bytes(&self.read_buffer[..length]);
+        self.prefix_read = 0;
+        self.payload_length = None;
+        self.payload_read = 0;
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
-        Ok(Some(value))
+        Ok(Some(value?))
     }
 
     pub fn write<T: Serialize>(
@@ -1443,12 +1487,13 @@ impl FrameCodec {
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
-        let payload_length = encode_frame(&mut self.buffer, self.maximum, value)?;
-        self.buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(payload_length as u32).to_be_bytes());
+        let payload_length = encode_frame(&mut self.write_buffer, self.maximum, value)?;
+        self.write_buffer[..LENGTH_PREFIX_BYTES]
+            .copy_from_slice(&(payload_length as u32).to_be_bytes());
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = payload_length);
         }
-        writer.write_all(&self.buffer)?;
+        writer.write_all(&self.write_buffer)?;
         writer.flush()?;
         Ok(())
     }
@@ -1629,11 +1674,69 @@ pub fn validate_proof(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
+        struct TimeoutReader {
+            bytes: Vec<u8>,
+            offset: usize,
+            timeouts: Vec<usize>,
+        }
+
+        impl Read for TimeoutReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.timeouts.first() == Some(&self.offset) {
+                    self.timeouts.remove(0);
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                if self.offset == self.bytes.len() {
+                    return Ok(0);
+                }
+                let next_timeout = self.timeouts.first().copied().unwrap_or(self.bytes.len());
+                let length = output
+                    .len()
+                    .min(next_timeout - self.offset)
+                    .min(self.bytes.len() - self.offset);
+                output[..length].copy_from_slice(&self.bytes[self.offset..self.offset + length]);
+                self.offset += length;
+                Ok(length)
+            }
+        }
+
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &"a split payload".to_owned()).unwrap();
+        write_frame(&mut bytes, &"next frame".to_owned()).unwrap();
+        let mut reader = TimeoutReader {
+            bytes,
+            offset: 0,
+            timeouts: vec![2, LENGTH_PREFIX_BYTES + 2],
+        };
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        assert!(matches!(
+            codec.read::<String>(&mut reader),
+            Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        // A writer on the same connection must not overwrite a partial read.
+        codec.write(&mut Vec::new(), &"outbound").unwrap();
+        assert!(matches!(
+            codec.read::<String>(&mut reader),
+            Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            codec.read::<String>(&mut reader).unwrap(),
+            Some("a split payload".into())
+        );
+        assert_eq!(
+            codec.read::<String>(&mut reader).unwrap(),
+            Some("next frame".into())
+        );
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
 
     #[test]
     fn terminal_recovery_origin_round_trips_in_framed_inventory() {

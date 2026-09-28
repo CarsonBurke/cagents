@@ -22,6 +22,25 @@ use std::{
     time::Duration,
 };
 
+// Native holder startup can spend 30 seconds sending its control request and
+// another 30 seconds receiving the reply. Leave room for the daemon response
+// and a busy desktop scheduler.
+const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
+
+fn frame_read_error(error: ipc::FrameError) -> String {
+    match &error {
+        ipc::FrameError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            "Timed out waiting for the daemon response".into()
+        }
+        _ => format!("Cannot decode matched daemon protocol: {error}"),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Wake {
     Changed,
@@ -173,7 +192,7 @@ fn receive(
 ) -> Result<ServerResponse, String> {
     let envelope: ServerEnvelope = codec
         .read(stream)
-        .map_err(|e| format!("Cannot decode matched daemon protocol: {e}"))?
+        .map_err(frame_read_error)?
         .ok_or("Daemon disconnected")?;
     if envelope.version != PROTOCOL_VERSION {
         return Err("Daemon version mismatch; use matched cagents executables".into());
@@ -570,7 +589,7 @@ impl ClientHandle {
     ) -> Result<Self, StartFailure> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
         stream
-            .set_read_timeout(Some(Duration::from_secs(20)))
+            .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
             .map_err(|e| e.to_string())?;
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
@@ -666,7 +685,7 @@ impl ClientHandle {
         let (session, initial) = loop {
             let envelope: ServerEnvelope = codec
                 .read(&mut stream)
-                .map_err(|error| format!("Cannot decode matched daemon protocol: {error}"))?
+                .map_err(frame_read_error)?
                 .ok_or("Daemon disconnected")?;
             if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
                 return Err("Daemon identity/version changed during native chat attachment".into());
