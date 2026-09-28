@@ -121,7 +121,8 @@ impl Token {
     /// the bare name two skills share either of their links.
     pub fn spells(&self, row: &Candidate, skills: &[Skill]) -> bool {
         self.tail.is_empty()
-            && invocations(&format!("{}{}", self.sigil, self.query), skills) == row.insertion
+            && invocations(&format!("{}{}", self.sigil, self.query), skills)
+                == invocations(&row.insertion, skills)
     }
 
     /// The selection covering the word, from its sigil to its end, which is
@@ -156,13 +157,21 @@ pub(super) struct Candidate<'a> {
     pub kind: Kind,
     /// The name the row is matched by.
     pub name: &'a str,
-    /// What the row puts in the draft, which is also what it shows: the
-    /// reader sees exactly the text that will be sent.
+    /// What the row puts in the draft. A path-qualified Codex skill is shown
+    /// by name in the picker while retaining its exact insertion text.
     pub insertion: Cow<'a, str>,
     pub description: &'a str,
 }
 
 impl<'a> Candidate<'a> {
+    pub fn label(&self) -> Cow<'a, str> {
+        if self.kind == Kind::Skill && self.insertion.starts_with("[$") {
+            Cow::Owned(format!("${}", self.name))
+        } else {
+            self.insertion.clone()
+        }
+    }
+
     /// The invocation without its sigil, as `skill:review` is OMP's
     /// `/skill:review`; `None` for a link.
     fn bare(&self) -> Option<&str> {
@@ -278,12 +287,25 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             .filter(|bare| *bare != skill.name)
             .and_then(|bare| rank(bare));
         if let Some(rank) = rank(&skill.name).into_iter().chain(spelled).min() {
+            let linked = skill.invocation.starts_with("[$");
+            let unique = snapshot
+                .skills
+                .iter()
+                .filter(|other| other.name == skill.name)
+                .nth(1)
+                .is_none();
             ranked.push((
                 rank,
                 Candidate {
                     kind: Kind::Skill,
                     name: &skill.name,
-                    insertion: Cow::Borrowed(&skill.invocation),
+                    // Keep the exact linked path in the catalog for sending,
+                    // while a unique skill can be selected by its short name.
+                    insertion: if linked && unique {
+                        Cow::Owned(format!("${}", skill.name))
+                    } else {
+                        Cow::Borrowed(&skill.invocation)
+                    },
                     description: &skill.description,
                 },
             ));
@@ -399,11 +421,18 @@ impl<'a> Names<'a> {
     /// before its name or before its invocation's.
     fn spellings(skill: &Skill) -> impl Iterator<Item = (char, &str)> {
         let invoked = skill.invocation.chars().next().zip(bare(&skill.invocation));
-        std::iter::once((COMMAND_SIGIL, skill.name.as_str())).chain(
-            invoked
-                .into_iter()
-                .flat_map(|(sigil, bare)| [(sigil, bare), (COMMAND_SIGIL, bare)]),
-        )
+        std::iter::once((COMMAND_SIGIL, skill.name.as_str()))
+            .chain(
+                skill
+                    .invocation
+                    .starts_with("[$")
+                    .then_some(('$', skill.name.as_str())),
+            )
+            .chain(
+                invoked
+                    .into_iter()
+                    .flat_map(|(sigil, bare)| [(sigil, bare), (COMMAND_SIGIL, bare)]),
+            )
     }
 }
 
@@ -416,10 +445,13 @@ fn named<'a>(message: &str, skills: &'a [Skill]) -> Vec<Named<'a>> {
     // which it is on every frame.
     let mut openers = vec![COMMAND_SIGIL];
     for skill in skills {
-        if let Some(opener) = skill.invocation.chars().next()
-            && !openers.contains(&opener)
+        for opener in [skill.invocation.chars().next(), sigil_of(&skill.invocation)]
+            .into_iter()
+            .flatten()
         {
-            openers.push(opener);
+            if !openers.contains(&opener) {
+                openers.push(opener);
+            }
         }
     }
     if skills.is_empty() || !message.contains(openers.as_slice()) {
@@ -904,6 +936,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_unique_linked_skill_uses_a_short_draft_and_exact_sent_path() {
+        let path = "[$steward-pr](/home/u/skills/steward-pr/SKILL.md)";
+        let snapshot = Snapshot {
+            skills: vec![Skill {
+                name: "steward-pr".into(),
+                description: "Own a pull request".into(),
+                invocation: path.into(),
+            }],
+            ..Snapshot::default()
+        };
+        assert_eq!(insertions(&snapshot, "$ste|"), ["$steward-pr"]);
+        assert_eq!(
+            invocations("Use $steward-pr now", &snapshot.skills),
+            format!("Use {path} now")
+        );
+        let (text, at) = marked("$steward-pr|");
+        let row = candidates(&snapshot, &token(&text, at).unwrap()).remove(0);
+        assert!(token(&text, at).unwrap().spells(&row, &snapshot.skills));
+    }
+
     fn apply_at(draft: &str, insertion: &str) -> (String, Position) {
         let (draft, at) = marked(draft);
         let mut composer = text_editor::Content::with_text(&draft);
@@ -1058,6 +1111,21 @@ mod tests {
         assert!(state.enter_chooses(&at("cd /|"), &commits, &codex));
         assert!(state.enter_chooses(&at("see /its|"), &commits, &codex));
         assert!(!state.enter_chooses(&at("/clear|"), &clear, &codex));
+    }
+
+    #[test]
+    fn a_path_qualified_skill_has_a_short_picker_label() {
+        let candidate = Candidate {
+            kind: Kind::Skill,
+            name: "review",
+            insertion: Cow::Borrowed("[$review](/workspace/skills/review/SKILL.md)"),
+            description: "Review changes",
+        };
+        assert_eq!(candidate.label(), "$review");
+        assert_eq!(
+            candidate.insertion,
+            "[$review](/workspace/skills/review/SKILL.md)"
+        );
     }
 
     /// What is sent names every skill the way the provider invokes it, at

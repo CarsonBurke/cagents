@@ -14,6 +14,41 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// The shortest directory suffix that distinguishes one same-name skill from
+/// its peers. A skill can declare a name different from its directory name.
+fn skill_source<'a>(path: &str, others: impl Iterator<Item = &'a str>) -> String {
+    fn directory_components(path: &str) -> Vec<String> {
+        std::path::Path::new(path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(path))
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+    let directory = directory_components(path);
+    let peers = others.map(directory_components).collect::<Vec<_>>();
+    let length = (1..=directory.len())
+        .find(|length| {
+            peers.iter().all(|peer| {
+                peer.len() < *length
+                    || peer[peer.len() - length..] != directory[directory.len() - length..]
+            })
+        })
+        .unwrap_or(directory.len());
+    let suffix = &directory[directory.len().saturating_sub(length)..];
+    // When all skill directory names match each other, the distinguishing
+    // ancestor is enough for the visible label.
+    let common_leaf = peers.iter().all(|peer| peer.last() == directory.last());
+    if common_leaf && suffix.len() > 1 {
+        suffix[..suffix.len() - 1].join("/")
+    } else {
+        suffix.join("/")
+    }
+}
+
 const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
@@ -652,7 +687,16 @@ impl Codex {
         let mut named: Vec<(&str, &str)> = Vec::new();
         for mention in skill_mentions(text) {
             let skill = match mention {
-                Mention::Linked(path) => self.skill_paths.iter().find(|(_, known)| known == path),
+                Mention::Linked(path) => self
+                    .skill_paths
+                    .iter()
+                    .find(|(_, known)| known == path)
+                    .or_else(|| {
+                        let resolved = std::fs::canonicalize(path).ok()?;
+                        self.skill_paths.iter().find(|(_, known)| {
+                            std::fs::canonicalize(known).is_ok_and(|known| known == resolved)
+                        })
+                    }),
                 Mention::Named(name) => {
                     let mut matching = self.skill_paths.iter().filter(|(known, _)| known == name);
                     match (matching.next(), matching.next()) {
@@ -1191,9 +1235,15 @@ impl Adapter for Codex {
                     }
                 }
                 Pending::Skills => {
+                    struct ListedSkill<'a> {
+                        skill: Skill,
+                        path: Option<String>,
+                        identity: Option<PathBuf>,
+                        scope: &'a str,
+                    }
                     // Each skill with the path it is at and the scope that
                     // owns it, which tell apart two skills sharing a name.
-                    let mut catalog: Vec<(Skill, Option<String>, &str)> = Vec::new();
+                    let mut catalog: Vec<ListedSkill<'_>> = Vec::new();
                     // The cap has to stop the outer walk as well: a catalog
                     // split across many directories would otherwise add one
                     // more skill per directory after the cap was reached.
@@ -1206,20 +1256,29 @@ impl Adapter for Codex {
                             else {
                                 continue;
                             };
-                            let path = value["path"].as_str().map(str::to_owned);
-                            // The same skill reached from two directories is
-                            // listed under each.
-                            if value["enabled"].as_bool() == Some(false)
-                                || catalog.iter().any(|(skill, known, _)| {
-                                    skill.name == name && (*known == path || path.is_none())
-                                })
-                            {
-                                continue;
-                            }
                             // A name is a file name in the working tree, so it
                             // is as much provider-controlled text as the
                             // description and is bounded the same way.
                             let name = name.chars().take(MAX_SKILL_NAME).collect::<String>();
+                            let path = value["path"].as_str().map(str::to_owned);
+                            // Codex can list one skill through both a
+                            // symlinked skill directory and its target. Keep
+                            // the original path for the typed input, but use
+                            // the resolved path to identify the same file.
+                            let identity = path.as_ref().map(|path| {
+                                std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+                            });
+                            // List a physical skill once even if several
+                            // searched directories reach it.
+                            if value["enabled"].as_bool() == Some(false)
+                                || catalog.iter().any(|known| {
+                                    known.skill.name == name
+                                        && (known.identity.as_ref() == identity.as_ref()
+                                            || path.is_none())
+                                })
+                            {
+                                continue;
+                            }
                             // The short description is the one written for a
                             // picker; the long one is written for the model
                             // and runs to paragraphs.
@@ -1228,8 +1287,8 @@ impl Adapter for Codex {
                                 .or_else(|| value["shortDescription"].as_str())
                                 .or_else(|| value["description"].as_str())
                                 .unwrap_or_default();
-                            catalog.push((
-                                Skill {
+                            catalog.push(ListedSkill {
+                                skill: Skill {
                                     description: description
                                         .lines()
                                         .next()
@@ -1245,8 +1304,9 @@ impl Adapter for Codex {
                                     name,
                                 },
                                 path,
-                                value["scope"].as_str().unwrap_or_default(),
-                            ));
+                                identity,
+                                scope: value["scope"].as_str().unwrap_or_default(),
+                            });
                         }
                     }
                     // A name two skills share loads neither, so each is named
@@ -1255,28 +1315,59 @@ impl Adapter for Codex {
                     let shared = |name: &str| {
                         catalog
                             .iter()
-                            .filter(|(skill, _, _)| skill.name == name)
+                            .filter(|listed| listed.skill.name == name)
                             .nth(1)
                             .is_some()
                     };
                     let skills = catalog
                         .iter()
-                        .map(|(skill, path, scope)| match path {
-                            Some(path) if shared(&skill.name) && !path.contains(')') => Skill {
-                                invocation: format!("[${}]({path})", skill.name),
-                                description: if scope.is_empty() {
-                                    skill.description.clone()
-                                } else {
-                                    format!("{scope} · {}", skill.description)
+                        .map(|listed| {
+                            let skill = &listed.skill;
+                            let scope = listed.scope;
+                            match &listed.path {
+                                Some(path) if shared(&skill.name) && !path.contains(')') => Skill {
+                                    invocation: format!("[${}]({path})", skill.name),
+                                    description: {
+                                        let same_scope = catalog
+                                            .iter()
+                                            .filter(|other| {
+                                                other.skill.name == skill.name
+                                                    && other.scope == scope
+                                            })
+                                            .nth(1)
+                                            .is_some();
+                                        let source = (scope.is_empty() || same_scope).then(|| {
+                                            skill_source(
+                                                path,
+                                                catalog
+                                                    .iter()
+                                                    .filter(|other| other.skill.name == skill.name)
+                                                    .filter_map(|other| other.path.as_deref())
+                                                    .filter(|other_path| {
+                                                        *other_path != path.as_str()
+                                                    }),
+                                            )
+                                        });
+                                        [
+                                            (!scope.is_empty()).then_some(scope),
+                                            source.as_deref(),
+                                            Some(skill.description.as_str()),
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        .filter(|part| !part.is_empty())
+                                        .collect::<Vec<_>>()
+                                        .join(" · ")
+                                    },
+                                    name: skill.name.clone(),
                                 },
-                                name: skill.name.clone(),
-                            },
-                            _ => skill.clone(),
+                                _ => skill.clone(),
+                            }
                         })
                         .collect();
                     self.skill_paths = catalog
                         .into_iter()
-                        .filter_map(|(skill, path, _)| Some((skill.name, path?)))
+                        .filter_map(|listed| Some((listed.skill.name, listed.path?)))
                         .collect();
                     step.events.push(Event::Skills(skills));
                     self.finish_setup(&mut step);
@@ -2735,6 +2826,100 @@ mod tests {
         assert_eq!(
             adapter.input("no skills here".into(), Vec::new()).unwrap(),
             [json!({"type":"text","text":"no skills here"})]
+        );
+    }
+
+    #[test]
+    fn a_symlinked_skill_is_one_named_skill() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("dotfiles/skills/review/SKILL.md");
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::write(&actual, "# Review").unwrap();
+        let link = directory.path().join("agents-skills");
+        symlink(directory.path().join("dotfiles/skills"), &link).unwrap();
+        let alias = link.join("review/SKILL.md");
+        let mut adapter = adapter();
+        let skills = listed(
+            &mut adapter,
+            json!([{"skills":[
+                {"name":"review","description":"Review changes","path":actual},
+                {"name":"review","description":"Review changes","path":alias}
+            ]}]),
+        );
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].invocation, "$review");
+        assert_eq!(
+            adapter.input("$review".into(), Vec::new()).unwrap(),
+            [
+                json!({"type":"text","text":"$review"}),
+                json!({"type":"skill","name":"review","path":actual})
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_symlink_target_uses_the_providers_listed_path() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("skills/review/SKILL.md");
+        fs::create_dir_all(actual.parent().unwrap()).unwrap();
+        fs::write(&actual, "# Review").unwrap();
+        let alias = directory.path().join("alias.md");
+        symlink(&actual, &alias).unwrap();
+        let mut adapter = adapter();
+        listed(
+            &mut adapter,
+            json!([{"skills":[{"name":"review","path":alias}]}]),
+        );
+        let message = format!("[$review]({})", actual.display());
+        assert_eq!(
+            adapter.input(message.clone(), Vec::new()).unwrap(),
+            [
+                json!({"type":"text","text":message}),
+                json!({"type":"skill","name":"review","path":alias})
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_same_scope_skills_show_different_sources() {
+        let mut adapter = adapter();
+        let skills = listed(
+            &mut adapter,
+            json!([{"skills":[
+                {"name":"review","description":"Review changes","path":"/home/user/.agents/skills/review/SKILL.md","scope":"user"},
+                {"name":"review","description":"Review changes","path":"/repo/.agents/skills/review/SKILL.md","scope":"user"}
+            ]}]),
+        );
+        assert_eq!(skills.len(), 2);
+        assert_eq!(
+            skills[0].description,
+            "user · user/.agents/skills · Review changes"
+        );
+        assert_eq!(
+            skills[1].description,
+            "user · repo/.agents/skills · Review changes"
+        );
+    }
+
+    #[test]
+    fn source_labels_distinguish_skill_directories_with_the_same_declared_name() {
+        assert_eq!(
+            skill_source(
+                "/repo/skills/a/SKILL.md",
+                ["/repo/skills/b/SKILL.md"].into_iter(),
+            ),
+            "a"
+        );
+        assert_eq!(
+            skill_source(
+                "/repo/skills/b/SKILL.md",
+                ["/repo/skills/a/SKILL.md"].into_iter(),
+            ),
+            "b"
         );
     }
 

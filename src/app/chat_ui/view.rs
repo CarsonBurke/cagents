@@ -365,8 +365,8 @@ fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Mes
 
 /// One row of the composer's completion list.
 ///
-/// A row shows exactly what choosing it puts in the draft, says what that
-/// does, and says whether it is a command or a skill: a command is the whole
+/// A row shows a short skill name, says what it does, and says whether it is a
+/// command or a skill: a command is the whole
 /// message and a skill is part of one, and a reader deciding where to type
 /// next needs to know which they just added.
 fn completion_row<'a>(
@@ -376,7 +376,7 @@ fn completion_row<'a>(
 ) -> Element<'a, Message> {
     widget::button::custom(
         widget::row::with_children(vec![
-            design::body(row.insertion)
+            design::body(row.label())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             design::caption(row.description)
