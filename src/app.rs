@@ -5570,6 +5570,7 @@ impl Cagents {
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
         }
+        let source_id = source.id;
         let mut card = source;
         card.id = CardId::new();
         card.existence = Existence::Open;
@@ -5578,7 +5579,7 @@ impl Cagents {
         card.residency = Residency::Hydrating { epoch: 1 };
         match &mut card.kind {
             CardKind::Terminal(session) => {
-                if let Some(path) = self.terminal_working_directories.get(&source.id) {
+                if let Some(path) = self.terminal_working_directories.get(&source_id) {
                     session.launch.working_directory = path.clone();
                 }
                 if crate::agent::Provider::from_program(&session.launch.program).is_some() {
@@ -8794,8 +8795,6 @@ impl Cagents {
                 .height(Length::Fill),
         )
         .class(cosmic::theme::Container::custom(move |theme| {
-            let mut accent = iced::Color::from(*theme.cosmic().accent_color());
-            accent.a = design::ATTENTION_BORDER_ALPHA;
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {

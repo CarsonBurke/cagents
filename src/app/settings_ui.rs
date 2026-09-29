@@ -767,6 +767,7 @@ fn settings_category_controls<'a>(
                     "Use {query} where the search terms belong, for example https://duckduckgo.com/?q={query}.",
                     &draft.browser_search_url,
                     SettingsField::BrowserSearchUrl,
+                    invalid,
                 ),
                 #[cfg(feature = "integrated-browser")]
                 setting_field(
