@@ -5133,9 +5133,10 @@ impl RepositoryRuntime {
                 .row
                 .zip(self.diff_layout())
                 .map_or(anchor.offset, |(anchor, layout)| {
-                    layout
+                    let offset = layout
                         .rows(mode)
-                        .restore(layout.folded(mode).to_display(anchor))
+                        .restore(layout.folded(mode).to_display(anchor));
+                    self.reachable_diff_offset(layout.rows(mode), offset)
                 });
         self.diff_horizontal = anchor.horizontal;
         self.diff_change = anchor.change;
@@ -12338,6 +12339,30 @@ mod tests {
             runtime.diff_layout().unwrap().folded(DiffMode::Inline),
             &folded
         );
+    }
+
+    #[test]
+    fn a_rebuild_that_removes_the_anchored_line_keeps_visible_rows_mounted() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        let large: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        load_fresh_diff(&mut runtime, card, crate::diff_view::build_diff("", &large));
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 150.0 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "only\n"))),
+        );
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let visible = visible_diff_rows(runtime.diff_rows().unwrap(), runtime.diff_viewport);
+        assert_eq!((visible.start, visible.end), (0, 1));
     }
 
     #[test]
