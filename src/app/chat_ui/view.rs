@@ -1784,16 +1784,26 @@ impl Runtime {
             let modes = &snapshot.capabilities.permission_modes;
             let selected = modes
                 .iter()
-                .position(|mode| Some(mode) == self.permission_mode.as_ref());
-            if transitioning {
+                .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
+            if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
-                    design::caption(selected.map_or("Permissions", |index| modes[index].as_str()))
-                        .into(),
+                    design::caption(
+                        selected
+                            .map_or("Permissions", |index| permission_mode_label(&modes[index])),
+                    )
+                    .into(),
                 );
             } else {
+                if selected.is_none() {
+                    controls.push(design::caption("Configured permissions").into());
+                }
                 let chosen = modes.clone();
+                let labels: Vec<_> = modes
+                    .iter()
+                    .map(|mode| permission_mode_label(mode).to_owned())
+                    .collect();
                 controls.push(
-                    widget::dropdown(modes.clone(), selected, move |index| {
+                    widget::dropdown(labels, selected, move |index| {
                         action(Action::PermissionMode(target, chosen[index].clone()))
                     })
                     .text_size(design::TEXT_CAPTION)
@@ -2264,6 +2274,20 @@ impl Runtime {
         )
         .width(Length::Fill)
         .into()
+    }
+}
+
+fn permission_mode_label(mode: &str) -> &str {
+    match mode {
+        "default" | "manual" => "Ask",
+        "readOnly" => "Read only",
+        "workspaceWrite" => "Workspace write",
+        "acceptEdits" => "Auto edits",
+        "auto" => "Auto",
+        "plan" => "Plan",
+        "dontAsk" => "Don't ask",
+        "bypassPermissions" | "yolo" => "YOLO",
+        _ => mode,
     }
 }
 
