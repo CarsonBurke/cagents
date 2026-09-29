@@ -61,13 +61,46 @@ pub enum GlobalShortcut {
 
 /// Where a shortcut applies, which decides when its chord is withheld from
 /// the process inside a card.
+///
+/// This is the workspace's answer to VS Code's "commands to skip shell": a
+/// focused terminal receives every chord except those of the actions whose
+/// scope reaches over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutScope {
-    /// Anywhere in the workspace.
+    /// Anywhere in the workspace, a focused terminal included. Its default
+    /// chords are ones a shell has no use for.
     Workspace,
+    /// Anywhere but a focused terminal, which receives the chord as input.
+    /// For an action whose chord means something to a shell and the same kind
+    /// of thing in every other pane, such as `Ctrl+F`.
+    OutsideTerminal,
     /// Only while a pull request pane has focus; a terminal or editor with
     /// focus receives the chord as ordinary input.
     Review,
+}
+
+impl ShortcutScope {
+    /// Whether an action of this scope acts, and so withholds its chord from
+    /// the card, while `focused` has focus.
+    pub fn applies_to(self, focused: FocusedPane) -> bool {
+        match self {
+            Self::Workspace => true,
+            Self::OutsideTerminal => focused != FocusedPane::Terminal,
+            Self::Review => focused == FocusedPane::Review,
+        }
+    }
+}
+
+/// The kind of the focused pane, as far as shortcut scopes care.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FocusedPane {
+    /// A terminal, which forwards the keys it is given to its process.
+    Terminal,
+    /// A pull request review pane.
+    Review,
+    /// Any other pane, or none.
+    #[default]
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +140,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::FocusProjectSearch,
         label: "Search projects",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
@@ -337,9 +370,13 @@ where
     focus_handoff(handoff, toolbar_focus_id, card_focus).chain(Task::done(after_focus))
 }
 
+/// The action a key press triggers while `focused` has focus. A chord whose
+/// action does not apply there triggers nothing, since
+/// [`is_global_shortcut_chord`] left it to the card.
 pub fn global_shortcut(
     event: &keyboard::Event,
     shortcuts: &KeyboardShortcuts,
+    focused: FocusedPane,
 ) -> Option<GlobalShortcut> {
     let keyboard::Event::KeyPressed {
         key,
@@ -352,23 +389,24 @@ pub fn global_shortcut(
         return None;
     };
     let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    (!*repeat || descriptor.repeatable).then_some(descriptor.action)
+    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
+        .then_some(descriptor.action)
 }
 
-/// Whether a chord is withheld from the process inside a card. Review chords
-/// are reserved only while a pull request pane has focus (`review_focused`),
-/// so a terminal never loses an arrow chord to a pane that is not there.
+/// Whether a chord is withheld from the process inside a card: whether it is
+/// bound to an action whose scope applies to the `focused` pane. So a terminal
+/// never loses an arrow chord to a review pane that is not there, nor its
+/// forward-char to project search.
 pub(crate) fn is_global_shortcut_chord(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     shortcuts: &KeyboardShortcuts,
-    review_focused: bool,
+    focused: FocusedPane,
 ) -> bool {
     crate::tab_history::is_chord(key, modifiers)
-        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some_and(
-            |descriptor| review_focused || descriptor.scope == ShortcutScope::Workspace,
-        )
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts)
+            .is_some_and(|descriptor| descriptor.scope.applies_to(focused))
 }
 
 fn global_shortcut_descriptor(
@@ -423,6 +461,14 @@ fn shortcut_matches(
             ShortcutKey::Tab => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
+            ),
+            ShortcutKey::PageUp => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::PageUp)
+            ),
+            ShortcutKey::PageDown => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::PageDown)
             ),
         }
 }
@@ -506,7 +552,7 @@ pub struct Events<ViewportMessage> {
 pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
-    review_focused: bool,
+    focused_pane: FocusedPane,
     focus_follows_mouse: bool,
     viewport_width: f32,
     scroll_id: widget::Id,
@@ -600,7 +646,7 @@ where
     WorkspaceSurface::new(
         cosmic::widget::id_container(scrollable, scroll_id.clone()),
         shortcuts,
-        review_focused,
+        focused_pane,
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
@@ -1245,9 +1291,8 @@ impl<'a, Message: 'a> From<VirtualStrip<'a, Message>> for Element<'a, Message> {
 struct WorkspaceSurface<'a, Message> {
     content: Element<'a, Message>,
     shortcuts: &'a KeyboardShortcuts,
-    /// Whether the focused card is a pull request pane; see
-    /// [`is_global_shortcut_chord`].
-    review_focused: bool,
+    /// The kind of the focused card; see [`is_global_shortcut_chord`].
+    focused_pane: FocusedPane,
     /// The strip viewport width the owner already holds, which is what the
     /// enclosing `view` laid this surface's content out against.
     ///
@@ -1268,14 +1313,14 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
     fn new(
         content: impl Into<Element<'a, Message>>,
         shortcuts: &'a KeyboardShortcuts,
-        review_focused: bool,
+        focused_pane: FocusedPane,
         reported_width: f32,
         on_resize: impl Fn(f32) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
             shortcuts,
-            review_focused,
+            focused_pane,
             reported_width,
             on_resize: Box::new(on_resize),
             initial_scroll: None,
@@ -1403,7 +1448,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
-                self.review_focused,
+                self.focused_pane,
             ) =>
             {
                 shell.capture_event();
@@ -1993,47 +2038,38 @@ mod tests {
         use keyboard::key::Code;
 
         let shortcuts = KeyboardShortcuts::default();
-        assert_eq!(
-            global_shortcut(
-                &key_press("t", Code::KeyT, keyboard::Modifiers::CTRL, false),
-                &shortcuts,
-            ),
-            Some(GlobalShortcut::NewTerminal)
-        );
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
         for (character, code, action) in [
-            ("g", Code::KeyG, GlobalShortcut::NewChannel),
-            ("e", Code::KeyE, GlobalShortcut::ClonePane),
+            ("T", Code::KeyT, GlobalShortcut::NewTerminal),
+            ("G", Code::KeyG, GlobalShortcut::NewChannel),
+            ("D", Code::KeyD, GlobalShortcut::ClonePane),
+            ("W", Code::KeyW, GlobalShortcut::CloseFocusedCard),
         ] {
             assert_eq!(
                 global_shortcut(
-                    &key_press(character, code, keyboard::Modifiers::ALT, false),
+                    &key_press(character, code, ctrl_shift, false),
                     &shortcuts,
+                    FocusedPane::Terminal,
                 ),
                 Some(action)
             );
             assert_eq!(
                 global_shortcut(
-                    &key_press(character, code, keyboard::Modifiers::ALT, true),
+                    &key_press(character, code, ctrl_shift, true),
                     &shortcuts,
+                    FocusedPane::Terminal,
                 ),
                 None,
-                "holding a creation shortcut must not create multiple panes"
+                "holding a creation or close shortcut must not repeat it"
             );
             assert!(is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),
                 keyboard::key::Physical::Code(code),
-                keyboard::Modifiers::ALT,
+                ctrl_shift,
                 &shortcuts,
-                false,
+                FocusedPane::Terminal,
             ));
         }
-        assert_eq!(
-            global_shortcut(
-                &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
-                &shortcuts,
-            ),
-            Some(GlobalShortcut::CloseFocusedCard)
-        );
         assert_eq!(
             global_shortcut(
                 &key_press(
@@ -2043,72 +2079,68 @@ mod tests {
                     false,
                 ),
                 &shortcuts,
+                FocusedPane::Other,
             ),
             Some(GlobalShortcut::FocusProjectSearch)
         );
-        for (character, code) in [("t", Code::KeyT), ("w", Code::KeyW), ("f", Code::KeyF)] {
-            assert_eq!(
-                global_shortcut(
-                    &key_press(character, code, keyboard::Modifiers::CTRL, true),
-                    &shortcuts,
-                ),
-                None,
-                "held Ctrl shortcuts must not repeat destructive/creation actions"
-            );
-        }
+        assert_eq!(
+            global_shortcut(
+                &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, true),
+                &shortcuts,
+                FocusedPane::Other,
+            ),
+            None,
+            "held Ctrl shortcuts must not repeat"
+        );
         for repeat in [false, true] {
             assert_eq!(
                 global_shortcut(
                     &key_press("A", Code::KeyA, keyboard::Modifiers::ALT, repeat),
                     &shortcuts,
+                    FocusedPane::Other,
                 ),
                 None,
                 "Alt+A must be forwarded on initial and repeated key presses"
             );
         }
-        assert_eq!(
-            global_shortcut(
-                &key_press("q", Code::KeyQ, keyboard::Modifiers::ALT, true),
-                &shortcuts,
-            ),
-            Some(GlobalShortcut::FocusAdjacent(FocusDirection::Left))
-        );
-        assert_eq!(
-            global_shortcut(
-                &key_press("w", Code::KeyW, keyboard::Modifiers::ALT, true),
-                &shortcuts,
-            ),
-            Some(GlobalShortcut::FocusAdjacent(FocusDirection::Right))
-        );
 
-        // An action answers to every chord bound to it, not just the first:
-        // column navigation ships a letter chord *and* an arrow, and each must
-        // navigate and be reserved against the process inside a card.
+        // Column navigation repeats while held, and is reserved against the
+        // process inside a card.
         for (named, code, direction) in [
             (
-                keyboard::key::Named::ArrowLeft,
-                Code::ArrowLeft,
+                keyboard::key::Named::PageUp,
+                Code::PageUp,
                 FocusDirection::Left,
             ),
             (
-                keyboard::key::Named::ArrowRight,
-                Code::ArrowRight,
+                keyboard::key::Named::PageDown,
+                Code::PageDown,
                 FocusDirection::Right,
             ),
         ] {
             for repeat in [false, true] {
-                let event = named_key_press(named, code, keyboard::Modifiers::ALT, repeat);
+                let event = named_key_press(named, code, keyboard::Modifiers::CTRL, repeat);
                 assert_eq!(
-                    global_shortcut(&event, &shortcuts),
+                    global_shortcut(&event, &shortcuts, FocusedPane::Terminal),
                     Some(GlobalShortcut::FocusAdjacent(direction)),
-                    "Alt+arrow must navigate on initial and repeated presses"
+                    "Ctrl+Page must navigate on initial and repeated presses"
                 );
                 assert!(is_global_shortcut_chord(
                     &keyboard::Key::Named(named),
                     keyboard::key::Physical::Code(code),
-                    keyboard::Modifiers::ALT,
+                    keyboard::Modifiers::CTRL,
                     &shortcuts,
-                    false,
+                    FocusedPane::Terminal,
+                ));
+            }
+            // The unmodified and shifted paging keys stay the terminal's.
+            for modifiers in [keyboard::Modifiers::empty(), keyboard::Modifiers::SHIFT] {
+                assert!(!is_global_shortcut_chord(
+                    &keyboard::Key::Named(named),
+                    keyboard::key::Physical::Code(code),
+                    modifiers,
+                    &shortcuts,
+                    FocusedPane::Terminal,
                 ));
             }
         }
@@ -2117,28 +2149,140 @@ mod tests {
         customized.new_terminal = vec!["Ctrl+Shift+N".to_owned()];
         assert_eq!(
             global_shortcut(
-                &key_press(
-                    "n",
-                    Code::KeyN,
-                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-                    false,
-                ),
+                &key_press("n", Code::KeyN, ctrl_shift, false),
                 &customized,
+                FocusedPane::Other,
             ),
             Some(GlobalShortcut::NewTerminal)
         );
         customized.new_terminal = vec!["Ctrl+Shift+1".to_owned()];
         assert_eq!(
             global_shortcut(
-                &key_press(
-                    "!",
-                    Code::Digit1,
-                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-                    false,
-                ),
+                &key_press("!", Code::Digit1, ctrl_shift, false),
                 &customized,
+                FocusedPane::Other,
             ),
             Some(GlobalShortcut::NewTerminal)
+        );
+    }
+
+    /// The keys a shell, an editor, or an agent CLI in a terminal relies on
+    /// reach it: no default binds them, so a focused terminal receives every
+    /// one. `Ctrl+W` deleting a word used to close the pane instead.
+    #[test]
+    fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
+        use keyboard::key::{Code, Named};
+
+        let shortcuts = KeyboardShortcuts::default();
+        let character = |character: &str, code, modifiers| {
+            (
+                keyboard::Key::Character(character.into()),
+                keyboard::key::Physical::Code(code),
+                modifiers,
+            )
+        };
+        let named = |named, code, modifiers| {
+            (
+                keyboard::Key::Named(named),
+                keyboard::key::Physical::Code(code),
+                modifiers,
+            )
+        };
+        let ctrl = keyboard::Modifiers::CTRL;
+        let alt = keyboard::Modifiers::ALT;
+        for (key, physical, modifiers) in [
+            character("w", Code::KeyW, ctrl),
+            character("t", Code::KeyT, ctrl),
+            character("f", Code::KeyF, ctrl),
+            character("r", Code::KeyR, ctrl),
+            character("e", Code::KeyE, ctrl),
+            character("g", Code::KeyG, ctrl),
+            character("p", Code::KeyP, ctrl),
+            character("q", Code::KeyQ, alt),
+            character("w", Code::KeyW, alt),
+            character("e", Code::KeyE, alt),
+            character("r", Code::KeyR, alt),
+            character("g", Code::KeyG, alt),
+            character("f", Code::KeyF, alt),
+            character("b", Code::KeyB, alt),
+            character(".", Code::Period, alt),
+            named(Named::ArrowLeft, Code::ArrowLeft, alt),
+            named(Named::ArrowRight, Code::ArrowRight, alt),
+            named(Named::ArrowLeft, Code::ArrowLeft, ctrl),
+            named(Named::ArrowRight, Code::ArrowRight, ctrl),
+            named(Named::ArrowUp, Code::ArrowUp, alt),
+            named(Named::ArrowDown, Code::ArrowDown, alt),
+        ] {
+            assert!(
+                !is_global_shortcut_chord(
+                    &key,
+                    physical,
+                    modifiers,
+                    &shortcuts,
+                    FocusedPane::Terminal
+                ),
+                "{modifiers:?}+{key:?} was withheld from a focused terminal"
+            );
+            let press = keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key.clone(),
+                physical_key: physical,
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            };
+            assert_eq!(
+                global_shortcut(&press, &shortcuts, FocusedPane::Terminal),
+                None,
+                "{modifiers:?}+{key:?} acted over a focused terminal"
+            );
+        }
+    }
+
+    /// The search chord belongs to whatever has focus: a focused terminal
+    /// receives it as input, and any other pane takes it as its search. Chords
+    /// of workspace scope act over a terminal as everywhere else.
+    #[test]
+    fn a_shell_key_bound_outside_terminals_reaches_a_focused_terminal() {
+        use keyboard::key::Code;
+
+        let shortcuts = KeyboardShortcuts::default();
+        let search = key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false);
+        let reserved = |focused| {
+            is_global_shortcut_chord(
+                &keyboard::Key::Character("f".into()),
+                keyboard::key::Physical::Code(Code::KeyF),
+                keyboard::Modifiers::CTRL,
+                &shortcuts,
+                focused,
+            )
+        };
+        assert!(!reserved(FocusedPane::Terminal));
+        assert_eq!(
+            global_shortcut(&search, &shortcuts, FocusedPane::Terminal),
+            None
+        );
+        for focused in [FocusedPane::Other, FocusedPane::Review] {
+            assert!(reserved(focused));
+            assert_eq!(
+                global_shortcut(&search, &shortcuts, focused),
+                Some(GlobalShortcut::FocusProjectSearch)
+            );
+        }
+
+        // A user who binds a shell key to a workspace action asked for it.
+        let customized = KeyboardShortcuts {
+            close_focused_column: vec!["Ctrl+W".into()],
+            ..KeyboardShortcuts::default()
+        };
+        assert_eq!(
+            global_shortcut(
+                &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
+                &customized,
+                FocusedPane::Terminal,
+            ),
+            Some(GlobalShortcut::CloseFocusedCard)
         );
     }
 
@@ -2146,22 +2290,35 @@ mod tests {
     fn customized_creation_shortcuts_release_defaults_and_reserve_only_bound_chords() {
         use keyboard::key::Code;
 
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
         let mut shortcuts = KeyboardShortcuts {
-            clone_pane: vec!["Ctrl+Shift+E".into()],
-            new_channel: vec!["Ctrl+Shift+T".into()],
+            clone_pane: vec!["Alt+Shift+E".into()],
+            new_channel: vec!["Ctrl+Shift+N".into()],
             ..KeyboardShortcuts::default()
         };
         for (character, code, default_character, default_code, action) in [
-            ("e", Code::KeyE, "e", Code::KeyE, GlobalShortcut::ClonePane),
-            ("t", Code::KeyT, "g", Code::KeyG, GlobalShortcut::NewChannel),
+            ("e", Code::KeyE, "d", Code::KeyD, GlobalShortcut::ClonePane),
+            ("n", Code::KeyN, "g", Code::KeyG, GlobalShortcut::NewChannel),
         ] {
-            let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+            let modifiers = if action == GlobalShortcut::ClonePane {
+                keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT
+            } else {
+                ctrl_shift
+            };
             assert_eq!(
-                global_shortcut(&key_press(character, code, modifiers, false), &shortcuts),
+                global_shortcut(
+                    &key_press(character, code, modifiers, false),
+                    &shortcuts,
+                    FocusedPane::Other,
+                ),
                 Some(action)
             );
             assert_eq!(
-                global_shortcut(&key_press(character, code, modifiers, true), &shortcuts),
+                global_shortcut(
+                    &key_press(character, code, modifiers, true),
+                    &shortcuts,
+                    FocusedPane::Other,
+                ),
                 None
             );
             assert!(is_global_shortcut_chord(
@@ -2169,26 +2326,33 @@ mod tests {
                 keyboard::key::Physical::Code(code),
                 modifiers,
                 &shortcuts,
-                false,
+                FocusedPane::Terminal,
             ));
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character(default_character.into()),
                 keyboard::key::Physical::Code(default_code),
-                keyboard::Modifiers::ALT,
+                ctrl_shift,
                 &shortcuts,
-                false,
+                FocusedPane::Terminal,
             ));
         }
 
         shortcuts.clone_pane.clear();
         shortcuts.new_channel.clear();
-        for (character, code) in [("e", Code::KeyE), ("t", Code::KeyT)] {
+        for (character, code, modifiers) in [
+            (
+                "e",
+                Code::KeyE,
+                keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+            ),
+            ("n", Code::KeyN, ctrl_shift),
+        ] {
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),
                 keyboard::key::Physical::Code(code),
-                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                modifiers,
                 &shortcuts,
-                false,
+                FocusedPane::Terminal,
             ));
         }
     }
@@ -2236,7 +2400,7 @@ mod tests {
         let mut element = view(
             &workspace,
             &shortcuts,
-            false,
+            FocusedPane::Other,
             true,
             400.0,
             widget::Id::unique(),
@@ -2339,7 +2503,7 @@ mod tests {
                 view(
                     workspace,
                     &shortcuts,
-                    false,
+                    FocusedPane::Other,
                     false,
                     workspace.viewport_width(),
                     scroll_id.clone(),
@@ -2552,8 +2716,13 @@ mod tests {
                 .collect(),
         };
         let shortcuts = KeyboardShortcuts::default();
-        let surface: Element<'_, ()> =
-            Element::new(WorkspaceSurface::new(strip, &shortcuts, false, 0.0, |_| ()));
+        let surface: Element<'_, ()> = Element::new(WorkspaceSurface::new(
+            strip,
+            &shortcuts,
+            FocusedPane::Other,
+            0.0,
+            |_| (),
+        ));
         let tree = Tree::new(&surface);
         let card_node = || {
             layout::Node::with_children(
@@ -2613,7 +2782,7 @@ mod tests {
         let mut composed: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
-            false,
+            FocusedPane::Other,
             true,
             VIEWPORT_WIDTH,
             widget::Id::unique(),
@@ -2679,24 +2848,26 @@ mod tests {
                 Physical::Code(code),
                 modifiers,
                 &shortcuts,
-                false,
+                FocusedPane::Other,
             )
         };
-        assert!(reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        assert!(reserved("t".into(), Code::KeyT, ctrl_shift));
+        assert!(!reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
-        assert!(reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
-        assert!(!reserved("a".into(), Code::KeyA, keyboard::Modifiers::ALT));
-        assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
-        assert!(!reserved("x".into(), Code::KeyX, keyboard::Modifiers::ALT));
+        assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
+        assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
+        assert!(reserved("w".into(), Code::KeyW, ctrl_shift));
+        assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
         assert!(!reserved(
-            "q".into(),
-            Code::KeyQ,
-            keyboard::Modifiers::ALT | keyboard::Modifiers::CTRL,
+            "t".into(),
+            Code::KeyT,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
         ));
         assert!(!reserved(
             "t".into(),
             Code::KeyT,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            ctrl_shift | keyboard::Modifiers::ALT,
         ));
     }
 
@@ -2708,57 +2879,64 @@ mod tests {
         use keyboard::key::{Code, Physical};
 
         let shortcuts = KeyboardShortcuts::default();
-        let reserved = |named, code, review_focused| {
+        let reserved = |named, code, modifiers, focused| {
             is_global_shortcut_chord(
                 &keyboard::Key::Named(named),
                 Physical::Code(code),
-                keyboard::Modifiers::ALT,
+                modifiers,
                 &shortcuts,
-                review_focused,
+                focused,
             )
         };
         for (named, code) in [
             (keyboard::key::Named::ArrowUp, Code::ArrowUp),
             (keyboard::key::Named::ArrowDown, Code::ArrowDown),
         ] {
+            for focused in [FocusedPane::Terminal, FocusedPane::Other] {
+                assert!(
+                    !reserved(named, code, keyboard::Modifiers::ALT, focused),
+                    "{named:?} reached no {focused:?} pane"
+                );
+            }
             assert!(
-                !reserved(named, code, false),
-                "{named:?} reached a terminal"
-            );
-            assert!(
-                reserved(named, code, true),
+                reserved(named, code, keyboard::Modifiers::ALT, FocusedPane::Review),
                 "{named:?} bypassed the review pane"
             );
         }
         // Workspace chords stay reserved either way.
-        assert!(reserved(
-            keyboard::key::Named::ArrowLeft,
-            Code::ArrowLeft,
-            false
-        ));
-        assert!(reserved(
-            keyboard::key::Named::ArrowLeft,
-            Code::ArrowLeft,
-            true
-        ));
+        for focused in [
+            FocusedPane::Terminal,
+            FocusedPane::Review,
+            FocusedPane::Other,
+        ] {
+            assert!(reserved(
+                keyboard::key::Named::PageUp,
+                Code::PageUp,
+                keyboard::Modifiers::CTRL,
+                focused,
+            ));
+        }
+        let step = named_key_press(
+            keyboard::key::Named::ArrowDown,
+            Code::ArrowDown,
+            keyboard::Modifiers::ALT,
+            true,
+        );
         assert_eq!(
-            global_shortcut(
-                &named_key_press(
-                    keyboard::key::Named::ArrowDown,
-                    Code::ArrowDown,
-                    keyboard::Modifiers::ALT,
-                    true,
-                ),
-                &shortcuts,
-            ),
+            global_shortcut(&step, &shortcuts, FocusedPane::Review),
             Some(GlobalShortcut::ReviewNextFile),
             "stepping files repeats while held"
+        );
+        assert_eq!(
+            global_shortcut(&step, &shortcuts, FocusedPane::Terminal),
+            None,
+            "a review chord acts on no other pane"
         );
     }
 
     #[test]
-    fn held_q_and_w_navigation_cross_four_cards_and_stop_at_edges() {
-        use keyboard::key::Code;
+    fn held_page_navigation_crosses_four_cards_and_stops_at_edges() {
+        use keyboard::key::{Code, Named};
 
         let mut workspace = Workspace::default();
         let cards = [CardId::new(), CardId::new(), CardId::new(), CardId::new()];
@@ -2777,11 +2955,17 @@ mod tests {
         let shortcuts = KeyboardShortcuts::default();
         for repeat in [false, true, true, true] {
             let shortcut = global_shortcut(
-                &key_press("w", Code::KeyW, keyboard::Modifiers::ALT, repeat),
+                &named_key_press(
+                    Named::PageDown,
+                    Code::PageDown,
+                    keyboard::Modifiers::CTRL,
+                    repeat,
+                ),
                 &shortcuts,
+                FocusedPane::Terminal,
             );
             let Some(GlobalShortcut::FocusAdjacent(direction)) = shortcut else {
-                panic!("Alt+W must remain a navigation shortcut on repeated key presses");
+                panic!("Ctrl+PageDown must remain a navigation shortcut on repeated key presses");
             };
             workspace.focus_adjacent(direction).unwrap();
         }
@@ -2789,11 +2973,17 @@ mod tests {
 
         for repeat in [false, true, true, true] {
             let shortcut = global_shortcut(
-                &key_press("q", Code::KeyQ, keyboard::Modifiers::ALT, repeat),
+                &named_key_press(
+                    Named::PageUp,
+                    Code::PageUp,
+                    keyboard::Modifiers::CTRL,
+                    repeat,
+                ),
                 &shortcuts,
+                FocusedPane::Terminal,
             );
             let Some(GlobalShortcut::FocusAdjacent(direction)) = shortcut else {
-                panic!("Alt+Q must remain a navigation shortcut on repeated key presses");
+                panic!("Ctrl+PageUp must remain a navigation shortcut on repeated key presses");
             };
             workspace.focus_adjacent(direction).unwrap();
         }
@@ -2971,7 +3161,7 @@ mod tests {
         let mut element: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
-            false,
+            FocusedPane::Other,
             false,
             VIEWPORT,
             scroll_id.clone(),
