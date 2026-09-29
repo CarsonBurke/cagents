@@ -1825,6 +1825,80 @@ fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
     ))
 }
 
+/// Retained native conversations that the last daemon upgrade could not
+/// reattach and that have not since been reattached or closed, as structured
+/// data and a human warning. `None` when nothing needs attention.
+fn upgrade_attention() -> Option<(Value, String)> {
+    let (evidence, conversations) = match crate::upgrade::handoff::Store::existing() {
+        Ok(None) => return None,
+        Ok(Some(store)) => (Some(store.unattached_path()), store.unattached()),
+        Err(error) => (None, Err(error)),
+    };
+    let conversations = match conversations {
+        Ok(conversations) if conversations.is_empty() => return None,
+        Ok(conversations) => conversations,
+        Err(error) => {
+            return Some((
+                json!({ "evidence": evidence, "error": error }),
+                format!(
+                    "cannot read retained-conversation upgrade evidence: {}",
+                    printable(&error)
+                ),
+            ));
+        }
+    };
+    Some((
+        json!({ "evidence": evidence, "unattached_conversations": conversations }),
+        describe_unattached(&conversations, evidence.as_deref()),
+    ))
+}
+
+fn describe_unattached(
+    conversations: &[crate::upgrade::handoff::UnattachedSummary],
+    evidence: Option<&Path>,
+) -> String {
+    let mut text = format!(
+        "{} retained native conversation{} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
+        conversations.len(),
+        if conversations.len() == 1 { "" } else { "s" },
+    );
+    for conversation in conversations {
+        text.push_str(&format!(
+            "\n  {} {} in {}: {}",
+            conversation.provider.label(),
+            printable(
+                conversation
+                    .conversation
+                    .as_deref()
+                    .unwrap_or("(unconfirmed conversation)")
+            ),
+            printable(&conversation.working_directory.to_string_lossy()),
+            printable(&conversation.reason),
+        ));
+    }
+    if let Some(evidence) = evidence {
+        text.push_str(&format!(
+            "\n  evidence: {}",
+            printable(&evidence.to_string_lossy())
+        ));
+    }
+    text
+}
+
+/// Escapes control characters, such as terminal escape sequences in a
+/// provider's error, before text recorded by the daemon reaches a terminal.
+fn printable(text: &str) -> String {
+    let mut printable = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            printable.extend(character.escape_default());
+        } else {
+            printable.push(character);
+        }
+    }
+    printable
+}
+
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     match command {
         DaemonCommand::Upgrade { yes, interrupt } => {
@@ -1840,9 +1914,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         DaemonCommand::Start => {
             let socket = terminal::ensure_daemon_ready()
                 .map_err(|error| AppError::new("daemon_start", error))?;
+            let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
+            // Installers discard a successful start's output, but a daemon that
+            // came up without some retained conversations must still say so.
+            if let Some((attention, warning)) = upgrade_attention() {
+                eprintln!("cagents: {warning}");
+                data["upgrade_attention"] = attention;
+            }
             Ok(CommandOutput {
                 command: "daemon.start",
-                data: json!({ "instance": instance::NAME, "running": true, "socket": socket }),
+                data,
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
@@ -1867,26 +1948,33 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
+            let mut data = json!({
+                "instance": instance::NAME,
+                "running": running,
+                "socket": socket,
+                "daemon_version": daemon_version,
+                "cli_version": crate::VERSION
+            });
+            let mut human = if running {
+                format!(
+                    "{} daemon {} running ({}); cli {}",
+                    instance::NAME,
+                    daemon_version.as_deref().unwrap_or("starting"),
+                    socket.display(),
+                    crate::VERSION
+                )
+            } else {
+                format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
+            };
+            if let Some((attention, warning)) = upgrade_attention() {
+                data["upgrade_attention"] = attention;
+                human.push_str("\nwarning: ");
+                human.push_str(&warning);
+            }
             Ok(CommandOutput {
                 command: "daemon.status",
-                data: json!({
-                    "instance": instance::NAME,
-                    "running": running,
-                    "socket": socket,
-                    "daemon_version": daemon_version,
-                    "cli_version": crate::VERSION
-                }),
-                human: if running {
-                    format!(
-                        "{} daemon {} running ({}); cli {}",
-                        instance::NAME,
-                        daemon_version.as_deref().unwrap_or("starting"),
-                        socket.display(),
-                        crate::VERSION
-                    )
-                } else {
-                    format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
-                },
+                data,
+                human,
             })
         }
         DaemonCommand::ProtocolVersion => Ok(CommandOutput {
@@ -2801,6 +2889,54 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn unattached_upgrade_conversations_are_named_with_their_reasons() {
+        let conversation = |reason: &str| crate::upgrade::handoff::UnattachedSummary {
+            id: TerminalId::new(),
+            provider: crate::agent::Provider::Codex,
+            conversation: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+            working_directory: "/work/project".into(),
+            reason: reason.into(),
+        };
+        let one = describe_unattached(
+            &[conversation("no rollout found for thread id")],
+            Some(Path::new("/data/daemon-upgrade.unattached.json")),
+        );
+        assert!(
+            one.starts_with("1 retained native conversation could not be reattached"),
+            "{one}"
+        );
+        assert!(one.contains("Nothing was restarted or resent"), "{one}");
+        assert!(
+            one.contains(
+                "\n  Codex aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa in /work/project: no rollout found for thread id"
+            ),
+            "{one}"
+        );
+        assert!(
+            one.ends_with("\n  evidence: /data/daemon-upgrade.unattached.json"),
+            "{one}"
+        );
+        let mut unconfirmed = conversation("The durable native holder is unavailable");
+        unconfirmed.conversation = None;
+        let two = describe_unattached(&[conversation("unavailable"), unconfirmed], None);
+        assert!(two.starts_with("2 retained native conversations"), "{two}");
+        assert!(two.contains("(unconfirmed conversation)"), "{two}");
+        assert!(!two.contains("evidence:"), "{two}");
+        let hostile =
+            describe_unattached(&[conversation("refused\u{1b}]52;c;x\u{7}\nforged")], None);
+        assert!(
+            hostile.contains("refused\\u{1b}]52;c;x\\u{7}\\nforged"),
+            "{hostile}"
+        );
+        assert!(
+            !hostile.chars().any(|c| c.is_control() && c != '\n'),
+            "{hostile}"
+        );
+        assert_eq!(hostile.lines().count(), 2, "{hostile}");
+    }
+
     #[test]
     fn require_empty_is_one_guarded_request_and_never_a_list_then_force() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
