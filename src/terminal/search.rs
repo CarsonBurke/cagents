@@ -9,6 +9,100 @@ pub struct SearchMatch {
     pub end_column: u16,
 }
 
+/// Streaming matching shared by the live emulator and immutable completed rows.
+#[cfg(feature = "host")]
+pub(super) struct Matcher {
+    query: String,
+    case_sensitive: bool,
+    text: String,
+    starts: Vec<Option<(u64, u16)>>,
+    ends: Vec<Option<(u64, u16)>>,
+    matches: Vec<SearchMatch>,
+    truncated: bool,
+}
+
+#[cfg(feature = "host")]
+impl Matcher {
+    pub(super) fn new(query: &str, case_sensitive: bool) -> Self {
+        use unicode_casefold::UnicodeCaseFold;
+        Self {
+            query: if case_sensitive {
+                query.to_owned()
+            } else {
+                query.case_fold().collect()
+            },
+            case_sensitive,
+            text: String::new(),
+            starts: Vec::new(),
+            ends: Vec::new(),
+            matches: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    pub(super) fn append(&mut self, character: char, row: u64, column: u16, end_column: u16) {
+        use unicode_casefold::UnicodeCaseFold;
+        let start = self.text.len();
+        if self.case_sensitive {
+            self.text.push(character);
+        } else {
+            self.text.extend(std::iter::once(character).case_fold());
+        }
+        self.starts.resize(self.text.len(), None);
+        self.ends.resize(self.text.len(), None);
+        self.starts[start] = Some((row, column));
+        self.ends[self.text.len() - 1] = Some((row, end_column));
+    }
+
+    pub(super) fn finish_row(&mut self, wrapped: bool) -> bool {
+        if self.query.is_empty() {
+            self.text.clear();
+            self.starts.clear();
+            self.ends.clear();
+            return true;
+        }
+        let mut offset = 0;
+        while offset + self.query.len() <= self.text.len() {
+            let end = offset + self.query.len();
+            if let (Some((start_row, start_column)), Some((end_row, end_column))) =
+                (self.starts[offset], self.ends[end - 1])
+                && self.text[offset..end] == self.query
+            {
+                if self.matches.len() == 10_000 {
+                    self.truncated = true;
+                    return false;
+                }
+                self.matches.push(SearchMatch {
+                    start_row,
+                    start_column,
+                    end_row,
+                    end_column,
+                });
+                offset = end;
+            } else {
+                offset += 1;
+            }
+        }
+        if wrapped {
+            while !self.text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            self.text.drain(..offset);
+            self.starts.drain(..offset);
+            self.ends.drain(..offset);
+        } else {
+            self.text.clear();
+            self.starts.clear();
+            self.ends.clear();
+        }
+        true
+    }
+
+    pub(super) fn results(self) -> (Vec<SearchMatch>, bool) {
+        (self.matches, self.truncated)
+    }
+}
+
 #[cfg(feature = "host")]
 pub(super) fn selected_text(
     terminal: &libghostty_vt::Terminal<'_, '_>,
@@ -74,25 +168,16 @@ pub(super) fn search(
         selection::Selection,
         terminal::{Point, PointCoordinate},
     };
-    use unicode_casefold::UnicodeCaseFold;
     const ROWS_PER_BATCH: u64 = 256;
-    const MAX_MATCHES: usize = 10_000;
     if query.is_empty() {
         return Ok(Some((Vec::new(), false)));
     }
-    let query = if case_sensitive {
-        query.to_owned()
-    } else {
-        query.case_fold().collect::<String>()
-    };
     let total = terminal.scrollbar()?.total;
     let columns = terminal.cols()?;
     if columns == 0 || total == 0 {
         return Ok(Some((Vec::new(), false)));
     }
-    let mut matches = Vec::new();
-    let mut logical = String::new();
-    let mut positions = Vec::new();
+    let mut matcher = Matcher::new(query, case_sensitive);
     let mut graphemes = vec!['\0'; 32];
     for first in (0..total).step_by(ROWS_PER_BATCH as usize) {
         if cancelled() {
@@ -116,19 +201,9 @@ pub(super) fn search(
         for (index, text) in text.split('\n').take((end - first) as usize).enumerate() {
             let row = first + index as u64;
             let mut column = 0;
-            let mut append = |character: char, column| {
-                let start = logical.len();
-                if case_sensitive {
-                    logical.push(character);
-                } else {
-                    logical.extend(std::iter::once(character).case_fold());
-                }
-                positions.resize(logical.len(), None);
-                positions[start] = Some((row, column));
-            };
             if text.is_ascii() {
                 for character in text.chars() {
-                    append(character, column);
+                    matcher.append(character, row, column, column + 1);
                     column += 1;
                 }
             } else {
@@ -151,55 +226,21 @@ pub(super) fn search(
                         result => result?,
                     };
                     if length == 0 {
-                        append(' ', x);
+                        matcher.append(' ', row, x, x + width);
                     } else {
                         for character in &graphemes[..length] {
-                            append(*character, x);
+                            matcher.append(*character, row, x, x + width);
                         }
                     }
-                    column = x + width;
                 }
             }
             let wrapped = reference(row, 0)?.row()?.is_wrapped()? && row + 1 < total;
-            positions.push(Some((row, column)));
-            let mut offset = 0;
-            while offset + query.len() <= logical.len() {
-                let end = offset + query.len();
-                if let (Some((start_row, start_column)), Some((end_row, end_column))) =
-                    (positions[offset], positions[end])
-                    && &logical[offset..end] == query
-                {
-                    if matches.len() == MAX_MATCHES {
-                        return Ok(Some((matches, true)));
-                    }
-                    matches.push(SearchMatch {
-                        start_row,
-                        start_column,
-                        end_row,
-                        end_column,
-                    });
-                    offset = end;
-                } else {
-                    offset += 1;
-                }
-            }
-            if wrapped {
-                // Only the untested suffix can participate in a match that
-                // crosses the next physical row. An unbroken million-row
-                // wrapped line must not retain a million-row position table.
-                while !logical.is_char_boundary(offset) {
-                    offset -= 1;
-                }
-                logical.drain(..offset);
-                positions.drain(..offset);
-                positions.pop();
-            } else {
-                logical.clear();
-                positions.clear();
+            if !matcher.finish_row(wrapped) {
+                return Ok(Some(matcher.results()));
             }
         }
     }
-    Ok(Some((matches, false)))
+    Ok(Some(matcher.results()))
 }
 
 #[cfg(all(test, feature = "host"))]

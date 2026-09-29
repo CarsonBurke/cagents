@@ -1129,6 +1129,18 @@ impl HostState {
         Ok(record.handle.clone())
     }
 
+    /// Read-only history and presentation remain available after PTY teardown.
+    pub(crate) fn history_handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalHandle, ProtocolError> {
+        Ok(self
+            .attached_terminal(client_id, terminal_id)?
+            .handle
+            .clone())
+    }
+
     pub(crate) fn focus_handle(
         &self,
         client_id: ClientId,
@@ -3278,12 +3290,20 @@ fn start_terminal_view_owned(
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
+    let archived_host = Arc::downgrade(shared);
+    redraw_handle.set_archived_event_observer(move |handle, event| {
+        record_event_from(&archived_host, terminal_id, event, Some(handle));
+    });
     let completion_handle = redraw_handle.clone();
     let event_thread = thread::Builder::new()
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
+                let completed = matches!(event, TerminalEvent::Completed { .. });
                 record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
+                if completed {
+                    break;
+                }
             }
             // The final grid is captured after the exit event and may race a
             // reveal queued just as the worker stops accepting commands.
@@ -3315,17 +3335,14 @@ fn apply_visibility(
     handle: &TerminalHandle,
     visibility: TerminalVisibility,
 ) -> Result<(), TerminalSendError> {
-    match visibility {
-        TerminalVisibility::Visible => handle.reveal(),
-        TerminalVisibility::Hidden => handle.hide(),
-        TerminalVisibility::Hibernated => handle.hibernate(),
-    }
-    .or_else(|error| match error {
-        // Visibility is presentation-only. A completed worker retains its
-        // final snapshot and must not require restarting its process to view it.
-        TerminalSendError::Closed => Ok(()),
-        error => Err(error),
-    })
+    handle
+        .set_host_visibility(visibility)
+        .or_else(|error| match error {
+            // Visibility is presentation-only. A completed worker retains its
+            // final snapshot and must not require restarting its process to view it.
+            TerminalSendError::Closed => Ok(()),
+            error => Err(error),
+        })
 }
 
 pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
@@ -5152,6 +5169,94 @@ for line in sys.stdin:
             );
             assert!(!state.shutting_down);
         }
+    }
+
+    #[test]
+    fn completed_terminal_history_routes_queries_after_the_event_forwarder_finishes() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let (first, second) = {
+            let mut state = shared.lock().unwrap();
+            (state.register_client(1), state.register_client(2))
+        };
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf 'retained hit\\r\\n'; exit 0".into()],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        spawn_terminal(&shared, 1, session, TerminalSpawnOptions::default()).unwrap();
+        let handle = {
+            let mut state = shared.lock().unwrap();
+            state.attach(2, id).unwrap();
+            state.terminals[&id].handle.clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed()
+            || !shared.lock().unwrap().terminals[&id]
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, WireTerminalEvent::Completed { .. }))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let mut state = shared.lock().unwrap();
+            assert!(state.surface_handle(1, id).is_err());
+            assert!(state.history_handle(1, id).is_ok());
+            assert!(state.history_handle(3, id).is_err());
+            state
+                .set_visibility(1, id, TerminalVisibility::Hidden)
+                .unwrap();
+            state
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .unwrap();
+        }
+        handle.search_for(Some(2), 9, "hit".into(), true).unwrap();
+        for (delivery, expected) in [(first, 0), (second, 1)] {
+            delivery.close_after_drain();
+            let mut results = 0;
+            while let Some(envelope) = delivery.pop() {
+                if let ServerMessage::Event {
+                    event:
+                        WireTerminalEvent::SearchResults {
+                            request: 9,
+                            matches,
+                            ..
+                        },
+                    ..
+                } = envelope.message
+                {
+                    assert_eq!(matches.len(), 1);
+                    results += 1;
+                }
+            }
+            assert_eq!(results, expected);
+        }
+        assert!(
+            !shared
+                .lock()
+                .unwrap()
+                .replay_events(id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.1, WireTerminalEvent::SearchResults { .. }))
+        );
+        handle.shutdown().unwrap();
     }
 
     #[test]

@@ -7216,16 +7216,35 @@ impl Cagents {
                     exit_code,
                     signal,
                     intentional,
+                } => {
+                    self.retire_ended_terminal(card, exit_code, signal.as_deref(), intentional);
+                    durable_changed = true;
                 }
-                | TerminalEvent::Completed {
+                TerminalEvent::Completed {
                     exit_code,
                     signal,
                     intentional,
                 } => {
                     self.retire_ended_terminal(card, exit_code, signal.as_deref(), intentional);
+                    self.refresh_completed_terminal_find(card);
                     durable_changed = true;
                 }
                 TerminalEvent::Error { operation, message } => {
+                    if matches!(
+                        operation,
+                        "retain completed terminal history"
+                            | "retain completed terminal screen"
+                            | "review completed terminal"
+                            | "copy completed terminal selection"
+                            | "copy terminal selection"
+                            | "search terminal"
+                    ) {
+                        if let Some(find) = self.terminal_find.get_mut(&card) {
+                            find.pending_copy = None;
+                        }
+                        self.status = Some(TransientNotice::error(message));
+                        continue;
+                    }
                     // Commands already in flight can lose the race with the
                     // process ending. They cannot turn an end into a failure.
                     if ended_terminal(self.card_state(card)).is_some() {

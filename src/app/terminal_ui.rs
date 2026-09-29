@@ -167,6 +167,14 @@ impl Cagents {
             Action::Clear(_) => {
                 self.terminal_context = None;
                 let _ = handle.clear_scrollback();
+                // History rows are rebased by clearing scrollback.
+                find.request = find.request.wrapping_add(1);
+                find.matches = Arc::default();
+                find.selected = 0;
+                find.truncated = false;
+                if find.open {
+                    let _ = handle.search(find.request, find.query.clone(), find.case_sensitive);
+                }
                 return Task::none();
             }
             Action::Open(_) => {
@@ -211,6 +219,21 @@ impl Cagents {
             });
         }
         Task::none()
+    }
+
+    pub(super) fn refresh_completed_terminal_find(&mut self, card: CardId) {
+        let Some(find) = self.terminal_find.get_mut(&card) else {
+            return;
+        };
+        find.request = find.request.wrapping_add(1);
+        find.matches = Arc::default();
+        find.selected = 0;
+        find.pending_copy = None;
+        if find.open
+            && let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+        {
+            let _ = handle.search(find.request, find.query.clone(), find.case_sensitive);
+        }
     }
 
     pub(super) fn terminal_search_results(
