@@ -53,6 +53,12 @@ const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `cagents ui` waits for a window that has closed, and so refuses
+/// activations, to finish exiting and release its lease. An exiting UI waits
+/// for its language servers (bounded at 5s) and its window's removal (2s),
+/// then flushes its session.
+const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
 const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
@@ -1708,21 +1714,32 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
     }
     let executable =
         sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
-    let mut command = Command::new(&executable);
-    if new_window {
-        command.arg("--new-window");
-    }
-    if let Some(slot) = slot {
-        command.args(["--window", slot]);
-    }
-    if let Err(error) = spawn_ui_process(&mut command) {
-        if !new_window
-            && handshake_reports_already_running(&error)
-            && activate().map_err(|error| AppError::new("launch", error))?
-        {
+    let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
+    loop {
+        let mut command = Command::new(&executable);
+        if new_window {
+            command.arg("--new-window");
+        }
+        if let Some(slot) = slot {
+            command.args(["--window", slot]);
+        }
+        let Err(error) = spawn_ui_process(&mut command) else {
+            break;
+        };
+        if new_window || !handshake_reports_already_running(&error) {
+            return Err(AppError::new("launch", error));
+        }
+        if activate().map_err(|error| AppError::new("launch", error))? {
             return Ok(already_running_ui_output());
         }
-        return Err(AppError::new("launch", error));
+        // The window's lease is held, yet nothing takes an activation: its
+        // window has closed and the process is finishing its exit. Wait for
+        // it to release the lease rather than report a window nobody sees.
+        let now = Instant::now();
+        if now >= predecessor_deadline {
+            return Err(AppError::new("launch", error));
+        }
+        thread::sleep(UI_PREDECESSOR_EXIT_POLL.min(predecessor_deadline - now));
     }
     Ok(CommandOutput {
         command: "ui",
