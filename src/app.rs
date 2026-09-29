@@ -20892,7 +20892,10 @@ mod tests {
     #[test]
     fn pane_clone_preserves_explicit_titles_across_later_process_reports() {
         for chat in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
             let mut app = context_inspector_test_app(true);
+            app.settings_path = Some(directory.path().join("settings.toml"));
+            app.settings_write_blocked = false;
             app.context_inspector_open = false;
             let source = app.workspace.focused().unwrap();
             if chat {
@@ -20930,7 +20933,10 @@ mod tests {
 
     #[test]
     fn reopening_a_renamed_pane_keeps_its_title_override() {
+        let directory = tempfile::tempdir().unwrap();
         let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
         app.context_inspector_open = false;
         let source = app.workspace.focused().unwrap();
         let _ = app.update_chrome(chrome_ui::Action::Rename(source));
