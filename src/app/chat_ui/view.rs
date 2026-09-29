@@ -2867,6 +2867,9 @@ fn model_list<'a>(
 }
 
 #[cfg(test)]
+mod frame_cost;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
