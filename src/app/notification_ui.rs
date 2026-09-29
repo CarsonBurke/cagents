@@ -76,6 +76,15 @@ impl State {
         self.changed(|pending| pending.preferences = Some(preferences));
     }
 
+    /// Preferences queued for the daemon and not yet sent.
+    #[cfg(test)]
+    pub(super) fn pending_preferences(&self) -> Option<Preferences> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .preferences
+    }
+
     pub(super) fn acknowledge(&mut self, id: uuid::Uuid) {
         if self.acknowledged.insert(id) {
             self.changed(|pending| {

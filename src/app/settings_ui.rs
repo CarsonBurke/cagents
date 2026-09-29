@@ -643,7 +643,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, or Down. Every chord must be unique.",
+            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown. Every chord must be unique. Apart from Search projects and the review chords, a bound chord no longer reaches the program in a terminal, so prefer chords a shell leaves alone, such as Ctrl+Shift plus a letter.",
             vec![
                 setting_input(
                     "New terminal",
@@ -665,13 +665,13 @@ fn settings_category_controls<'a>(
                 ),
                 setting_input(
                     "Close focused column",
-                    "Closes the active workspace column.",
+                    "Closes the active workspace column. A terminal running a program asks first while close confirmation is on.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
                 ),
                 setting_input(
                     "Search projects",
-                    "Moves keyboard focus to project search.",
+                    "Moves keyboard focus to project search, or finds in a focused editor. A focused terminal receives this chord instead.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
                 ),
