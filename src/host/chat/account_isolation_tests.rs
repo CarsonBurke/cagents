@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 
 const CHILD: &str = "CAGENTS_ACCOUNT_ISOLATION_TEST";
 
-/// A stand-in for the provider CLI: it records the home it was pointed at,
-/// then does what a CLI refreshing its login does - rewrites the login kept
-/// in that home. A start on the wrong home therefore shows twice: in the
-/// record, and as a login carried into a home it does not belong to.
+/// A stand-in for the provider CLI: it records the home it was pointed at and
+/// the account selection it was told of, then does what a CLI refreshing its
+/// login does - rewrites the login kept in that home. A start on the wrong
+/// home therefore shows twice: in the record, and as a login carried into a
+/// home it does not belong to.
 fn install_provider(program: &Path, record: &Path) {
     std::fs::write(
         program,
@@ -20,6 +21,7 @@ fn install_provider(program: &Path, record: &Path) {
             "#!/bin/sh\n\
              printf '%s\\n' \"${{CODEX_HOME-unset}}\" >> '{record}'\n\
              home=\"${{CODEX_HOME:-$HOME/.codex}}\"\n\
+             printf '%s' \"${{CAGENTS_ACCOUNT_HOMES-}}\" > \"$home/selected\"\n\
              read -r login < \"$home/login\" || exit 3\n\
              printf '%s+renewed\\n' \"$login\" > \"$home/login\"\n",
             record = record.display()
@@ -41,8 +43,9 @@ fn login(home: &Path) -> String {
         .to_owned()
 }
 
-/// Waits until the provider has been started `count` times in all.
-fn started(record: &Path, count: usize) -> Vec<PathBuf> {
+/// Waits until the provider has been started on `home` `count` times, and
+/// on no home but `expected` ones.
+fn started(record: &Path, home: &Path, count: usize, expected: &[PathBuf]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let homes: Vec<PathBuf> = std::fs::read_to_string(record)
@@ -50,10 +53,17 @@ fn started(record: &Path, count: usize) -> Vec<PathBuf> {
             .lines()
             .map(PathBuf::from)
             .collect();
-        if homes.len() >= count {
-            return homes;
+        if let Some(stranger) = homes.iter().find(|started| !expected.contains(started)) {
+            panic!("a provider ran on {}", stranger.display());
         }
-        assert!(Instant::now() < deadline, "the provider was not started");
+        if homes.iter().filter(|started| *started == home).count() >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the provider was not started on {}",
+            home.display()
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -113,6 +123,19 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
         sign_in(&home, name);
         accounts.push((Account::managed(Provider::Codex, key, home.clone()), home));
     }
+    let linked = root.join("linked-codex");
+    sign_in(&linked, "login-linked");
+    let key = uuid::Uuid::new_v4();
+    store
+        .update(|registry| registry.link(Provider::Codex, key, linked.clone(), None, None, 1))
+        .unwrap()
+        .1
+        .unwrap();
+    accounts.push((
+        Account::linked(Provider::Codex, key, linked.clone()),
+        linked,
+    ));
+    let expected: Vec<PathBuf> = accounts.iter().map(|(_, home)| home.clone()).collect();
     let project = root.join("home");
     // Each conversation is issued through the same policy windows and
     // `cagents agent` use, then started - and started again from its saved
@@ -124,7 +147,6 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
                 .unwrap()
         })
         .collect();
-    let mut expected = Vec::new();
     for round in 0..2 {
         // The second round is a restarted daemon, whose conversations start
         // again from the recipes they were issued with.
@@ -146,17 +168,28 @@ fn native_codex_starts_keep_each_account_on_its_own_home() {
                 Default::default(),
             );
             assert!(result.is_ok(), "round {round}: {:?}", result.err());
-            expected.push(home.clone());
-            assert_eq!(started(&record, expected.len()), expected, "round {round}");
+            started(&record, home, round + 1, &expected);
         }
     }
-    // Each home holds only its own login, renewed once per start on it.
+    // Each home holds only its own login, renewed by the starts on it, and
+    // each provider was told which home cagents selected for it - except
+    // on the system account, whose home is the reader's own.
     let deadline = Instant::now() + Duration::from_secs(10);
-    for ((_, home), original) in accounts.iter().zip(["login-system", "login-a", "login-b"]) {
+    for ((account, home), original) in
+        accounts
+            .iter()
+            .zip(["login-system", "login-a", "login-b", "login-linked"])
+    {
         let renewed = format!("{original}+renewed+renewed");
         while login(home) != renewed && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(login(home), renewed);
+        assert!(login(home).starts_with(&renewed), "{}", login(home));
+        let selected = std::fs::read_to_string(home.join("selected")).unwrap();
+        if account.is_system() {
+            assert_eq!(selected, "");
+        } else {
+            assert_eq!(selected, format!("CODEX_HOME={}", home.display()));
+        }
     }
 }

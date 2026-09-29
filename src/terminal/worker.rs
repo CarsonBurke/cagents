@@ -1013,6 +1013,14 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        // A cagents process started in this terminal must not take the
+        // account selected for it for the system account.
+        match crate::account::registry::selection_marker(|name| {
+            command.get_env(name)?.to_str().map(str::to_owned)
+        }) {
+            Some(marker) => command.env(crate::account::SELECTION_MARKER, marker),
+            None => command.env_remove(crate::account::SELECTION_MARKER),
+        }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
         if let Some(token) = config.agent_authority.token() {
             command.env(crate::agent_execution::AUTHORITY_ENV, token);

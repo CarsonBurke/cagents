@@ -569,6 +569,37 @@ pub struct LaunchAccountLease {
     _lock: crate::instance::OwnedLock,
 }
 
+/// The value of [`super::SELECTION_MARKER`] for a process about to start
+/// with the provider homes `home_of` names: each home that belongs to an
+/// account this installation manages or links, as `VARIABLE=path` lines.
+/// `None` when it runs on no such account - the system account included.
+///
+/// The registry is read without its lock: it is replaced by rename, and a
+/// launch may already hold the account lifecycle lock.
+pub(crate) fn selection_marker(home_of: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let linked: Vec<PathBuf> = Store::installation()
+        .and_then(|store| read(&store.path()).ok())
+        .map(|registry| {
+            registry
+                .accounts
+                .into_iter()
+                .filter_map(|account| account.linked_home)
+                .collect()
+        })
+        .unwrap_or_default();
+    let lines: Vec<String> = Account::PROVIDERS
+        .into_iter()
+        .filter_map(|provider| {
+            let variable = super::home_variable(provider)?;
+            let value = home_of(variable).filter(|value| !value.is_empty())?;
+            let path = Path::new(&value);
+            (super::is_account_namespace(provider, path) || linked.iter().any(|home| home == path))
+                .then(|| format!("{variable}={value}"))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Called immediately around an actual process creation, including probes.
 /// Live attachment never needs this lease and remains usable after removal.
 pub(crate) fn authorize_spawn(

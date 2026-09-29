@@ -1239,6 +1239,19 @@ fn start_with_execution(
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
         }
+        // Like the capability, transient: a cagents process the provider
+        // starts must not take this conversation's account for the system
+        // account.
+        match crate::account::registry::selection_marker(|name| spec.environment.get(name).cloned())
+        {
+            Some(marker) => {
+                spec.environment
+                    .insert(crate::account::SELECTION_MARKER.into(), marker);
+            }
+            None => {
+                spec.environment.remove(crate::account::SELECTION_MARKER);
+            }
+        }
         let execution_instance = uuid::Uuid::new_v4();
         if !matches!(
             spec.transport,

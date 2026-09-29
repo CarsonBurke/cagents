@@ -230,14 +230,18 @@ pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
         && name() == Some("accounts")
 }
 
-/// Set on every terminal cagents starts, whose shell carries the provider
-/// homes cagents selected for it.
-const TERMINAL_MARKER: &str = "CAGENTS_TERMINAL_ID";
+/// Carried by every terminal and conversation cagents starts on a managed or
+/// linked account: the provider homes it selected, as `VARIABLE=path` lines.
+/// A home the reader's own environment chose - the system account's - is
+/// never listed, so it survives into a cagents process started from there.
+pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
 
 /// The provider home variables to drop from an inherited environment, read
 /// through `environment`: those that only record an account cagents selected
 /// for a launch, which a cagents process started under that launch must not
-/// take for the provider's own default.
+/// take for the provider's own default. A variable is dropped while it still
+/// holds the home [`SELECTION_MARKER`] lists for it, or when it names a
+/// directory with the shape of a managed home.
 ///
 /// The system account is whatever home the provider's CLI resolves outside
 /// cagents. cagents points every terminal it starts, and every conversation,
@@ -249,13 +253,17 @@ const TERMINAL_MARKER: &str = "CAGENTS_TERMINAL_ID";
 /// account, and signing in to the system account signed the chosen
 /// account's home in to the system login.
 pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
-    let in_terminal = environment(TERMINAL_MARKER).is_some();
+    let marker = environment(SELECTION_MARKER).unwrap_or_default();
     Account::PROVIDERS
         .into_iter()
         .filter_map(|provider| {
             let variable = home_variable(provider)?;
             let value = environment(variable)?;
-            (in_terminal || is_account_namespace(provider, Path::new(&value))).then_some(variable)
+            let selected = marker.lines().any(|line| {
+                line.split_once('=')
+                    .is_some_and(|(name, home)| name == variable && home == value)
+            });
+            (selected || is_account_namespace(provider, Path::new(&value))).then_some(variable)
         })
         .collect()
 }
@@ -272,7 +280,7 @@ pub unsafe fn detach_inherited_selections() {
     let removed = inherited_selections(&|name| {
         std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
     });
-    for variable in removed {
+    for variable in removed.into_iter().chain([SELECTION_MARKER]) {
         // SAFETY: the caller guarantees the process is still single-threaded.
         unsafe { std::env::remove_var(variable) };
     }
@@ -1265,26 +1273,31 @@ mod tests {
             Some(PathBuf::from("/home/a/work-claude"))
         );
 
-        // Inside a cagents terminal both homes are the ones cagents chose
-        // for that terminal, whatever directories they name.
-        let in_terminal = environment(vec![
-            ("HOME", "/home/a".into()),
-            ("CAGENTS_TERMINAL_ID", "1".into()),
-            ("CODEX_HOME", "/home/a/linked-codex".into()),
-            ("CLAUDE_CONFIG_DIR", "/home/a/linked-claude".into()),
-        ]);
+        // A terminal or conversation on a linked account lists the homes
+        // cagents selected for it. The reader's own directory, pinned for
+        // the system account, is not listed and stays their default; a home
+        // the reader exported after cagents selected one is theirs too.
+        let launched = |codex_home: &str| {
+            environment(vec![
+                ("HOME", "/home/a".into()),
+                (SELECTION_MARKER, "CODEX_HOME=/home/a/linked-codex".into()),
+                ("CODEX_HOME", codex_home.into()),
+                ("CLAUDE_CONFIG_DIR", "/home/a/own-claude".into()),
+            ])
+        };
         assert_eq!(
-            inherited_selections(&in_terminal),
-            ["CLAUDE_CONFIG_DIR", "CODEX_HOME"]
+            inherited_selections(&launched("/home/a/linked-codex")),
+            ["CODEX_HOME"]
         );
         assert_eq!(
-            codex.home_directory(&in_terminal),
+            codex.home_directory(&launched("/home/a/linked-codex")),
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(
-            claude.home_directory(&in_terminal),
-            Some(PathBuf::from("/home/a/.claude"))
+            claude.home_directory(&launched("/home/a/linked-codex")),
+            Some(PathBuf::from("/home/a/own-claude"))
         );
+        assert!(inherited_selections(&launched("/home/a/exported")).is_empty());
         // Nothing inherited, nothing dropped.
         assert!(inherited_selections(&environment(vec![("HOME", "/home/a".into())])).is_empty());
     }
@@ -1309,6 +1322,7 @@ mod tests {
                 .env("HOME", "/home/a")
                 .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))
                 .env("CLAUDE_CONFIG_DIR", "/home/a/own-claude")
+                .env(SELECTION_MARKER, "CLAUDE_CONFIG_DIR=/home/a/other")
                 .output()
                 .unwrap();
             assert!(
@@ -1322,6 +1336,7 @@ mod tests {
         // nothing else in it reads the environment concurrently.
         unsafe { detach_inherited_selections() };
         assert_eq!(std::env::var_os("CODEX_HOME"), None);
+        assert_eq!(std::env::var_os(SELECTION_MARKER), None);
         assert_eq!(
             std::env::var("CLAUDE_CONFIG_DIR").as_deref(),
             Ok("/home/a/own-claude")
