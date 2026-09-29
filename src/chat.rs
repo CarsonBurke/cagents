@@ -661,8 +661,6 @@ pub struct Snapshot {
     pub models: Vec<Model>,
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
-    #[serde(default)]
-    pub permission_mode: Option<String>,
     pub commands: Vec<SlashCommand>,
     pub skills: Vec<Skill>,
     pub usage: Usage,
@@ -1122,7 +1120,6 @@ pub enum Event {
         title: Option<String>,
     },
     Capabilities(Capabilities),
-    PermissionMode(Option<String>),
     Models {
         models: Vec<Model>,
         selected: Option<String>,
@@ -1229,49 +1226,6 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(any(feature = "host", feature = "ui"))]
-    #[test]
-    fn a_fresh_claude_chat_uses_its_accounts_configured_default_mode() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join("settings.json"),
-            r#"{"permissions":{"defaultMode":"auto"}}"#,
-        )
-        .unwrap();
-        let account = crate::account::Account::managed(
-            Provider::Claude,
-            uuid::Uuid::new_v4(),
-            config.path().into(),
-        );
-        let session = fresh_session(
-            Provider::Claude,
-            crate::model::TerminalId::new(),
-            config.path().into(),
-            &account,
-        )
-        .unwrap();
-        assert_eq!(
-            session.launch.recipe.arguments,
-            ["--permission-mode", "auto"]
-        );
-
-        std::fs::create_dir(config.path().join("project")).unwrap();
-        std::fs::create_dir(config.path().join("project/.claude")).unwrap();
-        std::fs::write(
-            config.path().join("project/.claude/settings.json"),
-            r#"{"permissions":{"defaultMode":"plan"}}"#,
-        )
-        .unwrap();
-        let project_session = fresh_session(
-            Provider::Claude,
-            crate::model::TerminalId::new(),
-            config.path().join("project"),
-            &account,
-        )
-        .unwrap();
-        assert!(project_session.launch.recipe.arguments.is_empty());
-    }
 
     #[test]
     fn a_provider_is_offered_only_the_attachments_it_takes() {
@@ -1498,16 +1452,7 @@ pub(crate) fn fresh_session(
                 root.join("sessions/native").to_string_lossy().into_owned(),
             ]);
         }
-        Provider::Claude => {
-            // Claude's stream-json/print transport reports `default` even when
-            // the interactive CLI's configured default is Auto. Pin the
-            // account's user choice before the first native prompt so the
-            // two surfaces start with the same permissions. Project settings
-            // are left to Claude's own trust and policy handling.
-            if let Some(mode) = claude_configured_default_mode(&recipe) {
-                recipe.arguments.extend(["--permission-mode".into(), mode]);
-            }
-        }
+        Provider::Claude => {}
     }
     Ok(Session {
         native_continuity: Default::default(),
@@ -1521,52 +1466,4 @@ pub(crate) fn fresh_session(
         proof: None,
         terminal: None,
     })
-}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
-    fn setting(path: &std::path::Path) -> Option<String> {
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-        let mode = settings["permissions"]["defaultMode"].as_str()?;
-        matches!(
-            mode,
-            "default"
-                | "manual"
-                | "auto"
-                | "acceptEdits"
-                | "plan"
-                | "dontAsk"
-                | "bypassPermissions"
-        )
-        .then(|| mode.to_owned())
-    }
-
-    let user_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    for directory in recipe.working_directory.ancestors() {
-        if user_home.as_deref() == Some(directory) {
-            break;
-        }
-        if ["settings.local.json", "settings.json"]
-            .into_iter()
-            .any(|name| setting(&directory.join(".claude").join(name)).is_some())
-        {
-            // A project-specific choice belongs to Claude's own settings
-            // handling, not to a command-line override from another account.
-            return None;
-        }
-    }
-
-    let root = recipe
-        .environment
-        .get("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".claude"))
-        })?;
-    ["settings.local.json", "settings.json"]
-        .into_iter()
-        .find_map(|name| setting(&root.join(name)))
-        .filter(|mode| mode != "default")
 }

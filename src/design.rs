@@ -149,6 +149,14 @@ pub fn warning_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style 
     }
 }
 
+/// Text that reports an error the reader has to correct.
+pub fn destructive_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(destructive_color(theme)),
+        ..Default::default()
+    }
+}
+
 /// The gutter marker on an added or removed patch line.
 ///
 /// The marker is tinted rather than the whole line, so the line keeps the
