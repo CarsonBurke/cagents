@@ -26,9 +26,29 @@ pub(super) struct ActiveWorktreeOperation {
     label: String,
     /// The journal's verdict once the operation has finished.
     state: Option<WorktreeOperationState>,
+    /// What the user typed to start it, when this session started it: a
+    /// failure can then be reopened in the dialog instead of retyped.
+    draft: Option<WorktreeDraft>,
 }
 
 impl ActiveWorktreeOperation {
+    pub(super) fn project(&self) -> ProjectId {
+        self.project
+    }
+
+    pub(super) fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// The input of a creation that ended without a worktree, which the
+    /// dialog can take back to edit or run again.
+    pub(super) fn reopenable_draft(&self) -> Option<&WorktreeDraft> {
+        self.draft
+            .as_ref()
+            .filter(|_| self.finished && self.created_worktree.is_none())
+            .filter(|_| self.state != Some(WorktreeOperationState::Created))
+    }
+
     /// How the sidebar shows this operation, if at all.
     ///
     /// A creation that succeeded is shown by the worktree row itself as soon
@@ -65,59 +85,6 @@ impl ActiveWorktreeOperation {
             Some(WorktreeOperationState::NotCreated) if self.restored => None,
             _ => Some((WorktreeOperationPhase::Failed, self.detail.clone())),
         }
-    }
-}
-
-#[cfg(test)]
-mod input_tests {
-    use super::*;
-
-    #[test]
-    fn resolving_input_has_a_cancellable_row_and_does_not_close_a_new_dialog() {
-        let mut app = super::super::tests::context_inspector_test_app(false);
-        let directory = tempfile::tempdir().unwrap();
-        let (session, _) = SessionRuntime::open(
-            directory.path().join("state.sqlite3"),
-            crate::model::BootId::new("test"),
-        )
-        .unwrap();
-        app.session = Some(session);
-        let project = ProjectId::new();
-        let dialog = || WorktreeDialog {
-            project_id: project,
-            repository: directory.path().into(),
-            branch: "feature/one".into(),
-            base: "main".into(),
-            destination: String::new(),
-            advanced: false,
-            resolving: None,
-            error: None,
-        };
-        app.worktree_dialog = Some(dialog());
-        let id = OperationId::new();
-        let _task = app.start_worktree_input(
-            project,
-            crate::repository::WorktreeInput {
-                repository: directory.path().into(),
-                input: "feature/one".into(),
-                base: "main".into(),
-                managed_directory: "worktrees".into(),
-                destination: String::new(),
-                operation_id: id,
-            },
-        );
-        assert!(app.worktree_dialog.is_none());
-        assert!(app.worktree_operations[&id].row(&[]).is_some());
-        assert!(!app.worktree_operations[&id].finished);
-        app.worktree_dialog = Some(dialog());
-        let _ = app.cancel_worktree_operation(id);
-        let _ = app.finish_worktree_input(project, id, Err("cancelled".into()));
-        assert!(app.worktree_dialog.is_some());
-        assert!(app.worktree_operations[&id].finished);
-        assert_eq!(
-            app.worktree_operations[&id].state,
-            Some(WorktreeOperationState::NotCreated)
-        );
     }
 }
 
@@ -182,107 +149,11 @@ impl Cagents {
             .any(|operation| !operation.finished)
     }
 
-    pub(super) fn start_worktree_input(
-        &mut self,
-        project_id: ProjectId,
-        input: crate::repository::WorktreeInput,
-    ) -> Task<Message> {
-        if self.session.is_none() {
-            self.status = Some(TransientNotice::error(
-                "Worktree creation requires an available durable journal.",
-            ));
-            return Task::none();
-        }
-        let Some(dialog) = &mut self.worktree_dialog else {
-            return Task::none();
-        };
-        if dialog.project_id != project_id || dialog.resolving.is_some() {
-            return Task::none();
-        }
-        let operation_id = input.operation_id;
-        dialog.resolving = Some(operation_id);
-        dialog.error = None;
-        let token = CancellationToken::new();
-        self.worktree_operations.insert(
-            operation_id,
-            ActiveWorktreeOperation {
-                project: project_id,
-                generation: 1,
-                request: None,
-                token: Some(token.clone()),
-                receiver: None,
-                stage: Some(WorktreeProgressStage::ResolvingBase),
-                started: Instant::now(),
-                completed_elapsed: None,
-                restored: false,
-                termination_requested: false,
-                finished: false,
-                detail: "Resolving branch".into(),
-                created_worktree: None,
-                label: input.input.clone(),
-                state: None,
-            },
-        );
-        self.worktree_dialog = None;
-        self.sync_worktree_operation_rows();
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &token)
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            Message::WorktreeInputResolved {
-                project_id,
-                operation_id,
-                result,
-            }
-        })
-    }
-
-    pub(super) fn finish_worktree_input(
-        &mut self,
-        project_id: ProjectId,
-        operation_id: OperationId,
-        result: Result<CreateWorktreeRequest, String>,
-    ) -> Task<Message> {
-        let Some(operation) = self.worktree_operations.get_mut(&operation_id) else {
-            return Task::none();
-        };
-        if operation.project != project_id || operation.request.is_some() || operation.finished {
-            return Task::none();
-        }
-        if operation.termination_requested {
-            operation.finished = true;
-            operation.state = Some(WorktreeOperationState::NotCreated);
-            operation.detail = "Cancelled".into();
-            operation.token = None;
-            self.sync_worktree_operation_rows();
-            return Task::none();
-        }
-        match result {
-            Ok(request) => {
-                let submit = self.start_worktree_operation(project_id, request);
-                Task::batch([submit, self.focus_context_overlay_if_exposed()])
-            }
-            Err(error) => {
-                operation.finished = true;
-                operation.state = Some(WorktreeOperationState::NotCreated);
-                operation.detail = error.clone();
-                operation.token = None;
-                self.sync_worktree_operation_rows();
-                self.status = Some(TransientNotice::error(error));
-                Task::none()
-            }
-        }
-    }
-
     pub(super) fn start_worktree_operation(
         &mut self,
         project: ProjectId,
         request: CreateWorktreeRequest,
+        draft: Option<WorktreeDraft>,
     ) -> Task<Message> {
         let Some(session) = self.session.as_ref() else {
             self.status = Some(TransientNotice::error(
@@ -313,6 +184,7 @@ impl Cagents {
                 restored: false,
                 created_worktree: None,
                 state: None,
+                draft,
             },
         );
         self.sync_worktree_operation_rows();
@@ -514,6 +386,7 @@ impl Cagents {
                             restored: true,
                             detail: report.detail,
                             state: Some(report.state),
+                            draft: None,
                         },
                     );
                 }
@@ -565,6 +438,7 @@ impl Cagents {
                         cancellable: !operation.finished
                             && !operation.termination_requested
                             && operation.token.is_some(),
+                        reopenable: operation.reopenable_draft().is_some(),
                     })
                 })
                 .collect();
@@ -615,6 +489,7 @@ mod tests {
                     restored: false,
                     label: "review".into(),
                     state: None,
+                    draft: None,
                 },
             );
             let _ = app.cancel_worktree_operation(id);
@@ -683,6 +558,7 @@ mod tests {
             restored: false,
             label: path.into(),
             state: Some(WorktreeOperationState::Created),
+            draft: None,
         };
         let deleted = OperationId::new();
         let other = OperationId::new();

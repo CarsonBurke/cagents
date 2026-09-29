@@ -345,6 +345,9 @@ pub struct WorktreeOperationRow {
     pub detail: String,
     pub phase: WorktreeOperationPhase,
     pub cancellable: bool,
+    /// A failure whose input the create dialog can take back, to edit or to
+    /// run again.
+    pub reopenable: bool,
 }
 
 /// A deletion the user has confirmed, as the row being deleted shows it.
@@ -3080,6 +3083,8 @@ impl SidebarState {
             SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::DismissWorktreeOperation(_)
+            | SidebarAction::EditWorktreeOperation(_)
+            | SidebarAction::RetryWorktreeOperation(_)
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
@@ -3154,6 +3159,10 @@ pub enum SidebarAction {
     CancelWorktreeOperation(crate::model::OperationId),
     /// Removes the row of a creation that ended without a worktree.
     DismissWorktreeOperation(crate::model::OperationId),
+    /// Reopens a failed creation's input in the create dialog.
+    EditWorktreeOperation(crate::model::OperationId),
+    /// Runs a failed creation's input again.
+    RetryWorktreeOperation(crate::model::OperationId),
     /// Runs a confirmed worktree deletion again after it failed.
     RetryWorktreeDeletion {
         project_id: ProjectId,
@@ -4284,16 +4293,37 @@ fn operation_rows<'a>(
             Some(label),
             operation_status(operation.phase),
         );
+        // A failure the dialog can take back opens there, beside the input
+        // that caused it.
         let control = grid
             .control(content, false)
             .name(operation_accessible_name(operation))
+            .on_press_maybe(
+                gated(
+                    SidebarAction::EditWorktreeOperation(operation.id),
+                    modal_open,
+                )
+                .filter(|_| operation.reopenable),
+            )
             .width(Length::Fill);
         let control = crate::interaction::tooltip(control, &*operation.detail);
+        let retry = operation.reopenable.then(|| {
+            icon_action(
+                "view-refresh-symbolic",
+                format!("Retry creating {}", operation.label),
+                gated(
+                    SidebarAction::RetryWorktreeOperation(operation.id),
+                    modal_open,
+                ),
+                stable_id(format!("operation.{}.retry", operation.id)),
+            )
+        });
         let trailing = operation_control(operation, modal_open);
         grid.mount(
-            widget::row::with_capacity(2)
+            widget::row::with_capacity(3)
                 .align_y(Alignment::Center)
                 .push(control)
+                .push_maybe(retry)
                 .push_maybe(trailing),
         )
     })
@@ -4400,6 +4430,12 @@ fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
         WorktreeOperationPhase::Working => {
             format!(
                 "Creating worktree {}: {}",
+                operation.label, operation.detail
+            )
+        }
+        WorktreeOperationPhase::Failed if operation.reopenable => {
+            format!(
+                "Worktree {} was not created: {}. Activate to edit and retry.",
                 operation.label, operation.detail
             )
         }
@@ -12097,6 +12133,7 @@ pub(crate) mod tests {
             detail: "Running git".into(),
             phase: WorktreeOperationPhase::Working,
             cancellable: true,
+            reopenable: false,
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
@@ -12206,6 +12243,7 @@ pub(crate) mod tests {
             detail: "Cancelled before git ran".into(),
             phase: WorktreeOperationPhase::Failed,
             cancellable: false,
+            reopenable: false,
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
@@ -12220,6 +12258,41 @@ pub(crate) mod tests {
                 "compact {compact}: a finished operation still offers cancel: {actions:?}"
             );
         }
+    }
+
+    /// A failure this session started keeps its input: the row reopens it in
+    /// the dialog to edit, or runs it again, beside dismissing it (#499).
+    #[test]
+    fn a_reopenable_failed_worktree_operation_offers_edit_and_retry() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        let operation = crate::model::OperationId::new();
+        entry.operations.push(WorktreeOperationRow {
+            id: operation,
+            label: "review".into(),
+            detail: "destination already exists".into(),
+            phase: WorktreeOperationPhase::Failed,
+            cancellable: false,
+            reopenable: true,
+        });
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false));
+        for action in [
+            SidebarAction::EditWorktreeOperation(operation),
+            SidebarAction::RetryWorktreeOperation(operation),
+            SidebarAction::DismissWorktreeOperation(operation),
+        ] {
+            assert!(actions.contains(&action), "{action:?} missing: {actions:?}");
+        }
+        let behind_a_dialog = frame_enter_presses(&renderer, body(&model, &state, false, true));
+        assert!(
+            !behind_a_dialog.iter().any(|action| matches!(
+                action,
+                SidebarAction::EditWorktreeOperation(_) | SidebarAction::RetryWorktreeOperation(_)
+            )),
+            "{behind_a_dialog:?}"
+        );
     }
 
     #[test]
