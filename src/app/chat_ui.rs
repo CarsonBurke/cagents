@@ -324,8 +324,8 @@ pub(super) struct State {
     ///
     /// Returning a chat card to its terminal view and back used to discard
     /// whatever was typed, which is why leaving the surface at all had to be
-    /// refused. Holding the draft here makes the round trip lossless, so the
-    /// refusal is only needed where the process itself is about to restart.
+    /// refused. Holding the draft here makes the round trip lossless, and the
+    /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
@@ -357,6 +357,14 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             removed_accounts: HashSet::new(),
             last_models: HashMap::new(),
+        }
+    }
+}
+impl State {
+    pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
+        Self {
+            drafts,
+            ..Self::default()
         }
     }
 }
@@ -1781,14 +1789,10 @@ impl Runtime {
     }
     /// Why this chat cannot survive the process restarting.
     ///
-    /// The draft stash lives in memory, so an update is the one transition
-    /// that really does discard unsent text.
+    /// Composer text is included in the workspace snapshot flushed before an
+    /// update. Attachments, answers and in-flight work still need a live UI.
     pub(super) fn restart_blocker(&self) -> Option<&'static str> {
-        self.transition_blocker().or_else(|| {
-            (!self.composer.is_empty()).then_some(
-                "Send or clear the unsent chat message before updating; restarting discards it.",
-            )
-        })
+        self.transition_blocker()
     }
 }
 
@@ -2540,11 +2544,51 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
-        if self.chat_ui.default_chats.is_empty() {
+        let defaults = &self.chat_ui.default_chats;
+        let open_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !defaults.contains(&card.id))
+            .map(|card| card.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut chat_drafts: HashMap<CardId, String> = self
+            .chat_ui
+            .drafts
+            .iter()
+            .filter(|(card, draft)| open_cards.contains(card) && !draft.is_empty())
+            .map(|(card, draft)| (*card, draft.clone()))
+            .collect();
+        for (card, runtime) in &self.chat_ui.parked {
+            if open_cards.contains(card) {
+                let draft = runtime.composer.text();
+                if draft.is_empty() {
+                    chat_drafts.remove(card);
+                } else {
+                    chat_drafts.insert(*card, draft);
+                }
+            }
+        }
+        for (card, card_runtime) in &self.cards {
+            if let CardRuntime::Chat(runtime) = card_runtime
+                && open_cards.contains(card)
+            {
+                let draft = runtime.composer.text();
+                if draft.is_empty() {
+                    chat_drafts.remove(card);
+                } else {
+                    chat_drafts.insert(*card, draft);
+                }
+            }
+        }
+        if defaults.is_empty() && chat_drafts == self.durable.chat_drafts {
             return Arc::clone(&self.durable);
         }
-        let defaults = &self.chat_ui.default_chats;
         let mut saved = (*self.durable).clone();
+        saved.chat_drafts = chat_drafts;
+        if defaults.is_empty() {
+            return Arc::new(saved);
+        }
         saved.cards.retain(|card| !defaults.contains(&card.id));
         saved.card_scopes.retain(|card, _| !defaults.contains(card));
         saved
@@ -2661,19 +2705,21 @@ impl Cagents {
         };
         Task::batch([
             scope,
-            self.insert_chat_card_with_lifetime(session, None, ephemeral),
+            self.insert_chat_card_with_lifetime(session, None, ephemeral, None),
         ])
     }
 
     /// Opens a card for the new conversation `session`, as a draft whose first
     /// message starts it: beside the card it was begun from, filed where that
-    /// card is, or else where a new terminal would go.
+    /// card is, or else where a new terminal would go. A stopped terminal's
+    /// restored chat draft can move to the new card before its first snapshot.
     pub(super) fn insert_chat_card(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
+        draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -2681,6 +2727,7 @@ impl Cagents {
         session: chat::Session,
         beside: Option<CardId>,
         ephemeral: bool,
+        draft_from: Option<CardId>,
     ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
@@ -2692,6 +2739,13 @@ impl Cagents {
             Some((source, (index + 1, durable + 1)))
         });
         let card_id = CardId::new();
+        // A stopped terminal cannot be converted in place. If its chat had
+        // been parked before a restart, the new conversation owns that text.
+        if let Some(source) = draft_from
+            && let Some(draft) = self.chat_ui.drafts.remove(&source)
+        {
+            self.chat_ui.drafts.insert(card_id, draft);
+        }
         if ephemeral {
             self.chat_ui.default_chats.insert(card_id);
         }
@@ -2813,7 +2867,7 @@ impl Cagents {
         // runtime stops existing while its card lives on.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
             let draft = runtime.composer.text();
-            if draft.trim().is_empty() {
+            if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
             } else {
                 self.chat_ui.drafts.insert(card, draft);
@@ -3879,7 +3933,7 @@ impl Cagents {
                             } else {
                                 "This terminal's agent is not running, so a new conversation was opened beside it."
                             }));
-                            return self.insert_chat_card(fresh, Some(card));
+                            return self.insert_chat_card(fresh, Some(card), Some(card));
                         }
                         // The daemon reattaches its exact managed thread automatically.
                         // Unmanaged terminals are never matched by directory or recency.
@@ -5634,6 +5688,58 @@ mod tests {
     }
 
     #[test]
+    fn update_snapshot_restores_live_stashed_and_parked_composers() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let live = draft_chat(&mut app);
+        write(&mut app, live, "live draft");
+        assert!(chat_runtime(&app, live).restart_blocker().is_none());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&live) else {
+            panic!("expected live chat runtime");
+        };
+        runtime.attachments.push(Attachment {
+            path: "/workspace/example.txt".into(),
+        });
+        assert!(runtime.restart_blocker().is_some());
+        runtime.attachments.clear();
+
+        let stashed = draft_chat(&mut app);
+        write(&mut app, stashed, "stashed draft");
+        let stashed_session = chat_runtime(&app, stashed).session.clone();
+        app.chat_forget(stashed);
+        app.cards.insert(stashed, CardRuntime::Loading);
+
+        let parked = draft_chat(&mut app);
+        write(&mut app, parked, "parked draft");
+        let CardRuntime::Chat(runtime) = app.cards.remove(&parked).unwrap() else {
+            panic!("expected chat runtime");
+        };
+        app.chat_ui.parked.insert(parked, runtime);
+
+        let saved = app.persistent_workspace();
+        assert_eq!(saved.chat_drafts.get(&live).unwrap(), "live draft");
+        assert_eq!(saved.chat_drafts.get(&stashed).unwrap(), "stashed draft");
+        assert_eq!(saved.chat_drafts.get(&parked).unwrap(), "parked draft");
+
+        app.chat_ui = State::with_drafts(saved.chat_drafts.clone());
+        let _ = app.open_chat_draft(stashed, stashed_session);
+        assert_eq!(chat_runtime(&app, stashed).composer.text(), "stashed draft");
+
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&live) else {
+            panic!("expected live chat runtime");
+        };
+        runtime.replace_draft(text_editor::Content::new());
+        let saved = app.persistent_workspace();
+        assert!(!saved.chat_drafts.contains_key(&live));
+
+        close_chat(&mut app, stashed);
+        assert!(
+            !app.persistent_workspace()
+                .chat_drafts
+                .contains_key(&stashed)
+        );
+    }
+
+    #[test]
     fn default_pane_keeps_attached_files() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let _ = app.select_worktree(FIXTURE_DIRECTORY.into(), true);
@@ -6542,6 +6648,30 @@ mod tests {
         };
         assert_eq!(stored.launch.session_id.as_deref(), Some("started"));
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    #[test]
+    fn a_stopped_terminal_moves_its_restored_chat_draft_to_the_new_card() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let terminal = stopped_agent_terminal(&mut app, &["--resume", KNOWN_THREAD], true);
+        let text = "Continue this thought\n  with indentation";
+        Arc::make_mut(&mut app.durable)
+            .chat_drafts
+            .insert(terminal, text.into());
+        app.chat_ui = State::with_drafts(app.durable.chat_drafts.clone());
+
+        let _ = app.update(Message::ChatUi(Action::Switch(terminal)));
+        let chat = app.workspace.focused().unwrap();
+        assert_ne!(chat, terminal);
+        assert!(matches!(
+            app.card_state(terminal).unwrap().kind,
+            CardKind::Terminal(_)
+        ));
+        assert_eq!(chat_runtime(&app, chat).composer.text(), text);
+        assert!(!app.chat_ui.drafts.contains_key(&terminal));
+        let snapshot = app.persistent_workspace();
+        assert!(!snapshot.chat_drafts.contains_key(&terminal));
+        assert_eq!(snapshot.chat_drafts.get(&chat).unwrap(), text);
     }
 
     /// A stopped terminal whose relaunch is still starting may yet run its

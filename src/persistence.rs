@@ -250,6 +250,7 @@ pub struct WorkspaceManifest {
     pub channels: Vec<ProjectChannel>,
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
+    pub chat_drafts: HashMap<CardId, String>,
     pub workspace_model_identity: Option<uuid::Uuid>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
@@ -1092,6 +1093,7 @@ impl StateStore {
             channels: manifest.channels,
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
+            chat_drafts: manifest.chat_drafts,
             workspace_model_identity: manifest.workspace_model_identity,
         };
         if !warnings.is_empty() {
@@ -2551,6 +2553,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:chat_drafts"),
+        &to_json(&state.chat_drafts)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:workspace_model_identity"),
         &to_json(&state.workspace_model_identity)?,
     )?;
@@ -3784,6 +3791,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace card scopes", &value))
         .transpose()?
         .unwrap_or_default(),
+        chat_drafts: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:chat_drafts"),
+        )?
+        .map(|value| from_json("workspace chat drafts", &value))
+        .transpose()?
+        .unwrap_or_default(),
         workspace_model_identity: metadata(
             connection,
             &format!("workspace:{id}:navigation:workspace_model_identity"),
@@ -4369,6 +4383,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            chat_drafts: HashMap::new(),
             workspace_model_identity: None,
         }
     }
@@ -4394,6 +4409,45 @@ mod tests {
             self.cards.clone_from(&commit.card_generations);
             Ok(commit)
         }
+    }
+
+    #[test]
+    fn workspace_chat_drafts_commit_and_restore_with_terminal_cards() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("draft-boot");
+        let store =
+            StateStore::open(directory.path().join("drafts.sqlite3"), boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        workspace
+            .chat_drafts
+            .insert(card, "unfinished\nmessage".into());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored.chat_drafts.get(&card).unwrap(),
+            "unfinished\nmessage"
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .chat_drafts,
+            workspace.chat_drafts
+        );
+
+        workspace.chat_drafts.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_drafts
+                .is_empty()
+        );
     }
 
     fn agent_workspace(provider: crate::agent::Provider) -> (WorkspaceState, crate::chat::Session) {

@@ -1136,6 +1136,9 @@ pub struct WorkspaceState {
     /// would find it somewhere else after a restart.
     #[serde(default)]
     pub card_scopes: HashMap<CardId, PathBuf>,
+    /// Unsent native-chat composer text, keyed by the card that owns it.
+    #[serde(default)]
+    pub chat_drafts: HashMap<CardId, String>,
     /// The shared registry this window last reconciled against.
     ///
     /// Paired with [`ProjectChannel::shared`]: a flag only means anything
@@ -1161,6 +1164,7 @@ impl Default for WorkspaceState {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            chat_drafts: HashMap::new(),
             workspace_model_identity: None,
         }
     }

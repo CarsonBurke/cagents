@@ -121,6 +121,7 @@ fn scope_descriptor(
         active_channel: None,
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
+        chat_drafts: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what
         // was shared with which registry.
         workspace_model_identity: None,
