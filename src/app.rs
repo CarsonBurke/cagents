@@ -11278,10 +11278,7 @@ impl Cagents {
 
     fn synchronize_terminal_theme(&mut self) {
         let theme = self.effective_terminal_theme();
-        for (card, runtime) in &self.cards {
-            if ended_terminal(self.card_state(*card)).is_some() {
-                continue;
-            }
+        for runtime in self.cards.values() {
             if let CardRuntime::Terminal(surface) = runtime {
                 if let Err(error) = surface.set_theme(theme) {
                     self.status = Some(TransientNotice::error(format!(
