@@ -614,7 +614,7 @@ impl Cagents {
                 }
                 let _ = self.workspace.rename_card(id, title);
                 self.persist();
-                Task::none()
+                self.save_settings_task(false)
             }
             Action::CloseOthers(id) | Action::CloseToRight(id) => {
                 let to_right = matches!(action, Action::CloseToRight(_));

@@ -5580,6 +5580,7 @@ impl Cagents {
         }
         let source_id = source.id;
         let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
+        let save_title = user_title.is_some();
         let mut card = source;
         card.id = CardId::new();
         card.existence = Existence::Open;
@@ -5702,7 +5703,13 @@ impl Cagents {
             }
         };
         self.persist();
-        Task::batch([start, self.apply_viewport(update, true, false)])
+        let viewport = self.apply_viewport(update, true, false);
+        let title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
+        Task::batch([start, viewport, title])
     }
 
     fn pull_request_pane(&self, view: &crate::model::PullRequestView) -> PullRequestPane {
@@ -20851,6 +20858,41 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_rename_task_persists_the_override_for_window_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("title-persistence-test"),
+        )
+        .unwrap();
+        let store = session.operation_store();
+        let mut app = context_inspector_test_app(true);
+        app.session = Some(session);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let source = app.workspace.focused().unwrap();
+        let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+        let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
+        let task = app.update_chrome(chrome_ui::Action::RenameSubmit);
+        settle_settings_task(&mut app, task);
+
+        // Drive the action's actual returned task. A manual capture would
+        // pass even when RenameSubmit forgot to schedule WindowView saving.
+        let saved = store
+            .load_window_view()
+            .unwrap()
+            .expect("rename saved its window view");
+        let restored: WindowView = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.user_titles[&source], "Release review");
+        app.chrome_ui = chrome_ui::State::default().with_user_titles(restored.user_titles);
+        assert!(!app.apply_reported_title(source, "automatic process title".into()));
+        assert_eq!(
+            app.repository_chrome(app.card_state(source).unwrap()).0,
+            "Release review"
+        );
+    }
+
+    #[test]
     fn pane_clone_preserves_explicit_titles_across_later_process_reports() {
         for chat in [false, true] {
             let mut app = context_inspector_test_app(true);
@@ -20876,10 +20918,12 @@ mod tests {
             let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
             let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
             app.chrome_ui.tabs_focus = Some(source);
+            let before_clone = app.settings_save_generation;
             let _ = app.clone_focused_pane();
             let cloned = app.workspace.focused().unwrap();
             assert_ne!(cloned, source);
             assert_eq!(app.chrome_ui.tabs_focus, Some(cloned));
+            assert!(app.settings_save_generation > before_clone);
             assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
             assert_eq!(app.chrome_ui.user_titles[&cloned], "Release review");
             assert!(!app.apply_reported_title(cloned, "automatic process title".into()));
@@ -20900,6 +20944,7 @@ mod tests {
             app.active_workspace_destination(),
         ));
         app.chrome_ui.tabs_focus = Some(source);
+        let before_reopen = app.settings_save_generation;
         let _ = app.run_workspace_command(
             workspace_widget::GlobalShortcut::ReopenPane,
             keyboard::Modifiers::empty(),
@@ -20907,6 +20952,7 @@ mod tests {
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, source);
         assert_eq!(app.chrome_ui.tabs_focus, Some(reopened));
+        assert!(app.settings_save_generation > before_reopen);
         assert!(app.recently_closed.is_empty());
         assert_eq!(app.chrome_ui.user_titles[&reopened], "Release logs");
         assert!(!app.apply_reported_title(reopened, "automatic process title".into()));
