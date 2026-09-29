@@ -5386,6 +5386,10 @@ impl Cagents {
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     pane.runtime.update(RepositoryAction::BackToFiles { card }),
                 )),
+                pull_request_review::Effect::RevealFileDiscussion => tasks.push(repository_task(
+                    pane.runtime
+                        .update(RepositoryAction::RevealDiffTop { card }),
+                )),
                 pull_request_review::Effect::OpenUrl(url) => links.push(url),
                 pull_request_review::Effect::Checkout(target) => {
                     checkout = pane
@@ -5440,6 +5444,7 @@ impl Cagents {
         if review.is_open() {
             side.push(review.header(modal_open));
             side.push(design::horizontal_rule());
+            side.push(review.summary(modal_open));
             side.push(review.notice(modal_open));
             side.push(review.file_list(modal_open));
         } else {
@@ -5486,7 +5491,13 @@ impl Cagents {
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
-        if let Some(toolbar) = repository_widget::selected_file_toolbar(id, &pane.runtime) {
+        let file_comment = review.file_comment_control(modal_open).map(|control| {
+            crate::ui_controls::toolbar_actions(vec![control])
+                .map(move |action| RepositoryAction::Review { card: id, action })
+        });
+        if let Some(toolbar) =
+            repository_widget::selected_file_toolbar_with(id, &pane.runtime, file_comment)
+        {
             main.push(toolbar.map(Message::Repository));
             main.push(design::horizontal_rule());
         }
@@ -5528,14 +5539,6 @@ impl Cagents {
                 .center(Length::Fill)
                 .padding(spacing.space_m)
                 .into(),
-            );
-        }
-        if review.is_open() {
-            main.push(design::horizontal_rule());
-            main.push(
-                review
-                    .review_bar(modal_open)
-                    .map(move |action| Message::PullRequestReview { card: id, action }),
             );
         }
         widget::row::with_children(vec![

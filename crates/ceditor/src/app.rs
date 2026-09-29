@@ -879,6 +879,7 @@ fn review_panel<'a>(
     let rows = vec![
         review.header(modal_open),
         design::horizontal_rule(),
+        review.summary(modal_open),
         review.notice(modal_open),
         review.file_list(modal_open),
     ];
@@ -2437,6 +2438,10 @@ impl Editor {
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     tab.runtime
                         .update(RepositoryAction::BackToFiles { card: id }),
+                )),
+                pull_request_review::Effect::RevealFileDiscussion => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::RevealDiffTop { card: id }),
                 )),
                 pull_request_review::Effect::OpenUrl(url) => {
                     tasks.push(Self::open_external_link(url.to_string()));
@@ -4578,6 +4583,14 @@ impl Application for Editor {
             } else {
                 toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             }
+            if tab.review.is_open()
+                && let Some(control) = tab.review.file_comment_control(self.modal_open())
+            {
+                toolbar_controls.push(
+                    toolbar_actions(vec![control])
+                        .map(move |action| Message::PullRequestReview(tab.id, action)),
+                );
+            }
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
                     toolbar_actions(vec![
@@ -4648,14 +4661,6 @@ impl Application for Editor {
                 )
                 .map(Message::Repository),
             );
-            if tab.review.is_open() {
-                editor.push(design::horizontal_rule().into());
-                editor.push(
-                    tab.review
-                        .review_bar(self.modal_open())
-                        .map(move |action| Message::PullRequestReview(tab.id, action)),
-                );
-            }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
                 for (index, item) in tab.completions.iter().enumerate() {

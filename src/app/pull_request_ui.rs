@@ -797,8 +797,10 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     .into(),
                                     content.into(),
                                     widget::container(
-                                        widget::icon::from_name("external-link-symbolic")
-                                            .size(design::COMPACT_ICON_SIZE),
+                                        widget::icon::icon(crate::ui_controls::symbolic_icon(
+                                            "external-link-symbolic",
+                                        ))
+                                        .size(design::COMPACT_ICON_SIZE),
                                     )
                                     .width(Length::Fixed(design::COMPACT_ICON_SIZE.into()))
                                     .align_x(Alignment::Center)

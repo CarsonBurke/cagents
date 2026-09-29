@@ -908,16 +908,27 @@ impl ReviewEvent {
     }
 }
 
-/// A new thread on one line, or on an inclusive `start_line..=line` range, of
-/// the pull request's current diff, attached to a pending review.
+/// What a new review thread is attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewThreadSubject {
+    /// One line, or an inclusive `start_line..=line` range, of the pull
+    /// request's current diff.
+    Lines {
+        line: u64,
+        side: ReviewDiffSide,
+        start_line: Option<u64>,
+        start_side: Option<ReviewDiffSide>,
+    },
+    /// The file as a whole rather than any line of it.
+    File,
+}
+
+/// A new thread on a file of the pull request, attached to a pending review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddReviewThreadRequest {
     pub review_id: String,
     pub path: String,
-    pub line: u64,
-    pub side: ReviewDiffSide,
-    pub start_line: Option<u64>,
-    pub start_side: Option<ReviewDiffSide>,
+    pub subject: ReviewThreadSubject,
     pub body: String,
 }
 
@@ -926,7 +937,16 @@ impl AddReviewThreadRequest {
         validate_node_id("review_id", &self.review_id)?;
         validate_review_path(&self.path)?;
         validate_comment_body(&self.body)?;
-        if self.line == 0 {
+        let ReviewThreadSubject::Lines {
+            line,
+            start_line,
+            start_side,
+            ..
+        } = self.subject
+        else {
+            return Ok(());
+        };
+        if line == 0 {
             return Err(GitHubValidationError::InvalidField {
                 field: "line",
                 reason: "must be at least 1".into(),
@@ -934,15 +954,15 @@ impl AddReviewThreadRequest {
         }
         // A one-line range (`start_line == line`) is legal; only an inverted
         // range is not.
-        if let Some(start) = self.start_line
-            && (start == 0 || start > self.line)
+        if let Some(start) = start_line
+            && (start == 0 || start > line)
         {
             return Err(GitHubValidationError::InvalidField {
                 field: "start_line",
                 reason: "must be at least 1 and not after the last line".into(),
             });
         }
-        if self.start_side.is_some() && self.start_line.is_none() {
+        if start_side.is_some() && start_line.is_none() {
             return Err(GitHubValidationError::InvalidField {
                 field: "start_side",
                 reason: "needs a start line".into(),
@@ -2492,26 +2512,32 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         let mut variables: Vec<(&str, GraphQlValue)> = vec![
             ("review", request.review_id.as_str().into()),
             ("path", request.path.as_str().into()),
-            ("line", request.line.into()),
-            ("side", request.side.as_graphql().into()),
             ("body", request.body.as_str().into()),
         ];
-        if let Some(start) = request.start_line {
-            variables.push(("startLine", start.into()));
-            variables.push((
-                "startSide",
-                request
-                    .start_side
-                    .unwrap_or(request.side)
-                    .as_graphql()
-                    .into(),
-            ));
-        }
+        let query = match request.subject {
+            ReviewThreadSubject::Lines {
+                line,
+                side,
+                start_line,
+                start_side,
+            } => {
+                variables.push(("line", line.into()));
+                variables.push(("side", side.as_graphql().into()));
+                if let Some(start) = start_line {
+                    variables.push(("startLine", start.into()));
+                    variables.push(("startSide", start_side.unwrap_or(side).as_graphql().into()));
+                }
+                format!(
+                    "mutation($review:ID!,$path:String!,$line:Int!,$side:DiffSide!,$startLine:Int,$startSide:DiffSide,$body:String!){{addPullRequestReviewThread(input:{{pullRequestReviewId:$review,path:$path,line:$line,side:$side,startLine:$startLine,startSide:$startSide,body:$body}}){{thread{{{REVIEW_THREAD_FIELDS}}}}}}}"
+                )
+            }
+            ReviewThreadSubject::File => format!(
+                "mutation($review:ID!,$path:String!,$body:String!){{addPullRequestReviewThread(input:{{pullRequestReviewId:$review,path:$path,subjectType:FILE,body:$body}}){{thread{{{REVIEW_THREAD_FIELDS}}}}}}}"
+            ),
+        };
         let outcome = self.mutate(
             repository,
-            &format!(
-                "mutation($review:ID!,$path:String!,$line:Int!,$side:DiffSide!,$startLine:Int,$startSide:DiffSide,$body:String!){{addPullRequestReviewThread(input:{{pullRequestReviewId:$review,path:$path,line:$line,side:$side,startLine:$startLine,startSide:$startSide,body:$body}}){{thread{{{REVIEW_THREAD_FIELDS}}}}}}}"
-            ),
+            &query,
             variables,
             "/addPullRequestReviewThread/thread",
             cancellation,
@@ -3776,15 +3802,7 @@ mod tests {
                 .as_bytes(),
         )]));
         let service = GitHubService::new("gh", fake.clone());
-        let request = AddReviewThreadRequest {
-            review_id: "PRR_1".into(),
-            path: "src/lib.rs".into(),
-            line: 12,
-            side: ReviewDiffSide::Right,
-            start_line: Some(10),
-            start_side: None,
-            body: "Draft".into(),
-        };
+        let request = line_thread(12, Some(10), None);
         let outcome = service
             .add_review_thread(&repository(), &request, &CancellationToken::new())
             .unwrap();
@@ -3805,10 +3823,7 @@ mod tests {
         assert!(arguments.contains(&"startSide=RIGHT".to_owned()));
         assert!(arguments.contains(&"side=RIGHT".to_owned()));
 
-        let single = AddReviewThreadRequest {
-            start_line: None,
-            ..request.clone()
-        };
+        let single = line_thread(12, None, None);
         let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
             format!(r#"{{"data":{{"addPullRequestReviewThread":{{"thread":{THREAD_JSON}}}}}}}"#)
                 .as_bytes(),
@@ -3822,18 +3837,57 @@ mod tests {
         assert!(!arguments.iter().any(|a| a.starts_with("startSide=")));
     }
 
+    fn line_thread(
+        line: u64,
+        start_line: Option<u64>,
+        start_side: Option<ReviewDiffSide>,
+    ) -> AddReviewThreadRequest {
+        AddReviewThreadRequest {
+            review_id: "PRR_1".into(),
+            path: "src/lib.rs".into(),
+            subject: ReviewThreadSubject::Lines {
+                line,
+                side: ReviewDiffSide::Right,
+                start_line,
+                start_side,
+            },
+            body: "Draft".into(),
+        }
+    }
+
+    #[test]
+    fn a_file_thread_names_the_file_subject_and_sends_no_line() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            format!(r#"{{"data":{{"addPullRequestReviewThread":{{"thread":{THREAD_JSON}}}}}}}"#)
+                .as_bytes(),
+        )]));
+        let service = GitHubService::new("gh", fake.clone());
+        let request = AddReviewThreadRequest {
+            subject: ReviewThreadSubject::File,
+            ..line_thread(12, None, None)
+        };
+        service
+            .add_review_thread(&repository(), &request, &CancellationToken::new())
+            .unwrap();
+        let arguments = argument_strings(&fake.commands.lock().unwrap()[0]);
+        let query = arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("query="))
+            .unwrap();
+        assert!(query.contains("subjectType:FILE"));
+        assert!(!query.contains("$line"));
+        assert!(arguments.contains(&"path=src/lib.rs".to_owned()));
+        assert!(
+            !arguments
+                .iter()
+                .any(|a| a.starts_with("line=") || a.starts_with("side="))
+        );
+    }
+
     #[test]
     fn review_requests_refuse_inputs_the_forge_would_misread() {
         let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
-        let valid = AddReviewThreadRequest {
-            review_id: "PRR_1".into(),
-            path: "src/lib.rs".into(),
-            line: 12,
-            side: ReviewDiffSide::Right,
-            start_line: None,
-            start_side: None,
-            body: "Draft".into(),
-        };
+        let valid = line_thread(12, None, None);
         let refused = |request: AddReviewThreadRequest| {
             assert!(
                 service
@@ -3841,22 +3895,14 @@ mod tests {
                     .is_err()
             );
         };
-        refused(AddReviewThreadRequest {
-            line: 0,
-            ..valid.clone()
-        });
-        refused(AddReviewThreadRequest {
-            start_line: Some(13),
-            ..valid.clone()
-        });
+        refused(line_thread(0, None, None));
+        refused(line_thread(12, Some(13), None));
         // A one-line range is legal: the selection was one line.
-        let one_line = AddReviewThreadRequest {
-            start_line: Some(12),
-            ..valid.clone()
-        };
-        assert!(one_line.validate().is_ok());
+        assert!(line_thread(12, Some(12), None).validate().is_ok());
+        refused(line_thread(12, None, Some(ReviewDiffSide::Left)));
         refused(AddReviewThreadRequest {
-            start_side: Some(ReviewDiffSide::Left),
+            subject: ReviewThreadSubject::File,
+            path: "../secret".into(),
             ..valid.clone()
         });
         refused(AddReviewThreadRequest {

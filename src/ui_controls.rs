@@ -121,6 +121,14 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // Desktop themes disagree on this name, and one that lacks it leaves an
+    // empty, still clickable button in the review header.
+    static EXTERNAL_LINK: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2.5h4v4M13.5 2.5 8 8M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static COMMENT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5l-3 2.5v-2.5h-1a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     // Review marks: an empty box, a box with a check, and a box with a dash
     // for a folder whose files are only partly viewed. Drawn here so the
     // three read as one family whatever icon theme the desktop provides.
@@ -187,6 +195,8 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "document-open-recent-symbolic" => HISTORY.clone(),
         "dialog-information-symbolic" => INFO.clone(),
         "window-close-symbolic" => CLOSE.clone(),
+        "external-link-symbolic" => EXTERNAL_LINK.clone(),
+        "comment-symbolic" => COMMENT.clone(),
         "view-pop-out-symbolic" => POP_OUT.clone(),
         _ => widget::icon::from_name(name).handle(),
     }

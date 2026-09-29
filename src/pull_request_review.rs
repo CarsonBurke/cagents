@@ -55,6 +55,9 @@ const TREE_INDENT: u16 = 12;
 /// The slot an icon sits in, matching the sidebar's rows.
 const ROW_ICON_WIDTH: f32 = 20.0;
 
+/// How many lines a pull request title may wrap to before it is elided.
+const SUMMARY_TITLE_LINES: usize = 3;
+
 /// The pull request a shell asked to review, and where its objects go.
 ///
 /// The `PullRequest` inside is the row the user clicked. Its head may already
@@ -250,6 +253,9 @@ pub enum Effect {
     Checkout(CheckoutTarget),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
+    /// A discussion of the whole file opened above the first diff row, so
+    /// the diff scrolls back to it.
+    RevealFileDiscussion,
 }
 
 /// One row of the rendered tree: a directory or a file.
@@ -1539,21 +1545,24 @@ impl State {
         )
     }
 
-    /// The header row: what is under review, how far along it is, and the
-    /// controls that act on the whole pull request.
+    /// The header row: which pull request is under review and the controls
+    /// that act on it as a whole. It keeps the height of the toolbar beside
+    /// it, so the title, which needs more room than a toolbar row has, reads
+    /// in [`Self::summary`] beneath it instead of being elided to a few
+    /// letters between the controls.
     pub fn header<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         let spacing = cosmic::theme::spacing();
         let Some(target) = &self.target else {
             return widget::Space::new().into();
         };
         let pull_request = &target.pull_request;
-        let (viewed, total) = self.progress();
         let state = WorktreePullRequestState::from_github(pull_request);
-        let icon = symbolic_icon(match state {
-            Some(WorktreePullRequestState::Merged) => "merged-pull-request-symbolic",
-            Some(WorktreePullRequestState::Closed) => "closed-pull-request-symbolic",
-            _ => "pull-request-symbolic",
-        });
+        let (icon, state_label) = match state {
+            Some(WorktreePullRequestState::Merged) => ("merged-pull-request-symbolic", "Merged"),
+            Some(WorktreePullRequestState::Closed) => ("closed-pull-request-symbolic", "Closed"),
+            Some(WorktreePullRequestState::Draft) => ("pull-request-symbolic", "Draft"),
+            Some(WorktreePullRequestState::Open) | None => ("pull-request-symbolic", "Open"),
+        };
         let tone = match state {
             Some(WorktreePullRequestState::Merged) => design::Tone::Themed(design::accent_color),
             Some(WorktreePullRequestState::Closed) => {
@@ -1564,43 +1573,27 @@ impl State {
             }
             Some(WorktreePullRequestState::Open) => design::Tone::Themed(design::success_color),
         };
-        let one_line = |text: widget::text::Text<'a, cosmic::Theme, cosmic::Renderer>| {
-            text.wrapping(iced::widget::text::Wrapping::None).ellipsize(
-                iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1)),
-            )
-        };
-        let mut detail = vec![format!("#{}", pull_request.number)];
-        if let Some(viewer) = &self.cached_viewer {
-            detail.push(format!("Cached for {viewer} · read only"));
-        }
-        if let Some(author) = &pull_request.author {
-            detail.push(author.login.clone());
-        }
-        detail.push(format!(
-            "{} ← {}",
-            pull_request.base_ref_name, pull_request.head_ref_name
-        ));
-        let progress = if total == 0 {
-            match &self.load {
-                LoadState::Loading => "Loading files".to_owned(),
-                _ => "No files".to_owned(),
-            }
-        } else {
-            format!("{viewed} of {total} viewed")
-        };
-        let title = widget::column::with_children(vec![
-            one_line(design::heading(pull_request.title.as_str()))
-                .width(Length::Fill)
-                .into(),
-            one_line(design::caption(format!(
-                "{} · {progress}",
-                detail.join(" · ")
-            )))
-            .width(Length::Fill)
-            .into(),
-        ])
-        .spacing(0)
-        .width(Length::Fill);
+        let identity = crate::interaction::tooltip(
+            widget::row::with_children(vec![
+                widget::icon::icon(symbolic_icon(icon))
+                    .size(ROW_ICON_SIZE)
+                    .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
+                        cosmic::iced::widget::svg::Style {
+                            color: Some(tone.resolve(theme)),
+                        }
+                    })))
+                    .into(),
+                design::heading(format!("#{}", pull_request.number))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            ])
+            .spacing(spacing.space_xxs)
+            .align_y(Alignment::Center),
+            format!(
+                "{state_label} pull request #{} in {}/{}",
+                pull_request.number, target.repository.owner, target.repository.name
+            ),
+        );
         let busy = self.refreshing || self.load == LoadState::Loading;
         // The spinner has a permanent slot and the refresh control stays
         // mounted while busy: swapping one for the other would move the named
@@ -1652,25 +1645,80 @@ impl State {
             .into(),
         ]);
         widget::row::with_children(vec![
-            widget::container(widget::icon::icon(icon).size(ROW_ICON_SIZE).class(
-                cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
-                    cosmic::iced::widget::svg::Style {
-                        color: Some(tone.resolve(theme)),
-                    }
-                })),
-            ))
-            .center_y(Length::Fill)
-            .into(),
-            title.into(),
+            identity,
+            widget::Space::new().width(Length::Fill).into(),
             activity,
             controls,
         ])
-        .spacing(spacing.space_xs)
+        .spacing(spacing.space_xxs)
         .align_y(Alignment::Center)
         .padding(Padding::from([0, spacing.space_xs]))
         .height(design::HEADER_CONTENT_HEIGHT)
         .width(Length::Fill)
         .into()
+    }
+
+    /// What is under review, in full: the title given the room to wrap, who
+    /// proposes merging which branch into which, and the review entry point.
+    pub fn summary<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
+        let spacing = cosmic::theme::spacing();
+        let Some(target) = &self.target else {
+            return widget::Space::new().into();
+        };
+        let pull_request = &target.pull_request;
+        let title = crate::interaction::tooltip(
+            design::heading(pull_request.title.as_str())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    EllipsizeHeightLimit::Lines(SUMMARY_TITLE_LINES),
+                ))
+                .width(Length::Fill),
+            pull_request.title.as_str(),
+        );
+        let branches = format!(
+            "{} ← {}",
+            pull_request.base_ref_name, pull_request.head_ref_name
+        );
+        let detail = match &pull_request.author {
+            Some(author) => format!("{} · {branches}", author.login),
+            None => branches,
+        };
+        let mut rows = vec![
+            title,
+            crate::interaction::tooltip(
+                design::caption(detail.clone())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::Middle(
+                        EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill),
+                detail,
+            ),
+        ];
+        if let Some(viewer) = &self.cached_viewer {
+            rows.push(
+                design::caption(format!("Cached for {viewer} · read only"))
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+            );
+        }
+        rows.push(
+            widget::row::with_children(vec![
+                widget::Space::new().width(Length::Fill).into(),
+                self.review_control(modal_open),
+            ])
+            .padding(Padding {
+                top: spacing.space_xxs.into(),
+                ..Padding::ZERO
+            })
+            .into(),
+        );
+        widget::column::with_children(rows)
+            .spacing(spacing.space_xxxs)
+            .padding(Padding::from([spacing.space_xs, spacing.space_xs]))
+            .width(Length::Fill)
+            .into()
     }
 
     /// Viewed files over all files.
@@ -1687,6 +1735,16 @@ impl State {
     /// beneath it are named, and a notice that appeared as a new child would
     /// shift them by an index under a click already in flight.
     pub fn notice(&self, modal_open: bool) -> Element<'_, Action> {
+        let notice = self.pane_notice(modal_open);
+        match self.discussion_notice(modal_open) {
+            Some(discussion) => widget::column::with_children(vec![discussion, notice])
+                .width(Length::Fill)
+                .into(),
+            None => notice,
+        }
+    }
+
+    fn pane_notice(&self, modal_open: bool) -> Element<'_, Action> {
         let spacing = cosmic::theme::spacing();
         let message = match (&self.load, &self.notice) {
             (LoadState::Failed(message), _) => {
