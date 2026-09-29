@@ -3535,6 +3535,10 @@ fn record_event_from(
     let Some(host) = host.upgrade() else {
         return;
     };
+    let recipient = match &event {
+        TerminalEvent::SearchResults { owner, .. } => *owner,
+        _ => None,
+    };
     let wire_event = WireTerminalEvent::from(event);
     let (proof, sequence, deliveries) = {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3571,12 +3575,10 @@ fn record_event_from(
                 occurred_at_unix_ms: unix_time_ms(),
             });
         }
-        if matches!(wire_event, WireTerminalEvent::SearchResults { .. }) {
-            record
-                .events
-                .retain(|(_, event)| !matches!(event, WireTerminalEvent::SearchResults { .. }));
-        }
-        if !matches!(wire_event, WireTerminalEvent::ClipboardText { .. }) {
+        if !matches!(
+            wire_event,
+            WireTerminalEvent::ClipboardText { .. } | WireTerminalEvent::SearchResults { .. }
+        ) {
             record.events.push_back((sequence, wire_event.clone()));
         }
         while record.events.len() > EVENT_REPLAY_CAPACITY {
@@ -3584,6 +3586,7 @@ fn record_event_from(
         }
         let deliveries = client_ids
             .into_iter()
+            .filter(|client_id| recipient.is_none_or(|owner| owner == *client_id))
             .filter_map(|client_id| state.clients.get(&client_id).cloned())
             .collect::<Vec<_>>();
         (proof, sequence, deliveries)
@@ -5149,6 +5152,78 @@ for line in sys.stdin:
             );
             assert!(!state.shutting_down);
         }
+    }
+
+    #[test]
+    fn terminal_search_results_are_delivered_only_to_the_requesting_window_and_never_replayed() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            recovery_origin: None,
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let (first, second) = {
+            let mut state = shared.lock().unwrap();
+            let deliveries = (state.register_client(1), state.register_client(2));
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+            state.attach(2, id).unwrap();
+            deliveries
+        };
+        record_event(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::SearchResults {
+                owner: Some(1),
+                request: 1,
+                query: "hit".into(),
+                matches: Vec::new(),
+                truncated: false,
+            },
+        );
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .replay_events(id, 0)
+                .unwrap()
+                .is_empty()
+        );
+        for (delivery, expected) in [(first, 1), (second, 0)] {
+            delivery.close_after_drain();
+            let mut count = 0;
+            while let Some(envelope) = delivery.pop() {
+                if matches!(
+                    envelope.message,
+                    ServerMessage::Event {
+                        event: WireTerminalEvent::SearchResults { request: 1, .. },
+                        ..
+                    }
+                ) {
+                    count += 1;
+                }
+            }
+            assert_eq!(count, expected);
+        }
+        handle.shutdown().unwrap();
     }
 
     #[test]

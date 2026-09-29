@@ -96,6 +96,8 @@ pub enum TerminalEvent {
         text: String,
     },
     SearchResults {
+        /// Daemon client that owns the response; omitted on the client wire.
+        owner: Option<u64>,
         request: u64,
         query: String,
         matches: Vec<super::SearchMatch>,

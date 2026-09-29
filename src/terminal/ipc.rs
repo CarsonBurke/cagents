@@ -1343,6 +1343,7 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 query,
                 matches,
                 truncated,
+                ..
             } => Self::SearchResults {
                 request,
                 query,
@@ -1397,6 +1398,7 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 matches,
                 truncated,
             } => Self::SearchResults {
+                owner: None,
                 request,
                 query,
                 matches,

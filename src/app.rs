@@ -7189,6 +7189,7 @@ impl Cagents {
                     query,
                     matches,
                     truncated,
+                    ..
                 } => {
                     self.terminal_search_results(card, request, query, matches, truncated);
                 }

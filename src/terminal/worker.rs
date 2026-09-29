@@ -8,6 +8,7 @@ use close_processes::{FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     fs::File,
     io::{BufWriter, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -86,9 +87,11 @@ enum Command {
         selection: super::SearchMatch,
     },
     Search {
+        owner: Option<u64>,
         request: u64,
         query: String,
         case_sensitive: bool,
+        latest: Arc<AtomicU64>,
     },
     Hide,
     Reveal,
@@ -211,7 +214,7 @@ struct PublishedState {
     agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
     conversation_title: Mutex<Option<String>>,
-    latest_search: AtomicU64,
+    searches: Mutex<HashMap<Option<u64>, Weak<AtomicU64>>>,
     completed: AtomicBool,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
@@ -248,7 +251,7 @@ impl PublishedState {
             agent_observer: OnceLock::new(),
             semantic_events: OnceLock::new(),
             conversation_title: Mutex::new(None),
-            latest_search: AtomicU64::new(0),
+            searches: Mutex::new(HashMap::new()),
             completed: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -258,6 +261,22 @@ impl PublishedState {
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
         }
+    }
+
+    fn prepare_search(&self, owner: Option<u64>, request: u64) -> Arc<AtomicU64> {
+        let mut searches = self.searches.lock().unwrap_or_else(|p| p.into_inner());
+        // Only queued or active searches retain their cancellation token.
+        searches.retain(|_, token| token.strong_count() > 0);
+        let latest = searches
+            .get(&owner)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let latest = Arc::new(AtomicU64::new(request));
+                searches.insert(owner, Arc::downgrade(&latest));
+                latest
+            });
+        latest.store(request, Ordering::Release);
+        latest
     }
 
     fn set_agent_activity(&self, activity: Option<crate::agent::Activity>) {
@@ -633,14 +652,23 @@ impl TerminalHandle {
         query: String,
         case_sensitive: bool,
     ) -> Result<(), TerminalSendError> {
-        self.inner
-            .published
-            .latest_search
-            .store(request, Ordering::Release);
+        self.search_for(None, request, query, case_sensitive)
+    }
+
+    pub(crate) fn search_for(
+        &self,
+        owner: Option<u64>,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(), TerminalSendError> {
+        let latest = self.inner.published.prepare_search(owner, request);
         self.try_command(Command::Search {
+            owner,
             request,
             query,
             case_sensitive,
+            latest,
         })
     }
 
@@ -1671,14 +1699,17 @@ impl Worker {
                 }
             }
             Command::Search {
+                owner,
                 request,
                 query,
                 case_sensitive,
+                latest,
             } => {
                 match super::search::search(&self.terminal, &query, case_sensitive, || {
-                    self.published.latest_search.load(Ordering::Acquire) != request
+                    latest.load(Ordering::Acquire) != request
                 }) {
                     Ok(Some((matches, truncated))) => self.emit(TerminalEvent::SearchResults {
+                        owner,
                         request,
                         query,
                         matches,
@@ -3111,6 +3142,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn a_second_search_window_cannot_cancel_the_first_windows_query() {
+        let published = PublishedState::new(true, Arc::new(|_| {}));
+        let first = published.prepare_search(Some(1), 4);
+        let other = published.prepare_search(Some(2), 7);
+        assert_eq!(first.load(Ordering::Acquire), 4);
+        let replacement = published.prepare_search(Some(1), 5);
+        assert_eq!(first.load(Ordering::Acquire), 5);
+        assert_eq!(other.load(Ordering::Acquire), 7);
+        drop((first, other, replacement));
+        let local = published.prepare_search(None, 1);
+        assert_eq!(published.searches.lock().unwrap().len(), 1);
+        assert_eq!(local.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     fn osc7_working_directory_accepts_this_host_and_decodes_its_path() {

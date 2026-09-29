@@ -755,7 +755,7 @@ pub(super) fn process_request(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .surface_handle(client_id, terminal_id)?;
             handle
-                .search(request, query, case_sensitive)
+                .search_for(Some(client_id), request, query, case_sensitive)
                 .map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
