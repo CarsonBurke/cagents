@@ -163,20 +163,20 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static CHEVRON_LEFT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m10 4-4 4 4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
-    // The column tabs' globe and speech bubble. Tabs, the inspector heading,
-    // launchers, and empty states name a browser or a chat with one mark.
+    // A globe and a speech bubble. Tabs, the inspector heading, launchers,
+    // and empty states name a browser or a chat with one mark.
     static BROWSER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.25"/><ellipse cx="8" cy="8" rx="2.75" ry="6.25"/><path d="M1.75 8h12.5M3.25 4.5h9.5M3.25 11.5h9.5"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static CHAT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm2 5h10M7 13h7"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" d="M3.5 2.5h9A1.5 1.5 0 0 1 14 4v6a1.5 1.5 0 0 1-1.5 1.5H7L3.5 14v-2.5A1.5 1.5 0 0 1 2 10V4a1.5 1.5 0 0 1 1.5-1.5ZM5 5.75h6M5 8.25h4"/></svg>"#.as_slice()).symbolic(true)
     });
-    // Two panes, one line removed and one added: a comparison. It names both
+    // Two panes, a removal beside an addition: a comparison. It names both
     // the diff surface and its side-by-side layout.
     static DIFF: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M12 4v16M6 10h3M15 10h3M16.5 8.5v3M6 15h3M15 15h3"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 3v10M3.75 8h2.5M9.75 8h2.5M11 6.75v2.5"/></g></svg>"#.as_slice()).symbolic(true)
     });
-    // A node on the history line, with the branch glyphs' stroke.
+    // A node on the history line, with the pull-request glyphs' stroke.
     static COMMIT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v4M8 10.5v4"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -184,7 +184,7 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     // match is Adwaita's legacy glyph, a filled slab that reads as a solid
     // square at 16px.
     static KEYBOARD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M4.5 6.5h0M7 6.5h0M9.5 6.5h0M12 6.5h0M5.5 9.5h5"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M4.25 6.5h0M6.75 6.5h0M9.25 6.5h0M11.75 6.5h0M5.5 9.5h5"/></g></svg>"#.as_slice()).symbolic(true)
     });
     let icon: &LazyLock<widget::icon::Handle> = match name {
         "git-branch-symbolic" => &BRANCH,
@@ -1147,56 +1147,91 @@ mod tests {
         "zoom-out-symbolic",
     ];
 
-    /// Every `"…-symbolic"` string literal in the crate's non-test sources,
-    /// with the files that name it. Icon names reach `symbolic_icon` through tables,
-    /// models, and match arms, so the literals are the whole inventory.
-    fn symbolic_icon_names_in_source() -> BTreeMap<String, BTreeSet<PathBuf>> {
-        fn visit(dir: &Path, names: &mut BTreeMap<String, BTreeSet<PathBuf>>) {
+    /// The crate's Rust sources, keyed by path. This module's own
+    /// list would otherwise read as a use of every name on it; the module
+    /// closes its file, so everything before it is production code.
+    fn crate_sources() -> BTreeMap<PathBuf, String> {
+        fn visit(dir: &Path, sources: &mut BTreeMap<PathBuf, String>) {
             for entry in std::fs::read_dir(dir).expect("read a source directory") {
                 let path = entry.expect("read a source entry").path();
                 if path.is_dir() {
-                    visit(&path, names);
-                    continue;
-                }
-                if path.extension().is_none_or(|extension| extension != "rs") {
-                    continue;
-                }
-                let source = std::fs::read_to_string(&path).expect("read a source file");
-                // Assertions name icons without drawing them, and this
-                // module's own list would otherwise count as a use.
-                let source = source
-                    .split("\n#[cfg(test)]\nmod tests {")
-                    .next()
-                    .unwrap_or_default();
-                for (end, _) in source.match_indices("-symbolic\"") {
-                    let head = &source[..end];
-                    let stem = &head[head.rfind('"').map_or(0, |quote| quote + 1)..];
-                    let is_name = !stem.is_empty()
-                        && stem.bytes().all(|byte| {
-                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                        });
-                    if is_name {
-                        names
-                            .entry(format!("{stem}-symbolic"))
-                            .or_default()
-                            .insert(path.clone());
+                    visit(&path, sources);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let mut source = std::fs::read_to_string(&path).expect("read a source file");
+                    if path.ends_with("src/ui_controls.rs") {
+                        let tests = source
+                            .find("\n#[cfg(test)]\nmod tests {")
+                            .expect("this module is in ui_controls.rs");
+                        source.truncate(tests);
                     }
+                    sources.insert(path, source);
                 }
             }
         }
-        let mut names = BTreeMap::new();
+        let mut sources = BTreeMap::new();
         visit(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut names,
+            &mut sources,
         );
+        sources
+    }
+
+    /// Every `"…-symbolic"` string literal in the crate's sources, with the
+    /// files that name it. Icon names reach `symbolic_icon` through tables,
+    /// models, and match arms, so the literals are the whole inventory.
+    fn symbolic_icon_names_in_source() -> BTreeMap<String, BTreeSet<PathBuf>> {
+        let mut names = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+        for (path, source) in crate_sources() {
+            for (end, _) in source.match_indices("-symbolic\"") {
+                let head = &source[..end];
+                let stem = &head[head.rfind('"').map_or(0, |quote| quote + 1)..];
+                let is_name = !stem.is_empty()
+                    && stem.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    });
+                if is_name {
+                    names
+                        .entry(format!("{stem}-symbolic"))
+                        .or_default()
+                        .insert(path.clone());
+                }
+            }
+        }
         names
+    }
+
+    /// A direct theme lookup would skip the bundled drawings. Only external
+    /// editors' application icons, named by their desktop entries, go to the
+    /// theme without passing through `symbolic_icon`.
+    #[test]
+    fn symbolic_icons_are_drawn_through_symbolic_icon() {
+        let bypasses: Vec<_> = crate_sources()
+            .into_iter()
+            .filter(|(path, _)| !path.ends_with("src/ui_controls.rs"))
+            .flat_map(|(path, source)| {
+                source
+                    .match_indices("from_name(")
+                    .filter(|(start, call)| {
+                        !source[start + call.len()..].starts_with("editor.icon")
+                    })
+                    .map(|(start, _)| {
+                        let line = source[..start].lines().count();
+                        format!("{}:{line}", path.display())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            bypasses.is_empty(),
+            "icons looked up with `from_name` instead of `symbolic_icon`: {bypasses:#?}"
+        );
     }
 
     #[test]
     fn every_symbolic_icon_name_resolves() {
         let names = symbolic_icon_names_in_source();
         assert!(
-            names.contains_key("internet-web-browser-symbolic"),
+            names.contains_key("alarm-symbolic"),
             "the source scan found no icon names"
         );
         let unresolved: BTreeMap<_, _> = names

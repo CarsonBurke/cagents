@@ -430,11 +430,12 @@ fn section_header(
 ) -> Element<'static, Action> {
     widget::button::custom(
         widget::row::with_children(vec![
-            widget::icon::from_name(if open {
+            crate::ui_controls::symbolic_icon(if open {
                 "go-down-symbolic"
             } else {
                 "go-next-symbolic"
             })
+            .icon()
             .size(design::ROW_ICON_SIZE)
             .into(),
             design::heading(label.into()).width(Length::Fill).into(),
@@ -790,7 +791,9 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     // and the run of outcomes reads down the
                                     // panel as one column.
                                     widget::container(
-                                        widget::icon::from_name(symbol).size(design::ROW_ICON_SIZE),
+                                        crate::ui_controls::symbolic_icon(symbol)
+                                            .icon()
+                                            .size(design::ROW_ICON_SIZE),
                                     )
                                     .width(Length::Fixed(design::ROW_ICON_SIZE.into()))
                                     .align_x(Alignment::Center)

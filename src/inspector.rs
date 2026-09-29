@@ -719,13 +719,13 @@ pub fn model_for_card(
                 if source.surface == "Editor" && source.can_show_diff {
                     actions.push(Action::new(
                         "Show diff",
-                        "text-x-generic-symbolic",
+                        "vcs-diff-symbolic",
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
                 } else if source.surface == "Diff" && !source.saving {
                     actions.push(Action::new(
                         "Show editor",
-                        "document-edit-symbolic",
+                        "text-editor-symbolic",
                         InspectorAction::ShowRepositoryEditor(card.id),
                     ));
                 }
