@@ -9935,10 +9935,12 @@ impl Cagents {
                 Task::none()
             }
             Action::Diagnostics => {
+                self.context_tab = ContextTab::Details;
                 self.context_inspector_open = true;
                 Task::none()
             }
             Action::References => {
+                self.context_tab = ContextTab::Details;
                 self.context_inspector_open = true;
                 self.request_lsp(card, LspRequestKind::References)
             }
@@ -14776,6 +14778,7 @@ impl Application for Cagents {
                             locations[0].coordinates,
                         );
                     }
+                    self.context_tab = ContextTab::Details;
                     self.context_inspector_open = true;
                 }
                 Task::none()
@@ -21027,6 +21030,47 @@ mod tests {
             )),
         );
         card
+    }
+
+    #[test]
+    fn editor_language_results_reveal_details_from_the_files_tab() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        for action in [
+            repository_widget::EditorLspAction::Diagnostics,
+            repository_widget::EditorLspAction::References,
+        ] {
+            app.context_tab = ContextTab::Files;
+            app.context_inspector_open = false;
+            let _ = app.update(Message::Repository(RepositoryAction::Language {
+                card,
+                action,
+            }));
+            assert!(app.context_inspector_open);
+            assert_eq!(
+                app.context_tab,
+                ContextTab::Details,
+                "opening the file tree hides the requested language results"
+            );
+        }
+        let doc = LspDocumentId(1);
+        let request = crate::lsp::LspRequestId(1);
+        app.lsp_documents.insert(doc, card);
+        lsp_state(&mut app, card).editor_navigation = Some(request);
+        app.context_tab = ContextTab::Files;
+        app.context_inspector_open = false;
+        let _ = app.update(Message::Lsp(LspEvent::Locations {
+            doc,
+            request,
+            kind: crate::lsp::LocationKind::Definition,
+            items: Vec::new(),
+        }));
+        assert!(app.context_inspector_open);
+        assert_eq!(
+            app.context_tab,
+            ContextTab::Details,
+            "a definition response that cannot jump must expose its results"
+        );
     }
 
     fn lsp_state(app: &mut Cagents, card: CardId) -> &mut LspInspectorState {
