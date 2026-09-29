@@ -1634,7 +1634,15 @@ impl<Message> TerminalWidget<Message> {
                 }
                 match self.handle.resize(size) {
                     Ok(()) => state.pty_size.applied(size),
-                    Err(error) => self.publish_error(error, shell),
+                    Err(error) => {
+                        // The size stays pending, so the next frame sends it
+                        // again without another wait. Once layout is still,
+                        // nothing else may ask for that frame.
+                        if matches!(error, TerminalSendError::Full) {
+                            shell.request_redraw();
+                        }
+                        self.publish_error(error, shell);
+                    }
                 }
             }
         }
