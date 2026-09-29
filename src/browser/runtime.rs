@@ -602,6 +602,13 @@ impl Card {
                     session.webview.reload();
                 }
             }
+            Command::Stop => {
+                if let Some(session) = &self.session {
+                    session
+                        .webview
+                        .evaluate_javascript("window.stop();", |_| {});
+                }
+            }
             Command::Hibernate => self.hibernate(),
             Command::Restore => return self.restore_resources(),
             Command::Input(event) => self.forward_input(event),

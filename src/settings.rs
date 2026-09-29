@@ -533,6 +533,9 @@ const fn default_editor_auto_save() -> bool {
 const fn default_confirm_terminal_close() -> bool {
     true
 }
+fn default_browser_search_url() -> String {
+    "https://duckduckgo.com/?q={query}".into()
+}
 
 const fn default_chat_enter_sends() -> bool {
     true
@@ -705,6 +708,14 @@ pub struct AppSettings {
     pub default_channel_pane: DefaultPane,
     #[serde(default = "default_editor_auto_save")]
     pub editor_auto_save: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_size: Option<f32>,
+    #[serde(default = "default_confirm_terminal_close")]
+    pub confirm_multiline_paste: bool,
+    #[serde(default = "default_browser_search_url")]
+    pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
     #[serde(default)]
@@ -787,6 +798,10 @@ impl Default for AppSettings {
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
+            editor_font_family: None,
+            editor_font_size: None,
+            confirm_multiline_paste: true,
+            browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
@@ -1341,6 +1356,16 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    pub fn editor_font_size(&self) -> f32 {
+        self.editor_font_size.unwrap_or(self.terminal_font_size)
+    }
+
+    pub fn editor_font_family(&self) -> &str {
+        self.editor_font_family
+            .as_deref()
+            .unwrap_or(&self.terminal_font_family)
+    }
+
     /// A modified click explicitly selects a browser; ordinary links use the preference.
     pub fn link_destination(&self, gesture: Option<LinkOpenGesture>) -> LinkOpenDestination {
         match gesture {
@@ -1352,6 +1377,15 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
+        if !self.browser_search_url.contains("{query}")
+            || !search_url
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        {
+            return Err(SettingsError::Invalid(
+                "browser_search_url must be an HTTP(S) URL containing {query}",
+            ));
+        }
         if let crate::terminal::TerminalTheme::Custom(palette) = self.terminal_theme {
             // Keep custom colors when selecting another preset, and refresh
             // the active palette after the configuration file is edited.
@@ -1403,9 +1437,26 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
+        if self
+            .editor_font_size
+            .is_some_and(|size| !(8.0..=40.0).contains(&size))
+        {
+            return Err(SettingsError::Invalid(
+                "editor_font_size must be between 8 and 40",
+            ));
+        }
         if self.terminal_font_family.len() > 128 {
             return Err(SettingsError::Invalid(
                 "terminal_font_family must not exceed 128 bytes",
+            ));
+        }
+        if self
+            .editor_font_family
+            .as_ref()
+            .is_some_and(|family| family.len() > 128)
+        {
+            return Err(SettingsError::Invalid(
+                "editor_font_family must not exceed 128 bytes",
             ));
         }
         if !self.terminal_font_family.is_empty() && self.terminal_font_family.trim().is_empty() {
@@ -2542,6 +2593,24 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_font_inherits_terminal_until_overridden() {
+        let mut settings = super::AppSettings::default();
+        settings.terminal_font_family = "Test Mono".into();
+        settings.terminal_font_size = 19.0;
+        assert_eq!(settings.editor_font_family(), "Test Mono");
+        assert_eq!(settings.editor_font_size(), 19.0);
+        settings.editor_font_family = Some("Editor Mono".into());
+        settings.editor_font_size = Some(16.0);
+        assert_eq!(settings.editor_font_family(), "Editor Mono");
+        assert_eq!(settings.editor_font_size(), 16.0);
+        assert!(settings.confirm_multiline_paste);
+        assert_eq!(
+            settings.terminal_theme,
+            crate::terminal::TerminalTheme::Auto
+        );
+        assert!(settings.validate().is_ok());
+    }
     use super::*;
 
     #[test]

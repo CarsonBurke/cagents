@@ -64,6 +64,8 @@ where
     content: &'a Content<Renderer>,
     line_digits: u32,
     additions: &'a [usize],
+    find_matches: &'a [(Position, Position)],
+    current_match: usize,
     placeholder: Option<text::Fragment<'a>>,
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
@@ -95,6 +97,8 @@ where
             content,
             line_digits: content.line_count().max(1).ilog10() + 1,
             additions: &[],
+            find_matches: &[],
+            current_match: 0,
             placeholder: None,
             font: None,
             text_size: Some(Pixels(13.0)),
@@ -158,6 +162,12 @@ where
         self
     }
 
+    pub fn find_matches(mut self, matches: &'a [(Position, Position)], current: usize) -> Self {
+        self.find_matches = matches;
+        self.current_match = current;
+        self
+    }
+
     /// Sets the text size of the [`TextEditor`].
     pub fn size(mut self, size: impl Into<Pixels>) -> Self {
         self.text_size = Some(size.into());
@@ -193,6 +203,8 @@ where
             content: self.content,
             line_digits: self.line_digits,
             additions: self.additions,
+            find_matches: self.find_matches,
+            current_match: self.current_match,
             placeholder: self.placeholder,
             font: self.font,
             text_size: self.text_size,
@@ -731,6 +743,43 @@ where
         let internal = self.0.borrow();
         let line = internal.editor.line(index)?;
         Some(f(&line.text, line.ending))
+    }
+
+    /// Search Unicode text a line at a time, retaining source byte positions.
+    pub fn find_matches(&self, query: &str) -> Vec<(Position, Position)> {
+        use unicode_casefold::UnicodeCaseFold;
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query: String = query.case_fold().collect();
+        let mut matches = Vec::new();
+        for line in 0..self.line_count() {
+            self.with_line(line, |text, _| {
+                let mut folded = String::with_capacity(text.len());
+                let mut boundaries = Vec::with_capacity(text.len() + 1);
+                for (offset, character) in text.char_indices() {
+                    let start = folded.len();
+                    folded.extend(std::iter::once(character).case_fold());
+                    boundaries.resize(folded.len(), None);
+                    boundaries[start] = Some(offset);
+                }
+                boundaries.push(Some(text.len()));
+                for (offset, _) in folded.match_indices(&query) {
+                    if let (Some(start), Some(end)) =
+                        (boundaries[offset], boundaries[offset + query.len()])
+                    {
+                        matches.push((
+                            Position {
+                                line,
+                                column: start,
+                            },
+                            Position { line, column: end },
+                        ));
+                    }
+                }
+            });
+        }
+        matches
     }
 
     /// Byte length of the text [`Content::text`] would produce, without
@@ -1552,6 +1601,49 @@ where
         }
 
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
+        for run in internal.editor.buffer().layout_runs() {
+            let first = self
+                .find_matches
+                .partition_point(|(_, end)| end.line < run.line_i);
+            for (index, (start, end)) in self
+                .find_matches
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take_while(|(_, (start, _))| start.line <= run.line_i)
+            {
+                if run.line_i < start.line || run.line_i > end.line {
+                    continue;
+                }
+                let mut color = style.selection;
+                color.a *= if index == self.current_match {
+                    0.55
+                } else {
+                    0.18
+                };
+                for glyph in run.glyphs.iter().filter(|glyph| {
+                    (run.line_i != start.line || glyph.end > start.column)
+                        && (run.line_i != end.line || glyph.start < end.column)
+                }) {
+                    let rect = Rectangle::new(
+                        Point::new(
+                            text_bounds.x + horizontal.x + glyph.x,
+                            text_bounds.y + run.line_top,
+                        ),
+                        Size::new(glyph.w, run.line_height),
+                    );
+                    if let Some(bounds) = text_bounds.intersection(&rect) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                ..Default::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+            }
+        }
         let translation = text_bounds.position() - Point::ORIGIN + horizontal;
         let selection = state.focus.as_ref().map(|_| internal.selection());
         if let Some(Selection::Range(ranges)) = &selection {
@@ -2077,6 +2169,24 @@ impl ScrollGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_casefolds_unicode_preserves_whitespace_and_source_offsets() {
+        let content: Content = Content::with_text("Straße\n  café CAFÉ\nİ");
+        assert_eq!(
+            content.find_matches("STRASSE"),
+            vec![(
+                Position { line: 0, column: 0 },
+                Position { line: 0, column: 7 }
+            )]
+        );
+        assert_eq!(content.find_matches(" ").len(), 3);
+        assert_eq!(content.find_matches("CAFÉ").len(), 2);
+        assert!(content.find_matches("").is_empty());
+        // A match must cover a complete original character, even when folding
+        // expands it into more than one scalar.
+        assert!(content.find_matches("i").is_empty());
+    }
 
     #[test]
     fn pointer_drag_and_ime_paste_preserve_unselected_source_and_line_endings() {

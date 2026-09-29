@@ -555,6 +555,31 @@ pub enum RepositoryAction {
     FindPrevious {
         card: CardId,
     },
+    FindInputFocus {
+        card: CardId,
+        focused: bool,
+    },
+    ReplaceQueryChanged {
+        card: CardId,
+        query: String,
+    },
+    ToggleReplace {
+        card: CardId,
+    },
+    ReplaceMatch {
+        card: CardId,
+        all: bool,
+    },
+    ToggleToolbarOverflow {
+        card: CardId,
+    },
+    CloseToolbarOverflow {
+        card: CardId,
+    },
+    ZoomFont {
+        card: CardId,
+        delta: i8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,6 +629,13 @@ impl RepositoryAction {
             | Self::FindQueryChanged { card, .. }
             | Self::FindNext { card }
             | Self::FindPrevious { card }
+            | Self::FindInputFocus { card, .. }
+            | Self::ReplaceQueryChanged { card, .. }
+            | Self::ToggleReplace { card }
+            | Self::ReplaceMatch { card, .. }
+            | Self::ToggleToolbarOverflow { card }
+            | Self::CloseToolbarOverflow { card }
+            | Self::ZoomFont { card, .. }
             | Self::PdfPage { card, .. }
             | Self::PdfTone { card, .. }
             | Self::PdfZoom { card, .. }
@@ -1558,6 +1590,8 @@ pub struct RepositoryRuntime {
     selected: Option<RepositoryFile>,
     document: DocumentState,
     search_mode: bool,
+    editor_font: Font,
+    editor_font_size: f32,
     find_open: bool,
     /// The find bar's query exactly as the user typed it.
     find_query: String,
@@ -1572,6 +1606,11 @@ pub struct RepositoryRuntime {
     /// renews it.
     find_index: usize,
     find_total: usize,
+    find_input_focused: bool,
+    replace_open: bool,
+    replace_query: String,
+    toolbar_overflow_open: bool,
+    find_matches: Vec<(text_editor::Position, text_editor::Position)>,
     /// One entry per comparison this selection has been asked for.
     ///
     /// A list rather than a map: at most six bases are live at once, and
@@ -1719,10 +1758,17 @@ impl RepositoryRuntime {
             files: FileListState::Loading,
             selected: None,
             search_mode: false,
+            editor_font: Font::MONOSPACE,
+            editor_font_size: 14.0,
             find_open: false,
             find_query: String::new(),
             find_index: 0,
             find_total: 0,
+            find_input_focused: false,
+            replace_open: false,
+            replace_query: String::new(),
+            toolbar_overflow_open: false,
+            find_matches: Vec::new(),
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
@@ -2499,31 +2545,21 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
-        let query = query.trim();
+        self.find_matches = document.content.find_matches(query);
         if query.is_empty() {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let text = document.content.text();
-        let query = query.to_ascii_lowercase();
-        let lower = text.to_ascii_lowercase();
-        let total = lower.match_indices(&query).count();
+        let total = self.find_matches.len();
         if total == 0 {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let start = lower
-            .match_indices(&query)
-            .nth(occurrence % total)
-            .map(|(start, _)| start)
-            .expect("an occurrence modulo its total count exists");
-        let end = start + query.len();
-        let start = caret_for_offset(&document.content, start);
-        let end = caret_for_offset(&document.content, end);
+        let (start, end) = self.find_matches[occurrence % total];
         document.content.move_to(text_editor::Cursor {
             position: end,
             selection: Some(start),
@@ -2579,6 +2615,10 @@ impl RepositoryRuntime {
         self.find_open
     }
 
+    pub fn find_input_is_focused(&self) -> bool {
+        self.find_open && self.find_input_focused
+    }
+
     /// Mounts the find strip and selects the occurrence the user is looking
     /// at.
     ///
@@ -2621,6 +2661,8 @@ impl RepositoryRuntime {
         self.find_query.clear();
         self.find_index = 0;
         self.find_total = 0;
+        self.find_input_focused = false;
+        self.find_matches.clear();
         self.set_search_mode(false);
     }
 
@@ -2689,19 +2731,20 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else {
             return 0;
         };
-        let query = self.find_query.trim().to_ascii_lowercase();
+        let query = &self.find_query;
         if query.is_empty() {
             return 0;
         }
         let cursor = document.content.cursor();
-        let mut origin = caret_byte_offset(&document.content, cursor.position);
+        let mut origin = (cursor.position.line, cursor.position.column);
         if let Some(anchor) = cursor.selection {
-            origin = origin.min(caret_byte_offset(&document.content, anchor));
+            origin = origin.min((anchor.line, anchor.column));
         }
-        let mut text = document.content.text();
-        text.make_ascii_lowercase();
-        text.match_indices(&query)
-            .take_while(|(start, _)| *start < origin)
+        document
+            .content
+            .find_matches(query)
+            .iter()
+            .take_while(|(start, _)| (start.line, start.column) < origin)
             .count()
     }
 
@@ -3679,6 +3722,11 @@ impl RepositoryRuntime {
         }
     }
 
+    pub fn set_editor_font(&mut self, font: Font, size: f32) {
+        self.editor_font = font;
+        self.editor_font_size = size;
+    }
+
     fn auto_save_revision(&self) -> Option<u64> {
         match &self.document {
             DocumentState::Editable(document)
@@ -3788,6 +3836,19 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        if matches!(
+            &action,
+            RepositoryAction::Save { .. }
+                | RepositoryAction::DiscardEdits { .. }
+                | RepositoryAction::StageSelected { .. }
+                | RepositoryAction::ApplySourceSurface { .. }
+                | RepositoryAction::ApplyMarkdownMode { .. }
+                | RepositoryAction::ApplyDiffMode { .. }
+                | RepositoryAction::ApplyDiffBasis { .. }
+                | RepositoryAction::OpenExternal { .. }
+        ) {
+            self.toolbar_overflow_open = false;
+        }
         match action {
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
@@ -4424,6 +4485,9 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.capture_native_viewport();
+                if surface == SourceSurface::Editor {
+                    self.align_editor_to_diff();
+                }
                 self.source_surface = surface;
                 self.restore_native_viewport();
                 Task::batch([
@@ -4436,6 +4500,7 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.capture_native_viewport();
+                self.align_editor_to_diff();
                 self.source_surface = SourceSurface::Editor;
                 self.diffs
                     .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
@@ -4735,6 +4800,61 @@ impl RepositoryRuntime {
                 self.step_find(false);
                 Task::none()
             }
+            RepositoryAction::FindInputFocus { focused, .. } => {
+                self.find_input_focused = focused;
+                Task::none()
+            }
+            RepositoryAction::ReplaceQueryChanged { query, .. } => {
+                self.replace_query = query;
+                Task::none()
+            }
+            RepositoryAction::ToggleReplace { .. } => {
+                self.replace_open = !self.replace_open;
+                Task::none()
+            }
+            RepositoryAction::ReplaceMatch { card, all } => {
+                if self.is_saving() {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if self.find_matches.is_empty() {
+                    return Task::none();
+                }
+                if all {
+                    let mut text = document.content.text();
+                    for (start, end) in self.find_matches.iter().rev() {
+                        let start = caret_byte_offset(&document.content, *start);
+                        let end = caret_byte_offset(&document.content, *end);
+                        text.replace_range(start..end, &self.replace_query);
+                    }
+                    document.content.perform(text_editor::Action::SelectAll);
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(text),
+                    )));
+                } else {
+                    let (start, end) = self.find_matches[self.find_index];
+                    document.content.move_to(text_editor::Cursor {
+                        position: end,
+                        selection: Some(start),
+                    });
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(self.replace_query.clone()),
+                    )));
+                }
+                self.push_lsp_change(None);
+                self.markdown_task(card)
+            }
+            RepositoryAction::ToggleToolbarOverflow { .. } => {
+                self.toolbar_overflow_open = !self.toolbar_overflow_open;
+                Task::none()
+            }
+            RepositoryAction::CloseToolbarOverflow { .. } => {
+                self.toolbar_overflow_open = false;
+                Task::none()
+            }
+            RepositoryAction::ZoomFont { .. } => Task::none(),
         }
     }
 
@@ -5032,6 +5152,54 @@ impl RepositoryRuntime {
         let position = self.viewports.editor;
         if let DocumentState::Editable(document) = &mut self.document {
             document.content.restore_scroll_position(position);
+        }
+    }
+
+    fn align_editor_to_diff(&mut self) {
+        if self.source_surface != SourceSurface::Diff {
+            return;
+        }
+        let Some(diff_layout::Anchor::Row { row, fraction }) = self.current_diff_viewport().row
+        else {
+            return;
+        };
+        let Some(model) = self.diff_model() else {
+            return;
+        };
+        let line = match self.diff_mode {
+            DiffMode::Inline => model
+                .inline_rows
+                .iter()
+                .skip(row)
+                .find_map(|row| row.new_line)
+                .or_else(|| {
+                    model
+                        .inline_rows
+                        .iter()
+                        .take(row)
+                        .rev()
+                        .find_map(|row| row.new_line)
+                }),
+            DiffMode::Split => model
+                .split_rows
+                .iter()
+                .skip(row)
+                .find_map(|row| row.new_line)
+                .or_else(|| {
+                    model
+                        .split_rows
+                        .iter()
+                        .take(row)
+                        .rev()
+                        .find_map(|row| row.new_line)
+                }),
+        };
+        if let Some(line) = line {
+            self.viewports.editor = text_editor::ScrollPosition {
+                line: (line as usize).saturating_sub(1),
+                vertical: fraction as f32 * self.editor_font_size * self.line_height,
+                horizontal: self.diff_horizontal,
+            };
         }
     }
 
@@ -6163,7 +6331,7 @@ pub fn selected_file_toolbar(
             )
             .into(),
         );
-        document_actions.push(
+        controls.push(
             icon_control(
                 crate::ui_controls::symbolic_icon("document-save-symbolic"),
                 if runtime.is_saving() {
@@ -6265,30 +6433,40 @@ pub fn selected_file_toolbar(
             ));
         }
     }
-    // The action lane scrolls when space is tight while the secondary launch
-    // actions stay anchored on the right, leaving a clean left/right split.
-    let actions = widget::scrollable(
-        widget::row::with_children(controls)
-            .spacing(crate::design::TOOLBAR_GROUP_SPACING)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
-    )
-    .direction(iced::widget::scrollable::Direction::Horizontal(
-        // The compact rail fits below the centered controls in their existing
-        // inset. Reserving the full content gutter only on this lane shifted
-        // its controls above the filename and the shell's trailing actions.
-        crate::design::scrollbar().margin(0),
-    ))
-    .width(Length::FillPortion(4))
-    .height(crate::design::HEADER_CONTENT_HEIGHT);
+    // The common commands stay visible. File, comparison, review and external
+    // editor commands use a popover rather than clipping an icon rail.
+    let primary_count = if editable { 2 } else { 1 };
+    let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
+    overflow.extend(secondary);
+    let more = icon_control(
+        crate::ui_controls::symbolic_icon("view-more-symbolic"),
+        "More file actions",
+        runtime.toolbar_overflow_open,
+        true,
+        Some(RepositoryAction::ToggleToolbarOverflow { card }),
+    );
+    controls.push(crate::ui_controls::popover(
+        more,
+        runtime.toolbar_overflow_open.then(|| {
+            widget::container(
+                widget::column::with_children(overflow)
+                    .spacing(crate::design::TOOLBAR_GROUP_SPACING),
+            )
+            .padding(crate::design::TOOLBAR_INSET)
+            .into()
+        }),
+        widget::popover::Position::Bottom,
+        RepositoryAction::CloseToolbarOverflow { card },
+    ));
+    let actions = widget::row::with_children(controls)
+        .spacing(crate::design::TOOLBAR_GROUP_SPACING)
+        .align_y(Alignment::Center)
+        .height(crate::design::HEADER_CONTENT_HEIGHT);
     let mut header = Vec::with_capacity(3);
     if let Some(title) = title {
         header.push(title.into());
     }
     header.push(actions.into());
-    if !secondary.is_empty() {
-        header.push(toolbar_group(secondary));
-    }
     let toolbar = widget::container(
         widget::row::with_children(header)
             .spacing(crate::design::TOOLBAR_GROUP_SPACING)
@@ -6321,10 +6499,25 @@ fn find_strip<'a>(
     }
     let matched = runtime.find_total != 0;
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
+        icon_control(
+            crate::ui_controls::symbolic_icon("edit-find-symbolic"),
+            "Find and replace",
+            runtime.replace_open,
+            true,
+            Some(RepositoryAction::ToggleReplace { card }),
+        )
+        .into(),
         widget::text_input("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
             .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
-            .on_submit(move |_| RepositoryAction::FindNext { card })
+            .on_focus(RepositoryAction::FindInputFocus {
+                card,
+                focused: true,
+            })
+            .on_unfocus(RepositoryAction::FindInputFocus {
+                card,
+                focused: false,
+            })
             .size(crate::design::TEXT_BODY)
             .padding([0.0, crate::design::GRID_UNIT * 2.0])
             .width(Length::Fill)
@@ -6332,7 +6525,7 @@ fn find_strip<'a>(
     ];
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
-    if !runtime.find_query.trim().is_empty() {
+    if !runtime.find_query.is_empty() {
         row.push(
             crate::design::caption(if matched {
                 format!("{} of {}", runtime.find_index + 1, runtime.find_total)
@@ -6375,17 +6568,41 @@ fn find_strip<'a>(
         )
         .into(),
     );
+    let find = widget::row::with_children(row)
+        .spacing(crate::design::GRID_UNIT * 2.0)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
+    if runtime.replace_open {
+        strips.push(
+            widget::row::with_children(vec![
+                widget::text_input("Replace with", &runtime.replace_query)
+                    .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
+                    .width(Length::Fill)
+                    .into(),
+                widget::button::standard("Replace")
+                    .on_press_maybe(
+                        (matched && !runtime.is_saving())
+                            .then_some(RepositoryAction::ReplaceMatch { card, all: false }),
+                    )
+                    .into(),
+                widget::button::standard("Replace all")
+                    .on_press_maybe(
+                        (matched && !runtime.is_saving())
+                            .then_some(RepositoryAction::ReplaceMatch { card, all: true }),
+                    )
+                    .into(),
+            ])
+            .spacing(crate::design::GRID_UNIT * 2.0)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
     Some(
-        widget::container(
-            widget::row::with_children(row)
-                .spacing(crate::design::GRID_UNIT * 2.0)
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
-        )
-        .padding([0.0, crate::design::GRID_UNIT * 3.0])
-        .height(crate::design::DENSE_ROW_HEIGHT)
-        .width(Length::Fill)
-        .into(),
+        widget::container(widget::column::with_children(strips))
+            .padding([0.0, crate::design::GRID_UNIT * 3.0])
+            .width(Length::Fill)
+            .into(),
     )
 }
 
@@ -6827,8 +7044,16 @@ fn editable_document_view<'a>(
                 ),
                 |highlight, _theme: &cosmic::Theme| highlight.to_format(),
             )
-            .font(Font::MONOSPACE)
-            .size(14.0)
+            .font(runtime.editor_font)
+            .find_matches(
+                if runtime.find_open {
+                    &runtime.find_matches
+                } else {
+                    &[]
+                },
+                runtime.find_index,
+            )
+            .size(runtime.editor_font_size)
             .line_height(iced::widget::text::LineHeight::Relative(
                 runtime.line_height,
             ))
@@ -6850,7 +7075,20 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(text_editor::default_bindings);
+            .key_binding(move |press| {
+                if let Some(delta) = crate::interaction::font_zoom_chord(
+                    &press.key,
+                    press.physical_key,
+                    press.modifiers,
+                ) {
+                    Some(text_editor::Binding::Custom(RepositoryAction::ZoomFont {
+                        card,
+                        delta,
+                    }))
+                } else {
+                    text_editor::default_bindings(press)
+                }
+            });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         let entries = [
@@ -9666,27 +9904,14 @@ mod tests {
             assert!(targets > 0);
         }
 
-        // Horizontal only: the compact toolbar thumb fits into the controls'
-        // existing symmetric inset, with no right or bottom-only padding.
+        // The compact toolbar keeps its primary actions visible and moves
+        // secondary actions into a menu instead of a horizontal scroll lane.
         let toolbar = laid_out(
             selected_file_toolbar(card, &runtime).expect("a selected file has a toolbar"),
             &renderer,
             iced::Size::new(240.0, crate::design::HEADER_HEIGHT),
         );
-        let (viewport, content) = *scroll_viewports(&toolbar)
-            .first()
-            .expect("the action lane scrolls");
-        assert!(content.size().width > viewport.size().width);
-        let controls = occupied(content);
-        assert!(
-            content.size().width - (controls.x + controls.width) < 0.5,
-            "a horizontal-only lane reserves no right rail"
-        );
-        let bottom = content.size().height - (controls.y + controls.height);
-        assert!(
-            bottom >= crate::design::SCROLLBAR_THUMB_WIDTH,
-            "the lowest control leaves {bottom} below it, clear of the compact thumb"
-        );
+        assert!(scroll_viewports(&toolbar).is_empty());
 
         // Vertical only: the Markdown preview, whose inset comes from the
         // theme's medium spacing. That is wider than the rail today, and this
@@ -14524,6 +14749,59 @@ mod tests {
             "a closed find bar that left search mode on would swallow every keystroke that \
              followed it"
         );
+    }
+
+    #[test]
+    fn unicode_find_replace_all_is_one_edit_and_renews_matches() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "Straße STRASSE\n");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "strasse".into(),
+        }));
+        assert_eq!(runtime.find_total, 2);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "road".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        assert_eq!(document.content.text(), "road road\n");
+        assert!(runtime.is_dirty());
+        assert_eq!(runtime.find_total, 0);
+    }
+
+    #[test]
+    fn returning_from_diff_to_edit_preserves_the_visible_source_line() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "line\n".repeat(100).as_str());
+        runtime.source_surface = SourceSurface::Diff;
+        let mut model = model_with(1);
+        model.inline_rows = (0..100)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        runtime.set_diff_state(
+            runtime.diff_basis.clone(),
+            DiffState::ready(staged_text_diff(model)),
+        );
+        runtime.diff_viewport.offset = 30.0 * DIFF_ROW_HEIGHT;
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: false,
+        }));
+        assert_eq!(runtime.viewports.editor.line, 30);
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
     }
 
     #[test]

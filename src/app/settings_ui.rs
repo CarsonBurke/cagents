@@ -355,27 +355,47 @@ fn settings_category_controls<'a>(
                 ),
             ],
         )],
-        SettingsCategory::Editor => vec![settings_group(
-            "Editor",
-            "Shared native editor and diff preferences.",
-            crate::settings_widgets::editor_options(
-                draft.editor_auto_save,
-                draft.editor_wrap_lines,
-                draft.editor_syntax_theme,
-                |enabled| Message::SettingsChanged {
-                    field: SettingsField::EditorAutoSave,
-                    value: enabled.to_string(),
-                },
-                |enabled| Message::SettingsChanged {
-                    field: SettingsField::EditorWrapLines,
-                    value: enabled.to_string(),
-                },
-                |theme| Message::SettingsChanged {
-                    field: SettingsField::EditorSyntaxTheme,
-                    value: theme.key().into(),
-                },
+        SettingsCategory::Editor => vec![
+            settings_group(
+                "Font",
+                "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
+                vec![
+                    setting_input(
+                        "Font family",
+                        "Monospace font family, or blank to follow the terminal.",
+                        &draft.editor_font_family,
+                        SettingsField::EditorFontFamily,
+                    ),
+                    setting_input(
+                        "Font size",
+                        "8–40 logical pixels, or blank to follow the terminal.",
+                        &draft.editor_font_size,
+                        SettingsField::EditorFontSize,
+                    ),
+                ],
             ),
-        )],
+            settings_group(
+                "Editor",
+                "Shared native editor and diff preferences.",
+                crate::settings_widgets::editor_options(
+                    draft.editor_auto_save,
+                    draft.editor_wrap_lines,
+                    draft.editor_syntax_theme,
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::EditorAutoSave,
+                        value: enabled.to_string(),
+                    },
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::EditorWrapLines,
+                        value: enabled.to_string(),
+                    },
+                    |theme| Message::SettingsChanged {
+                        field: SettingsField::EditorSyntaxTheme,
+                        value: theme.key().into(),
+                    },
+                ),
+            ),
+        ],
         SettingsCategory::Appearance => vec![
             settings_group(
                 "Interface",
@@ -512,6 +532,18 @@ fn settings_category_controls<'a>(
                         "×",
                     ),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
+                    setting_field(
+                        "Multiline paste",
+                        "Warn before pasting multiple lines when the program does not support bracketed paste.",
+                        crate::settings_widgets::toggle(
+                            "Confirm multiline paste",
+                            draft.confirm_multiline_paste,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::ConfirmMultilinePaste,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                     settings_choice(
                         "Cursor shape",
                         "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
@@ -580,6 +612,12 @@ fn settings_category_controls<'a>(
             "Link handling",
             "Choose the default browser for links. Modified clicks explicitly choose either browser.",
             vec![
+                setting_input(
+                    "Search URL",
+                    "Use {query} where the search terms belong, for example https://duckduckgo.com/?q={query}.",
+                    &draft.browser_search_url,
+                    SettingsField::BrowserSearchUrl,
+                ),
                 #[cfg(feature = "integrated-browser")]
                 setting_field(
                     "Browser logins",
