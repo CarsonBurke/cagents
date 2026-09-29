@@ -2,7 +2,7 @@
 //! stay outside HostState and SQLite transactions.
 
 pub(super) mod precheck;
-pub(super) mod schedule;
+pub(super) use crate::automations::schedule;
 pub(super) mod service;
 pub(super) mod target;
 
