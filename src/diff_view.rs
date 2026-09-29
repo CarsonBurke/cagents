@@ -58,6 +58,11 @@ pub struct DiffModel {
     pub split_rows: Vec<SplitDiffRow>,
     pub inline_change_starts: Vec<usize>,
     pub split_change_starts: Vec<usize>,
+    /// Maximal runs of unchanged rows, in file order, for `[inline, split]`.
+    /// Both layouts hold the same runs with the same lengths, so run `i` of
+    /// one names exactly the lines of run `i` of the other; only their row
+    /// indices differ. Presentation decides how much of each run to fold.
+    pub unchanged: [Vec<Range<usize>>; 2],
     pub additions: u32,
     pub deletions: u32,
     /// Shaped logical-pixel extents for [light, dark], rounded up on the worker.
@@ -669,6 +674,12 @@ impl DiffModel {
         }
     }
 
+    /// Runs of unchanged rows in `mode`, in file order. See
+    /// [`DiffModel::unchanged`].
+    pub fn unchanged_runs(&self, mode: DiffMode) -> &[Range<usize>] {
+        &self.unchanged[usize::from(mode == DiffMode::Split)]
+    }
+
     pub fn row_count(&self, mode: DiffMode) -> usize {
         match mode {
             DiffMode::Inline => self.inline_rows.len(),
@@ -841,6 +852,7 @@ fn build_diff_rows(
             split_rows: Vec::with_capacity(lines.len()),
             inline_change_starts: Vec::new(),
             split_change_starts: Vec::new(),
+            unchanged: Default::default(),
             additions: 0,
             deletions: 0,
             max_line_width: [0; 2],
@@ -857,6 +869,7 @@ fn build_diff_rows(
             lines.len(),
             &mut model.inline_rows,
             &mut model.split_rows,
+            &mut model.unchanged,
             cancellation,
         )?;
         check_cancelled(cancellation)?;
@@ -889,6 +902,7 @@ fn build_diff_rows(
     let mut split_rows = Vec::new();
     let mut inline_change_starts = Vec::new();
     let mut split_change_starts = Vec::new();
+    let mut unchanged = <[Vec<Range<usize>>; 2]>::default();
     let mut old_cursor = 0usize;
     let mut new_cursor = 0usize;
     let mut before_endings = HashMap::<&str, u8>::new();
@@ -907,6 +921,7 @@ fn build_diff_rows(
             hunk.after.start as usize,
             &mut inline_rows,
             &mut split_rows,
+            &mut unchanged,
             cancellation,
         )?;
         inline_change_starts.push(inline_rows.len());
@@ -1029,6 +1044,7 @@ fn build_diff_rows(
         after_lines.len(),
         &mut inline_rows,
         &mut split_rows,
+        &mut unchanged,
         cancellation,
     )?;
 
@@ -1039,6 +1055,7 @@ fn build_diff_rows(
         split_rows,
         inline_change_starts,
         split_change_starts,
+        unchanged,
         additions: diff.count_additions(),
         deletions: diff.count_removals(),
         max_line_width: [0; 2],
@@ -1348,9 +1365,11 @@ fn append_context(
     new_end: usize,
     inline: &mut Vec<InlineDiffRow>,
     split: &mut Vec<SplitDiffRow>,
+    unchanged: &mut [Vec<Range<usize>>; 2],
     cancellation: &CancellationToken,
 ) -> Result<(), Cancelled> {
     debug_assert_eq!(old_end - *old_cursor, new_end - *new_cursor);
+    let starts = [inline.len(), split.len()];
     while *old_cursor < old_end && *new_cursor < new_end {
         check_cancelled(cancellation)?;
         let old_line = *old_cursor + 1;
@@ -1374,6 +1393,10 @@ fn append_context(
         });
         *old_cursor += 1;
         *new_cursor += 1;
+    }
+    if inline.len() > starts[0] {
+        unchanged[0].push(starts[0]..inline.len());
+        unchanged[1].push(starts[1]..split.len());
     }
     Ok(())
 }
@@ -1793,6 +1816,54 @@ mod tests {
             color_at(model.syntax.line(false, Some(2), false), 0),
             color_at(model.syntax.line(false, Some(2), true), 0),
             "palette changes must select cached matching syntax foregrounds",
+        );
+    }
+
+    #[test]
+    fn unchanged_runs_are_the_context_rows_of_both_layouts() {
+        let before: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        let mut after: Vec<String> = (1..=40).map(|line| format!("line {line}\n")).collect();
+        after[9] = "changed 10\n".into();
+        after.insert(30, "inserted\n".into());
+        let model = build_diff(&before, &after.concat());
+        assert_eq!(
+            model.unchanged_runs(DiffMode::Inline),
+            &[0..9, 11..31, 32..42]
+        );
+        assert_eq!(
+            model.unchanged_runs(DiffMode::Split),
+            &[0..9, 10..30, 31..41]
+        );
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let runs = model.unchanged_runs(mode);
+            for row in 0..model.row_count(mode) {
+                let kind = match mode {
+                    DiffMode::Inline => model.inline_rows[row].kind,
+                    DiffMode::Split => model.split_rows[row].kind,
+                };
+                assert_eq!(
+                    runs.iter().any(|run| run.contains(&row)),
+                    kind == DiffRowKind::Context,
+                    "{mode:?} row {row}"
+                );
+            }
+        }
+        // Run `i` names the same lines in both layouts.
+        for (inline, split) in model.unchanged[0].iter().zip(&model.unchanged[1]) {
+            assert_eq!(inline.len(), split.len());
+            assert_eq!(
+                model.inline_rows[inline.start].new_line,
+                model.split_rows[split.start].new_line
+            );
+        }
+
+        let identical = build_diff("a\nb\nc\n", "a\nb\nc\n");
+        assert_eq!(identical.unchanged, [vec![0..3], vec![0..3]]);
+        assert!(
+            build_diff("", "added\n")
+                .unchanged
+                .iter()
+                .all(Vec::is_empty)
         );
     }
 
