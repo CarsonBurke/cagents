@@ -107,7 +107,7 @@ Every shortcut is configurable; see
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
 - **Activate panes on hover** is off by default. When enabled, it previews the
-  pane under the pointer; keyboard focus moves when you click or type into it.
+  pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
 - Hold **Alt+Tab** to preview recently used worktrees and channels. Release
   **Alt** to open the highlighted workspace, or press **Escape** to cancel.
   Previewing does not start panes in the workspaces you pass.
@@ -213,23 +213,36 @@ reconciled on refresh. The cache retains up to 32 recent reviews within a
 - Settings → Links → **Open pull requests in** switches rows back to plain
   links.
 
-Click a diff line number to write a comment. Shift-click another line on the
-same side to select an inclusive range. **Save pending comment** keeps the
-comment in your GitHub draft review; **Preview** renders its Markdown before
-saving. Existing discussions appear below their lines, with outdated threads
-above the file. Resolved threads collapse. You can reply, resolve or reopen a
-thread, and edit or delete your own pending comments.
-Threads whose lines are unavailable, including non-text files, also appear
-above the file so their replies and resolution controls remain reachable.
+The header names the pull request and holds its whole-PR controls; the title,
+author, and branches read in full beneath it, with the viewed progress beside
+the review control.
 
-The review bar shows the pending comment count and offers **Comment**,
-**Approve**, or **Request changes**, with an optional summary. Save or cancel
-an open composer first. **Review and submit** shows the repository, pull
-request, exact commit, event, summary, and pending count before submission.
-The app rechecks the repository, signed-in account, commit, and pending comment
-contents before sending. If a request's answer is lost, it asks you to check
-GitHub rather than silently posting it again. The same controls are available
-in ceditor's Pull requests panel.
+Comment where the feedback belongs:
+
+- **A line:** click a diff line number. Shift-click another line on the same
+  side to select an inclusive range.
+- **A file:** use the comment button in the file toolbar. The discussion opens
+  above the file's first diff row.
+- **The pull request:** open **Review** under the title and write a comment
+  there.
+
+**Save pending comment** keeps a line or file comment in your GitHub draft
+review; **Preview** renders its Markdown before saving. Existing discussions
+appear below their lines, with file and outdated threads above the file.
+Resolved threads collapse. You can reply, resolve or reopen a thread, and edit
+or delete your own pending comments. Threads whose lines are unavailable,
+including non-text files, also appear above the file so their replies and
+resolution controls remain reachable.
+
+Submission stays out of the way until you want it. **Review** opens a popover
+with an optional pull request comment and **Comment**, **Approve**, or
+**Request changes**; once you have pending comments the button becomes
+**Finish review** with their count. Save or cancel an open composer first.
+**Submit review** then confirms the repository, pull request, exact commit,
+event, comment, and pending count. The app rechecks the repository, signed-in
+account, commit, and pending comment contents before sending. If a request's
+answer is lost, the pane asks you to check GitHub rather than silently posting
+it again. The same controls are available in ceditor's Pull requests panel.
 
 Use **Create worktree from reviewed commit** in the PR header to work on that
 exact revision. The suggested branch includes the PR number and commit prefix;

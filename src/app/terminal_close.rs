@@ -375,6 +375,10 @@ impl Cagents {
             }
         }
         self.lifecycle.remove(id);
+        if let Some(CardKind::Terminal(session)) = self.card_state(id).map(|card| &card.kind) {
+            let terminal = session.id;
+            self.retained_outputs.remove(&terminal);
+        }
         // A closed card is never reopened, so its filing is spent.
         Arc::make_mut(&mut self.durable).card_scopes.remove(&id);
         if let Some(card) = self.card_state_mut(id) {

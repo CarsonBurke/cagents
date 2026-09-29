@@ -1862,6 +1862,24 @@ mod tests {
             ]
         }
 
+        /// An open menu keeps the motions over it from everything beneath it,
+        /// and the window's input trace records them all the same.
+        #[test]
+        fn an_open_menu_does_not_hide_motion_from_the_input_trace() {
+            use crate::input_trace::{InputTrace, observe};
+
+            let input = InputTrace::default();
+            let traced = || observe(row(3), &input);
+            let mut frames = Frames::new();
+            let _ = frames.frame(traced(), &[moved(ANCHOR)], ANCHOR);
+            let _ = frames.frame(traced(), &right_click(), ANCHOR);
+            let _ = frames.frame(traced(), &[redraw()], ANCHOR);
+            let further = Point::new(OVER_MENU.x + 1.0, OVER_MENU.y);
+            let statuses = frames.frame(traced(), &[moved(OVER_MENU), moved(further)], further);
+            assert_eq!(statuses, [Status::Captured, Status::Captured]);
+            assert_eq!(input.previous_position(), Some(OVER_MENU));
+        }
+
         #[test]
         fn a_single_item_context_menu_activates_its_visible_item() {
             for move_before_press in [false, true] {

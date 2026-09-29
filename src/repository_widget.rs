@@ -14,7 +14,7 @@ use std::{
 mod text_editor;
 
 mod diff_layout;
-use diff_layout::RowOffsets;
+use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
@@ -38,6 +38,7 @@ use crate::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
         SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
     },
+    editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
         LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
     },
@@ -473,6 +474,14 @@ pub enum RepositoryAction {
     DiscardEdits {
         card: CardId,
     },
+    /// Reverts the newest step of the open buffer's edit history.
+    Undo {
+        card: CardId,
+    },
+    /// Re-applies the newest undone step.
+    Redo {
+        card: CardId,
+    },
     BackToFiles {
         card: CardId,
     },
@@ -531,6 +540,23 @@ pub enum RepositoryAction {
     NextChange {
         card: CardId,
     },
+    /// Scrolls the diff to its first row, where file-level annotations sit.
+    RevealDiffTop {
+        card: CardId,
+    },
+    /// Reveals rows of a folded run of unchanged lines. `run` is the rows
+    /// that run held in `mode` when the fold was drawn: a fold index names a
+    /// run of one model, and a rebuilt model may number its runs differently.
+    /// Anything else may change in between; a second click lands as a second
+    /// reveal, as a reader clicking twice expects.
+    ExpandDiffFold {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        mode: DiffMode,
+        fold: usize,
+        run: Range<usize>,
+        expansion: FoldExpansion,
+    },
     MarkdownLink {
         card: CardId,
         uri: markdown::Uri,
@@ -583,6 +609,8 @@ impl RepositoryAction {
             | Self::Save { card, .. }
             | Self::Reload { card }
             | Self::DiscardEdits { card }
+            | Self::Undo { card }
+            | Self::Redo { card }
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
@@ -596,6 +624,7 @@ impl RepositoryAction {
             | Self::PreviewViewport { card, .. }
             | Self::PreviousChange { card }
             | Self::NextChange { card }
+            | Self::RevealDiffTop { card }
             | Self::WorkingDiffDue { card, .. }
             | Self::MarkdownDue { card, .. }
             | Self::MarkdownLink { card, .. }
@@ -610,6 +639,7 @@ impl RepositoryAction {
             | Self::PdfPageRendered { card, .. } => *card,
             Self::ReviewLine { identity, .. }
             | Self::DiffAnnotations { identity, .. }
+            | Self::ExpandDiffFold { identity, .. }
             | Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
@@ -672,6 +702,18 @@ struct EditorDocument {
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
+    /// Undo and redo for this buffer. It lives exactly as long as the buffer:
+    /// a document loaded afresh starts a history of its own.
+    history: History,
+}
+
+/// What one editor action did to the buffer's text.
+#[derive(Debug, Clone, PartialEq)]
+enum Applied {
+    Unchanged,
+    /// The text changed; the protocol edit describing it, or `None` where it
+    /// has no protocol range and the server needs the whole document.
+    Changed(Option<LspTextEdit>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -711,6 +753,7 @@ impl EditorDocument {
             conflict: false,
             error: None,
             durability_warning: None,
+            history: History::default(),
         }
     }
 
@@ -721,7 +764,8 @@ impl EditorDocument {
         Self::new(path.clone(), path, text, disk_hash, markdown)
     }
 
-    /// Applies one editor action and brings the derived state with it.
+    /// Applies one editor action and brings the derived state with it,
+    /// answering whether the text changed and how to tell the server.
     ///
     /// Deliberately does *not* serialize the buffer.
     /// [`text_editor::Content::text`] walks every line into a fresh `String`,
@@ -729,22 +773,128 @@ impl EditorDocument {
     /// way copies megabytes per keystroke on the COSMIC update thread.
     /// Dirtiness is decided from the byte length first and Markdown is
     /// re-parsed at a debounce boundary instead.
-    fn apply(&mut self, action: text_editor::Action) {
-        let is_edit = action.is_edit();
-        self.content.perform(action);
-        if is_edit {
-            self.revision = self.revision.wrapping_add(1).max(1);
-            self.dirty = !content_matches(&self.content, &self.saved_text);
-            self.markdown_stale |= self.markdown;
+    fn apply(&mut self, action: text_editor::Action) -> Applied {
+        match action {
+            text_editor::Action::Edit(edit) => {
+                let kind = edit_kind(&edit, self.content.cursor());
+                let trailing_cr = trailing_carriage_return(&self.content).is_some();
+                let Some(recorded) = self.content.perform_edit(edit) else {
+                    return Applied::Unchanged;
+                };
+                // A final bare `\r` is a byte the protocol does not count, and
+                // `protocol_edit` measures against the edited buffer only; while
+                // either side ends in one, the server gets the whole document.
+                let protocol = if trailing_cr || trailing_carriage_return(&self.content).is_some() {
+                    None
+                } else {
+                    protocol_edit(&self.content, &recorded.change)
+                };
+                self.history.record(
+                    recorded.change,
+                    kind,
+                    recorded.before,
+                    self.content.cursor(),
+                    Instant::now(),
+                );
+                self.text_changed();
+                Applied::Changed(protocol)
+            }
+            // Scrolling is only looking; everything else moves the caret or
+            // the selection, and typing resumed from there is a new step.
+            text_editor::Action::Scroll { .. } => {
+                self.content.perform(action);
+                Applied::Unchanged
+            }
+            action => {
+                self.history.seal();
+                self.content.perform(action);
+                Applied::Unchanged
+            }
         }
     }
 
-    fn discard_edits(&mut self) {
-        // `Content::with_text` starts the viewport at the top of the file.
-        // This card maintains per-file anchors precisely so the user does not
-        // lose their place, and abandoning an edit is no reason to lose it.
+    /// Brings the derived state up to date after the text changed.
+    fn text_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.dirty = !content_matches(&self.content, &self.saved_text);
+        self.markdown_stale |= self.markdown;
+    }
+
+    /// Steps through the edit history, reporting what changed for the
+    /// language server, or `None` when there was nothing to step to.
+    ///
+    /// Each entry describes one replacement in the order it was applied; an
+    /// entry is `None` where the replacement had no protocol range.
+    fn step_history(&mut self, redo: bool) -> Option<Vec<Option<LspTextEdit>>> {
+        let mut buffer = ProtocolTracked {
+            content: &mut self.content,
+            edits: Vec::new(),
+        };
+        let replay = if redo {
+            self.history.redo(&mut buffer)
+        } else {
+            self.history.undo(&mut buffer)
+        };
+        let edits = buffer.edits;
+        match replay {
+            Replay::Empty => return None,
+            Replay::Applied => {}
+            Replay::Diverged => {
+                tracing::warn!("editor history no longer matched its buffer and was cleared");
+            }
+        }
+        if !edits.is_empty() {
+            self.text_changed();
+        }
+        Some(edits)
+    }
+
+    /// Returns the buffer to the text last read from or written to disk, as
+    /// one step the user can undo.
+    ///
+    /// Reported like [`EditorDocument::step_history`]. A buffer whose lines
+    /// cannot be addressed the way the history needs is rebuilt instead,
+    /// which cannot be undone and forgets the history.
+    fn discard_edits(&mut self) -> Vec<Option<LspTextEdit>> {
+        // The reader keeps their place: the caret and the viewport stay where
+        // they were rather than following the replaced text.
         let scroll = self.content.scroll_position();
-        self.content = text_editor::Content::with_text(&self.saved_text);
+        let cursor = self.content.cursor();
+        let change = self.content.replacement_to_text(&self.saved_text);
+        let mut edits = Vec::new();
+        if let Some(change) = change {
+            let mut buffer = ProtocolTracked {
+                content: &mut self.content,
+                edits: Vec::new(),
+            };
+            // Verified afterwards as well as before: the change was measured
+            // on the text re-split into lines, and a buffer whose own lines
+            // disagree with that split is rebuilt rather than trusted.
+            let replaced = buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            );
+            let replayed = buffer.edits;
+            if replaced && content_matches(&self.content, &self.saved_text) {
+                edits = replayed;
+                self.content.set_cursor(cursor);
+                self.history.record_group(
+                    vec![change],
+                    cursor,
+                    self.content.cursor(),
+                    Instant::now(),
+                );
+            } else {
+                tracing::warn!(
+                    "discarded edits by rebuilding the editor buffer; they cannot be undone"
+                );
+                self.content = text_editor::Content::with_text(&self.saved_text);
+                self.history.clear();
+                edits.push(None);
+            }
+        }
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.markdown_stale |= self.markdown;
@@ -752,6 +902,7 @@ impl EditorDocument {
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
         self.error = None;
+        edits
     }
 
     /// Advances the version the language server will be told about, or reports
@@ -776,9 +927,42 @@ impl EditorDocument {
     /// other way to express.
     fn replace_text(&mut self, text: &str) {
         self.content = text_editor::Content::with_text(text);
+        // The positions the history recorded address the buffer that was
+        // just thrown away.
+        self.history.clear();
         self.markdown_stale |= self.markdown;
         self.dirty = text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
+    }
+
+    /// Applies replacements given as byte spans of `text`, the buffer's
+    /// current text, in place and in the order given, returning the changes
+    /// the history needs to undo them.
+    ///
+    /// Each span must still address the buffer when its turn comes, which
+    /// holds for spans applied highest-first. A span the buffer cannot
+    /// address — one splitting a line break — stops the splice and answers
+    /// `None`; the caller then replaces the text wholesale, which is what
+    /// the partly spliced buffer needs anyway.
+    fn splice<'t>(
+        &mut self,
+        text: &str,
+        spans: impl Iterator<Item = (Range<usize>, &'t str)>,
+    ) -> Option<Vec<TextChange>> {
+        let mut changes = Vec::new();
+        for (span, inserted) in spans {
+            let removed = text.get(span.clone())?;
+            if removed == inserted {
+                continue;
+            }
+            let start = caret_for_offset(&self.content, span.start);
+            let end = self.content.range_end(start, removed)?;
+            if let Some(change) = self.content.replace_range_recorded(start, end, inserted) {
+                changes.push(change);
+            }
+        }
+        self.text_changed();
+        Some(changes)
     }
 
     /// Re-parses Markdown when an edit has invalidated the preview's items.
@@ -792,6 +976,71 @@ impl EditorDocument {
             return;
         }
         self.markdown_items = markdown::parse(&self.content.text()).collect();
+    }
+}
+
+/// How an edit may coalesce with the undo step before it, judged from the
+/// caret it was made at.
+fn edit_kind(edit: &text_editor::Edit, before: text_editor::Cursor) -> EditKind {
+    // Any selection counts, even one reported as anchored where the caret
+    // is: a double-clicked word selects its span from a single point.
+    let selected = before.selection.is_some();
+    match edit {
+        text_editor::Edit::Insert(_) | text_editor::Edit::Enter => EditKind::Insert,
+        text_editor::Edit::Backspace if !selected => EditKind::DeleteBackward,
+        text_editor::Edit::Delete if !selected => EditKind::DeleteForward,
+        text_editor::Edit::Backspace
+        | text_editor::Edit::Delete
+        | text_editor::Edit::Paste(_)
+        | text_editor::Edit::Indent
+        | text_editor::Edit::Unindent => EditKind::Other,
+    }
+}
+
+/// The editor buffer as the history replays into it, recording each
+/// replacement as the protocol edit that describes it.
+struct ProtocolTracked<'a> {
+    content: &'a mut text_editor::Content<cosmic::Renderer>,
+    edits: Vec<Option<LspTextEdit>>,
+}
+
+impl EditBuffer for ProtocolTracked<'_> {
+    fn replace(
+        &mut self,
+        start: text_editor::Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
+        let Some(end) = self.content.range_end(start, expected) else {
+            return false;
+        };
+        // Measured before the replacement lands, like every other edit the
+        // server is told about.
+        let range = caret_position(self.content, start)
+            .zip(caret_position(self.content, end))
+            .map(|(start, end)| LspRange::new(start, end));
+        let trailing_cr = trailing_carriage_return(self.content).is_some();
+        self.content
+            .replace_range_with_breaks(start, end, replacement, replacement_breaks);
+        // A final bare carriage return has no protocol column. Replaying
+        // its removal would otherwise report an empty range and leave the
+        // server holding a byte that the editor has removed.
+        self.edits.push(
+            if trailing_cr || trailing_carriage_return(self.content).is_some() {
+                None
+            } else {
+                range.map(|range| LspTextEdit {
+                    range,
+                    new_text: replacement.to_owned(),
+                })
+            },
+        );
+        true
+    }
+
+    fn set_cursor(&mut self, cursor: text_editor::Cursor) {
+        self.content.set_cursor(cursor);
     }
 }
 
@@ -1141,92 +1390,34 @@ fn caret_for_position(
     found
 }
 
-/// The protocol position one scalar before `at`, or `None` at the start of
-/// the buffer.
-fn position_before(
-    content: &text_editor::Content<cosmic::Renderer>,
-    at: LspPosition,
-) -> Option<LspPosition> {
-    if at.character > 0 {
-        return Some(LspPosition::new(at.line, at.character - 1));
-    }
-    let previous = at.line.checked_sub(1)?;
-    // Clamps to the end of that line, which is where the caret lands when a
-    // backspace joins two lines.
-    let caret = caret_for_position(content, LspPosition::new(previous, u32::MAX))?;
-    caret_position(content, caret)
-}
-
-/// The protocol position one scalar after `at`, or `None` at the end of the
-/// buffer.
-fn position_after(
-    content: &text_editor::Content<cosmic::Renderer>,
-    at: LspPosition,
-) -> Option<LspPosition> {
-    let caret = caret_for_position(content, LspPosition::new(at.line, at.character + 1))?;
-    let resolved = caret_position(content, caret)?;
-    if resolved != at {
-        return Some(resolved);
-    }
-    // `at` is the end of its line, so the next scalar is the line break.
-    let following = LspPosition::new(at.line.checked_add(1)?, 0);
-    caret_for_position(content, following)?;
-    Some(following)
-}
-
-/// The protocol edit an editor action is about to perform, measured against
-/// the buffer as it stands *now*.
+/// The protocol edit that describes a change the buffer has just made.
 ///
-/// `None` where the transition cannot be described as one range — the caller
-/// then falls back to the full document, which [`LspIntent::Change`] carries
-/// regardless, so an undescribed edit costs a resynchronisation rather than
-/// a wrong one.
-fn describe_edit(
+/// Built from the measured change rather than guessed from the keystroke: a
+/// double-clicked word reports its selection as a single point, so a guess
+/// would tell the server one character went where a whole word did. The
+/// start is read off the edited buffer, where nothing before it moved; the
+/// end is the start advanced over the removed text in protocol terms, where
+/// lines break on `\n` alone.
+///
+/// `None` where the start has no protocol position; the caller then falls
+/// back to the full document.
+fn protocol_edit(
     content: &text_editor::Content<cosmic::Renderer>,
-    edit: &text_editor::Edit,
+    change: &TextChange,
 ) -> Option<LspTextEdit> {
-    let cursor = content.cursor();
-    let caret = caret_position(content, cursor.position)?;
-    let anchor = match cursor.selection {
-        Some(anchor) => Some(caret_position(content, anchor)?),
-        None => None,
-    };
-    let (start, end) = match anchor {
-        Some(anchor) if (anchor.line, anchor.character) < (caret.line, caret.character) => {
-            (anchor, caret)
+    let start = caret_position(content, change.start)?;
+    let mut end = start;
+    for character in change.removed.chars() {
+        if character == '\n' {
+            end = LspPosition::new(end.line.checked_add(1)?, 0);
+        } else {
+            end = LspPosition::new(end.line, end.character.checked_add(1)?);
         }
-        Some(anchor) => (caret, anchor),
-        None => (caret, caret),
-    };
-    let selected = start != end;
-    let (range, new_text) = match edit {
-        text_editor::Edit::Insert(character) => (LspRange::new(start, end), character.to_string()),
-        text_editor::Edit::Paste(text) => (LspRange::new(start, end), text.as_ref().clone()),
-        text_editor::Edit::Enter => (
-            LspRange::new(start, end),
-            content
-                .line_ending()
-                .unwrap_or_default()
-                .as_str()
-                .to_owned(),
-        ),
-        text_editor::Edit::Backspace if !selected => (
-            LspRange::new(position_before(content, start)?, end),
-            String::new(),
-        ),
-        text_editor::Edit::Delete if !selected => (
-            LspRange::new(start, position_after(content, end)?),
-            String::new(),
-        ),
-        text_editor::Edit::Backspace | text_editor::Edit::Delete => {
-            (LspRange::new(start, end), String::new())
-        }
-        // Indentation rewrites every line the selection touches, with a
-        // width this runtime does not know. Reporting it as one range would
-        // be a lie; a full resynchronisation is not.
-        text_editor::Edit::Indent | text_editor::Edit::Unindent => return None,
-    };
-    Some(LspTextEdit { range, new_text })
+    }
+    Some(LspTextEdit {
+        range: LspRange::new(start, end),
+        new_text: change.inserted.clone(),
+    })
 }
 
 /// Byte range one completion edit replaces, or `None` when it cannot be
@@ -1347,19 +1538,19 @@ enum DiffState {
         request: u64,
         cancellation: CancellationToken,
     },
-    Ready(RenderedDiff, [RowOffsets; 2]),
+    Ready(RenderedDiff, DiffLayout),
 }
 
 impl DiffState {
     fn ready(content: RenderedDiff) -> Self {
-        let rows = [DiffMode::Inline, DiffMode::Split].map(|mode| {
-            let count = match &content {
-                RenderedDiff::Text { model, .. } => model.row_count(mode),
-                _ => 0,
-            };
-            RowOffsets::uniform(count, DIFF_ROW_HEIGHT)
-        });
-        Self::Ready(content, rows)
+        let layout = DiffLayout::new(
+            match &content {
+                RenderedDiff::Text { model, .. } => Some(model),
+                _ => None,
+            },
+            DIFF_ROW_HEIGHT,
+        );
+        Self::Ready(content, layout)
     }
 }
 
@@ -1450,12 +1641,37 @@ struct ListViewport {
     height: f32,
 }
 
+/// Which rows of a folded run of unchanged lines to reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldExpansion {
+    /// The run's first rows, continuing the content above the fold.
+    Down,
+    /// The run's last rows, leading into the content below the fold.
+    Up,
+    All,
+}
+
+/// A logical diff position. `row` is in model rows, not display rows, so
+/// neither expanding a fold nor rebuilding the model can move it.
 #[derive(Debug, Clone, Copy, Default)]
 struct DiffViewportAnchor {
     offset: f32,
     row: Option<diff_layout::Anchor>,
     horizontal: f32,
     change: usize,
+    /// A comparison opened for the first time: show its first change, with
+    /// context, as soon as its rows exist.
+    first_change: bool,
+}
+
+impl DiffViewportAnchor {
+    const FIRST_CHANGE: Self = Self {
+        offset: 0.0,
+        row: None,
+        horizontal: 0.0,
+        change: 0,
+        first_change: true,
+    };
 }
 
 /// Scroll coordinates only: the selected document remains the sole live buffer.
@@ -1556,6 +1772,7 @@ pub struct RepositoryRuntime {
     mutation_refresh_pending: bool,
     /// Last comparison stays readable while Git refreshes this file.
     stale_diff: Option<(PathBuf, DiffBasis, DiffState)>,
+    diff_hide_unchanged: bool,
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
@@ -1719,6 +1936,7 @@ impl RepositoryRuntime {
             background_file_refresh: false,
             mutation_refresh_pending: false,
             stale_diff: None,
+            diff_hide_unchanged: true,
             files: FileListState::Loading,
             selected: None,
             search_mode: false,
@@ -1808,6 +2026,28 @@ impl RepositoryRuntime {
         self.diffs.clear();
         self.working_diff.applied = None;
         self.working_diff.additions.clear();
+    }
+
+    pub fn set_diff_hide_unchanged(&mut self, enabled: bool) -> Task<RepositoryAction> {
+        if self.diff_hide_unchanged == enabled {
+            return Task::none();
+        }
+        let anchor = self.current_diff_viewport();
+        self.diff_hide_unchanged = enabled;
+        for (_, state) in &mut self.diffs {
+            if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = state {
+                layout.set_folding(model, enabled);
+            }
+        }
+        if let Some((_, _, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) =
+            &mut self.stale_diff
+        {
+            layout.set_folding(model, enabled);
+        }
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.apply_diff_viewport(anchor);
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 
     /// Re-renders the open document page for `theme`.
@@ -2489,12 +2729,9 @@ impl RepositoryRuntime {
         let Some(position) = caret_for_position(&document.content, at) else {
             return false;
         };
-        // `move_to` leaves an existing selection installed, which would turn a
-        // jump into a selection stretching from wherever the user last was.
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
-        document.content.move_to(text_editor::Cursor {
+        // Typing after a jump is a new undo step, like typing after a click.
+        document.history.seal();
+        document.content.set_cursor(text_editor::Cursor {
             position,
             selection: None,
         });
@@ -2512,6 +2749,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
+        document.history.seal();
         let query = query.trim();
         if query.is_empty() {
             document
@@ -2771,7 +3009,7 @@ impl RepositoryRuntime {
             return false;
         }
 
-        let mut updated = text;
+        let mut updated = text.clone();
         for (span, new_text, _) in edits.iter().rev() {
             updated.replace_range(span.clone(), new_text);
         }
@@ -2792,17 +3030,34 @@ impl RepositoryRuntime {
         // completion as the single document transition the user performed, not
         // as one transition per edit it happened to decompose into.
         let version = document.bump_lsp_version();
-        document.replace_text(&updated);
-        // Resolved against the rebuilt buffer, so the caret lands where the
+        let before = document.content.cursor();
+        let changes = document.splice(
+            &text,
+            edits
+                .iter()
+                .rev()
+                .map(|(span, new_text, _)| (span.clone(), *new_text)),
+        );
+        if changes.is_none() {
+            document.replace_text(&updated);
+        }
+        debug_assert_eq!(document.content.text(), updated);
+        // Resolved against the edited buffer, so the caret lands where the
         // editor now believes that offset to be.
         let position = caret_for_offset(&document.content, caret);
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
-        document.content.move_to(text_editor::Cursor {
+        document.content.set_cursor(text_editor::Cursor {
             position,
             selection: None,
         });
+        if let Some(changes) = changes {
+            // One step, like the one choice the user made.
+            document.history.record_group(
+                changes,
+                before,
+                document.content.cursor(),
+                Instant::now(),
+            );
+        }
         if let Some(version) = version {
             // Recorded highest-range-first, the order they were applied in:
             // each range then still addresses the document the one before it
@@ -3128,6 +3383,33 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Undoes or redoes one step in the open buffer.
+    fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
+        // The same gates as typing: a history step is an edit, and find
+        // holds the buffer read-only while it is open.
+        if self.search_mode || self.source_surface != SourceSurface::Editor {
+            return Task::none();
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        let Some(edits) = document.step_history(redo) else {
+            return Task::none();
+        };
+        self.push_lsp_edits(edits);
+        // Undo from the context menu leaves the keyboard on the menu; the
+        // restored caret is only visible in a focused buffer.
+        Task::batch([self.markdown_task(card), self.focus_editor(card)])
+    }
+
+    /// Reports a run of replacements, in the order they were applied, and
+    /// nothing at all for an empty run.
+    fn push_lsp_edits(&mut self, edits: Vec<Option<LspTextEdit>>) {
+        for edit in edits {
+            self.push_lsp_change(edit);
+        }
+    }
+
     /// Materialises the text of a deferred `didChange`, if one is pending.
     fn flush_lsp_change(&mut self) {
         let Some(version) = self.pending_lsp_change.take() else {
@@ -3342,6 +3624,7 @@ impl RepositoryRuntime {
             .as_ref()
             .is_some_and(|active| active.cancellation.is_cancelled());
         self.working_diff.active = None;
+        let mut installed = false;
         let completed = Some((identity.generation, revision, Arc::clone(&before)));
         if !cancelled
             && self.accepts_selected(&identity)
@@ -3373,6 +3656,7 @@ impl RepositoryRuntime {
                         }),
                     );
                     self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
+                    installed = true;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -3381,7 +3665,13 @@ impl RepositoryRuntime {
                 }
             }
         }
-        self.working_diff_task(identity.card)
+        let next = self.working_diff_task(identity.card);
+        // A rebuild re-anchors the viewport in rows of the new model; a
+        // mounted comparison has to be moved to match.
+        if installed && self.source_surface == SourceSurface::Diff {
+            return Task::batch([next, self.restore_visible_scroll()]);
+        }
+        next
     }
 
     fn file_has_basis(&self, file: &RepositoryFile, basis: &DiffBasis) -> bool {
@@ -3394,6 +3684,24 @@ impl RepositoryRuntime {
             && self.subject_file().is_some_and(|file| {
                 self.file_has_basis(&file, &self.diff_basis) || self.basis_resolution.is_some()
             })
+    }
+
+    /// Whether the diff surface can hold a discussion of the whole file: it
+    /// renders one only above a text or no-text comparison, so a failed,
+    /// empty, or unresolved comparison would hide a draft begun there. A
+    /// comparison still loading does not count: a failure would leave its
+    /// draft without a visible Save or Cancel control.
+    pub fn can_show_file_discussion(&self) -> bool {
+        self.can_show_diff()
+            && self.basis_resolution.is_none()
+            && self.working_diff_failure().is_none()
+            && matches!(
+                self.diff_state(&self.diff_basis),
+                Some(DiffState::Ready(
+                    RenderedDiff::Text { .. } | RenderedDiff::NoText(_),
+                    _
+                ))
+            )
     }
 
     fn can_apply_markdown_mode(&self, preview: bool) -> bool {
@@ -3671,10 +3979,10 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             unreachable!("discard eligibility requires an editable document");
         };
-        document.discard_edits();
         // Reached from the application's dirty-close dialog, which throws the
         // buffer away without the editor ever seeing an action for it.
-        self.push_lsp_change(None);
+        let edits = document.discard_edits();
+        self.push_lsp_edits(edits);
         true
     }
 
@@ -4252,26 +4560,21 @@ impl RepositoryRuntime {
                 if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
-                let is_edit = action.is_edit();
-                // Measured before the action lands: an edit names the range
-                // it is about to replace, in the document the server holds.
-                let edit = match (&action, &self.document) {
-                    (text_editor::Action::Edit(edit), DocumentState::Editable(document)) => {
-                        describe_edit(&document.content, edit)
-                    }
-                    _ => None,
+                let applied = match &mut self.document {
+                    DocumentState::Editable(document) => document.apply(action),
+                    _ => Applied::Unchanged,
                 };
-                if let DocumentState::Editable(document) = &mut self.document {
-                    document.apply(action);
+                // A caret movement is not a document change, and neither is
+                // an edit that found nothing to change. Bumping the version
+                // for one would leave every request the user makes next
+                // quoting a version the server has never been sent.
+                match applied {
+                    Applied::Changed(edit) => {
+                        self.push_lsp_change(edit);
+                        self.markdown_task(card)
+                    }
+                    Applied::Unchanged => Task::none(),
                 }
-                // A caret movement is not a document change. Bumping the
-                // version for one would leave every request the user makes
-                // next quoting a version the server has never been sent.
-                if is_edit {
-                    self.push_lsp_change(edit);
-                    return self.markdown_task(card);
-                }
-                Task::none()
             }
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::AutoSaveDue {
@@ -4411,16 +4714,24 @@ impl RepositoryRuntime {
                 if !self.can_discard_edits() {
                     return Task::none();
                 }
-                if let DocumentState::Editable(document) = &mut self.document {
-                    document.discard_edits();
-                    // `discard_edits` rebuilds the buffer without going
-                    // through an editor action, so nothing else here would
-                    // notice that the server's copy just became wrong, and
-                    // no range describes a wholesale replacement.
-                    self.push_lsp_change(None);
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                // `discard_edits` changes the buffer without going through
+                // an editor action, so nothing else here would notice that
+                // the server's copy just became wrong.
+                let edits = document.discard_edits();
+                self.push_lsp_edits(edits);
+                // Find keeps the keyboard while it is open.
+                if self.search_mode {
+                    return self.markdown_task(card);
                 }
-                self.markdown_task(card)
+                // The toolbar button took the keyboard; give it back so the
+                // Ctrl+Z its tooltip promises reaches the buffer.
+                Task::batch([self.markdown_task(card), self.focus_editor(card)])
             }
+            RepositoryAction::Undo { card } => self.step_history(card, false),
+            RepositoryAction::Redo { card } => self.step_history(card, true),
             RepositoryAction::BackToFiles { card } => {
                 if self.descriptor.selected_file.is_some() || self.blocks_navigation() {
                     return Task::none();
@@ -4493,10 +4804,19 @@ impl RepositoryRuntime {
                 }
                 self.capture_native_viewport();
                 self.capture_diff_viewport();
-                let previous = self.current_diff_viewport();
+                let mut previous = self.current_diff_viewport();
+                // On the first visit to the other layout, keep the same line
+                // on screen: the layouts number their rows differently.
+                // Subsequent visits restore that layout independently.
+                if let Some(model) = self.diff_model()
+                    && let Some(diff_layout::Anchor::Row { row, fraction }) = previous.row
+                {
+                    previous.row = Some(diff_layout::Anchor::Row {
+                        row: corresponding_row((model, self.diff_mode), row, (model, mode)),
+                        fraction,
+                    });
+                }
                 self.diff_mode = mode;
-                // On the first visit to the other layout, retain the approximate
-                // location. Subsequent visits restore that layout independently.
                 let anchor = self.viewports.diff[self.diff_mode_index()].unwrap_or(previous);
                 self.apply_diff_viewport(anchor);
                 self.restore_native_viewport();
@@ -4704,10 +5024,15 @@ impl RepositoryRuntime {
                 }
                 self.diff_viewport = ListViewport { offset, height };
                 self.diff_horizontal = horizontal;
-                if let (Some(model), Some(rows)) = (self.diff_model(), self.diff_rows()) {
+                if user_initiated
+                    && let (Some(model), Some(layout)) = (self.diff_model(), self.diff_layout())
+                {
+                    let rows = layout.rows(self.diff_mode);
                     self.diff_change = model
                         .change_starts(self.diff_mode)
-                        .partition_point(|row| rows.offset(*row) <= offset + 0.5)
+                        .partition_point(|row| {
+                            rows.offset(layout.folded(self.diff_mode).display(*row)) <= offset + 0.5
+                        })
                         .saturating_sub(1);
                 }
                 Task::none()
@@ -4731,6 +5056,53 @@ impl RepositoryRuntime {
                 }
                 self.realize_current_change();
                 self.scroll_to_change()
+            }
+            RepositoryAction::RevealDiffTop { card } => {
+                if self.is_saving() || self.selected.is_none() || !self.can_show_diff() {
+                    return Task::none();
+                }
+                // File discussions exist only above a diff, so a reader in
+                // the source view is taken to it.
+                let surface = if self.source_surface == SourceSurface::Diff {
+                    Task::none()
+                } else {
+                    self.capture_native_viewport();
+                    self.source_surface = SourceSurface::Diff;
+                    self.restore_native_viewport();
+                    self.ensure_current_diff(card)
+                };
+                // The block being revealed is usually not measured yet. An
+                // anchor at the top of the leading block holds the viewport
+                // there when its height arrives, rather than preserving the
+                // first code row and scrolling the new block out of view.
+                self.apply_diff_viewport(DiffViewportAnchor {
+                    offset: 0.0,
+                    row: Some(diff_layout::Anchor::Leading(0.0)),
+                    first_change: false,
+                    horizontal: self.diff_horizontal,
+                    change: self.diff_change,
+                });
+                self.capture_diff_viewport();
+                Task::batch([surface, self.restore_visible_scroll()])
+            }
+            RepositoryAction::ExpandDiffFold {
+                identity,
+                basis,
+                mode,
+                fold,
+                run,
+                expansion,
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.diff_basis != basis
+                    || !self.can_change_diff_layout()
+                    || self
+                        .diff_model()
+                        .is_none_or(|model| model.unchanged_runs(mode).get(fold) != Some(&run))
+                {
+                    return Task::none();
+                }
+                self.expand_diff_fold(fold, expansion)
             }
             RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
@@ -4774,9 +5146,38 @@ impl RepositoryRuntime {
             .map(|(_, state)| state)
     }
 
-    fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+    fn set_diff_state(&mut self, basis: DiffBasis, mut state: DiffState) {
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
+        // The rows on screen before a rebuild, which a rebuild must not move:
+        // display rows and pixel offsets both change meaning with the model.
+        let mut rebuilt = None;
+        if restores_current
+            && let Some(previous) = self.diff_model()
+            && let Some(DiffState::Ready(_, previous_layout)) = self.diff_state(&basis)
+            && let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state
+        {
+            // What the reader unfolded survives whatever the viewport awaits.
+            layout.carry_reveals(model, (previous, previous_layout));
+            // A pending anchor is logical and is applied below as it stands.
+            if self.pending_diff_anchor.is_none() {
+                let mut anchor = self.current_diff_viewport();
+                if let Some(diff_layout::Anchor::Row { row, fraction }) = anchor.row {
+                    anchor.row = Some(diff_layout::Anchor::Row {
+                        row: corresponding_row(
+                            (previous, self.diff_mode),
+                            row,
+                            (model, self.diff_mode),
+                        ),
+                        fraction,
+                    });
+                }
+                rebuilt = Some(anchor);
+            }
+        }
+        if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state {
+            layout.set_folding(model, self.diff_hide_unchanged);
+        }
         match self
             .diffs
             .iter_mut()
@@ -4788,12 +5189,19 @@ impl RepositoryRuntime {
                 self.prune_committed_diffs();
             }
         }
-        if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
+        if let Some(mut anchor) = rebuilt {
+            anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
+            self.apply_diff_viewport(anchor);
+        } else if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
             anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
             self.apply_diff_viewport(anchor);
             // Leading threads may not be measured yet; retain their logical
             // anchor until the first annotation projection or actual scroll.
-            self.pending_diff_anchor = Some(anchor);
+            // A first visit resolves itself, and is only held while it sits
+            // at the top, above which file-level threads may still appear.
+            if !anchor.first_change {
+                self.pending_diff_anchor = Some(anchor);
+            }
         }
     }
 
@@ -4926,7 +5334,9 @@ impl RepositoryRuntime {
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = basis.clone();
         self.committed_selection = Some((basis.clone(), old_path.clone()));
-        self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
+        self.apply_diff_viewport(
+            self.viewports.diff[self.diff_mode_index()].unwrap_or(DiffViewportAnchor::FIRST_CHANGE),
+        );
         let identity = self.next_identity(card, path);
         self.request_diff(identity, basis, old_path)
     }
@@ -4983,7 +5393,9 @@ impl RepositoryRuntime {
         self.document = DocumentState::Loading;
         self.diffs.clear();
         self.basis_resolution = None;
-        self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
+        self.apply_diff_viewport(
+            self.viewports.diff[self.diff_mode_index()].unwrap_or(DiffViewportAnchor::FIRST_CHANGE),
+        );
         self.diff_basis = if file.unstaged {
             DiffBasis::IndexToWorktree
         } else {
@@ -5007,13 +5419,17 @@ impl RepositoryRuntime {
         if let Some(anchor) = self.pending_diff_anchor {
             return anchor;
         }
+        let mode = self.diff_mode;
         DiffViewportAnchor {
             offset: self.diff_viewport.offset,
-            row: self
-                .diff_rows()
-                .map(|rows| rows.anchor(self.diff_viewport.offset)),
+            row: self.diff_layout().map(|layout| {
+                layout
+                    .folded(mode)
+                    .to_model(layout.rows(mode).anchor(self.diff_viewport.offset))
+            }),
             horizontal: self.diff_horizontal,
             change: self.diff_change,
+            first_change: false,
         }
     }
 
@@ -5023,23 +5439,67 @@ impl RepositoryRuntime {
     }
 
     fn apply_diff_viewport(&mut self, anchor: DiffViewportAnchor) {
+        if anchor.first_change {
+            self.diff_horizontal = anchor.horizontal;
+            self.diff_change = 0;
+            let offset = self.first_change_offset();
+            // Until the comparison has rows, the first change has no place;
+            // at the top, file-level threads measured later belong above it.
+            self.pending_diff_anchor = offset.is_none_or(|offset| offset == 0.0).then_some(anchor);
+            self.diff_viewport.offset = offset.unwrap_or(0.0);
+            return;
+        }
         let awaiting_geometry = anchor.row.is_some()
             && self.diff_rows().is_none_or(|rows| {
                 matches!(anchor.row, Some(diff_layout::Anchor::Leading(_)))
                     && rows.leading_height() == 0.0
             });
         self.pending_diff_anchor = awaiting_geometry.then_some(anchor);
-        self.diff_viewport.offset = anchor
-            .row
-            .zip(self.diff_rows())
-            .map_or(anchor.offset, |(anchor, rows)| rows.restore(anchor));
+        let mode = self.diff_mode;
+        self.diff_viewport.offset =
+            anchor
+                .row
+                .zip(self.diff_layout())
+                .map_or(anchor.offset, |(anchor, layout)| {
+                    let offset = layout
+                        .rows(mode)
+                        .restore(layout.folded(mode).to_display(anchor));
+                    self.reachable_diff_offset(layout.rows(mode), offset)
+                });
         self.diff_horizontal = anchor.horizontal;
         self.diff_change = anchor.change;
     }
 
+    /// Where a first visit to the current comparison starts: its first
+    /// change, below its [`diff_layout::FOLD_CONTEXT`] rows of context and
+    /// the row before them, which is the fold when one precedes the context,
+    /// so the reader sees what was folded away. A change that close to the
+    /// top starts at the top, which keeps any file-level review threads above
+    /// the first row in view. `None` while the comparison is still loading.
+    fn first_change_offset(&self) -> Option<f32> {
+        let (model, layout) = match self.diff_state(&self.diff_basis)? {
+            DiffState::Ready(RenderedDiff::Text { model, .. }, layout) => (model, layout),
+            DiffState::Ready(..) => return Some(0.0),
+            DiffState::Loading { .. } => return None,
+        };
+        let Some(&first) = model.change_starts(self.diff_mode).first() else {
+            return Some(0.0);
+        };
+        let row = layout
+            .folded(self.diff_mode)
+            .display(first)
+            .saturating_sub(diff_layout::FOLD_CONTEXT + 1);
+        let rows = layout.rows(self.diff_mode);
+        Some(if row == 0 {
+            0.0
+        } else {
+            self.reachable_diff_offset(rows, rows.offset(row))
+        })
+    }
+
     fn reset_diff_viewports(&mut self) {
         self.viewports.diff = [None; 2];
-        self.apply_diff_viewport(DiffViewportAnchor::default());
+        self.apply_diff_viewport(DiffViewportAnchor::FIRST_CHANGE);
     }
 
     /// The editable buffer's scroll position, retained while a surface that
@@ -5159,9 +5619,9 @@ impl RepositoryRuntime {
         }
     }
 
-    fn diff_rows(&self) -> Option<&RowOffsets> {
+    fn diff_layout(&self) -> Option<&DiffLayout> {
         match self.displayed_diff_state() {
-            Some(DiffState::Ready(_, rows)) => Some(&rows[self.diff_mode_index()]),
+            Some(DiffState::Ready(_, layout)) => Some(layout),
             _ => None,
         }
     }
@@ -5184,6 +5644,10 @@ impl RepositoryRuntime {
             .or(current)
     }
 
+    fn diff_rows(&self) -> Option<&RowOffsets> {
+        self.diff_layout().map(|layout| layout.rows(self.diff_mode))
+    }
+
     /// Installs measured review blocks for the active comparison. The caller
     /// fences document/request identity before applying asynchronous layout
     /// measurements. Heights exclude the code row itself; `leading` precedes
@@ -5195,15 +5659,14 @@ impl RepositoryRuntime {
         measurements: &[(usize, f32)],
     ) -> Task<RepositoryAction> {
         let anchor = self.current_diff_viewport();
-        let index = usize::from(mode == DiffMode::Split);
-        let Some((_, DiffState::Ready(_, rows))) = self
+        let Some((_, DiffState::Ready(_, layout))) = self
             .diffs
             .iter_mut()
             .find(|(basis, _)| *basis == self.diff_basis)
         else {
             return Task::none();
         };
-        let changed = rows[index].annotate(leading, measurements);
+        let changed = layout.rows_mut(mode).annotate(leading, measurements);
         if mode != self.diff_mode || (!changed && self.pending_diff_anchor.is_none()) {
             return Task::none();
         }
@@ -5219,15 +5682,29 @@ impl RepositoryRuntime {
     }
 
     fn change_target(&self, next: bool) -> Option<usize> {
-        let (model, rows) = (self.diff_model()?, self.diff_rows()?);
+        let (model, layout) = (self.diff_model()?, self.diff_layout()?);
+        let rows = layout.rows(self.diff_mode);
         let starts = model.change_starts(self.diff_mode);
         let offset = self.diff_viewport.offset;
+        // A short folded comparison may clamp multiple changes to the same
+        // reachable scroll offset. Keep explicit stepping exact there.
+        if self
+            .current_change_offset()
+            .is_some_and(|current| (current - offset).abs() < 0.5)
+        {
+            return if next {
+                (self.diff_change + 1 < starts.len()).then_some(self.diff_change + 1)
+            } else {
+                self.diff_change.checked_sub(1)
+            };
+        }
+        let position = |row: &usize| rows.offset(layout.folded(self.diff_mode).display(*row));
         if next {
-            let target = starts.partition_point(|row| rows.offset(*row) <= offset + 0.5);
+            let target = starts.partition_point(|row| position(row) <= offset + 0.5);
             (target < starts.len()).then_some(target)
         } else {
             starts
-                .partition_point(|row| rows.offset(*row) < offset - 0.5)
+                .partition_point(|row| position(row) < offset - 0.5)
                 .checked_sub(1)
         }
     }
@@ -5240,34 +5717,86 @@ impl RepositoryRuntime {
         true
     }
 
+    /// The offset that puts the current change at the top of the viewport.
+    /// Changes are never folded, so the change's own row is always drawn.
+    fn current_change_offset(&self) -> Option<f32> {
+        let row = *self
+            .diff_model()?
+            .change_starts(self.diff_mode)
+            .get(self.diff_change)?;
+        let layout = self.diff_layout()?;
+        let rows = layout.rows(self.diff_mode);
+        Some(self.reachable_diff_offset(
+            rows,
+            rows.offset(layout.folded(self.diff_mode).display(row)),
+        ))
+    }
+
+    /// `offset` limited to what the scrollable can actually reach. Folding
+    /// makes comparisons short, so a change near the end is often less than
+    /// a viewport from the bottom. The scrollable clamps a jump there on its
+    /// own, but virtualization reads this runtime offset: left unclamped, it
+    /// mounts rows below the ones on screen and the viewport draws blank.
+    fn reachable_diff_offset(&self, rows: &RowOffsets, offset: f32) -> f32 {
+        let height = self.diff_viewport.height;
+        if !(height.is_finite() && height > 0.0) {
+            return offset;
+        }
+        // The column ends with the horizontal thumb's rail.
+        let content = rows.total_height() + crate::design::SCROLLBAR_GUTTER;
+        offset.min((content - height).max(0.0))
+    }
+
     fn realize_current_change(&mut self) {
-        let row = self
-            .diff_model()
-            .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
-            .copied();
-        if let Some(row) = row {
-            self.diff_viewport.offset = self.diff_rows().map_or(0.0, |rows| rows.offset(row));
+        // An explicit step supersedes whatever position was still waiting for
+        // geometry; measuring review threads later must not undo it.
+        self.pending_diff_anchor = None;
+        if let Some(offset) = self.current_change_offset() {
+            self.diff_viewport.offset = offset;
         }
     }
 
     fn scroll_to_change(&self) -> Task<RepositoryAction> {
-        let Some(model) = self.diff_model() else {
-            return Task::none();
-        };
-        let starts = model.change_starts(self.diff_mode);
-        let Some(row) = starts.get(self.diff_change) else {
-            return Task::none();
-        };
-        let Some(rows) = self.diff_rows() else {
+        let Some(offset) = self.current_change_offset() else {
             return Task::none();
         };
         iced::widget::scrollable::scroll_to(
             self.diff_scroll_id.clone(),
             iced::widget::scrollable::AbsoluteOffset {
                 x: None,
-                y: Some(rows.offset(*row)),
+                y: Some(offset),
             },
         )
+    }
+
+    /// Reveals rows of fold `fold` while keeping the rows on screen where
+    /// they are: the viewport is anchored in model rows across the change.
+    fn expand_diff_fold(
+        &mut self,
+        fold: usize,
+        expansion: FoldExpansion,
+    ) -> Task<RepositoryAction> {
+        // The reader is acting on what is on screen, not on a position that
+        // was still waiting to be placed.
+        self.pending_diff_anchor = None;
+        let anchor = self.current_diff_viewport();
+        let basis = self.diff_basis.clone();
+        let Some((_, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) = self
+            .diffs
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == basis)
+        else {
+            return Task::none();
+        };
+        if !layout.expand(model, fold, expansion) {
+            return Task::none();
+        }
+        // Display rows moved: annotation measurements taken against the old
+        // rows no longer name the rows they measured.
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.apply_diff_viewport(anchor);
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 }
 
@@ -6053,21 +6582,92 @@ fn branch_comparison_icon() -> widget::icon::Handle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalEditorCommand<'a>(CardId, &'a str);
 
+/// An entry in the editor's context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EditorClipboardCommand {
-    card: CardId,
-    op: ClipboardOp,
+enum EditorMenuCommand {
+    Undo(CardId),
+    Redo(CardId),
+    Clipboard(CardId, ClipboardOp),
 }
 
-impl widget::menu::Action for EditorClipboardCommand {
+impl widget::menu::Action for EditorMenuCommand {
     type Message = RepositoryAction;
 
     fn message(&self) -> RepositoryAction {
-        RepositoryAction::Clipboard {
-            card: self.card,
-            op: self.op,
+        match *self {
+            Self::Undo(card) => RepositoryAction::Undo { card },
+            Self::Redo(card) => RepositoryAction::Redo { card },
+            Self::Clipboard(card, op) => RepositoryAction::Clipboard { card, op },
         }
     }
+}
+
+/// The editor's context menu: history, then the clipboard, each entry
+/// showing the chord that does the same thing.
+fn editor_context_menu(
+    card: CardId,
+    document: &EditorDocument,
+) -> Vec<widget::menu::Tree<RepositoryAction>> {
+    use widget::menu::{Item, KeyBind, key_bind::Modifier};
+    let chord = |modifiers: &[Modifier], key: &str| KeyBind {
+        modifiers: modifiers.to_vec(),
+        key: iced::keyboard::Key::Character(key.into()),
+    };
+    let ctrl = [Modifier::Ctrl];
+    let entries = [
+        (
+            "Undo",
+            EditorMenuCommand::Undo(card),
+            chord(&ctrl, "z"),
+            document.history.can_undo(),
+        ),
+        (
+            "Redo",
+            EditorMenuCommand::Redo(card),
+            chord(&[Modifier::Ctrl, Modifier::Shift], "z"),
+            document.history.can_redo(),
+        ),
+        (
+            "Cut",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
+            chord(&ctrl, "x"),
+            true,
+        ),
+        (
+            "Copy",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
+            chord(&ctrl, "c"),
+            true,
+        ),
+        (
+            "Paste",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
+            chord(&ctrl, "v"),
+            true,
+        ),
+        (
+            "Select all",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
+            chord(&ctrl, "a"),
+            true,
+        ),
+    ];
+    let key_binds = entries
+        .iter()
+        .map(|(_, command, chord, _)| (chord.clone(), *command))
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::with_capacity(entries.len() + 1);
+    for (index, (label, command, _, enabled)) in entries.into_iter().enumerate() {
+        if index == 2 {
+            items.push(Item::Divider);
+        }
+        items.push(if enabled {
+            Item::Button(label, None, command)
+        } else {
+            Item::ButtonDisabled(label, None, command)
+        });
+    }
+    widget::menu::items(&key_binds, items)
 }
 
 impl widget::menu::Action for ExternalEditorCommand<'_> {
@@ -6092,6 +6692,16 @@ pub fn selected_file_toolbar(
     card: CardId,
     runtime: &RepositoryRuntime,
 ) -> Option<Element<'_, RepositoryAction>> {
+    selected_file_toolbar_with(card, runtime, None)
+}
+
+/// [`selected_file_toolbar`] with a shell's own control group at its trailing
+/// edge, such as a pull request review's file actions.
+pub fn selected_file_toolbar_with<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    trailing: Option<Element<'a, RepositoryAction>>,
+) -> Option<Element<'a, RepositoryAction>> {
     let selected = runtime.selected.as_ref()?;
     let editing = runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Edit;
@@ -6225,8 +6835,8 @@ pub fn selected_file_toolbar(
     if editable {
         document_actions.push(
             icon_control(
-                crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-                "Discard unsaved changes",
+                crate::ui_controls::symbolic_icon("document-revert-symbolic"),
+                "Discard unsaved edits (Ctrl+Z restores them)",
                 false,
                 runtime.can_discard_edits(),
                 Some(RepositoryAction::DiscardEdits { card }),
@@ -6351,7 +6961,7 @@ pub fn selected_file_toolbar(
     ))
     .width(Length::FillPortion(4))
     .height(crate::design::HEADER_CONTENT_HEIGHT);
-    let mut header = Vec::with_capacity(3);
+    let mut header = Vec::with_capacity(4);
     if let Some(title) = title {
         header.push(title.into());
     }
@@ -6359,6 +6969,7 @@ pub fn selected_file_toolbar(
     if !secondary.is_empty() {
         header.push(toolbar_group(secondary));
     }
+    header.extend(trailing);
     let toolbar = widget::container(
         widget::row::with_children(header)
             .spacing(crate::design::TOOLBAR_GROUP_SPACING)
@@ -6920,24 +7531,22 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(text_editor::default_bindings);
+            .key_binding(move |press| match text_editor::history_command(&press) {
+                Some(text_editor::HistoryCommand::Undo) => {
+                    Some(text_editor::Binding::Custom(RepositoryAction::Undo {
+                        card,
+                    }))
+                }
+                Some(text_editor::HistoryCommand::Redo) => {
+                    Some(text_editor::Binding::Custom(RepositoryAction::Redo {
+                        card,
+                    }))
+                }
+                None => text_editor::default_bindings(press),
+            });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        let entries = [
-            ("Cut", ClipboardOp::Cut),
-            ("Copy", ClipboardOp::Copy),
-            ("Paste", ClipboardOp::Paste),
-            ("Select all", ClipboardOp::SelectAll),
-        ]
-        .into_iter()
-        .map(|(label, op)| {
-            widget::menu::Item::Button(label.to_owned(), None, EditorClipboardCommand { card, op })
-        })
-        .collect();
-        crate::interaction::context_menu(
-            editor,
-            widget::menu::items(&std::collections::HashMap::new(), entries),
-        )
+        crate::interaction::context_menu(editor, editor_context_menu(card, document))
     };
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
@@ -7023,7 +7632,7 @@ fn diff_review_controls(
                     || (runtime.stale_diff.is_some()
                         && matches!(
                             runtime.diff_state(&runtime.diff_basis),
-                            Some(DiffState::Loading)
+                            Some(DiffState::Loading { .. })
                         ))
                 {
                     crate::ui_controls::activity_spinner_tone(
@@ -7346,9 +7955,11 @@ fn diff_model_view<'a>(
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
-            let rows = runtime
-                .diff_rows()
+            let layout = runtime
+                .diff_layout()
                 .expect("rendered comparison owns its row layout");
+            let rows = layout.rows(runtime.diff_mode);
+            let folded = layout.folded(runtime.diff_mode);
             let visible = visible_diff_rows(rows, runtime.diff_viewport);
             let context = review.and_then(|review| {
                 let path = runtime.selected.as_ref()?.path.to_str()?;
@@ -7366,8 +7977,11 @@ fn diff_model_view<'a>(
                 .annotations()
                 .iter()
                 .filter(|(index, _)| {
+                    let DisplayRow::Code(row) = folded.row(**index) else {
+                        return false;
+                    };
                     context.is_some_and(|ctx| {
-                        let (old, new) = diff_row_lines(model, runtime.diff_mode, **index);
+                        let (old, new) = diff_row_lines(model, runtime.diff_mode, row);
                         ctx.review.has_annotation(ctx.path, old, new, false)
                     })
                 })
@@ -7385,10 +7999,39 @@ fn diff_model_view<'a>(
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
             for index in visible.start..visible.end {
-                let (old, new) = diff_row_lines(model, runtime.diff_mode, index);
+                let row = match folded.row(index) {
+                    DisplayRow::Code(row) => row,
+                    DisplayRow::Fold { fold, rows: hidden } => {
+                        let discussions = context.map_or(0, |ctx| {
+                            let (first, last) = (
+                                diff_row_lines(model, runtime.diff_mode, hidden.start),
+                                diff_row_lines(model, runtime.diff_mode, hidden.end - 1),
+                            );
+                            ctx.review.discussions_within(
+                                ctx.path,
+                                first.0.unwrap_or(0)..=last.0.unwrap_or(0),
+                                first.1.unwrap_or(0)..=last.1.unwrap_or(0),
+                            )
+                        });
+                        children.push(diff_fold_row(
+                            card,
+                            runtime,
+                            model,
+                            DiffFold {
+                                fold,
+                                hidden,
+                                discussions,
+                            },
+                            gutter,
+                            viewport_width,
+                        ));
+                        continue;
+                    }
+                };
+                let (old, new) = diff_row_lines(model, runtime.diff_mode, row);
                 let code = match runtime.diff_mode {
                     DiffMode::Inline => inline_diff_row_with_review(
-                        &model.inline_rows[index],
+                        &model.inline_rows[row],
                         &model.syntax,
                         gutter,
                         code_width,
@@ -7396,7 +8039,7 @@ fn diff_model_view<'a>(
                         context.and_then(|ctx| ctx.line_action(old, new)),
                     ),
                     DiffMode::Split => split_diff_row_with_review(
-                        &model.split_rows[index],
+                        &model.split_rows[row],
                         &model.syntax,
                         gutter,
                         code_width,
@@ -7543,6 +8186,35 @@ impl<'a> DiffReviewContext<'a> {
     }
 }
 
+/// The row of `to` showing the line `row` of `from` shows, or the first row
+/// after it when that line is gone. Lines, unlike rows, mean the same thing in
+/// both layouts and across a rebuild. A linear scan, run once per rebuild or
+/// layout switch, never per frame.
+fn corresponding_row(
+    (from, from_mode): (&DiffModel, DiffMode),
+    row: usize,
+    (to, to_mode): (&DiffModel, DiffMode),
+) -> usize {
+    let (from_rows, to_rows) = (from.row_count(from_mode), to.row_count(to_mode));
+    if row >= from_rows {
+        return to_rows + (row - from_rows);
+    }
+    let (old, new) = diff_row_lines(from, from_mode, row);
+    (0..to_rows)
+        .position(|candidate| {
+            let (candidate_old, candidate_new) = diff_row_lines(to, to_mode, candidate);
+            // The old side is the comparison's baseline, which an edit to
+            // the working file does not renumber; an added line has only
+            // its new number.
+            match (old, new) {
+                (Some(line), _) => candidate_old.is_some_and(|candidate| candidate >= line),
+                (None, Some(line)) => candidate_new.is_some_and(|candidate| candidate >= line),
+                (None, None) => false,
+            }
+        })
+        .unwrap_or(to_rows)
+}
+
 fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u32>, Option<u32>) {
     match mode {
         DiffMode::Inline => model
@@ -7555,6 +8227,161 @@ fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u3
             .map(|row| (row.old_line, row.new_line)),
     }
     .unwrap_or_default()
+}
+
+/// One folded run of unchanged rows, as drawn.
+struct DiffFold {
+    /// Which unchanged run of the model this fold belongs to.
+    fold: usize,
+    /// The model rows the fold stands in for.
+    hidden: Range<usize>,
+    /// Review discussions anchored to hidden lines.
+    discussions: usize,
+}
+
+/// The row that stands in for folded unchanged lines.
+///
+/// Its gutter holds the directional reveals, beside the line numbers they
+/// continue; the label reveals the whole run. A run that opens the file has
+/// nothing above it to continue, and one that ends the file nothing below.
+fn diff_fold_row<'a>(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    model: &DiffModel,
+    fold: DiffFold,
+    gutter: f32,
+    width: f32,
+) -> Element<'a, RepositoryAction> {
+    let mode = runtime.diff_mode;
+    let run = &model.unchanged_runs(mode)[fold.fold];
+    let count = fold.hidden.len();
+    let identity = runtime
+        .selected
+        .as_ref()
+        .map(|file| runtime.current_identity(card, file.path.clone()));
+    let action = |expansion| {
+        identity
+            .clone()
+            .map(|identity| RepositoryAction::ExpandDiffFold {
+                identity,
+                basis: runtime.diff_basis.clone(),
+                mode,
+                fold: fold.fold,
+                run: run.clone(),
+                expansion,
+            })
+    };
+    let step = diff_layout::FOLD_STEP;
+    let reveal = |icon: &str, label: String, expansion| -> Element<'a, RepositoryAction> {
+        crate::ui_controls::compact_icon_control(
+            crate::ui_controls::symbolic_icon(icon),
+            label,
+            action(expansion),
+        )
+        .into()
+    };
+    let mut controls = Vec::with_capacity(2);
+    // A step that would leave too few rows to fold opens the whole run, so
+    // offer that honestly instead of a step that reveals more than it says.
+    if count >= step + diff_layout::FOLD_MIN_HIDDEN {
+        if run.start > 0 {
+            controls.push(reveal(
+                "diff-expand-down-symbolic",
+                format!("Expand down {step} lines"),
+                FoldExpansion::Down,
+            ));
+        }
+        if run.end < model.row_count(mode) {
+            controls.push(reveal(
+                "diff-expand-up-symbolic",
+                format!("Expand up {step} lines"),
+                FoldExpansion::Up,
+            ));
+        }
+    } else {
+        controls.push(reveal(
+            "diff-expand-all-symbolic",
+            format!("Show {count} unchanged lines"),
+            FoldExpansion::All,
+        ));
+    }
+    // Room for both reveals in either layout; a split half has no marker
+    // column, but the fold row spans both halves and needs no alignment.
+    let gutter_width = gutter + DIFF_MARKER_WIDTH;
+    let mut label = vec![
+        widget::text::body(format!("{count} unchanged lines"))
+            .size(12)
+            .class(cosmic::theme::Text::Custom(crate::design::muted_text))
+            .into(),
+    ];
+    if fold.discussions > 0 {
+        label.push(
+            widget::text::body(if fold.discussions == 1 {
+                "· 1 comment".to_owned()
+            } else {
+                format!("· {} comments", fold.discussions)
+            })
+            .size(12)
+            .class(cosmic::theme::Text::Custom(|theme| {
+                iced::widget::text::Style {
+                    color: Some(crate::design::accent_color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into(),
+        );
+    }
+    let expand_all = crate::interaction::tooltip(
+        crate::interaction::hover(
+            widget::button::custom(
+                widget::row::with_children(label)
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .name(format!("Show all {count} unchanged lines"))
+            .class(crate::ui_controls::control_style(false, None))
+            .padding([2, 8])
+            .on_press_maybe(action(FoldExpansion::All)),
+        ),
+        format!("Show all {count} lines"),
+    );
+    widget::container(
+        widget::row::with_children([
+            widget::container(
+                widget::row::with_children(controls)
+                    .spacing(2)
+                    .align_y(Alignment::Center),
+            )
+            .align_x(Alignment::End)
+            .padding([0, 4])
+            .width(gutter_width)
+            .into(),
+            expand_all,
+        ])
+        .spacing(DIFF_ROW_PADDING)
+        .align_y(Alignment::Center),
+    )
+    .class(cosmic::theme::Container::custom(|theme| {
+        let mut accent = crate::design::accent_color(theme);
+        accent.a = if theme.theme_type.is_dark() {
+            0.10
+        } else {
+            0.07
+        };
+        iced::widget::container::Style {
+            background: Some(iced::Background::Color(diff_tint(
+                accent,
+                theme.cosmic().bg_color().into(),
+            ))),
+            ..Default::default()
+        }
+    }))
+    .padding([0.0, DIFF_ROW_PADDING])
+    .height(DIFF_ROW_HEIGHT)
+    .width(width)
+    .align_y(Alignment::Center)
+    .clip(true)
+    .into()
 }
 
 fn review_begin_anchor(
@@ -9163,7 +9990,10 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(100),
+            ))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -9253,7 +10083,10 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(100),
+            ))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -9344,7 +10177,7 @@ mod tests {
             identity,
             basis: DiffBasis::IndexToWorktree,
             request,
-            content: staged_text_diff(model_with(1)),
+            content: staged_text_diff(crate::diff_view::build_diff("", &"line\n".repeat(100))),
         }));
         assert_eq!(runtime.diff_viewport.offset, 1200.0);
         let visible = visible_rows(1000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
@@ -11017,6 +11850,7 @@ mod tests {
                 split_rows: Vec::new(),
                 inline_change_starts: vec![0, 2],
                 split_change_starts: vec![0, 2],
+                unchanged: Default::default(),
                 additions: 3,
                 deletions: 2,
                 max_line_width: [0; 2],
@@ -11514,7 +12348,7 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
         let mut model = model_with(2);
-        model.inline_rows = (0..10)
+        model.inline_rows = (0..20)
             .map(|line| InlineDiffRow {
                 old_line: Some(line + 1),
                 new_line: Some(line + 1),
@@ -11601,6 +12435,67 @@ mod tests {
     }
 
     #[test]
+    fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Loading {
+                request: 1,
+                cancellation: CancellationToken::new(),
+            },
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "a pending comparison may fail and strand a new file draft"
+        );
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(!runtime.can_show_file_discussion());
+        // Once a retry provides a renderable diff, a draft can be offered.
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "line\n"))),
+        );
+        assert!(runtime.can_show_file_discussion());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "\"Could not compute diff\" has no leading annotation"
+        );
+        runtime.basis_resolution = Some(BasisResolution::NoCommits);
+        assert!(!runtime.can_show_file_discussion());
+    }
+
+    #[test]
+    fn revealing_the_diff_top_survives_the_leading_block_being_measured() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(40),
+            ))),
+        );
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.diff_viewport.offset = 300.0;
+        drop(runtime.update(RepositoryAction::RevealDiffTop { card }));
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        // A new file discussion is measured after it mounts. Holding the
+        // first code row in place would scroll the discussion out of view.
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 180.0, &[]));
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(runtime.pending_diff_anchor.is_none());
+    }
+
+    #[test]
     fn annotated_file_reopen_restores_logical_anchor_after_async_load() {
         for (saved, scrolled, expected) in [
             (350.0, None, 350.0),
@@ -11654,6 +12549,9 @@ mod tests {
                     horizontal: 0.0,
                 }));
             }
+            // The pane returns to its reading height after the temporary
+            // redraw; the retained line must then survive measurement.
+            runtime.diff_viewport.height = 120.0;
             drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
             assert_eq!(runtime.diff_viewport.offset, expected);
             assert!(runtime.pending_diff_anchor.is_none());
@@ -11758,6 +12656,7 @@ mod tests {
                 split_rows: vec![split; 100_000],
                 inline_change_starts: vec![0, 50_000, 99_999],
                 split_change_starts: vec![0, 50_000, 99_999],
+                unchanged: Default::default(),
                 additions: 1,
                 deletions: 1,
                 max_line_width: [34; 2],
@@ -11776,6 +12675,317 @@ mod tests {
             let element = diff_surface(card, &runtime, None);
             assert!(widget_nodes(&element) < 1_500, "diff widget tree was eager");
         }
+    }
+
+    /// Opens the working comparison afresh and completes its load with `model`.
+    fn load_fresh_diff(runtime: &mut RepositoryRuntime, card: CardId, model: DiffModel) {
+        runtime.diffs.clear();
+        runtime.reset_diff_viewports();
+        drop(runtime.ensure_current_diff(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("a fresh comparison loads");
+        };
+        let request = *request;
+        let path = runtime.selected.as_ref().unwrap().path.clone();
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity: runtime.current_identity(card, path),
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(model),
+        }));
+    }
+
+    /// Two changed lines, at lines 50 and 150 of 200.
+    fn two_change_model() -> DiffModel {
+        let before: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        let after = before
+            .replace("line 50\n", "fifty\n")
+            .replace("line 150\n", "one hundred fifty\n");
+        crate::diff_view::build_diff(&before, &after)
+    }
+
+    #[test]
+    fn a_first_visit_opens_at_the_first_change_with_context() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        // Unfolded rows, as a model without unchanged runs has: the first
+        // change is far below the top.
+        let mut model = model_with(1);
+        model.inline_rows = (0..100)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        model.inline_change_starts = vec![60, 80];
+        load_fresh_diff(&mut runtime, card, model);
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            (60 - diff_layout::FOLD_CONTEXT - 1) as f32 * DIFF_ROW_HEIGHT
+        );
+        assert_eq!(runtime.diff_change, 0);
+
+        // Folded, the first change is a fold and three context rows down, so
+        // the comparison opens at its top.
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let layout = runtime.diff_layout().unwrap();
+        let folded = layout.folded(DiffMode::Inline);
+        assert!(matches!(folded.row(0), DisplayRow::Fold { fold: 0, .. }));
+        assert_eq!(folded.display(49), 4, "the first change");
+        assert!(
+            folded.len() < 30,
+            "two changes in 200 lines fold to a screen"
+        );
+
+        // A position the reader chose is theirs: a reload keeps it.
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 150.0,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let file = runtime.selected.clone().unwrap();
+        drop(runtime.open_file_entry(card, file.clone()));
+        runtime.source_surface = SourceSurface::Diff;
+        drop(runtime.ensure_current_diff(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("a reopened comparison loads");
+        };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity: runtime.current_identity(card, file.path),
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(two_change_model()),
+        }));
+        assert_eq!(runtime.diff_viewport.offset, 150.0);
+    }
+
+    #[test]
+    fn expanding_a_fold_keeps_the_rows_on_screen_and_navigation_exact() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 100.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        let layout = runtime.diff_layout().unwrap();
+        let folded = layout.folded(DiffMode::Inline).clone();
+        // Model row 148, the second context row above the second change,
+        // a third of the way in.
+        let display = folded.display(148);
+        assert!(matches!(
+            folded.row(display - 2),
+            DisplayRow::Fold { fold: 1, .. }
+        ));
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            height: 100.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let expand = |run: Range<usize>, expansion| RepositoryAction::ExpandDiffFold {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run,
+            expansion,
+        };
+        // A click on a fold drawn from another model names another run.
+        drop(runtime.update(expand(52..150, FoldExpansion::Up)));
+        assert!(matches!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline).row(display - 2),
+            DisplayRow::Fold { fold: 1, rows } if rows == (54..147)
+        ));
+        drop(runtime.update(expand(51..150, FoldExpansion::Up)));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+        let display = folded.display(148);
+        assert_eq!(
+            display,
+            folded.display(127) + 21,
+            "twenty rows revealed above"
+        );
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            "the row that was on screen stays on screen"
+        );
+
+        // Change navigation lands on the change's row in the folded layout,
+        // or as near it as the now short document can scroll.
+        runtime.diff_viewport.height = 300.0;
+        drop(runtime.update(RepositoryAction::NextChange { card }));
+        let bottom =
+            folded.len() as f32 * DIFF_ROW_HEIGHT + crate::design::SCROLLBAR_GUTTER - 300.0;
+        assert!(bottom < folded.display(150) as f32 * DIFF_ROW_HEIGHT);
+        assert_eq!(runtime.diff_viewport.offset, bottom);
+        // Reveals are shared by both layouts.
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        let split = runtime.diff_layout().unwrap().folded(DiffMode::Split);
+        // Split row 126 is line 127, the first line revealed inline.
+        let DisplayRow::Code(row) = split.row(split.display(126)) else {
+            panic!("the rows revealed inline are revealed side by side");
+        };
+        assert_eq!(
+            runtime.diff_model().unwrap().split_rows[row].new_line,
+            Some(127)
+        );
+        assert!(matches!(
+            split.row(split.display(125)),
+            DisplayRow::Fold { fold: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_rebuild_keeps_what_was_unfolded_and_the_line_on_screen() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        // The top of the viewport on the second fold itself, expanded down:
+        // the fold's first rows take its place.
+        let fold = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .display(60);
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: fold as f32 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        drop(runtime.update(RepositoryAction::ExpandDiffFold {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run: 51..150,
+            expansion: FoldExpansion::Down,
+        }));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+        assert_eq!(folded.row(fold), DisplayRow::Code(54));
+        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+
+        // The same comparison read again keeps its reveal and its place.
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(two_change_model())),
+        );
+        assert_eq!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+            &folded
+        );
+        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+
+        // An edit above renumbers the new side and shifts every row by one;
+        // the runs keep their lengths, so the reveal holds, and the same line
+        // stays at the top.
+        let before: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        let after = format!("new first line\n{}", before)
+            .replace("line 50\n", "fifty\n")
+            .replace("line 150\n", "one hundred fifty\n");
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        let layout = runtime.diff_layout().unwrap();
+        let line_54 = runtime
+            .diff_model()
+            .unwrap()
+            .inline_rows
+            .iter()
+            .position(|row| row.old_line == Some(54))
+            .unwrap();
+        let diff_layout::Anchor::Row { row, .. } = layout
+            .rows(DiffMode::Inline)
+            .anchor(runtime.diff_viewport.offset)
+        else {
+            panic!("a code row is on screen");
+        };
+        assert_eq!(
+            row,
+            layout.folded(DiffMode::Inline).display(line_54),
+            "line 54, first on screen before the edit, is still at the top"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_awaiting_its_anchor_still_keeps_what_was_unfolded() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        drop(runtime.update(RepositoryAction::ExpandDiffFold {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run: 51..150,
+            expansion: FoldExpansion::Down,
+        }));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+
+        // A working-diff rebuild lands while the viewport still waits to
+        // place an anchor.
+        runtime.pending_diff_anchor = Some(runtime.current_diff_viewport());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(two_change_model())),
+        );
+        assert_eq!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+            &folded
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_removes_the_anchored_line_keeps_visible_rows_mounted() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        let large: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        load_fresh_diff(&mut runtime, card, crate::diff_view::build_diff("", &large));
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 150.0 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "only\n"))),
+        );
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let visible = visible_diff_rows(runtime.diff_rows().unwrap(), runtime.diff_viewport);
+        assert_eq!((visible.start, visible.end), (0, 1));
     }
 
     #[test]
@@ -11801,6 +13011,7 @@ mod tests {
                 split_rows: Vec::new(),
                 inline_change_starts: vec![0, 50_000, 99_999],
                 split_change_starts: Vec::new(),
+                unchanged: Default::default(),
                 additions: 1,
                 deletions: 1,
                 max_line_width: [34; 2],
@@ -11846,6 +13057,13 @@ mod tests {
         runtime
             .editor_text()
             .expect("test expects an editable buffer")
+    }
+
+    fn document_revision(runtime: &RepositoryRuntime) -> u64 {
+        match &runtime.document {
+            DocumentState::Editable(document) => document.revision,
+            _ => panic!("test expects an editable buffer"),
+        }
     }
 
     fn lsp_version(runtime: &RepositoryRuntime) -> i32 {
@@ -13062,6 +14280,151 @@ mod tests {
     }
 
     #[test]
+    fn a_completion_is_one_undo_step_that_restores_the_caret() {
+        let card = CardId::new();
+        let original = "use std::fmt;\n\nfn main() {\n    prin\n}\n";
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, original);
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::Down),
+        }));
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(3, 4), LspPosition::new(3, 8)),
+                "println!()",
+            ),
+            vec![completion_edit(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                "use std::io;\n",
+            )],
+        );
+        let caret = runtime.cursor_position();
+        assert!(runtime.apply_completion(&item));
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "both edits come back as one"
+        );
+        assert_eq!(runtime.cursor_position(), caret);
+        assert!(!runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "use std::fmt;\nuse std::io;\n\nfn main() {\n    println!()\n}\n"
+        );
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(4, 14)));
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_typing_and_report_exact_edits() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        for character in ['a', 'b'] {
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+            }));
+        }
+        drop(runtime.take_lsp_intents());
+        drop(runtime.take_lsp_edits());
+        let revision = document_revision(&runtime);
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "fn main() {}\n");
+        assert!(
+            !runtime.is_dirty(),
+            "undoing to the saved text is not a modification"
+        );
+        assert_ne!(
+            document_revision(&runtime),
+            revision,
+            "autosave must see the change"
+        );
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 0)));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 4,
+                text: "fn main() {}\n".into(),
+            }]
+        );
+        assert_eq!(
+            runtime.take_lsp_edits(),
+            vec![LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 2)),
+                new_text: String::new(),
+            }]
+        );
+
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "abfn main() {}\n");
+        assert!(runtime.is_dirty());
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 2)));
+
+        // Nothing left to redo, and undo with nothing to undo, are no-ops the
+        // server never hears about.
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.take_lsp_intents(), Vec::new());
+    }
+
+    #[test]
+    fn discarding_unsaved_edits_can_itself_be_undone() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "one\ntwo\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("zero\n".into()))),
+        }));
+        assert!(runtime.is_dirty());
+
+        drop(runtime.update(RepositoryAction::DiscardEdits { card }));
+        assert_eq!(buffer_text(&runtime), "one\ntwo\n");
+        assert!(!runtime.is_dirty());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "zero\none\ntwo\n",
+            "a discard is a step like any other, so the edits it dropped come back"
+        );
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "one\ntwo\n");
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "one\ntwo\n",
+            "redo replays the discard too"
+        );
+    }
+
+    #[test]
+    fn undo_waits_while_find_holds_the_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        }));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "zalpha\n");
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "alpha\n");
+    }
+
+    #[test]
     fn a_completion_whose_edits_overlap_is_refused_rather_than_half_applied() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "let value = 1;\n");
@@ -13766,6 +15129,7 @@ mod tests {
             split_rows: Vec::new(),
             inline_change_starts: Vec::new(),
             split_change_starts: Vec::new(),
+            unchanged: Default::default(),
             additions,
             deletions: 0,
             max_line_width: [0; 2],
@@ -14610,6 +15974,62 @@ mod tests {
         document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('H')));
         assert_eq!(document.content.text().len(), text.len());
         assert!(document.dirty);
+    }
+
+    #[test]
+    fn an_edit_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        // The protocol does not count a buffer's final bare `\r`, so removing
+        // it has no protocol range measured on the edited buffer alone.
+        let text = "a\r";
+        let mut document = EditorDocument::unlinked(
+            PathBuf::from("mac.txt"),
+            text.into(),
+            blake3::hash(text.as_bytes()),
+            false,
+        );
+        document.apply(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        assert_eq!(
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Backspace)),
+            Applied::Changed(None)
+        );
+        assert_eq!(document.content.text(), "a");
+    }
+
+    #[test]
+    fn replay_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\r");
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Backspace),
+        }));
+        drop(runtime.take_lsp_intents());
+        drop(runtime.take_lsp_edits());
+
+        for (action, version, text) in [
+            (RepositoryAction::Undo { card }, 3, "a\r"),
+            (RepositoryAction::Redo { card }, 4, "a"),
+        ] {
+            drop(runtime.update(action));
+            assert_eq!(buffer_text(&runtime), text);
+            assert!(
+                !runtime.lsp_edits_exact,
+                "a trailing CR cannot be addressed by a protocol range"
+            );
+            assert_eq!(
+                runtime.take_lsp_intents(),
+                vec![LspIntent::Change {
+                    version,
+                    text: text.into(),
+                }]
+            );
+            assert!(runtime.take_lsp_edits().is_empty());
+        }
     }
 
     #[test]

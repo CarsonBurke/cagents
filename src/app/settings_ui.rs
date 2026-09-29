@@ -44,19 +44,20 @@ fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a,
 }
 
 fn setting_input<'a>(
-    label: &'static str,
     detail: impl Into<Cow<'a, str>> + 'a,
     value: &'a str,
     field: SettingsField,
+    invalid: &'a HashMap<SettingsField, String>,
 ) -> Setting<'a, Message> {
-    setting_field(
-        label,
-        detail,
-        widget::text_input(label, value)
-            .on_input(move |value| Message::SettingsDraftChanged { field, value })
-            .width(Length::Fill)
-            .into(),
-    )
+    let label = field.label();
+    let error = invalid.get(&field).map(String::as_str);
+    let mut input = widget::text_input(label, value)
+        .on_input(move |value| Message::SettingsDraftChanged { field, value })
+        .width(Length::Fill);
+    if let Some(error) = error {
+        input = input.error(error);
+    }
+    setting_field(label, detail, input.into()).error(error)
 }
 
 fn setting_stepper<'a>(
@@ -190,12 +191,24 @@ fn default_account_choice<'a>(
     )
 }
 
+/// What the settings pane shows besides the draft being edited, gathered
+/// from the rest of the application once per frame.
+pub(super) struct SettingsContext<'a> {
+    pub feedback: Option<&'a SettingsFeedback>,
+    /// Refused values, by the field that refused them.
+    pub invalid: &'a HashMap<SettingsField, String>,
+    pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    pub updates: update_ui::UpdateSummary,
+    pub testing_notification: bool,
+}
+
 fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
-    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
-    testing_notification: bool,
+    context: &SettingsContext<'a>,
 ) -> Vec<Group<'a, Message>> {
+    let invalid = context.invalid;
+    let testing_notification = context.testing_notification;
     match category {
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
@@ -270,8 +283,92 @@ fn settings_category_controls<'a>(
                 controls,
             )]
         }
+        SettingsCategory::About => {
+            let updates = &context.updates;
+            let version = if crate::instance::NAME == "development" {
+                format!("{} (development build)", crate::VERSION)
+            } else {
+                crate::VERSION.to_owned()
+            };
+            let status = design::body(updates.status.clone())
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill);
+            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+                status
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .into()
+            } else {
+                status.into()
+            }];
+            if let Some((_, url)) = &updates.available {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    // `Apply` is refused while this window is blocked, so the
+                    // button is disabled and the reason shown below it.
+                    widget::button::suggested("Review update")
+                        .on_press_maybe(
+                            updates
+                                .apply_blocker
+                                .is_none()
+                                .then_some(Message::UpdateUi(update_ui::Action::Apply)),
+                        )
+                        .into(),
+                );
+            } else {
+                update_row.push(
+                    widget::button::standard(if updates.checking {
+                        "Checking…"
+                    } else {
+                        "Check for updates"
+                    })
+                    .id(widget::Id::new("settings.updates.check"))
+                    .on_press_maybe(
+                        updates
+                            .can_check
+                            .then_some(Message::UpdateUi(update_ui::Action::CheckNow)),
+                    )
+                    .into(),
+                );
+            }
+            vec![settings_group(
+                "cagents",
+                "The build you are running and how it stays current.",
+                vec![
+                    setting_field(
+                        "Version",
+                        "The terminal service and every window run this same build.",
+                        design::body(version).into(),
+                    ),
+                    setting_field(
+                        "Updates",
+                        match updates.apply_blocker {
+                            Some(reason) => format!("{} {reason}", updates.detail),
+                            None => updates.detail.clone(),
+                        },
+                        widget::row::with_children(update_row)
+                            .align_y(Alignment::Center)
+                            .spacing(2.0 * design::GRID_UNIT)
+                            .width(Length::Fill)
+                            .into(),
+                    ),
+                    setting_field(
+                        SettingsField::CheckForUpdates.label(),
+                        "Look for a new release at startup and every six hours. A check that cannot reach the server is retried quietly; only one you ask for reports a failure.",
+                        crate::settings_widgets::toggle(
+                            "Check for updates automatically",
+                            draft.check_for_updates,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::CheckForUpdates,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
+                ],
+            )]
+        }
         SettingsCategory::Accounts => {
-            let mut settings: Vec<Setting<'a, Message>> = accounts
+            let mut settings: Vec<Setting<'a, Message>> = context
+                .accounts
                 .iter()
                 .filter(|(_, choices)| !choices.is_empty())
                 .map(|(provider, choices)| default_account_choice(*provider, choices))
@@ -300,10 +397,10 @@ fn settings_category_controls<'a>(
                         .into(),
                 ),
                 setting_input(
-                    "Managed worktree directory",
                     "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
                     &draft.managed_worktree_directory,
                     SettingsField::ManagedWorktreeDirectory,
+                    invalid,
                 ),
                 settings_choice(
                     "Default worktree pane",
@@ -340,7 +437,7 @@ fn settings_category_controls<'a>(
                 ),
                 setting_field(
                     "Pane activation",
-                    "Activate the pane under the pointer without scrolling the workspace or pane contents.",
+                    "Focus a pane, without scrolling, once the pointer moves into it and stays in it for a moment. Typing before then keeps focus where it is.",
                     crate::settings_widgets::toggle(
                         "Activate panes on hover",
                         draft.focus_follows_mouse,
@@ -351,16 +448,16 @@ fn settings_category_controls<'a>(
                     ),
                 ),
                 setting_input(
-                    "Maximum hot panes",
                     "At least 1 pane. Extra background panes may hibernate.",
                     &draft.max_hot_cards,
                     SettingsField::MaxHotCards,
+                    invalid,
                 ),
                 setting_input(
-                    "Hibernation delay (ms)",
                     "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
                     &draft.hibernation_delay_ms,
                     SettingsField::HibernationDelayMs,
+                    invalid,
                 ),
                 setting_field(
                     "Chat send key",
@@ -506,10 +603,10 @@ fn settings_category_controls<'a>(
                         " px",
                     ),
                     setting_input(
-                        "Font family",
                         "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Saves after you pause typing.",
                         &draft.terminal_font_family,
                         SettingsField::TerminalFontFamily,
+                        invalid,
                     ),
                     monospace_font_setting(
                         &draft.terminal_font_family,
@@ -538,10 +635,10 @@ fn settings_category_controls<'a>(
                         " px",
                     ),
                     setting_input(
-                        "Scroll size",
                         "1–10 lines per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
                         &draft.terminal_scroll_size,
                         SettingsField::TerminalScrollSize,
+                        invalid,
                     ),
                     setting_stepper(
                         "Scroll speed",
@@ -580,10 +677,10 @@ fn settings_category_controls<'a>(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
                 vec![setting_input(
-                    "Scrollback lines",
                     "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
                     &draft.terminal_scrollback_lines,
                     SettingsField::TerminalScrollbackLines,
+                    invalid,
                 )],
             ),
             settings_group(
@@ -689,100 +786,100 @@ fn settings_category_controls<'a>(
             "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown. Every chord must be unique. Apart from Search projects and the review chords, a bound chord no longer reaches the program in a terminal, so prefer chords a shell leaves alone, such as Ctrl+Shift plus a letter.",
             vec![
                 setting_input(
-                    "New terminal",
                     "Creates a terminal pane.",
                     &draft.keyboard_shortcuts.new_terminal,
                     SettingsField::ShortcutNewTerminal,
+                    invalid,
                 ),
                 setting_input(
-                    "New channel",
                     "Creates an independent native conversation in the project's main worktree. Leave blank to unbind.",
                     &draft.keyboard_shortcuts.new_channel,
                     SettingsField::ShortcutNewChannel,
+                    invalid,
                 ),
                 setting_input(
-                    "Clone focused pane",
                     "Opens an independent terminal or conversation, or the same browser or repository location. Leave blank to unbind.",
                     &draft.keyboard_shortcuts.clone_pane,
                     SettingsField::ShortcutClonePane,
+                    invalid,
                 ),
                 setting_input(
-                    "Close focused pane",
                     "Closes the active workspace pane. A terminal running a program asks first while close confirmation is on.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
+                    invalid,
                 ),
                 setting_input(
-                    "Search projects",
                     "Moves keyboard focus to project search, or finds in a focused editor. A focused terminal receives this chord instead.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
+                    invalid,
                 ),
                 setting_input(
-                    "Previous pane",
                     "Moves focus left and may repeat while held.",
                     &draft.keyboard_shortcuts.previous_column,
                     SettingsField::ShortcutPreviousColumn,
+                    invalid,
                 ),
                 setting_input(
-                    "Next pane",
                     "Moves focus right and may repeat while held.",
                     &draft.keyboard_shortcuts.next_column,
                     SettingsField::ShortcutNextColumn,
+                    invalid,
                 ),
                 setting_input(
-                    "Cycle pane width",
                     "Cycles the active pane through 1/3, 1/2, 2/3, and full viewport width; may repeat while held.",
                     &draft.keyboard_shortcuts.cycle_pane_width,
                     SettingsField::ShortcutCyclePaneWidth,
+                    invalid,
                 ),
                 setting_input(
-                    "Previous workspace",
                     "Previews the previous recently used workspace. Release the shortcut's modifiers to switch.",
                     &draft.keyboard_shortcuts.previous_workspace,
                     SettingsField::ShortcutPreviousWorkspace,
+                    invalid,
                 ),
                 setting_input(
-                    "Next workspace",
                     "Previews the next recently used workspace. Release the shortcut's modifiers to switch.",
                     &draft.keyboard_shortcuts.next_workspace,
                     SettingsField::ShortcutNextWorkspace,
+                    invalid,
                 ),
                 setting_input(
-                    "Mark reviewed file viewed",
                     "Toggles the reviewed file's viewed mark in the focused pull request pane and moves to the next file.",
                     &draft.keyboard_shortcuts.review_toggle_viewed,
                     SettingsField::ShortcutReviewToggleViewed,
+                    invalid,
                 ),
                 setting_input(
-                    "Next reviewed file",
                     "Opens the next changed file in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_next_file,
                     SettingsField::ShortcutReviewNextFile,
+                    invalid,
                 ),
                 setting_input(
-                    "Previous reviewed file",
                     "Opens the previous changed file in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_previous_file,
                     SettingsField::ShortcutReviewPreviousFile,
+                    invalid,
                 ),
                 setting_input(
-                    "Next unviewed file",
                     "Opens the next unviewed file in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_next_unviewed,
                     SettingsField::ShortcutReviewNextUnviewed,
+                    invalid,
                 ),
                 setting_input(
-                    "Next changed hunk",
                     "Opens the next changed hunk in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_next_change,
                     SettingsField::ShortcutReviewNextChange,
+                    invalid,
                 ),
                 setting_input(
-                    "Previous changed hunk",
                     "Opens the previous changed hunk in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_previous_change,
                     SettingsField::ShortcutReviewPreviousChange,
+                    invalid,
                 ),
             ],
         )],
@@ -799,6 +896,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
         SettingsCategory::Editor => "accessories-text-editor-symbolic",
         SettingsCategory::Accounts => "system-users-symbolic",
+        SettingsCategory::About => "dialog-information-symbolic",
     }
 }
 
@@ -806,25 +904,41 @@ fn settings_icon(name: &'static str) -> widget::icon::Icon {
     crate::ui_controls::symbolic_icon(name).icon().size(16)
 }
 
-fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> Element<'a, Message> {
+fn category_button<'a>(
+    item: SettingsCategory,
+    selected: SettingsCategory,
+    refused: bool,
+) -> Element<'a, Message> {
+    let mut row = vec![
+        settings_icon(category_icon(item)).into(),
+        // One line, cut short in a pane too narrow for the full
+        // label; the button's accessible name keeps all of it.
+        widget::text::body(item.label())
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into(),
+    ];
+    if refused {
+        // Points back to a refused value from wherever the user went next.
+        row.push(refused_marker());
+    }
     crate::interaction::hover(
         widget::button::custom(
-            widget::row::with_children(vec![
-                settings_icon(category_icon(item)).into(),
-                // One line, cut short in a pane too narrow for the full
-                // label; the button's accessible name keeps all of it.
-                widget::text::body(item.label())
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(2.0 * design::GRID_UNIT),
+            widget::row::with_children(row)
+                .align_y(Alignment::Center)
+                .spacing(2.0 * design::GRID_UNIT),
         )
-        .name(item.label())
+        .name(if refused {
+            Cow::Owned(format!(
+                "{}, has a setting that was not saved",
+                item.label()
+            ))
+        } else {
+            Cow::Borrowed(item.label())
+        })
         .class(crate::sidebar::sidebar_button_style(item == selected))
         .selected(item == selected)
         .on_press(Message::SelectSettingsCategory(item))
@@ -832,6 +946,43 @@ fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> El
         .height(design::ROW_HEIGHT)
         .width(Length::Fill),
     )
+}
+
+/// A small dot in the error tone, beside a category holding a refused value.
+fn refused_marker<'a>() -> Element<'a, Message> {
+    widget::container(iced::widget::Space::new().width(6).height(6))
+        .class(cosmic::theme::Container::custom(|theme| {
+            cosmic::widget::container::Style {
+                background: Some(design::destructive_color(theme).into()),
+                border: cosmic::iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+/// Whether the last edits reached the settings file, beside the page title.
+fn save_status<'a>(
+    feedback: Option<&'a SettingsFeedback>,
+    refused: usize,
+) -> Option<Element<'a, Message>> {
+    let refused_text = |text: String| {
+        design::caption(text)
+            .class(cosmic::theme::Text::Custom(design::destructive_text))
+            .into()
+    };
+    Some(match feedback? {
+        SettingsFeedback::Saved => design::caption("Saved").into(),
+        SettingsFeedback::Pending => design::caption("Saving…").into(),
+        SettingsFeedback::Invalid => refused_text(match refused {
+            1 => "1 setting not saved".to_owned(),
+            count => format!("{count} settings not saved"),
+        }),
+        SettingsFeedback::Error(_) => refused_text("Not saved".to_owned()),
+    })
 }
 
 /// Card width below which the category rail folds above the settings. The
@@ -847,20 +998,10 @@ pub(super) fn settings_pane<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
-    feedback: Option<&'a SettingsFeedback>,
-    accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
-    testing_notification: bool,
+    context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
     iced::widget::responsive(move |size| {
-        settings_layout(
-            category,
-            draft,
-            query,
-            feedback,
-            &accounts,
-            testing_notification,
-            size.width,
-        )
+        settings_layout(category, draft, query, &context, size.width)
     })
     .into()
 }
@@ -869,12 +1010,12 @@ fn settings_layout<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
-    feedback: Option<&'a SettingsFeedback>,
-    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
-    testing_notification: bool,
+    context: &SettingsContext<'a>,
     width: f32,
 ) -> Element<'a, Message> {
+    let (feedback, invalid) = (context.feedback, context.invalid);
     let narrow = width < RAIL_BREAKPOINT;
+    let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
     let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
 
@@ -916,7 +1057,7 @@ fn settings_layout<'a>(
                 widget::column::with_children(
                     SettingsCategory::ALL
                         .into_iter()
-                        .map(|item| category_button(item, category)),
+                        .map(|item| category_button(item, category, refused(item))),
                 )
                 .spacing(design::GRID_UNIT)
                 .width(Length::Fill),
@@ -962,7 +1103,7 @@ fn settings_layout<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft, accounts, testing_notification)
+            settings_category_controls(category, draft, context)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );
@@ -970,17 +1111,52 @@ fn settings_layout<'a>(
     if results.is_empty() {
         results.push(design::body("No matching settings").into());
     }
-    if let Some(SettingsFeedback::Invalid(message) | SettingsFeedback::Error(message)) = feedback {
-        results.insert(0, design::body(message.as_str()).into());
+    if let Some(SettingsFeedback::Error(message)) = feedback {
+        // Not any one field's fault, so it leads the page rather than
+        // sitting under a control.
+        results.insert(
+            0,
+            design::body(format!("Settings could not be saved: {message}"))
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+        );
     }
-    let content: Element<'a, Message> = widget::scrollable(
+    let mut header = vec![
+        design::heading(if searching {
+            "Search results"
+        } else {
+            category.label()
+        })
+        .width(Length::Fill)
+        .into(),
+    ];
+    header.extend(save_status(feedback, invalid.len()));
+    let header = widget::container(
+        widget::container(
+            widget::row::with_children(header)
+                .align_y(Alignment::Center)
+                .spacing(2.0 * design::GRID_UNIT)
+                .width(Length::Fill),
+        )
+        .max_width(CONTENT_MAX_WIDTH),
+    )
+    .padding(iced::Padding {
+        top: 3.0 * design::GRID_UNIT,
+        right: gutter,
+        bottom: 0.0,
+        left: gutter,
+    })
+    .width(Length::Fill);
+    let scroll = widget::scrollable(
         widget::container(
             widget::column::with_children(results)
                 .spacing(5.0 * design::GRID_UNIT)
                 .width(Length::Fill)
                 .max_width(CONTENT_MAX_WIDTH),
         )
-        .padding([4.0 * design::GRID_UNIT, gutter])
+        .padding([3.0 * design::GRID_UNIT, gutter])
         .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -988,8 +1164,13 @@ fn settings_layout<'a>(
     ))
     .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
-    .height(Length::Fill)
-    .into();
+    .height(Length::Fill);
+    // The title and save state stay put while the page scrolls under them.
+    let content: Element<'a, Message> =
+        widget::column::with_children(vec![header.into(), scroll.into()])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
     if narrow {
         widget::column::with_children(vec![
             navigation,

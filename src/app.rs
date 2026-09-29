@@ -26,6 +26,7 @@ mod settings_ui;
 mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
+mod terminal_end_ui;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
@@ -1081,15 +1082,6 @@ fn session_health_stream(
     ))
 }
 
-/// What a relaunch of this terminal would do, as its card offers it.
-fn terminal_relaunch_advice(session: &TerminalSession) -> &'static str {
-    if session.agent_resume_recipe().is_some() {
-        "Restart resumes the saved agent session in a new terminal."
-    } else {
-        "Restart starts a new terminal; no exact agent session is available."
-    }
-}
-
 fn terminal_completed(session: &TerminalSession) -> bool {
     matches!(&session.continuity,
         TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
@@ -1135,28 +1127,6 @@ fn terminal_ended(session: &TerminalSession) -> bool {
 
 fn ended_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
     settled_terminal(state).filter(|session| terminal_ended(session))
-}
-
-/// How an ended terminal finished, as the card's status line states it.
-fn terminal_end_summary(session: &TerminalSession) -> String {
-    if terminal_completed(session) {
-        return "Completed".into();
-    }
-    let (TerminalContinuity::RelaunchAvailable {
-        last_exit: Some(last_exit),
-        ..
-    }
-    | TerminalContinuity::Exited { last_exit }) = &session.continuity
-    else {
-        return "Ended".into();
-    };
-    match (last_exit.code, last_exit.signal.as_deref()) {
-        // The host reports the signal the way a shell names it -- "Killed",
-        // "Terminated", "Hangup" -- which is already the whole sentence.
-        (_, Some(signal)) => signal.to_owned(),
-        (Some(code), None) => format!("Exited with status {code}"),
-        (None, None) => "Ended".into(),
-    }
 }
 
 fn restored_runtime_residency(
@@ -1208,25 +1178,28 @@ fn apply_durable_viewport_update(
     changed
 }
 
-/// Whether [`apply_durable_viewport_update`] would change anything.
+/// Whether `transitions` change any card's durable exposure, which with a
+/// change of focus is all [`apply_durable_viewport_update`] can change.
 ///
 /// Callers hold the workspace behind an `Arc`, and taking a mutable reference
 /// copies it while the writer thread still holds the last snapshot. Camera-only
 /// updates arrive every frame, so they must not reach that copy.
-fn durable_viewport_update_pending(
-    state: &WorkspaceState,
-    focused: Option<CardId>,
-    transitions: &[VisibilityTransition],
-) -> bool {
-    state.focused != focused
-        || transitions.iter().any(|transition| {
-            let exposure = Exposure::from(transition.to);
-            state
-                .cards
-                .iter()
-                .any(|card| card.id == transition.id && card.exposure != exposure)
-        })
+fn exposure_update_pending(state: &WorkspaceState, transitions: &[VisibilityTransition]) -> bool {
+    transitions.iter().any(|transition| {
+        let exposure = Exposure::from(transition.to);
+        state
+            .cards
+            .iter()
+            .any(|card| card.id == transition.id && card.exposure != exposure)
+    })
 }
+
+/// How long a change of focus alone waits to be saved. Focus moves in bursts -
+/// a held navigation key, a pointer resting on one pane after another - and
+/// each save copies the workspace and every chat draft on the UI thread, so a
+/// burst is saved once, at its first move plus this delay. Any other save in
+/// between carries the focus with it.
+const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 fn deferred_terminal_session(
     state: Option<&CardState>,
@@ -1648,7 +1621,7 @@ fn update_workspace_viewport(
             (workspace.native_scroll(sample.offset, sample.width), false)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
-        WorkspaceViewportEvent::PointerEntered(card) => (
+        WorkspaceViewportEvent::PointerRested(card) => (
             workspace
                 .focus_without_scrolling(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged()),
@@ -2148,10 +2121,11 @@ pub enum SettingsCategory {
     Links,
     Keyboard,
     Accounts,
+    About,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
@@ -2160,6 +2134,7 @@ impl SettingsCategory {
         Self::Links,
         Self::Keyboard,
         Self::Accounts,
+        Self::About,
     ];
 
     const fn label(self) -> &'static str {
@@ -2172,6 +2147,7 @@ impl SettingsCategory {
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
+            Self::About => "About",
         }
     }
 }
@@ -2507,7 +2483,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
-                    | WorkspaceViewportEvent::PointerEntered(_),
+                    | WorkspaceViewportEvent::PointerRested(_),
                 ..
             }
             | Message::ToggleContextInspector
@@ -2623,6 +2599,7 @@ pub enum SettingsField {
     ChatEnterSends,
     ShowStatusBar,
     RelaunchAgentsOnUpgrade,
+    CheckForUpdates,
     EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
@@ -2646,11 +2623,147 @@ pub enum SettingsField {
     ShortcutReviewPreviousChange,
 }
 
+impl SettingsField {
+    /// The shortcut table in `KeyboardShortcuts::actions` order.
+    const SHORTCUTS: [Self; 16] = [
+        Self::ShortcutNewTerminal,
+        Self::ShortcutNewChannel,
+        Self::ShortcutClonePane,
+        Self::ShortcutCloseFocusedColumn,
+        Self::ShortcutSearchProjects,
+        Self::ShortcutPreviousColumn,
+        Self::ShortcutNextColumn,
+        Self::ShortcutCyclePaneWidth,
+        Self::ShortcutPreviousWorkspace,
+        Self::ShortcutNextWorkspace,
+        Self::ShortcutReviewToggleViewed,
+        Self::ShortcutReviewNextFile,
+        Self::ShortcutReviewPreviousFile,
+        Self::ShortcutReviewNextUnviewed,
+        Self::ShortcutReviewNextChange,
+        Self::ShortcutReviewPreviousChange,
+    ];
+
+    /// The label the settings pane shows for this setting, which is also
+    /// the name its messages use for it.
+    const fn label(self) -> &'static str {
+        use crate::notifications::Field;
+        match self {
+            Self::Notifications(Field::Enabled) => "System notifications",
+            Self::Notifications(Field::Success) => "Successful completion",
+            Self::Notifications(Field::Failure) => "Failure or cancellation",
+            Self::Notifications(Field::Waiting) => "Waiting for you",
+            Self::Notifications(Field::ReviewRequests) => "Review requests",
+            Self::Notifications(Field::WhileFocused) => "Notify while focused",
+            Self::AppTheme => "App theme",
+            Self::UiScale => "Interface scale",
+            Self::TerminalLineHeight => "Line height",
+            Self::TerminalPadding => "Inner padding",
+            Self::TerminalScrollSize => "Scroll size",
+            Self::TerminalScrollSpeed => "Scroll speed",
+            Self::TerminalCursorStyle => "Cursor shape",
+            Self::TerminalTheme => "Color theme",
+            Self::MaxHotCards => "Maximum hot panes",
+            Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::TerminalFontSize => "Font size",
+            Self::TerminalFontFamily => "Font family",
+            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::ManagedWorktreeDirectory => "Managed worktree directory",
+            Self::WorktreeSort => "Worktree order",
+            Self::DefaultWorktreePane => "Default worktree pane",
+            Self::DefaultChannelPane => "Default channel pane",
+            Self::DefaultColumnFraction => "New pane width",
+            Self::LinkOpenDestination => "Open links in",
+            Self::EditorAutoSave => "Auto-save",
+            Self::EditorWrapLines => "Word wrap",
+            Self::ChatEnterSends => "Chat send key",
+            Self::ShowStatusBar => "Status bar",
+            Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
+            Self::CheckForUpdates => "Automatic checks",
+            Self::EditorSyntaxTheme => "Syntax theme",
+            Self::ConfirmTerminalClose => "Active processes",
+            Self::FocusFollowsMouse => "Pane activation",
+            Self::LinkOpenGesture => "System browser gesture",
+            Self::PullRequestOpenTarget => "Open pull requests in",
+            Self::ShortcutNewTerminal => "New terminal",
+            Self::ShortcutNewChannel => "New channel",
+            Self::ShortcutClonePane => "Clone focused pane",
+            Self::ShortcutCloseFocusedColumn => "Close focused pane",
+            Self::ShortcutSearchProjects => "Search projects",
+            Self::ShortcutPreviousColumn => "Previous pane",
+            Self::ShortcutNextColumn => "Next pane",
+            Self::ShortcutCyclePaneWidth => "Cycle pane width",
+            Self::ShortcutPreviousWorkspace => "Previous workspace",
+            Self::ShortcutNextWorkspace => "Next workspace",
+            Self::ShortcutReviewToggleViewed => "Mark reviewed file viewed",
+            Self::ShortcutReviewNextFile => "Next reviewed file",
+            Self::ShortcutReviewPreviousFile => "Previous reviewed file",
+            Self::ShortcutReviewNextUnviewed => "Next unviewed file",
+            Self::ShortcutReviewNextChange => "Next changed hunk",
+            Self::ShortcutReviewPreviousChange => "Previous changed hunk",
+        }
+    }
+
+    /// The category whose page holds this setting.
+    const fn category(self) -> SettingsCategory {
+        match self {
+            Self::Notifications(_) => SettingsCategory::Notifications,
+            Self::AppTheme | Self::UiScale | Self::ShowStatusBar | Self::DefaultColumnFraction => {
+                SettingsCategory::Appearance
+            }
+            Self::TerminalLineHeight
+            | Self::TerminalPadding
+            | Self::TerminalScrollSize
+            | Self::TerminalScrollSpeed
+            | Self::TerminalCursorStyle
+            | Self::TerminalTheme
+            | Self::TerminalFontSize
+            | Self::TerminalFontFamily
+            | Self::TerminalScrollbackLines
+            | Self::ConfirmTerminalClose
+            | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
+            Self::MaxHotCards
+            | Self::HibernationDelayMs
+            | Self::ManagedWorktreeDirectory
+            | Self::WorktreeSort
+            | Self::DefaultWorktreePane
+            | Self::DefaultChannelPane
+            | Self::ChatEnterSends
+            | Self::FocusFollowsMouse => SettingsCategory::General,
+            Self::EditorAutoSave | Self::EditorWrapLines | Self::EditorSyntaxTheme => {
+                SettingsCategory::Editor
+            }
+            Self::CheckForUpdates => SettingsCategory::About,
+            Self::LinkOpenDestination | Self::LinkOpenGesture | Self::PullRequestOpenTarget => {
+                SettingsCategory::Links
+            }
+            Self::ShortcutNewTerminal
+            | Self::ShortcutNewChannel
+            | Self::ShortcutClonePane
+            | Self::ShortcutCloseFocusedColumn
+            | Self::ShortcutSearchProjects
+            | Self::ShortcutPreviousColumn
+            | Self::ShortcutNextColumn
+            | Self::ShortcutCyclePaneWidth
+            | Self::ShortcutPreviousWorkspace
+            | Self::ShortcutNextWorkspace
+            | Self::ShortcutReviewToggleViewed
+            | Self::ShortcutReviewNextFile
+            | Self::ShortcutReviewPreviousFile
+            | Self::ShortcutReviewNextUnviewed
+            | Self::ShortcutReviewNextChange
+            | Self::ShortcutReviewPreviousChange => SettingsCategory::Keyboard,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SettingsFeedback {
     Saved,
     Pending,
-    Invalid(String),
+    /// At least one entered value was refused; each is reported under its
+    /// own field, from `settings_invalid`.
+    Invalid,
     Error(String),
 }
 
@@ -2731,6 +2844,7 @@ struct SettingsDraft {
     chat_enter_sends: bool,
     show_status_bar: bool,
     relaunch_agents_on_upgrade: bool,
+    check_for_updates: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
@@ -2778,6 +2892,7 @@ impl SettingsDraft {
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
+            check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -2824,6 +2939,7 @@ impl SettingsDraft {
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
+            SettingsField::CheckForUpdates => self.check_for_updates = value == "true",
             SettingsField::EditorSyntaxTheme => {
                 if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
                     self.editor_syntax_theme = theme;
@@ -2935,6 +3051,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
             .map_err(|_| "Choose whether upgrades relaunch unresumable agents.".to_owned()),
+        SettingsField::CheckForUpdates => value
+            .parse::<bool>()
+            .map(|enabled| next.check_for_updates = enabled)
+            .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -3020,7 +3140,7 @@ fn settings_update(
         SettingsField::TerminalPadding => value
             .parse::<f32>()
             .map(|value| next.terminal_padding = value)
-            .map_err(|_| "Terminal padding must be a number.".to_owned()),
+            .map_err(|_| "Inner padding must be a number.".to_owned()),
         SettingsField::TerminalScrollSize => value
             .parse::<usize>()
             .map(|value| next.terminal_scroll_size = value)
@@ -3028,7 +3148,7 @@ fn settings_update(
         SettingsField::TerminalScrollSpeed => value
             .parse::<f32>()
             .map(|value| next.terminal_scroll_speed = value)
-            .map_err(|_| "Terminal scroll speed must be a number.".to_owned()),
+            .map_err(|_| "Scroll speed must be a number.".to_owned()),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -3040,7 +3160,7 @@ fn settings_update(
         SettingsField::TerminalFontSize => value
             .parse::<f32>()
             .map(|value| next.terminal_font_size = value)
-            .map_err(|_| "Terminal font size must be a number.".to_owned()),
+            .map_err(|_| "Font size must be a number.".to_owned()),
         SettingsField::TerminalFontFamily => {
             next.terminal_font_family = value.to_owned();
             Ok(())
@@ -3156,17 +3276,147 @@ fn settings_update(
         }
     };
     if let Err(message) = parsed {
-        return SettingsDecision::Invalid(message);
+        return SettingsDecision::Invalid(refusal(field, &next).unwrap_or(message));
     }
+    let attempted = next.clone();
     let next = match next.validate() {
         Ok(next) => next,
-        Err(error) => return SettingsDecision::Invalid(error.to_string()),
+        Err(error) => {
+            return SettingsDecision::Invalid(
+                refusal(field, &attempted).unwrap_or_else(|| error.to_string()),
+            );
+        }
     };
     if next == *current {
         SettingsDecision::Unchanged
     } else {
         SettingsDecision::Persist(next)
     }
+}
+
+/// Plain-language copy for a value the settings pane refused.
+///
+/// It names the setting as the pane labels it and says what it accepts,
+/// rather than quoting the settings file's key, and a shortcut clash names
+/// the action that already holds the chord. `None` leaves the parser's own
+/// message, which for a field without copy here is already worded for the
+/// pane.
+fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
+    let label = field.label();
+    Some(match field {
+        SettingsField::TerminalScrollSize => format!(
+            "{label} must be 1–{} lines.",
+            settings::MAX_TERMINAL_SCROLL_SIZE
+        ),
+        SettingsField::TerminalScrollbackLines => format!(
+            "Scrollback must be 0–{} lines.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        ),
+        SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
+        SettingsField::HibernationDelayMs => {
+            "Hibernation delay must be a whole number of milliseconds.".to_owned()
+        }
+        SettingsField::TerminalFontFamily
+            if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
+        {
+            format!(
+                "{label} must be at most {} bytes.",
+                settings::MAX_TERMINAL_FONT_FAMILY_BYTES
+            )
+        }
+        SettingsField::TerminalFontFamily => {
+            format!("{label} must be a font family name, or empty for the system monospace font.")
+        }
+        SettingsField::ManagedWorktreeDirectory
+            if attempted.managed_worktree_directory.trim().is_empty() =>
+        {
+            "Enter a directory for managed worktrees.".to_owned()
+        }
+        SettingsField::ManagedWorktreeDirectory => {
+            format!("{label} must be a path without control characters.")
+        }
+        field => {
+            let action = SettingsField::SHORTCUTS
+                .iter()
+                .position(|shortcut| *shortcut == field)?;
+            shortcut_refusal(action, &attempted.keyboard_shortcuts)?
+        }
+    })
+}
+
+/// Why the shortcut table cannot take the edit to `action`.
+fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
+    let fault = shortcuts.fault()?;
+    let Some(owner) = fault.conflicts_with else {
+        let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
+            return None;
+        };
+        return Some(sentence(reason));
+    };
+    // The table reports the later of two clashing actions, which is not
+    // necessarily the one just edited.
+    let other = match (fault.action == action, owner == action) {
+        (true, _) => owner,
+        (false, true) => fault.action,
+        (false, false) => return None,
+    };
+    let actions = shortcuts.actions();
+    let bindings = |index: usize| {
+        actions[index]
+            .iter()
+            .filter_map(|chord| Some((chord, settings::parse_shortcut(chord).ok()?)))
+            .collect::<Vec<_>>()
+    };
+    let mine = bindings(action);
+    let chord = if other == action {
+        // The chord that repeats one before it in the same row.
+        mine.iter()
+            .enumerate()
+            .find(|(index, (_, binding))| {
+                mine[..*index].iter().any(|(_, earlier)| earlier == binding)
+            })
+            .map(|(_, (chord, _))| chord.as_str())
+    } else {
+        let theirs = bindings(other);
+        mine.iter()
+            .find(|(_, binding)| theirs.iter().any(|(_, held)| held == binding))
+            .map(|(chord, _)| chord.as_str())
+    };
+    let chord = chord.map_or_else(|| "This shortcut".to_owned(), str::to_owned);
+    Some(if other == action {
+        format!("{chord} is listed twice.")
+    } else {
+        format!(
+            "{chord} is already the shortcut for “{}”.",
+            SettingsField::SHORTCUTS[other].label()
+        )
+    })
+}
+
+/// `message` with a capital first letter and a closing full stop.
+fn sentence(message: &str) -> String {
+    let mut characters = message.chars();
+    let mut sentence: String = characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default();
+    if !sentence.ends_with('.') {
+        sentence.push('.');
+    }
+    sentence
+}
+
+/// `value` with its thousands separated by commas.
+fn grouped_digits(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 #[derive(Debug, Clone)]
@@ -3223,6 +3473,13 @@ pub enum Message {
         card: CardId,
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
+    },
+    /// The final screen of a restored ended terminal, or `None` when the
+    /// daemon no longer holds one.
+    RetainedTerminalAttached {
+        card: CardId,
+        terminal: TerminalId,
+        result: Result<Option<TerminalSurface>, String>,
     },
     /// `None` when the terminal is no longer hosted and would have to be
     /// launched again, which waits until its card is opened.
@@ -3342,6 +3599,8 @@ pub enum Message {
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
     LifecycleSweepElapsed(u64),
+    /// The delay on saving a change of focus alone has passed.
+    FocusSaveDue,
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -3369,6 +3628,8 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
+    /// Enter pressed on an ended terminal's final screen.
+    RelaunchFromEndedScreen(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserAddressChanged {
         card: CardId,
@@ -3918,6 +4179,11 @@ pub struct Cagents {
     // the stale delivery be dropped.
     lifecycle_sweep_deadline: Option<Instant>,
     lifecycle_sweep_generation: u64,
+    /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
+    focus_save_pending: bool,
+    /// The main window's latest input, whichever widget or overlay took it;
+    /// hover activation reads it. See [`crate::input_trace`].
+    input_trace: crate::input_trace::InputTrace,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
     hosted_terminals_rx: async_channel::Receiver<Vec<crate::terminal::ipc::TerminalDescriptor>>,
@@ -4035,6 +4301,8 @@ pub struct Cagents {
     closed_terminal_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
     terminal_recovery_attempts: HashSet<TerminalId>,
+    /// Restored ended terminals whose final screen the daemon was asked for.
+    retained_outputs: HashMap<TerminalId, terminal_end_ui::RetainedOutput>,
     pending_terminal_handoffs: HashMap<TerminalId, TerminalSession>,
     terminal_handoff_commit_inflight: bool,
     worktree_operations:
@@ -5523,6 +5791,10 @@ impl Cagents {
                 pull_request_review::Effect::CloseFile => tasks.push(repository_task(
                     pane.runtime.update(RepositoryAction::BackToFiles { card }),
                 )),
+                pull_request_review::Effect::RevealFileDiscussion => tasks.push(repository_task(
+                    pane.runtime
+                        .update(RepositoryAction::RevealDiffTop { card }),
+                )),
                 pull_request_review::Effect::OpenUrl(url) => links.push(url),
                 pull_request_review::Effect::Checkout(target) => {
                     checkout = pane
@@ -5586,6 +5858,7 @@ impl Cagents {
         if review.is_open() {
             side.push(review.header(modal_open));
             side.push(design::horizontal_rule());
+            side.push(review.summary(modal_open));
             side.push(review.notice(modal_open));
             side.push(review.file_list(modal_open));
         } else {
@@ -5650,7 +5923,15 @@ impl Cagents {
             .width(Length::Fill)
             .into(),
         );
-        if let Some(toolbar) = repository_widget::selected_file_toolbar(id, &pane.runtime) {
+        let file_comment = review
+            .file_comment_control(modal_open, pane.runtime.can_show_file_discussion())
+            .map(|control| {
+                crate::ui_controls::toolbar_actions(vec![control])
+                    .map(move |action| RepositoryAction::Review { card: id, action })
+            });
+        if let Some(toolbar) =
+            repository_widget::selected_file_toolbar_with(id, &pane.runtime, file_comment)
+        {
             main.push(toolbar.map(Message::Repository));
             main.push(design::horizontal_rule());
         }
@@ -5692,14 +5973,6 @@ impl Cagents {
                 .center(Length::Fill)
                 .padding(spacing.space_m)
                 .into(),
-            );
-        }
-        if review.is_open() {
-            main.push(design::horizontal_rule());
-            main.push(
-                review
-                    .review_bar(modal_open)
-                    .map(move |action| Message::PullRequestReview { card: id, action }),
             );
         }
         let main = widget::column::with_children(main)
@@ -5937,6 +6210,7 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        self.focus_save_pending = false;
         self.snapshot_workspace_scope();
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
@@ -6447,7 +6721,13 @@ impl Cagents {
         signal: Option<&str>,
         intentional: bool,
     ) {
-        if let Some(state) = self.card_state_mut(card)
+        // An end is one fact, recorded by whichever report of it arrives
+        // first. A surface attached to a terminal that had already ended
+        // replays that report; recording it again would move the exit to now
+        // and announce it a second time.
+        let already_ended = ended_terminal(self.card_state(card)).is_some();
+        if !already_ended
+            && let Some(state) = self.card_state_mut(card)
             && let CardKind::Terminal(session) = &mut state.kind
         {
             transition_terminal_to_relaunchable(session, terminal_exit(exit_code, signal));
@@ -6457,7 +6737,7 @@ impl Cagents {
         if let Some(state) = self.card_state_mut(card) {
             state.residency = Residency::Hibernated;
         }
-        if !intentional && (exit_code != 0 || signal.is_some()) {
+        if !already_ended && !intentional && (exit_code != 0 || signal.is_some()) {
             self.status = Some(TransientNotice::error(match signal {
                 Some(signal) => format!("terminal exited with {signal}"),
                 None => format!("terminal exited with status {exit_code}"),
@@ -6480,6 +6760,9 @@ impl Cagents {
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
             || self.chat_start_pending(card)
+            // One relaunch at a time: a second would replace the identity the
+            // first is starting and tear down whatever it launched.
+            || self.terminal_start_in_flight(card)
             || self.refuse_for_deleting_card(card)
         {
             return Task::none();
@@ -6528,6 +6811,10 @@ impl Cagents {
             durable_state.residency = residency;
         }
         self.status = None;
+        if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // The ended identity's final-screen outcome is spent.
+            self.retained_outputs.remove(expected_terminal_id);
+        }
         if let Some((expected_terminal_id, replacement)) = terminal_replacement
             && let Some(session) = &self.session
         {
@@ -6694,6 +6981,11 @@ impl Cagents {
             // Arriving at settings means looking for one, so the keyboard
             // lands in its search field.
             Some(CardRuntime::Settings) => crate::settings_widgets::search_id(),
+            // An ended card without its final screen answers the keyboard
+            // with its primary action, which Enter then presses.
+            Some(CardRuntime::Completed) if ended_terminal(self.card_state(card)).is_some() => {
+                card_control_id(card, "ended.relaunch")
+            }
             _ => self.card_header_widget_id(card),
         }
     }
@@ -6790,14 +7082,15 @@ impl Cagents {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
         let focus_changed = self.durable.focused != focused;
-        let viewport_durable_changed =
-            durable_viewport_update_pending(&self.durable, focused, &update.transitions)
-                && apply_durable_viewport_update(
-                    Arc::make_mut(&mut self.durable),
-                    focused,
-                    &update.transitions,
-                );
-        let durable_changed = additional_durable_change || viewport_durable_changed;
+        let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
+        if focus_changed || exposure_changed {
+            apply_durable_viewport_update(
+                Arc::make_mut(&mut self.durable),
+                focused,
+                &update.transitions,
+            );
+        }
+        let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
         if focus_changed {
@@ -6864,10 +7157,27 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        if durable_changed {
+        if save_now {
             self.persist();
+        } else if focus_changed {
+            // The durable state stays current; only handing it to the writer
+            // waits, and that is the expensive part.
+            self.snapshot_workspace_scope();
+            tasks.push(self.save_focus_soon());
         }
         Task::batch(tasks)
+    }
+
+    /// Saves a change of focus alone within [`FOCUS_SAVE_DELAY`], together
+    /// with whatever else changes by then.
+    fn save_focus_soon(&mut self) -> Task<Message> {
+        if std::mem::replace(&mut self.focus_save_pending, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            tokio::time::sleep(FOCUS_SAVE_DELAY).await;
+            Message::FocusSaveDue
+        })
     }
 
     /// Arms a timer for `deadline`, superseding any timer already pending.
@@ -6959,7 +7269,10 @@ impl Cagents {
                 }
             }
         }
-        self.reconcile_lifecycle(&visible, &prefetch)
+        // An ended card holds no lifecycle slot, so the reconcile below never
+        // brings it up; its final screen is asked for once it is on screen.
+        let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
+        Task::batch([self.reconcile_lifecycle(&visible, &prefetch), retained])
     }
 
     fn reconcile_lifecycle(
@@ -7166,8 +7479,13 @@ impl Cagents {
         }
         for event in collected {
             match event {
+                // An ended terminal runs no agent. A surface attached after
+                // the end replays the activity it once reported, which must
+                // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    self.observe_agent_activity_for_card(card, activity);
+                    if ended_terminal(self.card_state(card)).is_none() {
+                        self.observe_agent_activity_for_card(card, activity);
+                    }
                 }
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
@@ -7245,11 +7563,13 @@ impl Cagents {
                 }
             }
         }
-        let activity = self.cards.get(&card).and_then(|runtime| match runtime {
-            CardRuntime::Terminal(handle) => handle.agent_activity(),
-            _ => None,
-        });
-        self.observe_agent_activity_for_card(card, activity);
+        if ended_terminal(self.card_state(card)).is_none() {
+            let activity = self.cards.get(&card).and_then(|runtime| match runtime {
+                CardRuntime::Terminal(handle) => handle.agent_activity(),
+                _ => None,
+            });
+            self.observe_agent_activity_for_card(card, activity);
+        }
         // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
             self.persist();
@@ -7673,6 +7993,10 @@ impl Cagents {
             Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
                 TerminalWidget::new(handle.clone())
                     .read_only(ended_terminal(card).is_some() || self.terminal_close_pending(id))
+                    .on_read_only_submit(
+                        (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
+                            .then_some(Message::RelaunchFromEndedScreen(id)),
+                    )
                     .id(chrome.map_or_else(
                         || workspace_widget::card_focus_id(id),
                         |chrome| chrome.focus_id.clone(),
@@ -7728,25 +8052,18 @@ impl Cagents {
                 self.settings_category,
                 &self.settings_draft,
                 &self.settings_search,
-                self.settings_feedback.as_ref(),
-                self.default_account_choices(),
-                self.notification_ui.testing,
+                settings_ui::SettingsContext {
+                    feedback: self.settings_feedback.as_ref(),
+                    invalid: &self.settings_invalid,
+                    accounts: self.default_account_choices(),
+                    updates: self.update_summary(),
+                    testing_notification: self.notification_ui.testing,
+                },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
             Some(CardRuntime::Completed) => {
-                widget::container(design::body(ended_terminal(card).map_or_else(
-                    || "Process finished successfully.".to_string(),
-                    |session| {
-                        format!(
-                            "{}. {}",
-                            terminal_end_summary(session),
-                            terminal_relaunch_advice(session)
-                        )
-                    },
-                )))
-                .center(Length::Fill)
-                .into()
+                self.ended_terminal_placeholder(id, ended_terminal(card))
             }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
@@ -7834,41 +8151,6 @@ impl Cagents {
         // confirms removal or reports that it must stay open.
         let closing_terminal =
             self.closed_terminal_cards.contains(&id) || self.terminal_close_pending(id);
-        if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
-            let resume = session.agent_resume_recipe().is_some();
-            let native = self.completed_terminal_has_native_owner(id);
-            let mut controls: Vec<Element<'a, Message>> = vec![
-                design::body(terminal_end_summary(session))
-                    .width(Length::Fill)
-                    .into(),
-                widget::button::standard(if native {
-                    "Open conversation"
-                } else if resume {
-                    "Resume"
-                } else {
-                    "Restart"
-                })
-                .on_press(Message::RetryCard(id))
-                .into(),
-            ];
-            if session.transcript_path.is_some() {
-                controls.push(
-                    widget::button::standard("Open saved output")
-                        .on_press(Message::OpenTerminalOutput(id))
-                        .into(),
-                );
-            }
-            rows.push(
-                widget::container(
-                    widget::row::with_children(controls)
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                )
-                .padding([4, 8])
-                .width(Length::Fill)
-                .into(),
-            );
-        }
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&id)
             && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
         {
@@ -7893,6 +8175,11 @@ impl Cagents {
             rows.push(toolbar);
         }
         rows.push(content);
+        if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
+            // Under the final screen, where the reader's eye already is when
+            // the output stops: the last lines it printed stay in view.
+            rows.push(self.ended_terminal_footer(id, session));
+        }
         let surface: Element<'a, Message> = widget::container(
             widget::column::with_children(rows)
                 .spacing(0)
@@ -10092,9 +10379,7 @@ impl Cagents {
         self.settings_feedback = if let Some(error) = &self.settings_save_error {
             Some(SettingsFeedback::Error(error.clone()))
         } else if !self.settings_invalid.is_empty() {
-            let mut errors: Vec<_> = self.settings_invalid.values().cloned().collect();
-            errors.sort();
-            Some(SettingsFeedback::Invalid(errors.join(" ")))
+            Some(SettingsFeedback::Invalid)
         } else if !self.settings_pending.is_empty()
             || self.settings_ack_generation < self.settings_save_generation
         {
@@ -10549,6 +10834,7 @@ impl Application for Cagents {
             closed_terminal_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
@@ -10591,6 +10877,8 @@ impl Application for Cagents {
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
+            focus_save_pending: false,
+            input_trace: crate::input_trace::InputTrace::default(),
         };
         // One notice per lost card, not a single joined line: the log dedupes
         // by message, so distinct failures stay distinct and a repeated one
@@ -10819,6 +11107,11 @@ impl Application for Cagents {
                 terminal,
                 result,
             } => self.terminal_started(card, terminal, result),
+            Message::RetainedTerminalAttached {
+                card,
+                terminal,
+                result,
+            } => self.retained_terminal_attached(card, terminal, result),
             Message::RestoredAgentAttached {
                 card,
                 terminal,
@@ -12341,12 +12634,12 @@ impl Application for Cagents {
                 if matches!(
                     event,
                     WorkspaceViewportEvent::PointerFocused(_)
-                        | WorkspaceViewportEvent::PointerEntered(_)
+                        | WorkspaceViewportEvent::PointerRested(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
                 }
-                if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
+                if matches!(event, WorkspaceViewportEvent::PointerRested(_))
                     && !self.settings.focus_follows_mouse
                 {
                     return Task::none();
@@ -12374,6 +12667,12 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::FocusSaveDue => {
+                if self.focus_save_pending {
+                    self.persist();
+                }
+                Task::none()
+            }
             // The exit released the parent before closing it. A factory that
             // captured the window just before must not start browsers on a
             // surface that is gone, nor mark the cards it would have loaded
@@ -12501,6 +12800,7 @@ impl Application for Cagents {
                 &mut self.status,
             ),
             Message::RetryCard(card) => self.retry_card(card),
+            Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
@@ -13956,6 +14256,7 @@ impl Application for Cagents {
                 &self.settings.keyboard_shortcuts,
                 self.focused_pane(),
                 self.settings.focus_follows_mouse,
+                &self.input_trace,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
@@ -14119,6 +14420,7 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
+        let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
@@ -16093,7 +16395,7 @@ mod tests {
         settle_settings_task(&mut app, task);
         assert!(matches!(
             app.settings_feedback,
-            Some(SettingsFeedback::Invalid(_))
+            Some(SettingsFeedback::Invalid)
         ));
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         let pane = app.utility_card(&CardKind::Settings).unwrap();
@@ -18798,16 +19100,20 @@ mod tests {
         let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
         // A signalled exit is not a clean zero status, and it says so.
         assert!(!terminal_completed(session));
-        assert_eq!(terminal_end_summary(session), "SIGKILL");
+        assert_eq!(
+            terminal_end_ui::terminal_end_report(session).status,
+            "SIGKILL"
+        );
+        let recorded = session.continuity.clone();
 
-        app.retire_ended_terminal(card, 0, None, false);
-        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
-        assert!(terminal_completed(session));
-        assert_eq!(terminal_end_summary(session), "Completed");
-
+        // A surface attached to the ended terminal later replays the same
+        // end. The first report stands: neither its moment nor its outcome
+        // moves, and it is not announced a second time.
+        app.status = None;
         app.retire_ended_terminal(card, 3, None, false);
         let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
-        assert_eq!(terminal_end_summary(session), "Exited with status 3");
+        assert_eq!(session.continuity, recorded);
+        assert!(app.status.is_none());
 
         // A relaunch carries the exit forward as metadata. While the card is
         // hydrating that is a starting terminal, not an ended one, and it must
@@ -18823,11 +19129,11 @@ mod tests {
         let CardKind::Terminal(session) = &mut state.kind else {
             panic!("terminal fixture");
         };
-        for (code, signal, completed, summary) in [
-            (Some(0), None, true, "Completed"),
-            (Some(1), None, false, "Exited with status 1"),
-            (None, Some("Terminated"), false, "Terminated"),
-            (None, None, false, "Ended"),
+        for (code, signal, completed) in [
+            (Some(0), None, true),
+            (Some(1), None, false),
+            (None, Some("Terminated"), false),
+            (None, None, false),
         ] {
             transition_terminal_to_relaunchable(
                 session,
@@ -18838,7 +19144,11 @@ mod tests {
                 },
             );
             assert_eq!(terminal_completed(session), completed);
-            assert_eq!(terminal_end_summary(session), summary);
+            assert_eq!(
+                terminal_end_ui::terminal_end_report(session).outcome
+                    == terminal_end_ui::TerminalOutcome::Clean,
+                completed
+            );
         }
     }
 
@@ -19894,6 +20204,8 @@ mod tests {
             next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
+            focus_save_pending: false,
+            input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
             terminal_wake_rx,
             hosted_terminals_rx: async_channel::unbounded().1,
@@ -19941,6 +20253,7 @@ mod tests {
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
@@ -20016,10 +20329,11 @@ mod tests {
     }
 
     #[test]
-    fn pane_attention_tracks_semantic_events_and_hover_acknowledges_only_its_pane() {
+    fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
         let second = terminal_card_state();
         let third = terminal_card_state();
@@ -20047,10 +20361,12 @@ mod tests {
         let offset = app.workspace.camera().offset();
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerEntered(second_id),
+            event: WorkspaceViewportEvent::PointerRested(second_id),
         });
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert_eq!(app.workspace.camera().offset(), offset);
+        // Only the pane the pointer rested on is read; the ones it crossed to
+        // get there are the widget's to filter out, and never arrive here.
         assert!(!app.sidebar_state.has_card_update(second_id));
         assert!(app.sidebar_state.has_card_update(third_id));
         app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
@@ -20058,11 +20374,52 @@ mod tests {
         app.settings.focus_follows_mouse = false;
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerEntered(third_id),
+            event: WorkspaceViewportEvent::PointerRested(third_id),
         });
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert!(app.sidebar_state.has_card_update(third_id));
     }
+
+    /// Moving focus alone is saved once per burst rather than once per move,
+    /// but the durable state carries it at once, so any save that happens
+    /// sooner - or the one on exit - records it.
+    #[test]
+    fn focus_only_changes_are_saved_once_per_burst() {
+        let mut app = context_inspector_test_app(true);
+        app.settings.focus_follows_mouse = true;
+        let second = terminal_card_state();
+        let third = terminal_card_state();
+        let (second_id, third_id) = (second.id, third.id);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([second, third]);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        // Every pane fits, so moving focus exposes nothing new.
+        let update = app.workspace.resize_viewport(3_000.0);
+        let _ = app.apply_viewport(update, false, true);
+        assert!(!app.focus_save_pending);
+
+        for card in [second_id, third_id] {
+            let _ = app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::PointerRested(card),
+            });
+            assert_eq!(app.durable.focused, Some(card));
+            assert!(app.focus_save_pending, "the save waits for the burst");
+        }
+        let _ = app.update(Message::FocusSaveDue);
+        assert!(!app.focus_save_pending);
+
+        // A change that must be saved now takes the pending focus with it.
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second_id),
+        });
+        assert!(app.focus_save_pending);
+        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
+        assert!(!app.focus_save_pending);
+    }
+
     #[test]
     fn an_agent_finishing_its_turn_marks_its_project_for_a_read() {
         use crate::agent::{Activity, ActivityState, Provider};
@@ -21203,7 +21560,8 @@ mod tests {
         let settings = AppSettings::default();
         assert!(matches!(
             settings_update(&settings, SettingsField::MaxHotCards, "0"),
-            SettingsDecision::Invalid(message) if message.contains("max_hot_cards")
+            SettingsDecision::Invalid(message)
+                if message == "Maximum hot columns must be a whole number, at least 1."
         ));
         assert!(matches!(
             settings_update(&settings, SettingsField::ManagedWorktreeDirectory, " "),
@@ -21213,6 +21571,97 @@ mod tests {
             settings_update(&settings, SettingsField::DefaultColumnFraction, "not a number"),
             SettingsDecision::Invalid(message) if message.contains("number")
         ));
+    }
+
+    #[test]
+    fn refused_values_are_explained_with_the_label_and_range_the_pane_shows() {
+        let settings = AppSettings::default();
+        let refusal = |field, value: &str| match settings_update(&settings, field, value) {
+            SettingsDecision::Invalid(message) => message,
+            decision => panic!("{value:?} was not refused: {decision:?}"),
+        };
+        // Out of range and unparsable read the same: both say what fits.
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollSize, "11"),
+            "Scroll size must be 1–10 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollSize, "lots"),
+            "Scroll size must be 1–10 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
+            "Scrollback must be 0–1,000,000 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),
+            "Font family must be at most 128 bytes."
+        );
+        assert_eq!(
+            refusal(SettingsField::ManagedWorktreeDirectory, " "),
+            "Enter a directory for managed worktrees."
+        );
+        for message in [
+            refusal(SettingsField::MaxHotCards, "0"),
+            refusal(SettingsField::HibernationDelayMs, "-1"),
+            refusal(SettingsField::ShortcutNewTerminal, "Ctrl+"),
+        ] {
+            assert!(!message.contains('_'), "{message} quotes a settings key");
+            assert!(message.ends_with('.'), "{message} is not a sentence");
+        }
+    }
+
+    #[test]
+    fn a_shortcut_clash_names_the_chord_and_the_action_that_holds_it() {
+        let settings = AppSettings::default();
+        let taken = settings.keyboard_shortcuts.new_channel[0].clone();
+        // The edited action sorts before its rival here, so the table reports
+        // the rival as the fault and the message must look past that.
+        assert_eq!(
+            settings_update(
+                &settings,
+                SettingsField::ShortcutNewTerminal,
+                &format!("Ctrl+Alt+J, {taken}")
+            ),
+            SettingsDecision::Invalid(format!(
+                "{taken} is already the shortcut for “New channel”."
+            ))
+        );
+        let earlier = settings.keyboard_shortcuts.new_terminal[0].clone();
+        assert_eq!(
+            settings_update(&settings, SettingsField::ShortcutNewChannel, &earlier),
+            SettingsDecision::Invalid(format!(
+                "{earlier} is already the shortcut for “New terminal”."
+            ))
+        );
+        assert_eq!(
+            settings_update(
+                &settings,
+                SettingsField::ShortcutNewChannel,
+                "Ctrl+Alt+K, Ctrl+Alt+J, ctrl+alt+j"
+            ),
+            SettingsDecision::Invalid("ctrl+alt+j is listed twice.".into())
+        );
+    }
+
+    #[test]
+    fn shortcut_fields_follow_the_order_of_the_shortcut_table() {
+        let settings = AppSettings::default();
+        for (index, field) in SettingsField::SHORTCUTS.into_iter().enumerate() {
+            let SettingsDecision::Persist(edited) =
+                settings_update(&settings, field, "Ctrl+Alt+Shift+9")
+            else {
+                panic!("{field:?} did not take a free chord");
+            };
+            assert_eq!(
+                edited.keyboard_shortcuts.actions()[index],
+                &vec!["Ctrl+Alt+Shift+9".to_owned()],
+                "{field:?}"
+            );
+            assert_eq!(field.category(), SettingsCategory::Keyboard);
+        }
+        assert_eq!(grouped_digits(1_000_000), "1,000,000");
+        assert_eq!(grouped_digits(999), "999");
     }
 
     #[test]

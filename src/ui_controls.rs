@@ -61,6 +61,17 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static CHEVRON_RIGHT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // Diff folds, after GitHub's fold-up / fold-down / unfold: the rule is the
+    // fold, and the arrows say which side of it the revealed lines come from.
+    static EXPAND_UP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 11V2.5M4.75 5.75 8 2.5l3.25 3.25M3 13.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static EXPAND_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5v8.5M4.75 10.25 8 13.5l3.25-3.25M3 2.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static EXPAND_ALL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5.5v-4M5.5 3.5 8 1l2.5 2.5M8 10.5v4M5.5 12.5 8 15l2.5-2.5M3 8h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     static PLUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8M8 4v8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
@@ -105,6 +116,10 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // A page with a return arrow distinguishes discarding edits from Undo.
+    static REVERT_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6M9.5 1.75v3.5H13M5 7 2 10l3 3M2 10h6a2.5 2.5 0 0 0 0-5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     // A page plus an inward arrow makes the open action unambiguous at 16px.
     static OPEN_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6zM9.5 1.75v3.5H13M2 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
@@ -134,6 +149,9 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     });
     static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static COMMENT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5l-3 2.5v-2.5h-1a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z"/></g></svg>"#.as_slice()).symbolic(true)
     });
     // Review marks: an empty box, a box with a check, and a box with a dash
     // for a folder whose files are only partly viewed. Drawn here so the
@@ -209,6 +227,9 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
         "go-up-symbolic" => &CHEVRON_UP,
         "go-next-symbolic" => &CHEVRON_RIGHT,
         "go-previous-symbolic" => &CHEVRON_LEFT,
+        "diff-expand-up-symbolic" => &EXPAND_UP,
+        "diff-expand-down-symbolic" => &EXPAND_DOWN,
+        "diff-expand-all-symbolic" => &EXPAND_ALL,
         "list-add-symbolic" => &PLUS,
         "list-remove-symbolic" => &MINUS,
         "checkbox-symbolic" => &CHECKBOX,
@@ -226,12 +247,14 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
         "document-open-symbolic" => &OPEN_FILE,
         "folder-open-symbolic" => &OPEN_FOLDER,
         "document-save-symbolic" | "document-save-as-symbolic" => &SAVE,
+        "document-revert-symbolic" => &REVERT_FILE,
         "emblem-system-symbolic" | "preferences-system-symbolic" => &SETTINGS,
         "preferences-desktop-keyboard-symbolic" => &KEYBOARD,
         "insert-text-symbolic" => &INSERT_TEXT,
         "document-open-recent-symbolic" => &HISTORY,
         "dialog-information-symbolic" => &INFO,
         "window-close-symbolic" => &CLOSE,
+        "comment-symbolic" => &COMMENT,
         "view-pop-out-symbolic" | "external-link-symbolic" => &POP_OUT,
         _ => return None,
     };
