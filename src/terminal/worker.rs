@@ -1723,6 +1723,8 @@ impl Worker {
     fn set_hidden(&mut self) {
         self.visibility = Visibility::Hidden;
         self.published.suppress_wakes();
+        // Nothing is published while away, so there is no update to time.
+        self.synchronized_since = None;
     }
 
     fn reveal(&mut self) {
@@ -1739,6 +1741,9 @@ impl Worker {
             }
         }
         self.visibility = Visibility::Visible;
+        // An update seen before the card went away must not count against one
+        // in progress now: that one gets its own full hold.
+        self.synchronized_since = None;
         // Observe promptly again: whatever ran in the background while this
         // card was away is what the user is now looking at.
         self.foreground_poll = FOREGROUND_POLL_MIN;
@@ -1749,6 +1754,7 @@ impl Worker {
     fn hibernate_visuals(&mut self) {
         self.visibility = Visibility::Hibernated;
         self.published.suppress_wakes();
+        self.synchronized_since = None;
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
         self.published.detach(self.generation);
@@ -3725,6 +3731,24 @@ mod tests {
         assert_eq!(worker.generation, before + 1);
         assert_eq!(published_row(&worker, 0), "stuck");
         assert_eq!(worker.synchronized_release_after(), None);
+        worker.run();
+    }
+
+    #[test]
+    fn a_revealed_card_gives_the_update_in_progress_a_full_hold() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"\x1b[?2026hhalf".to_vec());
+        // An update seen long ago, before the card went away.
+        worker.synchronized_since = Some(std::time::Instant::now() - SYNCHRONIZED_OUTPUT_TIMEOUT);
+        worker.handle_command(Command::Hide);
+        let before = worker.generation;
+
+        worker.handle_command(Command::Reveal);
+        assert_eq!(worker.generation, before, "a half-drawn frame was revealed");
+        worker.process_output(b" done\x1b[?2026l".to_vec());
+        assert_eq!(published_row(&worker, 0), "half done");
         worker.run();
     }
 
