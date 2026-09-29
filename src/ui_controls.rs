@@ -10,9 +10,23 @@ use cosmic::{
 
 use crate::interaction::tooltip;
 
-/// Keep essential controls visible even when the desktop icon theme omits
-/// these nonstandard names. Static handles retain renderer cache identity.
+/// Resolve a symbolic icon name, preferring the application's own drawing.
+///
+/// Every symbolic icon the interface shows goes through here. A bundled name
+/// never depends on the desktop icon theme; any other name must ship in the
+/// stock COSMIC theme chain (Cosmic, then Pop), which
+/// `tests::every_symbolic_icon_name_resolves` enforces for the whole crate.
 pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
+    bundled_symbolic_icon(name).unwrap_or_else(|| widget::icon::from_name(name).handle())
+}
+
+/// The application's own symbolic drawings, keyed by the freedesktop-style
+/// names call sites use. They keep controls legible where the desktop theme
+/// omits a name or answers it through libcosmic's prefix fallback, which
+/// retries `internet-web-browser-symbolic` as the full-color
+/// `internet-web-browser` application icon that a symbolic render flattens
+/// into a solid disc. Static handles retain renderer cache identity.
+fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     use std::sync::LazyLock;
     static BRANCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1A3.5 3.5 0 0 1 8.5 9H4"/></g></svg>"#.as_slice()).symbolic(true)
@@ -146,50 +160,82 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static COMPRESS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5h11M2.5 13.5h11M8 4.4V7.1M5.9 5.2 8 7.3l2.1-2.1M8 11.6V8.9M5.9 10.8 8 8.7l2.1 2.1"/></g></svg>"#.as_slice()).symbolic(true)
     });
-    match name {
-        "git-branch-symbolic" => BRANCH.clone(),
-        "edit-find-symbolic" | "system-search-symbolic" => SEARCH.clone(),
-        "document-edit-symbolic" => CHANGES.clone(),
-        "text-editor-symbolic" => EDIT.clone(),
-        "edit-rename-symbolic" => RENAME.clone(),
-        "edit-duplicate-symbolic" => DUPLICATE.clone(),
-        "edit-copy-path-symbolic" => COPY_PATH.clone(),
-        "edit-copy-relative-path-symbolic" => COPY_RELATIVE.clone(),
-        "view-list-tree-symbolic" => TREE.clone(),
-        "view-reveal-symbolic" => PREVIEW.clone(),
-        "view-split-right-symbolic" => SPLIT_PANEL.clone(),
-        "view-sidebar-start-symbolic" => SIDEBAR.clone(),
-        "view-compress-symbolic" => COMPRESS.clone(),
-        "pull-request-symbolic" => PULL_REQUEST.clone(),
-        "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
-        "closed-pull-request-symbolic" => CLOSED_PULL_REQUEST.clone(),
-        "go-down-symbolic" => CHEVRON_DOWN.clone(),
-        "go-up-symbolic" => CHEVRON_UP.clone(),
-        "go-next-symbolic" => CHEVRON_RIGHT.clone(),
-        "list-add-symbolic" => PLUS.clone(),
-        "list-remove-symbolic" => MINUS.clone(),
-        "checkbox-symbolic" => CHECKBOX.clone(),
-        "checkbox-checked-symbolic" => CHECKBOX_CHECKED.clone(),
-        "checkbox-mixed-symbolic" => CHECKBOX_MIXED.clone(),
-        "channel-symbolic" => CHANNEL.clone(),
-        "channel-add-symbolic" => CHANNEL_ADD.clone(),
-        "worktree-add-symbolic" => WORKTREE_ADD.clone(),
-        "notifications-symbolic" => ATTENTION.clone(),
-        "agent-working-symbolic" => WORKING.clone(),
-        "agent-waiting-symbolic" => WAITING.clone(),
-        "document-new-symbolic" => ADDED_FILE.clone(),
-        "document-open-symbolic" => OPEN_FILE.clone(),
-        "folder-open-symbolic" => OPEN_FOLDER.clone(),
-        "document-save-symbolic" => SAVE.clone(),
-        "document-save-as-symbolic" => SAVE.clone(),
-        "emblem-system-symbolic" | "preferences-system-symbolic" => SETTINGS.clone(),
-        "insert-text-symbolic" => INSERT_TEXT.clone(),
-        "document-open-recent-symbolic" => HISTORY.clone(),
-        "dialog-information-symbolic" => INFO.clone(),
-        "window-close-symbolic" => CLOSE.clone(),
-        "view-pop-out-symbolic" => POP_OUT.clone(),
-        _ => widget::icon::from_name(name).handle(),
-    }
+    static CHEVRON_LEFT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m10 4-4 4 4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    // A globe and a speech bubble. Tabs, the inspector heading, launchers,
+    // and empty states name a browser or a chat with one mark.
+    static BROWSER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.25"/><ellipse cx="8" cy="8" rx="2.75" ry="6.25"/><path d="M1.75 8h12.5M3.25 4.5h9.5M3.25 11.5h9.5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static CHAT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" d="M3.5 2.5h9A1.5 1.5 0 0 1 14 4v6a1.5 1.5 0 0 1-1.5 1.5H7L3.5 14v-2.5A1.5 1.5 0 0 1 2 10V4a1.5 1.5 0 0 1 1.5-1.5ZM5 5.75h6M5 8.25h4"/></svg>"#.as_slice()).symbolic(true)
+    });
+    // Two panes, a removal beside an addition: a comparison. It names both
+    // the diff surface and its side-by-side layout.
+    static DIFF: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 3v10M3.75 8h2.5M9.75 8h2.5M11 6.75v2.5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    // A node on the history line, with the pull-request glyphs' stroke.
+    static COMMIT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v4M8 10.5v4"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    // An outlined keyboard: a row of keys over a space bar. The themes' only
+    // match is Adwaita's legacy glyph, a filled slab that reads as a solid
+    // square at 16px.
+    static KEYBOARD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="13" height="9" rx="1.5"/><path d="M4.25 6.5h0M6.75 6.5h0M9.25 6.5h0M11.75 6.5h0M5.5 9.5h5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    let icon: &LazyLock<widget::icon::Handle> = match name {
+        "git-branch-symbolic" => &BRANCH,
+        "vcs-commit-symbolic" => &COMMIT,
+        "edit-find-symbolic" | "system-search-symbolic" => &SEARCH,
+        "document-edit-symbolic" => &CHANGES,
+        "text-editor-symbolic" => &EDIT,
+        "edit-rename-symbolic" => &RENAME,
+        "edit-duplicate-symbolic" => &DUPLICATE,
+        "edit-copy-path-symbolic" => &COPY_PATH,
+        "edit-copy-relative-path-symbolic" => &COPY_RELATIVE,
+        "view-list-tree-symbolic" => &TREE,
+        "view-reveal-symbolic" => &PREVIEW,
+        "view-split-right-symbolic" => &SPLIT_PANEL,
+        "vcs-diff-symbolic" => &DIFF,
+        "view-sidebar-start-symbolic" => &SIDEBAR,
+        "view-compress-symbolic" => &COMPRESS,
+        "pull-request-symbolic" => &PULL_REQUEST,
+        "merged-pull-request-symbolic" => &MERGED_PULL_REQUEST,
+        "closed-pull-request-symbolic" => &CLOSED_PULL_REQUEST,
+        "go-down-symbolic" => &CHEVRON_DOWN,
+        "go-up-symbolic" => &CHEVRON_UP,
+        "go-next-symbolic" => &CHEVRON_RIGHT,
+        "go-previous-symbolic" => &CHEVRON_LEFT,
+        "list-add-symbolic" => &PLUS,
+        "list-remove-symbolic" => &MINUS,
+        "checkbox-symbolic" => &CHECKBOX,
+        "checkbox-checked-symbolic" => &CHECKBOX_CHECKED,
+        "checkbox-mixed-symbolic" => &CHECKBOX_MIXED,
+        "channel-symbolic" => &CHANNEL,
+        "channel-add-symbolic" => &CHANNEL_ADD,
+        "chat-bubble-text-symbolic" => &CHAT,
+        "internet-web-browser-symbolic" => &BROWSER,
+        "worktree-add-symbolic" => &WORKTREE_ADD,
+        "notifications-symbolic" => &ATTENTION,
+        "agent-working-symbolic" => &WORKING,
+        "agent-waiting-symbolic" => &WAITING,
+        "document-new-symbolic" => &ADDED_FILE,
+        "document-open-symbolic" => &OPEN_FILE,
+        "folder-open-symbolic" => &OPEN_FOLDER,
+        "document-save-symbolic" | "document-save-as-symbolic" => &SAVE,
+        "emblem-system-symbolic" | "preferences-system-symbolic" => &SETTINGS,
+        "preferences-desktop-keyboard-symbolic" => &KEYBOARD,
+        "insert-text-symbolic" => &INSERT_TEXT,
+        "document-open-recent-symbolic" => &HISTORY,
+        "dialog-information-symbolic" => &INFO,
+        "window-close-symbolic" => &CLOSE,
+        "view-pop-out-symbolic" | "external-link-symbolic" => &POP_OUT,
+        _ => return None,
+    };
+    Some(LazyLock::force(icon).clone())
 }
 
 /// An informative glyph with the same resting ink as an inactive navigation
@@ -1055,8 +1101,216 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::f32::consts::TAU;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// Symbolic names the application leaves to the desktop theme. Each
+    /// ships under its exact name in the stock COSMIC chain: the Cosmic
+    /// theme, and the Pop theme that `cosmic-icon-theme` depends on and
+    /// inherits. A name outside this list and the bundled set reaches
+    /// libcosmic's prefix fallback or Adwaita's legacy glyphs, and renders as
+    /// a blank, a solid disc, or a filled slab.
+    const THEME_SYMBOLIC_ICONS: &[&str] = &[
+        "accessories-text-editor-symbolic",
+        "action-unavailable-symbolic",
+        "alarm-symbolic",
+        "applications-utilities-symbolic",
+        "avatar-default-symbolic",
+        "changes-prevent-symbolic",
+        "content-loading-symbolic",
+        "dialog-error-symbolic",
+        "dialog-warning-symbolic",
+        "display-brightness-symbolic",
+        "edit-clear-symbolic",
+        "edit-copy-symbolic",
+        "edit-delete-symbolic",
+        "edit-undo-symbolic",
+        "emblem-ok-symbolic",
+        "folder-symbolic",
+        "go-first-symbolic",
+        "go-home-symbolic",
+        "go-jump-symbolic",
+        "go-last-symbolic",
+        "image-x-generic-symbolic",
+        "mail-attachment-symbolic",
+        "mail-send-symbolic",
+        "media-playback-stop-symbolic",
+        "object-select-symbolic",
+        "pan-down-symbolic",
+        "pan-end-symbolic",
+        "preferences-desktop-display-symbolic",
+        "preferences-system-notifications-symbolic",
+        "process-stop-symbolic",
+        "software-update-available-symbolic",
+        "system-users-symbolic",
+        "text-x-generic-symbolic",
+        "utilities-terminal-symbolic",
+        "view-filter-symbolic",
+        "view-grid-symbolic",
+        "view-list-symbolic",
+        "view-more-symbolic",
+        "view-private-symbolic",
+        "view-refresh-symbolic",
+        "weather-clear-night-symbolic",
+        "web-browser-symbolic",
+        "zoom-fit-best-symbolic",
+        "zoom-in-symbolic",
+        "zoom-out-symbolic",
+    ];
+
+    /// The crate's Rust sources, keyed by path. This module's own
+    /// list would otherwise read as a use of every name on it; the module
+    /// closes its file, so everything before it is production code.
+    fn crate_sources() -> BTreeMap<PathBuf, String> {
+        fn visit(dir: &Path, sources: &mut BTreeMap<PathBuf, String>) {
+            for entry in std::fs::read_dir(dir).expect("read a source directory") {
+                let path = entry.expect("read a source entry").path();
+                if path.is_dir() {
+                    visit(&path, sources);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let mut source = std::fs::read_to_string(&path).expect("read a source file");
+                    if path.ends_with("src/ui_controls.rs") {
+                        let tests = source
+                            .find("\n#[cfg(test)]\nmod tests {")
+                            .expect("this module is in ui_controls.rs");
+                        source.truncate(tests);
+                    }
+                    sources.insert(path, source);
+                }
+            }
+        }
+        let mut sources = BTreeMap::new();
+        visit(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        sources
+    }
+
+    /// Every `"…-symbolic"` string literal in the crate's sources, with the
+    /// files that name it. Icon names reach `symbolic_icon` through tables,
+    /// models, and match arms, so the literals are the whole inventory.
+    fn symbolic_icon_names_in_source() -> BTreeMap<String, BTreeSet<PathBuf>> {
+        let mut names = BTreeMap::<String, BTreeSet<PathBuf>>::new();
+        for (path, source) in crate_sources() {
+            for (end, _) in source.match_indices("-symbolic\"") {
+                let head = &source[..end];
+                let stem = &head[head.rfind('"').map_or(0, |quote| quote + 1)..];
+                let is_name = !stem.is_empty()
+                    && stem.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    });
+                if is_name {
+                    names
+                        .entry(format!("{stem}-symbolic"))
+                        .or_default()
+                        .insert(path.clone());
+                }
+            }
+        }
+        names
+    }
+
+    /// A direct theme lookup would skip the bundled drawings. Only external
+    /// editors' application icons, named by their desktop entries, go to the
+    /// theme without passing through `symbolic_icon`.
+    #[test]
+    fn symbolic_icons_are_drawn_through_symbolic_icon() {
+        let bypasses: Vec<_> = crate_sources()
+            .into_iter()
+            .filter(|(path, _)| !path.ends_with("src/ui_controls.rs"))
+            .flat_map(|(path, source)| {
+                source
+                    .match_indices("from_name(")
+                    .filter(|(start, call)| {
+                        !source[start + call.len()..].starts_with("editor.icon")
+                    })
+                    .map(|(start, _)| {
+                        let line = source[..start].lines().count();
+                        format!("{}:{line}", path.display())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            bypasses.is_empty(),
+            "icons looked up with `from_name` instead of `symbolic_icon`: {bypasses:#?}"
+        );
+    }
+
+    #[test]
+    fn every_symbolic_icon_name_resolves() {
+        let names = symbolic_icon_names_in_source();
+        assert!(
+            names.contains_key("alarm-symbolic"),
+            "the source scan found no icon names"
+        );
+        let unresolved: BTreeMap<_, _> = names
+            .iter()
+            .filter(|(name, _)| {
+                bundled_symbolic_icon(name).is_none()
+                    && !THEME_SYMBOLIC_ICONS.contains(&name.as_str())
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "icon names neither bundled by `bundled_symbolic_icon` nor shipped by the \
+             COSMIC theme chain: {unresolved:#?}"
+        );
+        for name in THEME_SYMBOLIC_ICONS {
+            assert!(
+                bundled_symbolic_icon(name).is_none(),
+                "{name} is bundled; drop it from THEME_SYMBOLIC_ICONS"
+            );
+            assert!(
+                names.contains_key(*name),
+                "{name} is no longer used; drop it from THEME_SYMBOLIC_ICONS"
+            );
+        }
+    }
+
+    /// Where the COSMIC theme chain is installed, confirm it still carries
+    /// every name the application leaves to it.
+    #[test]
+    fn theme_supplied_icon_names_ship_in_the_installed_cosmic_theme() {
+        fn visit(dir: &Path, stems: &mut BTreeSet<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for path in entries.flatten().map(|entry| entry.path()) {
+                if path.is_dir() {
+                    visit(&path, stems);
+                } else if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    stems.insert(stem.to_owned());
+                }
+            }
+        }
+        let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+        let theme_roots: Vec<PathBuf> = std::env::split_paths(&data_dirs)
+            .flat_map(|dir| ["Cosmic", "Pop"].map(|theme| dir.join("icons").join(theme)))
+            .filter(|root| root.is_dir())
+            .collect();
+        if !theme_roots.iter().any(|root| root.ends_with("Cosmic")) {
+            eprintln!("the Cosmic icon theme is not installed; skipping");
+            return;
+        }
+        let mut stems = BTreeSet::new();
+        for root in &theme_roots {
+            visit(root, &mut stems);
+        }
+        let missing: Vec<_> = THEME_SYMBOLIC_ICONS
+            .iter()
+            .filter(|name| !stems.contains(**name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "missing from {theme_roots:?}; bundle them in `bundled_symbolic_icon`: {missing:?}"
+        );
+    }
 
     #[test]
     fn queued_overlay_clicks_use_the_position_before_later_motion() {

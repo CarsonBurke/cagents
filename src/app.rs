@@ -486,7 +486,10 @@ fn notice_surface<'a>(
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let mut children = vec![
-        widget::icon::from_name(severity.icon()).size(16).into(),
+        crate::ui_controls::symbolic_icon(severity.icon())
+            .icon()
+            .size(16)
+            .into(),
         body,
     ];
     if let Some(action) = action {
@@ -1359,7 +1362,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
         },
         Some(CardKind::Chat(_)) => CardLabels {
             type_label: "Chat",
-            icon: "chat-bubbles-symbolic",
+            icon: "chat-bubble-text-symbolic",
             starting: "Connecting to agent…",
             unavailable: "Agent connection unavailable",
         },
@@ -7381,19 +7384,21 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.back"),
-                                |chrome| chrome.browser_back_id.clone(),
-                            ))
-                            .name("Back")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "go-previous-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.back"),
+                            |chrome| chrome.browser_back_id.clone(),
+                        ))
+                        .name("Back")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-next-symbolic"))
+                        widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
                                 |chrome| chrome.browser_forward_id.clone(),
@@ -7405,15 +7410,17 @@ impl Cagents {
                         "Forward",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.reload"),
-                                |chrome| chrome.browser_reload_id.clone(),
-                            ))
-                            .name("Reload")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(active.then_some(Message::BrowserReload(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "view-refresh-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.reload"),
+                            |chrome| chrome.browser_reload_id.clone(),
+                        ))
+                        .name("Reload")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(active.then_some(Message::BrowserReload(id))),
                         "Reload",
                     ),
                     address_input.into(),
@@ -7582,7 +7589,8 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
-                            widget::icon::from_name("dialog-warning-symbolic")
+                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                                .icon()
                                 .size(24)
                                 .into(),
                             widget::text::title3(labels.unavailable).into(),
@@ -13622,9 +13630,9 @@ impl Application for Cagents {
                     widget::button::suggested("New terminal")
                         .id(widget::Id::new("empty.new-terminal"))
                         .name("New terminal")
-                        .leading_icon(
-                            widget::icon::from_name("utilities-terminal-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "utilities-terminal-symbolic",
+                        ))
                         .on_press(Message::NewTerminal)
                         .into(),
                     widget::button::standard("Open folder")
@@ -13636,9 +13644,9 @@ impl Application for Cagents {
                     widget::button::standard("New browser")
                         .id(widget::Id::new("empty.new-browser"))
                         .name("New browser")
-                        .leading_icon(
-                            widget::icon::from_name("internet-web-browser-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "internet-web-browser-symbolic",
+                        ))
                         .on_press(Message::NewBrowser)
                         .into(),
                 ]
@@ -13658,7 +13666,8 @@ impl Application for Cagents {
             };
             let surface = widget::container(
                 widget::column::with_children(vec![
-                    widget::icon::from_name("utilities-terminal-symbolic")
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
+                        .icon()
                         .size(32)
                         .into(),
                     widget::text::title2("Start a workspace").into(),
