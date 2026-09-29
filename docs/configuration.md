@@ -94,21 +94,25 @@ confirm_terminal_close = true
 chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
+shortcut_defaults_revision = 2
 
 [keyboard_shortcuts]
-new_terminal = ["Ctrl+T"]
-new_channel = ["Alt+G"]
-clone_pane = ["Alt+E"]
-close_focused_column = ["Ctrl+W"]
+new_terminal = ["Ctrl+Shift+T"]
+new_channel = ["Ctrl+Shift+G"]
+clone_pane = ["Ctrl+Shift+D"]
+close_focused_column = ["Ctrl+Shift+W"]
 search_projects = ["Ctrl+F"]
-previous_column = ["Alt+Q", "Alt+Left"]
-next_column = ["Alt+W", "Alt+Right"]
-cycle_pane_width = ["Alt+R"]
+previous_column = ["Ctrl+PageUp"]
+next_column = ["Ctrl+PageDown"]
+cycle_pane_width = ["Ctrl+Shift+R"]
 previous_workspace = ["Alt+Shift+Tab"]
 next_workspace = ["Alt+Tab"]
 review_toggle_viewed = ["Alt+V"]
 review_next_file = ["Alt+Down"]
 review_previous_file = ["Alt+Up"]
+review_next_unviewed = ["Alt+Shift+Down"]
+review_next_change = ["Alt+J"]
+review_previous_change = ["Alt+K"]
 ```
 
 TOML does not allow a top-level key after a table header. Put every plain
@@ -152,6 +156,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
+| `shortcut_defaults_revision` | integer | `2` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -166,12 +171,19 @@ modifiers, joined by `+`. Names are case-insensitive.
 
 - Modifiers: `Ctrl` (or `Control`), `Alt`, `Super` (or `Meta`), and `Shift`.
   Each chord needs `Ctrl`, `Alt`, or `Super`. `Shift` is optional.
-- Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, or `Tab`.
+- Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, `Tab`, `PageUp`, or
+  `PageDown`.
 - No chord can appear twice, even under different actions.
 - A chord you bind here is not passed to the program running in a pane.
   For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
   cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
-  be bound.
+  be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
+  with a letter or arrow, can be bound but then no longer reach a terminal;
+  the defaults avoid them.
+- The one exception is `search_projects`: while a terminal has focus, its
+  chords go to the terminal, so the default `Ctrl+F` stays forward-char there.
+  The review actions act only while a pull request pane has focus, and their
+  chords reach every other pane.
 - `new_terminal`, `close_focused_column`, `search_projects`,
   `previous_column`, and `next_column` need at least one chord. The rest
   (`new_channel`, `clone_pane`, `cycle_pane_width`, the two workspace actions,
@@ -290,11 +302,35 @@ them back as version 3 the next time it saves.
 - **Renamed shortcut:** a `new_thread` shortcut, the name used before channels
   were named, is read as `new_channel`. If both names are present,
   `new_channel` is used.
+- **New shortcut defaults:** a file without `shortcut_defaults_revision` was
+  written against the first defaults. Each action still bound to exactly its
+  old default, in any order or spelling, moves to the current one:
+
+  | Action | Old default | Current default |
+  | --- | --- | --- |
+  | `new_terminal` | `Ctrl+T` | `Ctrl+Shift+T` |
+  | `new_channel` | `Alt+G` | `Ctrl+Shift+G` |
+  | `clone_pane` | `Alt+E` | `Ctrl+Shift+D` |
+  | `close_focused_column` | `Ctrl+W` | `Ctrl+Shift+W` |
+  | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
+  | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
+  | `cycle_pane_width` | `Alt+R` | `Ctrl+Shift+R` |
+
+  An action the table leaves out counts as on its old default. A version-2
+  file that spells `previous_column` as `"Alt+Q"` or `next_column` as
+  `"Alt+W"`, the defaults before chord lists, moves too. An action you
+  changed, extended, or emptied keeps your chords. A new chord
+  another action already uses is not taken from it; if that leaves an action
+  with no new chord, it keeps its old default. The next save records
+  `shortcut_defaults_revision = 2`, after which an old default you choose
+  again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
-  gets its default chord. These actions are `new_channel` (Alt+G), `clone_pane`
-  (Alt+E), `cycle_pane_width` (Alt+R), `previous_workspace` (Alt+Shift+Tab),
-  `next_workspace` (Alt+Tab), `review_toggle_viewed` (Alt+V),
-  `review_next_file` (Alt+Down), and `review_previous_file` (Alt+Up). If
+  gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
+  `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Ctrl+Shift+R),
+  `previous_workspace` (Alt+Shift+Tab), `next_workspace` (Alt+Tab),
+  `review_toggle_viewed` (Alt+V), `review_next_file` (Alt+Down),
+  `review_previous_file` (Alt+Up), `review_next_unviewed` (Alt+Shift+Down),
+  `review_next_change` (Alt+J), and `review_previous_change` (Alt+K). If
   another action already uses that chord, the existing binding is kept and the
   new action stays unbound (`[]`) until you give it a free chord.
 - **Your bindings:** any binding you set yourself is kept, including an empty

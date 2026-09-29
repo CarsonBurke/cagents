@@ -9,7 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ashpd::desktop::notification::{Notification, NotificationProxy};
+use ashpd::{
+    desktop::notification::{Notification, NotificationProxy},
+    zbus,
+    zvariant::OwnedValue,
+};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -17,12 +21,25 @@ use uuid::Uuid;
 use super::state::{ClientId, HostState, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target},
+    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
 };
 
 const MAX_PENDING: usize = 2048;
+const MAX_ACTIONS: usize = 32;
+const MAX_ACTIVATION_TOKEN: usize = 4096;
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// The application action a notification's default action invokes, with the
+/// notice identity as its target. Notification backends deliver `app.` actions
+/// to the application's `org.freedesktop.Application` object together with the
+/// activation token the notification server minted for the click; without that
+/// token a Wayland compositor refuses to raise the window.
+const OPEN_ACTION: &str = "open-notification";
+/// The portal-signal action used while this daemon cannot receive application
+/// actions. Backends such as xdg-desktop-portal-gtk drop the activation token on
+/// this path, so the window is routed but may not be raised.
+const SIGNAL_OPEN_ACTION: &str = "open";
 
 struct Portal {
     proxy: NotificationProxy<'static>,
@@ -35,6 +52,43 @@ impl Drop for Portal {
     }
 }
 
+/// What the portal knows of this daemon's application ID. Registration binds
+/// the D-Bus connection, and ashpd shares one connection for the process, so
+/// the outcome outlives any single `Portal`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Registration {
+    #[default]
+    Untried,
+    /// A `Register` call was sent, but a timeout discarded its reply.
+    Unknown,
+    Registered,
+    /// The portal identifies this connection some other way, such as when no
+    /// desktop entry exists for the ID or the portal predates registration.
+    Refused,
+}
+
+impl Registration {
+    fn needs_attempt(self) -> bool {
+        matches!(self, Self::Untried | Self::Unknown)
+    }
+
+    /// The state after a `Register` attempt that started from `self`.
+    fn settle(self, outcome: Result<(), String>) -> Self {
+        match outcome {
+            Ok(()) => Self::Registered,
+            // The portal rejects a second registration of one connection. After
+            // a lost reply that registration can only have been ours: this
+            // daemon makes no other portal call before registering.
+            Err(error)
+                if self == Self::Unknown && error.contains("Connection already associated") =>
+            {
+                Self::Registered
+            }
+            Err(_) => Self::Refused,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     events: BTreeMap<Target, Event>,
@@ -42,9 +96,13 @@ struct Pending {
     acknowledged: BTreeSet<Uuid>,
     presence_changed: bool,
     actions: VecDeque<(Uuid, Option<String>)>,
+    /// The portal service's latest owner, when it changed; `Some(None)` means
+    /// it exited. A different owner has forgotten this daemon's registration.
+    portal_owner: Option<Option<zbus::names::OwnedUniqueName>>,
     reload: bool,
     preferences: Option<Preferences>,
-    test: bool,
+    /// Requesters waiting on a test notification, each answered once.
+    tests: Vec<std::sync::mpsc::Sender<TestOutcome>>,
     stopped: bool,
 }
 
@@ -109,12 +167,23 @@ impl Handle {
         });
     }
 
-    pub fn reload(&self, preferences: Option<Preferences>, test: bool) {
+    pub fn reload(&self, preferences: Option<Preferences>) {
         self.change(|pending| {
             pending.reload = true;
             pending.preferences = preferences;
-            pending.test |= test;
         });
+    }
+
+    /// Queues a test notification. The receiver yields its outcome once the
+    /// broker has tried it, and disconnects if the broker stops first.
+    pub fn test(&self) -> std::sync::mpsc::Receiver<TestOutcome> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.change(|pending| {
+            if pending.tests.len() < MAX_PENDING {
+                pending.tests.push(sender);
+            }
+        });
+        receiver
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -242,29 +311,262 @@ fn preferences() -> Result<Preferences, String> {
     )
 }
 
+impl Shared {
+    /// Queue one desktop activation of a notice for the broker loop.
+    ///
+    /// A click can arrive both as an application action and as a portal signal
+    /// on backends that emit both. Deliveries that meet in the queue coalesce
+    /// into one activation that keeps whichever carried an activation token;
+    /// activation is idempotent, so a delivery after the drain is harmless.
+    fn activate(&self, id: Uuid, token: Option<String>) {
+        let token = token.filter(|token| token.len() <= MAX_ACTIVATION_TOKEN);
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, queued)) = pending.actions.iter_mut().find(|(queued, _)| *queued == id) {
+            if queued.is_none() {
+                *queued = token;
+            }
+        } else if pending.actions.len() < MAX_ACTIONS {
+            pending.actions.push_back((id, token));
+        }
+        drop(pending);
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// `org.freedesktop.Application` object path for a desktop ID, per the
+/// Desktop Entry specification's D-Bus activation section.
+fn application_object_path(desktop_id: &str) -> String {
+    format!("/{}", desktop_id.replace('.', "/").replace('-', "_"))
+}
+
+/// The activation token in desktop platform data. `desktop-startup-id` is the
+/// X11-era key some backends still send alongside, or instead of, the
+/// Wayland `activation-token`.
+fn platform_activation_token(
+    platform_data: &std::collections::HashMap<String, OwnedValue>,
+) -> Option<String> {
+    ["activation-token", "desktop-startup-id"]
+        .into_iter()
+        .find_map(|key| String::try_from(platform_data.get(key)?.try_clone().ok()?).ok())
+        .filter(|token| !token.is_empty() && token.len() <= MAX_ACTIVATION_TOKEN)
+}
+
+/// The notice an `ActivateAction` call opens. Its first parameter is the
+/// target the notification declared: the notice identity.
+fn activated_notice(action: &str, parameter: &[OwnedValue]) -> Option<Uuid> {
+    if action != OPEN_ACTION {
+        return None;
+    }
+    let target = match &**parameter.first()? {
+        // The target is a variant inside `av`; tolerate one extra boxing.
+        ashpd::zvariant::Value::Value(boxed) => &**boxed,
+        target => target,
+    };
+    let target: &str = target.downcast_ref().ok()?;
+    Uuid::parse_str(target).ok()
+}
+
+/// Whether a portal `ActionInvoked` signal names a notice's open action.
+/// Backends that forward application actions as signals keep the `app.`
+/// prefix; the notification ID itself identifies the notice.
+fn signal_opens_notice(action: &str) -> bool {
+    action == SIGNAL_OPEN_ACTION || action.strip_prefix("app.") == Some(OPEN_ACTION)
+}
+
+/// Receives notification clicks that backends deliver as application actions.
+/// This identity exists only for notification routing, so launching the
+/// application or opening files through it is refused explicitly.
+struct ApplicationActions(Weak<Shared>);
+
+#[zbus::interface(name = "org.freedesktop.Application", crate = "ashpd::zbus")]
+impl ApplicationActions {
+    fn activate(
+        &self,
+        _platform_data: std::collections::HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        Err(zbus::fdo::Error::NotSupported(
+            "cagentsd only activates windows through notification actions".into(),
+        ))
+    }
+
+    fn open(
+        &self,
+        _uris: Vec<String>,
+        _platform_data: std::collections::HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        Err(zbus::fdo::Error::NotSupported(
+            "cagentsd does not open files".into(),
+        ))
+    }
+
+    fn activate_action(
+        &self,
+        action_name: &str,
+        parameter: Vec<OwnedValue>,
+        platform_data: std::collections::HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        let id = activated_notice(action_name, &parameter).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("unknown notification action {action_name:?}"))
+        })?;
+        let shared = self
+            .0
+            .upgrade()
+            .ok_or_else(|| zbus::fdo::Error::Failed("notifications are stopping".into()))?;
+        tracing::debug!(%id, "desktop notification application action received");
+        shared.activate(id, platform_activation_token(&platform_data));
+        Ok(())
+    }
+}
+
+/// Own the desktop ID's bus name so notification backends can deliver the
+/// clicked notice and its activation token as an application action.
+///
+/// The name is never queued for: a queued request would leave backends calling
+/// whichever process owns it now.
+async fn serve_application_actions(
+    shared: Weak<Shared>,
+    desktop_id: &str,
+) -> zbus::Result<zbus::Connection> {
+    let connection = zbus::connection::Builder::session()?
+        .serve_at(
+            application_object_path(desktop_id),
+            ApplicationActions(shared),
+        )?
+        .build()
+        .await?;
+    // Without queueing, a name another process owns is refused with a reply,
+    // not an error; clicks addressed to it would reach that process.
+    match connection
+        .request_name_with_flags(desktop_id, zbus::fdo::RequestNameFlags::DoNotQueue.into())
+        .await?
+    {
+        zbus::fdo::RequestNameReply::PrimaryOwner | zbus::fdo::RequestNameReply::AlreadyOwner => {
+            Ok(connection)
+        }
+        zbus::fdo::RequestNameReply::InQueue | zbus::fdo::RequestNameReply::Exists => {
+            Err(zbus::Error::NameTaken)
+        }
+    }
+}
+
+/// Receives desktop notification clicks for the daemon's lifetime.
+///
+/// The application-action endpoint is deliberately independent of `Portal`:
+/// notices already on screen keep addressing it while a failed delivery
+/// reconnects the portal.
+#[derive(Default)]
+struct Activation {
+    registration: Registration,
+    /// The portal instance that decided `registration`.
+    portal: Option<zbus::names::OwnedUniqueName>,
+    /// The portal was reached but the bus would not name its owner, so the
+    /// next owner change cannot be compared and counts as a replacement.
+    portal_unknown: bool,
+    actions: Option<zbus::Connection>,
+}
+
+impl Activation {
+    /// Whether notices can use the application action, which carries the
+    /// click's activation token, rather than the portal signal.
+    fn receives_actions(&self) -> bool {
+        self.registration == Registration::Registered && self.actions.is_some()
+    }
+
+    /// Forget a registration held by a portal instance that has exited or been
+    /// replaced. Returns whether the portal must be reconnected so the new
+    /// instance hears `Register` before any other call.
+    fn portal_changed(&mut self, owner: Option<zbus::names::OwnedUniqueName>) -> bool {
+        if self.portal_unknown {
+            self.portal_unknown = false;
+            // The instance may still be the one we registered with, which
+            // rejects a second `Register` as already associated; `Unknown`
+            // reads that rejection as the registration it is.
+            self.registration = match self.registration {
+                Registration::Registered => Registration::Unknown,
+                _ => Registration::Untried,
+            };
+            self.portal = None;
+            return true;
+        }
+        if self.portal.is_none() || self.portal == owner {
+            return false;
+        }
+        self.registration = Registration::Untried;
+        self.portal = None;
+        true
+    }
+
+    async fn prepare(
+        &mut self,
+        shared: &Weak<Shared>,
+        application: crate::notifications::Application,
+    ) -> Result<(), String> {
+        let desktop_id = crate::instance::notification_desktop_id(application);
+        // A host daemon is not launched from the UI desktop file's cgroup.
+        // Registration gives the portal the same application identity as UI.
+        if self.registration.needs_attempt() {
+            let id = desktop_id
+                .parse()
+                .map_err(|error| format!("Invalid application identity: {error}"))?;
+            let previous = self.registration;
+            // A timeout may drop this future after the call was sent.
+            self.registration = Registration::Unknown;
+            let outcome = ashpd::register_host_app(id).await;
+            if let Err(error) = &outcome {
+                tracing::debug!(%error, "desktop portal did not register the application");
+            }
+            self.registration = previous.settle(outcome.map_err(|error| error.to_string()));
+        }
+        // Backends address application actions to the portal's view of the
+        // application ID, which is ours only once registration succeeded.
+        if self.registration == Registration::Registered && self.actions.is_none() {
+            self.actions = serve_application_actions(shared.clone(), desktop_id)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "cannot receive notification actions; clicks may not raise windows"
+                    );
+                })
+                .ok();
+        }
+        Ok(())
+    }
+}
+
 async fn connect(
     shared: Weak<Shared>,
     application: crate::notifications::Application,
+    activation: &mut Activation,
 ) -> Result<Portal, String> {
     tokio::time::timeout(PORTAL_TIMEOUT, async move {
-        // A host daemon is not launched from the UI desktop file's cgroup.
-        // Registration gives the portal the same application identity as UI.
-        let _ = ashpd::register_host_app(
-            crate::instance::notification_desktop_id(application)
-                .parse()
-                .map_err(|error| format!("Invalid application identity: {error}"))?,
-        )
-        .await;
+        activation.prepare(&shared, application).await?;
         let proxy = NotificationProxy::new()
             .await
             .map_err(|error| error.to_string())?;
+        if activation.portal.is_none() {
+            // Asks the bus, not the portal, so it cannot affect registration.
+            activation.portal = zbus::fdo::DBusProxy::new(proxy.connection())
+                .await
+                .map_err(|error| error.to_string())?
+                .get_name_owner(proxy.destination().to_owned())
+                .await
+                .ok();
+            activation.portal_unknown = activation.portal.is_none();
+        }
         let listener = NotificationProxy::new()
             .await
             .map_err(|error| error.to_string())?;
         let (ready, subscribed) = tokio::sync::oneshot::channel();
         let listener = tokio::spawn(async move {
-            let actions = match listener.receive_action_invoked().await {
-                Ok(actions) => actions,
+            let subscriptions = async {
+                Ok::<_, ashpd::Error>((
+                    listener.receive_action_invoked().await?,
+                    listener.receive_owner_changed().await?,
+                ))
+            };
+            let (actions, owners) = match subscriptions.await {
+                Ok(streams) => streams,
                 Err(error) => {
                     let _ = ready.send(Err(error.to_string()));
                     return;
@@ -272,7 +574,26 @@ async fn connect(
             };
             let _ = ready.send(Ok(()));
             futures_util::pin_mut!(actions);
-            while let Some(action) = actions.next().await {
+            futures_util::pin_mut!(owners);
+            loop {
+                let action = tokio::select! {
+                    action = actions.next() => action,
+                    owner = owners.next() => {
+                        let (Some(owner), Some(shared)) = (owner, shared.upgrade()) else {
+                            break;
+                        };
+                        shared
+                            .pending
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .portal_owner = Some(owner.map(Into::into));
+                        let _ = shared.wake.try_send(());
+                        continue;
+                    }
+                };
+                let Some(action) = action else {
+                    break;
+                };
                 tracing::debug!(
                     id = action.id(),
                     action = action.name(),
@@ -281,32 +602,17 @@ async fn connect(
                 let Some(shared) = shared.upgrade() else {
                     break;
                 };
-                if action.name() != "open" {
+                if !signal_opens_notice(action.name()) {
                     continue;
                 }
                 let Ok(id) = Uuid::parse_str(action.id()) else {
                     continue;
                 };
-                let mut pending = shared.pending.lock().unwrap_or_else(|p| p.into_inner());
-                if pending.actions.len() < 32 {
-                    let token: Option<String> = action.parameter().iter().find_map(|parameter| {
-                        let dictionary: std::collections::HashMap<
-                            String,
-                            ashpd::zvariant::OwnedValue,
-                        > = parameter.try_clone().ok()?.try_into().ok()?;
-                        dictionary
-                            .get("activation-token")?
-                            .try_clone()
-                            .ok()?
-                            .try_into()
-                            .ok()
-                    });
-                    pending
-                        .actions
-                        .push_back((id, token.filter(|token| token.len() <= 4096)));
-                }
-                drop(pending);
-                let _ = shared.wake.try_send(());
+                // Portal v2 backends append platform data after the target.
+                let token = action.parameter().iter().find_map(|parameter| {
+                    platform_activation_token(&parameter.try_clone().ok()?.try_into().ok()?)
+                });
+                shared.activate(id, token);
             }
         });
         let portal = Portal { proxy, listener };
@@ -319,18 +625,42 @@ async fn connect(
     .map_err(|_| "Desktop notification portal timed out".to_owned())?
 }
 
-async fn send(proxy: &NotificationProxy<'_>, notice: &Notice) -> Result<(), String> {
+async fn send(portal: &Portal, notice: &Notice, application_action: bool) -> Result<(), String> {
     let body = crate::notifications::context(&notice.event);
+    let id = notice.id.to_string();
+    let action = if application_action {
+        format!("app.{OPEN_ACTION}")
+    } else {
+        SIGNAL_OPEN_ACTION.to_owned()
+    };
     let notification = Notification::new(notice.event.evidence.kind.label())
         .body(body.as_str())
-        .default_action("open");
+        .default_action(action.as_str())
+        .default_action_target(id.as_str());
     tokio::time::timeout(
         PORTAL_TIMEOUT,
-        proxy.add_notification(&notice.id.to_string(), notification),
+        portal.proxy.add_notification(&id, notification),
     )
     .await
     .map_err(|_| "Desktop notification portal timed out".to_owned())?
     .map_err(|error| format!("Desktop notifications unavailable: {error}"))
+}
+
+async fn send_test(backend: &Portal) -> TestOutcome {
+    let test = Notification::new("cagents notifications work")
+        .body("Agent completion and attention alerts appear here.");
+    match tokio::time::timeout(
+        PORTAL_TIMEOUT,
+        backend
+            .proxy
+            .add_notification("cagents-notification-test", test),
+    )
+    .await
+    {
+        Ok(Ok(())) => TestOutcome::Sent,
+        Ok(Err(error)) => TestOutcome::Unavailable(error.to_string()),
+        Err(_) => TestOutcome::TimedOut,
+    }
 }
 
 async fn remove(proxy: &Portal, id: Uuid) -> Result<(), String> {
@@ -358,6 +688,13 @@ fn queue_withdrawal(queue: &mut BTreeSet<Uuid>, id: Uuid) {
         queue.pop_first();
     }
     queue.insert(id);
+}
+
+fn answer_tests(requesters: &[std::sync::mpsc::Sender<TestOutcome>], outcome: &TestOutcome) {
+    for requester in requesters {
+        // A requester that gave up waiting has nothing left to tell.
+        let _ = requester.send(outcome.clone());
+    }
 }
 
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
@@ -409,6 +746,29 @@ mod tests {
     }
 
     #[test]
+    fn every_test_requester_is_answered_or_released() {
+        let (wake, _receiver) = mpsc::channel(1);
+        let handle = Handle(Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        }));
+        let first = handle.test();
+        let second = handle.test();
+        let pending = std::mem::take(&mut *handle.0.pending.lock().unwrap());
+        answer_tests(&pending.tests, &TestOutcome::Sent);
+        assert_eq!(first.recv(), Ok(TestOutcome::Sent));
+        assert_eq!(second.recv(), Ok(TestOutcome::Sent));
+
+        // A broker that stops with a test still queued releases its waiter
+        // instead of leaving the request to time out.
+        let orphaned = handle.test();
+        drop(std::mem::take(&mut *handle.0.pending.lock().unwrap()));
+        assert!(orphaned.recv().is_err());
+    }
+
+    #[test]
     fn portal_retry_wakes_without_another_ui_or_agent_event() {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -427,6 +787,205 @@ mod tests {
                 // The deadline, not a synthetic producer message, woke the broker.
                 assert!(receiver.try_recv().is_err());
             });
+    }
+
+    fn value(value: &str) -> OwnedValue {
+        ashpd::zvariant::Value::from(value).try_into().unwrap()
+    }
+
+    fn shared() -> (Arc<Shared>, mpsc::Receiver<()>) {
+        let (wake, receiver) = mpsc::channel(1);
+        let shared = Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        });
+        (shared, receiver)
+    }
+
+    #[test]
+    fn application_action_target_names_the_clicked_notice() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            activated_notice(OPEN_ACTION, &[value(&id.to_string())]),
+            Some(id)
+        );
+        // Backends strip the `app.` prefix before calling ActivateAction.
+        assert_eq!(
+            activated_notice(&format!("app.{OPEN_ACTION}"), &[value(&id.to_string())]),
+            None
+        );
+        assert_eq!(activated_notice("quit", &[value(&id.to_string())]), None);
+        assert_eq!(activated_notice(OPEN_ACTION, &[]), None);
+        assert_eq!(
+            activated_notice(OPEN_ACTION, &[value("not-a-notice")]),
+            None
+        );
+        let number: OwnedValue = ashpd::zvariant::Value::from(7u32).try_into().unwrap();
+        assert_eq!(activated_notice(OPEN_ACTION, &[number]), None);
+        let boxed: OwnedValue =
+            ashpd::zvariant::Value::Value(Box::new(ashpd::zvariant::Value::from(id.to_string())))
+                .try_into()
+                .unwrap();
+        assert_eq!(activated_notice(OPEN_ACTION, &[boxed]), Some(id));
+    }
+
+    #[test]
+    fn registration_survives_a_lost_reply_but_not_another_identity() {
+        let associated = || Err("Connection already associated with an application ID".to_owned());
+        assert_eq!(
+            Registration::Untried.settle(Ok(())),
+            Registration::Registered
+        );
+        // Only our own earlier Register call can have associated the
+        // connection after its reply was lost.
+        assert_eq!(
+            Registration::Unknown.settle(associated()),
+            Registration::Registered
+        );
+        // Without that call, the portal chose the identity from elsewhere.
+        assert_eq!(
+            Registration::Untried.settle(associated()),
+            Registration::Refused
+        );
+        assert_eq!(
+            Registration::Untried.settle(Err("App info not found".into())),
+            Registration::Refused
+        );
+        assert!(Registration::Unknown.needs_attempt());
+        assert!(!Registration::Refused.needs_attempt());
+        assert!(!Registration::Registered.needs_attempt());
+        // Owning the name alone is not enough: backends address the portal's
+        // application ID, so a refused registration keeps the signal path.
+        let unowned = Activation {
+            registration: Registration::Registered,
+            ..Default::default()
+        };
+        assert!(!unowned.receives_actions());
+    }
+
+    #[test]
+    fn a_replaced_portal_forgets_the_registration() {
+        let name = |name: &str| zbus::names::OwnedUniqueName::try_from(name).unwrap();
+        let registered = || Activation {
+            registration: Registration::Registered,
+            portal: Some(name(":1.1")),
+            ..Default::default()
+        };
+        let mut activation = registered();
+        // The instance we registered with reappearing needs nothing.
+        assert!(!activation.portal_changed(Some(name(":1.1"))));
+        assert_eq!(activation.registration, Registration::Registered);
+        for owner in [None, Some(name(":1.9"))] {
+            let mut activation = registered();
+            assert!(activation.portal_changed(owner));
+            assert_eq!(activation.registration, Registration::Untried);
+            assert_eq!(activation.portal, None);
+        }
+        // A portal that was never reached has no registration to lose, and a
+        // refusal is retried with a replacement that may accept it.
+        assert!(!Activation::default().portal_changed(None));
+        let mut refused = Activation {
+            registration: Registration::Refused,
+            portal: Some(name(":1.1")),
+            ..Default::default()
+        };
+        assert!(refused.portal_changed(Some(name(":1.2"))));
+        assert!(refused.registration.needs_attempt());
+    }
+
+    #[test]
+    fn a_portal_of_unknown_owner_takes_its_first_change_as_a_replacement() {
+        let name = |name: &str| zbus::names::OwnedUniqueName::try_from(name).unwrap();
+        let mut activation = Activation {
+            registration: Registration::Registered,
+            portal_unknown: true,
+            ..Default::default()
+        };
+        assert!(activation.portal_changed(Some(name(":1.9"))));
+        assert!(!activation.portal_unknown);
+        // Re-registering with the same instance must still read as registered.
+        assert_eq!(activation.registration, Registration::Unknown);
+        assert_eq!(
+            activation
+                .registration
+                .settle(Err("Connection already associated".into())),
+            Registration::Registered
+        );
+        // With the owner looked up again, only a real change counts.
+        activation.portal = Some(name(":1.9"));
+        assert!(!activation.portal_changed(Some(name(":1.9"))));
+    }
+
+    #[test]
+    fn portal_signals_open_notices_through_either_action_name() {
+        assert!(signal_opens_notice(SIGNAL_OPEN_ACTION));
+        assert!(signal_opens_notice(&format!("app.{OPEN_ACTION}")));
+        assert!(!signal_opens_notice(OPEN_ACTION));
+        assert!(!signal_opens_notice("app.quit"));
+    }
+
+    #[test]
+    fn platform_data_yields_a_bounded_activation_token() {
+        let data = |entries: &[(&str, &str)]| {
+            entries
+                .iter()
+                .map(|(key, token)| ((*key).to_owned(), value(token)))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert_eq!(
+            platform_activation_token(&data(&[
+                ("desktop-startup-id", "x11"),
+                ("activation-token", "wayland"),
+            ])),
+            Some("wayland".into())
+        );
+        assert_eq!(
+            platform_activation_token(&data(&[("desktop-startup-id", "x11")])),
+            Some("x11".into())
+        );
+        assert_eq!(platform_activation_token(&data(&[])), None);
+        assert_eq!(
+            platform_activation_token(&data(&[("activation-token", "")])),
+            None
+        );
+        let oversized = "t".repeat(MAX_ACTIVATION_TOKEN + 1);
+        assert_eq!(
+            platform_activation_token(&data(&[("activation-token", &oversized)])),
+            None
+        );
+    }
+
+    #[test]
+    fn application_object_path_follows_the_desktop_entry_specification() {
+        assert_eq!(
+            application_object_path("io.github.cagents.Development"),
+            "/io/github/cagents/Development"
+        );
+        assert_eq!(
+            application_object_path("org.example.my-app"),
+            "/org/example/my_app"
+        );
+    }
+
+    #[test]
+    fn duplicate_click_deliveries_activate_once_and_keep_a_token() {
+        let (shared, mut receiver) = shared();
+        let id = Uuid::new_v4();
+        // A signal without a token followed by an application action with one.
+        shared.activate(id, None);
+        shared.activate(id, Some("token".into()));
+        shared.activate(id, Some("later".into()));
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(
+            Vec::from(shared.pending.lock().unwrap().actions.clone()),
+            [(id, Some("token".to_owned()))]
+        );
+        for index in 0..MAX_ACTIONS * 2 {
+            shared.activate(Uuid::from_u128(index as u128), None);
+        }
+        assert_eq!(shared.pending.lock().unwrap().actions.len(), MAX_ACTIONS);
     }
 
     #[test]
@@ -461,6 +1020,7 @@ async fn run(
     });
     let mut presence = BTreeMap::<ClientId, Presence>::new();
     let mut proxy = None;
+    let mut activation = Activation::default();
     // Only events observed during this daemon lifetime are eligible for retry.
     // Restored attention stays visible in the UI without announcing old backlog.
     let mut delivery = BTreeMap::<Target, Notice>::new();
@@ -500,7 +1060,35 @@ async fn run(
         if pending.stopped {
             break;
         }
+        if let Some(owner) = pending.portal_owner
+            && activation.portal_changed(owner)
+        {
+            // Register with the new portal before anything else calls it, or
+            // it identifies this connection without the application ID.
+            proxy = None;
+            next_attempt = Instant::now();
+        }
         let Ok(journal) = &mut journal else {
+            // Without a journal there is no backlog to deliver, but the
+            // portal may be fine, so a test is still answered by the portal
+            // itself rather than dropped as if the broker had stopped.
+            if !pending.tests.is_empty() {
+                if proxy.is_none() {
+                    match connect(shared.clone(), application, &mut activation).await {
+                        Ok(connected) => proxy = Some(connected),
+                        Err(error) => {
+                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                        }
+                    }
+                }
+                if let Some(backend) = &proxy {
+                    let outcome = send_test(backend).await;
+                    if outcome != TestOutcome::Sent {
+                        proxy = None;
+                    }
+                    answer_tests(&pending.tests, &outcome);
+                }
+            }
             continue;
         };
         if let Some(current) = current_presence {
@@ -616,33 +1204,51 @@ async fn run(
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
-        if (!delivery.is_empty() || !withdrawals.is_empty() || pending.test)
-            && proxy.is_none()
-            && Instant::now() >= next_attempt
-        {
-            match connect(shared.clone(), application).await {
+        let backlog_due =
+            (!delivery.is_empty() || !withdrawals.is_empty()) && Instant::now() >= next_attempt;
+        // A test is a person asking right now, so it retries a portal that
+        // the backlog is still backing off from. Its failure is answered to
+        // that person rather than raised as every window's diagnostic, and
+        // leaves the backlog's schedule alone.
+        if proxy.is_none() && (backlog_due || !pending.tests.is_empty()) {
+            match connect(shared.clone(), application, &mut activation).await {
                 Ok(connected) => {
                     proxy = Some(connected);
                     snapshot.diagnostic = None;
                     retry_delay = RETRY_DELAY;
                 }
                 Err(error) => {
-                    snapshot.diagnostic = Some(error);
-                    next_attempt = Instant::now() + retry_delay;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    if backlog_due {
+                        snapshot.diagnostic = Some(error);
+                        next_attempt = Instant::now() + retry_delay;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    }
                 }
             }
         }
         if let Some(backend) = &proxy {
             let mut failed = false;
+            // Ahead of the backlog, so the answer is not held behind it.
+            if !pending.tests.is_empty() {
+                let outcome = send_test(backend).await;
+                failed = outcome != TestOutcome::Sent;
+                answer_tests(&pending.tests, &outcome);
+            }
             // Yield to coalesced lifecycle/focus/acknowledgment work between
             // bounded batches, rather than delaying it behind thousands of alerts.
-            let batch: Vec<_> = delivery.values().take(8).cloned().collect();
+            // A portal that just failed the test is dropped below, not
+            // handed the backlog as well.
+            let batch: Vec<_> = if failed {
+                Vec::new()
+            } else {
+                delivery.values().take(8).cloned().collect()
+            };
             for notice in batch {
                 if stopped(&shared) {
                     return;
                 }
-                match send(&backend.proxy, &notice).await {
+                match send(backend, &notice, activation.receives_actions()).await {
                     Ok(()) => {
                         delivery.remove(&notice.event.target());
                         if let Err(error) = journal.delivered(notice.id) {
@@ -662,6 +1268,9 @@ async fn run(
                 if stopped(&shared) {
                     return;
                 }
+                if failed {
+                    break;
+                }
                 let Some(id) = withdrawals.pop_first() else {
                     break;
                 };
@@ -670,32 +1279,6 @@ async fn run(
                     snapshot.diagnostic = Some(error);
                     failed = true;
                     break;
-                }
-            }
-            if pending.test {
-                let test = Notification::new("cagents notifications work")
-                    .body("Agent completion and attention alerts appear here.");
-                match tokio::time::timeout(
-                    PORTAL_TIMEOUT,
-                    backend
-                        .proxy
-                        .add_notification("cagents-notification-test", test),
-                )
-                .await
-                {
-                    Ok(Ok(())) => snapshot.diagnostic = Some(
-                        "Test notification sent. Your desktop controls its presentation and sound."
-                            .into(),
-                    ),
-                    Ok(Err(error)) => {
-                        failed = true;
-                        snapshot.diagnostic =
-                            Some(format!("Desktop notifications unavailable: {error}"))
-                    }
-                    Err(_) => {
-                        failed = true;
-                        snapshot.diagnostic = Some("Desktop notification portal timed out".into())
-                    }
                 }
             }
             if failed {

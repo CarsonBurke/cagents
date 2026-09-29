@@ -43,6 +43,17 @@ const DEFAULT_PADDING: f32 = 8.0;
 /// what xterm and Ghostty both default to.
 const BLINK_PHASE: Duration = Duration::from_millis(530);
 
+/// How long a terminal's grid must hold still before its PTY follows it.
+///
+/// Every PTY resize is a SIGWINCH, and a full-screen program answers each one
+/// by repainting at the new size: Codex reflows its whole transcript. A card
+/// animating to a new width crosses a column boundary on nearly every frame,
+/// and a new card grows from a sliver, so following each frame would make the
+/// program repaint a dozen times for one gesture, starting from one column.
+/// Until the grid settles the widget keeps drawing the frame it has, clipped
+/// or padded to its bounds. Kitty debounces resizes by the same interval.
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
 /// Opacity multiplier for the cursor of a terminal that does not hold the
 /// keyboard, so that exactly one card on screen reads as the place typing
 /// lands.
@@ -456,6 +467,19 @@ impl TerminalGeometry {
         (
             column.min(u32::from(self.columns.saturating_sub(1))) as u16,
             row.min(u32::from(self.rows.saturating_sub(1))) as u16,
+        )
+    }
+
+    /// [`Self::cell_at`], limited to a published grid of `columns` x `rows`.
+    ///
+    /// While a resize is pending the snapshot still has the old size, so a
+    /// cell past its edge would name text that is not there - the draw path
+    /// clips to the same bound.
+    fn cell_within(self, position: Point, columns: u16, rows: u16) -> (u16, u16) {
+        let (column, row) = self.cell_at(position);
+        (
+            column.min(columns.saturating_sub(1)),
+            row.min(rows.saturating_sub(1)),
         )
     }
 
@@ -875,9 +899,57 @@ fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell))
     text
 }
 
+/// What the PTY should do about the grid size the latest layout produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeSync {
+    /// The PTY already has this size.
+    Current,
+    /// The size has held still long enough: resize the PTY to it.
+    Apply(TerminalSize),
+    /// The size is still moving. Look again at this instant.
+    Settle(Instant),
+}
+
+/// Holds PTY resizes back until the grid stops changing size.
+#[derive(Debug, Default)]
+struct PtySize {
+    /// The size last sent to the PTY. `None` before the first resize.
+    applied: Option<TerminalSize>,
+    /// The newest size that differs from `applied`, and when layout first
+    /// produced it. Any other size restarts the wait.
+    pending: Option<(TerminalSize, Instant)>,
+}
+
+impl PtySize {
+    fn observe(&mut self, size: TerminalSize, now: Instant) -> SizeSync {
+        if self.applied == Some(size) {
+            self.pending = None;
+            return SizeSync::Current;
+        }
+        let since = match self.pending {
+            Some((pending, since)) if pending == size => since,
+            _ => {
+                self.pending = Some((size, now));
+                now
+            }
+        };
+        let due = since + RESIZE_SETTLE;
+        if now >= due {
+            SizeSync::Apply(size)
+        } else {
+            SizeSync::Settle(due)
+        }
+    }
+
+    fn applied(&mut self, size: TerminalSize) {
+        self.applied = Some(size);
+        self.pending = None;
+    }
+}
+
 #[derive(Default)]
 struct WidgetState {
-    last_size: Option<TerminalSize>,
+    pty_size: PtySize,
     input_focused: bool,
     focused: bool,
     focus_requested: bool,
@@ -1565,19 +1637,35 @@ impl<Message> TerminalWidget<Message> {
         if self.read_only {
             return;
         }
-        let size = geometry.terminal_size();
-        if state.last_size != Some(size) {
-            // Reflow moves every cell the selection named, so keeping it would
-            // leave it covering text the user never dragged over. The first
-            // frame has no size yet and nothing to clear.
-            if state.last_size.is_some() {
-                state.selection = None;
-                state.selecting = false;
-                state.selection_click = None;
-            }
-            match self.handle.resize(size) {
-                Ok(()) => state.last_size = Some(size),
-                Err(error) => self.publish_error(error, shell),
+        match state
+            .pty_size
+            .observe(geometry.terminal_size(), Instant::now())
+        {
+            SizeSync::Current => {}
+            // No event may arrive once layout stops moving, so ask for the
+            // frame that finishes the wait.
+            SizeSync::Settle(due) => shell.request_redraw_at(due),
+            SizeSync::Apply(size) => {
+                // Reflow moves every cell the selection named, so keeping it
+                // would leave it covering text the user never dragged over.
+                // Before the first resize there is nothing to clear.
+                if state.pty_size.applied.is_some() {
+                    state.selection = None;
+                    state.selecting = false;
+                    state.selection_click = None;
+                }
+                match self.handle.resize(size) {
+                    Ok(()) => state.pty_size.applied(size),
+                    Err(error) => {
+                        // The size stays pending, so the next frame sends it
+                        // again without another wait. Once layout is still,
+                        // nothing else may ask for that frame.
+                        if matches!(error, TerminalSendError::Full) {
+                            shell.request_redraw();
+                        }
+                        self.publish_error(error, shell);
+                    }
+                }
             }
         }
     }
@@ -1609,6 +1697,12 @@ impl<Message> TerminalWidget<Message> {
         if let Err(error) = self.handle.mouse(input) {
             self.publish_error(error, shell);
         }
+    }
+
+    /// The cell under a pointer position, within both the laid-out grid and
+    /// the published one.
+    fn cell_at(&self, geometry: TerminalGeometry, position: Point) -> (u16, u16) {
+        geometry.cell_within(position, self.snapshot.columns, self.snapshot.rows)
     }
 
     /// The grid this frame's selection resolves against.
@@ -1928,7 +2022,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 if let Some(position) = geometry.cursor_position(cursor) {
                     state.last_cursor = Some(position);
-                    let cell = geometry.cell_at(position);
+                    let cell = self.cell_at(geometry, position);
                     state.last_motion_cell = Some(cell);
                     if *button == IcedMouseButton::Left
                         && state.modifiers.control
@@ -2071,7 +2165,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 // Clamping happens in `cell_at`, so a pointer dragged outside
                 // the grid still extends along its nearest edge.
-                let cell = geometry.cell_at(Point::new(position.x - grid.x, position.y - grid.y));
+                let cell = self.cell_at(
+                    geometry,
+                    Point::new(position.x - grid.x, position.y - grid.y),
+                );
                 // A scrolled viewport puts a different absolute row under an
                 // unchanged cell, so that case may not be deduplicated away.
                 if scrolled || state.last_motion_cell != Some(cell) {
@@ -2090,7 +2187,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // channel the user's keystrokes queue in. Report only what
                     // can be observed - tracking enabled, or a drag in progress
                     // - and then only on a cell crossing.
-                    let cell = geometry.cell_at(position);
+                    let cell = self.cell_at(geometry, position);
                     if (self.snapshot.scroll.mouse_tracking || state.pressed_buttons != 0)
                         && state.last_motion_cell != Some(cell)
                     {
@@ -2496,7 +2593,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         if let Some(position) = geometry.cursor_position(cursor) {
-            let cell = geometry.cell_at(position);
+            let cell = self.cell_at(geometry, position);
             if tree.state.downcast_ref::<WidgetState>().modifiers.control
                 && self.on_open_link.is_some()
                 && self
@@ -3463,6 +3560,40 @@ mod tests {
     }
 
     #[test]
+    fn pointer_cells_stay_inside_a_grid_still_awaiting_its_resize() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let geometry = TerminalGeometry::new(
+            bounds,
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let corner = geometry
+            .cell_bounds(geometry.columns - 1, geometry.rows - 1)
+            .unwrap();
+        let position = Point::new(
+            corner.center_x() - geometry.grid_bounds.x,
+            corner.center_y() - geometry.grid_bounds.y,
+        );
+        let laid_out = (geometry.columns - 1, geometry.rows - 1);
+        assert_eq!(geometry.cell_at(position), laid_out);
+        // The published grid is still the smaller one from before the resize.
+        assert_eq!(geometry.cell_within(position, 5, 3), (4, 2));
+        // A larger published grid never extends past the laid-out one.
+        assert_eq!(
+            geometry.cell_within(position, geometry.columns + 5, geometry.rows + 5),
+            laid_out
+        );
+    }
+
+    #[test]
     fn scrollbar_gutter_never_overlaps_drawn_or_addressable_cells() {
         for scale in [1.0, 1.25, 2.0] {
             for padding in [0.0, 8.0, 16.0] {
@@ -3543,6 +3674,159 @@ mod tests {
             assert_eq!(bar.thumb.height, bounds.height);
             assert_eq!(bar.row_at(100.0, 0.0), 0);
         }
+    }
+
+    fn pty_size(columns: u16) -> TerminalSize {
+        TerminalSize {
+            columns,
+            rows: 40,
+            cell_width_px: 10,
+            cell_height_px: 21,
+        }
+    }
+
+    /// Replays a card animating between two widths at 60 Hz, as the workspace
+    /// eases its layout, and returns every size the PTY was sent.
+    fn animate_card(from: f32, to: f32, pty: &mut PtySize, start: Instant) -> Vec<TerminalSize> {
+        const FRAME: Duration = Duration::from_micros(16_667);
+        let animation = Duration::from_millis(220);
+        let mut applied = Vec::new();
+        for frame in 0..60u32 {
+            let elapsed = FRAME * frame;
+            let progress = (elapsed.as_secs_f32() / animation.as_secs_f32()).min(1.0);
+            let eased = 1.0 - (1.0 - progress).powi(3);
+            let bounds = Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: from + (to - from) * eased,
+                height: 900.0,
+            };
+            let geometry =
+                TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.0, "", LINE_HEIGHT_RATIO, 8.0);
+            match pty.observe(geometry.terminal_size(), start + elapsed) {
+                SizeSync::Apply(size) => {
+                    pty.applied(size);
+                    applied.push(size);
+                }
+                SizeSync::Settle(due) => assert!(due > start + elapsed),
+                SizeSync::Current => {}
+            }
+        }
+        applied
+    }
+
+    fn settled_size(width: f32) -> TerminalSize {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: 900.0,
+        };
+        TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.0, "", LINE_HEIGHT_RATIO, 8.0)
+            .terminal_size()
+    }
+
+    #[test]
+    fn an_animated_card_resizes_its_pty_once_at_the_final_width() {
+        for (from, to) in [(540.0, 1080.0), (1080.0, 540.0)] {
+            let start = Instant::now();
+            let mut pty = PtySize::default();
+            assert_eq!(
+                pty.observe(settled_size(from), start - RESIZE_SETTLE),
+                SizeSync::Settle(start)
+            );
+            assert_eq!(
+                pty.observe(settled_size(from), start),
+                SizeSync::Apply(settled_size(from))
+            );
+            pty.applied(settled_size(from));
+
+            // Each frame of the animation crosses a column boundary; the child
+            // must see one SIGWINCH for the gesture, not one per frame.
+            assert_eq!(
+                animate_card(from, to, &mut pty, start),
+                vec![settled_size(to)],
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_card_growing_from_a_sliver_never_sends_its_first_frame() {
+        let mut pty = PtySize::default();
+        let applied = animate_card(1.0, 800.0, &mut pty, Instant::now());
+        assert_eq!(applied, vec![settled_size(800.0)]);
+    }
+
+    #[test]
+    fn a_resize_waits_for_its_size_to_hold_still() {
+        let start = Instant::now();
+        let mut pty = PtySize::default();
+        pty.applied(pty_size(80));
+
+        assert_eq!(pty.observe(pty_size(80), start), SizeSync::Current);
+        assert_eq!(
+            pty.observe(pty_size(90), start),
+            SizeSync::Settle(start + RESIZE_SETTLE)
+        );
+        // Seeing the same size again does not restart its wait.
+        let later = start + RESIZE_SETTLE / 2;
+        assert_eq!(
+            pty.observe(pty_size(90), later),
+            SizeSync::Settle(start + RESIZE_SETTLE)
+        );
+        // A different size does.
+        assert_eq!(
+            pty.observe(pty_size(95), later),
+            SizeSync::Settle(later + RESIZE_SETTLE)
+        );
+        assert_eq!(
+            pty.observe(pty_size(95), later + RESIZE_SETTLE),
+            SizeSync::Apply(pty_size(95))
+        );
+        pty.applied(pty_size(95));
+        assert_eq!(
+            pty.observe(pty_size(95), later + RESIZE_SETTLE),
+            SizeSync::Current
+        );
+    }
+
+    #[test]
+    fn returning_to_the_applied_size_cancels_a_pending_resize() {
+        let start = Instant::now();
+        let mut pty = PtySize::default();
+        pty.applied(pty_size(80));
+        assert!(matches!(
+            pty.observe(pty_size(60), start),
+            SizeSync::Settle(_)
+        ));
+        assert_eq!(
+            pty.observe(pty_size(80), start + Duration::from_millis(10)),
+            SizeSync::Current
+        );
+        // The abandoned size gets a fresh wait if layout produces it again.
+        let again = start + RESIZE_SETTLE * 2;
+        assert_eq!(
+            pty.observe(pty_size(60), again),
+            SizeSync::Settle(again + RESIZE_SETTLE)
+        );
+    }
+
+    #[test]
+    fn a_failed_resize_is_retried_without_another_wait() {
+        let start = Instant::now();
+        let mut pty = PtySize::default();
+        pty.observe(pty_size(80), start);
+        let due = start + RESIZE_SETTLE;
+        assert_eq!(
+            pty.observe(pty_size(80), due),
+            SizeSync::Apply(pty_size(80))
+        );
+        // The send failed, so nothing was recorded as applied.
+        assert_eq!(
+            pty.observe(pty_size(80), due + Duration::from_millis(1)),
+            SizeSync::Apply(pty_size(80))
+        );
     }
 
     #[test]

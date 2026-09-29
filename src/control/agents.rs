@@ -29,6 +29,9 @@ pub enum AgentCommand {
         model: Option<String>,
         #[arg(long)]
         permission_mode: Option<String>,
+        /// The provider's effort name, such as low or high; omit for its default.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
         #[arg(long)]
         prompt: String,
         /// Reuse this key with the identical request to retrieve its acceptance.
@@ -148,6 +151,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             surface,
             model,
             permission_mode,
+            reasoning_effort,
             prompt,
             idempotency_key,
         } => {
@@ -171,6 +175,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     },
                     model,
                     permission_mode,
+                    reasoning_effort,
                 }),
                 prompt,
                 idempotency_key,
@@ -286,6 +291,7 @@ mod tests {
                 surface: Surface::Chat,
                 model: None,
                 permission_mode: None,
+                reasoning_effort: None,
             },
             session: None,
             console: None,

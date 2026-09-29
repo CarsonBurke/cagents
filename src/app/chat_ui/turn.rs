@@ -24,7 +24,7 @@ use std::collections::HashSet;
 /// `Step` is what the agent did, `Thinking` is it reasoning about what to do,
 /// `Commentary` is it narrating while it worked, and `Prose` is what the user
 /// asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Slot {
     /// A command, tool call, file change, or search.
     Step,

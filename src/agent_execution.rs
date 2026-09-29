@@ -101,6 +101,11 @@ pub struct Spec {
     pub surface: Surface,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    /// The provider's own effort name, such as `low` or `xhigh`, applied
+    /// through its launch policy before the first prompt. Absent in
+    /// definitions saved before it existed, which keep the provider default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +153,25 @@ impl Submit {
                     return Err(format!("Invalid {name}"));
                 }
             }
+            if let Some(effort) = &spec.reasoning_effort
+                && !valid_reasoning_effort(effort)
+            {
+                return Err(format!("Invalid reasoning effort {effort:?}"));
+            }
         }
         Ok(())
     }
+}
+
+/// An effort is a provider token that becomes one argument, or a Codex
+/// configuration value, so it is a plain word rather than free text: nothing
+/// that could read as an option or carry quoting into another grammar.
+pub fn valid_reasoning_effort(effort: &str) -> bool {
+    (1..=64).contains(&effort.len())
+        && effort.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && effort
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,5 +422,68 @@ mod tests {
         assert!(result.text.len() <= MAX_RESULT_BYTES);
         assert!(result.text.ends_with('€'));
         assert_eq!(result.diagnostic.unwrap().len(), MAX_DIAGNOSTIC_BYTES);
+    }
+
+    fn spec() -> Spec {
+        Spec {
+            provider: Provider::Codex,
+            account: None,
+            target: Target {
+                repository: "/repo".into(),
+                directory: "/repo".into(),
+                channel: None,
+            },
+            surface: Surface::Chat,
+            model: Some("gpt-test".into()),
+            permission_mode: None,
+            reasoning_effort: Some("low".into()),
+        }
+    }
+
+    #[test]
+    fn specs_saved_before_reasoning_effort_keep_the_provider_default() {
+        let saved = serde_json::json!({
+            "provider": "Codex",
+            "account": null,
+            "target": {"repository": "/repo", "directory": "/repo", "channel": null},
+            "surface": "Chat",
+            "model": "gpt-test",
+            "permission_mode": null,
+        });
+        let saved: Spec = serde_json::from_value(saved).unwrap();
+        assert_eq!(saved.reasoning_effort, None);
+        let current = spec();
+        let roundtrip: Spec =
+            serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!(roundtrip, current);
+        let wire: Spec = postcard::from_bytes(&postcard::to_allocvec(&current).unwrap()).unwrap();
+        assert_eq!(wire, current);
+    }
+
+    #[test]
+    fn reasoning_effort_is_a_single_provider_word() {
+        let submit = |effort: &str| Submit {
+            destination: Destination::New(Spec {
+                reasoning_effort: Some(effort.into()),
+                ..spec()
+            }),
+            prompt: "work".into(),
+            idempotency_key: "key".into(),
+        };
+        for effort in ["low", "xhigh", "future-effort", "max_2"] {
+            assert_eq!(submit(effort).validate(), Ok(()), "{effort}");
+        }
+        for effort in [
+            "",
+            "-low",
+            "--dangerously-skip-permissions",
+            "low high",
+            "\"low\"",
+            "a=b",
+            "\u{e9}",
+        ] {
+            assert!(submit(effort).validate().is_err(), "{effort:?}");
+        }
+        assert!(submit(&"x".repeat(65)).validate().is_err());
     }
 }

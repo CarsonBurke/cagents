@@ -502,7 +502,6 @@ pub struct InspectorModel {
     pub card_id: CardId,
     pub title: String,
     pub kind: &'static str,
-    pub icon: &'static str,
     pub sections: Vec<Section>,
     pub actions: Vec<Action>,
 }
@@ -513,15 +512,15 @@ pub fn model_for_card(
     projects: &[SidebarProject],
     repository_runtime: Option<&RepositoryInspectorContext>,
 ) -> InspectorModel {
-    let (kind, icon) = match &card.kind {
-        CardKind::Terminal(_) => ("Terminal", "utilities-terminal-symbolic"),
-        CardKind::Chat(_) => ("Chat", "chat-bubble-text-symbolic"),
-        CardKind::Browser(_) => ("Browser", "internet-web-browser-symbolic"),
-        CardKind::PullRequests(_) => ("Pull requests", "vcs-merge-request-symbolic"),
-        CardKind::Repository(_) => ("Repository", "folder-symbolic"),
-        CardKind::Settings => ("Settings", "emblem-system-symbolic"),
-        CardKind::Accounts => ("Accounts", "avatar-default-symbolic"),
-        CardKind::Automations => ("Automations", "alarm-symbolic"),
+    let kind = match &card.kind {
+        CardKind::Terminal(_) => "Terminal",
+        CardKind::Chat(_) => "Chat",
+        CardKind::Browser(_) => "Browser",
+        CardKind::PullRequests(_) => "Pull requests",
+        CardKind::Repository(_) => "Repository",
+        CardKind::Settings => "Settings",
+        CardKind::Accounts => "Accounts",
+        CardKind::Automations => "Automations",
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
@@ -720,20 +719,20 @@ pub fn model_for_card(
                 if source.surface == "Editor" && source.can_show_diff {
                     actions.push(Action::new(
                         "Show diff",
-                        "text-x-generic-symbolic",
+                        "vcs-diff-symbolic",
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
                 } else if source.surface == "Diff" && !source.saving {
                     actions.push(Action::new(
                         "Show editor",
-                        "document-edit-symbolic",
+                        "text-editor-symbolic",
                         InspectorAction::ShowRepositoryEditor(card.id),
                     ));
                 }
                 match source.markdown_mode {
                     Some("Edit") if !source.saving => actions.push(Action::new(
                         "Preview Markdown",
-                        "document-preview-symbolic",
+                        "view-reveal-symbolic",
                         InspectorAction::ShowMarkdownPreview(card.id),
                     )),
                     Some("Preview") if !source.saving => actions.push(Action::new(
@@ -744,33 +743,38 @@ pub fn model_for_card(
                     _ => {}
                 }
                 if source.surface == "Diff" {
+                    // Each action wears the glyph of the toolbar control that
+                    // selects the same basis or layout.
                     let opposite_basis = match source.diff_basis {
                         Some("Staged") if source.can_select_unstaged_diff => Some((
                             "Show unstaged diff",
+                            "document-edit-symbolic",
                             InspectorAction::ShowUnstagedDiff(card.id),
                         )),
-                        Some("Unstaged") if source.can_select_staged_diff => {
-                            Some(("Show staged diff", InspectorAction::ShowStagedDiff(card.id)))
-                        }
+                        Some("Unstaged") if source.can_select_staged_diff => Some((
+                            "Show staged diff",
+                            "object-select-symbolic",
+                            InspectorAction::ShowStagedDiff(card.id),
+                        )),
                         _ => None,
                     };
-                    if let Some((label, message)) = opposite_basis {
-                        actions.push(Action::new(label, "vcs-diff-symbolic", message));
+                    if let Some((label, icon, message)) = opposite_basis {
+                        actions.push(Action::new(label, icon, message));
                     }
                     if source.can_change_diff_layout {
-                        actions.push(Action::new(
-                            if source.diff_mode == Some("Split") {
-                                "Show inline diff"
-                            } else {
-                                "Show split diff"
-                            },
-                            "view-split-left-right-symbolic",
-                            if source.diff_mode == Some("Split") {
-                                InspectorAction::ShowInlineDiff(card.id)
-                            } else {
-                                InspectorAction::ShowSplitDiff(card.id)
-                            },
-                        ));
+                        actions.push(if source.diff_mode == Some("Split") {
+                            Action::new(
+                                "Show inline diff",
+                                "view-list-symbolic",
+                                InspectorAction::ShowInlineDiff(card.id),
+                            )
+                        } else {
+                            Action::new(
+                                "Show split diff",
+                                "vcs-diff-symbolic",
+                                InspectorAction::ShowSplitDiff(card.id),
+                            )
+                        });
                     }
                     if source.can_change_diff_layout && source.diff_change.is_some() {
                         actions.push(Action::new(
@@ -829,7 +833,7 @@ pub fn model_for_card(
             if let Some(project) = projects.iter().find(|project| project.id == view.project) {
                 actions.push(Action::new(
                     "Create PR",
-                    "vcs-merge-request-symbolic",
+                    "pull-request-symbolic",
                     InspectorAction::CreatePullRequest {
                         project_id: project.id,
                         worktree: view.worktree.clone(),
@@ -899,7 +903,6 @@ pub fn model_for_card(
         card_id: card.id,
         title: card.title.clone(),
         kind,
-        icon,
         sections,
         actions,
     }
@@ -1526,7 +1529,7 @@ impl SegmentedActions {
                 // buttons by id, and their accessible names come from their
                 // labels, so the identity buys nothing and costs a crash.
                 widget::button::standard(action.label)
-                    .leading_icon(widget::icon::from_name(action.icon).size(16))
+                    .leading_icon(crate::ui_controls::symbolic_icon(action.icon))
                     .class(crate::sidebar::sidebar_button_style(false))
                     .width(Length::Fill)
                     .on_press(action.message)
@@ -1826,14 +1829,16 @@ fn markdown_text(
     rich.into()
 }
 
+/// `icon` is the card's tab mark, so the heading names the pane as its tab does.
 pub fn view(
     model: InspectorModel,
+    icon: widget::icon::Handle,
     width: f32,
     diagnostics_open: bool,
 ) -> Element<'static, InspectorAction> {
     let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
-        widget::icon::from_name(model.icon).size(16).into(),
+        widget::icon(icon).size(16).into(),
         widget::column::with_children(vec![
             design::heading(model.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -1887,14 +1892,11 @@ pub fn view(
         sections.push(crate::design::horizontal_rule().into());
         sections.push(
             widget::button::text("Pane diagnostics")
-                .leading_icon(
-                    widget::icon::from_name(if diagnostics_open {
-                        "pan-down-symbolic"
-                    } else {
-                        "pan-end-symbolic"
-                    })
-                    .size(16),
-                )
+                .leading_icon(crate::ui_controls::symbolic_icon(if diagnostics_open {
+                    "pan-down-symbolic"
+                } else {
+                    "pan-end-symbolic"
+                }))
                 .on_press(InspectorAction::ToggleDiagnostics(model.card_id))
                 .width(Length::Fill)
                 .into(),
