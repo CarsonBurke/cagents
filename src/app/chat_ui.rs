@@ -1164,6 +1164,7 @@ pub(super) struct Runtime {
     history_stash: String,
     /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
+    unseen_activity: bool,
     /// The loaded transcript's height when a page of history was last asked
     /// for from that end, and `None` while the reader is not at that end.
     ///
@@ -1437,6 +1438,7 @@ impl Runtime {
             history_cursor: None,
             history_stash: String::new(),
             scroll: view::Scroll::default(),
+            unseen_activity: false,
             earlier_asked: None,
             later_asked: None,
             model_picker: None,
@@ -1544,6 +1546,15 @@ impl Runtime {
                 self.snapshot.permission_mode.clone().or_else(|| {
                     draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
                 });
+        }
+        if !self.scroll.at_bottom()
+            && snapshot.items.last().is_some_and(|item| {
+                self.cache
+                    .get(&item.id)
+                    .is_none_or(|cached| cached.token != ChangeToken::of(&item.content))
+            })
+        {
+            self.unseen_activity = true;
         }
         // Restored and paged conversations carry their own prompt history.
         // Preserve a recalled index while the reader is walking it.
@@ -5415,6 +5426,9 @@ impl Cagents {
                 }
             }
             Action::Latest(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.unseen_activity = false;
+                }
                 return iced::widget::scrollable::snap_to(
                     card_control_id(target.card, "chat-transcript"),
                     iced::widget::scrollable::RelativeOffset {
@@ -5930,6 +5944,9 @@ impl Cagents {
                 }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
+                if at_bottom {
+                    runtime.unseen_activity = false;
+                }
                 // Leaving an end is what arms the page at it, so a reader who
                 // scrolls away and comes back asks again, while one who stays
                 // put asks once.

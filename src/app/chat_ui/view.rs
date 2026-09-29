@@ -968,10 +968,17 @@ impl Runtime {
         ));
         if !self.scroll.at_bottom() {
             content.push(
-                widget::button::custom(design::caption("↓ Jump to latest"))
-                    .class(crate::ui_controls::control_style(false, None))
-                    .on_press(action(Action::Latest(target)))
-                    .into(),
+                widget::button::custom(design::caption(if self.unseen_activity {
+                    "↓ New activity"
+                } else {
+                    "↓ Jump to latest"
+                }))
+                .class(crate::ui_controls::control_style(
+                    self.unseen_activity,
+                    None,
+                ))
+                .on_press(action(Action::Latest(target)))
+                .into(),
             );
         }
         if let Some((text, _)) = &self.followup {
@@ -2564,12 +2571,24 @@ impl Runtime {
                         )
                     });
             let expanded = !finished || self.expanded.contains(&item.id);
+            let elapsed = item.at.and_then(|start| {
+                self.snapshot
+                    .items
+                    .iter()
+                    .skip_while(|candidate| candidate.id != item.id)
+                    .skip(1)
+                    .find_map(|candidate| candidate.at)
+                    .map(|end| format_duration(end.saturating_sub(start)))
+            });
+            let label = elapsed.filter(|_| finished).map_or_else(
+                || "Thought process".to_owned(),
+                |elapsed| format!("Thought for {elapsed}"),
+            );
             let mut rows = vec![
-                widget::button::custom(design::caption(if expanded {
-                    "▾ Thought process"
-                } else {
-                    "▸ Thought process"
-                }))
+                widget::button::custom(design::caption(format!(
+                    "{} {label}",
+                    if expanded { "▾" } else { "▸" }
+                )))
                 .class(crate::ui_controls::control_style(false, None))
                 .on_press(action(Action::Toggle(target, item.id.clone())))
                 .into(),
@@ -2579,11 +2598,17 @@ impl Runtime {
             }
             return widget::container(
                 widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
-                    .class(design::surface(
-                        Some(design::sunken),
-                        [design::RADIUS_S; 4],
-                        false,
-                    ))
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        widget::container::Style {
+                            background: Some(design::sunken(theme).into()),
+                            text_color: Some(design::muted_color(theme)),
+                            border: iced::Border {
+                                radius: design::RADIUS_S.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }))
                     .padding([step::GAP_S as u16, step::GAP_M as u16])
                     .max_width(design::READABLE_MEASURE),
             )
