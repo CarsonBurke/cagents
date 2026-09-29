@@ -391,15 +391,15 @@ impl Draft {
             },
         };
         pattern.expression()?;
-        let timezone = self.timezone.trim();
-        if !timezone_names().iter().any(|name| name == timezone) {
-            return Err(format!(
-                "Choose a timezone from the list; {timezone:?} is not one"
-            ));
-        }
+        let typed = self.timezone.trim();
+        // The daemon resolves the zone the same way, ignoring case; the saved
+        // name is the database's own spelling of it.
+        let zone = jiff::tz::db()
+            .get(typed)
+            .map_err(|_| format!("Choose a timezone from the list; {typed:?} is not one"))?;
         Ok(Schedule {
             pattern,
-            timezone: timezone.into(),
+            timezone: zone.iana_name().unwrap_or(typed).into(),
         })
     }
 
@@ -1276,7 +1276,7 @@ impl Draft {
         ])
         .spacing(4);
         let query = self.timezone.trim();
-        if !timezone_names().iter().any(|name| name == query) {
+        if jiff::tz::db().get(query).is_err() {
             let matches = timezone_matches(query, 6);
             if matches.is_empty() {
                 column = column.push(widget::text::caption(if query.is_empty() {
@@ -2034,7 +2034,7 @@ mod tests {
         let draft = state.draft.as_ref().unwrap();
         let error = draft.definition(&state.models).unwrap_err();
         assert!(error.contains("\"Vancouver\""), "{error}");
-        state.update(Action::Field(Field::Timezone, "America/Vancouver".into()));
+        state.update(Action::Field(Field::Timezone, "america/vancouver".into()));
         let saved = state
             .draft
             .as_ref()
