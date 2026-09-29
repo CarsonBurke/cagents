@@ -20,8 +20,10 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
-const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
+pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
+/// The longest terminal font family name, in bytes.
+pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SIDEBAR_WIDTH_MIN: f32 = 180.0;
@@ -285,7 +287,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 16] {
+    pub fn actions(&self) -> [&Vec<String>; 16] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -313,7 +315,7 @@ impl KeyboardShortcuts {
     /// The first action this table cannot bind, and why: by index into
     /// `actions()`, and for a conflict, the earlier action whose chord it
     /// repeats.
-    fn fault(&self) -> Option<ShortcutFault> {
+    pub fn fault(&self) -> Option<ShortcutFault> {
         let mut parsed: Vec<(ShortcutBinding, usize)> = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
             let fault = |error, conflicts_with| {
@@ -368,10 +370,10 @@ const SHORTCUT_ACTIONS: [&str; 16] = [
 
 /// An action a shortcut table cannot bind.
 #[derive(Debug)]
-struct ShortcutFault {
-    action: usize,
-    conflicts_with: Option<usize>,
-    error: SettingsError,
+pub struct ShortcutFault {
+    pub action: usize,
+    pub conflicts_with: Option<usize>,
+    pub error: SettingsError,
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -1403,7 +1405,7 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
-        if self.terminal_font_family.len() > 128 {
+        if self.terminal_font_family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES {
             return Err(SettingsError::Invalid(
                 "terminal_font_family must not exceed 128 bytes",
             ));
