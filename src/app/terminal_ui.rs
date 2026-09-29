@@ -49,6 +49,7 @@ pub(super) struct Find {
     truncated: bool,
     pub focused: bool,
     pub select_all_request: u64,
+    pub selection_reset: u64,
     pub pending_copy: Option<uuid::Uuid>,
 }
 
@@ -168,6 +169,7 @@ impl Cagents {
                 self.terminal_context = None;
                 let _ = handle.clear_scrollback();
                 // History rows are rebased by clearing scrollback.
+                find.selection_reset = find.selection_reset.wrapping_add(1);
                 find.request = find.request.wrapping_add(1);
                 find.matches = Arc::default();
                 find.selected = 0;
@@ -222,9 +224,8 @@ impl Cagents {
     }
 
     pub(super) fn refresh_completed_terminal_find(&mut self, card: CardId) {
-        let Some(find) = self.terminal_find.get_mut(&card) else {
-            return;
-        };
+        let find = self.terminal_find.entry(card).or_default();
+        find.selection_reset = find.selection_reset.wrapping_add(1);
         find.request = find.request.wrapping_add(1);
         find.matches = Arc::default();
         find.selected = 0;

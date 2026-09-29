@@ -976,6 +976,7 @@ struct WidgetState {
     completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
     select_all_request: u64,
+    selection_reset: u64,
     pty_size: PtySize,
     input_focused: bool,
     focused: bool,
@@ -1505,6 +1506,7 @@ pub struct TerminalWidget<Message> {
     working_directory: std::path::PathBuf,
     find_matches: Option<(Arc<[super::SearchMatch]>, usize)>,
     select_all_request: u64,
+    selection_reset: u64,
     _message: PhantomData<fn() -> Message>,
 }
 
@@ -1547,6 +1549,7 @@ impl<Message> TerminalWidget<Message> {
             working_directory: std::path::PathBuf::from("/"),
             find_matches: None,
             select_all_request: 0,
+            selection_reset: 0,
             _message: PhantomData,
         }
     }
@@ -1554,6 +1557,10 @@ impl<Message> TerminalWidget<Message> {
     /// Names the input surface for focus handoffs from tabs and other panes.
     pub fn find_matches(mut self, matches: Option<(Arc<[super::SearchMatch]>, usize)>) -> Self {
         self.find_matches = matches;
+        self
+    }
+    pub fn selection_reset(mut self, generation: u64) -> Self {
+        self.selection_reset = generation;
         self
     }
     pub fn select_all_request(mut self, request: u64) -> Self {
@@ -2015,11 +2022,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let state = tree.state.downcast_mut::<WidgetState>();
         if self.snapshot.scroll.total < state.history_total
             || (self.read_only && !state.completed_read_only)
+            || self.selection_reset != state.selection_reset
         {
             state.selection = None;
             state.selecting = false;
             state.selection_click = None;
         }
+        state.selection_reset = self.selection_reset;
         state.history_total = self.snapshot.scroll.total;
         state.completed_read_only = self.read_only;
         self.synchronize_size(state, geometry, shell);
