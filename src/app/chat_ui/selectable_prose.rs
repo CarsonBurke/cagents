@@ -10,14 +10,41 @@ use iced::{Event, Point, Rectangle, Size};
 
 type ParagraphBuffer = <cosmic::Renderer as TextRenderer>::Paragraph;
 
-#[derive(Default)]
+static NEXT_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct State {
+    identity: u64,
     spans: Option<Arc<[Span<'static, String>]>>,
     paragraph: ParagraphBuffer,
     anchor: usize,
     end: usize,
     dragging: bool,
     focused: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
+            spans: None,
+            paragraph: ParagraphBuffer::default(),
+            anchor: 0,
+            end: 0,
+            dragging: false,
+            focused: false,
+        }
+    }
+}
+
+impl State {
+    fn validate_selection(&mut self, plain: &str) {
+        if !plain.is_char_boundary(self.anchor) || !plain.is_char_boundary(self.end) {
+            self.anchor = 0;
+            self.end = 0;
+            self.dragging = false;
+        }
+    }
 }
 
 pub(super) fn text(
@@ -111,11 +138,29 @@ impl Selectable {
     }
 
     fn hit(&self, state: &State, position: Point) -> usize {
-        state
-            .paragraph
-            .hit_test(position)
-            .map_or(self.plain.len(), |hit| hit.cursor())
-            .min(self.plain.len())
+        if position.y < 0.0 {
+            return 0;
+        }
+        if position.y >= state.paragraph.min_bounds().height {
+            return self.plain.len();
+        }
+        let buffer = state.paragraph.buffer();
+        let Some(cursor) = buffer.hit(position.x, position.y) else {
+            return if position.x <= 0.0 {
+                0
+            } else {
+                self.plain.len()
+            };
+        };
+        // Iced's paragraph Hit omits the line number. Code blocks and hard
+        // breaks need the cursor's full byte offset in the original source.
+        let prefix: usize = buffer
+            .lines
+            .iter()
+            .take(cursor.line)
+            .map(|line| line.text().len() + line.ending().as_str().len())
+            .sum();
+        (prefix + cursor.index).min(self.plain.len())
     }
 }
 
@@ -141,10 +186,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
         // Selection bytes cannot outlive a streamed paragraph's replacement.
-        if !self.plain.is_char_boundary(state.anchor) || !self.plain.is_char_boundary(state.end) {
-            state.anchor = 0;
-            state.end = 0;
-        }
+        state.validate_selection(&self.plain);
         let description = iced::advanced::Text {
             content: self.spans.as_ref(),
             bounds: limits.max(),
@@ -216,11 +258,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        state.validate_selection(&self.plain);
         let position = cursor.position_in(layout.bounds());
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 state.focused = position.is_some() && cursor.is_over(*viewport);
                 if state.focused {
+                    ACTIVE_SELECTION.store(state.identity, Ordering::Relaxed);
                     state.anchor = self.hit(state, position.unwrap());
                     state.end = state.anchor;
                     state.dragging = true;
@@ -254,7 +298,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 key: keyboard::Key::Character(key),
                 modifiers,
                 ..
-            }) if state.focused && modifiers.command() => {
+            }) if state.focused
+                && ACTIVE_SELECTION.load(Ordering::Relaxed) == state.identity
+                && modifiers.command() =>
+            {
                 if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
                     clipboard.write(
                         iced::advanced::clipboard::Kind::Standard,
@@ -303,6 +350,65 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shaped_hit_testing_keeps_multiline_offsets_and_outside_drag_direction() {
+        let spans: Arc<[Span<'static, String>]> = vec![Span::new("α first\nβ second")].into();
+        let selectable = Selectable {
+            plain: "α first\nβ second".into(),
+            spans: spans.clone(),
+            matches: vec![],
+            size: design::TEXT_PROSE.into(),
+            font: iced::Font::default(),
+            target: Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            child: widget::text("").into(),
+        };
+        let state = State {
+            paragraph: ParagraphBuffer::with_spans(iced::advanced::Text {
+                content: spans.as_ref(),
+                bounds: Size::new(300.0, 200.0),
+                size: selectable.size,
+                line_height: Default::default(),
+                font: selectable.font,
+                align_x: Default::default(),
+                align_y: iced::alignment::Vertical::Top,
+                shaping: iced::widget::text::Shaping::Advanced,
+                wrapping: Wrapping::default(),
+                ellipsize: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let second = state
+            .paragraph
+            .buffer()
+            .layout_runs()
+            .find(|run| run.line_i == 1)
+            .unwrap();
+        assert_eq!(
+            selectable.hit(&state, Point::new(-20.0, second.line_top + 2.0)),
+            "α first\n".len()
+        );
+        assert_eq!(selectable.hit(&state, Point::new(80.0, -20.0)), 0);
+        assert_eq!(
+            selectable.hit(&state, Point::new(0.0, 400.0)),
+            selectable.plain.len()
+        );
+    }
+
+    #[test]
+    fn a_streamed_shrink_invalidates_selection_before_keyboard_copy() {
+        let mut state = State {
+            anchor: 3,
+            end: 40,
+            dragging: true,
+            ..Default::default()
+        };
+        state.validate_selection("new");
+        assert_eq!((state.anchor, state.end, state.dragging), (0, 0, false));
+    }
 
     #[test]
     fn selection_preserves_links_fonts_and_unicode_across_span_boundaries() {
