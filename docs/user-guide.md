@@ -32,15 +32,15 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   selected worktree or channel. Some settings and shortcut labels call a pane
   in the strip a **column**, and a few messages call it a **card**; all three
   mean the same thing.
-- **New terminal** (`Ctrl+T`) starts in the selected worktree and opens directly
+- **New terminal** (`Ctrl+Shift+T`) starts in the selected worktree and opens directly
   to the right of the focused pane. The **New tab** menu offers **New
   thread**, **Terminal**, and **Browser** with keyboard navigation; New thread
   opens the model selector.
-- **Clone focused pane** (`Alt+E`) opens another pane of the same kind:
+- **Clone focused pane** (`Ctrl+Shift+D`) opens another pane of the same kind:
   terminals launch a separate process, native chats start a separate
   conversation, and browser and repository panes open at the same location.
   Clones never share the original process or conversation.
-- **New channel** (`Alt+G`, or the channel-plus button on a project header)
+- **New channel** (`Ctrl+Shift+G`, or the channel-plus button on a project header)
   starts an independent native conversation in the project's main worktree.
   Channels have their own sidebar rows and panes. A channel holds the chats
   opened while it was selected, and its row shows how many when there is more
@@ -69,13 +69,13 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 
 | Action | Default |
 | --- | --- |
-| New terminal | `Ctrl+T` |
-| New channel | `Alt+G` |
-| Clone focused pane | `Alt+E` |
-| Close focused column | `Ctrl+W` |
-| Search projects | `Ctrl+F` |
-| Previous / next column | `Alt+Q` / `Alt+W`, or `Alt+Left` / `Alt+Right` |
-| Cycle pane width | `Alt+R` |
+| New terminal | `Ctrl+Shift+T` |
+| New channel | `Ctrl+Shift+G` |
+| Clone focused pane | `Ctrl+Shift+D` |
+| Close focused column | `Ctrl+Shift+W` |
+| Search projects | `Ctrl+F` (outside terminals) |
+| Previous / next column | `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Cycle pane width | `Ctrl+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
@@ -85,9 +85,22 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 Every shortcut is configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
 
+- The defaults leave the keys shells, editors, and agent CLIs use to the
+  focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
+  deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
+  bind is withheld from the terminal, except **Search projects**, which a
+  focused terminal receives as input (in an editor it finds in the file), and
+  the review chords, which act only in a pull request pane. As in those
+  terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
+  longer reach terminal programs such as Vim.
+- Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
+  `Alt+Left`/`Alt+Right`, `Alt+E`, `Alt+G`, and `Alt+R`. Shortcuts still on
+  those defaults move to the new ones; any shortcut you changed is kept. See
+  [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
+
 - Hold the column shortcuts to move repeatedly. Navigation scrolls only far
   enough to reveal the target pane.
-- **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
+- **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
@@ -270,9 +283,13 @@ showing that session. Closing a window leaves its processes running.
 ## Scheduled automations
 
 Open **Automations** from the clock button in the sidebar footer. Choose an open
-project or worktree, provider, account, prompt, model, and permission mode. Pick
-an hourly, daily, weekday, weekly, or five-field cron schedule with an explicit
-IANA timezone. New definitions are paused. **Enable…** and **Run now…** show the
+project or worktree, provider, account, prompt, model, and permission mode. The
+account starts as the one a new conversation in that directory would use, and
+follows the provider and directory until you pick another. Pick an hourly,
+daily, weekday, weekly, or five-field cron schedule with an explicit IANA
+timezone: it starts as the system's, and typing a city or region searches the
+known zones. The editor shows when the schedule as entered runs next, in its
+timezone and, if that differs, in yours. New definitions are paused. **Enable…** and **Run now…** show the
 exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
@@ -337,7 +354,8 @@ this shape (the repository must already be open):
     },
     "surface": "Chat",
     "model": null,
-    "permission_mode": null
+    "permission_mode": null,
+    "reasoning_effort": null
   },
   "schedule": {
     "pattern": { "daily": { "hour": 9, "minute": 0 } },
@@ -347,6 +365,11 @@ this shape (the repository must already be open):
   "precheck": null
 }
 ```
+
+`reasoning_effort` is optional: omit it, or use `null`, for the provider's
+default, or name a level the model offers, such as `"low"`. In the editor, the
+**Reasoning effort** picker lists the levels the chosen model advertises, as the
+chat composer does.
 
 An omitted account selection resolves once when the definition is saved and is
 then pinned in the saved definition. Review that account before enabling. Agent
@@ -455,6 +478,23 @@ checks supported process tokens before persistent credentials; its
 selects process authentication using the federation markers. `OPENAI_API_KEY`
 is also removed for provider/version compatibility.
 
+**System default** is the home the provider CLI uses outside cagents:
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
+`~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
+Every cagents terminal and conversation exports its account's home, and one on
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
+cagents window, daemon, or `cagents` command started from one - by you or by an
+agent - ignores a variable that still holds the listed home, or any path inside
+a cagents `accounts/<provider>/<id>` directory, when deciding the system
+default. A daemon started before this protection keeps its environment until it
+restarts.
+
+The Accounts pane flags a row whose home is not a login of its own: **Login
+changed** when a managed or linked home reports a different login than the one
+it was added with (the recorded login is kept; sign that account in again to
+accept the new one, or remove it), and **Same home** or **Same login** when two
+rows are the same directory or signed in to the same login.
+
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies
 remain user-controlled. This policy does not rewrite those settings or an
@@ -538,8 +578,8 @@ the source for resumed history.
   browserless builds. The selected file is restored with the workspace.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
-  focused; Cancel or Escape keeps the pane. The close button and `Ctrl+W`
-  follow the same rule. The decision uses the process tree, not prompt
+  focused; Cancel or Escape keeps the pane. The close button and
+  `Ctrl+Shift+W` follow the same rule. The decision uses the process tree, not prompt
   instrumentation, so a shell builtin with no child process closes without
   asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.

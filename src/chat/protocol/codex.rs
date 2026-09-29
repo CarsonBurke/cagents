@@ -14,6 +14,12 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// The Codex configuration key for a thread's reasoning effort. A launch
+/// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
+/// Codex CLI takes it, and a new thread receives it as a `thread/start`
+/// configuration override.
+pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.
 fn skill_source<'a>(path: &str, others: impl Iterator<Item = &'a str>) -> String {
@@ -190,6 +196,29 @@ fn create_inner(
                     start[key] = json!(value);
                 }
             }
+            "--config" | "-c" if launch.session_id.is_none() => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                // Only an override with a typed `thread/start` equivalent is
+                // translated; any other key would silently change meaning.
+                let effort = value
+                    .strip_prefix(REASONING_EFFORT_KEY)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .map(|effort| {
+                        effort
+                            .strip_prefix('"')
+                            .and_then(|effort| effort.strip_suffix('"'))
+                            .unwrap_or(effort)
+                    })
+                    .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
+                    .ok_or_else(|| {
+                        format!(
+                            "Codex launch option {arg} {value:?} cannot safely be translated to native app-server mode"
+                        )
+                    })?;
+                start["config"][REASONING_EFFORT_KEY] = json!(effort);
+            }
             "--profile" | "-p" | "--config" | "-c" | "--add-dir" | "--remote-auth-token-env"
                 if launch.session_id.is_some() =>
             {
@@ -361,6 +390,15 @@ enum Pending {
     /// wire announces that the figures a reader was looking at have moved.
     Compact,
     Other,
+}
+
+fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
+    match (approval.as_str(), sandbox["type"].as_str()) {
+        (Some("never"), Some("dangerFullAccess")) => Some("yolo"),
+        (Some("on-request"), Some("workspaceWrite")) => Some("workspaceWrite"),
+        (Some("on-request"), Some("readOnly")) => Some("readOnly"),
+        _ => None,
+    }
 }
 struct PendingRequest {
     frame: Value,
@@ -543,7 +581,11 @@ impl Codex {
             model_selection: self.direct_input && !self.models.is_empty(),
             reasoning_selection: self.direct_input
                 && model.is_some_and(|m| !m.reasoning.is_empty()),
-            permission_modes: Vec::new(),
+            permission_modes: if self.direct_input {
+                vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()]
+            } else {
+                Vec::new()
+            },
             skill_reach: SkillReach::Anywhere,
         }
     }
@@ -1040,7 +1082,22 @@ impl Adapter for Codex {
                 self.model_events(&mut step);
                 step.events.push(Event::Status { busy: self.busy, detail: "Model/reasoning selection will apply to your next new turn, not the running turn".into() });
             }
-            Command::SetPermissionMode { .. } => return Err("Codex permission profiles cannot safely be represented by this control; existing permissions are preserved and individual approvals remain explicit".into()),
+            Command::SetPermissionMode { mode } => {
+                if !self.direct_input || self.busy {
+                    return Err("Codex permissions can be changed only on an idle, writable thread".into());
+                }
+                let (approval, sandbox) = match mode.as_str() {
+                    "yolo" => ("never", "dangerFullAccess"),
+                    "workspaceWrite" => ("on-request", "workspaceWrite"),
+                    "readOnly" => ("on-request", "readOnly"),
+                    _ => return Err("Unsupported Codex permission mode".into()),
+                };
+                self.call(&mut step, "thread/settings/update", json!({
+                    "threadId": self.thread,
+                    "approvalPolicy": approval,
+                    "sandboxPolicy": {"type": sandbox},
+                }), Pending::Other)?;
+            }
             Command::Compact => {
                 if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
@@ -1176,6 +1233,10 @@ impl Adapter for Codex {
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
+                    step.events.push(Event::PermissionMode(
+                        permission_mode(&result["approvalPolicy"], &result["sandbox"])
+                            .map(str::to_owned),
+                    ));
                     step.events
                         .push(Event::Waiting(waiting_on_user(&thread["status"])));
                     step.events.push(Event::Session {
@@ -1452,6 +1513,12 @@ impl Adapter for Codex {
                 title: params["threadName"].as_str().map(str::to_owned),
             }),
             "thread/settings/updated" => {
+                let mode = permission_mode(
+                    &params["threadSettings"]["approvalPolicy"],
+                    &params["threadSettings"]["sandboxPolicy"],
+                );
+                step.events
+                    .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
                     self.selected = params["threadSettings"]["model"]
                         .as_str()
@@ -2534,6 +2601,60 @@ mod tests {
     }
 
     #[test]
+    fn permission_picker_updates_both_codex_policies() {
+        let mut adapter = adapter();
+        assert_eq!(
+            adapter.capabilities().permission_modes,
+            ["readOnly", "workspaceWrite", "yolo"]
+        );
+        for (mode, approval, sandbox) in [
+            ("yolo", "never", "dangerFullAccess"),
+            ("workspaceWrite", "on-request", "workspaceWrite"),
+            ("readOnly", "on-request", "readOnly"),
+        ] {
+            let step = adapter
+                .command(Command::SetPermissionMode { mode: mode.into() })
+                .unwrap();
+            assert_eq!(step.writes[0]["method"], "thread/settings/update");
+            assert_eq!(step.writes[0]["params"]["approvalPolicy"], approval);
+            assert_eq!(step.writes[0]["params"]["sandboxPolicy"]["type"], sandbox);
+            let acknowledged = adapter
+                .receive(json!({"id":step.writes[0]["id"], "result":{}}))
+                .unwrap();
+            assert!(
+                !acknowledged
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::PermissionMode(_)))
+            );
+            let confirmed = adapter
+                .receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact",
+                    "threadSettings": {"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
+                }}))
+                .unwrap();
+            assert!(
+                confirmed
+                    .events
+                    .contains(&Event::PermissionMode(Some(mode.into())))
+            );
+        }
+        let custom = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact",
+            "threadSettings": {"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
+        }})).unwrap();
+        assert!(custom.events.contains(&Event::PermissionMode(None)));
+        adapter.busy = true;
+        assert!(
+            adapter
+                .command(Command::SetPermissionMode {
+                    mode: "yolo".into()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
     fn accepted_run_waits_for_its_exact_turn_even_when_completion_precedes_ack() {
         use crate::agent_execution::ProviderEvent;
         let mut adapter = adapter();
@@ -2718,6 +2839,52 @@ mod tests {
             .unwrap();
         assert_eq!(start["params"]["sandbox"], json!("danger-full-access"));
         assert_eq!(start["params"]["approvalPolicy"], json!("never"));
+    }
+
+    #[test]
+    fn a_new_thread_takes_its_reasoning_effort_as_a_start_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let launch = |arguments: &[&str]| Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "codex".into(),
+                arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.path().to_str().unwrap().into(),
+                )]),
+            },
+        };
+        for (arguments, effort) in [
+            (&["--config", "model_reasoning_effort=low"][..], "low"),
+            (&["-c", "model_reasoning_effort=\"xhigh\""][..], "xhigh"),
+        ] {
+            let (spec, mut adapter) = create(&launch(arguments)).unwrap();
+            // The override is a thread setting, never a server-wide flag.
+            assert_eq!(spec.arguments, vec!["app-server"]);
+            let initialize = adapter.initialize().unwrap();
+            let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
+            let start = step
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/start")
+                .unwrap();
+            assert_eq!(
+                start["params"]["config"],
+                json!({REASONING_EFFORT_KEY: effort})
+            );
+        }
+        for arguments in [
+            &["--config", "model=\"other\""][..],
+            &["-c", "model_reasoning_effort=--yolo"][..],
+            &["-c", "model_reasoning_effort_extra=low"][..],
+            &["--config"][..],
+        ] {
+            assert!(create(&launch(arguments)).is_err(), "{arguments:?}");
+        }
     }
 
     /// The completion list is bounded whatever the account's skill tree looks

@@ -836,6 +836,20 @@ fn account_cell<'a>(
             design::Tone::Themed(design::accent_color),
         ));
     }
+    if let Some(conflict) = state.login_conflict(account)
+        && renaming.is_none()
+    {
+        let tone = match conflict {
+            LoginConflict::Changed { .. } => design::destructive_color,
+            LoginConflict::SameHome { .. } | LoginConflict::SameLogin { .. } => {
+                design::warning_color
+            }
+        };
+        title.push(crate::interaction::tooltip(
+            design::badge(conflict.label(), design::Tone::Themed(tone)),
+            conflict.detail(),
+        ));
+    }
     let email = account.email(&state.registry);
     let mut subtitle: Vec<String> = Vec::new();
     if account.account.is_brokered() {

@@ -39,11 +39,21 @@ impl Cagents {
                         directory: directory.to_path_buf(),
                         channel: None,
                     },
+                    defaults: crate::agent::Provider::ALL
+                        .into_iter()
+                        .map(|provider| {
+                            let account = self.default_account_for_directory(provider, directory);
+                            (provider, account.id())
+                        })
+                        .collect(),
                 });
             }
         }
-        self.automation_ui
-            .set_choices(targets, self.automation_account_choices());
+        self.automation_ui.set_choices(
+            targets,
+            self.automation_account_choices(),
+            self.automation_models(),
+        );
     }
 
     pub(super) fn open_automations(&mut self) -> Task<Message> {

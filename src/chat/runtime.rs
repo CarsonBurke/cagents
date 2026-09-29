@@ -725,6 +725,15 @@ impl Handle {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
     }
+    /// What the conversation is doing, read without loading its transcript.
+    pub(crate) fn activity(&self) -> crate::agent::ActivityState {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .activity()
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1858,6 +1867,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.waiting = false;
             state.error = None;
             state.plan.clear();
+            state.permission_mode = None;
         }
         Event::Session { id, title } => {
             state.session_id = Some(id);
@@ -1868,6 +1878,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         // to the surfaces before the store, so it never reaches a snapshot.
         Event::AccountUsage(_) => {}
         Event::Capabilities(value) => state.capabilities = value,
+        Event::PermissionMode(mode) => state.permission_mode = mode,
         Event::Models {
             models,
             selected,

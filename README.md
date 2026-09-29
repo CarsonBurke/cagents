@@ -59,9 +59,9 @@ cagents ui
 ```
 
 Add a repository from the **Projects** pane, select a worktree, and press
-`Ctrl+T` for a terminal. Start your agent there, or use **New tab → New
-thread** for a native chat. Move between panes with `Alt+Q` and `Alt+W`, and
-resize the focused pane with `Alt+R`. The
+`Ctrl+Shift+T` for a terminal. Start your agent there, or use **New tab → New
+thread** for a native chat. Move between panes with `Ctrl+PageUp` and
+`Ctrl+PageDown`, and resize the focused pane with `Ctrl+Shift+R`. The
 [user guide](docs/user-guide.md#navigation) lists every shortcut.
 
 The daemon is scriptable too:

@@ -172,6 +172,7 @@ fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    testing_notification: bool,
 ) -> Vec<Group<'a, Message>> {
     match category {
         SettingsCategory::Notifications => {
@@ -225,7 +226,21 @@ fn settings_category_controls<'a>(
                     )
                 })
                 .collect();
-            controls.push(setting_field("Test notification", "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; test results appear in notices.", widget::button::standard("Send test notification").on_press(Message::NotificationUi(notification_ui::Action::Test)).into()));
+            controls.push(setting_field(
+                "Test notification",
+                "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
+                widget::button::standard(if testing_notification {
+                    "Sending test notification…"
+                } else {
+                    "Send test notification"
+                })
+                .id(widget::Id::new("settings.notifications.test"))
+                .on_press_maybe(
+                    (!testing_notification)
+                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                )
+                .into(),
+            ));
             vec![settings_group(
                 "Agent notifications",
                 "Alerts contain the provider and folder name, never prompts or output.",
@@ -628,7 +643,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, or Down. Every chord must be unique.",
+            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown. Every chord must be unique. Apart from Search projects and the review chords, a bound chord no longer reaches the program in a terminal, so prefer chords a shell leaves alone, such as Ctrl+Shift plus a letter.",
             vec![
                 setting_input(
                     "New terminal",
@@ -650,13 +665,13 @@ fn settings_category_controls<'a>(
                 ),
                 setting_input(
                     "Close focused column",
-                    "Closes the active workspace column.",
+                    "Closes the active workspace column. A terminal running a program asks first while close confirmation is on.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
                 ),
                 setting_input(
                     "Search projects",
-                    "Moves keyboard focus to project search.",
+                    "Moves keyboard focus to project search, or finds in a focused editor. A focused terminal receives this chord instead.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
                 ),
@@ -792,9 +807,18 @@ pub(super) fn settings_pane<'a>(
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
     accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    testing_notification: bool,
 ) -> Element<'a, Message> {
     iced::widget::responsive(move |size| {
-        settings_layout(category, draft, query, feedback, &accounts, size.width)
+        settings_layout(
+            category,
+            draft,
+            query,
+            feedback,
+            &accounts,
+            testing_notification,
+            size.width,
+        )
     })
     .into()
 }
@@ -805,6 +829,7 @@ fn settings_layout<'a>(
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
     accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    testing_notification: bool,
     width: f32,
 ) -> Element<'a, Message> {
     let narrow = width < RAIL_BREAKPOINT;
@@ -911,7 +936,7 @@ fn settings_layout<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft, accounts)
+            settings_category_controls(category, draft, accounts, testing_notification)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );

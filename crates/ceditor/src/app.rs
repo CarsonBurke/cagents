@@ -4584,7 +4584,9 @@ impl Application for Editor {
                 toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             }
             if tab.review.is_open()
-                && let Some(control) = tab.review.file_comment_control(self.modal_open())
+                && let Some(control) = tab
+                    .review
+                    .file_comment_control(self.modal_open(), tab.runtime.can_show_file_discussion())
             {
                 toolbar_controls.push(
                     toolbar_actions(vec![control])
