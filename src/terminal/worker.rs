@@ -2010,13 +2010,7 @@ impl Worker {
                 Effect::Bell => self.emit(TerminalEvent::Bell),
                 Effect::WorkingDirectoryChanged => {
                     let raw = self.terminal.pwd().unwrap_or_default();
-                    let path = url::Url::parse(raw)
-                        .ok()
-                        .and_then(|url| url.to_file_path().ok())
-                        .or_else(|| {
-                            let path = std::path::PathBuf::from(raw);
-                            path.is_absolute().then_some(path)
-                        });
+                    let path = working_directory_path(raw, local_host_name());
                     if let Some(path) = path {
                         self.emit(TerminalEvent::WorkingDirectoryChanged(path));
                     }
@@ -3062,6 +3056,46 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
     }
 }
 
+fn local_host_name() -> Option<&'static str> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let mut buffer = [0u8; 256];
+        // SAFETY: gethostname receives a valid writable buffer and its size.
+        if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+            return None;
+        }
+        // An unterminated truncated hostname must not match a different host.
+        std::ffi::CStr::from_bytes_until_nul(&buffer)
+            .ok()?
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    })
+    .as_deref()
+}
+
+fn working_directory_path(raw: &str, local_host: Option<&str>) -> Option<PathBuf> {
+    if let Ok(uri) = url::Url::parse(raw) {
+        if uri.scheme() != "file" {
+            return None;
+        }
+        if uri
+            .host_str()
+            .zip(local_host)
+            .is_some_and(|(host, local)| host.eq_ignore_ascii_case(local))
+        {
+            return url::Url::parse(&format!("file://{}", uri.path()))
+                .ok()?
+                .to_file_path()
+                .ok();
+        }
+        uri.to_file_path().ok()
+    } else {
+        let path = PathBuf::from(raw);
+        path.is_absolute().then_some(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3077,6 +3111,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn osc7_working_directory_accepts_this_host_and_decodes_its_path() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal.vt_write(b"\x1b]7;file://workstation/tmp/my%20project\x1b\\");
+        assert_eq!(
+            terminal.pwd().unwrap(),
+            "file://workstation/tmp/my%20project"
+        );
+        assert_eq!(
+            working_directory_path(terminal.pwd().unwrap(), Some("WORKSTATION")),
+            Some(PathBuf::from("/tmp/my project"))
+        );
+        assert_eq!(
+            working_directory_path("file://remote/tmp/project", Some("workstation")),
+            None
+        );
+        assert_eq!(
+            working_directory_path("file://localhost/tmp/project", None),
+            Some(PathBuf::from("/tmp/project"))
+        );
+        assert_eq!(
+            working_directory_path("/tmp/project", None),
+            Some(PathBuf::from("/tmp/project"))
+        );
+    }
 
     #[test]
     fn a_terminal_whose_root_exits_ends_its_output_without_an_error() {
