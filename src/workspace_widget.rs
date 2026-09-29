@@ -3003,37 +3003,35 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap();
-        let mut workspace = Workspace::default();
-        workspace.resize_viewport(400.0);
-        for index in 0..4 {
-            workspace
-                .add_card(
-                    WorkspaceCard::new(CardId::new(), "Pane", CardWidth::Fixed(320.0)).unwrap(),
-                    index,
-                    index == 0,
-                )
-                .unwrap();
-        }
         let shortcuts = KeyboardShortcuts::default();
-        let mut element = view(
-            &workspace,
+        let scroll_input = Rc::new(Cell::new(false));
+        let callback_input = Rc::clone(&scroll_input);
+        // Exercise the native scrollable directly: VirtualStrip deliberately
+        // consumes wheels over pane content, which has its own regression.
+        let scrollable = cosmic::widget::scrollable::horizontal(
+            widget::Space::new().width(1_280.0).height(Length::Fill),
+        )
+        .direction(widget::scrollable::Direction::Horizontal(
+            widget::scrollable::Scrollbar::hidden(),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_scroll(move |viewport| {
+            WorkspaceViewportEvent::Scrolled(ViewportSample {
+                offset: viewport.absolute_offset().x,
+                width: viewport.bounds().width,
+                user_input: callback_input.get(),
+            })
+        });
+        let mut element: Element<'_, WorkspaceViewportEvent> = WorkspaceSurface::new(
+            scrollable.into(),
             &shortcuts,
             FocusedPane::Other,
-            false,
-            &InputTrace::default(),
             400.0,
-            widget::Id::unique(),
-            |_| {
-                widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            },
-            card_widget_id,
-            Events {
-                viewport: |event| event,
-            },
-        );
+            WorkspaceViewportEvent::Resized,
+        )
+        .with_scroll_input(scroll_input)
+        .into();
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
         let node = element.as_widget_mut().layout(
