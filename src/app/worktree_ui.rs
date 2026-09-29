@@ -1700,6 +1700,10 @@ mod tests {
         );
 
         let _ = app.begin_card_close(cloned);
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, cloned);
+        // The native focus handoff publishes CommitClose after the reserved
+        // pane yields focus. Drive that acknowledgement before reopening.
+        let _ = app.update(Message::CommitClose(cloned));
         assert!(!app.card_state(cloned).unwrap().existence.is_open());
         assert!(!app.durable.card_scopes.contains_key(&cloned));
         let _ = app.run_workspace_command(
