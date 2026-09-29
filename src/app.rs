@@ -5571,6 +5571,7 @@ impl Cagents {
             return Self::open_external_url(session.current_url.clone());
         }
         let source_id = source.id;
+        let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
         let mut card = source;
         card.id = CardId::new();
         card.existence = Existence::Open;
@@ -5626,6 +5627,9 @@ impl Cagents {
                 unreachable!("utility panes are refused before cloning")
             }
         }
+        if let Some(title) = &user_title {
+            card.title = title.clone();
+        }
         let (index, durable_index) = self.terminal_insertion_indices();
         let id = card.id;
         let update = match self.workspace.add_card(
@@ -5647,6 +5651,9 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(id);
+        if let Some(title) = user_title {
+            self.chrome_ui.user_titles.insert(id, title);
+        }
         self.register_channel_card(id);
         self.lifecycle
             .register(id, card.exposure, card.residency, Instant::now());
@@ -11092,6 +11099,22 @@ impl Cagents {
         self.apply_viewport(update, true, true)
     }
 
+    fn prune_pane_title_overrides(&mut self) {
+        if self.chrome_ui.user_titles.is_empty() {
+            return;
+        }
+        let retained: HashSet<_> = self
+            .durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .chain(self.recently_closed.iter().map(|(card, _)| card.id))
+            .collect();
+        self.chrome_ui
+            .user_titles
+            .retain(|id, _| retained.contains(id));
+    }
+
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
         if self.settings_write_blocked {
             return Err(
@@ -11103,6 +11126,7 @@ impl Cagents {
             Some(path) => path,
             None => settings::default_path().map_err(|error| error.to_string())?,
         };
+        self.prune_pane_title_overrides();
         let mut view = WindowView {
             user_titles: self.chrome_ui.user_titles.clone(),
             projects_sidebar_collapsed: self.chrome_ui.projects_collapsed,
@@ -20745,6 +20769,95 @@ mod tests {
     }
 
     #[test]
+    fn pane_clone_preserves_explicit_titles_across_later_process_reports() {
+        for chat in [false, true] {
+            let mut app = context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let source = app.workspace.focused().unwrap();
+            if chat {
+                let mut recipe = launch_recipe("/tmp");
+                recipe.program = "claude".into();
+                app.card_state_mut(source).unwrap().kind = CardKind::Chat(crate::chat::Session {
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    id: TerminalId::new(),
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: None,
+                    terminal: None,
+                });
+            }
+            let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+            let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
+            let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
+            let _ = app.clone_focused_pane();
+            let cloned = app.workspace.focused().unwrap();
+            assert_ne!(cloned, source);
+            assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
+            assert_eq!(app.chrome_ui.user_titles[&cloned], "Release review");
+            assert!(!app.apply_reported_title(cloned, "automatic process title".into()));
+            assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
+        }
+    }
+
+    #[test]
+    fn reopening_a_renamed_pane_keeps_its_title_override() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let source = app.workspace.focused().unwrap();
+        let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+        let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release logs".into()));
+        let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
+        app.recently_closed.push((
+            app.card_state(source).unwrap().clone(),
+            app.active_workspace_destination(),
+        ));
+        let _ = app.run_workspace_command(
+            workspace_widget::GlobalShortcut::ReopenPane,
+            keyboard::Modifiers::empty(),
+        );
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, source);
+        assert!(app.recently_closed.is_empty());
+        assert_eq!(app.chrome_ui.user_titles[&reopened], "Release logs");
+        assert!(!app.apply_reported_title(reopened, "automatic process title".into()));
+        assert_eq!(app.card_state(reopened).unwrap().title, "Release logs");
+    }
+
+    #[test]
+    fn saved_title_overrides_keep_durable_and_recent_panes_without_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let durable = app.durable.cards[0].id;
+        let mut recent = app.durable.cards[0].clone();
+        recent.id = CardId::new();
+        let recent_id = recent.id;
+        let orphan = CardId::new();
+        app.recently_closed.push((recent, None));
+        for id in [durable, recent_id, orphan] {
+            app.chrome_ui.user_titles.insert(id, "Custom title".into());
+        }
+        let saved = app.capture_settings_save().unwrap();
+        assert_eq!(saved.view.user_titles.len(), 2);
+        assert!(saved.view.user_titles.contains_key(&durable));
+        assert!(saved.view.user_titles.contains_key(&recent_id));
+        assert!(!app.chrome_ui.user_titles.contains_key(&orphan));
+        app.recently_closed.clear();
+        assert!(
+            !app.capture_settings_save()
+                .unwrap()
+                .view
+                .user_titles
+                .contains_key(&recent_id)
+        );
+    }
+
+    #[test]
     fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
@@ -20769,6 +20882,11 @@ mod tests {
         let _unpolled = app.clone_focused_pane();
         let cloned = app.workspace.focused().unwrap();
         assert_ne!(cloned, source_id);
+        assert_eq!(
+            app.card_state(cloned).unwrap().title,
+            crate::app::chat_ui::chat_card_title(crate::agent::Provider::Claude),
+            "unnamed chat clones retain the provider's default title"
+        );
         let CardKind::Chat(copy) = &app.card_state(cloned).unwrap().kind else {
             panic!("cloned conversation must stay native");
         };
