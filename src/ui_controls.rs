@@ -849,9 +849,9 @@ fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
 
 /// A ring whose filled sweep is the fraction of a budget in use.
 ///
-/// The sweep uses the same muted neutral ink as inactive navigation icons.
-/// The adjacent percentage carries urgency without turning the status line
-/// into a row of competing warning colours.
+/// The sweep uses the same muted neutral ink as inactive navigation icons,
+/// so a healthy status line is not a row of competing colours; a caller whose
+/// budget is in trouble tones it with [`budget_radial_toned`].
 ///
 /// The linear capsule this replaces cost a status line the width of a whole
 /// caption and, at the height a caption row allows, read as a crack in the
@@ -859,11 +859,21 @@ fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
 /// is what lets the budget stay pinned to the pane's right edge however
 /// narrow the pane gets.
 pub fn budget_radial<'a, Message: 'a>(fraction: f32) -> Element<'a, Message> {
-    Element::new(BudgetRadial { fraction })
+    budget_radial_toned(fraction, None)
+}
+
+/// A [`budget_radial`] whose sweep takes `tone` instead of the neutral ink,
+/// for a gauge whose budget is in trouble and should say so on its own.
+pub fn budget_radial_toned<'a, Message: 'a>(
+    fraction: f32,
+    tone: Option<crate::design::Tone>,
+) -> Element<'a, Message> {
+    Element::new(BudgetRadial { fraction, tone })
 }
 
 struct BudgetRadial {
     fraction: f32,
+    tone: Option<crate::design::Tone>,
 }
 
 impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
@@ -928,7 +938,10 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
             });
             frame.stroke(
                 &used.build(),
-                stroke.with_color(crate::design::muted_icon_color(theme)),
+                stroke.with_color(self.tone.map_or_else(
+                    || crate::design::muted_icon_color(theme),
+                    |tone| tone.resolve(theme),
+                )),
             );
         }
         let geometry = frame.into_geometry();
