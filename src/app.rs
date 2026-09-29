@@ -2642,11 +2642,145 @@ pub enum SettingsField {
     ShortcutReviewPreviousChange,
 }
 
+impl SettingsField {
+    /// The shortcut table in `KeyboardShortcuts::actions` order.
+    const SHORTCUTS: [Self; 16] = [
+        Self::ShortcutNewTerminal,
+        Self::ShortcutNewChannel,
+        Self::ShortcutClonePane,
+        Self::ShortcutCloseFocusedColumn,
+        Self::ShortcutSearchProjects,
+        Self::ShortcutPreviousColumn,
+        Self::ShortcutNextColumn,
+        Self::ShortcutCyclePaneWidth,
+        Self::ShortcutPreviousWorkspace,
+        Self::ShortcutNextWorkspace,
+        Self::ShortcutReviewToggleViewed,
+        Self::ShortcutReviewNextFile,
+        Self::ShortcutReviewPreviousFile,
+        Self::ShortcutReviewNextUnviewed,
+        Self::ShortcutReviewNextChange,
+        Self::ShortcutReviewPreviousChange,
+    ];
+
+    /// The label the settings pane shows for this setting, which is also
+    /// the name its messages use for it.
+    const fn label(self) -> &'static str {
+        use crate::notifications::Field;
+        match self {
+            Self::Notifications(Field::Enabled) => "System notifications",
+            Self::Notifications(Field::Success) => "Successful completion",
+            Self::Notifications(Field::Failure) => "Failure or cancellation",
+            Self::Notifications(Field::Waiting) => "Waiting for you",
+            Self::Notifications(Field::ReviewRequests) => "Review requests",
+            Self::Notifications(Field::WhileFocused) => "Notify while focused",
+            Self::AppTheme => "App theme",
+            Self::UiScale => "Interface scale",
+            Self::TerminalLineHeight => "Line height",
+            Self::TerminalPadding => "Inner padding",
+            Self::TerminalScrollSize => "Scroll size",
+            Self::TerminalScrollSpeed => "Scroll speed",
+            Self::TerminalCursorStyle => "Cursor shape",
+            Self::TerminalTheme => "Color theme",
+            Self::MaxHotCards => "Maximum hot columns",
+            Self::HibernationDelayMs => "Hibernation delay (ms)",
+            Self::TerminalFontSize => "Font size",
+            Self::TerminalFontFamily => "Font family",
+            Self::TerminalScrollbackLines => "Scrollback lines",
+            Self::ManagedWorktreeDirectory => "Managed worktree directory",
+            Self::WorktreeSort => "Worktree order",
+            Self::DefaultWorktreePane => "Default worktree pane",
+            Self::DefaultChannelPane => "Default channel pane",
+            Self::DefaultColumnFraction => "New column width",
+            Self::LinkOpenDestination => "Open links in",
+            Self::EditorAutoSave => "Auto-save",
+            Self::EditorWrapLines => "Word wrap",
+            Self::ChatEnterSends => "Chat send key",
+            Self::ShowStatusBar => "Status bar",
+            Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
+            Self::EditorSyntaxTheme => "Syntax theme",
+            Self::ConfirmTerminalClose => "Active processes",
+            Self::FocusFollowsMouse => "Pane activation",
+            Self::LinkOpenGesture => "System browser gesture",
+            Self::PullRequestOpenTarget => "Open pull requests in",
+            Self::ShortcutNewTerminal => "New terminal",
+            Self::ShortcutNewChannel => "New channel",
+            Self::ShortcutClonePane => "Clone focused pane",
+            Self::ShortcutCloseFocusedColumn => "Close focused column",
+            Self::ShortcutSearchProjects => "Search projects",
+            Self::ShortcutPreviousColumn => "Previous column",
+            Self::ShortcutNextColumn => "Next column",
+            Self::ShortcutCyclePaneWidth => "Cycle pane width",
+            Self::ShortcutPreviousWorkspace => "Previous workspace",
+            Self::ShortcutNextWorkspace => "Next workspace",
+            Self::ShortcutReviewToggleViewed => "Mark reviewed file viewed",
+            Self::ShortcutReviewNextFile => "Next reviewed file",
+            Self::ShortcutReviewPreviousFile => "Previous reviewed file",
+            Self::ShortcutReviewNextUnviewed => "Next unviewed file",
+            Self::ShortcutReviewNextChange => "Next changed hunk",
+            Self::ShortcutReviewPreviousChange => "Previous changed hunk",
+        }
+    }
+
+    /// The category whose page holds this setting.
+    const fn category(self) -> SettingsCategory {
+        match self {
+            Self::Notifications(_) => SettingsCategory::Notifications,
+            Self::AppTheme | Self::UiScale | Self::ShowStatusBar | Self::DefaultColumnFraction => {
+                SettingsCategory::Appearance
+            }
+            Self::TerminalLineHeight
+            | Self::TerminalPadding
+            | Self::TerminalScrollSize
+            | Self::TerminalScrollSpeed
+            | Self::TerminalCursorStyle
+            | Self::TerminalTheme
+            | Self::TerminalFontSize
+            | Self::TerminalFontFamily
+            | Self::TerminalScrollbackLines
+            | Self::ConfirmTerminalClose
+            | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
+            Self::MaxHotCards
+            | Self::HibernationDelayMs
+            | Self::ManagedWorktreeDirectory
+            | Self::WorktreeSort
+            | Self::DefaultWorktreePane
+            | Self::DefaultChannelPane
+            | Self::ChatEnterSends
+            | Self::FocusFollowsMouse => SettingsCategory::General,
+            Self::EditorAutoSave | Self::EditorWrapLines | Self::EditorSyntaxTheme => {
+                SettingsCategory::Editor
+            }
+            Self::LinkOpenDestination | Self::LinkOpenGesture | Self::PullRequestOpenTarget => {
+                SettingsCategory::Links
+            }
+            Self::ShortcutNewTerminal
+            | Self::ShortcutNewChannel
+            | Self::ShortcutClonePane
+            | Self::ShortcutCloseFocusedColumn
+            | Self::ShortcutSearchProjects
+            | Self::ShortcutPreviousColumn
+            | Self::ShortcutNextColumn
+            | Self::ShortcutCyclePaneWidth
+            | Self::ShortcutPreviousWorkspace
+            | Self::ShortcutNextWorkspace
+            | Self::ShortcutReviewToggleViewed
+            | Self::ShortcutReviewNextFile
+            | Self::ShortcutReviewPreviousFile
+            | Self::ShortcutReviewNextUnviewed
+            | Self::ShortcutReviewNextChange
+            | Self::ShortcutReviewPreviousChange => SettingsCategory::Keyboard,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SettingsFeedback {
     Saved,
     Pending,
-    Invalid(String),
+    /// At least one entered value was refused; each is reported under its
+    /// own field, from `settings_invalid`.
+    Invalid,
     Error(String),
 }
 
@@ -3016,7 +3150,7 @@ fn settings_update(
         SettingsField::TerminalPadding => value
             .parse::<f32>()
             .map(|value| next.terminal_padding = value)
-            .map_err(|_| "Terminal padding must be a number.".to_owned()),
+            .map_err(|_| "Inner padding must be a number.".to_owned()),
         SettingsField::TerminalScrollSize => value
             .parse::<usize>()
             .map(|value| next.terminal_scroll_size = value)
@@ -3024,7 +3158,7 @@ fn settings_update(
         SettingsField::TerminalScrollSpeed => value
             .parse::<f32>()
             .map(|value| next.terminal_scroll_speed = value)
-            .map_err(|_| "Terminal scroll speed must be a number.".to_owned()),
+            .map_err(|_| "Scroll speed must be a number.".to_owned()),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -3036,7 +3170,7 @@ fn settings_update(
         SettingsField::TerminalFontSize => value
             .parse::<f32>()
             .map(|value| next.terminal_font_size = value)
-            .map_err(|_| "Terminal font size must be a number.".to_owned()),
+            .map_err(|_| "Font size must be a number.".to_owned()),
         SettingsField::TerminalFontFamily => {
             next.terminal_font_family = value.to_owned();
             Ok(())
@@ -3052,7 +3186,7 @@ fn settings_update(
         SettingsField::DefaultColumnFraction => value
             .parse::<f32>()
             .map(|value| next.default_column_fraction = value)
-            .map_err(|_| "Default column fraction must be a number.".to_owned()),
+            .map_err(|_| "New column width must be a number.".to_owned()),
         SettingsField::LinkOpenDestination => match value {
             "integrated_browser" => {
                 next.link_open_destination = LinkOpenDestination::IntegratedBrowser;
@@ -3152,17 +3286,147 @@ fn settings_update(
         }
     };
     if let Err(message) = parsed {
-        return SettingsDecision::Invalid(message);
+        return SettingsDecision::Invalid(refusal(field, &next).unwrap_or(message));
     }
+    let attempted = next.clone();
     let next = match next.validate() {
         Ok(next) => next,
-        Err(error) => return SettingsDecision::Invalid(error.to_string()),
+        Err(error) => {
+            return SettingsDecision::Invalid(
+                refusal(field, &attempted).unwrap_or_else(|| error.to_string()),
+            );
+        }
     };
     if next == *current {
         SettingsDecision::Unchanged
     } else {
         SettingsDecision::Persist(next)
     }
+}
+
+/// Plain-language copy for a value the settings pane refused.
+///
+/// It names the setting as the pane labels it and says what it accepts,
+/// rather than quoting the settings file's key, and a shortcut clash names
+/// the action that already holds the chord. `None` leaves the parser's own
+/// message, which for a field without copy here is already worded for the
+/// pane.
+fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
+    let label = field.label();
+    Some(match field {
+        SettingsField::TerminalScrollSize => format!(
+            "{label} must be 1–{} lines.",
+            settings::MAX_TERMINAL_SCROLL_SIZE
+        ),
+        SettingsField::TerminalScrollbackLines => format!(
+            "Scrollback must be 0–{} lines.",
+            grouped_digits(settings::MAX_TERMINAL_SCROLLBACK_LINES)
+        ),
+        SettingsField::MaxHotCards => format!("{label} must be a whole number, at least 1."),
+        SettingsField::HibernationDelayMs => {
+            "Hibernation delay must be a whole number of milliseconds.".to_owned()
+        }
+        SettingsField::TerminalFontFamily
+            if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
+        {
+            format!(
+                "{label} must be at most {} bytes.",
+                settings::MAX_TERMINAL_FONT_FAMILY_BYTES
+            )
+        }
+        SettingsField::TerminalFontFamily => {
+            format!("{label} must be a font family name, or empty for the system monospace font.")
+        }
+        SettingsField::ManagedWorktreeDirectory
+            if attempted.managed_worktree_directory.trim().is_empty() =>
+        {
+            "Enter a directory for managed worktrees.".to_owned()
+        }
+        SettingsField::ManagedWorktreeDirectory => {
+            format!("{label} must be a path without control characters.")
+        }
+        field => {
+            let action = SettingsField::SHORTCUTS
+                .iter()
+                .position(|shortcut| *shortcut == field)?;
+            shortcut_refusal(action, &attempted.keyboard_shortcuts)?
+        }
+    })
+}
+
+/// Why the shortcut table cannot take the edit to `action`.
+fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
+    let fault = shortcuts.fault()?;
+    let Some(owner) = fault.conflicts_with else {
+        let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
+            return None;
+        };
+        return Some(sentence(reason));
+    };
+    // The table reports the later of two clashing actions, which is not
+    // necessarily the one just edited.
+    let other = match (fault.action == action, owner == action) {
+        (true, _) => owner,
+        (false, true) => fault.action,
+        (false, false) => return None,
+    };
+    let actions = shortcuts.actions();
+    let bindings = |index: usize| {
+        actions[index]
+            .iter()
+            .filter_map(|chord| Some((chord, settings::parse_shortcut(chord).ok()?)))
+            .collect::<Vec<_>>()
+    };
+    let mine = bindings(action);
+    let chord = if other == action {
+        // The chord that repeats one before it in the same row.
+        mine.iter()
+            .enumerate()
+            .find(|(index, (_, binding))| {
+                mine[..*index].iter().any(|(_, earlier)| earlier == binding)
+            })
+            .map(|(_, (chord, _))| chord.as_str())
+    } else {
+        let theirs = bindings(other);
+        mine.iter()
+            .find(|(_, binding)| theirs.iter().any(|(_, held)| held == binding))
+            .map(|(chord, _)| chord.as_str())
+    };
+    let chord = chord.map_or_else(|| "This shortcut".to_owned(), str::to_owned);
+    Some(if other == action {
+        format!("{chord} is listed twice.")
+    } else {
+        format!(
+            "{chord} is already the shortcut for “{}”.",
+            SettingsField::SHORTCUTS[other].label()
+        )
+    })
+}
+
+/// `message` with a capital first letter and a closing full stop.
+fn sentence(message: &str) -> String {
+    let mut characters = message.chars();
+    let mut sentence: String = characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default();
+    if !sentence.ends_with('.') {
+        sentence.push('.');
+    }
+    sentence
+}
+
+/// `value` with its thousands separated by commas.
+fn grouped_digits(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 #[derive(Debug, Clone)]
@@ -7589,6 +7853,7 @@ impl Cagents {
                 &self.settings_draft,
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
+                &self.settings_invalid,
                 self.default_account_choices(),
                 self.notification_ui.testing,
             ),
@@ -9952,9 +10217,7 @@ impl Cagents {
         self.settings_feedback = if let Some(error) = &self.settings_save_error {
             Some(SettingsFeedback::Error(error.clone()))
         } else if !self.settings_invalid.is_empty() {
-            let mut errors: Vec<_> = self.settings_invalid.values().cloned().collect();
-            errors.sort();
-            Some(SettingsFeedback::Invalid(errors.join(" ")))
+            Some(SettingsFeedback::Invalid)
         } else if !self.settings_pending.is_empty()
             || self.settings_ack_generation < self.settings_save_generation
         {
@@ -15871,7 +16134,7 @@ mod tests {
         settle_settings_task(&mut app, task);
         assert!(matches!(
             app.settings_feedback,
-            Some(SettingsFeedback::Invalid(_))
+            Some(SettingsFeedback::Invalid)
         ));
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         let pane = app.utility_card(&CardKind::Settings).unwrap();
@@ -20979,7 +21242,8 @@ mod tests {
         let settings = AppSettings::default();
         assert!(matches!(
             settings_update(&settings, SettingsField::MaxHotCards, "0"),
-            SettingsDecision::Invalid(message) if message.contains("max_hot_cards")
+            SettingsDecision::Invalid(message)
+                if message == "Maximum hot columns must be a whole number, at least 1."
         ));
         assert!(matches!(
             settings_update(&settings, SettingsField::ManagedWorktreeDirectory, " "),
@@ -20989,6 +21253,97 @@ mod tests {
             settings_update(&settings, SettingsField::DefaultColumnFraction, "not a number"),
             SettingsDecision::Invalid(message) if message.contains("number")
         ));
+    }
+
+    #[test]
+    fn refused_values_are_explained_with_the_label_and_range_the_pane_shows() {
+        let settings = AppSettings::default();
+        let refusal = |field, value: &str| match settings_update(&settings, field, value) {
+            SettingsDecision::Invalid(message) => message,
+            decision => panic!("{value:?} was not refused: {decision:?}"),
+        };
+        // Out of range and unparsable read the same: both say what fits.
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollSize, "11"),
+            "Scroll size must be 1–10 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollSize, "lots"),
+            "Scroll size must be 1–10 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalScrollbackLines, "1000001"),
+            "Scrollback must be 0–1,000,000 lines."
+        );
+        assert_eq!(
+            refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),
+            "Font family must be at most 128 bytes."
+        );
+        assert_eq!(
+            refusal(SettingsField::ManagedWorktreeDirectory, " "),
+            "Enter a directory for managed worktrees."
+        );
+        for message in [
+            refusal(SettingsField::MaxHotCards, "0"),
+            refusal(SettingsField::HibernationDelayMs, "-1"),
+            refusal(SettingsField::ShortcutNewTerminal, "Ctrl+"),
+        ] {
+            assert!(!message.contains('_'), "{message} quotes a settings key");
+            assert!(message.ends_with('.'), "{message} is not a sentence");
+        }
+    }
+
+    #[test]
+    fn a_shortcut_clash_names_the_chord_and_the_action_that_holds_it() {
+        let settings = AppSettings::default();
+        let taken = settings.keyboard_shortcuts.new_channel[0].clone();
+        // The edited action sorts before its rival here, so the table reports
+        // the rival as the fault and the message must look past that.
+        assert_eq!(
+            settings_update(
+                &settings,
+                SettingsField::ShortcutNewTerminal,
+                &format!("Ctrl+Alt+J, {taken}")
+            ),
+            SettingsDecision::Invalid(format!(
+                "{taken} is already the shortcut for “New channel”."
+            ))
+        );
+        let earlier = settings.keyboard_shortcuts.new_terminal[0].clone();
+        assert_eq!(
+            settings_update(&settings, SettingsField::ShortcutNewChannel, &earlier),
+            SettingsDecision::Invalid(format!(
+                "{earlier} is already the shortcut for “New terminal”."
+            ))
+        );
+        assert_eq!(
+            settings_update(
+                &settings,
+                SettingsField::ShortcutNewChannel,
+                "Ctrl+Alt+K, Ctrl+Alt+J, ctrl+alt+j"
+            ),
+            SettingsDecision::Invalid("ctrl+alt+j is listed twice.".into())
+        );
+    }
+
+    #[test]
+    fn shortcut_fields_follow_the_order_of_the_shortcut_table() {
+        let settings = AppSettings::default();
+        for (index, field) in SettingsField::SHORTCUTS.into_iter().enumerate() {
+            let SettingsDecision::Persist(edited) =
+                settings_update(&settings, field, "Ctrl+Alt+Shift+9")
+            else {
+                panic!("{field:?} did not take a free chord");
+            };
+            assert_eq!(
+                edited.keyboard_shortcuts.actions()[index],
+                &vec!["Ctrl+Alt+Shift+9".to_owned()],
+                "{field:?}"
+            );
+            assert_eq!(field.category(), SettingsCategory::Keyboard);
+        }
+        assert_eq!(grouped_digits(1_000_000), "1,000,000");
+        assert_eq!(grouped_digits(999), "999");
     }
 
     #[test]
