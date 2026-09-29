@@ -216,9 +216,9 @@ pub fn run() -> Result<(), HostError> {
     if let Some(broker) = &notification_broker {
         host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
     }
-    state::restore_upgrade(&host).map_err(io::Error::other)?;
+    let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
     state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
-    chat::restore_orphaned_native(&host).map_err(io::Error::other)?;
+    chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
     if let Ok(registry) = agent_execution::registry(&host) {
@@ -232,7 +232,12 @@ pub fn run() -> Result<(), HostError> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let _tray = crate::tray::start();
+    let tally_host = Arc::downgrade(&host);
+    let _tray = crate::tray::start(move || {
+        let host = tally_host.upgrade()?;
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        Some(state.agent_tally())
+    });
 
     let automation_broker = match automations::start(&host) {
         Ok(broker) => Some(broker),

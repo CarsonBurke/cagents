@@ -174,6 +174,7 @@ fn settings_category_controls<'a>(
     draft: &'a SettingsDraft,
     invalid: &'a HashMap<SettingsField, String>,
     accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    testing_notification: bool,
 ) -> Vec<Group<'a, Message>> {
     match category {
         SettingsCategory::Notifications => {
@@ -227,7 +228,21 @@ fn settings_category_controls<'a>(
                     )
                 })
                 .collect();
-            controls.push(setting_field("Test notification", "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; test results appear in notices.", widget::button::standard("Send test notification").on_press(Message::NotificationUi(notification_ui::Action::Test)).into()));
+            controls.push(setting_field(
+                "Test notification",
+                "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
+                widget::button::standard(if testing_notification {
+                    "Sending test notification…"
+                } else {
+                    "Send test notification"
+                })
+                .id(widget::Id::new("settings.notifications.test"))
+                .on_press_maybe(
+                    (!testing_notification)
+                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                )
+                .into(),
+            ));
             vec![settings_group(
                 "Agent notifications",
                 "Alerts contain the provider and folder name, never prompts or output.",
@@ -848,10 +863,18 @@ pub(super) fn settings_pane<'a>(
     feedback: Option<&'a SettingsFeedback>,
     invalid: &'a HashMap<SettingsField, String>,
     accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    testing_notification: bool,
 ) -> Element<'a, Message> {
     iced::widget::responsive(move |size| {
         settings_layout(
-            category, draft, query, feedback, invalid, &accounts, size.width,
+            category,
+            draft,
+            query,
+            feedback,
+            invalid,
+            &accounts,
+            testing_notification,
+            size.width,
         )
     })
     .into()
@@ -864,6 +887,7 @@ fn settings_layout<'a>(
     feedback: Option<&'a SettingsFeedback>,
     invalid: &'a HashMap<SettingsField, String>,
     accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    testing_notification: bool,
     width: f32,
 ) -> Element<'a, Message> {
     let narrow = width < RAIL_BREAKPOINT;
@@ -971,7 +995,7 @@ fn settings_layout<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft, invalid, accounts)
+            settings_category_controls(category, draft, invalid, accounts, testing_notification)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );

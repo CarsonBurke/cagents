@@ -3113,7 +3113,10 @@ pub struct WorktreeInput {
     pub operation_id: OperationId,
 }
 
-fn worktree_branch_input(input: &str) -> Result<String, ValidationError> {
+/// The branch a worktree request names: the input itself, or the branch a
+/// Linear issue URL implies. Pure, so a form can check it as the user types;
+/// what the repository already holds is settled by `resolve_worktree_request`.
+pub fn worktree_branch_input(input: &str) -> Result<String, ValidationError> {
     let input = input.trim();
     if !input.contains("://") {
         return ValidatedBranchName::parse(input).map(|branch| branch.0);

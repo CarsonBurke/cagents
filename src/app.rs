@@ -28,9 +28,13 @@ mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
 mod workspace_model_sync;
+mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+use worktree_dialog::{
+    WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
+};
 
 use std::{
     borrow::Cow,
@@ -200,6 +204,13 @@ const BROWSER_TOOLBAR_HEIGHT: f32 = design::ROW_HEIGHT;
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const DIALOG_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+/// How long an exit waits once its window is gone: a frame, which lets winit
+/// finish its pass and flush the window's destruction before iced tears down.
+const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(16);
+/// How long an exit waits for iced to report its window gone. iced reports it
+/// within a frame; the bound only keeps a lost report from leaving an
+/// invisible process holding the session lease, so no new window could open.
+const EXIT_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTENT_MAX_WIDTH: f32 = 560.0;
 const STATUS_SURFACE_MAX_WIDTH: f32 = 360.0;
 
@@ -486,7 +497,10 @@ fn notice_surface<'a>(
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let mut children = vec![
-        widget::icon::from_name(severity.icon()).size(16).into(),
+        crate::ui_controls::symbolic_icon(severity.icon())
+            .icon()
+            .size(16)
+            .into(),
         body,
     ];
     if let Some(action) = action {
@@ -576,7 +590,9 @@ fn notice_surface_detail<'a>(
 /// invisible — a pink label on a pink error surface. Every colour here comes
 /// from the surface's own component instead.
 fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
-    let appearance = move |theme: &cosmic::Theme| {
+    // Keyboard focus draws the outline at full strength and wider: the
+    // shell's accent focus ring would vanish against a severity fill.
+    let appearance = move |focused: bool, theme: &cosmic::Theme| {
         let component = severity.component(theme.cosmic());
         let on: iced::Color = component.on.into();
         widget::button::Style {
@@ -584,8 +600,8 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
             text_color: Some(on),
             icon_color: Some(on),
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
-            border_width: 1.0,
-            border_color: on.scale_alpha(0.4),
+            border_width: if focused { 2.0 } else { 1.0 },
+            border_color: if focused { on } else { on.scale_alpha(0.4) },
             ..widget::button::Style::new()
         }
     };
@@ -596,19 +612,19 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
         iced::Background::Color(on.scale_alpha(alpha))
     };
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, theme| appearance(theme)),
+        active: Box::new(move |focused, theme| appearance(focused, theme)),
         disabled: Box::new(move |theme| widget::button::Style {
             text_color: Some(severity.detail_color()),
             icon_color: Some(severity.detail_color()),
-            ..appearance(theme)
+            ..appearance(false, theme)
         }),
-        hovered: Box::new(move |_focused, theme| widget::button::Style {
+        hovered: Box::new(move |focused, theme| widget::button::Style {
             background: Some(wash(theme, 0.12)),
-            ..appearance(theme)
+            ..appearance(focused, theme)
         }),
-        pressed: Box::new(move |_focused, theme| widget::button::Style {
+        pressed: Box::new(move |focused, theme| widget::button::Style {
             background: Some(wash(theme, 0.2)),
-            ..appearance(theme)
+            ..appearance(focused, theme)
         }),
     }
 }
@@ -1359,7 +1375,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
         },
         Some(CardKind::Chat(_)) => CardLabels {
             type_label: "Chat",
-            icon: "chat-bubbles-symbolic",
+            icon: "chat-bubble-text-symbolic",
             starting: "Connecting to agent…",
             unavailable: "Agent connection unavailable",
         },
@@ -1987,17 +2003,6 @@ pub struct Startup {
     window_view: Option<WindowView>,
 }
 
-#[derive(Debug, Clone)]
-struct WorktreeDialog {
-    project_id: ProjectId,
-    repository: PathBuf,
-    branch: String,
-    base: String,
-    destination: String,
-    advanced: bool,
-    resolving: Option<crate::model::OperationId>,
-    error: Option<String>,
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
@@ -3530,6 +3535,8 @@ pub enum Message {
     CloseCard(CardId),
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
+    /// iced has removed a window, and winit has queued its destruction.
+    WindowClosed(window::Id),
     NewWindow,
     NewWindowOpened {
         saved: Result<SettingsSaved, String>,
@@ -3649,7 +3656,7 @@ pub enum Message {
     WorktreeInputResolved {
         project_id: ProjectId,
         operation_id: crate::model::OperationId,
-        result: Result<CreateWorktreeRequest, String>,
+        result: Result<CreateWorktreeRequest, WorktreeInputError>,
     },
     SubmitWorktree,
     WorktreeProgress(crate::repository::WorktreeProgressEvent),
@@ -3741,6 +3748,25 @@ pub enum Message {
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
     DismissAllNotices,
+}
+
+/// An application exit in progress.
+///
+/// The window closes as soon as the exit is committed. The process ends only
+/// once both halves below are done: before the window is gone, iced's
+/// teardown would run while it is still on screen, and before the servers
+/// are reaped it would take away the runtime that stops them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ApplicationExit {
+    /// The window the exit closed, until iced reports it gone.
+    closing: Option<window::Id>,
+    servers_reaped: bool,
+}
+
+impl ApplicationExit {
+    fn is_complete(self) -> bool {
+        self.closing.is_none() && self.servers_reaped
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4180,6 +4206,9 @@ pub struct Cagents {
     update_flush_pending: bool,
     update_generation: u64,
     update_committed: bool,
+    /// Set once the application has committed to exiting. No later close
+    /// request may start the exit again.
+    exit: Option<ApplicationExit>,
     /// A shell theme change has landed that the open document pages were not
     /// rendered for. It is recorded rather than acted on, because the notice
     /// arrives on a path whose returned task libcosmic discards, and it is
@@ -5688,19 +5717,15 @@ impl Cagents {
             tasks.push(self.open_clicked_link(url));
         }
         if let Some((project_id, target)) = checkout {
-            self.worktree_dialog = Some(WorktreeDialog {
+            tasks.push(self.open_worktree_dialog(
                 project_id,
-                repository: target.repository.clone(),
-                branch: target.suggested_branch(),
-                base: target.head.as_str().to_owned(),
-                destination: String::new(),
-                advanced: true,
-                resolving: None,
-                error: None,
-            });
-            tasks.push(
-                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App),
-            );
+                target.repository.clone(),
+                WorktreeDraft {
+                    base: target.head.as_str().to_owned(),
+                    ..WorktreeDraft::branch(target.suggested_branch())
+                },
+                None,
+            ));
         }
         Task::batch(tasks)
     }
@@ -7645,19 +7670,21 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.back"),
-                                |chrome| chrome.browser_back_id.clone(),
-                            ))
-                            .name("Back")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "go-previous-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.back"),
+                            |chrome| chrome.browser_back_id.clone(),
+                        ))
+                        .name("Back")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-next-symbolic"))
+                        widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
                                 |chrome| chrome.browser_forward_id.clone(),
@@ -7669,15 +7696,17 @@ impl Cagents {
                         "Forward",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.reload"),
-                                |chrome| chrome.browser_reload_id.clone(),
-                            ))
-                            .name("Reload")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(active.then_some(Message::BrowserReload(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "view-refresh-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.reload"),
+                            |chrome| chrome.browser_reload_id.clone(),
+                        ))
+                        .name("Reload")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(active.then_some(Message::BrowserReload(id))),
                         "Reload",
                     ),
                     address_input.into(),
@@ -7826,6 +7855,7 @@ impl Cagents {
                 self.settings_feedback.as_ref(),
                 &self.settings_invalid,
                 self.default_account_choices(),
+                self.notification_ui.testing,
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
@@ -7847,7 +7877,8 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
-                            widget::icon::from_name("dialog-warning-symbolic")
+                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                                .icon()
                                 .size(24)
                                 .into(),
                             widget::text::title3(labels.unavailable).into(),
@@ -9156,13 +9187,44 @@ impl Cagents {
     }
 
     fn other_modal_is_open(&self) -> bool {
+        self.form_dialog_is_open() || self.modal_over_form_dialogs()
+    }
+
+    /// The worktree and pull request dialogs: forms, whose focused field
+    /// captures the keys the dialog itself answers.
+    fn form_dialog_is_open(&self) -> bool {
+        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some()
+    }
+
+    /// Closes the topmost form dialog, stopping whatever it was waiting on.
+    fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if let Some(dialog) = self.worktree_dialog.take() {
+            dialog.cancel();
+        } else if self.pull_request_dialog.take().is_some() {
+            self.pull_request_dialog_generation =
+                self.pull_request_dialog_generation.wrapping_add(1);
+        }
+        if let Some(target) = self.nested_modal_focus_target() {
+            return iced::widget::operation::focus(target).map(cosmic::Action::App);
+        }
+        self.focus_context_overlay_if_exposed()
+    }
+
+    /// Whether a form dialog is the dialog on screen, not one under another.
+    fn form_dialog_on_top(&self) -> bool {
+        self.form_dialog_is_open()
+            && self.update_ui.confirmation.is_none()
+            && !self.modal_over_form_dialogs()
+    }
+
+    /// The dialogs `dialog` mounts above the form dialogs, besides the
+    /// update confirmation, which `modal_is_open` adds.
+    fn modal_over_form_dialogs(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
         }
-        self.worktree_dialog.is_some()
-            || self.pull_request_dialog.is_some()
-            || self.dirty_repository_close.is_some()
+        self.dirty_repository_close.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
@@ -9524,7 +9586,15 @@ impl Cagents {
         )
     }
 
-    /// Exits once the language servers have actually been reaped.
+    /// Leaves the application: the window first, the process once the window
+    /// is gone and the language servers have actually been reaped.
+    ///
+    /// The window is the only part of the exit anyone sees, so it goes at
+    /// once. What follows - the reap below, the final session flush in
+    /// `Drop`, the renderer and runtime teardown after `run` returns - takes
+    /// seconds on a busy machine, and winit destroys a closed toplevel only on
+    /// an event-loop pass after the close: an exit that reaches iced first
+    /// leaves the window on screen, unresponsive, until the process is gone.
     ///
     /// `shutdown` only *asks*: the processes are stopped by session tasks on
     /// the tokio runtime, and `iced::exit()` takes that runtime away. Waiting
@@ -9533,11 +9603,110 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.exit.is_some() {
+            return Task::none();
+        }
+        // The process outlives its window by the reap and the teardown below.
+        // An activation acknowledged in that time would tell `cagents ui` a
+        // window is being raised, and it would open none. Refused, the
+        // launcher waits for this process to release the window lease and
+        // starts a fresh window.
+        self.activation_rx.close();
+        // `Drop` writes the final state; this snapshot is queued now because
+        // someone who has watched the window close may power off before then.
+        self.persist();
         let reaped = self.lsp.begin_shutdown();
-        cosmic::task::future(async move {
+        let reap = cosmic::task::future(async move {
             reaped.await;
             Message::LanguageServersReaped
-        })
+        });
+        let close = self.close_main_window();
+        self.exit = Some(ApplicationExit {
+            closing: close.as_ref().map(|(window, _)| *window),
+            servers_reaped: false,
+        });
+        let Some((window, close)) = close else {
+            return reap;
+        };
+        let close_timeout = cosmic::task::future(async move {
+            tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
+            Message::WindowClosed(window)
+        });
+        Task::batch([close, reap, close_timeout])
+    }
+
+    /// Records one half of the exit and ends the process once both are done.
+    fn advance_exit(&mut self, advance: impl FnOnce(&mut ApplicationExit)) -> Task<Message> {
+        let Some(exit) = self.exit.as_mut() else {
+            return Task::none();
+        };
+        advance(exit);
+        if !exit.is_complete() {
+            return Task::none();
+        }
+        // The window's closed report and this exit can land in the very
+        // event-loop pass that destroyed the window, and iced would then tear
+        // down before winit flushed that destruction to the compositor.
+        iced::Task::future(async { tokio::time::sleep(EXIT_FLUSH_GRACE).await })
+            .discard()
+            .chain(iced::exit())
+    }
+
+    /// Closes the main window while the application keeps running, or
+    /// `None` when there is no window to close.
+    ///
+    /// libcosmic answers the main window closing with an immediate
+    /// `iced::exit()`, which would take the runtime away from the reap that
+    /// [`Self::exit_after_language_servers`] is still waiting on and orphan
+    /// every server not yet stopped. With no main window the close is only a
+    /// close; [`Application::view_window`] draws the window empty until iced
+    /// removes it.
+    fn close_main_window(&mut self) -> Option<(window::Id, Task<Message>)> {
+        let window = self.core.main_window_id()?;
+        #[cfg(feature = "integrated-browser")]
+        self.release_browser_parent();
+        self.core.set_main_window_id(None);
+        Some((window, iced::window::close(window)))
+    }
+
+    /// Tears down everything that borrows the main window's Wayland surface.
+    ///
+    /// Exact Wayland parent invariant, which must hold before the parent
+    /// window is closed or dropped:
+    /// 1. request and join every browser still owned by a card;
+    /// 2. join every off-UI-path card-close reaper;
+    /// 3. drop the raw-handle factory/Wayland host;
+    /// 4. deactivate/drop the parent lifetime guard.
+    ///
+    /// Idempotent: the exit path runs it before closing the window, and
+    /// `Drop` runs it again for an exit this application did not drive.
+    #[cfg(feature = "integrated-browser")]
+    fn release_browser_parent(&mut self) {
+        let cards = self
+            .cards
+            .iter()
+            .filter(|(_, runtime)| matches!(runtime, CardRuntime::Browser(_)))
+            .map(|(card, _)| *card)
+            .collect::<Vec<_>>();
+        let mut browsers = Vec::with_capacity(cards.len());
+        for card in cards {
+            if let Some(CardRuntime::Browser(browser)) = self.cards.remove(&card) {
+                // Every engine is asked before any is awaited, so they tear
+                // down together rather than one after another.
+                browser.handle.request_shutdown();
+                browsers.push(browser);
+            }
+        }
+        for mut browser in browsers {
+            browser.handle.shutdown();
+        }
+        for teardown in self.browser_teardowns.drain(..) {
+            let _ = teardown.join();
+        }
+        self.browser_factory.take();
+        if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
+            parent_lifetime.deactivate();
+        }
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
@@ -9639,8 +9808,8 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.sidebar_selection_ui.dialog.is_some() {
-            Some(sidebar_selection_ui::focus_id())
+        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
+            Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
@@ -10127,7 +10296,6 @@ impl Cagents {
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
-        let previous_scale = self.settings.ui_scale;
         match settings_update(&self.settings, field, &value) {
             SettingsDecision::Invalid(message) => {
                 self.settings_invalid.insert(field, message);
@@ -10143,128 +10311,93 @@ impl Cagents {
                 Task::none()
             }
             SettingsDecision::Persist(settings) => {
-                self.settings = settings;
-                self.synchronize_lifecycle_budget();
+                let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
-                if matches!(
-                    field,
-                    SettingsField::ShortcutNewTerminal
-                        | SettingsField::ShortcutNewChannel
-                        | SettingsField::ShortcutClonePane
-                        | SettingsField::ShortcutCloseFocusedColumn
-                        | SettingsField::ShortcutSearchProjects
-                        | SettingsField::ShortcutPreviousColumn
-                        | SettingsField::ShortcutNextColumn
-                        | SettingsField::ShortcutCyclePaneWidth
-                        | SettingsField::ShortcutPreviousWorkspace
-                        | SettingsField::ShortcutNextWorkspace
-                        | SettingsField::ShortcutReviewToggleViewed
-                        | SettingsField::ShortcutReviewNextFile
-                        | SettingsField::ShortcutReviewPreviousFile
-                        | SettingsField::ShortcutReviewNextUnviewed
-                        | SettingsField::ShortcutReviewNextChange
-                        | SettingsField::ShortcutReviewPreviousChange
-                ) {
-                    self.card_chrome.clear();
-                }
-                let effect = match field {
-                    SettingsField::WorktreeSort => {
-                        self.sidebar_state
-                            .set_worktree_sort(self.settings.worktree_sort);
-                        Task::none()
-                    }
-                    SettingsField::TerminalTheme => {
-                        self.synchronize_terminal_theme();
-                        Task::none()
-                    }
-                    SettingsField::EditorAutoSave => {
-                        Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-                            if let CardRuntime::Repository(runtime) = runtime {
-                                runtime.set_auto_save(self.settings.editor_auto_save);
-                                Some(repository_task(runtime.auto_save_task(card)))
-                            } else {
-                                None
-                            }
-                        }))
-                    }
-                    SettingsField::EditorWrapLines | SettingsField::EditorSyntaxTheme => {
-                        for runtime in self.cards.values_mut() {
-                            match runtime {
-                                CardRuntime::Repository(runtime) => {
-                                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                CardRuntime::PullRequests(pane) => {
-                                    pane.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                                    pane.runtime
-                                        .set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                CardRuntime::Chat(runtime) => {
-                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Task::none()
-                    }
-                    SettingsField::AppTheme | SettingsField::UiScale => {
-                        self.synchronize_appearance(previous_scale)
-                    }
-                    SettingsField::ShowStatusBar => self.accounts_surface_changed(),
-                    SettingsField::Notifications(_) => {
-                        self.notification_ui
-                            .preferences(self.settings.notifications, false);
-                        Task::none()
-                    }
-                    SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
-                    SettingsField::HibernationDelayMs => {
-                        // Reconciled here rather than through a queued
-                        // `LifecycleSweep`, so the manager's exposure is
-                        // current before the new grace is re-derived from it.
-                        let sweep = self.lifecycle_sweep();
-                        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
-                    }
-                    SettingsField::TerminalFontSize
-                    | SettingsField::TerminalFontFamily
-                    | SettingsField::TerminalScrollbackLines
-                    | SettingsField::TerminalLineHeight
-                    | SettingsField::TerminalPadding
-                    | SettingsField::TerminalScrollSize
-                    | SettingsField::TerminalScrollSpeed
-                    | SettingsField::TerminalCursorStyle
-                    | SettingsField::ConfirmTerminalClose
-                    | SettingsField::RelaunchAgentsOnUpgrade
-                    | SettingsField::ChatEnterSends
-                    | SettingsField::FocusFollowsMouse
-                    | SettingsField::DefaultColumnFraction
-                    | SettingsField::DefaultWorktreePane
-                    | SettingsField::DefaultChannelPane
-                    | SettingsField::ManagedWorktreeDirectory
-                    | SettingsField::LinkOpenDestination
-                    | SettingsField::LinkOpenGesture
-                    | SettingsField::ShortcutNewTerminal
-                    | SettingsField::ShortcutNewChannel
-                    | SettingsField::ShortcutClonePane
-                    | SettingsField::ShortcutCloseFocusedColumn
-                    | SettingsField::ShortcutSearchProjects
-                    | SettingsField::ShortcutPreviousColumn
-                    | SettingsField::ShortcutNextColumn
-                    | SettingsField::ShortcutCyclePaneWidth
-                    | SettingsField::ShortcutPreviousWorkspace
-                    | SettingsField::ShortcutNextWorkspace
-                    | SettingsField::PullRequestOpenTarget
-                    | SettingsField::ShortcutReviewToggleViewed
-                    | SettingsField::ShortcutReviewNextFile
-                    | SettingsField::ShortcutReviewPreviousFile
-                    | SettingsField::ShortcutReviewNextUnviewed
-                    | SettingsField::ShortcutReviewNextChange
-                    | SettingsField::ShortcutReviewPreviousChange => Task::none(),
-                };
+                let effect = self.synchronize_settings(&previous);
                 Task::batch([save, effect])
             }
         }
+    }
+
+    /// Applies every live effect of the settings changing from `previous` to
+    /// the ones now in force.
+    ///
+    /// Effects are derived from what changed rather than from which control
+    /// changed it, so a single edit and a wholesale reset reach the same
+    /// state: a reset that skipped one leaves the pane showing a value the
+    /// rest of the application - or the daemon - is not using.
+    fn synchronize_settings(&mut self, previous: &AppSettings) -> Task<Message> {
+        self.synchronize_lifecycle_budget();
+        let mut tasks = Vec::new();
+        if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
+            self.card_chrome.clear();
+        }
+        if previous.worktree_sort != self.settings.worktree_sort {
+            self.sidebar_state
+                .set_worktree_sort(self.settings.worktree_sort);
+        }
+        if previous.app_theme != self.settings.app_theme
+            || previous.ui_scale != self.settings.ui_scale
+        {
+            // Also re-applies the terminal theme.
+            tasks.push(self.synchronize_appearance(previous.ui_scale));
+        } else if previous.terminal_theme != self.settings.terminal_theme {
+            self.synchronize_terminal_theme();
+        }
+        let (wrap_lines, syntax_theme) = (
+            self.settings.editor_wrap_lines,
+            self.settings.editor_syntax_theme,
+        );
+        if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        {
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        runtime.set_wrap_lines(wrap_lines);
+                        runtime.set_syntax_theme(syntax_theme);
+                    }
+                    CardRuntime::PullRequests(pane) => {
+                        pane.runtime.set_wrap_lines(wrap_lines);
+                        pane.runtime.set_syntax_theme(syntax_theme);
+                    }
+                    CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
+                    _ => {}
+                }
+            }
+        }
+        if previous.editor_auto_save != self.settings.editor_auto_save {
+            let auto_save = self.settings.editor_auto_save;
+            tasks.extend(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+                let CardRuntime::Repository(runtime) = runtime else {
+                    return None;
+                };
+                runtime.set_auto_save(auto_save);
+                Some(repository_task(runtime.auto_save_task(card)))
+            }));
+        }
+        if previous.show_status_bar != self.settings.show_status_bar {
+            tasks.push(self.accounts_surface_changed());
+        }
+        if previous.notifications != self.settings.notifications {
+            self.notification_ui
+                .preferences(self.settings.notifications);
+        }
+        if previous.hibernation_delay_ms != self.settings.hibernation_delay_ms {
+            // Reconciled here rather than through a queued `LifecycleSweep`,
+            // so the manager's exposure is current before the new grace is
+            // re-derived from it.
+            tasks.push(self.lifecycle_sweep());
+            tasks.push(self.reschedule_offscreen_lifecycle_sweep());
+        } else if previous.max_hot_cards != self.settings.max_hot_cards {
+            tasks.push(cosmic::task::message(Message::LifecycleSweep));
+        }
+        // A no-op unless the configured list changed; a reset restores the
+        // built-in list, a different set of processes whenever the user had
+        // configured their own.
+        tasks.push(self.synchronize_language_servers());
+        Task::batch(tasks)
     }
 
     /// Rebuilds the language-server manager when the configured list no longer
@@ -10302,44 +10435,15 @@ impl Cagents {
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
-        let previous_scale = self.settings.ui_scale;
-        self.settings = AppSettings::default();
-        self.sidebar_state
-            .set_worktree_sort(self.settings.worktree_sort);
+        let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.settings_pending.clear();
         self.settings_invalid.clear();
-        self.card_chrome.clear();
-        self.synchronize_lifecycle_budget();
-        // Reset restores the built-in server list, which is a different set of
-        // processes whenever the user had configured their own.
-        let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
         let save = self.save_settings_task(true);
         self.refresh_settings_feedback();
-        let sweep = self.lifecycle_sweep();
-        let appearance = self.synchronize_appearance(previous_scale);
-        let auto_save = Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-            if let CardRuntime::Chat(runtime) = runtime {
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-            }
-            if let CardRuntime::Repository(runtime) = runtime {
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                Some(repository_task(runtime.auto_save_task(card)))
-            } else {
-                None
-            }
-        }));
-        Task::batch([
-            save,
-            resync,
-            sweep,
-            appearance,
-            auto_save,
-            self.reschedule_offscreen_lifecycle_sweep(),
-        ])
+        let effects = self.synchronize_settings(&previous);
+        Task::batch([save, effects])
     }
 }
 
@@ -10388,6 +10492,7 @@ impl Application for Cagents {
     }
 
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
+        std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
@@ -10507,6 +10612,7 @@ impl Application for Cagents {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            exit: None,
             document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
@@ -11528,7 +11634,10 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.sidebar_state.apply(&action);
-                let activated = match &action {
+                // Opening a row, by pointer or keyboard, is navigation: it
+                // ends any explicit selection and anchors a later range, but
+                // selects nothing.
+                let opened = match &action {
                     SidebarAction::OpenRepository { project_id, .. } => {
                         Some(sidebar::SelectionRow::Project(*project_id))
                     }
@@ -11542,8 +11651,8 @@ impl Application for Cagents {
                     }
                     _ => None,
                 };
-                if let Some(row) = activated {
-                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Replace);
+                if let Some(row) = opened {
+                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
                 self.prune_sidebar_row_selection();
                 match action {
@@ -11553,6 +11662,7 @@ impl Application for Cagents {
                             iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
                         } else { Task::none() }
                     }
+                    SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
@@ -11571,6 +11681,8 @@ impl Application for Cagents {
                     }
                     SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
                     SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
+                    SidebarAction::EditWorktreeOperation(id) => self.reopen_worktree_operation(id, false),
+                    SidebarAction::RetryWorktreeOperation(id) => self.reopen_worktree_operation(id, true),
                     SidebarAction::RetryWorktreeDeletion { worktree_id, .. } => {
                         self.handle_project_action(project_ui::Action::RetryDelete(worktree_id))
                     }
@@ -11615,18 +11727,12 @@ impl Application for Cagents {
                         if self.sidebar_model.project(project_id).is_some_and(|project| project.kind == ProjectKind::Folder) {
                             return Task::none();
                         }
-                        self.worktree_dialog = Some(WorktreeDialog {
+                        self.open_worktree_dialog(
                             project_id,
                             repository,
-                            branch: String::new(),
-                            base: String::new(),
-                            destination: String::new(),
-                            advanced: false,
-                            resolving: None,
-                            error: None,
-                        });
-                        iced::widget::operation::focus(worktree_dialog_focus_id())
-                            .map(cosmic::Action::App)
+                            WorktreeDraft::default(),
+                            None,
+                        )
                     }
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
@@ -12208,7 +12314,9 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
-                if self.dirty_repository_close.is_some() {
+                // libcosmic reports the closed window through this same
+                // request, and a second close must not reopen the exit.
+                if self.exit.is_some() || self.dirty_repository_close.is_some() {
                     return Task::none();
                 }
                 let dirty = self
@@ -12374,6 +12482,24 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            // The exit released the parent before closing it. A factory that
+            // captured the window just before must not start browsers on a
+            // surface that is gone, nor mark the cards it would have loaded
+            // failed in the state the exit is about to save.
+            #[cfg(feature = "integrated-browser")]
+            Message::InitializeBrowserFactory if self.exit.is_some() => Task::none(),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserFactoryReady(result) if self.exit.is_some() => {
+                if let Ok(BrowserFactoryBinding {
+                    factory,
+                    parent_lifetime,
+                }) = result
+                {
+                    drop(factory);
+                    parent_lifetime.deactivate();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -12553,32 +12679,26 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WorktreeBranchChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.branch = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Branch, value);
                 }
                 Task::none()
             }
             Message::WorktreeBaseChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.base = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Base, value);
                 }
                 Task::none()
             }
             Message::WorktreeDestinationChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.destination = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Destination, value);
                 }
                 Task::none()
             }
             Message::ToggleWorktreeAdvanced => {
                 if let Some(dialog) = &mut self.worktree_dialog {
-                    dialog.advanced = !dialog.advanced;
+                    dialog.toggle_options();
                 }
                 Task::none()
             }
@@ -12600,20 +12720,7 @@ impl Application for Cagents {
             Message::WorktreeOperationsRehydrated(result) => {
                 self.restore_worktree_operations(result)
             }
-            Message::SubmitWorktree => {
-                let Some(dialog) = self.worktree_dialog.as_ref() else {
-                    return Task::none();
-                };
-                let input = crate::repository::WorktreeInput {
-                    repository: dialog.repository.clone(),
-                    input: dialog.branch.clone(),
-                    base: dialog.base.clone(),
-                    managed_directory: self.settings.managed_worktree_directory.clone(),
-                    destination: dialog.destination.clone(),
-                    operation_id: crate::model::OperationId::new(),
-                };
-                self.start_worktree_input(dialog.project_id, input)
-            }
+            Message::SubmitWorktree => self.submit_worktree_dialog(),
             Message::WorktreeCreated {
                 project_id,
                 repository,
@@ -12802,18 +12909,7 @@ impl Application for Cagents {
                     self.restore_pull_request_dialog(dialog, generation)
                 }
             },
-            Message::CancelDialog => {
-                if self.worktree_dialog.take().is_none()
-                    && self.pull_request_dialog.take().is_some()
-                {
-                    self.pull_request_dialog_generation =
-                        self.pull_request_dialog_generation.wrapping_add(1);
-                }
-                if let Some(target) = self.nested_modal_focus_target() {
-                    return iced::widget::operation::focus(target).map(cosmic::Action::App);
-                }
-                self.focus_context_overlay_if_exposed()
-            }
+            Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
@@ -12858,6 +12954,13 @@ impl Application for Cagents {
                 // keystroke. Global shortcuts below are deliberately exempt:
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
+                // A form dialog on top answers Escape before anything under
+                // it, such as a find bar or picker, and even when its focused
+                // field captured the key to blur itself: otherwise closing it
+                // would take a second press.
+                if is_escape_press(&event) && self.form_dialog_on_top() {
+                    return self.cancel_form_dialog();
+                }
                 if is_escape_press(&event) && !captured {
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
@@ -13170,7 +13273,12 @@ impl Application for Cagents {
                 self.apply_lsp_event(event);
                 Task::none()
             }
-            Message::LanguageServersReaped => iced::exit().map(cosmic::Action::App),
+            Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
+            Message::WindowClosed(window) => self.advance_exit(|exit| {
+                if exit.closing == Some(window) {
+                    exit.closing = None;
+                }
+            }),
             Message::SessionSaveHealthChanged(event) => {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
@@ -13192,11 +13300,15 @@ impl Application for Cagents {
             Message::DismissStatus | Message::DismissAllNotices => {
                 self.status = None;
                 self.notices.clear();
-                self.reconcile_notice_popup()
+                // An update or save-health notice can keep the popup open
+                // after the Dismiss all control that held focus is gone.
+                let reconciled = self.reconcile_notice_popup();
+                Task::batch([reconciled, self.refocus_notices()])
             }
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
-                self.reconcile_notice_popup()
+                let reconciled = self.reconcile_notice_popup();
+                Task::batch([reconciled, self.refocus_notices()])
             }
             Message::DirectoryFilesLoaded {
                 key,
@@ -13349,6 +13461,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
+        self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take() {
             match notice.severity {
                 NoticeSeverity::Error => {
@@ -13449,6 +13562,9 @@ impl Application for Cagents {
                 }
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
+                }
+                iced::Event::Window(window::Event::Closed) => {
+                    Some(Message::WindowClosed(event_window))
                 }
                 iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, true),
@@ -13666,78 +13782,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(dialog) = self.worktree_dialog.as_ref() {
-            let mut rows: Vec<Element<'_, Message>> = vec![
-                widget::text::title3("Create worktree").into(),
-                design::caption(
-                    "Enter a branch name, a Linear issue ID, or paste a Linear issue URL.",
-                )
-                .into(),
-                widget::text_input("Branch or Linear issue", &dialog.branch)
-                    .id(worktree_dialog_focus_id())
-                    .on_input(Message::WorktreeBranchChanged)
-                    .into(),
-                widget::button::text(if dialog.advanced {
-                    "Hide options"
-                } else {
-                    "Base branch & destination"
-                })
-                .on_press(Message::ToggleWorktreeAdvanced)
-                .into(),
-            ];
-            if dialog.advanced {
-                rows.extend([
-                    crate::design::caption("Base branch (optional)").into(),
-                    widget::text_input("Automatic repository default", &dialog.base)
-                        .id(widget::Id::new("dialog.worktree.base"))
-                        .on_input(Message::WorktreeBaseChanged)
-                        .into(),
-                    crate::design::caption("Destination (optional)").into(),
-                    widget::text_input("Automatic managed directory", &dialog.destination)
-                        .id(widget::Id::new("dialog.worktree.destination"))
-                        .on_input(Message::WorktreeDestinationChanged)
-                        .into(),
-                    crate::design::caption(format!(
-                        "Default parent: {}. Relative paths start at the repository root.",
-                        self.settings.managed_worktree_directory
-                    ))
-                    .into(),
-                ]);
-            }
-            if let Some(error) = &dialog.error {
-                rows.push(
-                    widget::text::body(error.as_str())
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .into(),
-                );
-            }
-            rows.push(
-                widget::row::with_children(vec![
-                    widget::button::standard("Cancel")
-                        .on_press(Message::CancelDialog)
-                        .into(),
-                    widget::button::suggested(if dialog.resolving.is_some() {
-                        "Resolving…"
-                    } else {
-                        "Create"
-                    })
-                    .on_press_maybe(
-                        (dialog.resolving.is_none() && !dialog.branch.trim().is_empty())
-                            .then_some(Message::SubmitWorktree),
-                    )
-                    .into(),
-                ])
-                .spacing(2.0 * design::GRID_UNIT)
-                .into(),
-            );
-            return Some(dialog_ui::overlay(
-                dialog_ui::surface(
-                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                    560.0,
-                ),
-                Some(Message::CancelDialog),
-                1.0,
-            ));
+        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+            return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
         let dialog = self.pull_request_dialog.as_ref()?;
@@ -13844,6 +13890,13 @@ impl Application for Cagents {
         ))
     }
 
+    /// The application opens no window but its main one, which stops being
+    /// the main window only when the exit closes it. libcosmic's default
+    /// panics, and iced may still draw the window before it removes it.
+    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
+        widget::Space::new().into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
@@ -13881,9 +13934,9 @@ impl Application for Cagents {
                     widget::button::suggested("New terminal")
                         .id(widget::Id::new("empty.new-terminal"))
                         .name("New terminal")
-                        .leading_icon(
-                            widget::icon::from_name("utilities-terminal-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "utilities-terminal-symbolic",
+                        ))
                         .on_press(Message::NewTerminal)
                         .into(),
                     widget::button::standard("Open folder")
@@ -13895,9 +13948,9 @@ impl Application for Cagents {
                     widget::button::standard("New browser")
                         .id(widget::Id::new("empty.new-browser"))
                         .name("New browser")
-                        .leading_icon(
-                            widget::icon::from_name("internet-web-browser-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "internet-web-browser-symbolic",
+                        ))
                         .on_press(Message::NewBrowser)
                         .into(),
                 ]
@@ -13917,7 +13970,8 @@ impl Application for Cagents {
             };
             let surface = widget::container(
                 widget::column::with_children(vec![
-                    widget::icon::from_name("utilities-terminal-symbolic")
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
+                        .icon()
                         .size(32)
                         .into(),
                     widget::text::title2("Start a workspace").into(),
@@ -14138,30 +14192,13 @@ impl Drop for Cagents {
         self.lsp.shutdown();
         self.lsp.kill_retired_now();
 
-        // Exact Wayland parent invariant:
-        // 1. request and join every browser still owned by a card;
-        // 2. join every off-UI-path card-close reaper;
-        // 3. drop the raw-handle factory/Wayland host;
-        // 4. deactivate/drop the parent lifetime guard;
-        // 5. only then may Rust drop `core` and its parent window.
+        // The exit path already released the parent before closing the
+        // window. Otherwise the window is still open, and this must complete
+        // before Rust drops `core` and, with it, the parent window.
         #[cfg(feature = "integrated-browser")]
-        for runtime in std::mem::take(&mut self.cards).into_values() {
-            if let CardRuntime::Browser(mut browser) = runtime {
-                browser.handle.shutdown();
-            }
-        }
+        self.release_browser_parent();
         for teardown in self.terminal_teardowns.drain(..) {
             let _ = teardown.join();
-        }
-        #[cfg(feature = "integrated-browser")]
-        for teardown in self.browser_teardowns.drain(..) {
-            let _ = teardown.join();
-        }
-        #[cfg(feature = "integrated-browser")]
-        self.browser_factory.take();
-        #[cfg(feature = "integrated-browser")]
-        if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
-            parent_lifetime.deactivate();
         }
     }
 }
@@ -14178,11 +14215,6 @@ fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::I
         DirtyCloseControl::Save => "save",
     };
     widget::Id::new(format!("dialog.dirty-close.{card}.{control}"))
-}
-
-/// The worktree dialog's first field, focused when it opens.
-fn worktree_dialog_focus_id() -> widget::Id {
-    widget::Id::new("dialog.worktree.branch")
 }
 
 /// The pull-request dialog's first field, focused when it opens.
@@ -15420,6 +15452,137 @@ mod tests {
         );
     }
 
+    /// The window is the only part of an exit anyone sees, so it closes as
+    /// soon as the exit is committed; the language-server reap, the final
+    /// session flush and the process teardown all happen after it has gone.
+    #[test]
+    fn committed_exit_closes_the_window_before_the_process_exits() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        let closing = Some(ApplicationExit {
+            closing: Some(window),
+            servers_reaped: false,
+        });
+        assert_eq!(app.exit, closing);
+        // Released, so libcosmic's report of the closed window cannot end the
+        // application under the reap the exit is still waiting on, and the
+        // frames iced may draw before it removes the window must not panic.
+        assert_eq!(app.core.main_window_id(), None);
+        let _ = app.view_window(window);
+
+        // That report arrives as another close request. It must not start the
+        // exit again or raise a dialog in a window that no longer exists.
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let _ = app.update(Message::WindowCloseRequested(window));
+        assert!(app.dirty_repository_close.is_none());
+        assert_eq!(app.exit, closing);
+    }
+
+    /// Once the window is gone, an activation must be refused rather than
+    /// acknowledged, so `cagents ui` opens a new window instead of reporting
+    /// one that is already running.
+    #[test]
+    fn committed_exit_stops_accepting_activations() {
+        let mut app = context_inspector_test_app(false);
+        let (activations, receiver) = async_channel::unbounded();
+        app.activation_rx = receiver;
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        assert!(!activations.is_closed());
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        assert!(activations.is_closed());
+        assert!(
+            activations
+                .send_blocking(instance::UiActivation {
+                    token: None,
+                    update: None,
+                })
+                .is_err()
+        );
+    }
+
+    /// Neither half of the exit may end the process alone: servers reaped
+    /// before the window is destroyed would tear iced down with the window
+    /// still on screen, and a destroyed window before the reap would take the
+    /// runtime away from servers still stopping.
+    #[test]
+    fn exit_waits_for_both_the_window_and_the_language_servers() {
+        for window_first in [true, false] {
+            let mut app = context_inspector_test_app(false);
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            let _ = app.update(Message::WindowCloseRequested(window));
+
+            let (first, second) = if window_first {
+                (
+                    Message::WindowClosed(window),
+                    Message::LanguageServersReaped,
+                )
+            } else {
+                (
+                    Message::LanguageServersReaped,
+                    Message::WindowClosed(window),
+                )
+            };
+            let _ = app.update(first);
+            assert!(!app.exit.unwrap().is_complete());
+            let _ = app.update(second);
+            assert!(app.exit.unwrap().is_complete());
+        }
+    }
+
+    /// Only the window the exit closed can finish it.
+    #[test]
+    fn another_window_closing_does_not_finish_the_exit() {
+        let mut app = context_inspector_test_app(false);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        let _ = app.update(Message::LanguageServersReaped);
+        let _ = app.update(Message::WindowClosed(window::Id::unique()));
+
+        assert!(!app.exit.unwrap().is_complete());
+    }
+
+    /// iced reports every window it removes; outside an exit that is not half
+    /// of one.
+    #[test]
+    fn window_closed_outside_an_exit_is_ignored() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::WindowClosed(window::Id::unique()));
+        let _ = app.update(Message::LanguageServersReaped);
+        assert_eq!(app.exit, None);
+    }
+
+    #[test]
+    fn unresolved_repository_keeps_the_window_open_on_close() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        assert!(app.dirty_repository_close.is_some());
+        assert_eq!(app.exit, None);
+        assert_eq!(app.core.main_window_id(), Some(window));
+    }
+
     #[test]
     fn window_close_rejects_discard_for_post_persist_edit_back_fence() {
         let mut app = context_inspector_test_app(true);
@@ -16183,6 +16346,42 @@ mod tests {
         settle_settings_task(&mut app, task);
         let _ = app.autosave_setting(SettingsField::TerminalFontFamily, stale);
         assert_eq!(settings::load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn resetting_settings_sends_restored_notification_preferences_to_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.notifications.enabled = false;
+        app.settings.notifications.while_focused = true;
+        assert_eq!(app.notification_ui.pending_preferences(), None);
+
+        let task = app.reset_settings();
+        settle_settings_task(&mut app, task);
+
+        // The daemon, not the pane, decides which alerts arrive; a reset that
+        // only redraws the toggles leaves it applying the old policy.
+        assert_eq!(
+            app.notification_ui.pending_preferences(),
+            Some(crate::notifications::Preferences::default())
+        );
+    }
+
+    #[test]
+    fn resetting_unchanged_notification_preferences_sends_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 20.0;
+
+        let task = app.reset_settings();
+        settle_settings_task(&mut app, task);
+
+        assert_eq!(app.notification_ui.pending_preferences(), None);
+        assert_eq!(app.settings, AppSettings::default());
     }
 
     #[test]
@@ -17626,16 +17825,15 @@ mod tests {
     fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
         let mut app = context_inspector_test_app(true);
         let project = ProjectId::new();
-        app.worktree_dialog = Some(WorktreeDialog {
-            project_id: project,
-            repository: PathBuf::from("/repo"),
-            branch: String::new(),
-            base: "main".into(),
-            destination: "/worktrees".into(),
-            advanced: false,
-            resolving: None,
-            error: None,
-        });
+        app.worktree_dialog = Some(WorktreeDialog::new(
+            project,
+            PathBuf::from("/repo"),
+            WorktreeDraft {
+                base: "main".into(),
+                destination: "/worktrees".into(),
+                ..WorktreeDraft::default()
+            },
+        ));
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
             worktree_dialog_focus_id().to_string()
@@ -19765,6 +19963,7 @@ mod tests {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            exit: None,
             document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
