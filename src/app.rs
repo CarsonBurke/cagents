@@ -14268,6 +14268,12 @@ impl Application for Cagents {
             Message::KeyEvent { event, captured } => {
                 if !captured
                     && !self.workspace_inputs_blocked()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    )
+                    .is_none()
                     && let keyboard::Event::KeyPressed {
                         key: keyboard::Key::Character(key),
                         modifiers,
