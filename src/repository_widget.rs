@@ -4828,24 +4828,27 @@ impl RepositoryRuntime {
         // display rows and pixel offsets both change meaning with the model.
         let mut rebuilt = None;
         if restores_current
-            && self.pending_diff_anchor.is_none()
             && let Some(previous) = self.diff_model()
             && let Some(DiffState::Ready(_, previous_layout)) = self.diff_state(&basis)
             && let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state
         {
+            // What the reader unfolded survives whatever the viewport awaits.
             layout.carry_reveals(model, (previous, previous_layout));
-            let mut anchor = self.current_diff_viewport();
-            if let Some(diff_layout::Anchor::Row { row, fraction }) = anchor.row {
-                anchor.row = Some(diff_layout::Anchor::Row {
-                    row: corresponding_row(
-                        (previous, self.diff_mode),
-                        row,
-                        (model, self.diff_mode),
-                    ),
-                    fraction,
-                });
+            // A pending anchor is logical and is applied below as it stands.
+            if self.pending_diff_anchor.is_none() {
+                let mut anchor = self.current_diff_viewport();
+                if let Some(diff_layout::Anchor::Row { row, fraction }) = anchor.row {
+                    anchor.row = Some(diff_layout::Anchor::Row {
+                        row: corresponding_row(
+                            (previous, self.diff_mode),
+                            row,
+                            (model, self.diff_mode),
+                        ),
+                        fraction,
+                    });
+                }
+                rebuilt = Some(anchor);
             }
-            rebuilt = Some(anchor);
         }
         match self
             .diffs
@@ -12307,6 +12310,39 @@ mod tests {
             row,
             layout.folded(DiffMode::Inline).display(line_54),
             "line 54, first on screen before the edit, is still at the top"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_awaiting_its_anchor_still_keeps_what_was_unfolded() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        drop(runtime.update(RepositoryAction::ExpandDiffFold {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run: 51..150,
+            expansion: FoldExpansion::Down,
+        }));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+
+        // A working-diff rebuild lands while the viewport still waits to
+        // place an anchor.
+        runtime.pending_diff_anchor = Some(runtime.current_diff_viewport());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(two_change_model())),
+        );
+        assert_eq!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+            &folded
         );
     }
 

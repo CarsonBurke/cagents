@@ -397,10 +397,12 @@ impl DiffLayout {
     }
 
     /// Carries `previous`'s reveals into this freshly built layout when the
-    /// model was rebuilt with the same unchanged runs - a refresh, or an
-    /// edit that only changed lines inside existing changes - so what the
-    /// reader unfolded stays unfolded. Runs of other lengths are different
-    /// runs, and their reveals would open the wrong lines.
+    /// model was rebuilt in place with the same unchanged runs - a working
+    /// diff rebuilt after an edit, including one that only changed lines
+    /// inside existing changes - so what the reader unfolded stays unfolded.
+    /// A reload through `request_diff` passes through `DiffState::Loading`
+    /// and starts folded again. Runs of other lengths are different runs,
+    /// and their reveals would open the wrong lines.
     pub fn carry_reveals(&mut self, model: &DiffModel, previous: (&DiffModel, &DiffLayout)) {
         let (previous_model, previous) = previous;
         let lengths = |model: &DiffModel| {
