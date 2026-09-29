@@ -24,7 +24,7 @@ use crate::{
 pub struct ViewportSample {
     pub offset: f32,
     pub width: f32,
-    /// Wheel input moves the camera; native layout feedback only acknowledges it.
+    /// Pointer input moves the camera; native layout feedback only acknowledges it.
     pub user_input: bool,
 }
 
@@ -1712,7 +1712,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         if let Some(input) = &self.scroll_input {
             input.set(matches!(
                 event,
-                Event::Mouse(mouse::Event::WheelScrolled { .. })
+                Event::Mouse(mouse::Event::WheelScrolled { .. }) | Event::Touch(_)
             ));
         }
         self.content.as_widget_mut().update(
