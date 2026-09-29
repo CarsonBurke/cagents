@@ -853,7 +853,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
         SettingsCategory::Editor => "accessories-text-editor-symbolic",
         SettingsCategory::Accounts => "system-users-symbolic",
-        SettingsCategory::About => "help-about-symbolic",
+        SettingsCategory::About => "dialog-information-symbolic",
     }
 }
 
