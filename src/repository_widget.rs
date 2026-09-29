@@ -2945,6 +2945,30 @@ impl RepositoryRuntime {
             self.pending_fragment = Some(fragment.to_owned());
             return Task::none();
         }
+        if let Some(coordinates) = fragment.strip_prefix('L') {
+            let (line, column) = coordinates
+                .split_once(':')
+                .or_else(|| coordinates.split_once('C'))
+                .unwrap_or((coordinates, "1"));
+            if let (Ok(line), Ok(column)) = (line.parse::<u32>(), column.parse::<u32>()) {
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
+                self.move_cursor_to(LspPosition::new(
+                    line.saturating_sub(1),
+                    column.saturating_sub(1),
+                ));
+                if let DocumentState::Editable(document) = &mut self.document {
+                    document
+                        .content
+                        .restore_scroll_position(text_editor::ScrollPosition {
+                            line: line.saturating_sub(1) as usize,
+                            vertical: 0.0,
+                            horizontal: 0.0,
+                        });
+                }
+                return Task::none();
+            }
+        }
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
         };
@@ -6783,7 +6807,10 @@ fn editable_document_view<'a>(
                         .map(|(index, item)| {
                             let content = markdown::item(
                                 &crate::document_link::PreviewViewer,
-                                markdown::Settings::from(cosmic::iced::Theme::Dark),
+                                crate::design::markdown_settings(
+                                    &cosmic::theme::active(),
+                                    crate::design::TEXT_BODY,
+                                ),
                                 item,
                                 index,
                             )
@@ -6795,9 +6822,12 @@ fn editable_document_view<'a>(
                         .collect::<Vec<_>>(),
                 )
                 .spacing(
-                    markdown::Settings::from(cosmic::iced::Theme::Dark)
-                        .spacing
-                        .0,
+                    crate::design::markdown_settings(
+                        &cosmic::theme::active(),
+                        crate::design::TEXT_BODY,
+                    )
+                    .spacing
+                    .0,
                 ),
             )
             .padding(spacing.space_m)
