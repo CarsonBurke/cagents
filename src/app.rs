@@ -3338,12 +3338,12 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
             if attempted.terminal_font_family.len() > settings::MAX_TERMINAL_FONT_FAMILY_BYTES =>
         {
             format!(
-                "{label} must be at most {} characters.",
+                "{label} must be at most {} bytes.",
                 settings::MAX_TERMINAL_FONT_FAMILY_BYTES
             )
         }
         SettingsField::TerminalFontFamily => {
-            format!("{label} must name an installed font, or be empty for system monospace.")
+            format!("{label} must be a font family name, or empty for the system monospace font.")
         }
         SettingsField::ManagedWorktreeDirectory
             if attempted.managed_worktree_directory.trim().is_empty() =>
@@ -21095,7 +21095,7 @@ mod tests {
         );
         assert_eq!(
             refusal(SettingsField::TerminalFontFamily, "F".repeat(129).as_str()),
-            "Font family must be at most 128 characters."
+            "Font family must be at most 128 bytes."
         );
         assert_eq!(
             refusal(SettingsField::ManagedWorktreeDirectory, " "),
