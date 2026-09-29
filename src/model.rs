@@ -1131,13 +1131,12 @@ pub struct WorkspaceState {
     pub channels: Vec<ProjectChannel>,
     #[serde(default, alias = "active_thread")]
     pub active_channel: Option<ChannelId>,
-    /// The workspace scope a card was filed under when its launch directory
-    /// belongs to no known worktree.
+    /// Explicit workspace filing, independent of a card's launch directory.
     ///
-    /// Adopting a daemon-owned terminal is the only producer: the launch recipe
-    /// is never rewritten to relocate a card, so a terminal started outside
-    /// every project needs its filing recorded somewhere durable or the user
-    /// would find it somewhere else after a restart.
+    /// Adoption records the chosen workspace without rewriting launch recipes.
+    /// Cloning and reopening preserve that ownership, including editors whose
+    /// descriptor points into a nested directory, so startup projection keeps
+    /// them in the workspace where they were opened.
     #[serde(default)]
     pub card_scopes: HashMap<CardId, PathBuf>,
     /// Unsent native-chat composer text, keyed by the card that owns it.

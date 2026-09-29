@@ -5574,6 +5574,15 @@ impl Cagents {
     }
 
     fn duplicate_pane(&mut self, source: CardState) -> Task<Message> {
+        let owner = self.card_worktree(&source).map(Path::to_path_buf);
+        self.duplicate_pane_in_scope(source, owner)
+    }
+
+    fn duplicate_pane_in_scope(
+        &mut self,
+        source: CardState,
+        owner: Option<PathBuf>,
+    ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
@@ -5660,6 +5669,14 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(id);
+        // The descriptor's directory can be a nested editor directory rather
+        // than its containing workspace. Keep the filing across projection.
+        if worktree_ui::card_directory(&card).is_some() {
+            if let Some(owner) = owner {
+                durable.card_scopes.insert(id, owner.clone());
+                self.worktree_owners.insert(id, owner);
+            }
+        }
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(id, title);
         }

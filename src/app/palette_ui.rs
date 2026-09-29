@@ -389,11 +389,20 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                let (card, _) = self.recently_closed.remove(index);
+                let (card, saved_scope) = self.recently_closed.remove(index);
                 if card.kind.is_utility() {
                     self.open_utility_card(card.kind)
                 } else {
-                    self.duplicate_pane(card)
+                    // Close retires the old card's filing. The matching saved
+                    // destination identifies the workspace being reopened in;
+                    // channel membership is restored separately on insertion.
+                    let owner = match saved_scope {
+                        Some(
+                            WorkspaceDestination::Worktree(_) | WorkspaceDestination::Folder(_),
+                        ) => self.active_workspace.clone(),
+                        Some(WorkspaceDestination::Channel(_)) | None => None,
+                    };
+                    self.duplicate_pane_in_scope(card, owner)
                 }
             }
             Command::FocusPane1
