@@ -264,8 +264,15 @@ fn settings_category_controls<'a>(
             if let Some((_, url)) = &updates.available {
                 update_row.push(update_ui::release_notes_button(url));
                 update_row.push(
+                    // `Apply` is refused while this window is blocked, so the
+                    // button is disabled and the reason shown below it.
                     widget::button::suggested("Review update")
-                        .on_press(Message::UpdateUi(update_ui::Action::Apply))
+                        .on_press_maybe(
+                            updates
+                                .apply_blocker
+                                .is_none()
+                                .then_some(Message::UpdateUi(update_ui::Action::Apply)),
+                        )
                         .into(),
                 );
             } else {
@@ -295,7 +302,10 @@ fn settings_category_controls<'a>(
                     ),
                     setting_field(
                         "Updates",
-                        updates.detail.clone(),
+                        match updates.apply_blocker {
+                            Some(reason) => format!("{} {reason}", updates.detail),
+                            None => updates.detail.clone(),
+                        },
                         widget::row::with_children(update_row)
                             .align_y(Alignment::Center)
                             .spacing(2.0 * design::GRID_UNIT)

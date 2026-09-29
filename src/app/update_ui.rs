@@ -58,6 +58,25 @@ fn elapsed_label(since: std::time::SystemTime, now: std::time::SystemTime) -> St
     format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
 }
 
+/// When the next background check runs, worded from the backoff that
+/// failed checks put it on.
+fn next_check_label(failures: u32) -> String {
+    let interval = background_check_interval(failures);
+    if interval >= CHECK_INTERVAL {
+        return "Checks again every six hours.".into();
+    }
+    let minutes = interval.as_secs().div_ceil(60).max(1);
+    let (count, unit) = if minutes < 120 {
+        (minutes, "minute")
+    } else {
+        (minutes / 60, "hour")
+    };
+    format!(
+        "Could not reach the release server; retrying in about {count} {unit}{}.",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
 /// What the About settings page shows about updates.
 pub(super) struct UpdateSummary {
     pub status: String,
@@ -68,6 +87,8 @@ pub(super) struct UpdateSummary {
     pub can_check: bool,
     /// A newer release: its version and release notes.
     pub available: Option<(String, String)>,
+    /// Why this window would refuse to apply `available` right now.
+    pub apply_blocker: Option<&'static str>,
     pub detail: String,
 }
 
@@ -561,11 +582,15 @@ impl Cagents {
                 "A source build does not download releases; install cagents to update it.".into()
             }
             (Some(checked), true) => format!(
-                "Last checked {}. Checks again every six hours.",
-                elapsed_label(checked, now)
+                "Last checked {}. {}",
+                elapsed_label(checked, now),
+                next_check_label(state.check_failures)
             ),
             (Some(checked), false) => format!("Last checked {}.", elapsed_label(checked, now)),
-            (None, true) => "Checks at startup and every six hours.".into(),
+            (None, true) if state.check_failures == 0 => {
+                "Checks at startup and every six hours.".into()
+            }
+            (None, true) => next_check_label(state.check_failures),
             (None, false) => "Automatic checks are off.".into(),
         };
         UpdateSummary {
@@ -573,6 +598,9 @@ impl Cagents {
             failed,
             checking: state.checking,
             can_check: !development && !state.checking && !state.updating(),
+            apply_blocker: available
+                .as_ref()
+                .and_then(|_| self.window_update_blocker()),
             available,
             detail,
         }
@@ -666,7 +694,15 @@ impl Cagents {
                             return self.update_update_ui(Action::Poll);
                         }
                     }
-                    Err(error) if manual => self.update_ui.check_error = Some(error),
+                    Err(error) if manual => {
+                        // The header's "Check again" has already cleared the
+                        // failure it showed, and `check_error` is only shown
+                        // on the About page, so say so where the user is.
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not check for updates: {error}"
+                        )));
+                        self.update_ui.check_error = Some(error);
+                    }
                     Err(error) => {
                         self.update_ui.check_failures =
                             self.update_ui.check_failures.saturating_add(1);
@@ -897,6 +933,19 @@ mod tests {
         assert!(app.update_ui.check_error.is_none());
         assert!(!app.has_update_control());
         assert_eq!(app.update_ui.check_failures, 1);
+        // The About page says when the backed-off retry runs, not the
+        // six-hour cadence it will return to.
+        app.settings.check_for_updates = true;
+        assert_eq!(
+            app.summarize_updates(false).detail,
+            "Could not reach the release server; retrying in about 2 minutes."
+        );
+        assert_eq!(next_check_label(0), "Checks again every six hours.");
+        assert_eq!(
+            next_check_label(7),
+            "Could not reach the release server; retrying in about 2 hours."
+        );
+        assert_eq!(next_check_label(40), "Checks again every six hours.");
         assert_eq!(background_check_interval(1), FIRST_CHECK_RETRY);
         assert_eq!(background_check_interval(2), FIRST_CHECK_RETRY * 2);
         assert_eq!(background_check_interval(40), CHECK_INTERVAL);
@@ -904,9 +953,12 @@ mod tests {
 
         // A check the user asked for says why it failed, where they asked.
         app.update_ui.checking = true;
+        app.status = None;
         app.update_ui.manual_check = true;
         drop(app.update_update_ui(Action::Checked(Err("network is unreachable".into()))));
         assert!(app.update_ui.check_error.is_some());
+        // The header control that sent it is gone, so a notice says why.
+        assert!(app.status.is_some());
         assert!(app.summarize_updates(false).failed);
         assert!(!app.update_ui.manual_check);
 
