@@ -70,6 +70,14 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Action | Default |
 | --- | --- |
 | New terminal | `Ctrl+Shift+T` |
+| New native thread | `Ctrl+Shift+N` |
+| Command palette | `Ctrl+Shift+P` |
+| Open settings | `Ctrl+Comma` |
+| Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
+| Rename focused pane | `F2` |
+| Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
+| Reopen closed pane | `Ctrl+Shift+Z` |
+| Focus pane 1–9 | `Alt+1` through `Alt+9` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
 | Close focused pane | `Ctrl+Shift+W` |
@@ -101,6 +109,11 @@ Workspace and review shortcuts are configurable; see
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
   enough to reveal the target pane.
+- **Ctrl+Tab** previews recently used panes. Release **Ctrl** to focus the
+  highlighted pane, or press **Escape** to cancel.
+- Use the command palette to search commands, panes, channels and workspaces.
+  Keyboard settings let you record a chord, remove it, or reset a command;
+  conflicts name the command that already uses the chord.
 - **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.

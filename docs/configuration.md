@@ -185,9 +185,11 @@ Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
 
 - Modifiers: `Ctrl` (or `Control`), `Alt`, `Super` (or `Meta`), and `Shift`.
-  Each chord needs `Ctrl`, `Alt`, or `Super`. `Shift` is optional.
+  Each chord needs `Ctrl`, `Alt`, or `Super`, except function keys, which can
+  stand alone. `Shift` is optional.
 - Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, `Tab`, `PageUp`, or
-  `PageDown`.
+  `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
+  keys, for example `Ctrl+Comma`.
 - No chord can appear twice, even under different actions.
 - A chord you bind here is not passed to the program running in a pane.
   For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
@@ -202,8 +204,8 @@ modifiers, joined by `+`. Names are case-insensitive.
   act only in a pull request pane. The chords reach terminals outside that scope.
 - `new_terminal`, `close_focused_column`, `search_projects`,
   `previous_column`, and `next_column` need at least one chord. The rest
-  (`new_channel`, `clone_pane`, `cycle_pane_width`, the two workspace actions,
-  and the six `review_*` actions) can be empty lists (`[]`), which leaves
+  including the command palette, pane actions and the six `review_*` actions
+  can be empty lists (`[]`), which leaves
   them unbound.
 
 ## Terminal themes
