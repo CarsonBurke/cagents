@@ -2386,6 +2386,9 @@ where
         }?;
         let origin = layout.bounds().shrink(self.text_padding()).position();
         let anchor = origin + Vector::new(point.x + internal.horizontal_translation(), point.y);
+        // Workspace layouts are in content space during the overlay pass;
+        // the camera translation places their anchors in the screen-space viewport.
+        let anchor = anchor + translation;
         if !viewport.contains(anchor) {
             return None;
         }
@@ -2398,7 +2401,7 @@ where
             content: popup,
             tree: &mut tree.children[0],
             bounds: &mut tree.state.downcast_mut::<State<Highlighter>>().popup_bounds,
-            anchor: Rectangle::new(anchor + translation, Size::new(1.0, height)),
+            anchor: Rectangle::new(anchor, Size::new(1.0, height)),
         })))
     }
 
@@ -3288,6 +3291,53 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn completion_and_hover_overlays_follow_the_scrolled_pane() {
+        let renderer = headless_renderer();
+        let content: Content = Content::with_text("fn main() {}\n");
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(420.0, 300.0));
+        for at in [None, Some(Position { line: 0, column: 3 })] {
+            let mut editor: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(&content)
+                .size(16.0)
+                .height(Length::Fill)
+                .popup(Some(cosmic::widget::text("Native result").into()), at);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<(), cosmic::Theme, cosmic::Renderer>);
+            let node = editor
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                )
+                .move_to(Point::new(1000.0, 40.0));
+            let mut popup = editor
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::new(-900.0, 0.0),
+                )
+                .expect("the translated pane's visible anchor must retain its popup");
+            let popup_layout = popup.layout(&renderer, viewport.size());
+            assert!(viewport.contains(popup_layout.bounds().position()));
+            assert!(popup_layout.bounds().x >= 100.0);
+            drop(popup);
+            assert!(
+                editor
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .is_none(),
+                "an offscreen pane must not raise a popup"
+            );
+        }
     }
 
     /// The viewport every wheel test lays out and points its cursor into.
