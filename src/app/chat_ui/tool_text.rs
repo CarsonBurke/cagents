@@ -21,6 +21,16 @@ impl Language {
         }
     }
 
+    /// The highlighter's name for the language, where it is highlighted.
+    fn token(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Shell => Some("sh"),
+            Self::Json => Some("json"),
+            Self::Diff => Some("diff"),
+        }
+    }
+
     fn path(self) -> &'static Path {
         Path::new(match self {
             Self::Plain => "snippet.txt",
@@ -41,7 +51,8 @@ pub(super) struct ToolText {
 pub(super) struct Preview {
     pub(super) text: String,
     language: Language,
-    syntax: crate::diff_view::SyntaxLines,
+    /// The text highlighted in both palettes, drawn from on every frame.
+    block: prose::CodeBlock,
     theme: crate::settings::EditorSyntaxTheme,
 }
 
@@ -75,40 +86,22 @@ impl Preview {
         {
             return previous;
         }
-        let mut preview = Self {
+        let block = prose::CodeBlock::new(language.token(), &text, theme);
+        Self {
             text,
             language,
-            syntax: Default::default(),
+            block,
             theme,
-        };
-        preview.rehighlight(theme);
-        preview
+        }
     }
 
     pub(super) fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         self.theme = theme;
-        self.syntax = match self.language {
-            Language::Plain => Default::default(),
-            Language::Shell => crate::diff_view::highlight_snippet(&self.text, "sh", theme),
-            Language::Json => crate::diff_view::highlight_snippet(&self.text, "json", theme),
-            Language::Diff => crate::diff_view::highlight_snippet(&self.text, "diff", theme),
-        };
+        self.block = prose::CodeBlock::new(self.language.token(), &self.text, theme);
     }
 
-    pub(super) fn view(&self) -> Element<'_, Message> {
-        let mut spans = Vec::new();
-        for (index, line) in self.text.split('\n').enumerate() {
-            if index > 0 {
-                spans.push(iced::widget::text::Span::new("\n"));
-            }
-            spans.extend(crate::diff_view::syntax_spans(
-                line,
-                self.syntax[usize::from(cosmic::theme::is_dark())]
-                    .get(index)
-                    .map_or(&[], Vec::as_slice),
-            ));
-        }
-        let text = iced::widget::rich_text(spans)
+    pub(super) fn view(&self) -> Element<'static, Message> {
+        let text = iced::widget::rich_text(self.block.spans(cosmic::theme::is_dark()).clone())
             .font(iced::Font::MONOSPACE)
             .size(design::TEXT_BODY)
             .line_height(1.3)
@@ -135,16 +128,16 @@ impl ToolText {
         } else {
             language
         };
-        let key = fence_key(language.path().to_str().unwrap_or_default(), text);
+        // The key reads a bounded tail of the text, as an item's change token
+        // does, rather than hashing all of it: a running command's output is
+        // updated on every refresh, and grows for as long as it runs.
+        let key = tail_digest(language as u64, text);
         if let Some(mut previous) = previous {
             if previous.key == key {
                 return previous;
             }
             if let Some(prefix) = text.get(..previous.bytes)
-                && fence_key(
-                    previous.language.path().to_str().unwrap_or_default(),
-                    prefix,
-                ) == previous.key
+                && tail_digest(previous.language as u64, prefix) == previous.key
             {
                 let cursor = previous.content.cursor();
                 previous
@@ -406,15 +399,12 @@ mod tests {
             crate::settings::EditorSyntaxTheme::InspiredGitHub,
         );
         assert_eq!(preview.language, Language::Json);
-        assert!(
-            preview
-                .syntax
-                .iter()
-                .all(|lines| lines.iter().any(|spans| spans.len() > 1))
-        );
-        let previous = preview.syntax.clone();
+        for dark in [false, true] {
+            assert!(preview.block.spans(dark).len() > 1);
+        }
+        let previous = preview.block.spans(true).clone();
         preview.rehighlight(crate::settings::EditorSyntaxTheme::SolarizedDark);
-        assert_ne!(preview.syntax, previous);
+        assert_ne!(*preview.block.spans(true), previous);
     }
 
     #[test]
