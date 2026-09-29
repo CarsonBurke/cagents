@@ -9491,7 +9491,10 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(100),
+            ))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -9581,7 +9584,10 @@ mod tests {
         }
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::ready(staged_text_diff(model_with(1))),
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(100),
+            ))),
         );
         drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
         drop(runtime.update(RepositoryAction::DiffViewport {
@@ -9672,7 +9678,7 @@ mod tests {
             identity,
             basis: DiffBasis::IndexToWorktree,
             request,
-            content: staged_text_diff(model_with(1)),
+            content: staged_text_diff(crate::diff_view::build_diff("", &"line\n".repeat(100))),
         }));
         assert_eq!(runtime.diff_viewport.offset, 1200.0);
         let visible = visible_rows(1000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
@@ -11930,6 +11936,9 @@ mod tests {
                     horizontal: 0.0,
                 }));
             }
+            // The pane returns to its reading height after the temporary
+            // redraw; the retained line must then survive measurement.
+            runtime.diff_viewport.height = 120.0;
             drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 200.0, &[]));
             assert_eq!(runtime.diff_viewport.offset, expected);
             assert!(runtime.pending_diff_anchor.is_none());
@@ -12153,7 +12162,7 @@ mod tests {
     fn expanding_a_fold_keeps_the_rows_on_screen_and_navigation_exact() {
         let card = CardId::new();
         let (mut runtime, identity) = diff_runtime(card);
-        runtime.diff_viewport.height = 300.0;
+        runtime.diff_viewport.height = 100.0;
         load_fresh_diff(&mut runtime, card, two_change_model());
         let layout = runtime.diff_layout().unwrap();
         let folded = layout.folded(DiffMode::Inline).clone();
@@ -12167,7 +12176,7 @@ mod tests {
         drop(runtime.update(RepositoryAction::DiffViewport {
             card,
             offset: display as f32 * DIFF_ROW_HEIGHT + 10.0,
-            height: 300.0,
+            height: 100.0,
             horizontal: 0.0,
             user_initiated: true,
         }));
@@ -12205,6 +12214,7 @@ mod tests {
 
         // Change navigation lands on the change's row in the folded layout,
         // or as near it as the now short document can scroll.
+        runtime.diff_viewport.height = 300.0;
         drop(runtime.update(RepositoryAction::NextChange { card }));
         let bottom =
             folded.len() as f32 * DIFF_ROW_HEIGHT + crate::design::SCROLLBAR_GUTTER - 300.0;
