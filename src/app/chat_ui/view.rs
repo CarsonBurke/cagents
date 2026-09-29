@@ -6,26 +6,6 @@ fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .width(Length::Fill)
         .into()
 }
-/// The copy control's label for code block `index`.
-///
-/// The transcript is rebuilt on every frame of a streaming turn, so the labels
-/// a message plausibly needs are spelled out instead of formatted per frame.
-fn code_label(index: usize) -> Cow<'static, str> {
-    const LABELS: [&str; 8] = [
-        "Copy code block 1",
-        "Copy code block 2",
-        "Copy code block 3",
-        "Copy code block 4",
-        "Copy code block 5",
-        "Copy code block 6",
-        "Copy code block 7",
-        "Copy code block 8",
-    ];
-    LABELS.get(index).map_or_else(
-        || Cow::Owned(format!("Copy code block {}", index + 1)),
-        |label| Cow::Borrowed(*label),
-    )
-}
 /// The composer's own line height and inner padding.
 ///
 /// Named because the composer's height is computed from the draft rather than
@@ -390,6 +370,7 @@ fn completion_row<'a>(
             design::caption(match row.kind {
                 completion::Kind::Command => "Command",
                 completion::Kind::Skill => "Skill",
+                completion::Kind::File => "File",
             })
             .class(cosmic::theme::Text::Custom(design::muted_text))
             .into(),
@@ -710,7 +691,17 @@ impl Cagents {
                     view
                 }
             }
-            _ => widget::text::body("Connecting to native chat…").into(),
+            _ => widget::row::with_children(vec![
+                crate::ui_controls::activity_spinner_tone(
+                    f32::from(design::ROW_ICON_SIZE),
+                    design::accent_color,
+                ),
+                design::body("Connecting to native chat…").into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .padding(step::GAP_M)
+            .into(),
         }
     }
 }
@@ -778,17 +769,8 @@ impl Runtime {
         // three quarters of it iced defaults to, which put a code span at
         // ten pixels.
         let dark = cosmic::theme::is_dark();
-        let markdown_settings = markdown::Settings {
-            code_size: design::TEXT_BODY.into(),
-            ..markdown::Settings::with_text_size(
-                design::TEXT_PROSE,
-                markdown::Style::from(if dark {
-                    iced::Theme::Dark
-                } else {
-                    iced::Theme::Light
-                }),
-            )
-        };
+        let markdown_settings =
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
         let selected = self
             .selected_subagent
             .as_ref()
@@ -914,6 +896,47 @@ impl Runtime {
             transcript.push(notice_entry(error));
         }
         content.extend(self.plan_view());
+        if let Some(query) = &self.find {
+            content.push(
+                widget::row::with_children(vec![
+                    widget::text_input("Find in conversation (case sensitive)", query)
+                        .id(card_control_id(target.card, "chat-find"))
+                        .on_input(move |query| action(Action::Find(target, query)))
+                        .on_focus(action(Action::FindFocused(target, true)))
+                        .on_unfocus(action(Action::FindFocused(target, false)))
+                        .width(Length::Fill)
+                        .into(),
+                    design::caption(if self.find_matches.is_empty() {
+                        "0 matches".to_owned()
+                    } else {
+                        format!(
+                            "{} of {} turns",
+                            self.find_index + 1,
+                            self.find_matches.len()
+                        )
+                    })
+                    .into(),
+                    small_icon(
+                        "go-up-symbolic",
+                        "Previous match",
+                        Action::FindNext(target, false),
+                    ),
+                    small_icon(
+                        "go-down-symbolic",
+                        "Next match",
+                        Action::FindNext(target, true),
+                    ),
+                    small_icon(
+                        "window-close-symbolic",
+                        "Close find",
+                        Action::CloseFind(target),
+                    ),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(step::GAP_S)
+                .into(),
+            );
+        }
         let transcript = widget::scrollable(
             widget::column::with_children(transcript)
                 // Turns are held apart further than anything inside one,
@@ -943,6 +966,40 @@ impl Runtime {
                 .or_else(|| snapshot.items.first())
                 .map(|item| item.id.as_str()),
         ));
+        if !self.scroll.at_bottom() {
+            content.push(
+                widget::button::custom(design::caption(if self.unseen_activity {
+                    "↓ New activity"
+                } else {
+                    "↓ Jump to latest"
+                }))
+                .class(crate::ui_controls::control_style(
+                    self.unseen_activity,
+                    None,
+                ))
+                .on_press(action(Action::Latest(target)))
+                .into(),
+            );
+        }
+        if let Some((text, _)) = &self.followup {
+            content.push(
+                widget::row::with_children(vec![
+                    design::caption(format!(
+                        "Queued for next turn · {}",
+                        Self::short_description(text, 100)
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+                    small_icon(
+                        "edit-undo-symbolic",
+                        "Take queued follow-up back to edit",
+                        Action::CancelFollowup(target),
+                    ),
+                ])
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        }
         // A draft starting for its first message says so on the message
         // itself.
         if transitioning && self.queued.is_none() {
@@ -1001,11 +1058,12 @@ impl Runtime {
             content.push(
                 widget::column::with_children(vec![
                     body(instructions.as_str()),
-                    widget::button::text("Open authorization page")
+                    widget::button::custom(design::body("Open authorization page"))
+                        .class(crate::ui_controls::control_style(false, None))
                         .on_press(action(Action::OpenUrl(url.clone())))
                         .into(),
                 ])
-                .spacing(4)
+                .spacing(step::GAP_XS)
                 .into(),
             );
         }
@@ -1061,17 +1119,30 @@ impl Runtime {
                 } else {
                     agent.description.clone()
                 };
-                let marker = match agent.status {
-                    chat::ToolStatus::Running => "◌",
-                    chat::ToolStatus::Succeeded => "✓",
-                    chat::ToolStatus::Failed => "!",
-                    chat::ToolStatus::Denied => "×",
+                let marker = if agent.status == chat::ToolStatus::Running {
+                    crate::ui_controls::activity_spinner_tone(
+                        f32::from(design::COMPACT_ICON_SIZE),
+                        design::accent_color,
+                    )
+                } else {
+                    crate::ui_controls::passive_icon(
+                        crate::ui_controls::symbolic_icon(match agent.status {
+                            chat::ToolStatus::Succeeded => "emblem-ok-symbolic",
+                            chat::ToolStatus::Failed => "dialog-warning-symbolic",
+                            _ => "process-stop-symbolic",
+                        }),
+                        design::COMPACT_ICON_SIZE,
+                    )
                 };
                 chips.push(
-                    widget::button::text(format!(
-                        "{marker} {}",
-                        Self::short_description(&label, 56)
-                    ))
+                    widget::button::custom(
+                        widget::row::with_children(vec![
+                            marker,
+                            design::caption(Self::short_description(&label, 56)).into(),
+                        ])
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                    )
                     .class(crate::ui_controls::control_style(
                         selected.is_some_and(|active| active.id == agent.id),
                         None,
@@ -1109,7 +1180,8 @@ impl Runtime {
             && !self.composer.text().contains(provided.as_str())
         {
             content.push(
-                widget::button::text("Append provider's suggested draft")
+                widget::button::custom(design::body("Append provider's suggested draft"))
+                    .class(crate::ui_controls::control_style(false, None))
                     .on_press_maybe(
                         (!transitioning).then_some(action(Action::AppendProviderDraft(target))),
                     )
@@ -1181,25 +1253,57 @@ impl Runtime {
                     .into(),
             );
         }
+        let mut attachment_chips = Vec::new();
         for (index, attachment) in self.attachments.iter().enumerate() {
-            content.push(
-                widget::row::with_children(vec![
-                    crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
-                        "Pasted image".to_owned()
-                    } else {
-                        attachment.path.display().to_string()
+            let chip = widget::row::with_children(vec![
+                if attachment
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        chat::IMAGE_EXTENSIONS
+                            .iter()
+                            .any(|known| extension.eq_ignore_ascii_case(known))
                     })
-                    .width(Length::Fill)
-                    .into(),
-                    icon(
-                        "edit-delete-symbolic",
-                        "Remove attachment",
-                        !transitioning,
-                        Action::RemoveAttachment(target, index),
-                    ),
-                ])
-                .align_y(Alignment::Center)
-                .spacing(4)
+                {
+                    iced::widget::image(iced::widget::image::Handle::from_path(&attachment.path))
+                        .width(design::DENSE_ROW_HEIGHT)
+                        .height(design::DENSE_ROW_HEIGHT)
+                        .content_fit(iced::ContentFit::Cover)
+                        .into()
+                } else {
+                    crate::ui_controls::passive_icon(
+                        crate::ui_controls::symbolic_icon("mail-attachment-symbolic"),
+                        design::ROW_ICON_SIZE,
+                    )
+                },
+                crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
+                    "Pasted image".to_owned()
+                } else {
+                    attachment
+                        .path
+                        .file_name()
+                        .unwrap_or(attachment.path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .width(Length::Fill)
+                .into(),
+                icon(
+                    "edit-delete-symbolic",
+                    "Remove attachment",
+                    !transitioning,
+                    Action::RemoveAttachment(target, index),
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(step::GAP_XS);
+            attachment_chips.push(
+                widget::tooltip(
+                    chip,
+                    design::caption(attachment.path.display().to_string()),
+                    widget::tooltip::Position::Top,
+                )
                 .into(),
             );
         }
@@ -1231,7 +1335,7 @@ impl Runtime {
                 (true, true) => &[PromptMode::Steer, PromptMode::Queue],
                 (true, false) => &[PromptMode::Steer],
                 (false, true) => &[PromptMode::Queue],
-                (false, false) => &[],
+                (false, false) => &[PromptMode::Queue],
             }
         } else {
             &[PromptMode::Send]
@@ -1308,6 +1412,11 @@ impl Runtime {
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .key_binding(move |press| {
+                    if press.modifiers.command()
+                        && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
+                    }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
                         && !press.modifiers.alt()
@@ -1332,6 +1441,19 @@ impl Runtime {
                         )
                     {
                         return Some(text_editor::Binding::Custom(action(choice)));
+                    }
+                    if snapshot.busy
+                        && available
+                        && self.model_picker.is_none()
+                        && !self.reasoning_picker
+                        && !self.account_picker
+                        && !self.permission_picker
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::Command(
+                            target,
+                            Command::Interrupt,
+                        ))));
                     }
                     if let Some(mode) =
                         submit_chord(&press, key_submit.0, key_submit.1, enter_sends)
@@ -1389,7 +1511,7 @@ impl Runtime {
         // cannot use and cannot interpret: the queue button in particular was
         // a bare plus that never responded and never said what it was for.
         // Buttons still appear only when there is a message to send.
-        if available && has_draft && key_submit.0.is_some() {
+        if available && self.followup.is_none() && has_draft && key_submit.0.is_some() {
             for (slot, mode) in modes.iter().enumerate() {
                 let (name, label) = submit_control(*mode, slot, enter_sends);
                 actions.push(icon(name, label, true, Action::Submit(target, *mode)));
@@ -1398,7 +1520,7 @@ impl Runtime {
         if snapshot.busy {
             actions.push(icon(
                 "media-playback-stop-symbolic",
-                "Cancel active turn",
+                "Cancel active turn (Esc)",
                 available,
                 Action::Command(target, Command::Interrupt),
             ));
@@ -1410,6 +1532,10 @@ impl Runtime {
         content.push(
             widget::container(
                 widget::column::with_children(vec![
+                    widget::column::with_children(attachment_chips)
+                        .spacing(step::GAP_XS)
+                        .padding([0, step::GAP_M as u16])
+                        .into(),
                     editor,
                     widget::container(
                         widget::row::with_children(actions)
@@ -1422,7 +1548,11 @@ impl Runtime {
                 .width(Length::Fill),
             )
             .class(design::surface(
-                Some(design::raised),
+                Some(if self.drop_hover {
+                    design::accent_wash
+                } else {
+                    design::raised
+                }),
                 [design::RADIUS_M; 4],
                 true,
             ))
@@ -1474,10 +1604,17 @@ impl Runtime {
             (None, "Ready")
         };
         if let Some(glyph) = glyph {
-            status.push(crate::ui_controls::passive_icon(
-                crate::ui_controls::symbolic_icon(glyph),
-                12,
-            ));
+            status.push(if snapshot.busy {
+                crate::ui_controls::activity_spinner_tone(
+                    f32::from(design::ROW_ICON_SIZE),
+                    design::accent_color,
+                )
+            } else {
+                crate::ui_controls::passive_icon(
+                    crate::ui_controls::symbolic_icon(glyph),
+                    design::COMPACT_ICON_SIZE,
+                )
+            });
         }
         status.push(
             design::caption(state)
@@ -1602,11 +1739,12 @@ impl Runtime {
         // The whole pane takes a drop, not just the composer: the transcript
         // is most of what a reader aims at, and a drop lands in the draft
         // wherever it was aimed.
-        crate::file_drop::target(
+        crate::file_drop::target_with_hover(
             pane,
             ("chat", target.card),
             accepting_drops && !transitioning,
             move |payload| action(Action::Dropped(target, payload)),
+            move |hovering| action(Action::DropHover(target, hovering)),
         )
     }
 
@@ -1819,22 +1957,42 @@ impl Runtime {
                     .into(),
                 );
             } else {
-                if selected.is_none() {
-                    controls.push(design::caption("Configured permissions").into());
-                }
-                let chosen = modes.clone();
-                let labels: Vec<_> = modes
-                    .iter()
-                    .map(|mode| permission_mode_label(mode).to_owned())
-                    .collect();
-                controls.push(
-                    widget::dropdown(labels, selected, move |index| {
-                        action(Action::PermissionMode(target, chosen[index].clone()))
-                    })
-                    .text_size(design::TEXT_CAPTION)
-                    .padding(CONTROL_PADDING)
-                    .into(),
-                );
+                let open = self.permission_picker;
+                let anchor = widget::button::custom(design::caption(
+                    selected.map_or("Configured permissions", |index| {
+                        permission_mode_label(&modes[index])
+                    }),
+                ))
+                .name("Choose permission mode")
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
+                let choices = open.then(|| {
+                    widget::column::with_children(
+                        modes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, mode)| {
+                                widget::button::custom(design::body(permission_mode_label(mode)))
+                                    .class(crate::ui_controls::control_style(
+                                        Some(index) == selected,
+                                        None,
+                                    ))
+                                    .width(Length::Fill)
+                                    .on_press(action(Action::PermissionMode(target, mode.clone())))
+                                    .into()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .width(200)
+                    .into()
+                });
+                controls.push(crate::ui_controls::popover(
+                    anchor,
+                    choices,
+                    widget::popover::Position::Top,
+                    action(Action::PermissionPicker(target, false)),
+                ));
             }
         }
         controls
@@ -2094,6 +2252,9 @@ impl Runtime {
         )
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
+        self.find.hash(&mut hasher);
+        self.copied.hash(&mut hasher);
+        self.snapshot.busy.hash(&mut hasher);
         // A running group's duration counts up, so its strip changes with the
         // clock; a finished one's is fixed at how long the work took.
         if !turn.steps.is_empty() {
@@ -2135,7 +2296,7 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         for index in &turn.prompt {
             if let Some(item) = items.get(*index) {
-                rows.push(Self::prompt_view(item));
+                rows.push(self.prompt_view(item));
             }
         }
         if !turn.steps.is_empty() {
@@ -2158,10 +2319,16 @@ impl Runtime {
                 _ => step(item, cached),
             });
         }
-        widget::column::with_children(rows)
-            .spacing(step::GAP_M)
-            .width(Length::Fill)
-            .into()
+        widget::container(
+            widget::column::with_children(rows)
+                .spacing(step::GAP_M)
+                .width(Length::Fill),
+        )
+        .id(iced::advanced::widget::Id::new(format!(
+            "chat-turn-{}-{}",
+            self.target.card, turn.key
+        )))
+        .into()
     }
 
     /// What to call an attachment the reader just sent.
@@ -2267,7 +2434,7 @@ impl Runtime {
     /// its author squared off. That asymmetry is what identifies the author
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
-    fn prompt_view(item: &chat::Item) -> Element<'static, Message> {
+    fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
@@ -2278,6 +2445,19 @@ impl Runtime {
         // An attachment sits under its prompt as an outlined chip rather than
         // another filled bubble, so a message with two images does not read as
         // three separate things the reader said.
+        let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
+        let expanded = self.expanded.contains(&item.id);
+        let text = if long && !expanded {
+            text.lines()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .chars()
+                .take(2000)
+                .collect::<String>()
+        } else {
+            text
+        };
         let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(crate::ui_controls::symbolic_icon(
@@ -2291,10 +2471,27 @@ impl Runtime {
             .align_y(Alignment::Center)
             .into()
         } else {
-            widget::selectable_text(text)
+            let text: Element<'static, Message> = widget::selectable_text(text)
                 .size(design::TEXT_PROSE)
                 .width(Length::Shrink)
+                .into();
+            if long {
+                widget::column::with_children(vec![
+                    text,
+                    widget::button::custom(design::caption(if expanded {
+                        "Show less"
+                    } else {
+                        "Show more"
+                    }))
+                    .class(crate::ui_controls::control_style(false, None))
+                    .on_press(action(Action::Toggle(self.target, item.id.clone())))
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
                 .into()
+            } else {
+                text
+            }
         };
         widget::container(
             widget::container(body)
@@ -2346,20 +2543,72 @@ impl Runtime {
     ) -> Element<'static, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
-            return widget::container(prose::view(cached, settings))
-                .max_width(design::READABLE_MEASURE)
-                .width(Length::Fill)
-                .into();
+            return widget::container(prose::view(
+                cached,
+                settings,
+                self.target,
+                self.find.as_deref(),
+            ))
+            .max_width(design::READABLE_MEASURE)
+            .width(Length::Fill)
+            .into();
         }
         if slot == turn::Slot::Thinking {
-            // Reasoning keeps a subtle surface without shrinking the prose.
+            let finished = !self.snapshot.busy
+                || self
+                    .snapshot
+                    .items
+                    .iter()
+                    .skip_while(|candidate| candidate.id != item.id)
+                    .skip(1)
+                    .any(|candidate| {
+                        matches!(
+                            &candidate.content,
+                            ItemContent::Text {
+                                phase: chat::Phase::Final,
+                                ..
+                            }
+                        )
+                    });
+            let expanded = !finished || self.expanded.contains(&item.id);
+            let elapsed = item.at.and_then(|start| {
+                self.snapshot
+                    .items
+                    .iter()
+                    .skip_while(|candidate| candidate.id != item.id)
+                    .skip(1)
+                    .find_map(|candidate| candidate.at)
+                    .map(|end| format_duration(end.saturating_sub(start)))
+            });
+            let label = elapsed.filter(|_| finished).map_or_else(
+                || "Thought process".to_owned(),
+                |elapsed| format!("Thought for {elapsed}"),
+            );
+            let mut rows = vec![
+                widget::button::custom(design::caption(format!(
+                    "{} {label}",
+                    if expanded { "▾" } else { "▸" }
+                )))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Toggle(target, item.id.clone())))
+                .into(),
+            ];
+            if expanded {
+                rows.push(prose::view(cached, settings, target, self.find.as_deref()));
+            }
             return widget::container(
-                widget::container(prose::view(cached, settings))
-                    .class(design::surface(
-                        Some(design::sunken),
-                        [design::RADIUS_S; 4],
-                        false,
-                    ))
+                widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        widget::container::Style {
+                            background: Some(design::sunken(theme).into()),
+                            text_color: Some(design::muted_color(theme)),
+                            border: iced::Border {
+                                radius: design::RADIUS_S.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }))
                     .padding([step::GAP_S as u16, step::GAP_M as u16])
                     .max_width(design::READABLE_MEASURE),
             )
@@ -2367,7 +2616,12 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        let mut rows: Vec<Element<'static, Message>> = vec![prose::view(cached, settings)];
+        let mut rows: Vec<Element<'static, Message>> = vec![prose::view(
+            cached,
+            settings,
+            self.target,
+            self.find.as_deref(),
+        )];
         // An answer's footer says when it finished and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
@@ -2377,22 +2631,24 @@ impl Runtime {
         // and an icon in the text color beside a muted stamp was the one
         // thing on the row that looked like it wanted attention.
         let mut controls: Vec<Element<'static, Message>> = vec![small_icon(
-            "edit-copy-symbolic",
+            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
+                "emblem-ok-symbolic"
+            } else {
+                "edit-copy-symbolic"
+            },
             "Copy this message",
             Action::Copy(target, item.id.clone(), CopyPart::Text),
         )];
-        for index in 0..cached.code.codes.len() {
-            controls.push(small_icon(
-                "edit-copy-symbolic",
-                code_label(index),
-                Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
-            ));
-        }
-        if let Some(stamp) = item.at.map(clock_label).filter(|at| !at.is_empty()) {
+
+        if let Some((_, stamp, full)) = &cached.stamp {
             controls.push(
-                design::caption(stamp)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
+                widget::tooltip(
+                    design::caption(stamp.clone())
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+                    design::caption(full.clone()),
+                    widget::tooltip::Position::Top,
+                )
+                .into(),
             );
         }
         rows.push(
@@ -2416,10 +2672,10 @@ impl Runtime {
 
 fn permission_mode_label(mode: &str) -> &str {
     match mode {
-        "default" | "manual" => "Ask",
+        "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
         "workspaceWrite" => "Workspace write",
-        "acceptEdits" => "Auto edits",
+        "acceptEdits" => "Auto-accept edits",
         "auto" => "Auto",
         "plan" => "Plan",
         "dontAsk" => "Don't ask",
@@ -3120,12 +3376,17 @@ mod tests {
             2,
             "the quoted fence and the top-level one"
         );
-        let settings = markdown::Settings::with_text_size(
-            design::TEXT_PROSE,
-            markdown::Style::from(iced::Theme::Dark),
-        );
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
         let renderer = crate::app::tests::headless_renderer();
-        let mut element = prose::view(&cached, settings);
+        let mut element = prose::view(
+            &cached,
+            settings,
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            None,
+        );
         let mut tree = iced::advanced::widget::Tree::new(&element);
         let node = element.as_widget_mut().layout(
             &mut tree,

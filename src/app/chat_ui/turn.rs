@@ -28,8 +28,7 @@ use std::collections::HashSet;
 pub(super) enum Slot {
     /// A command, tool call, file change, or search.
     Step,
-    /// The agent's own reasoning, which is prose about prose: it is rendered
-    /// inline and set back, never filed behind a disclosure row.
+    /// Reasoning streams inline and collapses behind a disclosure when done.
     Thinking,
     /// Progress narration, and the session notices the harness sends
     /// alongside it. Measured over this workstation's Codex history narration

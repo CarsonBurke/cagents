@@ -63,7 +63,9 @@ impl Token {
         let query = &word[sigil.len_utf8()..];
         // Anything but a name inside the word makes it a path, an expression
         // or punctuation, `/usr/bin` or `$HOME/x`, rather than a name.
-        if !query.chars().all(is_name_character) {
+        let name_character =
+            |character| is_name_character(character) || (sigil == '@' && character == '/');
+        if !query.chars().all(name_character) {
             return None;
         }
         // The word runs on past the caret as far as the name does, so a comma
@@ -75,7 +77,7 @@ impl Token {
             0
         } else {
             after
-                .find(|character: char| !is_name_character(character))
+                .find(|character: char| !name_character(character))
                 .unwrap_or(after.len())
         };
         if after[rest..].starts_with(sigils) {
@@ -149,6 +151,44 @@ pub(super) enum Kind {
     Command,
     /// A skill, which the provider reads anywhere in a message.
     Skill,
+    File,
+}
+
+/// Fuzzy subsequence matching preserves path boundaries in the inserted name.
+pub(super) fn files<'a>(paths: &'a [String], query: &str) -> Vec<Candidate<'a>> {
+    let query = query.to_lowercase();
+    let mut matches = paths
+        .iter()
+        .filter_map(|path| {
+            let lower = path.to_lowercase();
+            let mut remaining = query.chars();
+            let mut next = remaining.next();
+            let mut gaps = 0usize;
+            for character in lower.chars() {
+                if next == Some(character) {
+                    next = remaining.next();
+                } else if next.is_some() {
+                    gaps += 1;
+                }
+            }
+            next.is_none().then_some((gaps, path))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(a, path_a), (b, path_b)| {
+        a.cmp(b)
+            .then_with(|| path_a.len().cmp(&path_b.len()))
+            .then_with(|| path_a.cmp(path_b))
+    });
+    matches
+        .into_iter()
+        .take(100)
+        .map(|(_, path)| Candidate {
+            kind: Kind::File,
+            name: path,
+            insertion: Cow::Borrowed(path),
+            description: "Worktree file",
+        })
+        .collect()
 }
 
 /// One row of the completion list.
@@ -209,7 +249,7 @@ fn sigil_of(invocation: &str) -> Option<char> {
 /// The sigils that open a completion for this provider: the command slash,
 /// and whatever the provider spells its skills with.
 pub(super) fn sigils(snapshot: &Snapshot) -> Vec<char> {
-    let mut sigils = vec![COMMAND_SIGIL];
+    let mut sigils = vec![COMMAND_SIGIL, '@'];
     for skill in &snapshot.skills {
         if let Some(sigil) = sigil_of(&skill.invocation)
             && !sigils.contains(&sigil)
@@ -698,6 +738,33 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_mentions_fuzzy_match_paths_and_replace_only_the_token() {
+        use super::*;
+        let paths = vec![
+            "src/app/chat_ui.rs".to_owned(),
+            "src/chat.rs".to_owned(),
+            "docs/guide.md".to_owned(),
+        ];
+        let candidates = files(&paths, "s/ch");
+        assert_eq!(candidates.first().unwrap().name, "src/chat.rs");
+        assert!(candidates.iter().all(|row| row.kind == Kind::File));
+        assert!(files(&paths, "missing").is_empty());
+        let token = Token::at(
+            "read @src/ch carefully",
+            Position {
+                line: 0,
+                column: 12,
+            },
+            &['@'],
+            || false,
+        )
+        .unwrap();
+        assert_eq!(
+            (token.start, token.end, token.query.as_str()),
+            (5, 12, "src/ch")
+        );
+    }
     use super::*;
     use crate::chat::{Capabilities, Skill, SlashCommand};
 
@@ -889,7 +956,7 @@ mod tests {
             },
             ..Snapshot::default()
         };
-        assert_eq!(sigils(&snapshot), ['/', '$']);
+        assert_eq!(sigils(&snapshot), ['/', '@', '$']);
         assert_eq!(insertions(&snapshot, "use $co|"), ["$commits"]);
         // The slash names a skill in the provider's own spelling, and offers
         // compaction where it is a capability rather than a listed command.
@@ -915,7 +982,7 @@ mod tests {
             ],
             ..Snapshot::default()
         };
-        assert_eq!(sigils(&snapshot), ['/', '$']);
+        assert_eq!(sigils(&snapshot), ['/', '@', '$']);
         assert_eq!(
             insertions(&snapshot, "then $li|"),
             [

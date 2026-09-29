@@ -1259,7 +1259,10 @@ impl State {
                 rows.push(
                     markdown::view(
                         &composer.markdown,
-                        markdown::Settings::from(iced::Theme::Dark),
+                        crate::design::markdown_settings(
+                            &cosmic::theme::active(),
+                            crate::design::TEXT_BODY,
+                        ),
                     )
                     .map(|uri| Action::OpenLink(uri.to_string())),
                 );

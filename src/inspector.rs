@@ -1610,17 +1610,25 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
 /// this module's model is consumed by value, so the crate's own item viewer
 /// cannot be reused here. The parsing and all inline styling still come from
 /// it: `markdown::Text::spans` yields owned, already-styled spans.
-/// Parsing happens on every render: `LspInspectorContext` carries the hover as
-/// the Markdown source the manager delivered, and the whole inspector model is
-/// rebuilt per frame anyway. `repository_widget` caches its parse because a
-/// document's Markdown lives in durable widget state; a hover answer does not.
+/// The most recent source is parsed once; theme-dependent spans are applied
+/// when the cached items are rendered.
 fn markdown_body(source: &str) -> Element<'static, InspectorAction> {
-    let settings = widget::markdown::Settings::with_text_size(
-        design::TEXT_BODY,
-        widget::markdown::Style::from(cosmic::iced::Theme::Dark),
-    );
-    let items: Vec<widget::markdown::Item> = widget::markdown::parse(source).collect();
-    markdown_items(&items, &settings, 0)
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_BODY);
+    thread_local! {
+        // One inspector hover is visible at a time; a single entry avoids
+        // retaining every server response for the application's lifetime.
+        static PARSED: std::cell::RefCell<Option<(String, Vec<widget::markdown::Item>)>> = const { std::cell::RefCell::new(None) };
+    }
+    PARSED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != source)
+        {
+            *cache = Some((source.to_owned(), widget::markdown::parse(source).collect()));
+        }
+        markdown_items(&cache.as_ref().unwrap().1, &settings, 0)
+    })
 }
 
 fn markdown_items(
