@@ -13820,13 +13820,22 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
                 let task = self.apply_viewport(update, false, false);
-                if synchronize_scroll {
-                    Task::batch([task, self.synchronize_workspace_scroll()])
+                // Both native Scrolled feedback and Resized can measure the
+                // narrower strip first. Reveal its active tab independently
+                // of focus activation and attention acknowledgement.
+                let tabs = if previous_width != self.workspace.viewport_width() {
+                    self.reveal_active_tab()
                 } else {
-                    task
+                    Task::none()
+                };
+                if synchronize_scroll {
+                    Task::batch([task, tabs, self.synchronize_workspace_scroll()])
+                } else {
+                    Task::batch([task, tabs])
                 }
             }
             Message::Frame(frame) => {
