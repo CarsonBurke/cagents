@@ -100,6 +100,7 @@ impl Cagents {
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
             return Task::none();
         };
+        let restore_query_focus = matches!(&action, Action::Case(_));
         let find = self.terminal_find.entry(card).or_default();
         match action {
             Action::Context(_, point, selection, link) => {
@@ -197,6 +198,7 @@ impl Cagents {
                 return Task::none();
             }
             Action::Next(_, backwards) => {
+                find.focused = true;
                 if !find.matches.is_empty() {
                     find.selected = if backwards {
                         (find.selected + find.matches.len() - 1) % find.matches.len()
@@ -205,7 +207,7 @@ impl Cagents {
                     };
                     let _ = handle.scroll_to_row(find.matches[find.selected].start_row);
                 }
-                return Task::none();
+                return iced::widget::operation::focus(input_id(card)).map(cosmic::Action::App);
             }
             Action::Query(_, query) => find.query = query,
             Action::Case(_) => find.case_sensitive = !find.case_sensitive,
@@ -214,13 +216,22 @@ impl Cagents {
         find.matches = Arc::default();
         find.selected = 0;
         find.truncated = false;
+        let focus = if restore_query_focus {
+            find.focused = true;
+            iced::widget::operation::focus(input_id(card)).map(cosmic::Action::App)
+        } else {
+            Task::none()
+        };
         if let Err(error) = handle.search(find.request, find.query.clone(), find.case_sensitive) {
-            return cosmic::task::message(Message::TerminalError {
-                card,
-                message: error.to_string(),
-            });
+            return Task::batch([
+                focus,
+                cosmic::task::message(Message::TerminalError {
+                    card,
+                    message: error.to_string(),
+                }),
+            ]);
         }
-        Task::none()
+        focus
     }
 
     pub(super) fn refresh_completed_terminal_find(&mut self, card: CardId) {
