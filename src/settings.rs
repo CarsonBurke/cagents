@@ -525,7 +525,7 @@ fn default_managed_worktree_directory() -> String {
 }
 
 const fn default_focus_follows_mouse() -> bool {
-    true
+    false
 }
 
 const fn default_editor_auto_save() -> bool {
@@ -2776,7 +2776,7 @@ mod tests {
             default_column_fraction: 0.55,
             managed_worktree_directory: "../managed trees/".to_owned(),
             worktree_sort: WorktreeSort::Oldest,
-            focus_follows_mouse: false,
+            focus_follows_mouse: true,
             confirm_terminal_close: false,
             relaunch_agents_on_upgrade: false,
             ..AppSettings::default()
@@ -2801,7 +2801,7 @@ mod tests {
         table.remove("relaunch_agents_on_upgrade");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
-        assert!(decoded.focus_follows_mouse);
+        assert!(!decoded.focus_follows_mouse);
         assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
     }
@@ -2950,7 +2950,7 @@ mod tests {
             assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
             assert_eq!(loaded.sidebar_width, expected_width);
             assert_eq!(loaded.default_column_fraction, 0.72);
-            assert!(loaded.focus_follows_mouse);
+            assert!(!loaded.focus_follows_mouse);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
     }
@@ -2986,7 +2986,7 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.sidebar_width, 376.0);
         assert_eq!(migrated.terminal_font_size, 15.0);
         assert_eq!(migrated.default_column_fraction, 0.72);
-        assert!(migrated.focus_follows_mouse);
+        assert!(!migrated.focus_follows_mouse);
         // Every shortcut the file held was a default then, so each takes
         // today's default.
         assert_eq!(migrated.keyboard_shortcuts, KeyboardShortcuts::default());

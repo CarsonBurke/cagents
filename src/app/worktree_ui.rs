@@ -1349,6 +1349,7 @@ mod tests {
                 &shortcuts,
                 workspace_widget::FocusedPane::Other,
                 true,
+                &crate::input_trace::InputTrace::default(),
                 300.0,
                 id,
                 |_| {
