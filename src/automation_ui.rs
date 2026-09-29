@@ -36,6 +36,9 @@ const WEEKDAYS: [&str; 7] = [
 pub struct TargetChoice {
     pub label: String,
     pub target: Target,
+    /// The account each provider's new work in this directory uses: the
+    /// project's own choice, or else the application default.
+    pub defaults: BTreeMap<Provider, AccountId>,
 }
 #[derive(Debug, Clone)]
 pub struct AccountChoice {
@@ -155,6 +158,9 @@ pub struct Draft {
     timeout: String,
     provider: usize,
     account: Option<usize>,
+    /// Whether the account was picked, or saved, rather than preselected as
+    /// the target's default; a preselection follows the provider and target.
+    account_chosen: bool,
     target: Option<usize>,
     schedule: usize,
     weekday: usize,
@@ -180,13 +186,15 @@ impl Draft {
             custom_model: false,
             effort: None,
             permission: String::new(),
-            timezone: "UTC".into(),
+            timezone: crate::automations::schedule::system_timezone()
+                .unwrap_or_else(|| "UTC".into()),
             hour: "9".into(),
             minute: "0".into(),
             cron: "0 9 * * 1-5".into(),
             timeout: "30".into(),
             provider: 0,
             account: None,
+            account_chosen: false,
             target: (!targets.is_empty()).then_some(0),
             schedule: 1,
             weekday: 0,
@@ -210,6 +218,8 @@ impl Draft {
                 .accounts
                 .iter()
                 .position(|entry| Some(&entry.id) == definition.agent.account.as_ref());
+            // A saved account is never replaced by a default, even when absent.
+            value.account_chosen = true;
             value.target = value
                 .targets
                 .iter()
@@ -224,6 +234,7 @@ impl Draft {
                         definition.agent.target.directory.display()
                     ),
                     target: definition.agent.target.clone(),
+                    defaults: BTreeMap::new(),
                 });
             }
             value.reuse = definition.session_mode == SessionMode::Reuse;
@@ -264,7 +275,33 @@ impl Draft {
                 }
             }
         }
+        value.preselect_account();
         value
+    }
+
+    /// Unless the reader picked one, the account is the target's default for
+    /// the provider, as a new conversation there would use, or the provider's
+    /// only account.
+    fn preselect_account(&mut self) {
+        if self.account_chosen {
+            return;
+        }
+        let provider = provider(self.provider);
+        let default = self
+            .target
+            .and_then(|index| self.targets.get(index))
+            .and_then(|target| target.defaults.get(&provider));
+        let mut candidates = self
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| account.provider == provider);
+        let only = candidates.clone().nth(1).is_none();
+        self.account = candidates
+            .clone()
+            .find(|(_, account)| Some(&account.id) == default)
+            .or_else(|| candidates.next().filter(|_| only))
+            .map(|(index, _)| index);
     }
 
     /// The listed model this draft names, whose efforts it chooses among.
@@ -324,17 +361,12 @@ impl Draft {
         }
     }
 
-    fn definition(&self, models: &Models) -> Result<Definition, String> {
-        if let (Some(model), Some(effort)) = (self.listed(models), &self.effort)
-            && !model.reasoning.contains(effort)
-        {
-            return Err(format!(
-                "{} does not offer the {effort} reasoning effort; choose one it lists",
-                model.label
-            ));
-        }
+    /// The schedule as entered, with a timezone the database knows. The daemon
+    /// checks the same again when saving.
+    fn schedule(&self) -> Result<Schedule, String> {
         let parse = |text: &str, label: &str| {
-            text.parse::<u8>()
+            text.trim()
+                .parse::<u8>()
                 .map_err(|_| format!("Enter a valid {label}"))
         };
         let pattern = match self.schedule {
@@ -358,6 +390,29 @@ impl Draft {
                 expression: self.cron.clone(),
             },
         };
+        pattern.expression()?;
+        let timezone = self.timezone.trim();
+        if !timezone_names().iter().any(|name| name == timezone) {
+            return Err(format!(
+                "Choose a timezone from the list; {timezone:?} is not one"
+            ));
+        }
+        Ok(Schedule {
+            pattern,
+            timezone: timezone.into(),
+        })
+    }
+
+    fn definition(&self, models: &Models) -> Result<Definition, String> {
+        if let (Some(model), Some(effort)) = (self.listed(models), &self.effort)
+            && !model.reasoning.contains(effort)
+        {
+            return Err(format!(
+                "{} does not offer the {effort} reasoning effort; choose one it lists",
+                model.label
+            ));
+        }
+        let schedule = self.schedule()?;
         let account = self
             .account
             .and_then(|index| self.accounts.get(index))
@@ -379,10 +434,7 @@ impl Draft {
                 permission_mode: optional(&self.permission),
                 reasoning_effort: self.effort.clone(),
             },
-            schedule: Schedule {
-                pattern,
-                timezone: self.timezone.trim().into(),
-            },
+            schedule,
             session_mode: if self.reuse {
                 SessionMode::Reuse
             } else {
@@ -711,7 +763,10 @@ impl State {
                     && draft.provider != index
                 {
                     draft.provider = index;
-                    draft.account = None;
+                    // An account belongs to one provider; the new one's default
+                    // replaces it, even one picked for the previous provider.
+                    draft.account_chosen = false;
+                    draft.preselect_account();
                     // Model IDs and effort names belong to one provider.
                     draft.choose_model(ModelChoice::Default, &self.models);
                 }
@@ -735,12 +790,14 @@ impl State {
                         .filter(|(_, account)| account.provider == provider(draft.provider))
                         .nth(index)
                         .map(|(index, _)| index);
+                    draft.account_chosen = true;
                 }
             }
             Action::Target(index) => {
                 if let Some(draft) = &mut self.draft {
                     if index < draft.targets.len() {
                         draft.target = Some(index);
+                        draft.preselect_account();
                     }
                 }
             }
@@ -1176,11 +1233,6 @@ impl Draft {
                 .into(),
             widget::text::body("Schedule").into(),
             widget::dropdown(SCHEDULES.to_vec(), Some(self.schedule), Action::Schedule).into(),
-            input(
-                "IANA timezone, e.g. America/Vancouver",
-                &self.timezone,
-                Field::Timezone,
-            ),
         ])
         .spacing(8)
         .width(Length::Fill);
@@ -1199,6 +1251,7 @@ impl Draft {
                 ));
             }
         }
+        fields = fields.push(self.timezone_picker()).push(self.next_run());
         fields = fields.push(widget::checkbox(self.reuse).label("Reuse this automation's idle agent").on_toggle(Action::Reuse))
             .push(widget::text::body("Fresh sessions close after a result. Reuse keeps the same account, model, reasoning effort and permissions; interactive takeover pauses automation reuse."))
             .push(widget::checkbox(self.precheck).label("Run a shell precheck").on_toggle(Action::Precheck));
@@ -1213,6 +1266,55 @@ impl Draft {
 }
 
 impl Draft {
+    /// The timezone is typed to search the system's zones; a match fills it.
+    fn timezone_picker(&self) -> Element<'_, Action> {
+        let mut column = widget::column::with_children(vec![
+            widget::text::body("Timezone").into(),
+            widget::text_input("Search timezones, e.g. Vancouver", &self.timezone)
+                .on_input(|value| Action::Field(Field::Timezone, value))
+                .into(),
+        ])
+        .spacing(4);
+        let query = self.timezone.trim();
+        if !timezone_names().iter().any(|name| name == query) {
+            let matches = timezone_matches(query, 6);
+            if matches.is_empty() {
+                column = column.push(widget::text::caption(if query.is_empty() {
+                    "Type a city or region to find its timezone."
+                } else {
+                    "No timezone matches this search."
+                }));
+            }
+            for name in matches {
+                column = column.push(
+                    widget::button::custom(widget::text::body(name))
+                        .class(crate::ui_controls::control_style(false, None))
+                        .width(Length::Fill)
+                        .on_press(Action::Field(Field::Timezone, name.to_owned())),
+                );
+            }
+        }
+        column.into()
+    }
+
+    /// When the schedule as entered runs next, or why it cannot run.
+    fn next_run(&self) -> Element<'_, Action> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let text = self
+            .schedule()
+            .and_then(|schedule| {
+                crate::automations::schedule::describe_next(
+                    &schedule,
+                    now,
+                    &jiff::tz::TimeZone::system(),
+                )
+            })
+            .map_or_else(|error| error, |next| format!("Next run: {next}"));
+        widget::text::caption(text).into()
+    }
+
     /// The provider's listed models, as the composer offers them, or a typed
     /// ID for one it does not list. Before a provider has listed any, the
     /// model is typed.
@@ -1423,6 +1525,49 @@ fn provider_index(provider: Provider) -> usize {
         Provider::Omp => 2,
     }
 }
+/// Every timezone the schedule can name, read once from the system database.
+fn timezone_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = crate::automations::schedule::timezones();
+        names.sort_unstable();
+        names
+    })
+}
+
+/// At most `limit` timezones for `query`, which matches any part of a name
+/// with spaces for underscores: a city (`vancouver`, `new york`) before a
+/// region or a fragment elsewhere in the name.
+fn timezone_matches(query: &str, limit: usize) -> Vec<&'static str> {
+    let query = query.trim().to_lowercase().replace(' ', "_");
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = timezone_names()
+        .iter()
+        .filter_map(|name| {
+            let lower = name.to_lowercase();
+            let city = lower.rsplit('/').next().unwrap_or(&lower);
+            let rank = if city.starts_with(&query) {
+                0
+            } else if lower.starts_with(&query) {
+                1
+            } else if lower.contains(&query) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, name)| name)
+        .collect()
+}
+
 fn optional(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
@@ -1533,6 +1678,7 @@ mod tests {
         let target = TargetChoice {
             label: "Original target".into(),
             target: existing.definition.agent.target.clone(),
+            defaults: BTreeMap::new(),
         };
         let mut state = State {
             selected: Some(existing.clone()),
@@ -1712,6 +1858,7 @@ mod tests {
             vec![TargetChoice {
                 label: "Fixture".into(),
                 target: agent.target.clone(),
+                defaults: BTreeMap::new(),
             }],
             vec![AccountChoice {
                 label: "Codex".into(),
@@ -1790,10 +1937,119 @@ mod tests {
         assert_eq!(saved_effort(&state), Ok(Some("low".into())));
     }
 
+    fn account(label: &str, provider: Provider) -> AccountChoice {
+        AccountChoice {
+            label: label.into(),
+            provider,
+            id: format!("{}/{}", provider.executable(), Uuid::new_v4())
+                .parse()
+                .unwrap(),
+        }
+    }
+
+    fn selected_account(state: &State) -> Option<&str> {
+        let draft = state.draft.as_ref().unwrap();
+        draft
+            .account
+            .map(|index| draft.accounts[index].label.as_str())
+    }
+
+    #[test]
+    fn a_new_automation_starts_on_the_targets_default_account() {
+        let work = account("Work", Provider::Claude);
+        let personal = account("Personal", Provider::Claude);
+        let codex = account("Codex", Provider::Codex);
+        let target = |label: &str, claude: &AccountChoice| TargetChoice {
+            label: label.into(),
+            target: automation().definition.agent.target,
+            defaults: BTreeMap::from([(Provider::Claude, claude.id.clone())]),
+        };
+        let mut state = State::default();
+        state.set_choices(
+            vec![
+                target("Work project", &work),
+                target("Side project", &personal),
+            ],
+            vec![work.clone(), personal.clone(), codex],
+            Models::new(),
+        );
+        state.update(Action::New);
+        assert_eq!(selected_account(&state), Some("Work"));
+        // The preselection follows the target until the reader picks one.
+        state.update(Action::Target(1));
+        assert_eq!(selected_account(&state), Some("Personal"));
+        state.update(Action::Account(0));
+        state.update(Action::Target(0));
+        state.update(Action::Target(1));
+        assert_eq!(selected_account(&state), Some("Work"));
+        // With no default of its own, a provider's only account is chosen.
+        state.update(Action::Provider(provider_index(Provider::Codex)));
+        assert_eq!(selected_account(&state), Some("Codex"));
+        // A provider with no account leaves the choice to the reader.
+        state.update(Action::Provider(provider_index(Provider::Omp)));
+        assert_eq!(selected_account(&state), None);
+        // Changing provider replaced the picked account with a default.
+        state.update(Action::Provider(provider_index(Provider::Claude)));
+        assert_eq!(selected_account(&state), Some("Personal"));
+    }
+
+    #[test]
+    fn a_new_automation_starts_in_the_system_timezone() {
+        let mut state = State::default();
+        state.update(Action::New);
+        let timezone = &state.draft.as_ref().unwrap().timezone;
+        assert_eq!(
+            Some(timezone),
+            crate::automations::schedule::system_timezone()
+                .or_else(|| Some("UTC".into()))
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn timezones_are_found_by_city_before_any_other_part() {
+        assert_eq!(timezone_matches("vancouver", 6), ["America/Vancouver"]);
+        assert_eq!(timezone_matches("New york", 1), ["America/New_York"]);
+        let europe = timezone_matches("europe/", 6);
+        assert_eq!(europe.len(), 6);
+        assert!(europe.iter().all(|name| name.starts_with("Europe/")));
+        // A city match ranks before a name that only contains the query.
+        let city = |name: &str| name.rsplit('/').next().unwrap().to_lowercase();
+        let ho = timezone_matches("ho", 200);
+        let first_other = ho.iter().position(|name| !city(name).starts_with("ho"));
+        assert!(first_other.is_some_and(|index| index > 0));
+        assert!(
+            ho[first_other.unwrap()..]
+                .iter()
+                .all(|name| !city(name).starts_with("ho"))
+        );
+        assert!(timezone_matches("", 6).is_empty());
+        assert!(timezone_matches("Mars", 6).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_timezone_is_refused_before_the_daemon_sees_it() {
+        let (mut state, existing) = editing(None, None);
+        state.update(Action::Field(Field::Timezone, "Vancouver".into()));
+        let draft = state.draft.as_ref().unwrap();
+        let error = draft.definition(&state.models).unwrap_err();
+        assert!(error.contains("\"Vancouver\""), "{error}");
+        state.update(Action::Field(Field::Timezone, "America/Vancouver".into()));
+        let saved = state
+            .draft
+            .as_ref()
+            .unwrap()
+            .definition(&state.models)
+            .unwrap();
+        assert_eq!(saved.schedule.timezone, "America/Vancouver");
+        assert_eq!(saved.agent, existing.definition.agent);
+    }
+
     #[test]
     fn absent_saved_account_cannot_silently_switch_to_a_default() {
         let selected = automation();
-        let draft = Draft::new(&[], &[], Some(&selected));
+        let claude = account("Only Claude account", Provider::Claude);
+        let draft = Draft::new(&[], &[claude], Some(&selected));
         assert!(
             draft
                 .definition(&Models::new())

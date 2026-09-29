@@ -257,9 +257,13 @@ showing that session. Closing a window leaves its processes running.
 ## Scheduled automations
 
 Open **Automations** from the clock button in the sidebar footer. Choose an open
-project or worktree, provider, account, prompt, model, and permission mode. Pick
-an hourly, daily, weekday, weekly, or five-field cron schedule with an explicit
-IANA timezone. New definitions are paused. **Enable…** and **Run now…** show the
+project or worktree, provider, account, prompt, model, and permission mode. The
+account starts as the one a new conversation in that directory would use, and
+follows the provider and directory until you pick another. Pick an hourly,
+daily, weekday, weekly, or five-field cron schedule with an explicit IANA
+timezone: it starts as the system's, and typing a city or region searches the
+known zones. The editor shows when the schedule as entered runs next, in its
+timezone and, if that differs, in yours. New definitions are paused. **Enable…** and **Run now…** show the
 exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
