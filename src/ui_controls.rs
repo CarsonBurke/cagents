@@ -47,6 +47,17 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static CHEVRON_RIGHT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // Diff folds, after GitHub's fold-up / fold-down / unfold: the rule is the
+    // fold, and the arrows say which side of it the revealed lines come from.
+    static EXPAND_UP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 11V2.5M4.75 5.75 8 2.5l3.25 3.25M3 13.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static EXPAND_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5v8.5M4.75 10.25 8 13.5l3.25-3.25M3 2.5h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static EXPAND_ALL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 5.5v-4M5.5 3.5 8 1l2.5 2.5M8 10.5v4M5.5 12.5 8 15l2.5-2.5M3 8h10" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     static PLUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8M8 4v8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
@@ -166,6 +177,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "go-down-symbolic" => CHEVRON_DOWN.clone(),
         "go-up-symbolic" => CHEVRON_UP.clone(),
         "go-next-symbolic" => CHEVRON_RIGHT.clone(),
+        "diff-expand-up-symbolic" => EXPAND_UP.clone(),
+        "diff-expand-down-symbolic" => EXPAND_DOWN.clone(),
+        "diff-expand-all-symbolic" => EXPAND_ALL.clone(),
         "list-add-symbolic" => PLUS.clone(),
         "list-remove-symbolic" => MINUS.clone(),
         "checkbox-symbolic" => CHECKBOX.clone(),
