@@ -5024,7 +5024,8 @@ fn compact_project<'a>(
     }
     for channel in project.channels.iter().filter(|channel| {
         expanded
-            && (channel.selected
+            && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
+                || channel.selected
                 || channel.unread
                 || channel.activity.is_some()
                 || channel.deletion.is_some())
@@ -5047,11 +5048,12 @@ fn compact_project<'a>(
     }
     for &worktree in project.worktrees.iter().filter(|worktree| {
         expanded
-            && (selection
-                == Some(SidebarSelection::Worktree {
-                    project_id: entity.id,
-                    worktree_id: worktree.id,
-                })
+            && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
+                || selection
+                    == Some(SidebarSelection::Worktree {
+                        project_id: entity.id,
+                        worktree_id: worktree.id,
+                    })
                 || project.state.has_agent_update(entity.id, worktree.id)
                 || project.state.worktree_has_panes(entity.id, worktree.id)
                 || worktree.deletion.is_some()
@@ -9239,7 +9241,7 @@ fn search_label(
         weight: cosmic::iced::font::Weight::Bold,
         ..font
     };
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span<'_, ()>> = Vec::new();
     let mut cursor = 0;
     for range in search_highlight_ranges(label, query) {
         if cursor < range.start {
@@ -10426,6 +10428,25 @@ pub(crate) mod tests {
         assert!(entry.worktrees[0].matches("/repo/"));
         assert!(search_score("feature/authentication", "fauth").is_some());
         assert!(search_score("feature/authentication", "fhz").is_none());
+    }
+
+    #[test]
+    fn compact_search_mounts_matching_rows_without_open_panes_or_attention() {
+        let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
+        let mut state = SidebarState::default();
+        let id = selection_row_focus_id(SelectionRow::Worktree(
+            project_id(1),
+            WorktreeId::from_uuid(Uuid::from_u128(3)),
+        ));
+        let quiet = project_list(&model, &state, true, false);
+        assert!(Tree::new(&quiet).find(&id).is_none());
+        state.controls_expanded = true;
+        state.query = "fix".into();
+        let result = project_list(&model, &state, true, false);
+        assert!(
+            Tree::new(&result).find(&id).is_some(),
+            "a matching inactive worktree must be mounted so Search Down can focus it"
+        );
     }
 
     #[test]
