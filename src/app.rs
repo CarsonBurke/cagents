@@ -8546,6 +8546,11 @@ impl Cagents {
                 let find = self.terminal_find.get(&id).filter(|find| find.open);
                 let terminal = crate::file_drop::target(
                     TerminalWidget::new(handle.clone())
+                        .selection_reset(
+                            self.terminal_find
+                                .get(&id)
+                                .map_or(0, |find| find.selection_reset),
+                        )
                         .select_all_request(
                             self.terminal_find
                                 .get(&id)
