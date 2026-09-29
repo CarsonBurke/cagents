@@ -128,7 +128,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of columns kept live; extra background columns can hibernate. Required |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background column hibernates. Required |
-| `focus_follows_mouse` | boolean | `false` | Activates a pane, without scrolling, once the pointer moves into it and rests there for 300 ms. A key press before then cancels it; a pane uncovered under a still pointer, such as by a closing dropdown, is not activated |
+| `focus_follows_mouse` | boolean | `false` | Activates a pane, without scrolling, once the pointer crosses into it and stays in it, moving or not, for 300 ms. A key press before then cancels it; a pane uncovered under a still pointer, such as by a closing dropdown, is not activated, nor is one the pointer lands on as it enters the window, until it crosses into a pane |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
