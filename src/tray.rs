@@ -1,7 +1,7 @@
 mod service {
     use std::{
         os::unix::process::CommandExt,
-        process::{Command, Stdio},
+        process::{Command, Output, Stdio},
         sync::{Arc, LazyLock},
         thread::{self, JoinHandle},
         time::{Duration, Instant},
@@ -178,6 +178,15 @@ mod service {
                 None => "Daemon running".into(),
             }
         }
+
+        /// The tooltip reads like the menu's header: the status, so a fresh
+        /// failure is not hidden behind busy agents, then the agent counts.
+        fn tool_tip_description(&self) -> String {
+            match self.tally.summary() {
+                Some(agents) => format!("{}\n{agents}", self.status()),
+                None => self.status(),
+            }
+        }
     }
 
     fn open_from_tray() -> ActionResult {
@@ -187,9 +196,14 @@ mod service {
     }
 
     fn run_child(name: &str, arguments: &[String]) -> Result<String, String> {
+        let output = spawn_child(name, arguments)?;
+        child_outcome(output.status.success(), &output.stdout, &output.stderr)
+    }
+
+    fn spawn_child(name: &str, arguments: &[String]) -> Result<Output, String> {
         let mut executable = std::env::current_exe().map_err(|error| error.to_string())?;
         executable.set_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        let output = Command::new(&executable)
+        Command::new(&executable)
             .args(arguments)
             .stdin(Stdio::null())
             // The tray lives in the daemon, which inherits the launcher
@@ -201,8 +215,7 @@ mod service {
             .output()
             .map_err(|error| {
                 format!("could not launch {name}: {error}; no confirmation was performed")
-            })?;
-        child_outcome(output.status.success(), &output.stdout, &output.stderr)
+            })
     }
 
     fn child_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<String, String> {
@@ -246,19 +259,33 @@ mod service {
             .map_err(|error| failed(error.to_string()))?;
         let capability = serde_json::to_string(&preflight.capability)
             .map_err(|error| failed(error.to_string()))?;
-        let report = run_child("cagents-ui", &["--confirm-daemon-stop".into(), capability])
-            .or_else(|detail| {
-                // A refused stop exits unsuccessfully but still reports why.
-                if detail
-                    .lines()
-                    .any(|line| serde_json::from_str::<StopReport>(line).is_ok())
-                {
-                    Ok(detail)
-                } else {
-                    Err(failed(detail))
-                }
-            })?;
+        let output = spawn_child("cagents-ui", &["--confirm-daemon-stop".into(), capability])
+            .map_err(failed)?;
+        confirmation_outcome(output.status.success(), &output.stdout, &output.stderr)
+    }
+
+    /// The dialog's report decides the outcome whatever its exit status: a
+    /// refused stop exits unsuccessfully but still reports why. Its streams
+    /// are only shown when it reported nothing, so stderr noise cannot bury
+    /// the report.
+    fn confirmation_outcome(success: bool, stdout: &[u8], stderr: &[u8]) -> ActionResult {
+        let report = String::from_utf8_lossy(stdout);
+        if !success && stop_report(&report).is_none() {
+            let detail = child_outcome(false, stdout, stderr)
+                .err()
+                .unwrap_or_default();
+            return Err(format!("Could not stop the daemon: {detail}"));
+        }
         confirmation_result(&report)
+    }
+
+    /// The last JSON report line, whatever else a misbehaving child printed
+    /// around it.
+    fn stop_report(stdout: &str) -> Option<StopReport> {
+        stdout
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<StopReport>(line.trim()).ok())
     }
 
     fn stop_result(outcome: &ShutdownOutcome) -> ActionResult {
@@ -272,11 +299,7 @@ mod service {
     /// Words the confirmation dialog's report; its last JSON line is the
     /// outcome, whatever else a misbehaving child printed around it.
     fn confirmation_result(stdout: &str) -> ActionResult {
-        let report = stdout
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<StopReport>(line.trim()).ok());
-        match report {
+        match stop_report(stdout) {
             Some(StopReport::Cancelled) => Ok("Stop cancelled; nothing was closed".into()),
             Some(StopReport::Finished { outcome }) => stop_result(&outcome),
             Some(StopReport::Failed { error }) => {
@@ -304,6 +327,29 @@ mod service {
             assert_eq!(child_outcome(false, b" \n", b"").unwrap_err(), "no output");
             assert!(confirmation_result("").is_err());
             assert!(confirmation_result("ready\n").is_err());
+        }
+
+        #[test]
+        fn a_refused_stop_reads_its_report_despite_stderr_noise() {
+            let report = serde_json::to_string(&StopReport::Finished {
+                outcome: ShutdownOutcome::InventoryChanged { current_count: 4 },
+            })
+            .unwrap();
+            let stdout = format!("{report}\n");
+            assert_eq!(
+                confirmation_outcome(false, stdout.as_bytes(), b"Gdk-WARNING: noise\n"),
+                Err("Not stopped: the open terminals changed (4 now). Try again.".into())
+            );
+            assert_eq!(
+                confirmation_outcome(true, stdout.as_bytes(), b"noise\n"),
+                confirmation_result(&report)
+            );
+            // With no report, the streams explain the failure.
+            assert_eq!(
+                confirmation_outcome(false, b"", b"dialog crashed\n"),
+                Err("Could not stop the daemon: dialog crashed".into())
+            );
+            assert!(confirmation_outcome(true, b"", b"").is_err());
         }
 
         #[test]
@@ -373,6 +419,22 @@ mod service {
         }
 
         #[test]
+        fn the_tooltip_keeps_a_failure_beside_the_agent_counts() {
+            let (updates, _results) = mpsc::unbounded_channel();
+            let mut tray = DaemonTray::new(updates);
+            assert_eq!(tray.tool_tip_description(), "Daemon running");
+            tray.tally = AgentTally {
+                working: 2,
+                waiting: 0,
+            };
+            tray.finish(Err("Could not open".into()), Instant::now());
+            assert_eq!(
+                tray.tool_tip_description(),
+                "Could not open\n2 agents working"
+            );
+        }
+
+        #[test]
         fn agent_counts_read_as_one_line() {
             let tally = |working, waiting| AgentTally { working, waiting }.summary();
             assert_eq!(tally(0, 0), None);
@@ -414,7 +476,7 @@ mod service {
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: self.title(),
-                description: self.tally.summary().unwrap_or_else(|| self.status()),
+                description: self.tool_tip_description(),
                 ..Default::default()
             }
         }
