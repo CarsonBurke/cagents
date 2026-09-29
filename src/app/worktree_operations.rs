@@ -36,17 +36,22 @@ impl ActiveWorktreeOperation {
         self.project
     }
 
-    pub(super) fn detail(&self) -> &str {
-        &self.detail
+    /// Why it stopped, unless the user stopped it: a cancellation needs no
+    /// explaining back to the person who asked for it.
+    pub(super) fn failure(&self) -> Option<&str> {
+        (!self.termination_requested).then_some(self.detail.as_str())
     }
 
-    /// The input of a creation that ended without a worktree, which the
-    /// dialog can take back to edit or run again.
+    /// The input of a creation the journal settled as not created, which the
+    /// dialog can take back to edit or run again. Any other ending may have
+    /// left something behind, and its row stays until reconciled or
+    /// dismissed.
     pub(super) fn reopenable_draft(&self) -> Option<&WorktreeDraft> {
-        self.draft
-            .as_ref()
-            .filter(|_| self.finished && self.created_worktree.is_none())
-            .filter(|_| self.state != Some(WorktreeOperationState::Created))
+        if self.finished && self.state == Some(WorktreeOperationState::NotCreated) {
+            self.draft.as_ref()
+        } else {
+            None
+        }
     }
 
     /// How the sidebar shows this operation, if at all.

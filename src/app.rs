@@ -8874,6 +8874,20 @@ impl Cagents {
         self.worktree_dialog.is_some() || self.pull_request_dialog.is_some()
     }
 
+    /// Closes the topmost form dialog, stopping whatever it was waiting on.
+    fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if let Some(dialog) = self.worktree_dialog.take() {
+            dialog.cancel();
+        } else if self.pull_request_dialog.take().is_some() {
+            self.pull_request_dialog_generation =
+                self.pull_request_dialog_generation.wrapping_add(1);
+        }
+        if let Some(target) = self.nested_modal_focus_target() {
+            return iced::widget::operation::focus(target).map(cosmic::Action::App);
+        }
+        self.focus_context_overlay_if_exposed()
+    }
+
     /// Whether a form dialog is the dialog on screen, not one under another.
     fn form_dialog_on_top(&self) -> bool {
         self.form_dialog_is_open()
@@ -12507,18 +12521,7 @@ impl Application for Cagents {
                     self.restore_pull_request_dialog(dialog, generation)
                 }
             },
-            Message::CancelDialog => {
-                if let Some(dialog) = self.worktree_dialog.take() {
-                    dialog.cancel();
-                } else if self.pull_request_dialog.take().is_some() {
-                    self.pull_request_dialog_generation =
-                        self.pull_request_dialog_generation.wrapping_add(1);
-                }
-                if let Some(target) = self.nested_modal_focus_target() {
-                    return iced::widget::operation::focus(target).map(cosmic::Action::App);
-                }
-                self.focus_context_overlay_if_exposed()
-            }
+            Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
@@ -12563,11 +12566,12 @@ impl Application for Cagents {
                 // keystroke. Global shortcuts below are deliberately exempt:
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
-                // A focused text field captures Escape to blur itself, which
-                // in a form dialog on top would take a second press to close.
-                // The field is the dialog's, so Escape answers the dialog.
-                if is_escape_press(&event) && captured && self.form_dialog_on_top() {
-                    return cosmic::task::message(Message::CancelDialog);
+                // A form dialog on top answers Escape before anything under
+                // it, such as a find bar or picker, and even when its focused
+                // field captured the key to blur itself: otherwise closing it
+                // would take a second press.
+                if is_escape_press(&event) && self.form_dialog_on_top() {
+                    return self.cancel_form_dialog();
                 }
                 if is_escape_press(&event) && !captured {
                     if self.update_ui.confirmation.is_some() {

@@ -84,6 +84,14 @@ impl WorktreeInputError {
         }
     }
 
+    /// A detail recorded elsewhere, such as the journal's, shown as written.
+    fn recorded(detail: &str) -> Self {
+        Self {
+            field: None,
+            message: punctuated(detail),
+        }
+    }
+
     /// Reads a resolution failure as something the form can show.
     pub fn from_resolution(error: &RepositoryError, draft: &WorktreeDraft) -> Self {
         let RepositoryError::Validation(validation) = error else {
@@ -135,24 +143,35 @@ impl WorktreeInputError {
 /// about it. Git names cannot contain whitespace, so a detail without any is
 /// the value.
 fn invalid_value(detail: &str, typed: &str, noun: &str) -> String {
-    if detail == typed.trim() || !detail.contains(char::is_whitespace) {
+    if detail.is_empty() {
+        format!("“{}” does not name a {noun}.", typed.trim())
+    } else if detail == typed.trim() || !detail.contains(char::is_whitespace) {
         format!("“{detail}” is not a valid {noun}.")
     } else {
-        sentence(detail)
+        // Such a detail usually leads with a branch name, whose case is
+        // significant: it is punctuated, never capitalized.
+        punctuated(detail)
     }
 }
 
-fn sentence(message: &str) -> String {
-    let message = message.trim();
-    let mut chars = message.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut sentence: String = first.to_uppercase().chain(chars).collect();
-    if !sentence.ends_with(['.', '!', '?']) {
-        sentence.push('.');
+/// A message ending as a sentence does.
+fn punctuated(message: &str) -> String {
+    let mut message = message.trim().to_owned();
+    if !message.is_empty() && !message.ends_with(['.', '!', '?']) {
+        message.push('.');
     }
-    sentence
+    message
+}
+
+/// A fixed message from our own code as a sentence; not for text that can
+/// lead with a name the user typed.
+fn sentence(message: &str) -> String {
+    let message = punctuated(message);
+    let mut chars = message.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// A resolution in flight: the dialog is read-only until it answers, and
@@ -171,6 +190,9 @@ pub struct WorktreeDialog {
     advanced: bool,
     resolving: Option<Resolution>,
     error: Option<WorktreeInputError>,
+    /// The failed creation this dialog reopened. Its row stays until this
+    /// input resolves, so cancelling the dialog loses nothing.
+    replaces: Option<OperationId>,
 }
 
 impl WorktreeDialog {
@@ -182,6 +204,7 @@ impl WorktreeDialog {
             draft,
             resolving: None,
             error: None,
+            replaces: None,
         }
     }
 
@@ -266,6 +289,9 @@ impl Cagents {
         draft: WorktreeDraft,
         error: Option<WorktreeInputError>,
     ) -> Task<Message> {
+        if let Some(replaced) = self.worktree_dialog.take() {
+            replaced.cancel();
+        }
         let dialog = self
             .worktree_dialog
             .insert(WorktreeDialog::new(project_id, repository, draft));
@@ -351,7 +377,11 @@ impl Cagents {
         match result {
             Ok(request) => {
                 let draft = dialog.draft.clone();
+                let replaces = dialog.replaces;
                 self.worktree_dialog = None;
+                if let Some(replaced) = replaces {
+                    let _ = self.dismiss_worktree_operation(replaced);
+                }
                 let start = self.start_worktree_operation(project_id, request, Some(draft));
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
@@ -364,8 +394,8 @@ impl Cagents {
     }
 
     /// Reopens a failed creation's input in the dialog, with the failure
-    /// beside it; `submit` runs it again straight away. The dialog now owns
-    /// the failure, so the row that reported it goes.
+    /// beside it; `submit` runs it again straight away. The row that
+    /// reported the failure goes once the input resolves again.
     pub(super) fn reopen_worktree_operation(
         &mut self,
         id: OperationId,
@@ -374,13 +404,13 @@ impl Cagents {
         if self.worktree_dialog.is_some() {
             return Task::none();
         }
-        let Some((project_id, draft, detail)) =
+        let Some((project_id, draft, failure)) =
             self.worktree_operations.get(&id).and_then(|operation| {
                 operation.reopenable_draft().map(|draft| {
                     (
                         operation.project(),
                         draft.clone(),
-                        operation.detail().to_owned(),
+                        operation.failure().map(WorktreeInputError::recorded),
                     )
                 })
             })
@@ -394,9 +424,11 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let _ = self.dismiss_worktree_operation(id);
-        let error = (!submit).then(|| WorktreeInputError::general(detail));
+        let error = failure.filter(|_| !submit);
         let focus = self.open_worktree_dialog(project_id, repository, draft, error);
+        if let Some(dialog) = &mut self.worktree_dialog {
+            dialog.replaces = Some(id);
+        }
         if submit {
             Task::batch([focus, self.submit_worktree_dialog()])
         } else {
@@ -588,6 +620,7 @@ pub(super) fn worktree_dialog_focus_id() -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::WorktreeOperationState;
 
     struct Fixture {
         app: Cagents,
@@ -753,29 +786,74 @@ mod tests {
         assert!(app.worktree_operations.is_empty());
     }
 
-    /// Escape reaches the dialog even though its focused field captures the
-    /// key to blur itself, and cancelling stops a running resolution.
+    fn escape(captured: bool) -> Message {
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured,
+        }
+    }
+
+    /// Escape closes the dialog on the first press although its focused
+    /// field captures the key to blur itself, and stops a running
+    /// resolution.
     #[test]
-    fn escape_from_a_focused_field_answers_the_dialog() {
+    fn escape_from_a_focused_field_closes_the_dialog() {
         let Fixture { mut app, .. } = fixture();
-        assert!(app.form_dialog_on_top());
-        // Captured under a dialog mounted above the form, it is not the
-        // form's to answer.
+        // Under a dialog mounted above the form, the key is not the form's.
         app.settings_reset_confirm = true;
-        assert!(!app.form_dialog_on_top());
+        let _ = app.update(escape(true));
+        assert!(app.worktree_dialog.is_some());
         app.settings_reset_confirm = false;
 
         let _ = app.update(Message::WorktreeBranchChanged("feature/one".into()));
         let _ = app.update(Message::SubmitWorktree);
         let token = dialog(&app).resolving.as_ref().unwrap().token.clone();
-        let _ = app.update(Message::CancelDialog);
+        let _ = app.update(escape(true));
         assert!(app.worktree_dialog.is_none());
         assert!(token.is_cancelled());
-        assert!(!app.form_dialog_on_top());
+    }
+
+    fn request(id: OperationId) -> CreateWorktreeRequest {
+        CreateWorktreeRequest {
+            repository: "/repo".into(),
+            managed_root: "/".into(),
+            destination: "/one".into(),
+            branch: crate::repository::ValidatedBranchName::parse("feature/one").unwrap(),
+            base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
+            track: false,
+            operation_id: id,
+        }
+    }
+
+    /// Settles a creation as the journal does when Git created nothing.
+    fn not_created(app: &mut Cagents, id: OperationId, detail: &str) {
+        let _ = app.finish_worktree_operation(
+            id,
+            1,
+            Ok(crate::repository::WorktreeOperationReport {
+                operation_id: id,
+                generation: 1,
+                request: Some(request(id)),
+                state: WorktreeOperationState::NotCreated,
+                outcome: None,
+                detail: detail.into(),
+                created_at_unix_ms: 0,
+            }),
+        );
     }
 
     /// A resolved request closes the dialog and becomes a creation row; if the
-    /// creation then fails, the row reopens the same input (#499).
+    /// creation then fails cleanly, the row reopens the same input, and goes
+    /// only once that input resolves again (#499).
     #[test]
     fn a_failed_creation_reopens_its_input_in_the_dialog() {
         let Fixture {
@@ -787,37 +865,67 @@ mod tests {
         let _ = app.update(Message::SubmitWorktree);
         let id = resolution(&app);
         let draft = dialog(&app).draft.clone();
-        let request = CreateWorktreeRequest {
-            repository: "/repo".into(),
-            managed_root: "/".into(),
-            destination: "/one".into(),
-            branch: crate::repository::ValidatedBranchName::parse("feature/one").unwrap(),
-            base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
-            track: false,
-            operation_id: id,
-        };
         let _ = app.update(Message::WorktreeInputResolved {
             project_id: project,
             operation_id: id,
-            result: Ok(request),
+            result: Ok(request(id)),
         });
         assert!(app.worktree_dialog.is_none());
         assert!(app.worktree_operations[&id].reopenable_draft().is_none());
 
-        let _ = app.finish_worktree_operation(id, 1, Err("git worktree add failed".into()));
+        not_created(
+            &mut app,
+            id,
+            "fatal: a branch named 'feature/one' already exists",
+        );
         assert!(app.sidebar_model.projects[0].operations[0].reopenable);
 
         let _ = app.update(Message::Sidebar(SidebarAction::EditWorktreeOperation(id)));
-        let dialog = dialog(&app);
-        assert_eq!(dialog.draft, draft);
-        assert!(dialog.advanced);
-        assert!(dialog.resolving.is_none());
+        let shown = dialog(&app);
+        assert_eq!(shown.draft, draft);
+        assert!(shown.advanced);
+        assert!(shown.resolving.is_none());
         assert_eq!(
-            dialog.error.as_ref().map(|error| error.message.as_str()),
-            Some("Git worktree add failed.")
+            shown.error.as_ref().map(|error| error.message.as_str()),
+            Some("fatal: a branch named 'feature/one' already exists.")
         );
+        let _ = app.update(Message::CancelDialog);
+        assert!(
+            app.worktree_operations.contains_key(&id),
+            "cancelling the reopened dialog keeps the failure"
+        );
+
+        let _ = app.update(Message::Sidebar(SidebarAction::EditWorktreeOperation(id)));
+        let _ = app.update(Message::WorktreeBranchChanged("feature/two".into()));
+        let _ = app.update(Message::SubmitWorktree);
+        let retry = resolution(&app);
+        let _ = app.update(Message::WorktreeInputResolved {
+            project_id: project,
+            operation_id: retry,
+            result: Ok(request(retry)),
+        });
         assert!(!app.worktree_operations.contains_key(&id));
-        assert!(app.sidebar_model.projects[0].operations.is_empty());
+        assert!(app.worktree_operations.contains_key(&retry));
+    }
+
+    /// Only a creation the journal settled as not created is offered back:
+    /// any other ending may have left something behind.
+    #[test]
+    fn an_unsettled_failure_is_not_reopened() {
+        let Fixture {
+            mut app, project, ..
+        } = fixture();
+        let _ = app.update(Message::CancelDialog);
+        let id = OperationId::new();
+        let _ = app.start_worktree_operation(
+            project,
+            request(id),
+            Some(WorktreeDraft::branch("feature/one")),
+        );
+        let _ = app.finish_worktree_operation(id, 1, Err("worker lost".into()));
+        assert!(!app.sidebar_model.projects[0].operations[0].reopenable);
+        let _ = app.update(Message::Sidebar(SidebarAction::RetryWorktreeOperation(id)));
+        assert!(app.worktree_dialog.is_none());
     }
 
     #[test]
@@ -827,28 +935,19 @@ mod tests {
         } = fixture();
         let _ = app.update(Message::CancelDialog);
         let id = OperationId::new();
-        let request = CreateWorktreeRequest {
-            repository: "/repo".into(),
-            managed_root: "/".into(),
-            destination: "/one".into(),
-            branch: crate::repository::ValidatedBranchName::parse("feature/one").unwrap(),
-            base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(),
-            track: false,
-            operation_id: id,
-        };
         let _ = app.start_worktree_operation(
             project,
-            request,
+            request(id),
             Some(WorktreeDraft::branch("feature/one")),
         );
-        let _ = app.finish_worktree_operation(id, 1, Err("network".into()));
+        not_created(&mut app, id, "network");
 
         let _ = app.update(Message::Sidebar(SidebarAction::RetryWorktreeOperation(id)));
-        let dialog = dialog(&app);
-        assert_eq!(dialog.draft, WorktreeDraft::branch("feature/one"));
-        assert!(dialog.error.is_none());
-        assert!(dialog.resolving.is_some(), "retry submits straight away");
-        assert!(!app.worktree_operations.contains_key(&id));
+        let shown = dialog(&app);
+        assert_eq!(shown.draft, WorktreeDraft::branch("feature/one"));
+        assert!(shown.error.is_none());
+        assert!(shown.resolving.is_some(), "retry submits straight away");
+        assert!(app.worktree_operations.contains_key(&id));
     }
 
     #[test]
@@ -867,7 +966,7 @@ mod tests {
         assert_eq!(checked_out.field, Some(WorktreeField::Branch));
         assert_eq!(
             checked_out.message,
-            "Main is already checked out at /repo; use that worktree or switch its branch first."
+            "main is already checked out at /repo; use that worktree or switch its branch first."
         );
         let occupied = read(ValidationError::DestinationOccupied, &typed);
         assert_eq!(occupied.field, Some(WorktreeField::Destination));
