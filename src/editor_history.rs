@@ -42,21 +42,28 @@ pub struct TextChange {
     pub start: Position,
     pub removed: String,
     pub inserted: String,
+    /// Byte offsets immediately after each native line ending. Native edits
+    /// can keep LF and CRLF separate even where a text parser reads LFCR.
+    pub removed_breaks: Vec<usize>,
+    pub inserted_breaks: Vec<usize>,
 }
 
 impl TextChange {
     /// Where the removed text ended, before the change.
     pub fn removed_end(&self) -> Position {
-        advance(self.start, &self.removed)
+        advance_native(self.start, self.removed.len(), &self.removed_breaks)
     }
 
     /// Where the inserted text ends, after the change.
     pub fn inserted_end(&self) -> Position {
-        advance(self.start, &self.inserted)
+        advance_native(self.start, self.inserted.len(), &self.inserted_breaks)
     }
 
     fn bytes(&self) -> usize {
-        self.removed.len() + self.inserted.len()
+        self.removed.capacity()
+            + self.inserted.capacity()
+            + (self.removed_breaks.capacity() + self.inserted_breaks.capacity())
+                * std::mem::size_of::<usize>()
     }
 }
 
@@ -82,7 +89,13 @@ pub trait EditBuffer {
     /// Refuses — answering `false` and changing nothing — when the text at
     /// `start` is not `expected`. That is the guard that keeps a history that
     /// has somehow diverged from its buffer from ever corrupting it.
-    fn replace(&mut self, start: Position, expected: &str, replacement: &str) -> bool;
+    fn replace(
+        &mut self,
+        start: Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool;
 
     /// Places the caret, and the selection with it.
     fn set_cursor(&mut self, cursor: Cursor);
@@ -101,7 +114,9 @@ struct Transaction {
 
 impl Transaction {
     fn bytes(&self) -> usize {
-        TRANSACTION_OVERHEAD + self.changes.iter().map(TextChange::bytes).sum::<usize>()
+        TRANSACTION_OVERHEAD
+            + self.changes.capacity() * std::mem::size_of::<TextChange>()
+            + self.changes.iter().map(TextChange::bytes).sum::<usize>()
     }
 }
 
@@ -191,13 +206,15 @@ impl History {
         self.drop_redo();
         if self.open
             && let Some(last) = self.undo.back_mut()
-            && coalesce(last, &change, kind, now)
         {
-            self.bytes += change.bytes();
-            last.after = after;
-            last.last_edit = now;
-            self.enforce_limits();
-            return;
+            let previous_bytes = last.bytes();
+            if coalesce(last, &change, kind, now) {
+                self.bytes = self.bytes - previous_bytes + last.bytes();
+                last.after = after;
+                last.last_edit = now;
+                self.enforce_limits();
+                return;
+            }
         }
         self.push(
             Transaction {
@@ -247,7 +264,12 @@ impl History {
             return Replay::Empty;
         };
         for change in transaction.changes.iter().rev() {
-            if !buffer.replace(change.start, &change.inserted, &change.removed) {
+            if !buffer.replace(
+                change.start,
+                &change.inserted,
+                &change.removed,
+                &change.removed_breaks,
+            ) {
                 self.clear();
                 return Replay::Diverged;
             }
@@ -264,7 +286,12 @@ impl History {
             return Replay::Empty;
         };
         for change in &transaction.changes {
-            if !buffer.replace(change.start, &change.removed, &change.inserted) {
+            if !buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            ) {
                 self.clear();
                 return Replay::Diverged;
             }
@@ -322,6 +349,10 @@ fn coalesce(last: &mut Transaction, change: &TextChange, kind: EditKind, now: In
             {
                 return false;
             }
+            let offset = previous.inserted.len();
+            previous
+                .inserted_breaks
+                .extend(change.inserted_breaks.iter().map(|end| offset + end));
             previous.inserted.push_str(&change.inserted);
         }
         EditKind::DeleteBackward => {
@@ -332,6 +363,14 @@ fn coalesce(last: &mut Transaction, change: &TextChange, kind: EditKind, now: In
                 return false;
             }
             previous.start = change.start;
+            let mut endings = change.removed_breaks.clone();
+            endings.extend(
+                previous
+                    .removed_breaks
+                    .iter()
+                    .map(|end| change.removed.len() + end),
+            );
+            previous.removed_breaks = endings;
             previous.removed.insert_str(0, &change.removed);
         }
         EditKind::DeleteForward => {
@@ -341,6 +380,10 @@ fn coalesce(last: &mut Transaction, change: &TextChange, kind: EditKind, now: In
             {
                 return false;
             }
+            let offset = previous.removed.len();
+            previous
+                .removed_breaks
+                .extend(change.removed_breaks.iter().map(|end| offset + end));
             previous.removed.push_str(&change.removed);
         }
         EditKind::Other => return false,
@@ -413,6 +456,27 @@ pub fn advance(start: Position, text: &str) -> Position {
     }
 }
 
+fn advance_native(start: Position, length: usize, endings: &[usize]) -> Position {
+    match endings.last() {
+        Some(end) => Position {
+            line: start.line + endings.len(),
+            column: length - end,
+        },
+        None => Position {
+            line: start.line,
+            column: start.column + length,
+        },
+    }
+}
+
+/// Whether pasting these bytes once preserves the recorded native endings.
+/// This scan allocates nothing; ordinary text takes the native bulk path.
+pub fn canonical_breaks(text: &str, endings: &[usize]) -> bool {
+    breaks(text)
+        .map(|(start, length)| start + length)
+        .eq(endings.iter().copied())
+}
+
 /// A run of consecutive buffer lines serialized exactly as the saved file
 /// would hold them, remembering where each line's text ends.
 ///
@@ -469,6 +533,27 @@ impl Excerpt {
     /// The text of the whole excerpt.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    fn endings(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(_, start))| {
+                let end = self
+                    .lines
+                    .get(index + 1)
+                    .map_or(self.text.len(), |&(start, _)| start);
+                (end > start).then_some((start, end))
+            })
+    }
+
+    fn slice_breaks(&self, start: usize, end: usize) -> Vec<usize> {
+        self.endings()
+            .filter_map(|(_, boundary)| {
+                (boundary > start && boundary <= end).then(|| boundary - start)
+            })
+            .collect()
     }
 
     /// The line an offset falls on, by index into `lines`.
@@ -533,6 +618,31 @@ impl Excerpt {
 pub fn replacement(before: &Excerpt, after: &Excerpt, max_prefix: usize) -> Option<TextChange> {
     debug_assert_eq!(before.first_line, after.first_line);
     let (old, new) = (before.text.as_str(), after.text.as_str());
+    if old == new && before.lines == after.lines {
+        return None;
+    }
+    let canonical = |excerpt: &Excerpt| {
+        excerpt
+            .endings()
+            .eq(breaks(excerpt.text()).map(|(start, length)| (start, start + length)))
+    };
+    // Native edits can retain adjacent endings that a plain-text parser
+    // would pair differently. In that uncommon case preserve the captured
+    // native lines as a whole: the excerpt is still only the affected lines
+    // and their immediate neighbours, and no byte-only trim can lose a
+    // boundary needed by an earlier history step.
+    if !canonical(before) || !canonical(after) {
+        return Some(TextChange {
+            start: Position {
+                line: before.first_line,
+                column: 0,
+            },
+            removed: old.to_owned(),
+            inserted: new.to_owned(),
+            removed_breaks: before.slice_breaks(0, old.len()),
+            inserted_breaks: after.slice_breaks(0, new.len()),
+        });
+    }
     // Capping only widens the change, so any cap still describes the edit.
     let mut prefix = old
         .bytes()
@@ -581,6 +691,8 @@ pub fn replacement(before: &Excerpt, after: &Excerpt, max_prefix: usize) -> Opti
         start: before.position(prefix),
         removed: old[prefix..old_end].to_owned(),
         inserted: new[prefix..new_end].to_owned(),
+        removed_breaks: before.slice_breaks(prefix, old_end),
+        inserted_breaks: after.slice_breaks(prefix, new_end),
     })
 }
 
@@ -678,7 +790,13 @@ mod tests {
     }
 
     impl EditBuffer for Model {
-        fn replace(&mut self, start: Position, expected: &str, replacement: &str) -> bool {
+        fn replace(
+            &mut self,
+            start: Position,
+            expected: &str,
+            replacement: &str,
+            _replacement_breaks: &[usize],
+        ) -> bool {
             let Some(offset) = self.offset(start) else {
                 return false;
             };
@@ -785,6 +903,97 @@ mod tests {
     }
 
     #[test]
+    fn coalescing_preserves_separate_native_line_endings() {
+        let now = Instant::now();
+        for kind in [
+            EditKind::Insert,
+            EditKind::DeleteForward,
+            EditKind::DeleteBackward,
+        ] {
+            let mut history = History::default();
+            let changes = match kind {
+                EditKind::Insert => [
+                    TextChange {
+                        start: caret(0, 0).position,
+                        removed: String::new(),
+                        inserted: "\n".into(),
+                        removed_breaks: vec![],
+                        inserted_breaks: vec![1],
+                    },
+                    TextChange {
+                        start: caret(1, 0).position,
+                        removed: String::new(),
+                        inserted: "\r\n".into(),
+                        removed_breaks: vec![],
+                        inserted_breaks: vec![2],
+                    },
+                ],
+                EditKind::DeleteForward => [
+                    TextChange {
+                        start: caret(0, 0).position,
+                        removed: "\n".into(),
+                        inserted: String::new(),
+                        removed_breaks: vec![1],
+                        inserted_breaks: vec![],
+                    },
+                    TextChange {
+                        start: caret(0, 0).position,
+                        removed: "\r\n".into(),
+                        inserted: String::new(),
+                        removed_breaks: vec![2],
+                        inserted_breaks: vec![],
+                    },
+                ],
+                EditKind::DeleteBackward => [
+                    TextChange {
+                        start: caret(1, 0).position,
+                        removed: "\r\n".into(),
+                        inserted: String::new(),
+                        removed_breaks: vec![2],
+                        inserted_breaks: vec![],
+                    },
+                    TextChange {
+                        start: caret(0, 0).position,
+                        removed: "\n".into(),
+                        inserted: String::new(),
+                        removed_breaks: vec![1],
+                        inserted_breaks: vec![],
+                    },
+                ],
+                EditKind::Other => unreachable!(),
+            };
+            for change in changes {
+                history.record(change, kind, caret(0, 0), caret(0, 0), now);
+            }
+            assert_eq!(history.undo.len(), 1, "{kind:?}");
+            let change = &history.undo[0].changes[0];
+            let endings = if kind == EditKind::Insert {
+                &change.inserted_breaks
+            } else {
+                &change.removed_breaks
+            };
+            assert_eq!(endings, &[1, 3], "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn replacing_identical_bytes_still_records_changed_native_boundaries() {
+        let mut before = Excerpt::new(0);
+        before.push_line("a", "\n");
+        before.push_line("", "\r\n");
+        before.push_line("b", "");
+        let after = Excerpt::document("a\n\r\nb");
+        let change = replacement(&before, &after, usize::MAX).unwrap();
+        assert_eq!(change.start, at(0, 0));
+        assert_eq!(change.removed, "a\n\r\nb");
+        assert_eq!(change.removed, change.inserted);
+        assert_eq!(change.removed_breaks, [2, 4]);
+        assert_eq!(change.inserted_breaks, [3, 4]);
+        assert_eq!(change.removed_end(), at(2, 1));
+        assert_eq!(change.inserted_end(), at(2, 1));
+    }
+
+    #[test]
     fn runs_beside_a_repeated_character_stay_one_step() {
         let now = Instant::now();
         // Typing `l` after `hex|lo` reads just as well as an insertion after
@@ -867,14 +1076,18 @@ mod tests {
             start: at(0, 4),
             removed: String::new(),
             inserted: "_me".into(),
+            removed_breaks: vec![],
+            inserted_breaks: vec![],
         };
         let second = TextChange {
             start: at(0, 0),
             removed: String::new(),
             inserted: "use x;\n".into(),
+            removed_breaks: vec![],
+            inserted_breaks: vec![7],
         };
-        assert!(model.replace(first.start, "", &first.inserted));
-        assert!(model.replace(second.start, "", &second.inserted));
+        assert!(model.replace(first.start, "", &first.inserted, &first.inserted_breaks));
+        assert!(model.replace(second.start, "", &second.inserted, &second.inserted_breaks));
         history.record_group(vec![first, second], caret(0, 4), caret(1, 7), now);
         assert_eq!(model.text, "use x;\ncall_me(\n");
         assert_eq!(history.undo(&mut model), Replay::Applied);
@@ -909,7 +1122,10 @@ mod tests {
         assert_eq!(undo_all(&mut history, &mut model), 3);
         assert_eq!(model.text, "a b ");
 
-        let mut history = History::with_limits(usize::MAX, 2 * TRANSACTION_OVERHEAD + 10);
+        let mut history = History::with_limits(
+            usize::MAX,
+            2 * (TRANSACTION_OVERHEAD + std::mem::size_of::<TextChange>()) + 16,
+        );
         let mut model = Model::new("");
         for word in ["1234", "5678", "9abc"] {
             model.type_text(&mut history, word, now);
@@ -1033,7 +1249,12 @@ mod tests {
                 };
                 // Apply the recorded change rather than the raw edit, which
                 // is what proves the recording exact.
-                assert!(model.replace(change.start, &change.removed, &change.inserted));
+                assert!(model.replace(
+                    change.start,
+                    &change.removed,
+                    &change.inserted,
+                    &change.inserted_breaks
+                ));
                 assert_eq!(model.text, after, "round {round} step {step}");
                 model.cursor = Cursor {
                     position: change.inserted_end(),
