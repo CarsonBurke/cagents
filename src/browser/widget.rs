@@ -22,6 +22,7 @@ use super::{
 
 #[derive(Default)]
 struct WidgetState {
+    shortcut_keys: Vec<keyboard::key::Physical>,
     focused: bool,
     focus_requested: bool,
     cursor_inside: bool,
@@ -120,6 +121,7 @@ pub struct BrowserWidget<'a, Message> {
     model_focused: bool,
     virtual_offset: f32,
     on_focus: Option<Message>,
+    on_shortcut: Option<Box<dyn Fn(keyboard::Event) -> Option<Message> + 'a>>,
     on_error: Option<Arc<ErrorMapper<Message>>>,
     _message: PhantomData<fn() -> Message>,
 }
@@ -144,6 +146,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
             virtual_offset: 0.0,
             model_focused: false,
             on_focus: None,
+            on_shortcut: None,
             on_error: None,
             _message: PhantomData,
         }
@@ -151,6 +154,14 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     pub fn scale_factor(mut self, scale_factor: f32) -> Self {
         self.scale_factor = scale_factor.max(0.01);
+        self
+    }
+
+    pub fn on_shortcut(
+        mut self,
+        callback: impl Fn(keyboard::Event) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_shortcut = Some(Box::new(callback));
         self
     }
 
@@ -453,6 +464,19 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 repeat,
                 ..
             }) if self.model_focused => {
+                if let Some(message) = self.on_shortcut.as_ref().and_then(|callback| {
+                    let Event::Keyboard(event) = event else {
+                        return None;
+                    };
+                    callback(event.clone())
+                }) {
+                    if !state.shortcut_keys.contains(physical_key) {
+                        state.shortcut_keys.push(*physical_key);
+                    }
+                    shell.publish(message);
+                    shell.capture_event();
+                    return;
+                }
                 self.send(
                     iced_key(
                         ButtonState::Pressed,
@@ -474,6 +498,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 modifiers,
                 ..
             }) if self.model_focused => {
+                if let Some(index) = state
+                    .shortcut_keys
+                    .iter()
+                    .position(|key| key == physical_key)
+                {
+                    state.shortcut_keys.swap_remove(index);
+                    shell.capture_event();
+                    return;
+                }
                 self.send(
                     iced_key(
                         ButtonState::Released,

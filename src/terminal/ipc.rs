@@ -94,7 +94,10 @@ use crate::{
 /// Version 32 binds update preparation to typed, daemon-owned session impact.
 /// Version 33 carries an optional reasoning effort in agent and automation specs.
 /// Version 34 answers a test notification request with its own outcome.
-pub const PROTOCOL_VERSION: u16 = 34;
+/// Version 35 carries row wrapping, OSC 8 links, bracketed-paste state, live cwd,
+/// and terminal-owner scrollback search, clearing, and selection copying.
+/// Snapshots require a matched set.
+pub const PROTOCOL_VERSION: u16 = 35;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -383,6 +386,20 @@ pub enum ClientRequest {
     /// Shows a desktop notification and answers with whether the desktop
     /// accepted it, answered to the requesting connection alone.
     SendTestNotification,
+    SearchTerminal {
+        terminal_id: TerminalId,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    },
+    ClearTerminalScrollback {
+        terminal_id: TerminalId,
+    },
+    CopyTerminalSelection {
+        terminal_id: TerminalId,
+        request: uuid::Uuid,
+        selection: crate::terminal::SearchMatch,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1119,11 +1136,15 @@ impl From<WireCursorShape> for CursorShape {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireRowSnapshot {
     pub cells: Vec<WireCellSnapshot>,
+    pub wrapped: bool,
+    pub hyperlinks: Vec<crate::terminal::snapshot::HyperlinkSpan>,
 }
 
 impl From<&RowSnapshot> for WireRowSnapshot {
     fn from(value: &RowSnapshot) -> Self {
         Self {
+            wrapped: value.wrapped,
+            hyperlinks: value.hyperlinks.clone(),
             cells: value.cells.iter().map(Into::into).collect(),
         }
     }
@@ -1132,6 +1153,8 @@ impl From<&RowSnapshot> for WireRowSnapshot {
 impl From<WireRowSnapshot> for RowSnapshot {
     fn from(value: WireRowSnapshot) -> Self {
         Self {
+            wrapped: value.wrapped,
+            hyperlinks: value.hyperlinks,
             cells: value.cells.into_iter().map(Into::into).collect(),
         }
     }
@@ -1295,12 +1318,38 @@ pub enum WireTerminalEvent {
     ConversationTitleChanged {
         title: String,
     },
+    WorkingDirectoryChanged {
+        path: std::path::PathBuf,
+    },
+    ClipboardText {
+        request: uuid::Uuid,
+        text: String,
+    },
+    SearchResults {
+        request: u64,
+        query: String,
+        matches: Vec<crate::terminal::SearchMatch>,
+        truncated: bool,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
     fn from(value: TerminalEvent) -> Self {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
+            TerminalEvent::ClipboardText { request, text } => Self::ClipboardText { request, text },
+            TerminalEvent::SearchResults {
+                request,
+                query,
+                matches,
+                truncated,
+            } => Self::SearchResults {
+                request,
+                query,
+                matches,
+                truncated,
+            },
+            TerminalEvent::WorkingDirectoryChanged(path) => Self::WorkingDirectoryChanged { path },
             TerminalEvent::ConversationTitleChanged(title) => {
                 Self::ConversationTitleChanged { title }
             }
@@ -1339,6 +1388,23 @@ impl From<WireTerminalEvent> for TerminalEvent {
     fn from(value: WireTerminalEvent) -> Self {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
+            WireTerminalEvent::ClipboardText { request, text } => {
+                Self::ClipboardText { request, text }
+            }
+            WireTerminalEvent::SearchResults {
+                request,
+                query,
+                matches,
+                truncated,
+            } => Self::SearchResults {
+                request,
+                query,
+                matches,
+                truncated,
+            },
+            WireTerminalEvent::WorkingDirectoryChanged { path } => {
+                Self::WorkingDirectoryChanged(path)
+            }
             WireTerminalEvent::ConversationTitleChanged { title } => {
                 Self::ConversationTitleChanged(title)
             }
@@ -1840,6 +1906,7 @@ mod tests {
                 len: 1,
                 alternate_screen: false,
                 mouse_tracking: true,
+                bracketed_paste: false,
             },
             ..base.clone()
         };
@@ -2064,6 +2131,8 @@ mod tests {
 
     fn row(text: &str) -> RowSnapshot {
         RowSnapshot {
+            wrapped: false,
+            hyperlinks: Vec::new(),
             cells: text
                 .chars()
                 .map(|character| CellSnapshot {

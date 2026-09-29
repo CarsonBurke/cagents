@@ -2,6 +2,49 @@ use std::fmt;
 
 use url::Url;
 
+/// Interpret omnibox input before URL parsing, which otherwise treats
+/// `localhost:3000` as an opaque scheme.
+pub fn navigation_url(input: &str) -> Result<Url, url::ParseError> {
+    navigation_url_with_search(input, "https://duckduckgo.com/?q={query}")
+}
+
+pub fn navigation_url_with_search(input: &str, search_url: &str) -> Result<Url, url::ParseError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(url::ParseError::EmptyHost);
+    }
+    if input.contains("://") || input.starts_with("file:") || input.starts_with("about:") {
+        return Url::parse(input);
+    }
+    let candidate = Url::parse(&format!("http://{input}"));
+    if let Ok(mut url) = candidate {
+        let local = match url.host() {
+            Some(url::Host::Domain(host)) => {
+                host == "localhost" || host.ends_with(".localhost") || host.ends_with(".test")
+            }
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            Some(url::Host::Ipv6(ip)) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+            None => false,
+        };
+        if local {
+            return Ok(url);
+        }
+        if !input.chars().any(char::is_whitespace)
+            && url.host_str().is_some_and(|host| host.contains('.'))
+        {
+            let _ = url.set_scheme("https");
+            return Ok(url);
+        }
+    }
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", input)
+        .finish();
+    let encoded = &encoded[2..];
+    Url::parse(&search_url.replace("{query}", &encoded))
+}
+
 /// A browser location that is safe to present outside navigation and restore
 /// state.
 ///
@@ -72,6 +115,33 @@ impl fmt::Display for SanitizedLocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omnibox_routes_local_servers_hosts_and_searches() {
+        for (input, expected) in [
+            ("localhost:3000", "http://localhost:3000/"),
+            ("127.0.0.1:8080/a?b=2#c", "http://127.0.0.1:8080/a?b=2#c"),
+            ("192.168.1.2:3000", "http://192.168.1.2:3000/"),
+            ("[::1]:3000", "http://[::1]:3000/"),
+            ("app.localhost:5173", "http://app.localhost:5173/"),
+            ("example.com", "https://example.com/"),
+        ] {
+            assert_eq!(navigation_url(input).unwrap().as_str(), expected);
+        }
+        assert_eq!(
+            navigation_url("rust iced").unwrap().query(),
+            Some("q=rust+iced")
+        );
+        assert_eq!(navigation_url("rust").unwrap().query(), Some("q=rust"));
+        assert!(navigation_url("https://bad host/").is_err());
+        assert!(navigation_url("").is_err());
+        assert_eq!(
+            navigation_url_with_search("a&b #c", "https://example.org/search?q={query}&source=ade")
+                .unwrap()
+                .as_str(),
+            "https://example.org/search?q=a%26b+%23c&source=ade"
+        );
+    }
 
     #[test]
     fn http_locations_keep_only_normalized_origin_and_path() {

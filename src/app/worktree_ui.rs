@@ -630,6 +630,13 @@ impl Cagents {
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
+        if let Some(path) = self
+            .workspace
+            .focused()
+            .and_then(|card| self.terminal_working_directories.get(&card))
+        {
+            return Some(path.clone());
+        }
         if let Some(path) = &self.active_workspace {
             return Some(path.clone());
         }

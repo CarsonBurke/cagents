@@ -27,6 +27,7 @@ mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
+mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
@@ -2221,6 +2222,44 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     )
 }
 
+#[cfg(feature = "integrated-browser")]
+fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
+    use keyboard::{Key, key::Named};
+    let keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if modifiers.logo() || modifiers.shift() {
+        return None;
+    }
+    if modifiers.control() && !modifiers.alt() {
+        return match key
+            .to_latin(*physical_key)
+            .map(|key| key.to_ascii_lowercase())
+        {
+            Some('l') => Some(Message::FocusBrowserAddress(card)),
+            Some('r') => Some(Message::BrowserReload(card)),
+            _ => None,
+        };
+    }
+    match key.as_ref() {
+        Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
+            Some(Message::BrowserBack(card))
+        }
+        Key::Named(Named::ArrowRight) if modifiers.alt() && !modifiers.control() => {
+            Some(Message::BrowserForward(card))
+        }
+        Key::Named(Named::F5) if modifiers.is_empty() => Some(Message::BrowserReload(card)),
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -2374,6 +2413,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
@@ -2388,6 +2428,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
         | Message::BrowserReload(_)
+        | Message::BrowserStop(_)
+        | Message::FocusBrowserAddress(_)
         | Message::BrowserAddressChanged { .. }
         | Message::BrowserNavigate(_) => true,
         _ => false,
@@ -2587,6 +2629,10 @@ pub enum SettingsField {
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
+    ConfirmMultilinePaste,
+    BrowserSearchUrl,
+    EditorFontFamily,
+    EditorFontSize,
     TerminalScrollbackLines,
     ManagedWorktreeDirectory,
     WorktreeSort,
@@ -2831,6 +2877,10 @@ struct SettingsDraft {
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
+    editor_font_family: String,
+    editor_font_size: String,
+    confirm_multiline_paste: bool,
+    browser_search_url: String,
     terminal_scrollback_lines: String,
     managed_worktree_directory: String,
     worktree_sort: String,
@@ -2875,6 +2925,11 @@ impl SettingsDraft {
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
+            editor_font_family: settings.editor_font_family.clone().unwrap_or_default(),
+            editor_font_size: settings
+                .editor_font_size
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
             terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             worktree_sort: match settings.worktree_sort {
@@ -2889,6 +2944,8 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
+            confirm_multiline_paste: settings.confirm_multiline_paste,
+            browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
@@ -2917,6 +2974,10 @@ impl SettingsDraft {
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
+            SettingsField::ConfirmMultilinePaste => self.confirm_multiline_paste = value == "true",
+            SettingsField::BrowserSearchUrl => self.browser_search_url = value,
+            SettingsField::EditorFontFamily => self.editor_font_family = value,
+            SettingsField::EditorFontSize => self.editor_font_size = value,
             SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::WorktreeSort => self.worktree_sort = value,
@@ -3039,6 +3100,14 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.confirm_terminal_close = enabled)
             .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+        SettingsField::ConfirmMultilinePaste => value
+            .parse::<bool>()
+            .map(|value| next.confirm_multiline_paste = value)
+            .map_err(|_| "Choose whether multiline pastes require confirmation.".to_owned()),
+        SettingsField::BrowserSearchUrl => {
+            next.browser_search_url = value.to_owned();
+            Ok(())
+        }
         SettingsField::ChatEnterSends => value
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
@@ -3087,6 +3156,18 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
             .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
+        SettingsField::EditorFontFamily => {
+            next.editor_font_family = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            Ok(())
+        }
+        SettingsField::EditorFontSize => {
+            if value.trim().is_empty() {
+                next.editor_font_size = None;
+                Ok(())
+            } else {
+                value.parse::<f32>().map(|size| next.editor_font_size = Some(size)).map_err(|_| "Enter an editor font size from 8 to 40, or leave it blank to follow the terminal.".to_owned())
+            }
+        }
         SettingsField::AppTheme => AppTheme::from_key(value)
             .map(|theme| next.app_theme = theme)
             .ok_or_else(|| "Choose one of the listed app themes.".to_owned()),
@@ -3626,6 +3707,10 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserReload(CardId),
     #[cfg(feature = "integrated-browser")]
+    BrowserStop(CardId),
+    #[cfg(feature = "integrated-browser")]
+    FocusBrowserAddress(CardId),
+    #[cfg(feature = "integrated-browser")]
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
     /// Enter pressed on an ended terminal's final screen.
@@ -3637,6 +3722,13 @@ pub enum Message {
     },
     #[cfg(feature = "integrated-browser")]
     BrowserNavigate(CardId),
+    #[cfg(feature = "integrated-browser")]
+    BrowserAddressFocus {
+        card: CardId,
+        focused: bool,
+    },
+    #[cfg(feature = "integrated-browser")]
+    BrowserProgressTick,
     #[cfg(feature = "integrated-browser")]
     BrowserEvent {
         card: CardId,
@@ -3704,6 +3796,12 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    TerminalFind(terminal_ui::Action),
+    ZoomFont {
+        card: CardId,
+        delta: i8,
+        editor: bool,
+    },
     ToggleContextInspector,
     SelectContextTab(ContextTab),
     ContextInspector(InspectorAction),
@@ -3829,7 +3927,6 @@ enum BrowserAddress {
         presented: SanitizedLocation,
     },
     UserInput(String),
-    Invalid(SanitizedLocation),
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -3849,8 +3946,24 @@ impl BrowserAddress {
         match self {
             Self::Location { presented, .. } => presented.as_str(),
             Self::UserInput(value) => value,
-            Self::Invalid(presented) => presented.as_str(),
         }
+    }
+
+    fn editable_str(&self, focused: bool) -> &str {
+        if let Self::Location { authoritative, .. } = self {
+            let local = match authoritative.host() {
+                Some(url::Host::Domain(host)) => {
+                    host == "localhost" || host.ends_with(".localhost")
+                }
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+                None => false,
+            };
+            if focused || local || authoritative.scheme() == "file" {
+                return authoritative.as_str();
+            }
+        }
+        self.as_str()
     }
 
     /// Resolves the value to navigate without deriving authority from its
@@ -3858,19 +3971,14 @@ impl BrowserAddress {
     /// its complete URL when the user submits the unchanged address, while a
     /// submitted draft is immediately replaced by its safe presentation.
     fn submit(&mut self) -> Result<Url, ()> {
+        self.submit_with_search("https://duckduckgo.com/?q={query}")
+    }
+    fn submit_with_search(&mut self, search_url: &str) -> Result<Url, ()> {
         let result = match self {
             Self::Location { authoritative, .. } => Ok(authoritative.clone()),
             Self::UserInput(value) => {
-                let value = value.trim();
-                Url::parse(value).or_else(|error| {
-                    if has_explicit_url_scheme(value) {
-                        Err(error)
-                    } else {
-                        Url::parse(&format!("https://{value}"))
-                    }
-                })
+                crate::location::navigation_url_with_search(value, search_url)
             }
-            Self::Invalid(_) => return Err(()),
         };
 
         match result {
@@ -3878,25 +3986,9 @@ impl BrowserAddress {
                 *self = Self::location(&url);
                 Ok(url)
             }
-            Err(_) => {
-                *self = Self::Invalid(SanitizedLocation::invalid());
-                Err(())
-            }
+            Err(_) => Err(()),
         }
     }
-}
-
-#[cfg(feature = "integrated-browser")]
-fn has_explicit_url_scheme(value: &str) -> bool {
-    value.split_once(':').is_some_and(|(scheme, _)| {
-        let mut chars = scheme.chars();
-        chars
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic())
-            && chars.all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-            })
-    })
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -3905,6 +3997,9 @@ struct BrowserRuntime {
     ime: Option<InputMethodState>,
     lifecycle: BrowserLifecycle,
     address: BrowserAddress,
+    address_focused: bool,
+    address_error: bool,
+    progress_phase: f32,
     load_state: Option<String>,
 }
 
@@ -4160,6 +4255,10 @@ pub struct Cagents {
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
+    terminal_working_directories: HashMap<CardId, PathBuf>,
+    terminal_find: HashMap<CardId, terminal_ui::Find>,
+    terminal_context: Option<terminal_ui::Context>,
+    terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     lifecycle: LifecycleManager,
     /// The shared language-server client. One manager serves every card; a
@@ -4794,6 +4893,10 @@ impl Cagents {
                 CardKind::Repository(view) => {
                     let mut runtime = self.repository_runtime(view);
                     runtime.set_auto_save(self.settings.editor_auto_save);
+                    runtime.set_editor_font(
+                        crate::terminal::monospace_font(self.settings.editor_font_family()),
+                        self.settings.editor_font_size(),
+                    );
                     runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                     runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                     runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -5004,7 +5107,7 @@ impl Cagents {
                     tasks.push(self.finish_terminal_start(card));
                     return Task::batch(tasks);
                 };
-                if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
+                if let Err(error) = handle.set_theme(self.effective_terminal_theme()) {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not apply terminal theme: {error}"
                     )));
@@ -5076,7 +5179,7 @@ impl Cagents {
         TerminalConfig {
             initially_visible: visible,
             max_scrollback: self.settings.terminal_scrollback_lines,
-            theme: self.settings.terminal_theme,
+            theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
     }
@@ -5218,6 +5321,9 @@ impl Cagents {
         card.residency = Residency::Hydrating { epoch: 1 };
         match &mut card.kind {
             CardKind::Terminal(session) => {
+                if let Some(path) = self.terminal_working_directories.get(&source.id) {
+                    session.launch.working_directory = path.clone();
+                }
                 if crate::agent::Provider::from_program(&session.launch.program).is_some() {
                     let Some(recipe) = crate::model::agent_recovery::fresh_recipe(&session.launch)
                     else {
@@ -5299,6 +5405,10 @@ impl Cagents {
             CardKind::Repository(view) => {
                 let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_editor_font(
+                    crate::terminal::monospace_font(self.settings.editor_font_family()),
+                    self.settings.editor_font_size(),
+                );
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -5335,6 +5445,10 @@ impl Cagents {
             worktree: view.repository.clone(),
         });
         runtime.set_standalone(true);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         PullRequestPane {
@@ -6070,6 +6184,10 @@ impl Cagents {
         self.register_channel_card(card_id);
         let mut runtime = self.repository_runtime(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -6544,10 +6662,19 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
             let (title, file_caption) = self.repository_chrome(card);
             let caption = match &card.kind {
+                CardKind::Terminal(_)
+                    if self.terminal_working_directories.contains_key(&card.id) =>
+                {
+                    display_path(&self.terminal_working_directories[&card.id])
+                }
                 CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
                     Cow::Owned(format!(
                         "Relaunched after upgrade · {}",
@@ -6728,6 +6855,13 @@ impl Cagents {
         signal: Option<&str>,
         intentional: bool,
     ) {
+        if self
+            .terminal_paste
+            .as_ref()
+            .is_some_and(|(target, _)| *target == card)
+        {
+            self.terminal_paste = None;
+        }
         // An end is one fact, recorded by whichever report of it arrives
         // first. A surface attached to a terminal that had already ended
         // replays that report; recording it again would move the exit to now
@@ -6870,6 +7004,10 @@ impl Cagents {
             CardKind::Repository(view) => {
                 let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_editor_font(
+                    crate::terminal::monospace_font(self.settings.editor_font_family()),
+                    self.settings.editor_font_size(),
+                );
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -7463,6 +7601,7 @@ impl Cagents {
         };
         let mut durable_changed = false;
         let mut recovery = None;
+        let mut clipboard_task = Task::none();
         if let Some(proof) = proof
             && ended_terminal(self.card_state(card)).is_none()
         {
@@ -7497,6 +7636,27 @@ impl Cagents {
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
                 }
+                TerminalEvent::WorkingDirectoryChanged(path) => {
+                    self.terminal_working_directories.insert(card, path);
+                }
+                TerminalEvent::ClipboardText { request, text } => {
+                    if let Some(find) = self.terminal_find.get_mut(&card)
+                        && find.pending_copy == Some(request)
+                    {
+                        find.pending_copy = None;
+                        if !text.trim().is_empty() {
+                            clipboard_task = iced::clipboard::write(text).map(cosmic::Action::App);
+                        }
+                    }
+                }
+                TerminalEvent::SearchResults {
+                    request,
+                    query,
+                    matches,
+                    truncated,
+                } => {
+                    self.terminal_search_results(card, request, query, matches, truncated);
+                }
                 TerminalEvent::ConversationTitleChanged(title) => {
                     self.name_channel_from_prompt(card, &title);
                 }
@@ -7509,7 +7669,7 @@ impl Cagents {
                         durable_changed = true;
                     }
                 }
-                TerminalEvent::Bell => {}
+                TerminalEvent::Bell => self.observe_agent_update_for_card(card),
                 // Root exit is not PTY completion: a descendant may still
                 // accept input and produce output. Keep its live surface.
                 TerminalEvent::Exited {
@@ -7616,7 +7776,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return self.start_terminal(card, session, visible, false);
         }
-        Task::none()
+        clipboard_task
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -7851,8 +8011,11 @@ impl Cagents {
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
+            let browser_loading = browser_runtime.is_some_and(|browser| {
+                browser.lifecycle == BrowserLifecycle::Restoring || browser.load_state.is_some()
+            });
             let address = browser_runtime
-                .map(|browser| browser.address.as_str())
+                .map(|browser| browser.address.editable_str(browser.address_focused))
                 .or_else(|| chrome.map(|chrome| chrome.caption.as_str()))
                 .unwrap_or(SanitizedLocation::INVALID);
             let active = browser_runtime.is_some();
@@ -7867,6 +8030,14 @@ impl Cagents {
                 .width(Length::Fill);
             if active {
                 address_input = address_input
+                    .on_focus(Message::BrowserAddressFocus {
+                        card: id,
+                        focused: true,
+                    })
+                    .on_unfocus(Message::BrowserAddressFocus {
+                        card: id,
+                        focused: false,
+                    })
                     .on_input(move |value| Message::BrowserAddressChanged { card: id, value })
                     .on_submit(move |_| Message::BrowserNavigate(id));
             }
@@ -7900,17 +8071,27 @@ impl Cagents {
                     ),
                     crate::interaction::tooltip(
                         widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "view-refresh-symbolic",
+                            if browser_loading {
+                                "process-stop-symbolic"
+                            } else {
+                                "view-refresh-symbolic"
+                            },
                         ))
                         .id(chrome.map_or_else(
                             || card_control_id(id, "browser.reload"),
                             |chrome| chrome.browser_reload_id.clone(),
                         ))
-                        .name("Reload")
+                        .name(if browser_loading { "Stop" } else { "Reload" })
                         .width(ICON_CONTROL_SIZE)
                         .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(active.then_some(Message::BrowserReload(id))),
-                        "Reload",
+                        .on_press_maybe(active.then_some(
+                            if browser_loading {
+                                Message::BrowserStop(id)
+                            } else {
+                                Message::BrowserReload(id)
+                            },
+                        )),
+                        if browser_loading { "Stop" } else { "Reload" },
                     ),
                     address_input.into(),
                 ])
@@ -7930,20 +8111,40 @@ impl Cagents {
             };
             let mut rows: Vec<Element<'a, Message>> =
                 vec![toolbar.into(), crate::design::horizontal_rule()];
-            if browser_loading {
+            if browser_runtime.is_some_and(|browser| browser.address_error) {
                 rows.push(
-                    widget::container(iced::widget::Space::new())
-                        .height(Length::Fixed(BROWSER_PROGRESS_HEIGHT))
-                        .width(Length::Fill)
-                        .class(cosmic::theme::Container::custom(|theme| {
-                            cosmic::iced::widget::container::Style {
-                                background: Some(iced::Background::Color(
-                                    (*theme.cosmic().accent_color()).into(),
-                                )),
-                                ..Default::default()
-                            }
-                        }))
-                        .into(),
+                    crate::design::caption("Invalid URL — edit the address and try again.").into(),
+                );
+            }
+            {
+                let phase = browser_runtime.map_or(0.0, |browser| browser.progress_phase);
+                rows.push(
+                    widget::container(iced::widget::responsive(move |size| {
+                        let width = size.width * 0.25;
+                        widget::row::with_children(vec![
+                            iced::widget::Space::new()
+                                .width((size.width - width) * phase)
+                                .into(),
+                            widget::container(iced::widget::Space::new())
+                                .width(width)
+                                .height(BROWSER_PROGRESS_HEIGHT)
+                                .class(cosmic::theme::Container::custom(move |theme| {
+                                    cosmic::iced::widget::container::Style {
+                                        background: browser_loading.then_some(
+                                            iced::Background::Color(
+                                                (*theme.cosmic().accent_color()).into(),
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    }
+                                }))
+                                .into(),
+                        ])
+                        .into()
+                    }))
+                    .height(Length::Fixed(BROWSER_PROGRESS_HEIGHT))
+                    .width(Length::Fill)
+                    .into(),
                 );
             }
             widget::column::with_children(rows).spacing(0).into()
@@ -7997,46 +8198,129 @@ impl Cagents {
                 }
                 message => message,
             }),
-            Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
-                TerminalWidget::new(handle.clone())
-                    .read_only(ended_terminal(card).is_some() || self.terminal_close_pending(id))
-                    .on_read_only_submit(
-                        (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
-                            .then_some(Message::RelaunchFromEndedScreen(id)),
-                    )
-                    .id(chrome.map_or_else(
-                        || workspace_widget::card_focus_id(id),
-                        |chrome| chrome.focus_id.clone(),
-                    ))
-                    .font_size(self.settings.terminal_font_size)
-                    .font_family(&self.settings.terminal_font_family)
-                    .line_height(self.settings.terminal_line_height)
-                    .padding(self.settings.terminal_padding)
-                    .scroll_size(self.settings.terminal_scroll_size)
-                    .scroll_speed(self.settings.terminal_scroll_speed)
-                    .cursor_style(self.settings.terminal_cursor_style)
-                    .scale_factor(effective_surface_scale(
-                        self.window_scale_factor,
-                        self.settings.ui_scale,
-                    ))
-                    .model_focused(card_focused)
-                    .on_focus(Message::FocusCard(id))
-                    .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
-                    .on_command_error(move |error| Message::TerminalError {
-                        card: id,
-                        message: error.to_string(),
-                    }),
-                ("terminal", id),
-                // A dialog over the workspace owns the pointer as well as the
-                // keyboard, so a drop aimed through it is refused rather than
-                // typed into a shell the reader cannot see.
-                ended_terminal(card).is_none()
-                    && !self.terminal_close_pending(id)
-                    && !self.workspace_inputs_blocked(),
-                move |payload| Message::TerminalDropped { card: id, payload },
-            ),
+            Some(CardRuntime::Terminal(handle)) => {
+                let find = self.terminal_find.get(&id).filter(|find| find.open);
+                let terminal = crate::file_drop::target(
+                    TerminalWidget::new(handle.clone())
+                        .select_all_request(
+                            self.terminal_find
+                                .get(&id)
+                                .map_or(0, |find| find.select_all_request),
+                        )
+                        .on_context(move |point, selection, link| {
+                            Message::TerminalFind(terminal_ui::Action::Context(
+                                id, point, selection, link,
+                            ))
+                        })
+                        .on_paste(move |text| {
+                            Message::TerminalFind(terminal_ui::Action::Paste(id, text))
+                        })
+                        .on_copy(move |range| {
+                            Message::TerminalFind(terminal_ui::Action::CopySelection(id, range))
+                        })
+                        .find_matches(find.map(|find| (find.matches.clone(), find.selected)))
+                        .working_directory(
+                            self.terminal_working_directories
+                                .get(&id)
+                                .cloned()
+                                .or_else(|| {
+                                    card.and_then(|card| match &card.kind {
+                                        CardKind::Terminal(session) => {
+                                            Some(session.launch.working_directory.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                                .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
+                        )
+                        .read_only(
+                            ended_terminal(card).is_some() || self.terminal_close_pending(id),
+                        )
+                        .on_read_only_submit(
+                            (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
+                                .then_some(Message::RelaunchFromEndedScreen(id)),
+                        )
+                        .id(chrome.map_or_else(
+                            || workspace_widget::card_focus_id(id),
+                            |chrome| chrome.focus_id.clone(),
+                        ))
+                        .font_size(self.settings.terminal_font_size)
+                        .font_family(&self.settings.terminal_font_family)
+                        .line_height(self.settings.terminal_line_height)
+                        .padding(self.settings.terminal_padding)
+                        .scroll_size(self.settings.terminal_scroll_size)
+                        .scroll_speed(self.settings.terminal_scroll_speed)
+                        .cursor_style(self.settings.terminal_cursor_style)
+                        .scale_factor(effective_surface_scale(
+                            self.window_scale_factor,
+                            self.settings.ui_scale,
+                        ))
+                        .model_focused(card_focused && !find.is_some_and(|find| find.focused))
+                        .on_shortcut(move |event| {
+                            let keyboard::Event::KeyPressed {
+                                key,
+                                physical_key,
+                                modifiers,
+                                ..
+                            } = event
+                            else {
+                                return None;
+                            };
+                            if modifiers.control()
+                                && !modifiers.alt()
+                                && !modifiers.logo()
+                                && !modifiers.shift()
+                                && key
+                                    .to_latin(physical_key)
+                                    .is_some_and(|key| key.eq_ignore_ascii_case(&'f'))
+                            {
+                                return Some(Message::TerminalFind(terminal_ui::Action::Open(id)));
+                            }
+                            crate::interaction::font_zoom_chord(&key, physical_key, modifiers).map(
+                                |delta| Message::ZoomFont {
+                                    card: id,
+                                    delta,
+                                    editor: false,
+                                },
+                            )
+                        })
+                        .on_focus(Message::FocusCard(id))
+                        .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
+                        .on_command_error(move |error| Message::TerminalError {
+                            card: id,
+                            message: error.to_string(),
+                        }),
+                    ("terminal", id),
+                    // A dialog over the workspace owns the pointer as well as the
+                    // keyboard, so a drop aimed through it is refused rather than
+                    // typed into a shell the reader cannot see.
+                    ended_terminal(card).is_none()
+                        && !self.terminal_close_pending(id)
+                        && !self.workspace_inputs_blocked(),
+                    move |payload| Message::TerminalDropped { card: id, payload },
+                );
+                let terminal = crate::ui_controls::popover(
+                    terminal,
+                    self.terminal_menu(id),
+                    widget::popover::Position::Point(
+                        self.terminal_context
+                            .as_ref()
+                            .filter(|context| context.card == id)
+                            .map_or(iced::Point::ORIGIN, |context| context.point),
+                    ),
+                    Message::TerminalFind(terminal_ui::Action::DismissContext(id)),
+                );
+                if let Some(strip) = self.terminal_find_view(id) {
+                    widget::column::with_children(vec![strip, terminal])
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    terminal
+                }
+            }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
+                .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(effective_surface_scale(
@@ -9516,6 +9800,7 @@ impl Cagents {
             return true;
         }
         self.dirty_repository_close.is_some()
+            || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
@@ -10417,17 +10702,36 @@ impl Cagents {
     }
 
     fn synchronize_terminal_theme(&mut self) {
+        let theme = self.effective_terminal_theme();
         for (card, runtime) in &self.cards {
             if ended_terminal(self.card_state(*card)).is_some() {
                 continue;
             }
             if let CardRuntime::Terminal(surface) = runtime {
-                if let Err(error) = surface.set_theme(self.settings.terminal_theme) {
+                if let Err(error) = surface.set_theme(theme) {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not apply terminal theme: {error}"
                     )));
                 }
             }
+        }
+    }
+
+    fn effective_terminal_theme(&self) -> crate::terminal::TerminalTheme {
+        use crate::terminal::TerminalTheme;
+        match self.settings.terminal_theme {
+            TerminalTheme::Auto
+                if self
+                    .settings
+                    .app_theme
+                    .resolve(self.core.system_theme())
+                    .theme_type
+                    .is_dark() =>
+            {
+                TerminalTheme::Dark
+            }
+            TerminalTheme::Auto => TerminalTheme::Light,
+            theme => theme,
         }
     }
 
@@ -10622,6 +10926,19 @@ impl Cagents {
     fn synchronize_settings(&mut self, previous: &AppSettings) -> Task<Message> {
         self.synchronize_lifecycle_budget();
         let mut tasks = Vec::new();
+        if previous.editor_font_family() != self.settings.editor_font_family()
+            || previous.editor_font_size() != self.settings.editor_font_size()
+        {
+            let font = crate::terminal::monospace_font(self.settings.editor_font_family());
+            let size = self.settings.editor_font_size();
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
+                    _ => {}
+                }
+            }
+        }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
             self.card_chrome.clear();
         }
@@ -10868,6 +11185,10 @@ impl Application for Cagents {
             workspace,
             durable: Arc::new(durable),
             cards: HashMap::new(),
+            terminal_working_directories: HashMap::new(),
+            terminal_find: HashMap::new(),
+            terminal_context: None,
+            terminal_paste: None,
             card_chrome: HashMap::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
@@ -11825,6 +12146,44 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
+                self.update(Message::ZoomFont {
+                    card,
+                    delta,
+                    editor: true,
+                })
+            }
+            Message::ZoomFont {
+                card,
+                delta,
+                editor,
+            } => {
+                if self.workspace.focused() != Some(card) {
+                    return Task::none();
+                }
+                let current = if editor {
+                    self.settings.editor_font_size()
+                } else {
+                    self.settings.terminal_font_size
+                };
+                let value = if delta == 0 {
+                    if editor {
+                        String::new()
+                    } else {
+                        AppSettings::default().terminal_font_size.to_string()
+                    }
+                } else {
+                    (current + f32::from(delta)).clamp(8.0, 40.0).to_string()
+                };
+                self.update(Message::SettingsChanged {
+                    field: if editor {
+                        SettingsField::EditorFontSize
+                    } else {
+                        SettingsField::TerminalFontSize
+                    },
+                    value,
+                })
             }
             Message::Repository(action) => {
                 if let RepositoryAction::DiffAnnotations {
@@ -12960,19 +13319,58 @@ impl Application for Cagents {
                 |handle| handle.reload(),
                 &mut self.status,
             ),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserStop(card) => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.load_state = None;
+                }
+                browser_command(&self.cards, card, |handle| handle.stop(), &mut self.status)
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::FocusBrowserAddress(card) => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.address_focused = true;
+                }
+                iced::widget::operation::focus(card_control_id(card, "browser.address")).chain(
+                    iced::widget::operation::select_all(card_control_id(card, "browser.address")),
+                )
+            }
             Message::RetryCard(card) => self.retry_card(card),
             Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
                     browser.address = BrowserAddress::user_input(value);
+                    browser.address_error = false;
+                }
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserAddressFocus { card, focused } => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.address_focused = focused;
+                }
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserProgressTick => {
+                for runtime in self.cards.values_mut() {
+                    if let CardRuntime::Browser(browser) = runtime {
+                        browser.progress_phase = (browser.progress_phase + 0.035) % 1.0;
+                    }
                 }
                 Task::none()
             }
             #[cfg(feature = "integrated-browser")]
             Message::BrowserNavigate(card) => {
                 let url = match self.cards.get_mut(&card) {
-                    Some(CardRuntime::Browser(browser)) => browser.address.submit(),
+                    Some(CardRuntime::Browser(browser)) => {
+                        let result = browser
+                            .address
+                            .submit_with_search(&self.settings.browser_search_url);
+                        browser.address_error = result.is_err();
+                        result
+                    }
                     _ => return Task::none(),
                 };
                 match url {
@@ -13347,6 +13745,10 @@ impl Application for Cagents {
                     return self.cancel_form_dialog();
                 }
                 if is_escape_press(&event) && !captured {
+                    if let Some((card, _)) = &self.terminal_paste {
+                        return self
+                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
+                    }
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
                     }
@@ -13414,6 +13816,54 @@ impl Application for Cagents {
                 // is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
+                }
+                if let Some(card) = self.workspace.focused()
+                    && self.terminal_find.get(&card).is_some_and(|find| find.open)
+                    && let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modifiers,
+                        ..
+                    } = &event
+                {
+                    if *key == keyboard::key::Named::Escape {
+                        return self.handle_terminal_find(terminal_ui::Action::Close(card));
+                    }
+                    if *key == keyboard::key::Named::Enter
+                        && self
+                            .terminal_find
+                            .get(&card)
+                            .is_some_and(|find| find.focused)
+                    {
+                        return self.handle_terminal_find(terminal_ui::Action::Next(
+                            card,
+                            modifiers.shift(),
+                        ));
+                    }
+                }
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modifiers,
+                    ..
+                } = &event
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
+                {
+                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                        RepositoryAction::FindPrevious { card }
+                    } else {
+                        RepositoryAction::FindNext { card }
+                    }));
+                }
+                #[cfg(feature = "integrated-browser")]
+                if !captured
+                    && let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+                    && let Some(message) = browser_shortcut(card, &event)
+                {
+                    return cosmic::task::message(message);
                 }
                 if !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
@@ -13549,6 +13999,11 @@ impl Application for Cagents {
                 if let Some(task) = self.open_chat_find() {
                     return task;
                 }
+                if let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                {
+                    return self.handle_terminal_find(terminal_ui::Action::Open(card));
+                }
                 // `focus` unfocuses every widget whose id does not match, so
                 // aiming it at an id the pane is not rendering would blur
                 // whatever the user was typing into and focus nothing. Only
@@ -13569,6 +14024,7 @@ impl Application for Cagents {
                     .map(cosmic::Action::App)
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
+            Message::TerminalFind(action) => self.handle_terminal_find(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
@@ -13675,6 +14131,9 @@ impl Application for Cagents {
                 Task::batch([refresh, self.flush_document_tone(), accounts])
             }
             Message::DocumentToneStale => {
+                if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
+                    self.synchronize_terminal_theme();
+                }
                 self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                 self.flush_document_tone()
             }
@@ -14064,10 +14523,19 @@ impl Application for Cagents {
                 );
             }
         }
+        #[cfg(feature = "integrated-browser")]
+        if self.cards.iter().any(|(card, runtime)| matches!(runtime, CardRuntime::Browser(browser) if browser.load_state.is_some() || browser.lifecycle == BrowserLifecycle::Restoring)
+            && self.workspace.visibility(*card) == Some(VisibilityClass::Visible))
+        {
+            subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::BrowserProgressTick));
+        }
         Subscription::batch(subscriptions)
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.terminal_paste_dialog() {
+            return Some(dialog);
+        }
         #[cfg(feature = "integrated-browser")]
         if let Some(dialog) = self.browser_import_dialog() {
             return Some(dialog);
@@ -14702,6 +15170,9 @@ fn spawn_browser(
     };
     BrowserHandle::spawn(restore, visible, fallback)
         .map(|handle| BrowserRuntime {
+            progress_phase: 0.0,
+            address_focused: false,
+            address_error: false,
             handle,
             ime: None,
             lifecycle: if visible {
@@ -15881,7 +16352,10 @@ mod tests {
             "https://alice:password@example .test/path?token=secret".into(),
         );
         assert_eq!(malformed.submit(), Err(()));
-        assert_eq!(malformed.as_str(), SanitizedLocation::INVALID);
+        assert_eq!(
+            malformed.as_str(),
+            "https://alice:password@example .test/path?token=secret"
+        );
     }
     #[test]
     fn application_close_sequence_visits_every_unresolved_repository_card() {
@@ -20390,6 +20864,10 @@ mod tests {
         Cagents {
             workspace,
             durable,
+            terminal_working_directories: HashMap::new(),
+            terminal_find: HashMap::new(),
+            terminal_context: None,
+            terminal_paste: None,
             cards: card_id
                 .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
                 .unwrap_or_default(),

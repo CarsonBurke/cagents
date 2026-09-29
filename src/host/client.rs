@@ -737,6 +737,50 @@ pub(super) fn process_request(
             handle.set_theme(theme).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::SearchTerminal {
+            terminal_id,
+            request,
+            query,
+            case_sensitive,
+        } => {
+            if query.len() > 4096 {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Terminal search query is too long",
+                    false,
+                ));
+            }
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .surface_handle(client_id, terminal_id)?;
+            handle
+                .search(request, query, case_sensitive)
+                .map_err(send_error)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ClearTerminalScrollback { terminal_id } => {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .surface_handle(client_id, terminal_id)?;
+            handle.clear_scrollback().map_err(send_error)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::CopyTerminalSelection {
+            terminal_id,
+            request,
+            selection,
+        } => {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .surface_handle(client_id, terminal_id)?;
+            handle
+                .copy_selection(request, selection)
+                .map_err(send_error)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Scroll {
             terminal_id,
             scroll,

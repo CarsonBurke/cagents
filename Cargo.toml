@@ -21,6 +21,7 @@ latency-harness = ["ui"]
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
 host = [
+    "dep:unicode-width",
     "dep:croner",
     "dep:jiff",
     "dep:ashpd",

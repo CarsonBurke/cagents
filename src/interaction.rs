@@ -133,6 +133,30 @@ impl Operation for MoveListFocus {
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 
+pub fn font_zoom_chord(
+    key: &cosmic::iced::keyboard::Key,
+    physical: cosmic::iced::keyboard::key::Physical,
+    modifiers: cosmic::iced::keyboard::Modifiers,
+) -> Option<i8> {
+    use cosmic::iced::keyboard::{
+        Key,
+        key::{Code, Physical},
+    };
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match (key.as_ref(), physical) {
+        (Key::Character("=" | "+"), _) | (_, Physical::Code(Code::Equal)) => Some(1),
+        (Key::Character("-"), _) | (_, Physical::Code(Code::Minus)) if !modifiers.shift() => {
+            Some(-1)
+        }
+        (Key::Character("0"), _) | (_, Physical::Code(Code::Digit0)) if !modifiers.shift() => {
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
 /// Reserve tab-history keys before editor widgets can treat Tab as indentation.
 /// The application's keyboard subscription owns navigation and Control release.
 pub fn reserve_tab_history<'a, Message: 'a>(
@@ -1596,6 +1620,54 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn font_zoom_accepts_layout_variants_without_claiming_typing() {
+        use cosmic::iced::keyboard::{
+            Key, Modifiers,
+            key::{Code, Physical},
+        };
+        let equal = Physical::Code(Code::Equal);
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::CTRL),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("+".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("-".into()),
+                Physical::Code(Code::Minus),
+                Modifiers::CTRL
+            ),
+            Some(-1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("0".into()),
+                Physical::Code(Code::Digit0),
+                Modifiers::CTRL
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::empty()),
+            None
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("=".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::ALT
+            ),
+            None
+        );
+    }
 
     #[test]
     fn list_arrows_move_native_focus_and_enter_activates_only_the_destination() {
