@@ -9880,128 +9880,93 @@ impl Cagents {
                 Task::none()
             }
             SettingsDecision::Persist(settings) => {
-                self.settings = settings;
-                self.synchronize_lifecycle_budget();
+                let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
-                if matches!(
-                    field,
-                    SettingsField::ShortcutNewTerminal
-                        | SettingsField::ShortcutNewChannel
-                        | SettingsField::ShortcutClonePane
-                        | SettingsField::ShortcutCloseFocusedColumn
-                        | SettingsField::ShortcutSearchProjects
-                        | SettingsField::ShortcutPreviousColumn
-                        | SettingsField::ShortcutNextColumn
-                        | SettingsField::ShortcutCyclePaneWidth
-                        | SettingsField::ShortcutPreviousWorkspace
-                        | SettingsField::ShortcutNextWorkspace
-                        | SettingsField::ShortcutReviewToggleViewed
-                        | SettingsField::ShortcutReviewNextFile
-                        | SettingsField::ShortcutReviewPreviousFile
-                        | SettingsField::ShortcutReviewNextUnviewed
-                        | SettingsField::ShortcutReviewNextChange
-                        | SettingsField::ShortcutReviewPreviousChange
-                ) {
-                    self.card_chrome.clear();
-                }
-                let effect = match field {
-                    SettingsField::WorktreeSort => {
-                        self.sidebar_state
-                            .set_worktree_sort(self.settings.worktree_sort);
-                        Task::none()
-                    }
-                    SettingsField::TerminalTheme => {
-                        self.synchronize_terminal_theme();
-                        Task::none()
-                    }
-                    SettingsField::EditorAutoSave => {
-                        Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-                            if let CardRuntime::Repository(runtime) = runtime {
-                                runtime.set_auto_save(self.settings.editor_auto_save);
-                                Some(repository_task(runtime.auto_save_task(card)))
-                            } else {
-                                None
-                            }
-                        }))
-                    }
-                    SettingsField::EditorWrapLines | SettingsField::EditorSyntaxTheme => {
-                        for runtime in self.cards.values_mut() {
-                            match runtime {
-                                CardRuntime::Repository(runtime) => {
-                                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                CardRuntime::PullRequests(pane) => {
-                                    pane.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                                    pane.runtime
-                                        .set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                CardRuntime::Chat(runtime) => {
-                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Task::none()
-                    }
-                    SettingsField::AppTheme | SettingsField::UiScale => {
-                        self.synchronize_appearance(previous_scale)
-                    }
-                    SettingsField::ShowStatusBar => self.accounts_surface_changed(),
-                    SettingsField::Notifications(_) => {
-                        self.notification_ui
-                            .preferences(self.settings.notifications, false);
-                        Task::none()
-                    }
-                    SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
-                    SettingsField::HibernationDelayMs => {
-                        // Reconciled here rather than through a queued
-                        // `LifecycleSweep`, so the manager's exposure is
-                        // current before the new grace is re-derived from it.
-                        let sweep = self.lifecycle_sweep();
-                        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
-                    }
-                    SettingsField::TerminalFontSize
-                    | SettingsField::TerminalFontFamily
-                    | SettingsField::TerminalScrollbackLines
-                    | SettingsField::TerminalLineHeight
-                    | SettingsField::TerminalPadding
-                    | SettingsField::TerminalScrollSize
-                    | SettingsField::TerminalScrollSpeed
-                    | SettingsField::TerminalCursorStyle
-                    | SettingsField::ConfirmTerminalClose
-                    | SettingsField::RelaunchAgentsOnUpgrade
-                    | SettingsField::ChatEnterSends
-                    | SettingsField::FocusFollowsMouse
-                    | SettingsField::DefaultColumnFraction
-                    | SettingsField::DefaultWorktreePane
-                    | SettingsField::DefaultChannelPane
-                    | SettingsField::ManagedWorktreeDirectory
-                    | SettingsField::LinkOpenDestination
-                    | SettingsField::LinkOpenGesture
-                    | SettingsField::ShortcutNewTerminal
-                    | SettingsField::ShortcutNewChannel
-                    | SettingsField::ShortcutClonePane
-                    | SettingsField::ShortcutCloseFocusedColumn
-                    | SettingsField::ShortcutSearchProjects
-                    | SettingsField::ShortcutPreviousColumn
-                    | SettingsField::ShortcutNextColumn
-                    | SettingsField::ShortcutCyclePaneWidth
-                    | SettingsField::ShortcutPreviousWorkspace
-                    | SettingsField::ShortcutNextWorkspace
-                    | SettingsField::PullRequestOpenTarget
-                    | SettingsField::ShortcutReviewToggleViewed
-                    | SettingsField::ShortcutReviewNextFile
-                    | SettingsField::ShortcutReviewPreviousFile
-                    | SettingsField::ShortcutReviewNextUnviewed
-                    | SettingsField::ShortcutReviewNextChange
-                    | SettingsField::ShortcutReviewPreviousChange => Task::none(),
-                };
+                let effect = self.synchronize_settings(&previous);
                 Task::batch([save, effect])
             }
         }
+    }
+
+    /// Applies every live effect of the settings changing from `previous` to
+    /// the ones now in force.
+    ///
+    /// Effects are derived from what changed rather than from which control
+    /// changed it, so a single edit and a wholesale reset reach the same
+    /// state: a reset that skipped one leaves the pane showing a value the
+    /// rest of the application - or the daemon - is not using.
+    fn synchronize_settings(&mut self, previous: &AppSettings) -> Task<Message> {
+        self.synchronize_lifecycle_budget();
+        let mut tasks = Vec::new();
+        if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
+            self.card_chrome.clear();
+        }
+        if previous.worktree_sort != self.settings.worktree_sort {
+            self.sidebar_state
+                .set_worktree_sort(self.settings.worktree_sort);
+        }
+        if previous.app_theme != self.settings.app_theme
+            || previous.ui_scale != self.settings.ui_scale
+        {
+            // Also re-applies the terminal theme.
+            tasks.push(self.synchronize_appearance(previous.ui_scale));
+        } else if previous.terminal_theme != self.settings.terminal_theme {
+            self.synchronize_terminal_theme();
+        }
+        let (wrap_lines, syntax_theme) = (
+            self.settings.editor_wrap_lines,
+            self.settings.editor_syntax_theme,
+        );
+        if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        {
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        runtime.set_wrap_lines(wrap_lines);
+                        runtime.set_syntax_theme(syntax_theme);
+                    }
+                    CardRuntime::PullRequests(pane) => {
+                        pane.runtime.set_wrap_lines(wrap_lines);
+                        pane.runtime.set_syntax_theme(syntax_theme);
+                    }
+                    CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
+                    _ => {}
+                }
+            }
+        }
+        if previous.editor_auto_save != self.settings.editor_auto_save {
+            let auto_save = self.settings.editor_auto_save;
+            tasks.extend(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+                let CardRuntime::Repository(runtime) = runtime else {
+                    return None;
+                };
+                runtime.set_auto_save(auto_save);
+                Some(repository_task(runtime.auto_save_task(card)))
+            }));
+        }
+        if previous.show_status_bar != self.settings.show_status_bar {
+            tasks.push(self.accounts_surface_changed());
+        }
+        if previous.notifications != self.settings.notifications {
+            self.notification_ui
+                .preferences(self.settings.notifications, false);
+        }
+        if previous.hibernation_delay_ms != self.settings.hibernation_delay_ms {
+            // Reconciled here rather than through a queued `LifecycleSweep`,
+            // so the manager's exposure is current before the new grace is
+            // re-derived from it.
+            tasks.push(self.lifecycle_sweep());
+            tasks.push(self.reschedule_offscreen_lifecycle_sweep());
+        } else if previous.max_hot_cards != self.settings.max_hot_cards {
+            tasks.push(cosmic::task::message(Message::LifecycleSweep));
+        }
+        // A no-op unless the configured list changed; a reset restores the
+        // built-in list, a different set of processes whenever the user had
+        // configured their own.
+        tasks.push(self.synchronize_language_servers());
+        Task::batch(tasks)
     }
 
     /// Rebuilds the language-server manager when the configured list no longer
@@ -10039,44 +10004,15 @@ impl Cagents {
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
-        let previous_scale = self.settings.ui_scale;
-        self.settings = AppSettings::default();
-        self.sidebar_state
-            .set_worktree_sort(self.settings.worktree_sort);
+        let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.settings_pending.clear();
         self.settings_invalid.clear();
-        self.card_chrome.clear();
-        self.synchronize_lifecycle_budget();
-        // Reset restores the built-in server list, which is a different set of
-        // processes whenever the user had configured their own.
-        let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
         let save = self.save_settings_task(true);
         self.refresh_settings_feedback();
-        let sweep = self.lifecycle_sweep();
-        let appearance = self.synchronize_appearance(previous_scale);
-        let auto_save = Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-            if let CardRuntime::Chat(runtime) = runtime {
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-            }
-            if let CardRuntime::Repository(runtime) = runtime {
-                runtime.set_auto_save(self.settings.editor_auto_save);
-                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
-                Some(repository_task(runtime.auto_save_task(card)))
-            } else {
-                None
-            }
-        }));
-        Task::batch([
-            save,
-            resync,
-            sweep,
-            appearance,
-            auto_save,
-            self.reschedule_offscreen_lifecycle_sweep(),
-        ])
+        let effects = self.synchronize_settings(&previous);
+        Task::batch([save, effects])
     }
 }
 
@@ -15920,6 +15856,42 @@ mod tests {
         settle_settings_task(&mut app, task);
         let _ = app.autosave_setting(SettingsField::TerminalFontFamily, stale);
         assert_eq!(settings::load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn resetting_settings_sends_restored_notification_preferences_to_the_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.notifications.enabled = false;
+        app.settings.notifications.while_focused = true;
+        assert_eq!(app.notification_ui.pending_preferences(), None);
+
+        let task = app.reset_settings();
+        settle_settings_task(&mut app, task);
+
+        // The daemon, not the pane, decides which alerts arrive; a reset that
+        // only redraws the toggles leaves it applying the old policy.
+        assert_eq!(
+            app.notification_ui.pending_preferences(),
+            Some(crate::notifications::Preferences::default())
+        );
+    }
+
+    #[test]
+    fn resetting_unchanged_notification_preferences_sends_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 20.0;
+
+        let task = app.reset_settings();
+        settle_settings_task(&mut app, task);
+
+        assert_eq!(app.notification_ui.pending_preferences(), None);
+        assert_eq!(app.settings, AppSettings::default());
     }
 
     #[test]
