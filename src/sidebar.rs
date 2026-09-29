@@ -3901,7 +3901,8 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     if compact {
         return widget::container(
             widget::column::with_children(vec![
-                widget::icon::from_name("dialog-warning-symbolic")
+                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                    .icon()
                     .size(STATUS_ICON_SIZE)
                     .into(),
                 icon_action(
@@ -3920,7 +3921,8 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     }
     widget::container(
         widget::column::with_children(vec![
-            widget::icon::from_name("dialog-warning-symbolic")
+            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                .icon()
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading("Couldn’t load projects").into(),
@@ -3969,7 +3971,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
             SidebarFilter::PullRequests => (
-                "vcs-merge-request-symbolic",
+                "pull-request-symbolic",
                 "No pull requests found",
                 "Open a repository or change the current filter.",
                 "Show all",
@@ -5477,14 +5479,18 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
             .width(size)
             .height(size)
             .into(),
-        None => widget::container(widget::icon::from_name("folder-symbolic").size(size))
-            .class(theme::Container::custom(move |theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_icon_color(theme)),
-                    ..Default::default()
-                }
-            }))
-            .into(),
+        None => widget::container(
+            crate::ui_controls::symbolic_icon("folder-symbolic")
+                .icon()
+                .size(size),
+        )
+        .class(theme::Container::custom(move |theme| {
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(design::muted_icon_color(theme)),
+                ..Default::default()
+            }
+        }))
+        .into(),
     }
 }
 
@@ -6563,9 +6569,13 @@ fn panel_section<'a>(
     let parts = SectionHeader::new(key, section, count, expanded, modal_open);
     let row = button::custom(
         widget::row::with_children(vec![
-            widget::container(icon::from_name(parts.icon).size(ROW_ICON_SIZE))
-                .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                .into(),
+            widget::container(
+                crate::ui_controls::symbolic_icon(parts.icon)
+                    .icon()
+                    .size(ROW_ICON_SIZE),
+            )
+            .center_x(Length::Fixed(ROW_ICON_WIDTH))
+            .into(),
             design::heading(parts.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -7730,7 +7740,8 @@ fn commit_changes_section<'a>(
         .push(
             button::custom(
                 widget::row::with_children(vec![
-                    icon::from_name("go-previous-symbolic")
+                    crate::ui_controls::symbolic_icon("go-previous-symbolic")
+                        .icon()
                         .size(ROW_ICON_SIZE)
                         .into(),
                     design::body("History").into(),
@@ -7862,9 +7873,13 @@ fn history_section<'a>(
         rows = rows.push(
             button::custom(
                 widget::row::with_children(vec![
-                    widget::container(icon::from_name("vcs-commit-symbolic").size(ROW_ICON_SIZE))
-                        .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                        .into(),
+                    widget::container(
+                        crate::ui_controls::symbolic_icon("vcs-commit-symbolic")
+                            .icon()
+                            .size(ROW_ICON_SIZE),
+                    )
+                    .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                    .into(),
                     widget::column::with_children(vec![
                         design::body(&*chrome.subject)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)

@@ -202,20 +202,6 @@ pub enum Action {
     Launch(NewTab),
 }
 
-fn browser_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/></g></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
-}
-
-fn chat_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm2 5h10M7 13h7"/></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
-}
-
 // Tabs retain a neutral keyboard focus cue without an accent outline.
 fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
@@ -386,8 +372,12 @@ impl Cagents {
                         NewTab::Terminal => {
                             crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                         }
-                        NewTab::Thread => chat_icon(),
-                        NewTab::Browser => browser_icon(),
+                        NewTab::Thread => {
+                            crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
+                        }
+                        NewTab::Browser => {
+                            crate::ui_controls::symbolic_icon("internet-web-browser-symbolic")
+                        }
                     };
                     crate::ui_controls::popover_item(
                         icon,
@@ -804,7 +794,7 @@ impl Cagents {
                 .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
                 .map_or(0, |index| index + 1);
             actions.push(command(
-                widget::icon::from_name("go-previous-symbolic"),
+                crate::ui_controls::symbolic_icon("go-previous-symbolic"),
                 "Previous column",
                 widget::Id::new("command.previous-column"),
                 (current > 1).then_some(Message::FocusAdjacent(
@@ -818,7 +808,7 @@ impl Cagents {
                     .into(),
             );
             actions.push(command(
-                widget::icon::from_name("go-next-symbolic"),
+                crate::ui_controls::symbolic_icon("go-next-symbolic"),
                 "Next column",
                 widget::Id::new("command.next-column"),
                 (current > 0 && current < total).then_some(Message::FocusAdjacent(
@@ -869,6 +859,27 @@ impl Cagents {
         ]
     }
 
+    /// The mark that names a card wherever the card itself is shown: its tab
+    /// and the inspector heading. Agents wear their provider's mark, whether
+    /// they run in a native chat or a terminal.
+    pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
+        let kind = self.card_state(id).map(|card| &card.kind);
+        let generic = || crate::ui_controls::symbolic_icon(card_kind_labels(kind).icon);
+        match kind {
+            Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
+            Some(CardKind::Chat(session)) => {
+                crate::ui_controls::provider_icon(session.launch.provider)
+            }
+            Some(CardKind::Terminal(session)) => self
+                .sidebar_state
+                .card_activity(id)
+                .map(|activity| activity.provider)
+                .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
+                .map_or_else(generic, crate::ui_controls::provider_icon),
+            _ => generic(),
+        }
+    }
+
     fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -881,35 +892,9 @@ impl Cagents {
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
-        let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
-            Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
-            Some(CardKind::Repository(_)) => {
-                crate::ui_controls::ceditor_icon().icon().size(16).into()
-            }
-            Some(CardKind::Chat(session)) => {
-                crate::ui_controls::provider_icon(session.launch.provider)
-                    .icon()
-                    .size(16)
-                    .into()
-            }
-            Some(CardKind::Terminal(session)) => self
-                .sidebar_state
-                .card_activity(id)
-                .map(|activity| activity.provider)
-                .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
-                .map(crate::ui_controls::provider_icon)
-                .unwrap_or_else(|| crate::ui_controls::symbolic_icon(labels.icon))
-                .icon()
-                .size(16)
-                .into(),
-            _ => crate::ui_controls::symbolic_icon(labels.icon)
-                .icon()
-                .size(16)
-                .into(),
-        };
         let title_control = widget::button::custom(
             widget::row::with_children(vec![
-                icon,
+                self.card_icon(id).icon().size(16).into(),
                 design::body(title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
@@ -963,7 +948,8 @@ impl Cagents {
             let indicator: Element<'_, Message> = if busy {
                 crate::ui_controls::activity_spinner_tone(14.0, design::accent_color)
             } else {
-                widget::icon::from_name("dialog-warning-symbolic")
+                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                    .icon()
                     .size(14)
                     .into()
             };
@@ -994,9 +980,9 @@ impl Cagents {
         if self.chat_switch_available(id) {
             children.push(command(
                 if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
-                    widget::icon::from_name("utilities-terminal-symbolic").into()
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                 } else {
-                    chat_icon()
+                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
                 },
                 self.chat_switch_label(id),
                 card_control_id(id, "chat"),
@@ -1199,7 +1185,9 @@ impl Cagents {
                 },
                 |model| {
                     let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
-                    inspector::view(model, width, diagnostics_open).map(Message::ContextInspector)
+                    let icon = self.card_icon(model.card_id);
+                    inspector::view(model, icon, width, diagnostics_open)
+                        .map(Message::ContextInspector)
                 },
             ),
         };

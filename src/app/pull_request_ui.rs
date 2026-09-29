@@ -797,7 +797,8 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     .into(),
                                     content.into(),
                                     widget::container(
-                                        widget::icon::from_name("external-link-symbolic")
+                                        crate::ui_controls::symbolic_icon("external-link-symbolic")
+                                            .icon()
                                             .size(design::COMPACT_ICON_SIZE),
                                     )
                                     .width(Length::Fixed(design::COMPACT_ICON_SIZE.into()))
