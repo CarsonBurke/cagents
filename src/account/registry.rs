@@ -65,6 +65,25 @@ impl Registered {
             plan: None,
         }
     }
+
+    /// Whether `reported` is a different login from the one this account
+    /// was added with. A home cagents keeps for one login that reports
+    /// another has had its credentials replaced, which is never a change
+    /// to take quietly.
+    pub fn conflicts_with(&self, reported: &Identity) -> bool {
+        self.email.is_some() && reported.email.is_some() && !self.identity().same_login(reported)
+    }
+}
+
+/// How an account's reported login compares with the one it was added with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observed {
+    /// Nothing new to record.
+    Unchanged,
+    /// Details the registry lacked were recorded.
+    Recorded,
+    /// The home reports a different login. The recorded one is kept.
+    Conflict,
 }
 
 /// A home created for a sign-in that has not finished: registered before the
@@ -450,22 +469,45 @@ impl Registry {
         self.pending.retain(|pending| pending.key != key);
     }
 
-    /// Updates what the provider last reported about a managed account, so
-    /// the table and the dedupe of the next sign-in know who it is.
-    pub fn observe_identity(&mut self, key: Uuid, identity: &Identity) -> bool {
+    /// Records what the provider reported about a managed account that the
+    /// registry does not know yet, so the table and the dedupe of the next
+    /// sign-in know who it is.
+    ///
+    /// The login an account was added with is its identity: a home that
+    /// later reports a different one is a [`Observed::Conflict`], and the
+    /// recorded login is kept for the reader to see. Only an explicit sign-in
+    /// to that account changes it (see [`Self::adopt_identity`]).
+    pub fn observe_identity(&mut self, key: Uuid, identity: &Identity) -> Observed {
         let Some(managed) = self.accounts.iter_mut().find(|managed| managed.key == key) else {
-            return false;
+            return Observed::Unchanged;
         };
-        let email = identity.email.clone().or_else(|| managed.email.clone());
-        let organization = identity
+        if managed.conflicts_with(identity) {
+            return Observed::Conflict;
+        }
+        let email = managed.email.clone().or_else(|| identity.email.clone());
+        let organization = managed
             .organization
             .clone()
-            .or_else(|| managed.organization.clone());
+            .or_else(|| identity.organization.clone());
         if managed.email == email && managed.organization == organization {
-            return false;
+            return Observed::Unchanged;
         }
         managed.email = email;
         managed.organization = organization;
+        Observed::Recorded
+    }
+
+    /// Replaces the login recorded for a managed account with the one the
+    /// reader just signed it in to.
+    pub fn adopt_identity(&mut self, key: Uuid, identity: &Identity) -> bool {
+        let Some(managed) = self.accounts.iter_mut().find(|managed| managed.key == key) else {
+            return false;
+        };
+        if identity.email.is_none() || managed.identity().same_login(identity) {
+            return false;
+        }
+        managed.email = identity.email.clone();
+        managed.organization = identity.organization.clone();
         true
     }
 
@@ -1096,6 +1138,58 @@ mod tests {
             .register(managed(Provider::Codex, "same@example.com"), &[])
             .expect("a managed home has its own history and may share a login with a linked home");
         assert_eq!(registry.registered().len(), 2);
+    }
+
+    #[test]
+    fn a_home_reporting_another_login_keeps_the_login_it_was_added_with() {
+        let reported = |email: &str, organization: Option<&str>| Identity {
+            email: Some(email.into()),
+            organization: organization.map(str::to_owned),
+            plan: None,
+        };
+        let mut registry = Registry::default();
+        let added = managed(Provider::Claude, "work@example.com");
+        let key = added.key;
+        registry.register(added, &[]).unwrap();
+
+        // What the registry lacked is learned; the same login is no change.
+        assert_eq!(
+            registry.observe_identity(key, &reported("work@example.com", Some("Acme"))),
+            Observed::Recorded
+        );
+        assert_eq!(
+            registry.observe_identity(key, &reported(" WORK@example.com", None)),
+            Observed::Unchanged
+        );
+        // Another login - or the same address in another organization - is
+        // a home whose credentials were replaced, never a quiet rename.
+        for other in [
+            reported("personal@example.com", Some("Acme")),
+            reported("work@example.com", Some("Personal")),
+        ] {
+            assert!(registry.find(key).unwrap().conflicts_with(&other));
+            assert_eq!(registry.observe_identity(key, &other), Observed::Conflict);
+            assert_eq!(
+                registry.find(key).unwrap().identity(),
+                reported("work@example.com", Some("Acme"))
+            );
+        }
+        // A home that names nobody says nothing about who it is.
+        assert!(
+            !registry
+                .find(key)
+                .unwrap()
+                .conflicts_with(&Identity::default())
+        );
+
+        // Signing that account in again is the reader's choice of login.
+        assert!(registry.adopt_identity(key, &reported("personal@example.com", None)));
+        assert_eq!(
+            registry.find(key).unwrap().identity(),
+            reported("personal@example.com", None)
+        );
+        assert!(!registry.adopt_identity(key, &reported("personal@example.com", None)));
+        assert!(!registry.adopt_identity(key, &Identity::default()));
     }
 
     #[test]
