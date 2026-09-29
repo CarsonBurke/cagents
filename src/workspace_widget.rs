@@ -3024,7 +3024,7 @@ mod tests {
             })
         });
         let mut element: Element<'_, WorkspaceViewportEvent> = WorkspaceSurface::new(
-            scrollable.into(),
+            scrollable,
             &shortcuts,
             FocusedPane::Other,
             400.0,
