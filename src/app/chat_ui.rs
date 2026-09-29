@@ -12,6 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod clipboard_image;
 mod completion;
 mod prose;
 mod retained;
@@ -20,6 +21,10 @@ mod step;
 mod tool_text;
 mod turn;
 mod view;
+
+pub(super) fn prune_pasted_images() {
+    clipboard_image::prune_cache();
+}
 
 fn action(action: Action) -> Message {
     Message::ChatUi(action)
@@ -139,6 +144,13 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    Paste(Target),
+    PastedImage(Target, Option<clipboard_image::Image>),
+    PastedText(Target, Option<String>),
+    /// A clipboard image the chat cannot take, offered without any text to
+    /// paste in its place.
+    PasteRefused(Target, &'static str),
+    ImageSaved(Target, Result<PathBuf, String>),
     Submit(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
@@ -210,6 +222,10 @@ impl Action {
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::Attached(..)
+                | Self::PastedImage(..)
+                | Self::PastedText(..)
+                | Self::PasteRefused(..)
+                | Self::ImageSaved(..)
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
@@ -242,6 +258,7 @@ impl Action {
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Attach(target)
+            | Self::Paste(target)
             | Self::Dropped(target, _)
             | Self::RemoveAttachment(target, _)
             | Self::Model(target, _)
@@ -1133,6 +1150,10 @@ pub(super) struct Runtime {
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
+    /// Clipboard reads and image writes still destined for this draft.
+    pastes_pending: usize,
+    image_pastes_saving: usize,
+    submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
     answers: view::Answers,
@@ -1393,6 +1414,9 @@ impl Runtime {
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
+            pastes_pending: 0,
+            image_pastes_saving: 0,
+            submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
             answers: HashMap::new(),
@@ -1972,9 +1996,10 @@ fn draft_snapshot(
 ) -> Snapshot {
     Snapshot {
         capabilities: chat::Capabilities {
-            // Codex takes an image only on a model that reads one, which it
-            // says once the conversation has started.
-            attachments: provider != Provider::Codex,
+            // Codex reports model image support only after its conversation
+            // starts. Let a draft stage an image; the first send checks the
+            // provider's actual capability and restores the draft on refusal.
+            attachments: true,
             model_selection: true,
             reasoning_selection: true,
             permission_modes: match provider {
@@ -4713,6 +4738,137 @@ impl Cagents {
                     }
                 }
             }
+            Action::Paste(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                runtime.pastes_pending += 1;
+                return iced::clipboard::read_data::<clipboard_image::Image>().map(move |image| {
+                    cosmic::Action::App(Message::ChatUi(Action::PastedImage(target, image)))
+                });
+            }
+            Action::PastedImage(target, Some(image)) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Many apps offer text alongside an image; where the chat
+                // cannot take the image, the text is pasted instead, and the
+                // refusal is shown only when there is no text. The paste
+                // stays pending until that text read resolves.
+                let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                let refusal = if !runtime.snapshot.capabilities.attachments {
+                    Some("The current model cannot accept images.")
+                } else if rules.max_count.is_some_and(|limit| {
+                    runtime.attachments.len() + runtime.image_pastes_saving >= limit
+                }) {
+                    Some("This chat has reached its attachment limit.")
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    return iced::clipboard::read().map(move |text| {
+                        cosmic::Action::App(Message::ChatUi(match text {
+                            Some(text) => Action::PastedText(target, Some(text)),
+                            None => Action::PasteRefused(target, refusal),
+                        }))
+                    });
+                }
+                runtime.image_pastes_saving += 1;
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        clipboard_image::save(image, rules.max_image_bytes)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::ChatUi(Action::ImageSaved(target, result))
+                });
+            }
+            Action::PastedImage(target, None) => {
+                return iced::clipboard::read().map(move |text| {
+                    cosmic::Action::App(Message::ChatUi(Action::PastedText(target, text)))
+                });
+            }
+            Action::PastedText(target, Some(text)) => {
+                let submit = if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    (runtime.pastes_pending == 0)
+                        .then(|| runtime.submit_after_paste.take())
+                        .flatten()
+                } else {
+                    None
+                };
+                let edited = self.handle_chat_ui(Action::Composer(
+                    target,
+                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text))),
+                ));
+                return Task::batch(
+                    std::iter::once(edited).chain(
+                        submit.map(|mode| self.handle_chat_ui(Action::Submit(target, mode))),
+                    ),
+                );
+            }
+            Action::PastedText(target, None) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    if runtime.pastes_pending == 0
+                        && let Some(mode) = runtime.submit_after_paste.take()
+                    {
+                        return self.handle_chat_ui(Action::Submit(target, mode));
+                    }
+                }
+            }
+            Action::PasteRefused(target, refusal) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    runtime.submit_after_paste = None;
+                    runtime.error = Some(refusal.into());
+                }
+            }
+            Action::ImageSaved(target, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    runtime.image_pastes_saving = runtime.image_pastes_saving.saturating_sub(1);
+                    let rules =
+                        chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                    let success = match result {
+                        Ok(path)
+                            if runtime.snapshot.capabilities.attachments
+                                && rules
+                                    .max_count
+                                    .is_none_or(|limit| runtime.attachments.len() < limit) =>
+                        {
+                            runtime.attach([path]);
+                            true
+                        }
+                        Ok(path) => {
+                            let _ = std::fs::remove_file(path);
+                            runtime.error = Some(
+                                if runtime.snapshot.capabilities.attachments {
+                                    "This chat has reached its attachment limit."
+                                } else {
+                                    "The current model cannot accept images."
+                                }
+                                .into(),
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            runtime.error = Some(error);
+                            false
+                        }
+                    };
+                    if !success {
+                        runtime.submit_after_paste = None;
+                    } else if runtime.pastes_pending == 0
+                        && let Some(mode) = runtime.submit_after_paste.take()
+                    {
+                        return self.handle_chat_ui(Action::Submit(target, mode));
+                    }
+                } else if let Ok(path) = result {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
             Action::AppendProviderDraft(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if let Some(provided) = &runtime.snapshot.composer {
@@ -4729,6 +4885,10 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.pastes_pending > 0 {
+                    runtime.submit_after_paste = Some(mode);
+                    return Task::none();
+                }
                 if runtime.composer.text().trim().is_empty() && runtime.attachments.is_empty() {
                     return Task::none();
                 }
@@ -6026,6 +6186,98 @@ mod tests {
     fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
         let _ = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+    }
+
+    #[test]
+    fn a_pending_image_paste_stays_with_the_message_it_precedes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "describe this image");
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot)
+                .capabilities
+                .attachments = true;
+            runtime.pastes_pending = 1;
+            runtime.image_pastes_saving = 1;
+        }
+        submit(&mut app, card);
+        assert!(chat_runtime(&app, card).pending.is_none());
+        assert_eq!(
+            chat_runtime(&app, card).submit_after_paste,
+            Some(PromptMode::Send)
+        );
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "describe this image"
+        );
+
+        let path = PathBuf::from("/fixture/pasted.png");
+        let _ = app.update(Message::ChatUi(Action::ImageSaved(
+            target,
+            Ok(path.clone()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert_eq!(runtime.image_pastes_saving, 0);
+        assert_eq!(runtime.submit_after_paste, None);
+        assert_eq!(runtime.attachments, [Attachment { path }]);
+        assert!(
+            runtime.pending.is_some(),
+            "send resumes after the image is ready"
+        );
+    }
+
+    #[test]
+    fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot)
+                .capabilities
+                .attachments = false;
+            runtime.pastes_pending = 1;
+            runtime.submit_after_paste = Some(PromptMode::Send);
+        }
+        let image = clipboard_image::Image::try_from((
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+            "image/png".to_owned(),
+        ))
+        .unwrap();
+        let _ = app.update(Message::ChatUi(Action::PastedImage(target, Some(image))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error, None, "the clipboard text is read first");
+        assert_eq!(runtime.pastes_pending, 1);
+        assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
+
+        let _ = app.update(Message::ChatUi(Action::PastedText(
+            target,
+            Some("pasted cell".into()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachments.is_empty());
+        assert!(
+            runtime.pending.is_some(),
+            "the send waiting on the paste goes ahead with its text"
+        );
+
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.pastes_pending = 1;
+        let _ = app.update(Message::ChatUi(Action::PasteRefused(
+            target,
+            "The current model cannot accept images.",
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("The current model cannot accept images.")
+        );
     }
 
     /// A new conversation whose start, for its first message, is still in

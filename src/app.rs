@@ -10227,6 +10227,7 @@ impl Application for Cagents {
     }
 
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
+        std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
