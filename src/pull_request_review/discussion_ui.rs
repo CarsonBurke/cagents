@@ -19,6 +19,8 @@ pub enum Action {
         result: Result<Arc<PullRequestConversation>, String>,
     },
     Begin(Anchor),
+    /// Starts a comment on the whole of the selected file.
+    BeginFile(String),
     Reply(String),
     Edit(String),
     Delete(String),
@@ -33,6 +35,9 @@ pub enum Action {
     Save,
     Summary(text_editor::Action),
     Event(ReviewEvent),
+    /// Shows or hides the review submission popover.
+    ToggleReview,
+    CloseReview,
     PrepareSubmit,
     CancelSubmit,
     ConfirmSubmit,
@@ -47,6 +52,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 enum Destination {
     Line(Anchor),
+    File(String),
     Reply(String),
     Edit(String),
 }
@@ -76,6 +82,11 @@ pub(super) struct DiscussionState {
     markdown: HashMap<String, Vec<markdown::Item>>,
     expanded: BTreeSet<String>,
     composer: Option<Composer>,
+    /// The submission surface is disclosed on demand rather than parked
+    /// under every diff.
+    review_open: bool,
+    /// Why GitHub refused the last submission, shown inside the popover.
+    submit_error: Option<String>,
     summary: text_editor::Content<cosmic::Renderer>,
     event: ReviewEvent,
     confirmation: Option<(
@@ -99,6 +110,8 @@ impl Default for DiscussionState {
             markdown: HashMap::new(),
             expanded: BTreeSet::new(),
             composer: None,
+            review_open: false,
+            submit_error: None,
             summary: text_editor::Content::new(),
             event: ReviewEvent::Comment,
             confirmation: None,
@@ -158,6 +171,10 @@ impl State {
             && self.discussion.unknown.is_none()
     }
 
+    fn can_discard_draft(&self) -> bool {
+        !self.discussion.busy && self.discussion.unknown.is_none()
+    }
+
     fn send_discussion(&mut self, authority: Authority, mutation: Mutation) -> ActionTask {
         if !self.can_mutate_discussion() {
             return ActionTask::none();
@@ -166,7 +183,10 @@ impl State {
         self.discussion.submitting = matches!(mutation, Mutation::Submit { .. });
         self.discussion.saving_composer = matches!(
             mutation,
-            Mutation::Comment { .. } | Mutation::Reply { .. } | Mutation::Edit { .. }
+            Mutation::Comment { .. }
+                | Mutation::FileComment { .. }
+                | Mutation::Reply { .. }
+                | Mutation::Edit { .. }
         );
         // A load started before this write must not install an older pending count.
         self.load_generation = self.load_generation.wrapping_add(1);
@@ -263,13 +283,27 @@ impl State {
                         if self.discussion.saving_composer {
                             self.discussion.composer = None;
                         }
-                        if self.discussion.submitting {
+                        self.notice = Some(if self.discussion.submitting {
                             self.discussion.summary = text_editor::Content::new();
-                        }
-                        self.notice = Some("Review updated on GitHub.".into());
+                            self.discussion.event = ReviewEvent::Comment;
+                            self.discussion.review_open = false;
+                            "Review submitted to GitHub.".into()
+                        } else {
+                            "Review updated on GitHub.".into()
+                        });
+                    }
+                    // A refused submission is reported where it was made; the
+                    // pane's notice would sit underneath the open popover.
+                    Outcome::Refused(message) if self.discussion.submitting => {
+                        self.discussion.submit_error = Some(message)
                     }
                     Outcome::Refused(message) => self.notice = Some(message),
-                    Outcome::Unknown(message) => self.discussion.unknown = Some(message),
+                    // Every review write is blocked until this is resolved,
+                    // and its resolution lives in the pane's notice slot.
+                    Outcome::Unknown(message) => {
+                        self.discussion.review_open = false;
+                        self.discussion.unknown = Some(message);
+                    }
                 }
                 self.refreshing = true;
                 return self.start_load();
@@ -285,7 +319,44 @@ impl State {
                     self.discussion.expanded.insert(id);
                 }
             }
-            Action::CancelSubmit => self.discussion.confirmation = None,
+            Action::CancelSubmit if !self.discussion.submitting || !self.discussion.busy => {
+                self.discussion.confirmation = None;
+            }
+            Action::ToggleReview if !self.discussion.submitting || !self.discussion.busy => {
+                self.discussion.review_open = !self.discussion.review_open;
+                self.discussion.confirmation = None;
+                self.discussion.submit_error = None;
+            }
+            Action::CloseReview if !self.discussion.submitting || !self.discussion.busy => {
+                self.discussion.review_open = false;
+                self.discussion.confirmation = None;
+                self.discussion.submit_error = None;
+            }
+            Action::BeginFile(path) if self.drafting_file(&path) => {
+                // The file's draft is already open: take the reader back to it.
+                self.effects.push(Effect::RevealFileDiscussion);
+            }
+            // Drafting is local until it is saved, so a background refresh
+            // must not swallow keystrokes. Only an in-flight write, whose
+            // completion replaces the draft, holds them back.
+            Action::Composer(action) if !self.discussion.busy => {
+                if let Some(composer) = &mut self.discussion.composer {
+                    composer.content.perform(action);
+                    composer.markdown = markdown::parse(&composer.content.text()).collect();
+                }
+            }
+            Action::Preview if !self.discussion.busy => {
+                if let Some(composer) = &mut self.discussion.composer {
+                    composer.preview = !composer.preview;
+                }
+            }
+            Action::Summary(action) if !self.discussion.busy => {
+                self.discussion.summary.perform(action)
+            }
+            // Discarding a draft sends nothing, so a refresh does not hold it.
+            // A write whose outcome was lost does: the draft is what the
+            // reader compares with GitHub.
+            Action::Cancel if self.can_discard_draft() => self.discussion.composer = None,
             Action::OpenLink(raw) => {
                 if let Ok(url) = Url::parse(&raw)
                     && matches!(url.scheme(), "https" | "http")
@@ -321,6 +392,28 @@ impl State {
                     markdown: Vec::new(),
                 });
             }
+            Action::BeginFile(path) => {
+                if self
+                    .selected
+                    .as_ref()
+                    .is_none_or(|selected| selected.as_path().to_str() != Some(path.as_str()))
+                {
+                    return ActionTask::none();
+                }
+                if self.discussion.composer.is_some() {
+                    self.notice = Some("Save or cancel the open comment first.".into());
+                    return ActionTask::none();
+                }
+                self.discussion.composer = Some(Composer {
+                    authority: self.authority().expect("loaded review authority"),
+                    destination: Destination::File(path),
+                    content: text_editor::Content::new(),
+                    preview: false,
+                    markdown: Vec::new(),
+                });
+                // File discussions sit above the first diff row.
+                self.effects.push(Effect::RevealFileDiscussion);
+            }
             Action::Reply(id) => {
                 if self.discussion.composer.is_some() {
                     self.notice = Some("Save or cancel the open comment first.".into());
@@ -355,22 +448,11 @@ impl State {
                     markdown: markdown::parse(&comment.body).collect(),
                 });
             }
-            Action::Composer(action) => {
-                if let Some(composer) = &mut self.discussion.composer {
-                    composer.content.perform(action);
-                    composer.markdown = markdown::parse(&composer.content.text()).collect();
-                }
-            }
-            Action::Preview => {
-                if let Some(composer) = &mut self.discussion.composer {
-                    composer.preview = !composer.preview;
-                }
-            }
-            Action::Cancel => self.discussion.composer = None,
-            Action::Summary(action) => self.discussion.summary.perform(action),
+            Action::Composer(_) | Action::Preview | Action::Summary(_) | Action::Cancel => {}
             Action::Event(event) => {
                 self.discussion.event = event;
                 self.discussion.confirmation = None;
+                self.discussion.submit_error = None;
             }
             Action::Save => {
                 let Some(composer) = &self.discussion.composer else {
@@ -384,6 +466,10 @@ impl State {
                 let mutation = match &composer.destination {
                     Destination::Line(anchor) => Mutation::Comment {
                         anchor: anchor.clone(),
+                        body,
+                    },
+                    Destination::File(path) => Mutation::FileComment {
+                        path: path.clone(),
                         body,
                     },
                     Destination::Reply(thread) => Mutation::Reply {
@@ -408,6 +494,7 @@ impl State {
                 }
             }
             Action::PrepareSubmit => {
+                self.discussion.submit_error = None;
                 if self.discussion.composer.is_some() {
                     self.notice = Some(
                         "Save or cancel the open comment before submitting your review.".into(),
@@ -439,113 +526,422 @@ impl State {
                 }
             }
             Action::ConfirmSubmit => {
-                if let Some((authority, request, comments)) = self.discussion.confirmation.take() {
+                // The confirmation stays on screen, reading "Submitting…",
+                // until the outcome arrives and clears it.
+                if let Some((authority, request, comments)) = self.discussion.confirmation.clone() {
+                    self.discussion.submit_error = None;
                     return self.send_discussion(authority, Mutation::Submit { request, comments });
                 }
             }
-            Action::AcknowledgeUnknown => {}
+            Action::AcknowledgeUnknown
+            | Action::ToggleReview
+            | Action::CloseReview
+            | Action::CancelSubmit => {}
         }
         ActionTask::none()
     }
 
-    pub fn review_bar(&self, modal_open: bool) -> Element<'_, super::Action> {
-        let enabled = !modal_open && self.can_mutate_discussion();
-        let mut rows: Vec<Element<'_, Action>> = Vec::new();
-        let pending = self
-            .context
+    fn pending_count(&self) -> u64 {
+        self.context
             .as_ref()
-            .and_then(|c| c.pending.as_ref())
-            .map_or(0, |p| p.comment_count);
-        rows.push(design::heading(format!("Review · {pending} pending comments")).into());
-        if let Some(message) = &self.discussion.unknown {
-            rows.push(design::body(format!("GitHub may have received the last change. Check the discussion before continuing. {message}")).into());
-            rows.push(
-                button::text("I checked GitHub; continue")
-                    .on_press(Action::AcknowledgeUnknown)
-                    .into(),
-            );
+            .and_then(|context| context.pending.as_ref())
+            .map_or(0, |pending| pending.comment_count)
+    }
+
+    /// The pull request's review entry point. Submission is disclosed on
+    /// demand: a quiet button until comments are pending, then a primary
+    /// one that carries their count, like a forge's "Finish your review".
+    pub fn review_control(&self, modal_open: bool) -> Element<'_, super::Action> {
+        let pending = self.pending_count();
+        let available = !modal_open && self.authority().is_some();
+        let mut label: Vec<Element<'_, Action>> = vec![
+            design::body(if pending == 0 {
+                "Review"
+            } else {
+                "Finish review"
+            })
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        ];
+        if pending > 0 {
+            label.push(count_pill(pending));
         }
+        let button = button::custom(
+            widget::row::with_children(label)
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .class(if pending > 0 {
+            cosmic::theme::Button::Suggested
+        } else {
+            cosmic::theme::Button::Standard
+        })
+        .padding([3, 10])
+        .selected(self.discussion.review_open)
+        .on_press_maybe(available.then_some(Action::ToggleReview));
+        let tip = if self.authority().is_none() {
+            "Reviewing needs this pull request loaded from GitHub"
+        } else if pending == 0 {
+            "Approve, request changes, or comment on the pull request"
+        } else {
+            "Submit your pending comments as a review"
+        };
+        let anchor = crate::interaction::tooltip(button, tip);
+        let popup = (self.discussion.review_open && !modal_open).then(|| self.review_popup());
+        let element = crate::ui_controls::popover(
+            anchor,
+            popup,
+            widget::popover::Position::Point(iced::Point::new(0.0, REVIEW_POPUP_OFFSET)),
+            Action::CloseReview,
+        );
+        element.map(|action| self.review_action(action))
+    }
+
+    fn review_popup(&self) -> Element<'_, Action> {
+        let spacing = cosmic::theme::spacing();
+        let enabled = self.can_mutate_discussion();
+        let pending = self.pending_count();
+        let mut rows: Vec<Element<'_, Action>> = Vec::new();
         if let Some((authority, request, _)) = &self.discussion.confirmation {
+            let comments = match authority
+                .context
+                .pending
+                .as_ref()
+                .map_or(0, |p| p.comment_count)
+            {
+                0 => "no pending comments".to_owned(),
+                1 => "1 pending comment".to_owned(),
+                count => format!("{count} pending comments"),
+            };
+            rows.push(design::heading(format!("{}?", request.event.label())).into());
             rows.push(
                 design::body(format!(
-                    "{} on {}/{} #{}\nCommit {}\nIncludes {} pending comments.",
-                    request.event.label(),
+                    "Submits to {}/{} #{} at commit {} with {comments}.",
                     authority.target.repository.owner,
                     authority.target.repository.name,
                     authority.target.pull_request.number,
-                    request.commit_oid,
-                    authority
-                        .context
-                        .pending
-                        .as_ref()
-                        .map_or(0, |p| p.comment_count)
+                    request.commit_oid.get(..7).unwrap_or(&request.commit_oid),
                 ))
+                .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             );
-            rows.push(design::body(request.body.clone()).into());
-            rows.push(
-                widget::row::with_children(vec![
-                    button::suggested("Submit review")
-                        .on_press_maybe(enabled.then_some(Action::ConfirmSubmit))
-                        .into(),
-                    button::text("Back").on_press(Action::CancelSubmit).into(),
-                ])
-                .spacing(8)
-                .into(),
-            );
+            if !request.body.trim().is_empty() {
+                rows.push(
+                    widget::container(
+                        design::body(request.body.as_str())
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                    )
+                    .padding([spacing.space_xxs, spacing.space_xs])
+                    .width(Length::Fill)
+                    .max_height(160)
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        widget::container::Style {
+                            background: Some(iced::Background::Color(design::sunken(theme))),
+                            border: iced::Border {
+                                radius: design::RADIUS_XS.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }))
+                    .into(),
+                );
+            }
+            rows.push(popup_actions(
+                button::text("Back")
+                    .on_press_maybe((!self.discussion.busy).then_some(Action::CancelSubmit)),
+                button::suggested(if self.discussion.busy {
+                    "Submitting…"
+                } else {
+                    "Submit review"
+                })
+                .on_press_maybe(enabled.then_some(Action::ConfirmSubmit)),
+            ));
         } else {
-            let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
+            rows.push(design::heading("Finish your review").into());
             rows.push(
-                widget::row::with_children(
-                    [
-                        ReviewEvent::Comment,
-                        ReviewEvent::Approve,
-                        ReviewEvent::RequestChanges,
-                    ]
-                    .into_iter()
-                    .map(|event| {
-                        button::text(if event == self.discussion.event {
-                            format!("✓ {}", event.label())
-                        } else {
-                            event.label().into()
-                        })
-                        .on_press_maybe(
-                            (enabled && (!own || event == ReviewEvent::Comment))
-                                .then_some(Action::Event(event)),
-                        )
-                        .into()
-                    })
-                    .collect::<Vec<_>>(),
-                )
-                .spacing(4)
+                design::caption(match pending {
+                    0 => "No pending comments. Comment on a line from the diff gutter, or on a whole file from its toolbar.".to_owned(),
+                    1 => "1 pending comment will be published with this review.".to_owned(),
+                    count => format!("{count} pending comments will be published with this review."),
+                })
+                .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             );
             let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
-                .placeholder("Review summary (optional)")
-                .height(90);
-            if enabled {
+                .placeholder("Leave a comment on the pull request (optional)")
+                .padding(spacing.space_xs)
+                .height(96);
+            if !self.discussion.busy {
                 editor = editor.on_action(Action::Summary);
             }
             rows.push(editor.into());
-            rows.push(
+            let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
+            let mut choices: Vec<Element<'_, Action>> = [
+                (
+                    ReviewEvent::Comment,
+                    "Submit general feedback without explicit approval.",
+                ),
+                (
+                    ReviewEvent::Approve,
+                    "Give your approval to merge these changes.",
+                ),
+                (
+                    ReviewEvent::RequestChanges,
+                    "Submit feedback that must be addressed before merging.",
+                ),
+            ]
+            .into_iter()
+            .map(|(event, description)| {
+                event_choice(
+                    event,
+                    description,
+                    event == self.discussion.event,
+                    enabled && (!own || event == ReviewEvent::Comment),
+                )
+            })
+            .collect();
+            if own {
+                choices.push(
+                    design::caption(
+                        "You can’t approve or request changes on your own pull request.",
+                    )
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
+                );
+            }
+            rows.push(widget::column::with_children(choices).spacing(2).into());
+            let drafting = self.discussion.composer.is_some();
+            if drafting {
+                rows.push(
+                    design::caption("Save or cancel the comment you’re writing before submitting.")
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                );
+            }
+            rows.push(popup_actions(
+                button::text("Cancel").on_press(Action::CloseReview),
                 button::suggested(if self.discussion.busy {
                     "Saving…"
                 } else {
-                    "Review and submit"
+                    "Submit review"
                 })
-                .on_press_maybe(enabled.then_some(Action::PrepareSubmit))
-                .into(),
+                .on_press_maybe((enabled && !drafting).then_some(Action::PrepareSubmit)),
+            ));
+        }
+        if let Some(error) = &self.discussion.submit_error {
+            // Just above the actions, where the eye returns after submitting.
+            rows.insert(
+                rows.len() - 1,
+                design::caption(format!("GitHub didn’t accept the review. {error}"))
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
             );
         }
-        {
-            let element: Element<'_, Action> =
-                widget::container(widget::column::with_children(rows).spacing(8))
-                    .padding(8)
-                    .width(Length::Fill)
-                    .into();
-            element.map(|action| self.review_action(action))
-        }
+        widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
+            .padding(spacing.space_xxs)
+            .width(Length::Fixed(REVIEW_POPUP_WIDTH))
+            .into()
     }
+
+    /// Starts a discussion on the selected file as a whole. Line comments
+    /// begin in the diff gutter; this is the file header's counterpart.
+    ///
+    /// `diff_can_show` says whether the diff beside it can render a file
+    /// discussion. Where it cannot, a new draft would be invisible yet hold
+    /// every other comment and the submission, so the control is withheld;
+    /// an existing draft keeps its control so it is never lost track of.
+    pub fn file_comment_control(
+        &self,
+        modal_open: bool,
+        diff_can_show: bool,
+    ) -> Option<Element<'_, super::Action>> {
+        let path = self.selected.as_ref()?.as_path().to_str()?.to_owned();
+        let drafting_here = self.drafting_file(&path);
+        if !diff_can_show && !drafting_here {
+            return None;
+        }
+        // While this file's draft is open the control stays live and leads
+        // back to it; any other open draft must be finished first.
+        let enabled = !modal_open
+            && self.authority().is_some()
+            && (drafting_here
+                || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
+        let control: Element<'_, Action> = crate::ui_controls::icon_control(
+            symbolic_icon("comment-symbolic"),
+            if drafting_here {
+                "Show the comment on this file"
+            } else {
+                "Comment on this file"
+            },
+            drafting_here,
+            enabled,
+            Some(Action::BeginFile(path)),
+        )
+        .into();
+        Some(control.map(|action| self.review_action(action)))
+    }
+
+    fn drafting_file(&self, path: &str) -> bool {
+        self.discussion.composer.as_ref().is_some_and(
+            |composer| matches!(&composer.destination, Destination::File(file) if file == path),
+        )
+    }
+
+    /// A write whose outcome was lost blocks every other review write until
+    /// the reader has compared the draft with GitHub, so it is shown with the
+    /// pane's notices rather than inside a surface that may be closed.
+    pub(super) fn discussion_notice(&self, modal_open: bool) -> Option<Element<'_, super::Action>> {
+        let message = self.discussion.unknown.as_ref()?;
+        let spacing = cosmic::theme::spacing();
+        let element: Element<'_, Action> = widget::column::with_children(vec![
+            design::caption(format!(
+                "GitHub may have received the last review change. Check the discussion before continuing. {message}"
+            ))
+            .class(cosmic::theme::Text::Custom(design::warning_text))
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into(),
+            button::text("I checked GitHub; continue")
+                .on_press_maybe(
+                    (!modal_open && !self.discussion.busy).then_some(Action::AcknowledgeUnknown),
+                )
+                .into(),
+        ])
+        .spacing(spacing.space_xxxs)
+        .padding(Padding::from([spacing.space_xxxs, spacing.space_xs]))
+        .into();
+        Some(element.map(|action| self.review_action(action)))
+    }
+}
+
+/// Where the submission popover opens, below its anchor button.
+const REVIEW_POPUP_OFFSET: f32 = 30.0;
+const REVIEW_POPUP_WIDTH: f32 = 380.0;
+
+fn count_pill<'a>(count: u64) -> Element<'a, Action> {
+    widget::container(
+        design::caption(count.to_string())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Default),
+    )
+    .padding([0, 5])
+    .class(cosmic::theme::Container::custom(|_| {
+        widget::container::Style {
+            // The pill sits on the accent fill of a primary button, so it
+            // shades that fill rather than adding a hue of its own.
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.0, 0.0, 0.0, 0.2,
+            ))),
+            border: iced::Border {
+                radius: design::RADIUS_L.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }))
+    .into()
+}
+
+/// One review verdict: a radio mark, its name, and what it tells the author.
+fn event_choice<'a>(
+    event: ReviewEvent,
+    description: &'a str,
+    selected: bool,
+    enabled: bool,
+) -> Element<'a, Action> {
+    let mark = widget::container(
+        widget::container(widget::Space::new())
+            .width(6)
+            .height(6)
+            .class(cosmic::theme::Container::custom(move |theme| {
+                widget::container::Style {
+                    background: selected
+                        .then(|| iced::Background::Color(design::accent_color(theme))),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })),
+    )
+    .center(Length::Fixed(14.0))
+    .class(cosmic::theme::Container::custom(move |theme| {
+        widget::container::Style {
+            border: iced::Border {
+                color: if selected {
+                    design::accent_color(theme)
+                } else {
+                    design::muted_icon_color(theme)
+                },
+                width: 1.5,
+                radius: 7.0.into(),
+            },
+            ..Default::default()
+        }
+    }));
+    let mut title = design::body(event.label());
+    let mut detail = design::caption(description).wrapping(iced::widget::text::Wrapping::Word);
+    if !enabled {
+        title = title.class(cosmic::theme::Text::Custom(unavailable_text));
+        detail = detail.class(cosmic::theme::Text::Custom(unavailable_text));
+    }
+    let content = widget::row::with_children(vec![
+        widget::container(mark)
+            .padding(Padding {
+                top: 2.0,
+                ..Padding::ZERO
+            })
+            .into(),
+        widget::column::with_children(vec![title.into(), detail.into()])
+            .spacing(1)
+            .width(Length::Fill)
+            .into(),
+    ])
+    .spacing(10)
+    .align_y(Alignment::Start);
+    if !enabled {
+        // An unavailable verdict is plain, dimmed text rather than a
+        // disabled button, whose own palette would override the dimming.
+        return widget::container(content)
+            .padding([5, 8])
+            .width(Length::Fill)
+            .into();
+    }
+    button::custom(content)
+        .class(crate::ui_controls::control_style(false, None))
+        .padding([5, 8])
+        .width(Length::Fill)
+        .on_press(Action::Event(event))
+        .into()
+}
+
+fn unavailable_text(theme: &cosmic::Theme) -> iced::widget::text::Style {
+    let mut color = design::muted_color(theme);
+    color.a *= 0.55;
+    iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
+    }
+}
+
+/// A popover's dismissive and committing actions, the commit at the trailing
+/// edge where the eye finishes reading.
+fn popup_actions<'a>(
+    dismiss: impl Into<Element<'a, Action>>,
+    commit: impl Into<Element<'a, Action>>,
+) -> Element<'a, Action> {
+    widget::row::with_children(vec![
+        widget::Space::new().width(Length::Fill).into(),
+        dismiss.into(),
+        commit.into(),
+    ])
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 impl State {
@@ -596,6 +992,7 @@ impl State {
                         }
                     }
             }
+            Destination::File(file) => leading && file == path,
             Destination::Reply(id) => self
                 .threads_at(path, old, new, leading, bounds)
                 .any(|t| &t.id == id),
@@ -721,11 +1118,13 @@ impl State {
                 },
                 thread.comments.len()
             );
-            if leading
-                && !thread.outdated
-                && let Some(line) = thread.line
-            {
-                label = format!("Line {line} · unavailable in this diff · {label}");
+            if leading && !thread.outdated {
+                label = match thread.line {
+                    Some(line) => format!("Line {line} · unavailable in this diff · {label}"),
+                    // GitHub reports no line, current or original, only for
+                    // a discussion of the file as a whole.
+                    None => format!("Whole file · {label}"),
+                };
             }
             rows.push(
                 button::text(label)
@@ -819,6 +1218,7 @@ impl State {
                     format!("New comment · lines {}–{}", anchor.start_line, anchor.line)
                 }
                 Destination::Line(anchor) => format!("New comment · line {}", anchor.line),
+                Destination::File(_) => "New comment · whole file".into(),
                 Destination::Reply(_) => "Reply in pending review".into(),
                 Destination::Edit(_) => "Edit pending comment".into(),
             };
@@ -835,7 +1235,7 @@ impl State {
                 let mut editor = text_editor::TextEditor::new(&composer.content)
                     .placeholder("Leave a review comment…")
                     .height(140);
-                if enabled {
+                if !self.discussion.busy {
                     editor = editor.on_action(Action::Composer);
                 }
                 rows.push(editor.into());
@@ -848,11 +1248,13 @@ impl State {
                                 .then_some(Action::Save),
                         )
                         .into(),
+                    // Local to the draft, so live through a background
+                    // refresh, as typing is; only a write in flight holds them.
                     button::text(if composer.preview { "Write" } else { "Preview" })
-                        .on_press_maybe(enabled.then_some(Action::Preview))
+                        .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
                         .into(),
                     button::text("Cancel")
-                        .on_press_maybe(enabled.then_some(Action::Cancel))
+                        .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
                         .into(),
                 ])
                 .spacing(8)
@@ -1053,5 +1455,174 @@ mod tests {
         drop(state.update_discussion(Action::Reply("right".into())));
         assert!(state.composer_at("file.rs", None, None, true, Some([0, 0])));
         assert!(!state.composer_at("file.rs", None, None, true, Some([7, 7])));
+    }
+
+    #[test]
+    fn review_popover_is_disclosed_on_demand_and_closing_it_drops_a_confirmation() {
+        let mut state = ready();
+        assert!(!state.discussion.review_open, "submission starts hidden");
+        drop(state.update_discussion(Action::ToggleReview));
+        assert!(state.discussion.review_open);
+        drop(state.update_discussion(Action::PrepareSubmit));
+        assert!(state.discussion.confirmation.is_some());
+        drop(state.update_discussion(Action::CloseReview));
+        assert!(!state.discussion.review_open);
+        assert!(
+            state.discussion.confirmation.is_none(),
+            "reopening must not land on a stale confirmation"
+        );
+    }
+
+    #[test]
+    fn a_submitted_review_closes_its_popover_and_resets_the_draft() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::ToggleReview));
+        drop(state.update_discussion(Action::Event(ReviewEvent::Approve)));
+        state.discussion.summary = text_editor::Content::with_text("Ship it");
+        state.discussion.busy = true;
+        state.discussion.submitting = true;
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Applied,
+        }));
+        assert!(!state.discussion.review_open);
+        assert_eq!(state.discussion.event, ReviewEvent::Comment);
+        assert!(state.discussion.summary.text().trim().is_empty());
+        assert_eq!(state.notice.as_deref(), Some("Review submitted to GitHub."));
+    }
+
+    #[test]
+    fn a_refused_submission_keeps_the_popover_and_its_draft() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::ToggleReview));
+        state.discussion.summary = text_editor::Content::with_text("Needs work");
+        state.discussion.busy = true;
+        state.discussion.submitting = true;
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Refused("changed".into()),
+        }));
+        assert!(state.discussion.review_open);
+        assert_eq!(state.discussion.summary.text().trim(), "Needs work");
+        assert_eq!(state.discussion.submit_error.as_deref(), Some("changed"));
+        assert!(
+            state.notice.is_none(),
+            "the refusal belongs in the popover, not under it"
+        );
+    }
+
+    #[test]
+    fn a_lost_submission_closes_the_popover_over_its_warning() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::ToggleReview));
+        state.discussion.busy = true;
+        state.discussion.submitting = true;
+        drop(state.update_discussion(Action::Finished {
+            generation: state.generation,
+            outcome: Outcome::Unknown("lost".into()),
+        }));
+        assert!(!state.discussion.review_open);
+        assert!(state.discussion.unknown.is_some());
+    }
+
+    #[test]
+    fn confirming_keeps_the_confirmation_on_screen_while_submitting() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::ToggleReview));
+        drop(state.update_discussion(Action::PrepareSubmit));
+        drop(state.update_discussion(Action::CancelSubmit));
+        assert!(state.discussion.confirmation.is_none());
+        assert!(state.discussion.review_open);
+        drop(state.update_discussion(Action::PrepareSubmit));
+        drop(state.update_discussion(Action::ConfirmSubmit));
+        assert!(state.discussion.busy && state.discussion.submitting);
+        assert!(state.discussion.confirmation.is_some());
+        drop(state.update_discussion(Action::CancelSubmit));
+        assert!(
+            state.discussion.confirmation.is_some(),
+            "Back cannot dismiss the confirmation while GitHub is receiving it"
+        );
+        drop(state.update_discussion(Action::CloseReview));
+        assert!(
+            state.discussion.review_open,
+            "an in-flight submission keeps its progress visible"
+        );
+    }
+
+    #[test]
+    fn drafts_accept_typing_during_a_background_refresh() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        state.refreshing = true;
+        assert!(!state.can_mutate_discussion());
+        let typed = text_editor::Action::Edit(text_editor::Edit::Insert('x'));
+        drop(state.update_discussion(Action::Composer(typed.clone())));
+        drop(state.update_discussion(Action::Summary(typed.clone())));
+        assert_eq!(
+            state
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text()
+                .trim(),
+            "x"
+        );
+        assert_eq!(state.discussion.summary.text().trim(), "x");
+        // A write in flight replaces the draft when it lands, so it is held.
+        state.discussion.busy = true;
+        drop(state.update_discussion(Action::Composer(typed)));
+        assert_eq!(
+            state
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text()
+                .trim(),
+            "x"
+        );
+        // Preview and Cancel are just as local, but not while a write is in
+        // flight.
+        drop(state.update_discussion(Action::Preview));
+        assert!(!state.discussion.composer.as_ref().unwrap().preview);
+        drop(state.update_discussion(Action::Cancel));
+        assert!(state.discussion.composer.is_some());
+        state.discussion.busy = false;
+        drop(state.update_discussion(Action::Preview));
+        assert!(state.discussion.composer.as_ref().unwrap().preview);
+        drop(state.update_discussion(Action::Cancel));
+        assert!(state.discussion.composer.is_none());
+    }
+
+    #[test]
+    fn a_file_comment_opens_above_the_diff_of_the_selected_file_only() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::BeginFile("other.rs".into())));
+        assert!(state.discussion.composer.is_none());
+        drop(state.take_effects());
+
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        assert!(matches!(
+            &state.discussion.composer.as_ref().unwrap().destination,
+            Destination::File(path) if path == "file.rs"
+        ));
+        assert_eq!(state.take_effects(), [Effect::RevealFileDiscussion]);
+        assert!(state.has_leading_annotation("file.rs", [3, 3]));
+        assert!(!state.has_annotation("file.rs", Some(1), Some(1), false));
+
+        // One draft at a time: a line comment cannot replace it.
+        drop(state.update_discussion(Action::Begin(anchor())));
+        assert!(matches!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::File(_)
+        ));
+        // Asking again leads back to the open draft rather than refusing.
+        state.notice = None;
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        assert_eq!(state.take_effects(), [Effect::RevealFileDiscussion]);
+        assert!(state.notice.is_none());
     }
 }

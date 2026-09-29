@@ -540,6 +540,10 @@ pub enum RepositoryAction {
     NextChange {
         card: CardId,
     },
+    /// Scrolls the diff to its first row, where file-level annotations sit.
+    RevealDiffTop {
+        card: CardId,
+    },
     MarkdownLink {
         card: CardId,
         uri: markdown::Uri,
@@ -607,6 +611,7 @@ impl RepositoryAction {
             | Self::PreviewViewport { card, .. }
             | Self::PreviousChange { card }
             | Self::NextChange { card }
+            | Self::RevealDiffTop { card }
             | Self::WorkingDiffDue { card, .. }
             | Self::MarkdownDue { card, .. }
             | Self::MarkdownLink { card, .. }
@@ -3589,6 +3594,24 @@ impl RepositoryRuntime {
             })
     }
 
+    /// Whether the diff surface can hold a discussion of the whole file: it
+    /// renders one only above a text or no-text comparison, so a failed,
+    /// empty, or unresolved comparison would hide a draft begun there. A
+    /// comparison still loading does not count: a failure would leave its
+    /// draft without a visible Save or Cancel control.
+    pub fn can_show_file_discussion(&self) -> bool {
+        self.can_show_diff()
+            && self.basis_resolution.is_none()
+            && self.working_diff_failure().is_none()
+            && matches!(
+                self.diff_state(&self.diff_basis),
+                Some(DiffState::Ready(
+                    RenderedDiff::Text { .. } | RenderedDiff::NoText(_),
+                    _
+                ))
+            )
+    }
+
     fn can_apply_markdown_mode(&self, preview: bool) -> bool {
         !self.is_saving()
             && match &self.document {
@@ -4920,6 +4943,33 @@ impl RepositoryRuntime {
                 }
                 self.realize_current_change();
                 self.scroll_to_change()
+            }
+            RepositoryAction::RevealDiffTop { card } => {
+                if self.is_saving() || self.selected.is_none() || !self.can_show_diff() {
+                    return Task::none();
+                }
+                // File discussions exist only above a diff, so a reader in
+                // the source view is taken to it.
+                let surface = if self.source_surface == SourceSurface::Diff {
+                    Task::none()
+                } else {
+                    self.capture_native_viewport();
+                    self.source_surface = SourceSurface::Diff;
+                    self.restore_native_viewport();
+                    self.ensure_current_diff(card)
+                };
+                // The block being revealed is usually not measured yet. An
+                // anchor at the top of the leading block holds the viewport
+                // there when its height arrives, rather than preserving the
+                // first code row and scrolling the new block out of view.
+                self.apply_diff_viewport(DiffViewportAnchor {
+                    offset: 0.0,
+                    row: Some(diff_layout::Anchor::Leading(0.0)),
+                    horizontal: self.diff_horizontal,
+                    change: self.diff_change,
+                });
+                self.capture_diff_viewport();
+                Task::batch([surface, self.restore_visible_scroll()])
             }
             RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
@@ -6312,6 +6362,16 @@ pub fn selected_file_toolbar(
     card: CardId,
     runtime: &RepositoryRuntime,
 ) -> Option<Element<'_, RepositoryAction>> {
+    selected_file_toolbar_with(card, runtime, None)
+}
+
+/// [`selected_file_toolbar`] with a shell's own control group at its trailing
+/// edge, such as a pull request review's file actions.
+pub fn selected_file_toolbar_with<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    trailing: Option<Element<'a, RepositoryAction>>,
+) -> Option<Element<'a, RepositoryAction>> {
     let selected = runtime.selected.as_ref()?;
     let editing = runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Edit;
@@ -6569,7 +6629,7 @@ pub fn selected_file_toolbar(
     ))
     .width(Length::FillPortion(4))
     .height(crate::design::HEADER_CONTENT_HEIGHT);
-    let mut header = Vec::with_capacity(3);
+    let mut header = Vec::with_capacity(4);
     if let Some(title) = title {
         header.push(title.into());
     }
@@ -6577,6 +6637,7 @@ pub fn selected_file_toolbar(
     if !secondary.is_empty() {
         header.push(toolbar_group(secondary));
     }
+    header.extend(trailing);
     let toolbar = widget::container(
         widget::row::with_children(header)
             .spacing(crate::design::TOOLBAR_GROUP_SPACING)
@@ -11726,6 +11787,67 @@ mod tests {
         assert_eq!(runtime.diff_viewport.offset, 210.0);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
         assert_eq!(runtime.diff_viewport.offset, 60.0);
+    }
+
+    #[test]
+    fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Loading {
+                request: 1,
+                cancellation: CancellationToken::new(),
+            },
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "a pending comparison may fail and strand a new file draft"
+        );
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(!runtime.can_show_file_discussion());
+        // Once a retry provides a renderable diff, a draft can be offered.
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "line\n"))),
+        );
+        assert!(runtime.can_show_file_discussion());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "\"Could not compute diff\" has no leading annotation"
+        );
+        runtime.basis_resolution = Some(BasisResolution::NoCommits);
+        assert!(!runtime.can_show_file_discussion());
+    }
+
+    #[test]
+    fn revealing_the_diff_top_survives_the_leading_block_being_measured() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                "",
+                &"line\n".repeat(40),
+            ))),
+        );
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.diff_viewport.offset = 300.0;
+        drop(runtime.update(RepositoryAction::RevealDiffTop { card }));
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        // A new file discussion is measured after it mounts. Holding the
+        // first code row in place would scroll the discussion out of view.
+        drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 180.0, &[]));
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(runtime.pending_diff_anchor.is_none());
     }
 
     #[test]

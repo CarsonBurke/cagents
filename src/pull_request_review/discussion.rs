@@ -6,7 +6,7 @@
 use super::*;
 use crate::github::{
     AddReviewThreadRequest, PendingReview, PullRequestConversation, ReplyToThreadRequest,
-    ReviewDiffSide, ReviewEvent, SubmitReviewRequest,
+    ReviewDiffSide, ReviewEvent, ReviewThreadSubject, SubmitReviewRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,11 @@ pub struct Anchor {
 pub enum Mutation {
     Comment {
         anchor: Anchor,
+        body: String,
+    },
+    /// A thread on the file as a whole rather than any line of its diff.
+    FileComment {
+        path: String,
         body: String,
     },
     Reply {
@@ -275,18 +280,29 @@ fn execute_current(
         }
         return outcome(api.submit_review(repository, request, cancellation)).map(drop);
     }
-    if let Mutation::Comment { anchor, body } = mutation {
-        // Validate before creating a pending review, so a blank composer or
-        // invalid range never leaves an empty remote draft behind.
-        let mut request = AddReviewThreadRequest {
+    let thread = match mutation {
+        Mutation::Comment { anchor, body } => Some(AddReviewThreadRequest {
             review_id: "pending".into(),
             path: anchor.path.clone(),
-            line: anchor.line,
-            side: anchor.side,
-            start_line: (anchor.start_line != anchor.line).then_some(anchor.start_line),
-            start_side: (anchor.start_line != anchor.line).then_some(anchor.side),
+            subject: ReviewThreadSubject::Lines {
+                line: anchor.line,
+                side: anchor.side,
+                start_line: (anchor.start_line != anchor.line).then_some(anchor.start_line),
+                start_side: (anchor.start_line != anchor.line).then_some(anchor.side),
+            },
             body: body.clone(),
-        };
+        }),
+        Mutation::FileComment { path, body } => Some(AddReviewThreadRequest {
+            review_id: "pending".into(),
+            path: path.clone(),
+            subject: ReviewThreadSubject::File,
+            body: body.clone(),
+        }),
+        _ => None,
+    };
+    if let Some(mut request) = thread {
+        // Validate before creating a pending review, so a blank composer or
+        // invalid range never leaves an empty remote draft behind.
         request
             .validate()
             .map_err(|error| Outcome::Refused(error.to_string()))?;
@@ -353,7 +369,9 @@ fn execute_current(
             }
             outcome(api.set_thread_resolved(repository, thread, *resolved, cancellation))
         }
-        Mutation::Comment { .. } | Mutation::Submit { .. } => unreachable!(),
+        Mutation::Comment { .. } | Mutation::FileComment { .. } | Mutation::Submit { .. } => {
+            unreachable!()
+        }
     }
 }
 
@@ -589,5 +607,31 @@ mod tests {
             ),
             Err(Outcome::Refused(_))
         ));
+    }
+
+    #[test]
+    fn blank_or_escaping_file_comment_does_not_create_a_remote_pending_review() {
+        let api = ScriptedApi::new();
+        let mut current = context();
+        current.pending = None;
+        let repo = repository();
+        for (path, body) in [("file.rs", " \n"), ("../outside.rs", "Looks good")] {
+            let mutation = Mutation::FileComment {
+                path: path.into(),
+                body: body.into(),
+            };
+            assert!(matches!(
+                execute_current(
+                    &api,
+                    &repo,
+                    &PullRequestKey::new(repo.clone(), 1).unwrap(),
+                    &current,
+                    &current,
+                    &mutation,
+                    &CancellationToken::new()
+                ),
+                Err(Outcome::Refused(_))
+            ));
+        }
     }
 }

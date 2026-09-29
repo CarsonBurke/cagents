@@ -139,6 +139,9 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    static COMMENT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5h9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5l-3 2.5v-2.5h-1a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     // Review marks: an empty box, a box with a check, and a box with a dash
     // for a folder whose files are only partly viewed. Drawn here so the
     // three read as one family whatever icon theme the desktop provides.
@@ -237,6 +240,7 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
         "document-open-recent-symbolic" => &HISTORY,
         "dialog-information-symbolic" => &INFO,
         "window-close-symbolic" => &CLOSE,
+        "comment-symbolic" => &COMMENT,
         "view-pop-out-symbolic" | "external-link-symbolic" => &POP_OUT,
         _ => return None,
     };
