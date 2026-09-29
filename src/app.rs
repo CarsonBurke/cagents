@@ -9374,8 +9374,8 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.sidebar_selection_ui.dialog.is_some() {
-            Some(sidebar_selection_ui::focus_id())
+        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
+            Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
@@ -11265,7 +11265,10 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.sidebar_state.apply(&action);
-                let activated = match &action {
+                // Opening a row, by pointer or keyboard, is navigation: it
+                // ends any explicit selection and anchors a later range, but
+                // selects nothing.
+                let opened = match &action {
                     SidebarAction::OpenRepository { project_id, .. } => {
                         Some(sidebar::SelectionRow::Project(*project_id))
                     }
@@ -11279,8 +11282,8 @@ impl Application for Cagents {
                     }
                     _ => None,
                 };
-                if let Some(row) = activated {
-                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Replace);
+                if let Some(row) = opened {
+                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
                 self.prune_sidebar_row_selection();
                 match action {
@@ -11290,6 +11293,7 @@ impl Application for Cagents {
                             iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
                         } else { Task::none() }
                     }
+                    SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
