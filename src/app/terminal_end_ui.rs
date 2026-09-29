@@ -466,7 +466,7 @@ impl Cagents {
         let spacing = cosmic::theme::spacing();
         let mut children: Vec<Element<'a, Message>> = vec![
             crate::ui_controls::passive_icon(
-                widget::icon::from_name("utilities-terminal-symbolic").handle(),
+                crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
                 design::STATUS_ICON_SIZE,
             ),
             design::heading("Output not available").into(),
