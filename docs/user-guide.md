@@ -465,6 +465,23 @@ checks supported process tokens before persistent credentials; its
 selects process authentication using the federation markers. `OPENAI_API_KEY`
 is also removed for provider/version compatibility.
 
+**System default** is the home the provider CLI uses outside cagents:
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
+`~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
+Every cagents terminal and conversation exports its account's home, and one on
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
+cagents window, daemon, or `cagents` command started from one - by you or by an
+agent - ignores a variable that still holds the listed home, or any path inside
+a cagents `accounts/<provider>/<id>` directory, when deciding the system
+default. A daemon started before this protection keeps its environment until it
+restarts.
+
+The Accounts pane flags a row whose home is not a login of its own: **Login
+changed** when a managed or linked home reports a different login than the one
+it was added with (the recorded login is kept; sign that account in again to
+accept the new one, or remove it), and **Same home** or **Same login** when two
+rows are the same directory or signed in to the same login.
+
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies
 remain user-controlled. This policy does not rewrite those settings or an
