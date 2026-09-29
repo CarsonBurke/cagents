@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::Arc, time::Duration};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -24,6 +24,8 @@ use crate::{
 pub struct ViewportSample {
     pub offset: f32,
     pub width: f32,
+    /// Wheel input moves the camera; native layout feedback only acknowledges it.
+    pub user_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -782,6 +784,8 @@ where
                 .collect(),
         );
     let on_viewport_for_scroll = on_viewport.clone();
+    let scroll_input = Rc::new(Cell::new(false));
+    let input_for_scroll = Rc::clone(&scroll_input);
     // Reordering belongs to the tab strip's explicit title handles. A wrapper
     // around pane bodies intercepts Alt drags before terminals can route them
     // to mouse-tracking applications.
@@ -797,6 +801,7 @@ where
             on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
                 offset: viewport.absolute_offset().x,
                 width: viewport.bounds().width,
+                user_input: input_for_scroll.get(),
             }))
         });
 
@@ -810,6 +815,7 @@ where
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .with_scroll_input(scroll_input)
     .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
 }
@@ -1535,6 +1541,7 @@ struct WorkspaceSurface<'a, Message> {
     reported_width: f32,
     on_resize: Box<dyn Fn(f32) -> Message + 'a>,
     initial_scroll: Option<(widget::Id, f32)>,
+    scroll_input: Option<Rc<Cell<bool>>>,
 }
 
 #[derive(Default)]
@@ -1557,11 +1564,17 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             reported_width,
             on_resize: Box::new(on_resize),
             initial_scroll: None,
+            scroll_input: None,
         }
     }
 
     fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
         self.initial_scroll = Some((id, offset));
+        self
+    }
+
+    fn with_scroll_input(mut self, input: Rc<Cell<bool>>) -> Self {
+        self.scroll_input = Some(input);
         self
     }
 
@@ -1696,6 +1709,12 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
         };
+        if let Some(input) = &self.scroll_input {
+            input.set(matches!(
+                event,
+                Event::Mouse(mouse::Event::WheelScrolled { .. })
+            ));
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -1706,6 +1725,9 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             shell,
             &clipped,
         );
+        if let Some(input) = &self.scroll_input {
+            input.set(false);
+        }
         // Reported on redraw rather than from `layout`, because layout runs
         // during view building where publishing a message would fight the
         // reflow it triggers.
@@ -2480,6 +2502,7 @@ mod tests {
         let scrolled = WorkspaceViewportEvent::Scrolled(ViewportSample {
             offset: 240.0,
             width: 800.0,
+            user_input: true,
         });
         let resized = WorkspaceViewportEvent::Resized(800.0);
 
@@ -2488,6 +2511,7 @@ mod tests {
             WorkspaceViewportEvent::Scrolled(ViewportSample {
                 offset: 240.0,
                 width: 800.0,
+                user_input: true,
             })
         );
         assert_eq!(resized, WorkspaceViewportEvent::Resized(800.0));
@@ -2963,6 +2987,93 @@ mod tests {
     /// same frame must publish nothing - including a pass whose height changed,
     /// and a pass whose strip was remounted with fresh widget state, neither of
     /// which changes the width the owner reads.
+    #[test]
+    fn native_scroll_samples_distinguish_redraw_feedback_from_user_wheels() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::{Font, Pixels};
+        use std::time::Instant;
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(400.0);
+        for index in 0..4 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Pane", CardWidth::Fixed(320.0)).unwrap(),
+                    index,
+                    index == 0,
+                )
+                .unwrap();
+        }
+        let shortcuts = KeyboardShortcuts::default();
+        let mut element = view(
+            &workspace,
+            &shortcuts,
+            FocusedPane::Other,
+            false,
+            &InputTrace::default(),
+            400.0,
+            widget::Id::unique(),
+            |_| {
+                widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            },
+            card_widget_id,
+            Events {
+                viewport: |event| event,
+            },
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut messages = Vec::new();
+        for event in [
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: -120.0, y: 0.0 },
+            }),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        let samples: Vec<_> = messages
+            .into_iter()
+            .filter_map(|event| match event {
+                WorkspaceViewportEvent::Scrolled(sample) => Some(sample),
+                _ => None,
+            })
+            .collect();
+        assert!(samples.iter().any(|sample| !sample.user_input));
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.user_input && sample.offset > 0.0)
+        );
+    }
+
     #[test]
     fn a_reported_viewport_width_is_not_reported_twice_in_one_frame() {
         use cosmic::iced::advanced::{clipboard, renderer::Headless};

@@ -1620,7 +1620,16 @@ fn update_workspace_viewport(
 ) -> (ViewportUpdate, bool) {
     match event {
         WorkspaceViewportEvent::Scrolled(sample) => {
-            (workspace.native_scroll(sample.offset, sample.width), false)
+            let width_changed = sample.width != workspace.viewport_width();
+            let update = if sample.user_input {
+                workspace.native_scroll(sample.offset, sample.width)
+            } else {
+                workspace.native_layout_scroll(sample.offset, sample.width)
+            };
+            let synchronize = !sample.user_input
+                && (width_changed
+                    || (sample.offset - workspace.camera().offset()).abs() > f32::EPSILON);
+            (update, synchronize)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
         WorkspaceViewportEvent::PointerRested(card) => (
@@ -20707,6 +20716,44 @@ mod tests {
             app.sidebar_model.data_state,
             SidebarDataState::Error("refresh failed".into())
         );
+    }
+
+    #[test]
+    fn layout_scroll_feedback_requests_camera_sync_without_cancelling_reveal() {
+        let mut workspace = Workspace::default();
+        for index in 0..4 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Pane", CardWidth::Fixed(480.0)).unwrap(),
+                    index,
+                    index == 3,
+                )
+                .unwrap();
+        }
+        workspace.resize_viewport(600.0);
+        workspace.tick(Duration::from_secs(1));
+        let target = workspace.camera().target();
+        let (_, synchronize) = update_workspace_viewport(
+            &mut workspace,
+            WorkspaceViewportEvent::Scrolled(crate::workspace_widget::ViewportSample {
+                offset: 0.0,
+                width: 600.0,
+                user_input: false,
+            }),
+        );
+        assert!(synchronize);
+        assert_eq!(workspace.camera().target(), target);
+
+        let (_, synchronize) = update_workspace_viewport(
+            &mut workspace,
+            WorkspaceViewportEvent::Scrolled(crate::workspace_widget::ViewportSample {
+                offset: 0.0,
+                width: 600.0,
+                user_input: true,
+            }),
+        );
+        assert!(!synchronize);
+        assert_eq!(workspace.camera().target(), 0.0);
     }
 
     #[test]

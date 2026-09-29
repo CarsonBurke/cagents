@@ -1185,6 +1185,21 @@ impl Workspace {
     }
 
     pub fn native_scroll(&mut self, offset: f32, viewport_width: f32) -> ViewportUpdate {
+        self.native_scroll_sample(offset, viewport_width, true)
+    }
+
+    /// Native layout/clamping acknowledges geometry, not a decision to scroll
+    /// away from the focused pane. Only real input may interrupt its reveal.
+    pub fn native_layout_scroll(&mut self, offset: f32, viewport_width: f32) -> ViewportUpdate {
+        self.native_scroll_sample(offset, viewport_width, false)
+    }
+
+    fn native_scroll_sample(
+        &mut self,
+        offset: f32,
+        viewport_width: f32,
+        user_input: bool,
+    ) -> ViewportUpdate {
         let old_offset = self.camera.offset();
         let offset = finite_nonnegative(offset);
         let viewport_width = finite_nonnegative(viewport_width);
@@ -1236,7 +1251,7 @@ impl Workspace {
 
         // Iced also reports the current offset when content bounds change.
         // Layout feedback without movement must not cancel a focused-card reveal.
-        if (offset - self.camera.offset()).abs() <= f32::EPSILON {
+        if !user_input || (offset - self.camera.offset()).abs() <= f32::EPSILON {
             return self
                 .refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON);
         }
@@ -2424,6 +2439,41 @@ mod tests {
         }));
         let unchanged = workspace.native_scroll(1_248.0, 400.0);
         assert!(unchanged.transitions.is_empty());
+    }
+
+    #[test]
+    fn stale_layout_scroll_preserves_focus_across_remounts_and_viewport_changes() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 7], 1_640.0);
+        let focused = workspace.order().last().unwrap();
+        workspace.focus(focused).unwrap();
+        workspace.tick(Duration::from_secs(1));
+
+        for width in [1_640.0, 800.0, 450.0, 900.0] {
+            workspace.resize_viewport(width);
+            let target = workspace.camera().target();
+            // A remounted native scrollable starts at zero even though the
+            // owner still holds the focused pane's camera position.
+            workspace.native_layout_scroll(0.0, width);
+            assert_eq!(workspace.camera().target(), target);
+            workspace.tick(Duration::from_secs(1));
+            let pane = workspace.geometry().card(focused).unwrap();
+            let offset = workspace.camera().offset();
+            assert!(pane.start >= offset - SCROLL_SYNC_EPSILON);
+            assert!(pane.end <= offset + width + SCROLL_SYNC_EPSILON);
+        }
+
+        // Feedback can measure the new width before the resize message.
+        workspace.native_layout_scroll(0.0, 600.0);
+        let target = workspace.camera().target();
+        workspace.resize_viewport(600.0);
+        assert_eq!(workspace.camera().target(), target);
+        assert!(target > 0.0);
+
+        // An actual user scroll must still cancel the reveal immediately.
+        workspace.native_scroll(0.0, 600.0);
+        assert_eq!(workspace.camera().offset(), 0.0);
+        assert_eq!(workspace.camera().target(), 0.0);
+        assert!(!workspace.camera().is_animating());
     }
 
     #[test]

@@ -1464,6 +1464,7 @@ mod tests {
                 event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
                     offset: 0.0,
                     width: 1_000.0,
+                    user_input: true,
                 }),
             });
         }
@@ -1485,6 +1486,7 @@ mod tests {
             event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
                 offset: 319.0,
                 width: 1_000.0,
+                user_input: true,
             }),
         });
         assert_eq!(app.workspace.camera().offset(), 319.0);
