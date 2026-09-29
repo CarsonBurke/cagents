@@ -7122,9 +7122,6 @@ fn editable_document_view<'a>(
                     return text_editor::default_bindings(press);
                 }
                 let action = match &press.key {
-                    Key::Named(Named::Space) if press.modifiers.command() => {
-                        Some(EditorLspAction::Complete)
-                    }
                     Key::Character(character)
                         if character.as_str() == " " && press.modifiers.command() =>
                     {
