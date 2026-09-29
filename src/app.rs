@@ -576,7 +576,9 @@ fn notice_surface_detail<'a>(
 /// invisible — a pink label on a pink error surface. Every colour here comes
 /// from the surface's own component instead.
 fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
-    let appearance = move |theme: &cosmic::Theme| {
+    // Keyboard focus draws the outline at full strength and wider: the
+    // shell's accent focus ring would vanish against a severity fill.
+    let appearance = move |focused: bool, theme: &cosmic::Theme| {
         let component = severity.component(theme.cosmic());
         let on: iced::Color = component.on.into();
         widget::button::Style {
@@ -584,8 +586,8 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
             text_color: Some(on),
             icon_color: Some(on),
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
-            border_width: 1.0,
-            border_color: on.scale_alpha(0.4),
+            border_width: if focused { 2.0 } else { 1.0 },
+            border_color: if focused { on } else { on.scale_alpha(0.4) },
             ..widget::button::Style::new()
         }
     };
@@ -596,19 +598,19 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
         iced::Background::Color(on.scale_alpha(alpha))
     };
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, theme| appearance(theme)),
+        active: Box::new(move |focused, theme| appearance(focused, theme)),
         disabled: Box::new(move |theme| widget::button::Style {
             text_color: Some(severity.detail_color()),
             icon_color: Some(severity.detail_color()),
-            ..appearance(theme)
+            ..appearance(false, theme)
         }),
-        hovered: Box::new(move |_focused, theme| widget::button::Style {
+        hovered: Box::new(move |focused, theme| widget::button::Style {
             background: Some(wash(theme, 0.12)),
-            ..appearance(theme)
+            ..appearance(focused, theme)
         }),
-        pressed: Box::new(move |_focused, theme| widget::button::Style {
+        pressed: Box::new(move |focused, theme| widget::button::Style {
             background: Some(wash(theme, 0.2)),
-            ..appearance(theme)
+            ..appearance(focused, theme)
         }),
     }
 }
@@ -12911,7 +12913,8 @@ impl Application for Cagents {
             }
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
-                self.reconcile_notice_popup()
+                let reconciled = self.reconcile_notice_popup();
+                Task::batch([reconciled, self.refocus_notices()])
             }
             Message::DirectoryFilesLoaded {
                 key,
@@ -13064,6 +13067,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         let task = Task::batch([task, self.flush_settings_on_blur()]);
         self.sync_notification_presence();
+        self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take() {
             match notice.severity {
                 NoticeSeverity::Error => {

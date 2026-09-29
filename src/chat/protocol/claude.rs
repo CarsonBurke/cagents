@@ -27,14 +27,7 @@ const MAX_DOCUMENT: u64 = ATTACHMENTS.max_file_bytes.unwrap();
 const MAX_PAYLOAD: usize = 30 * 1024 * 1024;
 const HISTORY_PAGE: u64 = 4 * 1024 * 1024;
 const MAX_TEXT: usize = 1024 * 1024;
-const MODES: &[&str] = &[
-    "manual",
-    "acceptEdits",
-    "auto",
-    "plan",
-    "dontAsk",
-    "bypassPermissions",
-];
+const MODES: &[&str] = &["default", "acceptEdits", "plan", "dontAsk"];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
@@ -218,18 +211,6 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                 "Claude option {flag} cannot safely transfer to native chat; remove it before connecting"
             ));
         }
-    }
-    // Older stored chats and terminal conversions may predate native launch
-    // defaults. Apply the account choice at the final transport boundary too.
-    if !result.iter().any(|argument| {
-        argument == "--permission-mode" || argument == "--dangerously-skip-permissions"
-    }) && !launch
-        .recipe
-        .environment
-        .contains_key("CLAUDE_CODE_PERMISSION_MODE")
-        && let Some(mode) = crate::chat::claude_configured_default_mode(&launch.recipe)
-    {
-        result.extend(["--permission-mode".into(), mode]);
     }
     result.extend(
         [
@@ -1222,7 +1203,10 @@ impl Adapter for Claude {
             }
             Command::SetPermissionMode { mode } => {
                 if !MODES.contains(&mode.as_str()) {
-                    return Err("Unsupported Claude permission mode".into());
+                    return Err(
+                        "Unsupported Claude permission mode; permission bypass is not offered"
+                            .into(),
+                    );
                 }
                 self.control(json!({"subtype":"set_permission_mode", "mode":mode}))
             }
@@ -1385,13 +1369,6 @@ impl Adapter for Claude {
                             self.ready = true;
                             step.events.push(Event::Ready(true));
                             self.metadata(&response["response"], &mut step);
-                            if let Some(mode) =
-                                response["response"]["current_permission_mode"].as_str()
-                            {
-                                step.events.push(Event::PermissionMode(Some(
-                                    if mode == "default" { "manual" } else { mode }.into(),
-                                )));
-                            }
                             self.status(self.busy, "Claude connected", &mut step);
                             for key in [
                                 "pending_permission_requests",
@@ -1419,8 +1396,6 @@ impl Adapter for Claude {
                             self.metadata(&Value::Null, &mut step);
                         }
                         "set_permission_mode" => {
-                            step.events
-                                .push(Event::PermissionMode(Some(string(&request, "mode").into())));
                             step.events.push(Event::Status {
                                 busy: self.busy,
                                 detail: format!(
@@ -4290,94 +4265,6 @@ mod tests {
         ];
         let preserved = arguments(&launch).unwrap();
         assert_eq!(&preserved[..4], &launch.recipe.arguments);
-        launch.recipe.arguments = vec!["--permission-mode=auto".into()];
-        assert_eq!(
-            &arguments(&launch).unwrap()[..2],
-            &["--permission-mode", "auto"]
-        );
-    }
-
-    #[test]
-    fn converted_chat_applies_configured_auto_before_its_first_prompt() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join("settings.json"),
-            r#"{"permissions":{"defaultMode":"auto"}}"#,
-        )
-        .unwrap();
-        let mut launch = Launch {
-            provider: Provider::Claude,
-            session_id: None,
-            recipe: crate::model::LaunchRecipe {
-                unset_environment: Default::default(),
-                program: "claude".into(),
-                arguments: Vec::new(),
-                working_directory: config.path().into(),
-                environment: [(
-                    "CLAUDE_CONFIG_DIR".into(),
-                    config.path().display().to_string(),
-                )]
-                .into(),
-            },
-        };
-        assert!(
-            arguments(&launch)
-                .unwrap()
-                .windows(2)
-                .any(|pair| pair == ["--permission-mode", "auto"])
-        );
-        launch.recipe.environment.insert(
-            "CLAUDE_CODE_PERMISSION_MODE".into(),
-            "bypassPermissions".into(),
-        );
-        assert!(
-            !arguments(&launch)
-                .unwrap()
-                .contains(&"--permission-mode".into())
-        );
-    }
-
-    #[test]
-    fn auto_and_yolo_modes_are_advertised_and_sent_to_claude() {
-        let mut adapter = Claude::default();
-        let initialized = adapter.initialize().unwrap();
-        let ready = adapter
-            .receive(reply(
-                initialized.writes[0]["request_id"].as_str().unwrap(),
-                json!({"current_permission_mode":"auto"}),
-            ))
-            .unwrap();
-        assert!(
-            ready
-                .events
-                .contains(&Event::PermissionMode(Some("auto".into())))
-        );
-        for mode in ["auto", "bypassPermissions"] {
-            assert!(
-                adapter
-                    .capabilities()
-                    .permission_modes
-                    .contains(&mode.into())
-            );
-            let step = adapter
-                .command(Command::SetPermissionMode { mode: mode.into() })
-                .unwrap();
-            assert_eq!(
-                step.writes[0]["request"],
-                json!({"subtype":"set_permission_mode", "mode":mode})
-            );
-            let response = adapter
-                .receive(reply(
-                    step.writes[0]["request_id"].as_str().unwrap(),
-                    json!({}),
-                ))
-                .unwrap();
-            assert!(
-                response
-                    .events
-                    .contains(&Event::PermissionMode(Some(mode.into())))
-            );
-        }
     }
 
     #[test]

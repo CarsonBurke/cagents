@@ -1080,6 +1080,7 @@ struct PendingCommand {
     id: u64,
     draft_revision: Option<u64>,
     request: Option<String>,
+    permission_mode: Option<String>,
     /// The first user prompt, used to name a new channel once locally queued.
     first_prompt: Option<String>,
     /// The model this command chooses, remembered for new drafts of the
@@ -1220,6 +1221,7 @@ pub(super) struct Runtime {
     reasoning_picker: bool,
     /// Whether the account choice is open.
     account_picker: bool,
+    permission_mode: Option<String>,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
@@ -1476,6 +1478,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             account_picker: false,
+            permission_mode: None,
             history: Vec::new(),
             history_cursor: None,
             history_stash: String::new(),
@@ -2048,18 +2051,6 @@ fn draft_snapshot(
             attachments: provider != Provider::Codex,
             model_selection: true,
             reasoning_selection: true,
-            permission_modes: match provider {
-                Provider::Claude => vec![
-                    "manual".into(),
-                    "acceptEdits".into(),
-                    "auto".into(),
-                    "plan".into(),
-                    "dontAsk".into(),
-                    "bypassPermissions".into(),
-                ],
-                Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
-                Provider::Omp => Vec::new(),
-            },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
                 Provider::Claude => chat::SkillReach::Leading,
@@ -2072,112 +2063,6 @@ fn draft_snapshot(
         reasoning,
         ..Snapshot::default()
     }
-}
-
-fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
-    let arguments = &recipe.arguments;
-    match provider {
-        Provider::Claude => {
-            if arguments
-                .iter()
-                .any(|argument| argument == "--dangerously-skip-permissions")
-            {
-                return Some("bypassPermissions".into());
-            }
-            arguments
-                .iter()
-                .enumerate()
-                .find_map(|(index, argument)| {
-                    argument
-                        .strip_prefix("--permission-mode=")
-                        .or_else(|| {
-                            (argument == "--permission-mode")
-                                .then(|| arguments.get(index + 1).map(String::as_str))
-                                .flatten()
-                        })
-                        .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
-                })
-                .or_else(|| {
-                    recipe
-                        .environment
-                        .get("CLAUDE_CODE_PERMISSION_MODE")
-                        .cloned()
-                })
-                .or_else(|| chat::claude_configured_default_mode(recipe))
-                .or_else(|| Some("manual".into()))
-        }
-        Provider::Codex => {
-            if arguments.iter().any(|argument| {
-                matches!(
-                    argument.as_str(),
-                    "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
-                )
-            }) {
-                Some("yolo".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "workspace-write"])
-            {
-                Some("workspaceWrite".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "read-only"])
-            {
-                Some("readOnly".into())
-            } else {
-                None
-            }
-        }
-        Provider::Omp => None,
-    }
-}
-
-fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
-    if provider == Provider::Claude {
-        recipe.environment.remove("CLAUDE_CODE_PERMISSION_MODE");
-    }
-    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
-    let mut original = recipe.arguments.iter();
-    while let Some(argument) = original.next() {
-        match (provider, argument.as_str()) {
-            (Provider::Claude, "--permission-mode")
-            | (Provider::Codex, "-a" | "--ask-for-approval" | "-s" | "--sandbox") => {
-                original.next();
-            }
-            (
-                Provider::Claude,
-                "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions",
-            )
-            | (Provider::Codex, "--yolo" | "--dangerously-bypass-approvals-and-sandbox") => {}
-            (Provider::Claude, value) if value.starts_with("--permission-mode=") => {}
-            _ => arguments.push(argument.clone()),
-        }
-    }
-    match provider {
-        Provider::Claude => {
-            arguments.extend(["--permission-mode".into(), mode.into()]);
-        }
-        Provider::Codex if mode == "yolo" => arguments.push("--yolo".into()),
-        Provider::Codex if matches!(mode, "readOnly" | "workspaceWrite") => arguments.extend([
-            "--ask-for-approval".into(),
-            "on-request".into(),
-            "--sandbox".into(),
-            if mode == "readOnly" {
-                "read-only"
-            } else {
-                "workspace-write"
-            }
-            .into(),
-        ]),
-        _ => {}
-    }
-    recipe.arguments = arguments;
 }
 
 /// The words a chat whose first message is still waiting to be sent refuses
@@ -2245,12 +2130,6 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
-        let recipe = moved
-            .as_ref()
-            .map_or(&runtime.session.launch.recipe, |session| {
-                &session.launch.recipe
-            });
-        snapshot.permission_mode = draft_permission_mode(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -2353,8 +2232,6 @@ impl Cagents {
         }
         runtime.session = session.clone();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -2953,9 +2830,7 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
-        let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let snapshot = self.chat_draft_snapshot(session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -3762,14 +3637,13 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let mut snapshot = self.chat_draft_snapshot(provider);
+        let snapshot = self.chat_draft_snapshot(provider);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
-        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft => None,
@@ -3864,6 +3738,11 @@ impl Cagents {
         };
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
+        let permission_mode = if let Command::SetPermissionMode { mode } = &command {
+            Some(mode.clone())
+        } else {
+            None
+        };
         let page = match &command {
             Command::LoadEarlier => Some(view::Page::Earlier),
             Command::Refresh => Some(view::Page::Newer),
@@ -3886,6 +3765,7 @@ impl Cagents {
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
+            permission_mode,
             first_prompt,
             model,
             page,
@@ -4860,6 +4740,9 @@ impl Cagents {
                 };
                 let first_prompt = match result {
                     Ok(()) => {
+                        if let Some(mode) = pending.permission_mode {
+                            runtime.permission_mode = Some(mode);
+                        }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
                             runtime.attachments.clear();
@@ -5156,17 +5039,6 @@ impl Cagents {
                     .permission_modes
                     .contains(&mode)
                 {
-                    return Task::none();
-                }
-                if runtime.is_draft() {
-                    if !runtime.choosing() {
-                        return Task::none();
-                    }
-                    let provider = runtime.session.launch.provider;
-                    set_draft_permission_mode(&mut runtime.session.launch.recipe, provider, &mode);
-                    Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
-                    let session = runtime.session.clone();
-                    self.replace_chat_conversation(target.card, session);
                     return Task::none();
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
@@ -6854,69 +6726,6 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
-    }
-
-    #[test]
-    fn draft_permission_choice_sets_the_first_turns_launch_policy() {
-        let mut recipe = LaunchRecipe {
-            unset_environment: Default::default(),
-            program: "claude".into(),
-            arguments: vec!["--permission-mode".into(), "auto".into()],
-            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
-            environment: Default::default(),
-        };
-        assert_eq!(
-            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
-            Some("auto")
-        );
-        set_draft_permission_mode(&mut recipe, Provider::Claude, "bypassPermissions");
-        assert_eq!(recipe.arguments, ["--permission-mode", "bypassPermissions"]);
-        set_draft_permission_mode(&mut recipe, Provider::Claude, "manual");
-        assert_eq!(recipe.arguments, ["--permission-mode", "manual"]);
-
-        recipe.arguments.clear();
-        recipe.environment.insert(
-            "CLAUDE_CODE_PERMISSION_MODE".into(),
-            "bypassPermissions".into(),
-        );
-        assert_eq!(
-            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
-            Some("bypassPermissions")
-        );
-        set_draft_permission_mode(&mut recipe, Provider::Claude, "manual");
-        assert!(
-            !recipe
-                .environment
-                .contains_key("CLAUDE_CODE_PERMISSION_MODE")
-        );
-
-        recipe.program = "codex".into();
-        recipe.arguments = vec!["--remote".into(), "unix://".into()];
-        set_draft_permission_mode(&mut recipe, Provider::Codex, "yolo");
-        assert_eq!(
-            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
-            Some("yolo")
-        );
-        assert!(recipe.arguments.contains(&"--yolo".into()));
-        set_draft_permission_mode(&mut recipe, Provider::Codex, "workspaceWrite");
-        assert_eq!(
-            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
-            Some("workspaceWrite")
-        );
-        assert_eq!(
-            &recipe.arguments[2..],
-            &[
-                "--ask-for-approval",
-                "on-request",
-                "--sandbox",
-                "workspace-write"
-            ]
-        );
-        set_draft_permission_mode(&mut recipe, Provider::Codex, "readOnly");
-        assert_eq!(
-            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
-            Some("readOnly")
-        );
     }
 
     /// A draft moved to another provider, then to another account, is saved
