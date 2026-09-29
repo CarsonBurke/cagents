@@ -4955,7 +4955,11 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.capture_native_viewport();
-                self.align_editor_to_diff();
+                // Preview has its own retained viewport. Only an explicit
+                // return to Edit follows the source line currently in Diff.
+                if !preview {
+                    self.align_editor_to_diff();
+                }
                 self.source_surface = SourceSurface::Editor;
                 self.diffs
                     .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
@@ -16800,7 +16804,13 @@ mod tests {
             runtime.diff_basis.clone(),
             DiffState::ready(staged_text_diff(model)),
         );
-        runtime.diff_viewport.offset = 30.0 * DIFF_ROW_HEIGHT;
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 30.0 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
         drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
             card,
             preview: false,
