@@ -28,6 +28,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
 /// into a solid disc. Static handles retain renderer cache identity.
 fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     use std::sync::LazyLock;
+    static PROJECT_DRAG: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="black"><circle cx="5.5" cy="3" r="1"/><circle cx="10.5" cy="3" r="1"/><circle cx="5.5" cy="8" r="1"/><circle cx="10.5" cy="8" r="1"/><circle cx="5.5" cy="13" r="1"/><circle cx="10.5" cy="13" r="1"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static BRANCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1A3.5 3.5 0 0 1 8.5 9H4"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -237,6 +240,7 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
         "checkbox-mixed-symbolic" => &CHECKBOX_MIXED,
         "channel-symbolic" => &CHANNEL,
         "channel-add-symbolic" => &CHANNEL_ADD,
+        "project-drag-symbolic" => &PROJECT_DRAG,
         "chat-bubble-text-symbolic" => &CHAT,
         "internet-web-browser-symbolic" => &BROWSER,
         "worktree-add-symbolic" => &WORKTREE_ADD,

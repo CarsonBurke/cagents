@@ -349,9 +349,10 @@ fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
-            background: focused
-                .then(|| iced::Background::Color(theme.current_container().component.hover.into())),
-            border_width: 0.0,
+            // The tab owns its selection surface. Keep its mark and title
+            // inline rather than painting another button pill inside it.
+            border_width: if focused { 1.0 } else { 0.0 },
+            border_color: iced::Color::from(theme.current_container().on).scale_alpha(0.18),
             icon_color: Some(design::muted_icon_color(theme)),
             ..widget::button::Style::new()
         }
@@ -359,18 +360,34 @@ fn column_title_style() -> cosmic::theme::Button {
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(|_| widget::button::Style::new()),
-        hovered: Box::new(|focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.hover.into(),
-            )),
-            ..appearance(focused, theme)
-        }),
-        pressed: Box::new(|focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.pressed.into(),
-            )),
-            ..appearance(focused, theme)
-        }),
+        hovered: Box::new(appearance),
+        pressed: Box::new(appearance),
+    }
+}
+
+#[cfg(test)]
+mod tab_style_tests {
+    #[test]
+    fn inline_tab_mark_and_title_do_not_paint_a_nested_hover_button() {
+        let cosmic::theme::Button::Custom {
+            active,
+            hovered,
+            pressed,
+            ..
+        } = super::column_title_style()
+        else {
+            unreachable!();
+        };
+        let theme = cosmic::Theme::dark();
+        for appearance in [active, hovered, pressed] {
+            assert!(appearance(false, &theme).background.is_none());
+            let focused = appearance(true, &theme);
+            assert!(focused.background.is_none());
+            assert!(
+                focused.border_width > 0.0,
+                "keyboard focus retains a visible cue"
+            );
+        }
     }
 }
 

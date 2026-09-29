@@ -74,9 +74,6 @@ const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 /// `space_xxxs`, because `row_interaction`'s pointer regions and the rail's
 /// row width are derived from it and neither of those can ask a theme.
 const ROW_GUTTER: f32 = design::GRID_UNIT;
-/// One hierarchy step. A child row's icon slot starts exactly where its
-/// parent's label does, so the tree reads without a guide line.
-const ROW_INDENT: f32 = ROW_ICON_WIDTH + ROW_GUTTER;
 /// The live-indicator slot, reserved whether or not the row has an indicator
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
@@ -4275,14 +4272,6 @@ impl RowGrid {
         }
     }
 
-    /// Distance from the row's left edge to its leading icon slot.
-    fn indent(self) -> f32 {
-        match self.kind {
-            RowKind::Child if !self.compact => ROW_INDENT,
-            _ => 0.0,
-        }
-    }
-
     fn gutter(self) -> f32 {
         if self.compact { 0.0 } else { ROW_GUTTER }
     }
@@ -4356,7 +4345,10 @@ impl RowGrid {
         selected: bool,
     ) -> button::Button<'a, SidebarAction> {
         button::custom(content)
-            .class(sidebar_button_style(selected))
+            .class(match self.kind {
+                RowKind::Project => row_button_style::<true, false>(selected),
+                RowKind::Child => row_button_style::<true, true>(selected),
+            })
             .selected(selected)
             .padding([0.0, self.gutter()])
             .width(if self.compact {
@@ -4367,23 +4359,12 @@ impl RowGrid {
             .height(Length::Fixed(self.height()))
     }
 
-    /// Places a finished row on the grid at its hierarchy indent.
-    ///
-    /// The indent is padding around the control rather than inside it, so a
-    /// selected row's background still starts at its own column instead of
-    /// spanning the indent strip back to the pane border.
+    /// Navigation rows share the entire list width and the same icon column.
     fn mount<'a>(
         self,
         control: impl Into<Element<'a, SidebarAction>>,
     ) -> Element<'a, SidebarAction> {
-        let row = control.into();
-        let indent = self.indent();
-        if indent == 0.0 {
-            return row;
-        }
-        widget::container(row)
-            .padding(Padding::ZERO.left(indent))
-            .into()
+        control.into()
     }
 }
 
@@ -4431,7 +4412,18 @@ fn project_identity_row<'a>(
     let label = (!compact).then(|| project_name_label(project, query));
     let control = grid
         .control(
-            grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
+            grid.content(
+                if compact {
+                    project_icon(project, ROW_ICON_SIZE)
+                } else {
+                    crate::ui_controls::symbolic_icon("project-drag-symbolic")
+                        .icon()
+                        .size(ROW_ICON_SIZE)
+                        .into()
+                },
+                label,
+                None,
+            ),
             selected,
         )
         .id(chrome.open_id.clone())
@@ -4852,8 +4844,9 @@ fn project_view<'a>(
         gated(SidebarAction::NewChannel { project_id }, modal_open),
         chrome.new_channel_id.clone(),
     );
-    let mut identity =
-        widget::row::with_children(vec![disclosure, project_identity]).align_y(Alignment::Center);
+    let mut identity = widget::row::with_children(vec![project_identity])
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
     if !expanded {
         let activity = entity
             .channels
@@ -4882,6 +4875,7 @@ fn project_view<'a>(
             (entity.channels.len() + entity.worktrees.len()).to_string(),
         ));
     }
+    identity = identity.push(disclosure);
     let header = project_header_row(
         identity.into(),
         if entity.kind == ProjectKind::Git {
@@ -8608,7 +8602,12 @@ fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
 
 /// Neutral text, transparent rows, and restrained pointer/keyboard feedback.
 pub fn sidebar_button_style(selected: bool) -> theme::Button {
-    fn appearance(
+    row_button_style::<false, true>(selected)
+}
+
+/// Navigation fills span their complete row; project labels remain plain on hover.
+fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> theme::Button {
+    fn appearance<const FLAT: bool>(
         theme: &cosmic::Theme,
         focused: bool,
         selected: bool,
@@ -8627,7 +8626,11 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
         } else {
             design::muted_icon_color(theme)
         });
-        style.border_radius = theme.cosmic().corner_radii.radius_s.into();
+        style.border_radius = if FLAT {
+            [0.0; 4].into()
+        } else {
+            theme.cosmic().corner_radii.radius_s.into()
+        };
         if selected || focused || alpha > 0.0 {
             let mut surface = foreground;
             surface.a = if disabled {
@@ -8641,18 +8644,36 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
     }
     // Noncapturing closures keep the boxed callbacks allocation-free for the
     // hundreds of file rows rebuilt on terminal wakes.
-    fn class<const SELECTED: bool>() -> theme::Button {
+    fn class<const SELECTED: bool, const FLAT: bool, const HOVER: bool>() -> theme::Button {
         theme::Button::Custom {
-            active: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.0, false)),
-            disabled: Box::new(|theme| appearance(theme, false, SELECTED, 0.0, true)),
-            hovered: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.06, false)),
-            pressed: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.1, false)),
+            active: Box::new(|focused, theme| {
+                appearance::<FLAT>(theme, focused, SELECTED, 0.0, false)
+            }),
+            disabled: Box::new(|theme| appearance::<FLAT>(theme, false, SELECTED, 0.0, true)),
+            hovered: Box::new(|focused, theme| {
+                appearance::<FLAT>(
+                    theme,
+                    focused,
+                    SELECTED,
+                    if HOVER { 0.06 } else { 0.0 },
+                    false,
+                )
+            }),
+            pressed: Box::new(|focused, theme| {
+                appearance::<FLAT>(
+                    theme,
+                    focused,
+                    SELECTED,
+                    if HOVER { 0.1 } else { 0.0 },
+                    false,
+                )
+            }),
         }
     }
     if selected {
-        class::<true>()
+        class::<true, FLAT, HOVER>()
     } else {
-        class::<false>()
+        class::<false, FLAT, HOVER>()
     }
 }
 
@@ -10077,7 +10098,7 @@ mod row_interaction {
                     .and_then(|point| self.header_at(layout, point))
                     .is_some()
             {
-                return mouse::Interaction::Pointer;
+                return mouse::Interaction::Grab;
             }
             self.children
                 .iter()
@@ -10173,13 +10194,12 @@ mod row_interaction {
             // edge over a light neutral fill: distinct from the active row,
             // whose button paints the neutral fill alone, without outlining
             // the whole row in accent (#448). The fill uses the button's own
-            // radius token and bounds, so a row that is both shares one shape.
+            // flat bounds, so a row that is both shares one shape.
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
                 let bounds = state.selection_bounds.unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
-                    let radius = theme.cosmic().corner_radii.radius_s;
                     let edge = Rectangle {
                         x: bounds.x + 1.0,
                         y: bounds.y + bounds.height * 0.25,
@@ -10191,7 +10211,7 @@ mod row_interaction {
                             renderer::Quad {
                                 bounds,
                                 border: cosmic::iced::Border {
-                                    radius: radius.into(),
+                                    radius: 0.0.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -11277,9 +11297,12 @@ pub(crate) mod tests {
         assert_eq!((expanded_header.len(), expanded.len()), (1, 3));
         let (head, channel, primary) = (&expanded_header[0].1, &expanded[0].1, &expanded[1].1);
         assert_eq!(
-            channel[0].x, head[1].x,
-            "a child row's icon starts where its project's label does",
+            (channel[0].x, channel[1].x),
+            (head[0].x, head[1].x),
+            "project, channel and worktree glyphs and labels share columns",
         );
+        assert_eq!(expanded[0].0.x, expanded_header[0].0.x);
+        assert_eq!(expanded[0].0.width, expanded_header[0].0.width);
         assert_eq!(
             (channel[0].x, channel[1].x),
             (primary[0].x, primary[1].x),
@@ -11310,6 +11333,33 @@ pub(crate) mod tests {
                 "every rail row reserves the same indicator slot",
             );
         }
+    }
+
+    #[test]
+    fn project_drag_label_has_no_hover_fill_and_navigation_selection_spans_a_flat_row() {
+        let theme = cosmic::Theme::dark();
+        let theme::Button::Custom {
+            active,
+            hovered,
+            pressed,
+            ..
+        } = row_button_style::<true, false>(false)
+        else {
+            unreachable!();
+        };
+        assert!(active(false, &theme).background.is_none());
+        assert!(hovered(false, &theme).background.is_none());
+        assert!(pressed(false, &theme).background.is_none());
+        assert!(
+            hovered(true, &theme).background.is_some(),
+            "keyboard focus remains visible"
+        );
+        let theme::Button::Custom { active, .. } = row_button_style::<true, true>(true) else {
+            unreachable!();
+        };
+        let selected = active(false, &theme);
+        assert!(selected.background.is_some());
+        assert_eq!(selected.border_radius, [0.0; 4].into());
     }
 
     /// The whole point of drawing the header's commands over the row is that
@@ -12434,6 +12484,17 @@ pub(crate) mod tests {
         );
         let origin = Point::new(100.0, PROJECT_HEADER_HEIGHT / 2.0);
         let end = Point::new(100.0, 1.9 * PROJECT_HEADER_HEIGHT);
+        assert_eq!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(origin),
+                &viewport,
+                &renderer,
+            ),
+            mouse::Interaction::Grab,
+            "project titles expose their existing drag gesture",
+        );
         let mut dispatch = |event: Event, point: Point| {
             let mut messages = Vec::new();
             element.as_widget_mut().update(
