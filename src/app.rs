@@ -28,9 +28,13 @@ mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
 mod workspace_model_sync;
+mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+use worktree_dialog::{
+    WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
+};
 
 use std::{
     borrow::Cow,
@@ -1990,17 +1994,6 @@ pub struct Startup {
     window_view: Option<WindowView>,
 }
 
-#[derive(Debug, Clone)]
-struct WorktreeDialog {
-    project_id: ProjectId,
-    repository: PathBuf,
-    branch: String,
-    base: String,
-    destination: String,
-    advanced: bool,
-    resolving: Option<crate::model::OperationId>,
-    error: Option<String>,
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
@@ -3388,7 +3381,7 @@ pub enum Message {
     WorktreeInputResolved {
         project_id: ProjectId,
         operation_id: crate::model::OperationId,
-        result: Result<CreateWorktreeRequest, String>,
+        result: Result<CreateWorktreeRequest, WorktreeInputError>,
     },
     SubmitWorktree,
     WorktreeProgress(crate::repository::WorktreeProgressEvent),
@@ -5427,19 +5420,15 @@ impl Cagents {
             tasks.push(self.open_clicked_link(url));
         }
         if let Some((project_id, target)) = checkout {
-            self.worktree_dialog = Some(WorktreeDialog {
+            tasks.push(self.open_worktree_dialog(
                 project_id,
-                repository: target.repository.clone(),
-                branch: target.suggested_branch(),
-                base: target.head.as_str().to_owned(),
-                destination: String::new(),
-                advanced: true,
-                resolving: None,
-                error: None,
-            });
-            tasks.push(
-                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App),
-            );
+                target.repository.clone(),
+                WorktreeDraft {
+                    base: target.head.as_str().to_owned(),
+                    ..WorktreeDraft::branch(target.suggested_branch())
+                },
+                None,
+            ));
         }
         Task::batch(tasks)
     }
@@ -8900,13 +8889,44 @@ impl Cagents {
     }
 
     fn other_modal_is_open(&self) -> bool {
+        self.form_dialog_is_open() || self.modal_over_form_dialogs()
+    }
+
+    /// The worktree and pull request dialogs: forms, whose focused field
+    /// captures the keys the dialog itself answers.
+    fn form_dialog_is_open(&self) -> bool {
+        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some()
+    }
+
+    /// Closes the topmost form dialog, stopping whatever it was waiting on.
+    fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if let Some(dialog) = self.worktree_dialog.take() {
+            dialog.cancel();
+        } else if self.pull_request_dialog.take().is_some() {
+            self.pull_request_dialog_generation =
+                self.pull_request_dialog_generation.wrapping_add(1);
+        }
+        if let Some(target) = self.nested_modal_focus_target() {
+            return iced::widget::operation::focus(target).map(cosmic::Action::App);
+        }
+        self.focus_context_overlay_if_exposed()
+    }
+
+    /// Whether a form dialog is the dialog on screen, not one under another.
+    fn form_dialog_on_top(&self) -> bool {
+        self.form_dialog_is_open()
+            && self.update_ui.confirmation.is_none()
+            && !self.modal_over_form_dialogs()
+    }
+
+    /// The dialogs `dialog` mounts above the form dialogs, besides the
+    /// update confirmation, which `modal_is_open` adds.
+    fn modal_over_form_dialogs(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
         }
-        self.worktree_dialog.is_some()
-            || self.pull_request_dialog.is_some()
-            || self.dirty_repository_close.is_some()
+        self.dirty_repository_close.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
@@ -11256,6 +11276,8 @@ impl Application for Cagents {
                     }
                     SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
                     SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
+                    SidebarAction::EditWorktreeOperation(id) => self.reopen_worktree_operation(id, false),
+                    SidebarAction::RetryWorktreeOperation(id) => self.reopen_worktree_operation(id, true),
                     SidebarAction::RetryWorktreeDeletion { worktree_id, .. } => {
                         self.handle_project_action(project_ui::Action::RetryDelete(worktree_id))
                     }
@@ -11300,18 +11322,12 @@ impl Application for Cagents {
                         if self.sidebar_model.project(project_id).is_some_and(|project| project.kind == ProjectKind::Folder) {
                             return Task::none();
                         }
-                        self.worktree_dialog = Some(WorktreeDialog {
+                        self.open_worktree_dialog(
                             project_id,
                             repository,
-                            branch: String::new(),
-                            base: String::new(),
-                            destination: String::new(),
-                            advanced: false,
-                            resolving: None,
-                            error: None,
-                        });
-                        iced::widget::operation::focus(worktree_dialog_focus_id())
-                            .map(cosmic::Action::App)
+                            WorktreeDraft::default(),
+                            None,
+                        )
                     }
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
@@ -12238,32 +12254,26 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WorktreeBranchChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.branch = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Branch, value);
                 }
                 Task::none()
             }
             Message::WorktreeBaseChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.base = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Base, value);
                 }
                 Task::none()
             }
             Message::WorktreeDestinationChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog
-                    && dialog.resolving.is_none()
-                {
-                    dialog.destination = value;
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit(WorktreeField::Destination, value);
                 }
                 Task::none()
             }
             Message::ToggleWorktreeAdvanced => {
                 if let Some(dialog) = &mut self.worktree_dialog {
-                    dialog.advanced = !dialog.advanced;
+                    dialog.toggle_options();
                 }
                 Task::none()
             }
@@ -12285,20 +12295,7 @@ impl Application for Cagents {
             Message::WorktreeOperationsRehydrated(result) => {
                 self.restore_worktree_operations(result)
             }
-            Message::SubmitWorktree => {
-                let Some(dialog) = self.worktree_dialog.as_ref() else {
-                    return Task::none();
-                };
-                let input = crate::repository::WorktreeInput {
-                    repository: dialog.repository.clone(),
-                    input: dialog.branch.clone(),
-                    base: dialog.base.clone(),
-                    managed_directory: self.settings.managed_worktree_directory.clone(),
-                    destination: dialog.destination.clone(),
-                    operation_id: crate::model::OperationId::new(),
-                };
-                self.start_worktree_input(dialog.project_id, input)
-            }
+            Message::SubmitWorktree => self.submit_worktree_dialog(),
             Message::WorktreeCreated {
                 project_id,
                 repository,
@@ -12487,18 +12484,7 @@ impl Application for Cagents {
                     self.restore_pull_request_dialog(dialog, generation)
                 }
             },
-            Message::CancelDialog => {
-                if self.worktree_dialog.take().is_none()
-                    && self.pull_request_dialog.take().is_some()
-                {
-                    self.pull_request_dialog_generation =
-                        self.pull_request_dialog_generation.wrapping_add(1);
-                }
-                if let Some(target) = self.nested_modal_focus_target() {
-                    return iced::widget::operation::focus(target).map(cosmic::Action::App);
-                }
-                self.focus_context_overlay_if_exposed()
-            }
+            Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
@@ -12543,6 +12529,13 @@ impl Application for Cagents {
                 // keystroke. Global shortcuts below are deliberately exempt:
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
+                // A form dialog on top answers Escape before anything under
+                // it, such as a find bar or picker, and even when its focused
+                // field captured the key to blur itself: otherwise closing it
+                // would take a second press.
+                if is_escape_press(&event) && self.form_dialog_on_top() {
+                    return self.cancel_form_dialog();
+                }
                 if is_escape_press(&event) && !captured {
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
@@ -13351,78 +13344,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(dialog) = self.worktree_dialog.as_ref() {
-            let mut rows: Vec<Element<'_, Message>> = vec![
-                widget::text::title3("Create worktree").into(),
-                design::caption(
-                    "Enter a branch name, a Linear issue ID, or paste a Linear issue URL.",
-                )
-                .into(),
-                widget::text_input("Branch or Linear issue", &dialog.branch)
-                    .id(worktree_dialog_focus_id())
-                    .on_input(Message::WorktreeBranchChanged)
-                    .into(),
-                widget::button::text(if dialog.advanced {
-                    "Hide options"
-                } else {
-                    "Base branch & destination"
-                })
-                .on_press(Message::ToggleWorktreeAdvanced)
-                .into(),
-            ];
-            if dialog.advanced {
-                rows.extend([
-                    crate::design::caption("Base branch (optional)").into(),
-                    widget::text_input("Automatic repository default", &dialog.base)
-                        .id(widget::Id::new("dialog.worktree.base"))
-                        .on_input(Message::WorktreeBaseChanged)
-                        .into(),
-                    crate::design::caption("Destination (optional)").into(),
-                    widget::text_input("Automatic managed directory", &dialog.destination)
-                        .id(widget::Id::new("dialog.worktree.destination"))
-                        .on_input(Message::WorktreeDestinationChanged)
-                        .into(),
-                    crate::design::caption(format!(
-                        "Default parent: {}. Relative paths start at the repository root.",
-                        self.settings.managed_worktree_directory
-                    ))
-                    .into(),
-                ]);
-            }
-            if let Some(error) = &dialog.error {
-                rows.push(
-                    widget::text::body(error.as_str())
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .into(),
-                );
-            }
-            rows.push(
-                widget::row::with_children(vec![
-                    widget::button::standard("Cancel")
-                        .on_press(Message::CancelDialog)
-                        .into(),
-                    widget::button::suggested(if dialog.resolving.is_some() {
-                        "Resolving…"
-                    } else {
-                        "Create"
-                    })
-                    .on_press_maybe(
-                        (dialog.resolving.is_none() && !dialog.branch.trim().is_empty())
-                            .then_some(Message::SubmitWorktree),
-                    )
-                    .into(),
-                ])
-                .spacing(2.0 * design::GRID_UNIT)
-                .into(),
-            );
-            return Some(dialog_ui::overlay(
-                dialog_ui::surface(
-                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
-                    560.0,
-                ),
-                Some(Message::CancelDialog),
-                1.0,
-            ));
+        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+            return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
         let dialog = self.pull_request_dialog.as_ref()?;
@@ -13864,11 +13787,6 @@ fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::I
         DirtyCloseControl::Save => "save",
     };
     widget::Id::new(format!("dialog.dirty-close.{card}.{control}"))
-}
-
-/// The worktree dialog's first field, focused when it opens.
-fn worktree_dialog_focus_id() -> widget::Id {
-    widget::Id::new("dialog.worktree.branch")
 }
 
 /// The pull-request dialog's first field, focused when it opens.
@@ -17348,16 +17266,15 @@ mod tests {
     fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
         let mut app = context_inspector_test_app(true);
         let project = ProjectId::new();
-        app.worktree_dialog = Some(WorktreeDialog {
-            project_id: project,
-            repository: PathBuf::from("/repo"),
-            branch: String::new(),
-            base: "main".into(),
-            destination: "/worktrees".into(),
-            advanced: false,
-            resolving: None,
-            error: None,
-        });
+        app.worktree_dialog = Some(WorktreeDialog::new(
+            project,
+            PathBuf::from("/repo"),
+            WorktreeDraft {
+                base: "main".into(),
+                destination: "/worktrees".into(),
+                ..WorktreeDraft::default()
+            },
+        ));
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
             worktree_dialog_focus_id().to_string()
