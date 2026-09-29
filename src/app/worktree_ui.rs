@@ -328,8 +328,8 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
             .filter_map(|card| {
-                // An explicit filing outranks discovery: it exists precisely
-                // because no root contains this card's launch directory.
+                // An explicit filing outranks directory discovery, including
+                // cloned editors whose descriptors point into nested roots.
                 if let Some(scope) = self.durable.card_scopes.get(&card.id) {
                     return Some((card.id, scope.clone()));
                 }
