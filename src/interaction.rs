@@ -17,6 +17,37 @@ use serde::Deserialize;
 
 mod context_menu;
 
+/// Let a focused field answer Escape before its native blur handler runs.
+pub fn focused_escape<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_escape: impl Fn() -> Message + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusedEscape,
+        tip: None,
+        on_escape: Some(Box::new(on_escape)),
+    }
+    .into()
+}
+
+#[derive(Default)]
+struct ChildFocus(bool);
+
+impl Operation for ChildFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        self.0 |= state.is_focused();
+    }
+}
+
 /// Arrow navigation stays inside the list that owns native keyboard focus.
 pub fn keyboard_list<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -26,6 +57,7 @@ pub fn keyboard_list<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::KeyboardList(enabled),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -37,6 +69,7 @@ pub fn keyboard_list_row<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::ListRow,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -167,6 +200,7 @@ pub fn reserve_tab_history<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::TabHistory(enabled),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -178,6 +212,7 @@ pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         content: content.into(),
         kind: Kind::Hover,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -191,6 +226,7 @@ pub fn drive_animation<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::DriveAnimation(active),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -283,6 +319,7 @@ fn reveal_width_aligned<'a, Message: 'a>(
             leading,
         },
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -302,6 +339,7 @@ pub fn fade<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Fade(progress.clamp(0.0, 1.0)),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -328,6 +366,7 @@ pub fn tooltip<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Tooltip,
         tip: Some(Tip { content: tip }),
+        on_escape: None,
     }
     .into()
 }
@@ -345,6 +384,7 @@ pub fn context_menu<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::surface(menu)),
         kind: Kind::ContextMenu,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -358,6 +398,7 @@ pub fn context_menu_lazy<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::lazy_surface(builder)),
         kind: Kind::ContextMenu,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -368,6 +409,7 @@ pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
         content: content.into(),
         kind: Kind::Opaque,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -1054,6 +1096,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 #[derive(Clone, Copy)]
 enum Kind {
     KeyboardList(bool),
+    FocusedEscape,
     ListRow,
     TabHistory(bool),
     Hover,
@@ -1073,6 +1116,7 @@ struct Effect<'a, Message> {
     content: Element<'a, Message>,
     kind: Kind,
     tip: Option<Tip<'a, Message>>,
+    on_escape: Option<Box<dyn Fn() -> Message + 'a>>,
 }
 
 struct Tip<'a, Message> {
@@ -1084,6 +1128,7 @@ struct Tip<'a, Message> {
 struct HoverTag;
 struct TabHistoryTag;
 struct KeyboardListTag;
+struct FocusedEscapeTag;
 struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
@@ -1136,6 +1181,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
             Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
+            Kind::FocusedEscape => tree::Tag::of::<FocusedEscapeTag>(),
             Kind::ListRow => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
@@ -1249,6 +1295,31 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Some(on_escape) = &self.on_escape
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Escape
+                    ),
+                    ..
+                })
+            )
+            && !shell.is_event_captured()
+        {
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0 {
+                shell.publish(on_escape());
+                shell.capture_event();
+                return;
+            }
+        }
         if let Kind::KeyboardList(true) = self.kind
             && let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
                 key: cosmic::iced::keyboard::Key::Named(key),
@@ -1679,6 +1750,88 @@ mod tests {
                 Modifiers::CTRL | Modifiers::ALT
             ),
             None
+        );
+    }
+
+    #[test]
+    fn focused_escape_answers_before_the_native_field_blurs() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let id = Id::from("escape.find");
+        let mut element = focused_escape(
+            widget::text_input("Find", "needle")
+                .id(id.clone())
+                .on_input(|_| 0_u8)
+                .on_unfocus(2_u8),
+            || 1_u8,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 100.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut published = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut published),
+            &bounds,
+        );
+        assert!(
+            published.is_empty(),
+            "an unfocused find field cannot steal Escape"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(id),
+        );
+        let mut shell = Shell::new(&mut published);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(shell.is_event_captured());
+        assert_eq!(
+            published,
+            [1],
+            "Escape closes find before COSMIC publishes blur"
         );
     }
 

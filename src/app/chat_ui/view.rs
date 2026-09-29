@@ -899,13 +899,15 @@ impl Runtime {
         if let Some(query) = &self.find {
             content.push(
                 widget::row::with_children(vec![
-                    widget::text_input("Find in conversation (case sensitive)", query)
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill)
-                        .into(),
+                    crate::interaction::focused_escape(
+                        widget::text_input("Find in conversation (case sensitive)", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
+                        move || action(Action::CloseFind(target)),
+                    ),
                     design::caption(if self.find_matches.is_empty() {
                         "0 matches".to_owned()
                     } else {
