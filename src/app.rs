@@ -5491,10 +5491,12 @@ impl Cagents {
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
-        let file_comment = review.file_comment_control(modal_open).map(|control| {
-            crate::ui_controls::toolbar_actions(vec![control])
-                .map(move |action| RepositoryAction::Review { card: id, action })
-        });
+        let file_comment = review
+            .file_comment_control(modal_open, pane.runtime.can_show_file_discussion())
+            .map(|control| {
+                crate::ui_controls::toolbar_actions(vec![control])
+                    .map(move |action| RepositoryAction::Review { card: id, action })
+            });
         if let Some(toolbar) =
             repository_widget::selected_file_toolbar_with(id, &pane.runtime, file_comment)
         {

@@ -3380,6 +3380,23 @@ impl RepositoryRuntime {
             })
     }
 
+    /// Whether the diff surface can hold a discussion of the whole file: it
+    /// renders one only above a text or no-text comparison, so a failed,
+    /// empty, or unresolved comparison would hide a draft begun there. A
+    /// comparison still loading counts, since it resolves into one of those.
+    pub fn can_show_file_discussion(&self) -> bool {
+        self.can_show_diff()
+            && self.basis_resolution.is_none()
+            && self.working_diff_failure().is_none()
+            && matches!(
+                self.diff_state(&self.diff_basis),
+                Some(
+                    DiffState::Loading { .. }
+                        | DiffState::Ready(RenderedDiff::Text { .. } | RenderedDiff::NoText(_), _)
+                )
+            )
+    }
+
     fn can_apply_markdown_mode(&self, preview: bool) -> bool {
         !self.is_saving()
             && match &self.document {
@@ -11489,6 +11506,27 @@ mod tests {
         assert_eq!(runtime.diff_viewport.offset, 210.0);
         drop(runtime.set_diff_annotation_heights(DiffMode::Inline, 0.0, &[]));
         assert_eq!(runtime.diff_viewport.offset, 60.0);
+    }
+
+    #[test]
+    fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "line\n"))),
+        );
+        assert!(runtime.can_show_file_discussion());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "\"Could not compute diff\" has no leading annotation"
+        );
+        runtime.basis_resolution = Some(BasisResolution::NoCommits);
+        assert!(!runtime.can_show_file_discussion());
     }
 
     #[test]

@@ -735,9 +735,21 @@ impl State {
 
     /// Starts a discussion on the selected file as a whole. Line comments
     /// begin in the diff gutter; this is the file header's counterpart.
-    pub fn file_comment_control(&self, modal_open: bool) -> Option<Element<'_, super::Action>> {
+    ///
+    /// `diff_can_show` says whether the diff beside it can render a file
+    /// discussion. Where it cannot, a new draft would be invisible yet hold
+    /// every other comment and the submission, so the control is withheld;
+    /// an existing draft keeps its control so it is never lost track of.
+    pub fn file_comment_control(
+        &self,
+        modal_open: bool,
+        diff_can_show: bool,
+    ) -> Option<Element<'_, super::Action>> {
         let path = self.selected.as_ref()?.as_path().to_str()?.to_owned();
         let drafting_here = self.drafting_file(&path);
+        if !diff_can_show && !drafting_here {
+            return None;
+        }
         // While this file's draft is open the control stays live and leads
         // back to it; any other open draft must be finished first.
         let enabled = !modal_open
