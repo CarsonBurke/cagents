@@ -12909,7 +12909,10 @@ impl Application for Cagents {
             Message::DismissStatus | Message::DismissAllNotices => {
                 self.status = None;
                 self.notices.clear();
-                self.reconcile_notice_popup()
+                // An update or save-health notice can keep the popup open
+                // after the Dismiss all control that held focus is gone.
+                let reconciled = self.reconcile_notice_popup();
+                Task::batch([reconciled, self.refocus_notices()])
             }
             Message::DismissNotice(id) => {
                 self.notices.dismiss(id);
