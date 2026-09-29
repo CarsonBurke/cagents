@@ -44,7 +44,7 @@ pub(super) fn overlay<'a>(
                     0.0,
                     0.0,
                     0.0,
-                    0.48 * progress,
+                    design::SCRIM_ALPHA * progress,
                 ))),
                 ..Default::default()
             }

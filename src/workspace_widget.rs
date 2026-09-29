@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::Arc, time::Duration};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -24,6 +24,8 @@ use crate::{
 pub struct ViewportSample {
     pub offset: f32,
     pub width: f32,
+    /// Pointer input moves the camera; native layout feedback only acknowledges it.
+    pub user_input: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +45,24 @@ pub enum WorkspaceViewportEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalShortcut {
+    ToggleProjects,
+    RenamePane,
+    CommandPalette,
+    NewThread,
+    ToggleInspector,
+    OpenSettings,
+    MovePaneLeft,
+    MovePaneRight,
+    ReopenPane,
+    FocusPane1,
+    FocusPane2,
+    FocusPane3,
+    FocusPane4,
+    FocusPane5,
+    FocusPane6,
+    FocusPane7,
+    FocusPane8,
+    FocusPane9,
     NewTerminal,
     NewChannel,
     ClonePane,
@@ -123,6 +143,114 @@ pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
+        action: GlobalShortcut::ToggleProjects,
+        label: "Toggle Projects sidebar",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RenamePane,
+        label: "Rename focused pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CommandPalette,
+        label: "Open command palette",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewThread,
+        label: "New thread",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ToggleInspector,
+        label: "Toggle inspector",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenSettings,
+        label: "Open settings",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MovePaneLeft,
+        label: "Move pane left",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MovePaneRight,
+        label: "Move pane right",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReopenPane,
+        label: "Reopen closed pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane1,
+        label: "Focus pane 1",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane2,
+        label: "Focus pane 2",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane3,
+        label: "Focus pane 3",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane4,
+        label: "Focus pane 4",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane5,
+        label: "Focus pane 5",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane6,
+        label: "Focus pane 6",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane7,
+        label: "Focus pane 7",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane8,
+        label: "Focus pane 8",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane9,
+        label: "Focus pane 9",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
         repeatable: false,
@@ -142,7 +270,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CloseFocusedCard,
-        label: "Close focused column",
+        label: "Close focused pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -154,13 +282,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
-        label: "Previous column",
+        label: "Previous pane",
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Right),
-        label: "Next column",
+        label: "Next pane",
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
@@ -230,6 +358,24 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
 /// Every configured chord; newer actions may be explicitly unbound.
 pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
+        GlobalShortcut::ToggleProjects => &shortcuts.toggle_projects,
+        GlobalShortcut::RenamePane => &shortcuts.rename_pane,
+        GlobalShortcut::CommandPalette => &shortcuts.command_palette,
+        GlobalShortcut::NewThread => &shortcuts.new_native_thread,
+        GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
+        GlobalShortcut::OpenSettings => &shortcuts.open_settings,
+        GlobalShortcut::MovePaneLeft => &shortcuts.move_pane_left,
+        GlobalShortcut::MovePaneRight => &shortcuts.move_pane_right,
+        GlobalShortcut::ReopenPane => &shortcuts.reopen_pane,
+        GlobalShortcut::FocusPane1 => &shortcuts.focus_pane_1,
+        GlobalShortcut::FocusPane2 => &shortcuts.focus_pane_2,
+        GlobalShortcut::FocusPane3 => &shortcuts.focus_pane_3,
+        GlobalShortcut::FocusPane4 => &shortcuts.focus_pane_4,
+        GlobalShortcut::FocusPane5 => &shortcuts.focus_pane_5,
+        GlobalShortcut::FocusPane6 => &shortcuts.focus_pane_6,
+        GlobalShortcut::FocusPane7 => &shortcuts.focus_pane_7,
+        GlobalShortcut::FocusPane8 => &shortcuts.focus_pane_8,
+        GlobalShortcut::FocusPane9 => &shortcuts.focus_pane_9,
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::NewChannel => &shortcuts.new_channel,
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,
@@ -480,6 +626,25 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageDown)
             ),
+            ShortcutKey::Function(number) => {
+                use keyboard::key::Named;
+                let keys = [
+                    Named::F1,
+                    Named::F2,
+                    Named::F3,
+                    Named::F4,
+                    Named::F5,
+                    Named::F6,
+                    Named::F7,
+                    Named::F8,
+                    Named::F9,
+                    Named::F10,
+                    Named::F11,
+                    Named::F12,
+                ];
+                keys.get(usize::from(number).saturating_sub(1))
+                    .is_some_and(|expected| key.as_ref() == keyboard::Key::Named(*expected))
+            }
         }
 }
 
@@ -487,7 +652,7 @@ fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Opti
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
         if let (Some(character), None) = (characters.next(), characters.next())
-            && character.is_ascii_alphanumeric()
+            && character.is_ascii_graphic()
         {
             return Some(character.to_ascii_lowercase());
         }
@@ -619,29 +784,11 @@ where
                 .collect(),
         );
     let on_viewport_for_scroll = on_viewport.clone();
-    let on_select = on_viewport.clone();
-    let on_drop = on_viewport.clone();
-    let on_drag_scroll = on_viewport.clone();
-    let strip = crate::reorder::strip(
-        strip,
-        workspace
-            .presentation_geometry()
-            .cards()
-            .iter()
-            .map(|card| crate::reorder::Item {
-                id: card.id,
-                start: card.start,
-                width: card.width(),
-            })
-            .collect(),
-        true,
-        true,
-        Some(Box::new(move |offset| {
-            on_drag_scroll(WorkspaceViewportEvent::DragScrolled(offset))
-        })),
-        move |id| on_select(WorkspaceViewportEvent::PointerFocused(id)),
-        move |card, before| on_drop(WorkspaceViewportEvent::Reordered { card, before }),
-    );
+    let scroll_input = Rc::new(Cell::new(false));
+    let input_for_scroll = Rc::clone(&scroll_input);
+    // Reordering belongs to the tab strip's explicit title handles. A wrapper
+    // around pane bodies intercepts Alt drags before terminals can route them
+    // to mouse-tracking applications.
     let scrollable = cosmic::widget::scrollable::horizontal(strip)
         .direction(widget::scrollable::Direction::Horizontal(
             widget::scrollable::Scrollbar::hidden(),
@@ -654,6 +801,7 @@ where
             on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
                 offset: viewport.absolute_offset().x,
                 width: viewport.bounds().width,
+                user_input: input_for_scroll.get(),
             }))
         });
 
@@ -667,6 +815,7 @@ where
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .with_scroll_input(scroll_input)
     .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
 }
@@ -1392,6 +1541,7 @@ struct WorkspaceSurface<'a, Message> {
     reported_width: f32,
     on_resize: Box<dyn Fn(f32) -> Message + 'a>,
     initial_scroll: Option<(widget::Id, f32)>,
+    scroll_input: Option<Rc<Cell<bool>>>,
 }
 
 #[derive(Default)]
@@ -1414,11 +1564,17 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             reported_width,
             on_resize: Box::new(on_resize),
             initial_scroll: None,
+            scroll_input: None,
         }
     }
 
     fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
         self.initial_scroll = Some((id, offset));
+        self
+    }
+
+    fn with_scroll_input(mut self, input: Rc<Cell<bool>>) -> Self {
+        self.scroll_input = Some(input);
         self
     }
 
@@ -1553,6 +1709,12 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
         };
+        if let Some(input) = &self.scroll_input {
+            input.set(matches!(
+                event,
+                Event::Mouse(mouse::Event::WheelScrolled { .. }) | Event::Touch(_)
+            ));
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -1563,6 +1725,9 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             shell,
             &clipped,
         );
+        if let Some(input) = &self.scroll_input {
+            input.set(false);
+        }
         // Reported on redraw rather than from `layout`, because layout runs
         // during view building where publishing a message would fight the
         // reflow it triggers.
@@ -2337,6 +2502,7 @@ mod tests {
         let scrolled = WorkspaceViewportEvent::Scrolled(ViewportSample {
             offset: 240.0,
             width: 800.0,
+            user_input: true,
         });
         let resized = WorkspaceViewportEvent::Resized(800.0);
 
@@ -2345,6 +2511,7 @@ mod tests {
             WorkspaceViewportEvent::Scrolled(ViewportSample {
                 offset: 240.0,
                 width: 800.0,
+                user_input: true,
             })
         );
         assert_eq!(resized, WorkspaceViewportEvent::Resized(800.0));
@@ -2501,6 +2668,7 @@ mod tests {
 
         let mut customized = shortcuts;
         customized.new_terminal = vec!["Ctrl+Shift+N".to_owned()];
+        customized.new_native_thread.clear();
         assert_eq!(
             global_shortcut(
                 &key_press("n", Code::KeyN, ctrl_shift, false),
@@ -2648,6 +2816,7 @@ mod tests {
         let mut shortcuts = KeyboardShortcuts {
             clone_pane: vec!["Alt+Shift+E".into()],
             new_channel: vec!["Ctrl+Shift+N".into()],
+            new_native_thread: vec![],
             ..KeyboardShortcuts::default()
         };
         for (character, code, default_character, default_code, action) in [
@@ -2818,6 +2987,91 @@ mod tests {
     /// same frame must publish nothing - including a pass whose height changed,
     /// and a pass whose strip was remounted with fresh widget state, neither of
     /// which changes the width the owner reads.
+    #[test]
+    fn native_scroll_samples_distinguish_redraw_feedback_from_user_wheels() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::{Font, Pixels};
+        use std::time::Instant;
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let shortcuts = KeyboardShortcuts::default();
+        let scroll_input = Rc::new(Cell::new(false));
+        let callback_input = Rc::clone(&scroll_input);
+        // Exercise the native scrollable directly: VirtualStrip deliberately
+        // consumes wheels over pane content, which has its own regression.
+        let scrollable = cosmic::widget::scrollable::horizontal(
+            widget::Space::new().width(1_280.0).height(Length::Fill),
+        )
+        .direction(widget::scrollable::Direction::Horizontal(
+            widget::scrollable::Scrollbar::hidden(),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_scroll(move |viewport| {
+            WorkspaceViewportEvent::Scrolled(ViewportSample {
+                offset: viewport.absolute_offset().x,
+                width: viewport.bounds().width,
+                user_input: callback_input.get(),
+            })
+        });
+        let mut element: Element<'_, WorkspaceViewportEvent> = WorkspaceSurface::new(
+            scrollable,
+            &shortcuts,
+            FocusedPane::Other,
+            400.0,
+            WorkspaceViewportEvent::Resized,
+        )
+        .with_scroll_input(scroll_input)
+        .into();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut messages = Vec::new();
+        for event in [
+            Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: -120.0, y: 0.0 },
+            }),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        let samples: Vec<_> = messages
+            .into_iter()
+            .filter_map(|event| match event {
+                WorkspaceViewportEvent::Scrolled(sample) => Some(sample),
+                _ => None,
+            })
+            .collect();
+        assert!(samples.iter().any(|sample| !sample.user_input));
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.user_input && sample.offset > 0.0)
+        );
+    }
+
     #[test]
     fn a_reported_viewport_width_is_not_reported_twice_in_one_frame() {
         use cosmic::iced::advanced::{clipboard, renderer::Headless};

@@ -41,12 +41,12 @@ Settings pane edits the same file, so most people never open it by hand. A few
 preferences exist only in the file: language servers and a custom terminal
 palette.
 
-The file uses schema version 3. Seven keys are required: `schema_version`,
-`max_hot_cards`, `hibernation_delay_ms`, `terminal_font_size`,
-`sidebar_width`, `inspector_width`, and `default_column_fraction`. Every other
-key is optional and takes the default below when it is missing. Unknown keys,
-unsupported schema versions, malformed TOML, conflicting shortcuts, and
-out-of-range values are errors. A file that fails to load is reported when the
+The file uses schema version 3. `schema_version` identifies the format; all
+other missing keys take their defaults. Unknown keys are
+ignored and preserved on save. Values this build cannot read use their default
+with a warning and remain in the file until that setting is changed.
+Unsupported schema versions and malformed TOML are
+errors. A file that fails to load is reported when the
 app starts. That session then runs on defaults and does not write the file, so
 your file is not overwritten. To replace a broken file from the app, use
 **Reset all settings**.
@@ -59,8 +59,8 @@ leaves the file invalid, saves from running windows fail until it is fixed.
 
 ### Example
 
-This is the file cagents writes with every default, in the order it writes
-the keys. `language_servers` is left out here: when it is missing, the built-in
+This example shows common preferences and shortcut defaults. Omitted optional
+fields use their defaults. When `language_servers` is missing, the built-in
 list applies (see [Language servers](#language-servers)).
 
 ```toml
@@ -75,7 +75,7 @@ terminal_scroll_speed = 1.0
 terminal_padding = 8.0
 terminal_scroll_size = 2
 terminal_cursor_style = "beam"
-terminal_theme = "dark"
+terminal_theme = "auto"
 terminal_font_size = 14.0
 terminal_font_family = ""
 sidebar_width = 260.0
@@ -114,6 +114,14 @@ review_previous_file = ["Alt+Up"]
 review_next_unviewed = ["Alt+Shift+Down"]
 review_next_change = ["Alt+J"]
 review_previous_change = ["Alt+K"]
+
+[notifications]
+enabled = true
+success = true
+failure = true
+waiting = true
+while_focused = false
+review_requests = true
 ```
 
 TOML does not allow a top-level key after a table header. Put every plain
@@ -127,9 +135,9 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | Key | Type | Default | Accepted values |
 | --- | --- | --- | --- |
 | `schema_version` | integer | `3` | Exactly `3`. Required |
-| `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of columns kept live; extra background columns can hibernate. Required |
-| `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background column hibernates. Required |
-| `focus_follows_mouse` | boolean | `false` | Activates a pane, without scrolling, once the pointer crosses into it and stays in it, moving or not, for 300 ms. A key press before then cancels it; a pane uncovered under a still pointer, such as by a closing dropdown, is not activated, nor is one the pointer lands on as it enters the window, until it crosses into a pane |
+| `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of panes kept live; extra background panes can hibernate |
+| `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background pane hibernates |
+| `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
@@ -137,12 +145,16 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `terminal_padding` | float | `8.0` | `0.0` through `24.0` logical pixels |
 | `terminal_scroll_size` | integer | `2` | `1` through `10` lines per mouse-wheel notch. Trackpad scrolling stays proportional |
 | `terminal_cursor_style` | string | `"beam"` | `"application"` uses the cursor shape the program requests. `"block"`, `"beam"`, and `"underline"` override that request |
-| `terminal_theme` | string or table | `"dark"` | One of the 25 terminal presets (see [Terminal themes](#terminal-themes)), independent of `app_theme`. When **Custom** is selected, the file stores the palette here as a `[terminal_theme.custom]` table |
-| `terminal_font_size` | float | `14.0` | `8.0` through `40.0` logical pixels. Required |
+| `terminal_theme` | string or table | `"auto"` | `"auto"` follows the application's light/dark theme, or choose one of the 25 terminal presets (see [Terminal themes](#terminal-themes)). When **Custom** is selected, the file stores the palette here as a `[terminal_theme.custom]` table |
+| `terminal_font_size` | float | `14.0` | `8.0` through `40.0` logical pixels |
 | `terminal_font_family` | string | `""` | Empty for the system monospace font, or a family name of up to 128 bytes that is not only whitespace. The terminal grid needs one character width. A family whose glyph widths differ falls back to the system monospace font |
-| `sidebar_width` | float | `260.0` | `220.0` through `420.0`. Required |
-| `inspector_width` | float | `380.0` | `320.0` through `480.0`. Required |
-| `default_column_fraction` | float | `0.5` | `0.25` through `1.0`. The share of the workspace a new column takes. Required |
+| `editor_font_family` | optional string | absent | Follows the terminal family when absent; otherwise a font family of up to 128 bytes |
+| `editor_font_size` | optional float | absent | Follows the terminal size when absent; otherwise `8.0` through `40.0` logical pixels |
+| `confirm_multiline_paste` | boolean | `true` | Confirm multiline terminal paste when bracketed paste is unavailable |
+| `browser_search_url` | string | `"https://duckduckgo.com/?q={query}"` | HTTP(S) search URL containing `{query}` |
+| `sidebar_width` | float | `260.0` | `220.0` through `420.0` |
+| `inspector_width` | float | `380.0` | `320.0` through `480.0` |
+| `default_column_fraction` | float | `0.5` | `0.25` through `1.0`. The share of the workspace a new pane takes |
 | `terminal_scrollback_lines` | integer | `10000` | `0` through `1000000` lines. Applies to terminals started after the change |
 | `link_open_destination` | string | `"integrated_browser"` | Where an ordinary link click opens: `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | The gesture that always opens the system browser: `"control_click"` or `"control_shift_click"`. The other gesture always opens the in-app browser |
@@ -165,6 +177,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `notifications.failure` | boolean | `true` | Alerts for failures and cancellations |
 | `notifications.waiting` | boolean | `true` | Alerts when a supported provider needs attention |
 | `notifications.while_focused` | boolean | `false` | Also alerts for the focused pane in a focused window |
+| `notifications.review_requests` | boolean | `true` | Alerts for incoming GitHub review requests |
 
 ## Keyboard shortcuts
 
@@ -172,9 +185,11 @@ Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
 
 - Modifiers: `Ctrl` (or `Control`), `Alt`, `Super` (or `Meta`), and `Shift`.
-  Each chord needs `Ctrl`, `Alt`, or `Super`. `Shift` is optional.
+  Each chord needs `Ctrl`, `Alt`, or `Super`, except function keys, which can
+  stand alone. `Shift` is optional.
 - Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, `Tab`, `PageUp`, or
-  `PageDown`.
+  `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
+  keys, for example `Ctrl+Comma`.
 - No chord can appear twice, even under different actions.
 - A chord you bind here is not passed to the program running in a pane.
   For that reason, bare `Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, and `Ctrl+Q`
@@ -182,14 +197,15 @@ modifiers, joined by `+`. Names are case-insensitive.
   be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
   with a letter or arrow, can be bound but then no longer reach a terminal;
   the defaults avoid them.
-- The one exception is `search_projects`: while a terminal has focus, its
-  chords go to the terminal, so the default `Ctrl+F` stays forward-char there.
-  The review actions act only while a pull request pane has focus, and their
-  chords reach every other pane.
+- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
+  which opens terminal scrollback find. The same key finds in the focused
+  editor or chat transcript, and otherwise searches projects.
+  File and hunk navigation also works in local diff panes. Viewed-file commands
+  act only in a pull request pane. The chords reach terminals outside that scope.
 - `new_terminal`, `close_focused_column`, `search_projects`,
   `previous_column`, and `next_column` need at least one chord. The rest
-  (`new_channel`, `clone_pane`, `cycle_pane_width`, the two workspace actions,
-  and the three `review_*` actions) can be empty lists (`[]`), which leaves
+  including the command palette, pane actions and the six `review_*` actions
+  can be empty lists (`[]`), which leaves
   them unbound.
 
 ## Terminal themes

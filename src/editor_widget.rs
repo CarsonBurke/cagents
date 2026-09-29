@@ -34,7 +34,7 @@ use cosmic::iced::advanced::{
     clipboard::{self, Clipboard},
     input_method,
     layout::{self, Layout},
-    mouse, renderer,
+    mouse, overlay, renderer,
     text::{self, Ellipsize, LineHeight, Text, Wrapping},
     widget::{self, Widget, operation},
 };
@@ -54,6 +54,14 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+/// A diagnostic mapped once to the renderer's byte-addressed line positions.
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub start: Position,
+    pub end: Position,
+    pub severity: crate::lsp::LspSeverity,
+}
 type NativeEditor = <cosmic::Renderer as text::Renderer>::Editor;
 pub struct TextEditor<'a, Highlighter, Message, Theme = cosmic::Theme, Renderer = cosmic::Renderer>
 where
@@ -65,6 +73,13 @@ where
     content: &'a Content<Renderer>,
     line_digits: u32,
     additions: &'a [usize],
+    diagnostics: &'a [Diagnostic],
+    popup: Option<Element<'a, Message, Theme, Renderer>>,
+    popup_at: Option<Position>,
+    on_hover: Option<Box<dyn Fn(Option<Position>) -> Message + 'a>>,
+    on_definition: Option<Box<dyn Fn(Position) -> Message + 'a>>,
+    find_matches: &'a [(Position, Position)],
+    current_match: usize,
     placeholder: Option<text::Fragment<'a>>,
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
@@ -96,6 +111,13 @@ where
             content,
             line_digits: content.line_count().max(1).ilog10() + 1,
             additions: &[],
+            diagnostics: &[],
+            popup: None,
+            popup_at: None,
+            on_hover: None,
+            on_definition: None,
+            find_matches: &[],
+            current_match: 0,
             placeholder: None,
             font: None,
             text_size: Some(Pixels(13.0)),
@@ -151,11 +173,42 @@ where
         self
     }
 
+    pub fn diagnostics(mut self, diagnostics: &'a [Diagnostic]) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub fn popup(
+        mut self,
+        popup: Option<Element<'a, Message, Theme, Renderer>>,
+        at: Option<Position>,
+    ) -> Self {
+        self.popup = popup;
+        self.popup_at = at;
+        self
+    }
+
+    pub fn on_hover(mut self, on_hover: impl Fn(Option<Position>) -> Message + 'a) -> Self {
+        self.on_hover = Some(Box::new(on_hover));
+        self
+    }
+
+    pub fn on_definition(mut self, on_definition: impl Fn(Position) -> Message + 'a) -> Self {
+        self.on_definition = Some(Box::new(on_definition));
+        self
+    }
+
     /// Sets the [`Font`] of the [`TextEditor`].
     ///
     /// [`Font`]: text::Renderer::Font
     pub fn font(mut self, font: impl Into<Renderer::Font>) -> Self {
         self.font = Some(font.into());
+        self
+    }
+
+    pub fn find_matches(mut self, matches: &'a [(Position, Position)], current: usize) -> Self {
+        self.find_matches = matches;
+        self.current_match = current;
         self
     }
 
@@ -194,6 +247,13 @@ where
             content: self.content,
             line_digits: self.line_digits,
             additions: self.additions,
+            diagnostics: self.diagnostics,
+            popup: self.popup,
+            popup_at: self.popup_at,
+            on_hover: self.on_hover,
+            on_definition: self.on_definition,
+            find_matches: self.find_matches,
+            current_match: self.current_match,
             placeholder: self.placeholder,
             font: self.font,
             text_size: self.text_size,
@@ -767,6 +827,43 @@ where
         Some(f(&line.text, line.ending))
     }
 
+    /// Search Unicode text a line at a time, retaining source byte positions.
+    pub fn find_matches(&self, query: &str) -> Vec<(Position, Position)> {
+        use unicode_casefold::UnicodeCaseFold;
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let query: String = query.case_fold().collect();
+        let mut matches = Vec::new();
+        for line in 0..self.line_count() {
+            self.with_line(line, |text, _| {
+                let mut folded = String::with_capacity(text.len());
+                let mut boundaries = Vec::with_capacity(text.len() + 1);
+                for (offset, character) in text.char_indices() {
+                    let start = folded.len();
+                    folded.extend(std::iter::once(character).case_fold());
+                    boundaries.resize(folded.len(), None);
+                    boundaries[start] = Some(offset);
+                }
+                boundaries.push(Some(text.len()));
+                for (offset, _) in folded.match_indices(&query) {
+                    if let (Some(start), Some(end)) =
+                        (boundaries[offset], boundaries[offset + query.len()])
+                    {
+                        matches.push((
+                            Position {
+                                line,
+                                column: start,
+                            },
+                            Position { line, column: end },
+                        ));
+                    }
+                }
+            });
+        }
+        matches
+    }
+
     /// Byte length of the text [`Content::text`] would produce, without
     /// building it.
     ///
@@ -1177,6 +1274,8 @@ pub struct State<Highlighter: text::Highlighter> {
     highlighter_format_address: usize,
     context_menu_position: Option<Point>,
     pending_edit: Option<Action>,
+    hover: Option<(Position, Instant, bool)>,
+    popup_bounds: Option<Rectangle>,
 }
 
 #[derive(Debug, Clone)]
@@ -1258,6 +1357,8 @@ where
             highlighter_format_address: self.highlighter_format as usize,
             context_menu_position: None,
             pending_edit: None,
+            hover: None,
+            popup_bounds: None,
         })
     }
 
@@ -1265,6 +1366,22 @@ where
         Size {
             width: self.width,
             height: self.height,
+        }
+    }
+
+    fn children(&self) -> Vec<widget::Tree> {
+        self.popup.iter().map(widget::Tree::new).collect()
+    }
+
+    fn diff(&mut self, tree: &mut widget::Tree) {
+        if let Some(popup) = &mut self.popup {
+            if tree.children.is_empty() {
+                tree.children.push(widget::Tree::new(&*popup));
+            }
+            tree.children[0].diff(popup);
+            tree.children.truncate(1);
+        } else {
+            tree.children.clear();
         }
     }
 
@@ -1408,6 +1525,76 @@ where
             state.horizontal_grab = None;
         }
         let pointer = cursor.position().filter(|point| _viewport.contains(*point));
+        if self.popup.is_none() {
+            state.popup_bounds = None;
+        }
+        if self.on_hover.is_some() || self.on_definition.is_some() {
+            let text_bounds = layout.bounds().shrink(self.text_padding());
+            let hit = pointer
+                .filter(|point| text_bounds.contains(*point))
+                .and_then(|point| {
+                    let internal = self.content.0.borrow();
+                    let point = point
+                        - text_bounds.position()
+                        - Vector::new(internal.horizontal_translation(), 0.0);
+                    let cursor = internal.editor.buffer().hit(point.x, point.y)?;
+                    Some(Position {
+                        line: cursor.line,
+                        column: cursor.index,
+                    })
+                });
+            match event {
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if pointer.is_some_and(|point| {
+                        state
+                            .popup_bounds
+                            .is_some_and(|bounds| bounds.contains(point))
+                    }) {
+                        return;
+                    }
+                    if state.hover.map(|hover| hover.0) != hit {
+                        if state.hover.take().is_some()
+                            && let Some(on_hover) = &self.on_hover
+                        {
+                            shell.publish(on_hover(None));
+                        }
+                        state.hover = hit.map(|at| (at, Instant::now(), false));
+                    }
+                    if let Some((_, started, false)) = state.hover {
+                        shell.request_redraw_at(started + Duration::from_millis(500));
+                    }
+                }
+                Event::Window(window::Event::RedrawRequested(now)) => {
+                    if let Some((at, started, sent)) = &mut state.hover
+                        && !*sent
+                        && *now >= *started + Duration::from_millis(500)
+                        && let Some(on_hover) = &self.on_hover
+                    {
+                        *sent = true;
+                        shell.publish(on_hover(Some(*at)));
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    if state.modifiers.command()
+                        && hit.is_some()
+                        && self.on_definition.is_some() =>
+                {
+                    shell.publish(self.on_definition.as_ref().unwrap()(hit.unwrap()));
+                    shell.capture_event();
+                    return;
+                }
+                Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | Event::Mouse(mouse::Event::CursorLeft)
+                | Event::Window(window::Event::Unfocused) => {
+                    if state.hover.take().is_some()
+                        && let Some(on_hover) = &self.on_hover
+                    {
+                        shell.publish(on_hover(None));
+                    }
+                }
+                _ => {}
+            }
+        }
         let drag = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 if self.on_edit.is_some()
@@ -1873,6 +2060,49 @@ where
         }
 
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
+        for run in internal.editor.buffer().layout_runs() {
+            let first = self
+                .find_matches
+                .partition_point(|(_, end)| end.line < run.line_i);
+            for (index, (start, end)) in self
+                .find_matches
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take_while(|(_, (start, _))| start.line <= run.line_i)
+            {
+                if run.line_i < start.line || run.line_i > end.line {
+                    continue;
+                }
+                let mut color = style.selection;
+                color.a *= if index == self.current_match {
+                    0.55
+                } else {
+                    0.18
+                };
+                for glyph in run.glyphs.iter().filter(|glyph| {
+                    (run.line_i != start.line || glyph.end > start.column)
+                        && (run.line_i != end.line || glyph.start < end.column)
+                }) {
+                    let rect = Rectangle::new(
+                        Point::new(
+                            text_bounds.x + horizontal.x + glyph.x,
+                            text_bounds.y + run.line_top,
+                        ),
+                        Size::new(glyph.w, run.line_height),
+                    );
+                    if let Some(bounds) = text_bounds.intersection(&rect) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                ..Default::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+            }
+        }
         let translation = text_bounds.position() - Point::ORIGIN + horizontal;
         let selection = state.focus.as_ref().map(|_| internal.selection());
         if let Some(Selection::Range(ranges)) = &selection {
@@ -1919,6 +2149,81 @@ where
                 style.value,
                 text_bounds,
             );
+        }
+
+        if !self.diagnostics.is_empty() {
+            use cosmic::iced::advanced::graphics::text::cosmic_text;
+            let theme = cosmic::theme::active();
+            for run in internal.editor.buffer().layout_runs() {
+                for diagnostic in self.diagnostics.iter().filter(|diagnostic| {
+                    diagnostic.start.line <= run.line_i && diagnostic.end.line >= run.line_i
+                }) {
+                    let color = match diagnostic.severity {
+                        crate::lsp::LspSeverity::Error => crate::design::destructive_color(&theme),
+                        crate::lsp::LspSeverity::Warning => crate::design::warning_color(&theme),
+                        crate::lsp::LspSeverity::Information => crate::design::accent_color(&theme),
+                        crate::lsp::LspSeverity::Hint => crate::design::muted_color(&theme),
+                    };
+                    let start = if run.line_i == diagnostic.start.line {
+                        diagnostic.start.column
+                    } else {
+                        0
+                    };
+                    let end = if run.line_i == diagnostic.end.line {
+                        diagnostic.end.column
+                    } else {
+                        run.text.len()
+                    };
+                    let spans = run.highlight(
+                        cosmic_text::Cursor::new(run.line_i, start),
+                        cosmic_text::Cursor::new(run.line_i, end),
+                    );
+                    for (left, width) in spans {
+                        let y = text_bounds.y + run.line_top + run.line_height - 2.0;
+                        let left = left + text_bounds.x + horizontal.x;
+                        let mut x = left.max(text_bounds.x);
+                        let right = (left + width).min(text_bounds.x + text_bounds.width);
+                        let mut raised = false;
+                        while x < right {
+                            let mark = Rectangle::new(
+                                Point::new(x, y + if raised { 0.0 } else { 1.0 }),
+                                Size::new(2.0_f32.min(right - x), 1.0),
+                            );
+                            if let Some(bounds) = text_bounds.intersection(&mark) {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds,
+                                        ..Default::default()
+                                    },
+                                    color,
+                                );
+                            }
+                            x += 2.0;
+                            raised = !raised;
+                        }
+                    }
+                    let dot = Rectangle::new(
+                        Point::new(
+                            bounds.x + 2.0,
+                            text_bounds.y + run.line_top + run.line_height / 2.0 - 2.0,
+                        ),
+                        Size::new(4.0, 4.0),
+                    );
+                    if let Some(bounds) = bounds.intersection(&dot) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                border: Border {
+                                    radius: 2.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+            }
         }
 
         if let (Some(focus), Some(selection)) = (state.focus.as_ref(), selection) {
@@ -2057,11 +2362,151 @@ where
         operation.focusable(self.id.as_ref(), layout.bounds(), state);
     }
 
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut widget::Tree,
+        layout: Layout<'b>,
+        _renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        let internal = self.content.0.borrow();
+        let point = if let Some(at) = self.popup_at {
+            use cosmic::iced::advanced::graphics::text::cosmic_text;
+            internal.editor.buffer().layout_runs().find_map(|run| {
+                if run.line_i != at.line as usize {
+                    return None;
+                }
+                let cursor = cosmic_text::Cursor::new(run.line_i, at.column);
+                run.cursor_position(&cursor)
+                    .map(|x| Point::new(x, run.line_top))
+            })
+        } else {
+            internal.caret_position()
+        }?;
+        let origin = layout.bounds().shrink(self.text_padding()).position();
+        let anchor = origin + Vector::new(point.x + internal.horizontal_translation(), point.y);
+        // Workspace layouts are in content space during the overlay pass;
+        // the camera translation places their anchors in the screen-space viewport.
+        let anchor = anchor + translation;
+        if !viewport.contains(anchor) {
+            return None;
+        }
+        let height = self
+            .line_height
+            .to_absolute(self.text_size.unwrap_or(Pixels(13.0)))
+            .0;
+        let popup = self.popup.as_mut()?;
+        Some(overlay::Element::new(Box::new(EditorPopup {
+            content: popup,
+            tree: &mut tree.children[0],
+            bounds: &mut tree.state.downcast_mut::<State<Highlighter>>().popup_bounds,
+            anchor: Rectangle::new(anchor, Size::new(1.0, height)),
+        })))
+    }
+
     fn id(&self) -> Option<widget::Id> {
         self.id.clone()
     }
     fn set_id(&mut self, id: widget::Id) {
         self.id = Some(id);
+    }
+}
+
+struct EditorPopup<'a, 'b, Message, Theme, Renderer> {
+    content: &'a mut Element<'b, Message, Theme, Renderer>,
+    tree: &'a mut widget::Tree,
+    anchor: Rectangle,
+    bounds: &'a mut Option<Rectangle>,
+}
+
+impl<Message, Theme, Renderer> overlay::Overlay<Message, Theme, Renderer>
+    for EditorPopup<'_, '_, Message, Theme, Renderer>
+where
+    Renderer: cosmic::iced::advanced::Renderer,
+{
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        let node = self.content.as_widget_mut().layout(
+            self.tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, bounds),
+        );
+        let size = node.size();
+        let x = self
+            .anchor
+            .x
+            .clamp(0.0, (bounds.width - size.width).max(0.0));
+        let below = self.anchor.y + self.anchor.height + 4.0;
+        let y = if below + size.height <= bounds.height {
+            below
+        } else {
+            self.anchor.y - size.height - 4.0
+        };
+        let position = Point::new(x, y.clamp(0.0, (bounds.height - size.height).max(0.0)));
+        *self.bounds = Some(Rectangle::new(position, size));
+        node.move_to(position)
+    }
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        self.content.as_widget().draw(
+            self.tree,
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            &layout.bounds(),
+        );
+    }
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        self.content.as_widget_mut().update(
+            self.tree,
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            &layout.bounds(),
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            self.tree,
+            layout,
+            cursor,
+            &layout.bounds(),
+            renderer,
+        )
+    }
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(self.tree, layout, renderer, operation);
     }
 }
 
@@ -2398,6 +2843,24 @@ impl ScrollGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_casefolds_unicode_preserves_whitespace_and_source_offsets() {
+        let content: Content = Content::with_text("Straße\n  café CAFÉ\nİ");
+        assert_eq!(
+            content.find_matches("STRASSE"),
+            vec![(
+                Position { line: 0, column: 0 },
+                Position { line: 0, column: 7 }
+            )]
+        );
+        assert_eq!(content.find_matches(" ").len(), 3);
+        assert_eq!(content.find_matches("CAFÉ").len(), 2);
+        assert!(content.find_matches("").is_empty());
+        // A match must cover a complete original character, even when folding
+        // expands it into more than one scalar.
+        assert!(content.find_matches("i").is_empty());
+    }
 
     #[test]
     fn pointer_drag_and_ime_paste_preserve_unselected_source_and_line_endings() {
@@ -2828,6 +3291,53 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .unwrap()
+    }
+
+    #[test]
+    fn completion_and_hover_overlays_follow_the_scrolled_pane() {
+        let renderer = headless_renderer();
+        let content: Content = Content::with_text("fn main() {}\n");
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(420.0, 300.0));
+        for at in [None, Some(Position { line: 0, column: 3 })] {
+            let mut editor: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(&content)
+                .size(16.0)
+                .height(Length::Fill)
+                .popup(Some(cosmic::widget::text("Native result").into()), at);
+            let mut tree =
+                widget::Tree::new(&editor as &dyn Widget<(), cosmic::Theme, cosmic::Renderer>);
+            let node = editor
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                )
+                .move_to(Point::new(1000.0, 40.0));
+            let mut popup = editor
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::new(-900.0, 0.0),
+                )
+                .expect("the translated pane's visible anchor must retain its popup");
+            let popup_layout = popup.as_overlay_mut().layout(&renderer, viewport.size());
+            assert!(viewport.contains(popup_layout.bounds().position()));
+            assert!(popup_layout.bounds().x >= 100.0);
+            drop(popup);
+            assert!(
+                editor
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &viewport,
+                        Vector::ZERO,
+                    )
+                    .is_none(),
+                "an offscreen pane must not raise a popup"
+            );
+        }
     }
 
     /// The viewport every wheel test lays out and points its cursor into.

@@ -24,7 +24,7 @@ pub(super) fn worktree_directory_available(path: &Path) -> bool {
     }
 }
 
-fn card_directory(card: &CardState) -> Option<&Path> {
+pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
     match &card.kind {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
@@ -328,8 +328,8 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
             .filter_map(|card| {
-                // An explicit filing outranks discovery: it exists precisely
-                // because no root contains this card's launch directory.
+                // An explicit filing outranks directory discovery, including
+                // cloned editors whose descriptors point into nested roots.
                 if let Some(scope) = self.durable.card_scopes.get(&card.id) {
                     return Some((card.id, scope.clone()));
                 }
@@ -630,6 +630,13 @@ impl Cagents {
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
+        if let Some(path) = self
+            .workspace
+            .focused()
+            .and_then(|card| self.terminal_working_directories.get(&card))
+        {
+            return Some(path.clone());
+        }
         if let Some(path) = &self.active_workspace {
             return Some(path.clone());
         }
@@ -1457,6 +1464,7 @@ mod tests {
                 event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
                     offset: 0.0,
                     width: 1_000.0,
+                    user_input: true,
                 }),
             });
         }
@@ -1478,6 +1486,7 @@ mod tests {
             event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
                 offset: 319.0,
                 width: 1_000.0,
+                user_input: true,
             }),
         });
         assert_eq!(app.workspace.camera().offset(), 319.0);
@@ -1642,6 +1651,89 @@ mod tests {
             );
             assert!(app.card_state(retained.id).unwrap().existence.is_open());
         }
+    }
+
+    #[test]
+    fn cloned_and_reopened_nested_editors_keep_their_workspace_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let nested = root.join("src");
+        std::fs::create_dir(&nested).unwrap();
+        let source = repository(nested.to_str().unwrap());
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![source.clone()],
+            focused: Some(source.id),
+            active_worktree: Some(root.clone()),
+            card_scopes: HashMap::from([(source.id, root.clone())]),
+            ..WorkspaceState::default()
+        });
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            root.clone(),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                root.clone(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1_280.0);
+        let _ = app.restore_worktree_scope();
+
+        let _ = app.clone_focused_pane();
+        let cloned = app.workspace.focused().unwrap();
+        assert_ne!(cloned, source.id);
+        assert_eq!(app.worktree_owners[&cloned], root);
+        let _ = app.select_worktree(root.clone(), false);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![source.id, cloned]
+        );
+
+        let _ = app.begin_card_close(cloned);
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, cloned);
+        // The native focus handoff publishes CommitClose after the reserved
+        // pane yields focus. Drive that acknowledgement before reopening.
+        let _ = app.update(Message::CommitClose(cloned));
+        assert!(!app.card_state(cloned).unwrap().existence.is_open());
+        assert!(!app.durable.card_scopes.contains_key(&cloned));
+        let _ = app.run_workspace_command(
+            crate::workspace_widget::GlobalShortcut::ReopenPane,
+            cosmic::iced::keyboard::Modifiers::empty(),
+        );
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, cloned);
+        assert_ne!(reopened, source.id);
+        assert_eq!(app.worktree_owners[&reopened], root);
+        assert_eq!(app.durable.card_scopes[&reopened], root);
+
+        // Reconstruct from the serialized durable state, with empty ownership
+        // caches, using the same startup projection as a fresh application.
+        let saved = serde_json::to_string(app.durable.as_ref()).unwrap();
+        let mut restarted = super::super::tests::context_inspector_test_app(false);
+        restarted.durable = Arc::new(serde_json::from_str(&saved).unwrap());
+        restarted.sidebar_model = app.sidebar_model.clone();
+        restarted.worktree_owners.clear();
+        restarted.workspace = Cagents::rebuild_workspace(&restarted.durable);
+        restarted.workspace.resize_viewport(1_280.0);
+        let _ = restarted.restore_worktree_scope();
+        assert_eq!(
+            restarted.workspace.order().collect::<Vec<_>>(),
+            vec![source.id, reopened]
+        );
+        assert_eq!(restarted.workspace.focused(), Some(reopened));
+        assert_eq!(restarted.worktree_owners[&source.id], root);
+        assert_eq!(restarted.worktree_owners[&reopened], root);
+        assert!(!restarted.workspace.order().any(|id| id == cloned));
     }
 
     #[test]

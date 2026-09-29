@@ -589,10 +589,22 @@ enum ClientCommand {
     Resize(TerminalSize),
     Scroll(TerminalScroll),
     SetTheme(super::TerminalTheme),
+    ClearScrollback,
+    CopySelection {
+        request: uuid::Uuid,
+        selection: super::SearchMatch,
+    },
+    Search {
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    },
     Visibility(TerminalVisibility),
     AcknowledgeOutput(u64),
     Hibernate,
-    Resume { visible: bool },
+    Resume {
+        visible: bool,
+    },
     ShutdownTerminal(Sender<()>),
     Stop,
 }
@@ -608,6 +620,9 @@ impl ClientCommand {
             Self::Resize(_) => "resize terminal",
             Self::Scroll(_) => "scroll terminal",
             Self::SetTheme(_) => "set terminal theme",
+            Self::ClearScrollback => "clear terminal scrollback",
+            Self::CopySelection { .. } => "copy terminal selection",
+            Self::Search { .. } => "search terminal",
             Self::Visibility(_) => "set terminal visibility",
             Self::AcknowledgeOutput(_) => "acknowledge terminal output",
             Self::Hibernate => "hibernate terminal",
@@ -640,6 +655,22 @@ impl ClientCommand {
                 scroll,
             },
             Self::SetTheme(theme) => ClientRequest::SetTheme { terminal_id, theme },
+            Self::ClearScrollback => ClientRequest::ClearTerminalScrollback { terminal_id },
+            Self::CopySelection { request, selection } => ClientRequest::CopyTerminalSelection {
+                terminal_id,
+                request,
+                selection,
+            },
+            Self::Search {
+                request,
+                query,
+                case_sensitive,
+            } => ClientRequest::SearchTerminal {
+                terminal_id,
+                request,
+                query,
+                case_sensitive,
+            },
             Self::Visibility(visibility) => ClientRequest::SetVisibility {
                 terminal_id,
                 visibility,
@@ -930,6 +961,29 @@ impl HostedTerminalHandle {
 
     pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::SetTheme(theme))
+    }
+
+    pub fn search(
+        &self,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::Search {
+            request,
+            query,
+            case_sensitive,
+        })
+    }
+    pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::ClearScrollback)
+    }
+    pub fn copy_selection(
+        &self,
+        request: uuid::Uuid,
+        selection: super::SearchMatch,
+    ) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::CopySelection { request, selection })
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {
@@ -3264,6 +3318,8 @@ mod tests {
             columns: 1,
             rows: 1,
             lines: vec![Arc::new(RowSnapshot {
+                wrapped: false,
+                hyperlinks: Vec::new(),
                 cells: vec![CellSnapshot {
                     text: CellText::new(text),
                     ..CellSnapshot::default()
@@ -3527,6 +3583,8 @@ mod tests {
                 columns: 1,
                 rows: 1,
                 lines: vec![Arc::new(RowSnapshot {
+                    wrapped: false,
+                    hyperlinks: Vec::new(),
                     cells: vec![CellSnapshot {
                         text: CellText::new(text),
                         ..CellSnapshot::default()

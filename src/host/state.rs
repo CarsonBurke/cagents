@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,6 +65,7 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    working_directory: Option<(u64, PathBuf)>,
 }
 
 #[derive(Default)]
@@ -1061,6 +1063,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                working_directory: None,
             },
         );
         let visibility = if initially_visible {
@@ -1124,6 +1127,18 @@ impl HostState {
             ));
         }
         Ok(record.handle.clone())
+    }
+
+    /// Read-only history and presentation remain available after PTY teardown.
+    pub(crate) fn history_handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalHandle, ProtocolError> {
+        Ok(self
+            .attached_terminal(client_id, terminal_id)?
+            .handle
+            .clone())
     }
 
     pub(crate) fn focus_handle(
@@ -1228,7 +1243,25 @@ impl HostState {
             .iter()
             .filter(|(sequence, _)| *sequence > after_sequence)
             .cloned();
-        Ok(title.chain(events).collect())
+        let cwd = record
+            .working_directory
+            .iter()
+            .filter(|(sequence, _)| {
+                *sequence > after_sequence
+                    && record
+                        .events
+                        .front()
+                        .is_none_or(|(first, _)| sequence < first)
+            })
+            .map(|(sequence, path)| {
+                (
+                    *sequence,
+                    WireTerminalEvent::WorkingDirectoryChanged { path: path.clone() },
+                )
+            });
+        let mut replay: Vec<_> = title.chain(cwd).chain(events).collect();
+        replay.sort_by_key(|(sequence, _)| *sequence);
+        Ok(replay)
     }
 
     fn inventory_count(&mut self) -> u64 {
@@ -3257,12 +3290,20 @@ fn start_terminal_view_owned(
     );
     redraw_handle.set_agent_process_observer(move || activity_wake.notify());
     let event_host = Arc::downgrade(shared);
+    let archived_host = Arc::downgrade(shared);
+    redraw_handle.set_archived_event_observer(move |handle, event| {
+        record_event_from(&archived_host, terminal_id, event, Some(handle));
+    });
     let completion_handle = redraw_handle.clone();
     let event_thread = thread::Builder::new()
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
+                let completed = matches!(event, TerminalEvent::Completed { .. });
                 record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
+                if completed {
+                    break;
+                }
             }
             // The final grid is captured after the exit event and may race a
             // reveal queued just as the worker stops accepting commands.
@@ -3294,17 +3335,14 @@ fn apply_visibility(
     handle: &TerminalHandle,
     visibility: TerminalVisibility,
 ) -> Result<(), TerminalSendError> {
-    match visibility {
-        TerminalVisibility::Visible => handle.reveal(),
-        TerminalVisibility::Hidden => handle.hide(),
-        TerminalVisibility::Hibernated => handle.hibernate(),
-    }
-    .or_else(|error| match error {
-        // Visibility is presentation-only. A completed worker retains its
-        // final snapshot and must not require restarting its process to view it.
-        TerminalSendError::Closed => Ok(()),
-        error => Err(error),
-    })
+    handle
+        .set_host_visibility(visibility)
+        .or_else(|error| match error {
+            // Visibility is presentation-only. A completed worker retains its
+            // final snapshot and must not require restarting its process to view it.
+            TerminalSendError::Closed => Ok(()),
+            error => Err(error),
+        })
 }
 
 pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
@@ -3514,6 +3552,10 @@ fn record_event_from(
     let Some(host) = host.upgrade() else {
         return;
     };
+    let recipient = match &event {
+        TerminalEvent::SearchResults { owner, .. } => *owner,
+        _ => None,
+    };
     let wire_event = WireTerminalEvent::from(event);
     let (proof, sequence, deliveries) = {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3533,6 +3575,9 @@ fn record_event_from(
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }
+        if let WireTerminalEvent::WorkingDirectoryChanged { path } = &wire_event {
+            record.working_directory = Some((sequence, path.clone()));
+        }
         if let WireTerminalEvent::Exited {
             exit_code, signal, ..
         } = &wire_event
@@ -3547,12 +3592,18 @@ fn record_event_from(
                 occurred_at_unix_ms: unix_time_ms(),
             });
         }
-        record.events.push_back((sequence, wire_event.clone()));
+        if !matches!(
+            wire_event,
+            WireTerminalEvent::ClipboardText { .. } | WireTerminalEvent::SearchResults { .. }
+        ) {
+            record.events.push_back((sequence, wire_event.clone()));
+        }
         while record.events.len() > EVENT_REPLAY_CAPACITY {
             record.events.pop_front();
         }
         let deliveries = client_ids
             .into_iter()
+            .filter(|client_id| recipient.is_none_or(|owner| owner == *client_id))
             .filter_map(|client_id| state.clients.get(&client_id).cloned())
             .collect::<Vec<_>>();
         (proof, sequence, deliveries)
@@ -5118,6 +5169,166 @@ for line in sys.stdin:
             );
             assert!(!state.shutting_down);
         }
+    }
+
+    #[test]
+    fn completed_terminal_history_routes_queries_after_the_event_forwarder_finishes() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let (first, second) = {
+            let mut state = shared.lock().unwrap();
+            (state.register_client(1), state.register_client(2))
+        };
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf 'retained hit\\r\\n'; exit 0".into()],
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        spawn_terminal(&shared, 1, session, TerminalSpawnOptions::default()).unwrap();
+        let handle = {
+            let mut state = shared.lock().unwrap();
+            state.attach(2, id).unwrap();
+            state.terminals[&id].handle.clone()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed()
+            || !shared.lock().unwrap().terminals[&id]
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, WireTerminalEvent::Completed { .. }))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let mut state = shared.lock().unwrap();
+            assert!(state.surface_handle(1, id).is_err());
+            assert!(state.history_handle(1, id).is_ok());
+            assert!(state.history_handle(3, id).is_err());
+            state
+                .set_visibility(1, id, TerminalVisibility::Hidden)
+                .unwrap();
+            state
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .unwrap();
+        }
+        handle.search_for(Some(2), 9, "hit".into(), true).unwrap();
+        for (delivery, expected) in [(first, 0), (second, 1)] {
+            delivery.close_after_drain();
+            let mut results = 0;
+            while let Some(envelope) = delivery.pop() {
+                if let ServerMessage::Event {
+                    event:
+                        WireTerminalEvent::SearchResults {
+                            request: 9,
+                            matches,
+                            ..
+                        },
+                    ..
+                } = envelope.message
+                {
+                    assert_eq!(matches.len(), 1);
+                    results += 1;
+                }
+            }
+            assert_eq!(results, expected);
+        }
+        assert!(
+            !shared
+                .lock()
+                .unwrap()
+                .replay_events(id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.1, WireTerminalEvent::SearchResults { .. }))
+        );
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn terminal_search_results_are_delivered_only_to_the_requesting_window_and_never_replayed() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            recovery_origin: None,
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let (first, second) = {
+            let mut state = shared.lock().unwrap();
+            let deliveries = (state.register_client(1), state.register_client(2));
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+            state.attach(2, id).unwrap();
+            deliveries
+        };
+        record_event(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::SearchResults {
+                owner: Some(1),
+                request: 1,
+                query: "hit".into(),
+                matches: Vec::new(),
+                truncated: false,
+            },
+        );
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .replay_events(id, 0)
+                .unwrap()
+                .is_empty()
+        );
+        for (delivery, expected) in [(first, 1), (second, 0)] {
+            delivery.close_after_drain();
+            let mut count = 0;
+            while let Some(envelope) = delivery.pop() {
+                if matches!(
+                    envelope.message,
+                    ServerMessage::Event {
+                        event: WireTerminalEvent::SearchResults { request: 1, .. },
+                        ..
+                    }
+                ) {
+                    count += 1;
+                }
+            }
+            assert_eq!(count, expected);
+        }
+        handle.shutdown().unwrap();
     }
 
     #[test]

@@ -65,9 +65,8 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-// Child navigation rows use smaller ink while retaining the shared hit targets.
-const CHILD_ROW_ICON_SIZE: u16 = 14;
-const CHILD_ROW_TEXT_SIZE: f32 = 12.0;
+const CHILD_ROW_ICON_SIZE: u16 = design::ROW_ICON_SIZE;
+const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
 /// Horizontal step between one row slot and the next, and the unit the rest of
@@ -75,9 +74,6 @@ const CHILD_ROW_TEXT_SIZE: f32 = 12.0;
 /// `space_xxxs`, because `row_interaction`'s pointer regions and the rail's
 /// row width are derived from it and neither of those can ask a theme.
 const ROW_GUTTER: f32 = design::GRID_UNIT;
-/// One hierarchy step. A child row's icon slot starts exactly where its
-/// parent's label does, so the tree reads without a guide line.
-const ROW_INDENT: f32 = ROW_ICON_WIDTH + ROW_GUTTER;
 /// The live-indicator slot, reserved whether or not the row has an indicator
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
@@ -625,8 +621,17 @@ impl SidebarProject {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        self.chrome.folded_name.contains(folded_query)
-            || self.chrome.folded_repository.contains(folded_query)
+        self.search_rank(folded_query).is_some()
+    }
+
+    fn search_rank(&self, query: &str) -> Option<usize> {
+        search_score(&self.chrome.folded_name, query).or_else(|| {
+            query
+                .contains('/')
+                .then(|| self.chrome.folded_repository.find(query))
+                .flatten()
+                .map(|position| 10_000 + position)
+        })
     }
 }
 
@@ -728,7 +733,7 @@ impl SidebarWorktree {
             paneless_accessible_name: paneless_name(&accessible_name),
             accessible_name: accessible_name.into_boxed_str(),
             tooltip: format!(
-                "{label} — {} — {path_label} — {status}",
+                "{label}\nBranch: {}\n{path_label}\n{status}",
                 branch.as_deref().unwrap_or("Detached HEAD")
             )
             .into_boxed_str(),
@@ -840,14 +845,26 @@ impl SidebarWorktree {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        if self.chrome.folded_label.contains(folded_query) {
-            return true;
-        }
-        self.chrome
-            .folded_branch
-            .as_deref()
-            .is_some_and(|branch| branch.contains(folded_query))
-            || self.chrome.folded_path.contains(folded_query)
+        self.search_rank(folded_query).is_some()
+    }
+
+    fn search_rank(&self, query: &str) -> Option<usize> {
+        search_score(&self.chrome.folded_label, query)
+            .into_iter()
+            .chain(
+                self.chrome
+                    .folded_branch
+                    .as_deref()
+                    .and_then(|branch| search_score(branch, query)),
+            )
+            .min()
+            .or_else(|| {
+                query
+                    .contains('/')
+                    .then(|| self.chrome.folded_path.find(query))
+                    .flatten()
+                    .map(|position| 10_000 + position)
+            })
     }
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
@@ -935,7 +952,7 @@ impl SidebarWorktree {
         self.chrome.paneless_accessible_name = paneless_name(&accessible_name);
         self.chrome.accessible_name = accessible_name.into_boxed_str();
         self.chrome.tooltip = format!(
-            "{} — {branch} — {} — {status}",
+            "{}\nBranch: {branch}\n{}\n{status}",
             self.chrome.label,
             self.path.display()
         )
@@ -1186,9 +1203,7 @@ enum PullRequestTone {
     Review,
     Merged,
     Danger,
-    Pending,
     Draft,
-    Passing,
     Neutral,
 }
 
@@ -1196,11 +1211,8 @@ fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
     match pr.state {
         Some(WorktreePullRequestState::Merged) => PullRequestTone::Merged,
         Some(WorktreePullRequestState::Closed) => PullRequestTone::Danger,
-        _ if pr.checks == CheckStatus::Failing => PullRequestTone::Danger,
         _ if pr.needs_review => PullRequestTone::Review,
-        _ if pr.checks == CheckStatus::Pending => PullRequestTone::Pending,
         _ if pr.draft => PullRequestTone::Draft,
-        _ if pr.checks == CheckStatus::Passing => PullRequestTone::Passing,
         _ => PullRequestTone::Neutral,
     }
 }
@@ -1213,9 +1225,7 @@ impl PullRequestTone {
             Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
             Self::Review => design::accent_color(theme),
             Self::Danger => cosmic.destructive.base.into(),
-            Self::Pending => cosmic.warning.base.into(),
             Self::Draft => theme.current_container().component.on_disabled.into(),
-            Self::Passing => cosmic.success.base.into(),
             Self::Neutral => theme.current_container().component.on.into(),
         }
     }
@@ -1643,13 +1653,12 @@ impl ChangeGroup {
             stage_all_id: stable_id(format!("panel.group.stage.{key}")),
             unstage_all_id: stable_id(format!("panel.group.unstage.{key}")),
             discard_all_id: stable_id(format!("panel.group.discard.{key}")),
-            stage_all_name: format!("Stage all visible {title}").into_boxed_str(),
-            unstage_all_name: format!("Unstage all visible {title}").into_boxed_str(),
-            discard_all_name: format!("Discard all visible {title}").into_boxed_str(),
+            stage_all_name: format!("Stage all {title}").into_boxed_str(),
+            unstage_all_name: format!("Unstage all {title}").into_boxed_str(),
+            discard_all_name: format!("Discard all {title}").into_boxed_str(),
         };
         let paths = rows
             .iter()
-            .take(MAX_VISIBLE_CHANGE_ROWS)
             .map(|row| row.entry.path.clone())
             .collect::<Vec<_>>();
         let tree = file_rows(&paths);
@@ -1668,21 +1677,20 @@ impl ChangeGroup {
         &self.rows
     }
 
-    /// The rows this group actually renders. "Stage all" and "Unstage all" act
-    /// on exactly these, so the display bound is never a hidden side effect.
+    /// Complete group rows; the view mounts a bounded page of this model.
     pub fn visible(&self) -> &[ChangeRow] {
-        &self.rows[..self.rows.len().min(MAX_VISIBLE_CHANGE_ROWS)]
+        &self.rows
     }
 
     pub fn hidden(&self) -> usize {
-        self.rows.len().saturating_sub(MAX_VISIBLE_CHANGE_ROWS)
+        0
     }
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
-    /// The path selection covering every visible row, rename halves included.
+    /// The path selection covering the entire group, rename halves included.
     pub fn visible_selection(&self) -> Vec<PathSelection> {
         self.visible().iter().map(ChangeRow::selection).collect()
     }
@@ -1794,11 +1802,7 @@ impl BranchChangesModel {
             })
             .collect();
         rows.sort_unstable_by(|left, right| left.entry.path.cmp(&right.entry.path));
-        let paths: Vec<_> = rows
-            .iter()
-            .take(MAX_VISIBLE_CHANGE_ROWS)
-            .map(|row| row.entry.path.clone())
-            .collect();
+        let paths: Vec<_> = rows.iter().map(|row| row.entry.path.clone()).collect();
         Self {
             count_label: tab_count_label(rows.len()),
             base_label: format!("Since branching from {}", comparison.base_ref.short_name())
@@ -2592,6 +2596,7 @@ enum PanelSelection {
     File(RepoPath),
     Change { path: RepoPath, area: ChangeArea },
     Branch(RepoPath),
+    Commit { oid: Oid, path: RepoPath },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2632,6 +2637,23 @@ struct PaneActivity {
 /// Everything here is local to the surface: what is typed, what is open, and
 /// what is selected. Nothing that a Git or GitHub call produced lives here -
 /// those are immutable snapshots on [`SidebarModel`].
+#[derive(Debug, Default)]
+struct CommitComposer(cosmic::iced::widget::text_editor::Content<cosmic::Renderer>);
+
+impl Clone for CommitComposer {
+    fn clone(&self) -> Self {
+        Self(cosmic::iced::widget::text_editor::Content::with_text(
+            &self.0.text(),
+        ))
+    }
+}
+impl PartialEq for CommitComposer {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.text() == other.0.text()
+    }
+}
+impl Eq for CommitComposer {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SidebarState {
     rows: selection::Selection,
@@ -2661,12 +2683,15 @@ pub struct SidebarState {
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
     commit_message: String,
+    commit_composer: CommitComposer,
+    amend_commit: bool,
     /// File-tree folders the user opened. Everything else renders collapsed,
     /// so a fresh worktree shows its top level and loading a whole project
     /// tree stays cheap.
     expanded_directories: BTreeSet<RepoPath>,
     /// Change review starts open; only folders the user folded are stored.
     collapsed_change_directories: BTreeMap<ChangeTreeScope, BTreeSet<RepoPath>>,
+    change_pages: BTreeMap<ChangeTreeScope, usize>,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
     panel_selection: Option<PanelSelection>,
@@ -2882,7 +2907,8 @@ impl SidebarState {
             .map(|selection| match selection {
                 PanelSelection::File(path)
                 | PanelSelection::Branch(path)
-                | PanelSelection::Change { path, .. } => path.as_path(),
+                | PanelSelection::Change { path, .. }
+                | PanelSelection::Commit { path, .. } => path.as_path(),
             });
         if current != path {
             self.panel_selection = path
@@ -2938,6 +2964,8 @@ impl SidebarState {
     /// must not, because the message is the user's work.
     pub fn clear_commit_message(&mut self) {
         self.commit_message.clear();
+        self.commit_composer = CommitComposer::default();
+        self.amend_commit = false;
     }
 
     /// Rebinds the source-control panel after a focus or model change.
@@ -2979,9 +3007,10 @@ impl SidebarState {
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
         self.files_filter_open = false;
-        self.commit_message.clear();
+        self.clear_commit_message();
         self.expanded_directories.clear();
         self.collapsed_change_directories.clear();
+        self.change_pages.clear();
         // Every section is one worktree's change area now, not a view of the
         // panel, so none of their disclosures carry to the next worktree.
         self.toggled_sections.clear();
@@ -3008,6 +3037,10 @@ impl SidebarState {
     /// this changes.
     pub fn section_expanded(&self, section: PanelSection) -> bool {
         self.toggled_sections.contains(&section) != section.expanded_by_default()
+    }
+
+    pub fn project_expanded(&self, project: ProjectId) -> bool {
+        !self.collapsed_projects.contains(&project)
     }
 
     /// Applies only local, pure presentation transitions. Commands such as
@@ -3070,6 +3103,7 @@ impl SidebarState {
                 }
             }
             SidebarAction::ToggleChangeDirectory { scope, path, .. } => {
+                self.change_pages.remove(scope);
                 let collapsed = self.collapsed_change_directories.entry(*scope).or_default();
                 if !collapsed.remove(path) {
                     collapsed.insert(path.clone());
@@ -3087,8 +3121,27 @@ impl SidebarState {
             SidebarAction::OpenBranchFile { path, .. } => {
                 self.panel_selection = Some(PanelSelection::Branch(path.clone()));
             }
+            SidebarAction::OpenCommitFile { oid, path, .. } => {
+                self.panel_selection = Some(PanelSelection::Commit {
+                    oid: oid.clone(),
+                    path: path.clone(),
+                });
+            }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.commit_message.clone_from(message);
+                self.commit_composer = CommitComposer(
+                    cosmic::iced::widget::text_editor::Content::with_text(message),
+                );
+            }
+            SidebarAction::CommitEditorAction { action, .. } => {
+                self.commit_composer.0.perform(action.clone());
+                if action.is_edit() {
+                    self.commit_message = self.commit_composer.0.text();
+                }
+            }
+            SidebarAction::AmendChanged { amend, .. } => self.amend_commit = *amend,
+            SidebarAction::ChangePage { scope, page, .. } => {
+                self.change_pages.insert(*scope, *page);
             }
             SidebarAction::RequestDiscard { key, request } => {
                 self.discard = Some(DiscardConfirmation {
@@ -3142,16 +3195,22 @@ impl SidebarState {
             | SidebarAction::OpenSettings
             | SidebarAction::OpenAutomations
             | SidebarAction::Stage { .. }
+            | SidebarAction::ChangeGroup { .. }
             | SidebarAction::Unstage { .. }
             | SidebarAction::Commit { .. }
             | SidebarAction::OpenCommit { .. }
             | SidebarAction::CloseCommit { .. }
-            | SidebarAction::OpenCommitFile { .. }
             | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
+            | SidebarAction::NavigateRow { .. }
+            | SidebarAction::OpenFirstSearchResult
+            | SidebarAction::FocusFirstSearchResult
+            | SidebarAction::ScrollProjects(_)
+            | SidebarAction::RenameChannel(_)
+            | SidebarAction::MarkChannelRead(_)
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::ClearRowSelection => {}
@@ -3168,6 +3227,13 @@ pub enum FileCommand {
     CopyRelativePath,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeGroupCommand {
+    Stage,
+    Unstage,
+    Discard,
+}
+
 /// All sidebar intents. Payloads are self-contained so `app.rs` does not need
 /// to recover a path or URL from ephemeral row indexes, and every
 /// source-control intent carries the whole [`ActiveWorktreeKey`] so a result
@@ -3176,6 +3242,25 @@ pub enum FileCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    ChangeGroup {
+        key: ActiveWorktreeKey,
+        area: ChangeArea,
+        command: ChangeGroupCommand,
+    },
+    ChangePage {
+        key: ActiveWorktreeKey,
+        scope: ChangeTreeScope,
+        page: usize,
+    },
+    NavigateRow {
+        row: SelectionRow,
+        key: cosmic::iced::keyboard::key::Named,
+    },
+    OpenFirstSearchResult,
+    FocusFirstSearchResult,
+    ScrollProjects(f32),
+    RenameChannel(ChannelId),
+    MarkChannelRead(ChannelId),
     SelectRows {
         row: SelectionRow,
         intent: SelectionIntent,
@@ -3381,9 +3466,18 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         message: String,
     },
+    CommitEditorAction {
+        key: ActiveWorktreeKey,
+        action: cosmic::iced::widget::text_editor::Action,
+    },
+    AmendChanged {
+        key: ActiveWorktreeKey,
+        amend: bool,
+    },
     Commit {
         key: ActiveWorktreeKey,
         message: String,
+        amend: bool,
     },
     Push {
         key: ActiveWorktreeKey,
@@ -3481,6 +3575,42 @@ pub fn view<'a>(
     persisted_width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    view_inner(model, state, mode, persisted_width, modal_open, None)
+}
+
+#[derive(Default)]
+pub struct NavigationCache(std::cell::RefCell<(SidebarModel, SidebarState, u64)>);
+impl NavigationCache {
+    fn generation(&self, model: &SidebarModel, state: &SidebarState) -> u64 {
+        let mut snapshot = self.0.borrow_mut();
+        if &snapshot.0 != model || &snapshot.1 != state {
+            snapshot.0 = model.clone();
+            snapshot.1 = state.clone();
+            snapshot.2 = snapshot.2.wrapping_add(1);
+        }
+        snapshot.2
+    }
+}
+
+pub fn view_cached<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    mode: SidebarMode,
+    persisted_width: f32,
+    modal_open: bool,
+    cache: &'a NavigationCache,
+) -> Element<'a, SidebarAction> {
+    view_inner(model, state, mode, persisted_width, modal_open, Some(cache))
+}
+
+fn view_inner<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    mode: SidebarMode,
+    persisted_width: f32,
+    modal_open: bool,
+    cache: Option<&'a NavigationCache>,
+) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -3502,9 +3632,22 @@ pub fn view<'a>(
     }
 
     content = content.push(
-        widget::container(body(model, state, compact, modal_open))
-            .width(Length::Fill)
-            .height(Length::Fill),
+        widget::container(
+            if let Some(cache) = cache
+                && !model.projects.is_empty()
+                && !matches!(model.data_state, SidebarDataState::Error(_))
+            {
+                cosmic::iced::widget::lazy(
+                    (cache.generation(model, state), compact, modal_open),
+                    move |_| project_list(model, state, compact, modal_open),
+                )
+                .into()
+            } else {
+                body(model, state, compact, modal_open)
+            },
+        )
+        .width(Length::Fill)
+        .height(Length::Fill),
     );
     if !state.rows.is_empty() {
         content = content.push(selection_controls(state, compact, modal_open));
@@ -3818,14 +3961,18 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
 /// this box.
 fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
     let width = Length::Fill;
-    let mut input = widget::text_input::search_input("Search projects", &state.query).width(width);
+    let mut input =
+        widget::text_input::search_input("Search projects, branches, channels", &state.query)
+            .width(width);
     if !modal_open {
-        input = input.on_input(SidebarAction::SearchChanged);
+        input = input
+            .on_input(SidebarAction::SearchChanged)
+            .on_submit(|_| SidebarAction::OpenFirstSearchResult);
         if !state.query.is_empty() {
             input = input.on_clear(SidebarAction::SearchChanged(String::new()));
         }
     }
-    input.id(search_focus_id()).into()
+    RowInteraction::search(input.id(search_focus_id()).into(), !modal_open)
 }
 
 /// Secondary filters live beside the search input. Attention has its own
@@ -3881,7 +4028,7 @@ fn project_list<'a>(
     state: &'a SidebarState,
     compact: bool,
     modal_open: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
         return project_scroll(empty(state, compact, modal_open), state.filter);
@@ -4125,14 +4272,6 @@ impl RowGrid {
         }
     }
 
-    /// Distance from the row's left edge to its leading icon slot.
-    fn indent(self) -> f32 {
-        match self.kind {
-            RowKind::Child if !self.compact => ROW_INDENT,
-            _ => 0.0,
-        }
-    }
-
     fn gutter(self) -> f32 {
         if self.compact { 0.0 } else { ROW_GUTTER }
     }
@@ -4206,7 +4345,10 @@ impl RowGrid {
         selected: bool,
     ) -> button::Button<'a, SidebarAction> {
         button::custom(content)
-            .class(sidebar_button_style(selected))
+            .class(match self.kind {
+                RowKind::Project => row_button_style::<true, false>(selected),
+                RowKind::Child => row_button_style::<true, true>(selected),
+            })
             .selected(selected)
             .padding([0.0, self.gutter()])
             .width(if self.compact {
@@ -4217,23 +4359,12 @@ impl RowGrid {
             .height(Length::Fixed(self.height()))
     }
 
-    /// Places a finished row on the grid at its hierarchy indent.
-    ///
-    /// The indent is padding around the control rather than inside it, so a
-    /// selected row's background still starts at its own column instead of
-    /// spanning the indent strip back to the pane border.
+    /// Navigation rows share the entire list width and the same icon column.
     fn mount<'a>(
         self,
         control: impl Into<Element<'a, SidebarAction>>,
     ) -> Element<'a, SidebarAction> {
-        let row = control.into();
-        let indent = self.indent();
-        if indent == 0.0 {
-            return row;
-        }
-        widget::container(row)
-            .padding(Padding::ZERO.left(indent))
-            .into()
+        control.into()
     }
 }
 
@@ -4274,40 +4405,54 @@ fn project_identity_row<'a>(
     modal_open: bool,
     compact: bool,
     review_mode: bool,
-) -> Element<'a, SidebarAction> {
+    query: &str,
+) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let label = (!compact).then(|| project_name_label(project));
+    let label = (!compact).then(|| project_name_label(project, query));
     let control = grid
         .control(
-            grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
+            grid.content(
+                if compact {
+                    project_icon(project, ROW_ICON_SIZE)
+                } else {
+                    crate::ui_controls::symbolic_icon("project-drag-symbolic")
+                        .icon()
+                        .size(ROW_ICON_SIZE)
+                        .into()
+                },
+                label,
+                None,
+            ),
             selected,
         )
         .id(chrome.open_id.clone())
         .name(if review_mode && project.github_ready {
             Cow::Owned(format!("Browse pull requests in {}", project.name))
         } else if compact {
-            Cow::Borrowed(&*chrome.compact_open_name)
+            Cow::Owned(chrome.compact_open_name.to_string())
         } else {
-            Cow::Borrowed(&*chrome.open_name)
+            Cow::Owned(chrome.open_name.to_string())
         })
         .on_press_maybe(gated(
             if review_mode && project.github_ready {
                 SidebarAction::BrowsePullRequests {
                     project_id: project.id,
                 }
-            } else {
+            } else if project.kind == ProjectKind::Folder {
                 SidebarAction::OpenRepository {
                     project_id: project.id,
                     repository: project.repository.clone(),
                 }
+            } else {
+                SidebarAction::ToggleProject(project.id)
             },
             modal_open,
         ));
-    let tip: Cow<'a, str> = if review_mode && project.github_ready {
+    let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
     } else if compact {
-        Cow::Borrowed(&*chrome.compact_open_name)
+        Cow::Owned(chrome.compact_open_name.to_string())
     } else {
         Cow::Owned(project.repository.display().to_string())
     };
@@ -4316,15 +4461,14 @@ fn project_identity_row<'a>(
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
 /// name cannot change a header's height.
-fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
-    design::heading(project.name.as_str())
-        .class(theme::Text::Default)
-        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-            EllipsizeHeightLimit::Lines(1),
-        ))
-        .width(Length::Fill)
-        .into()
+fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static, SidebarAction> {
+    search_label(
+        &project.name,
+        query,
+        design::TEXT_HEADING,
+        theme::Text::Default,
+        true,
+    )
 }
 
 /// The rows for a project's worktree creations that have no worktree row yet.
@@ -4337,10 +4481,10 @@ fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
 fn operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
-) -> impl Iterator<Item = Element<'a, SidebarAction>> {
+) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
     project.operations.iter().map(move |operation| {
-        let label = design::body(&*operation.label)
+        let label = design::body(operation.label.to_string())
             .class(theme::Text::Custom(design::muted_text))
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -4366,7 +4510,7 @@ fn operation_rows<'a>(
                 .filter(|_| operation.reopenable),
             )
             .width(Length::Fill);
-        let control = crate::interaction::tooltip(control, &*operation.detail);
+        let control = crate::interaction::tooltip(control, operation.detail.to_string());
         let retry = operation.reopenable.then(|| {
             icon_action(
                 "view-refresh-symbolic",
@@ -4394,7 +4538,7 @@ fn operation_rows<'a>(
 fn compact_operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
-) -> impl Iterator<Item = Element<'a, SidebarAction>> {
+) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(true);
     project.operations.iter().map(move |operation| {
         let control = grid
@@ -4404,14 +4548,20 @@ fn compact_operation_rows<'a>(
             )
             .name(operation_accessible_name(operation))
             .on_press_maybe(gated_operation_action(operation, modal_open));
-        grid.mount(crate::interaction::tooltip(control, &*operation.detail))
+        grid.mount(crate::interaction::tooltip(
+            control,
+            operation.detail.to_string(),
+        ))
     })
 }
 
 /// The leading glyph: the worktree icon the row will keep, muted, while the
 /// creation runs; a warning once it has failed. The rail has no status slot,
 /// so there the spinner takes the glyph's place.
-fn operation_icon<'a>(phase: WorktreeOperationPhase, compact: bool) -> Element<'a, SidebarAction> {
+fn operation_icon<'a>(
+    phase: WorktreeOperationPhase,
+    compact: bool,
+) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working if compact => crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -4431,7 +4581,7 @@ fn operation_icon<'a>(phase: WorktreeOperationPhase, compact: bool) -> Element<'
     }
 }
 
-fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'a, SidebarAction>> {
+fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
     match phase {
         WorktreeOperationPhase::Working => Some(crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -4464,7 +4614,7 @@ fn gated_operation_action(
 fn operation_control<'a>(
     operation: &'a WorktreeOperationRow,
     modal_open: bool,
-) -> Option<Element<'a, SidebarAction>> {
+) -> Option<Element<'static, SidebarAction>> {
     let action = gated_operation_action(operation, modal_open)?;
     let (icon_name, label) = if operation.cancellable {
         (
@@ -4525,7 +4675,7 @@ fn unreachable_project<'a>(
     compact: bool,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let reload = (!project.reloading)
@@ -4556,7 +4706,7 @@ fn unreachable_project<'a>(
         .control(
             grid.content(
                 toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
-                (!compact).then(|| project_name_label(project)),
+                (!compact).then(|| project_name_label(project, &state.query)),
                 None,
             ),
             false,
@@ -4621,7 +4771,7 @@ fn project_view<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
@@ -4641,7 +4791,7 @@ fn project_view<'a>(
         selection
     };
     if compact {
-        return compact_project(project, selection, modal_open, sticky_viewport);
+        return compact_project(project, expanded, selection, modal_open, sticky_viewport);
     }
 
     let worktree_count = project.worktrees.len();
@@ -4652,9 +4802,10 @@ fn project_view<'a>(
         modal_open,
         false,
         project.state.filter == SidebarFilter::PullRequests,
+        &project.state.query,
     );
 
-    let disclosure: Element<'a, SidebarAction> = if has_children {
+    let disclosure: Element<'static, SidebarAction> = if has_children {
         icon_action(
             if expanded {
                 "go-down-symbolic"
@@ -4662,9 +4813,9 @@ fn project_view<'a>(
                 "go-next-symbolic"
             },
             if expanded {
-                &*chrome.collapse_name
+                chrome.collapse_name.to_string()
             } else {
-                &*chrome.expand_name
+                chrome.expand_name.to_string()
             },
             gated(SidebarAction::ToggleProject(project_id), modal_open),
             chrome.toggle_id.clone(),
@@ -4677,7 +4828,7 @@ fn project_view<'a>(
     };
     let add_worktree = icon_action(
         "worktree-add-symbolic",
-        &*chrome.new_worktree_name,
+        chrome.new_worktree_name.to_string(),
         gated(
             SidebarAction::NewWorktree {
                 project_id,
@@ -4689,16 +4840,48 @@ fn project_view<'a>(
     );
     let add_channel = icon_action(
         "channel-add-symbolic",
-        &*chrome.new_channel_name,
+        chrome.new_channel_name.to_string(),
         gated(SidebarAction::NewChannel { project_id }, modal_open),
         chrome.new_channel_id.clone(),
     );
+    let mut identity = widget::row::with_children(vec![project_identity])
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    if !expanded {
+        let activity = entity
+            .channels
+            .iter()
+            .filter_map(|channel| channel.activity)
+            .chain(
+                entity
+                    .worktrees
+                    .iter()
+                    .filter_map(|worktree| project.state.agent_activity(project_id, worktree.id)),
+            )
+            .max_by_key(|activity| match activity {
+                crate::agent::ActivityState::Waiting => 2,
+                crate::agent::ActivityState::Working => 1,
+                _ => 0,
+            });
+        let unread = entity.channels.iter().any(|channel| channel.unread)
+            || entity
+                .worktrees
+                .iter()
+                .any(|worktree| project.state.has_agent_update(project_id, worktree.id));
+        if let Some(indicator) = agent_indicator(activity, unread) {
+            identity = identity.push(indicator);
+        }
+        identity = identity.push(design::caption(
+            (entity.channels.len() + entity.worktrees.len()).to_string(),
+        ));
+    }
+    identity = identity.push(disclosure);
     let header = project_header_row(
-        project_identity,
+        identity.into(),
         if entity.kind == ProjectKind::Git {
-            vec![disclosure, add_channel, add_worktree]
+            vec![add_channel, add_worktree]
         } else {
-            vec![disclosure, add_channel]
+            vec![add_channel]
         },
     );
     let header = context_controls(
@@ -4736,6 +4919,7 @@ fn project_view<'a>(
                         .state
                         .rows
                         .group_size(SelectionRow::Channel(channel.id)),
+                    &project.state.query,
                 ),
                 SelectionRow::Channel(channel.id),
                 project.state,
@@ -4761,6 +4945,7 @@ fn project_view<'a>(
                         .state
                         .rows
                         .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                    &project.state.query,
                 ),
                 SelectionRow::Worktree(project_id, worktree.id),
                 project.state,
@@ -4780,12 +4965,12 @@ pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
 
 fn compact_project<'a>(
     project: &FilteredProject<'a>,
+    expanded: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let entity = project.project;
-    let chrome = &entity.chrome;
     let selected = matches!(
         selection,
         Some(SidebarSelection::Project(project_id))
@@ -4800,6 +4985,7 @@ fn compact_project<'a>(
             modal_open,
             true,
             project.state.filter == SidebarFilter::PullRequests,
+            &project.state.query,
         ),
         entity.id,
         None,
@@ -4830,7 +5016,14 @@ fn compact_project<'a>(
     for row in compact_operation_rows(entity, modal_open) {
         column = column.push(row);
     }
-    for channel in &project.channels {
+    for channel in project.channels.iter().filter(|channel| {
+        expanded
+            && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
+                || channel.selected
+                || channel.unread
+                || channel.activity.is_some()
+                || channel.deletion.is_some())
+    }) {
         column = column.push(RowInteraction::selectable(
             channel_view(
                 channel,
@@ -4840,13 +5033,29 @@ fn compact_project<'a>(
                     .state
                     .rows
                     .group_size(SelectionRow::Channel(channel.id)),
+                &project.state.query,
             ),
             SelectionRow::Channel(channel.id),
             project.state,
             !modal_open && channel.deletion != Some(RowDeletion::Deleting),
         ));
     }
-    for &worktree in &project.worktrees {
+    for &worktree in project.worktrees.iter().filter(|worktree| {
+        expanded
+            && ((!project.state.query.trim().is_empty() && project.state.controls_expanded)
+                || selection
+                    == Some(SidebarSelection::Worktree {
+                        project_id: entity.id,
+                        worktree_id: worktree.id,
+                    })
+                || project.state.has_agent_update(entity.id, worktree.id)
+                || project.state.worktree_has_panes(entity.id, worktree.id)
+                || worktree.deletion.is_some()
+                || project
+                    .state
+                    .agent_activity(entity.id, worktree.id)
+                    .is_some())
+    }) {
         column = column.push(RowInteraction::selectable(
             worktree_view(
                 entity.id,
@@ -4865,35 +5074,11 @@ fn compact_project<'a>(
                     .state
                     .rows
                     .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                &project.state.query,
             ),
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
             !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
-        ));
-    }
-    column = column.push(new_row_action(
-        "channel-add-symbolic",
-        &*chrome.new_channel_name,
-        gated(
-            SidebarAction::NewChannel {
-                project_id: entity.id,
-            },
-            modal_open,
-        ),
-        chrome.new_channel_id.clone(),
-    ));
-    if entity.kind == ProjectKind::Git {
-        column = column.push(new_row_action(
-            "worktree-add-symbolic",
-            &*chrome.new_worktree_name,
-            gated(
-                SidebarAction::NewWorktree {
-                    project_id: entity.id,
-                    repository: entity.repository.clone(),
-                },
-                modal_open,
-            ),
-            chrome.new_worktree_id.clone(),
         ));
     }
     widget::container(RowInteraction::group(
@@ -5002,8 +5187,25 @@ fn worktree_glyph_tone(
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarAction>> {
-    if channel.activity == Some(crate::agent::ActivityState::Working) {
+fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'static, SidebarAction>> {
+    agent_indicator(channel.activity, channel.unread)
+        .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
+}
+
+/// Waiting is a live state, independent of whether its notification was read.
+/// Channels and worktrees share the same vocabulary and priority.
+fn agent_indicator<'a>(
+    activity: Option<crate::agent::ActivityState>,
+    unread: bool,
+) -> Option<Element<'static, SidebarAction>> {
+    if activity == Some(crate::agent::ActivityState::Waiting) {
+        return Some(status_icon(
+            "agent-waiting-symbolic",
+            "An agent is waiting for input",
+            BadgeTone::Warning,
+        ));
+    }
+    if activity == Some(crate::agent::ActivityState::Working) {
         return Some(crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
@@ -5012,21 +5214,19 @@ fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarActi
             "An agent is actively working",
         ));
     }
-    if channel.unread {
+    if unread {
         return Some(status_icon(
             "agent-waiting-symbolic",
-            "Channel needs attention",
+            "Unread agent update",
             BadgeTone::Neutral,
         ));
     }
-    // A channel holds conversations rather than being one, and the count is
-    // the only thing on the row that says so.
-    (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into())
+    None
 }
 
 /// A deletion under way takes the reserved slot: it is the one live thing
 /// about the row, and outranks whatever the row was doing before.
-fn deleting_indicator<'a>() -> Element<'a, SidebarAction> {
+fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
     crate::interaction::tooltip(
         crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -5039,8 +5239,12 @@ fn deleting_indicator<'a>() -> Element<'a, SidebarAction> {
 /// A failed deletion is a fact about the row until it is retried, so it is a
 /// badge after the reserved slot and leaves live activity where it was. The
 /// rail has room for nothing after the slot, so there it takes the slot.
-fn deletion_failed_badge(reason: &str) -> Element<'_, SidebarAction> {
-    status_icon("dialog-warning-symbolic", reason, BadgeTone::Warning)
+fn deletion_failed_badge(reason: &str) -> Element<'static, SidebarAction> {
+    status_icon(
+        "dialog-warning-symbolic",
+        reason.to_owned(),
+        BadgeTone::Warning,
+    )
 }
 
 /// A row being deleted reads as muted as a creation's row does, glyph and
@@ -5055,13 +5259,13 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
 
 /// Mounts a row with the trailing retry a failed deletion offers.
 fn with_deletion_retry<'a>(
-    row: Element<'a, SidebarAction>,
+    row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
     label: &str,
     retry: Option<SidebarAction>,
     id: Id,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     if compact || !matches!(deletion, Some(RowDeletion::Failed(_))) {
         return row;
     }
@@ -5079,11 +5283,11 @@ fn with_deletion_retry<'a>(
 
 /// A row's accessible name with the deletion it is part of.
 fn with_deletion_name<'a>(
-    name: Cow<'a, str>,
+    name: Cow<'static, str>,
     kind: &str,
     label: &str,
     deletion: Option<&RowDeletion>,
-) -> Cow<'a, str> {
+) -> Cow<'static, str> {
     match deletion {
         None => name,
         Some(RowDeletion::Deleting) => Cow::Owned(format!("Deleting {kind} {label}")),
@@ -5098,7 +5302,8 @@ fn channel_view(
     modal_open: bool,
     compact: bool,
     selection_count: Option<usize>,
-) -> Element<'_, SidebarAction> {
+    query: &str,
+) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
@@ -5114,15 +5319,13 @@ fn channel_view(
         }
     }));
     let label = (!compact).then(|| {
-        design::body(&channel.title)
-            .size(CHILD_ROW_TEXT_SIZE)
-            .class(channel_ink(channel).text_class())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into()
+        search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            channel_ink(channel).text_class(),
+            false,
+        )
     });
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
@@ -5146,7 +5349,7 @@ fn channel_view(
         .control(content, channel.selected)
         .id(channel.open_id.clone())
         .name(with_deletion_name(
-            Cow::Borrowed(&*channel.accessible_name),
+            Cow::Owned(channel.accessible_name.to_string()),
             "channel",
             &channel.title,
             deletion,
@@ -5158,7 +5361,7 @@ fn channel_view(
             inert,
         ));
     let action = row_quick_delete(
-        crate::interaction::tooltip(action, &*channel.tooltip),
+        crate::interaction::tooltip(action, channel.tooltip.to_string()),
         &channel.delete_name,
         gated(
             SidebarAction::DeleteChannel {
@@ -5188,12 +5391,12 @@ fn channel_view(
 /// The compact rail reuses its indicator slot while hovered; an expanded row
 /// reserves the button width so the label continues to ellipsize correctly.
 fn row_quick_delete<'a>(
-    content: Element<'a, SidebarAction>,
-    label: &'a str,
+    content: Element<'static, SidebarAction>,
+    label: &str,
     action: Option<SidebarAction>,
     id: Id,
     compact: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let width = if compact {
         ROW_STATUS_WIDTH
     } else {
@@ -5202,13 +5405,13 @@ fn row_quick_delete<'a>(
     let control = button::icon(crate::ui_controls::symbolic_icon("edit-delete-symbolic"))
         .class(sidebar_button_style(false))
         .id(id)
-        .name(label)
+        .name(label.to_owned())
         .width(width)
         .height(WORKTREE_ROW_HEIGHT)
         .padding(0)
         .on_press_maybe(action);
     let controls = widget::container(
-        widget::container(crate::interaction::tooltip(control, label))
+        widget::container(crate::interaction::tooltip(control, label.to_owned()))
             .class(theme::Container::Primary)
             .width(width)
             .height(WORKTREE_ROW_HEIGHT),
@@ -5224,27 +5427,47 @@ fn row_quick_delete<'a>(
 /// deleting one is destructive and the entry says so with an ellipsis: the
 /// application answers it with a confirmation rather than a removal.
 fn channel_context_controls<'a>(
-    content: impl Into<Element<'a, SidebarAction>>,
+    content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
     selection_count: Option<usize>,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
-        items(
-            &std::collections::HashMap::new(),
-            vec![Item::Button(
-                match selection_count {
-                    Some(count) if count > 1 => format!(
-                        "{}…",
-                        SelectionRow::Channel(channel_id).deletion_label(count)
-                    ),
-                    _ => "Delete channel…".to_owned(),
-                },
-                None,
-                ChannelContextCommand(channel_id, selection_count.unwrap_or(1) > 1),
-            )],
-        )
+        let mut entries = vec![Item::Button(
+            match selection_count {
+                Some(count) if count > 1 => format!(
+                    "{}…",
+                    SelectionRow::Channel(channel_id).deletion_label(count)
+                ),
+                _ => "Delete channel…".to_owned(),
+            },
+            None,
+            ChannelContextCommand(
+                channel_id,
+                selection_count.unwrap_or(1) > 1,
+                ChannelMenuCommand::Delete,
+            ),
+        )];
+        if selection_count == Some(1) {
+            entries.insert(
+                0,
+                Item::Button(
+                    "Rename channel…".into(),
+                    None,
+                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
+                ),
+            );
+            entries.insert(
+                1,
+                Item::Button(
+                    "Mark as read".into(),
+                    None,
+                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::MarkRead),
+                ),
+            );
+        }
+        items(&std::collections::HashMap::new(), entries)
     }) else {
         return content.into();
     };
@@ -5252,12 +5475,24 @@ fn channel_context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChannelContextCommand(ChannelId, bool);
+struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelMenuCommand {
+    Delete,
+    Rename,
+    MarkRead,
+}
 
 impl widget::menu::Action for ChannelContextCommand {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
+        match self.2 {
+            ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
+            ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
+            ChannelMenuCommand::Delete => {}
+        }
         if self.1 {
             SidebarAction::DeleteSelectedRows
         } else {
@@ -5271,11 +5506,11 @@ fn worktree_accessible_name(
     unread: bool,
     activity: Option<crate::agent::ActivityState>,
     has_panes: bool,
-) -> Cow<'_, str> {
-    let mut name = Cow::Borrowed(if has_panes {
-        &*worktree.chrome.accessible_name
+) -> Cow<'static, str> {
+    let mut name: Cow<'static, str> = Cow::Owned(if has_panes {
+        worktree.chrome.accessible_name.to_string()
     } else {
-        &*worktree.chrome.paneless_accessible_name
+        worktree.chrome.paneless_accessible_name.to_string()
     });
     if unread {
         name.to_mut().push_str(", unread agent update");
@@ -5322,35 +5557,29 @@ fn worktree_indicator(
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
     compact: bool,
-) -> Option<Element<'_, SidebarAction>> {
+) -> Option<Element<'static, SidebarAction>> {
     let indicators = worktree_indicators(worktree);
-    let working = activity == Some(crate::agent::ActivityState::Working);
-    let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting) && agent_update;
+    if let Some(indicator) = agent_indicator(activity, agent_update) {
+        return Some(indicator);
+    }
     let checks = indicators.pending_checks;
-    if working || (compact && !waiting_unread && checks) {
+    if compact && checks {
         return Some(crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
                 design::warning_color,
             ),
-            if working {
-                "An agent is actively working"
-            } else {
-                "CI checks pending or running"
-            },
-        ));
-    }
-    if waiting_unread {
-        return Some(status_icon(
-            "agent-waiting-symbolic",
-            "An agent needs input",
-            BadgeTone::Danger,
+            "CI checks pending or running",
         ));
     }
     if compact {
-        return indicators
-            .dirty
-            .map(|label| status_icon("document-edit-symbolic", label, BadgeTone::Warning));
+        return indicators.dirty.map(|label| {
+            status_icon(
+                "document-edit-symbolic",
+                label.to_owned(),
+                BadgeTone::Warning,
+            )
+        });
     }
     None
 }
@@ -5369,21 +5598,20 @@ fn worktree_view<'a>(
     has_panes: bool,
     compact: bool,
     selection_count: Option<usize>,
-) -> Element<'a, SidebarAction> {
+    query: &str,
+) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let label = (!compact).then(|| {
-        design::body(&*chrome.label)
-            .size(CHILD_ROW_TEXT_SIZE)
-            .class(deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into()
+        search_label(
+            &chrome.label,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class(),
+            false,
+        )
     });
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
@@ -5400,7 +5628,7 @@ fn worktree_view<'a>(
             }))
             .into()
     } else {
-        worktree_status_icon(worktree, agent_update, has_panes)
+        worktree_status_icon(worktree, false, has_panes || agent_update)
     };
     let mut content = grid.content(glyph, label, indicator);
     if !compact {
@@ -5421,7 +5649,7 @@ fn worktree_view<'a>(
         if let Some(label) = indicators.dirty {
             content = content.push(status_icon(
                 "document-edit-symbolic",
-                label,
+                label.to_owned(),
                 BadgeTone::Warning,
             ));
         }
@@ -5441,8 +5669,13 @@ fn worktree_view<'a>(
                 )
             })
         })));
-        if indicators.pending_checks && activity != Some(crate::agent::ActivityState::Working) {
-            content = content.push(check_indicator(CheckStatus::Pending));
+        if let Some(pr) = indicators.pull_request
+            && matches!(
+                pr.checks,
+                CheckStatus::Failing | CheckStatus::Pending | CheckStatus::Passing
+            )
+        {
+            content = content.push(check_indicator(pr.checks));
         }
         if primary {
             content = content.push(status_icon(
@@ -5496,12 +5729,12 @@ fn worktree_view<'a>(
             worktree_primary_action(project_id, worktree, review_mode),
             inert,
         ));
-    let action: Element<'a, SidebarAction> = if compact {
+    let action: Element<'static, SidebarAction> = if compact {
         action.into()
     } else {
         crate::interaction::hover(action)
     };
-    let action = crate::interaction::tooltip(action, &*chrome.tooltip);
+    let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
     let action = if !primary
         && worktree
             .pull_request()
@@ -5569,7 +5802,7 @@ fn worktree_primary_action(
     }
 }
 
-fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarAction> {
+fn project_icon(project: &SidebarProject, size: u16) -> Element<'static, SidebarAction> {
     match &project.avatar {
         Some(handle) => cosmic::iced::widget::image(handle.clone())
             .width(size)
@@ -5592,8 +5825,15 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectCommand {
+    CopyPath,
+    CopyBranch,
+    PullRequest,
+    NewWorktreeFromBranch,
+    MoveUp,
+    MoveDown,
     Reveal,
     NewTerminal,
+    NewChannel,
     NewWorktree,
     RepositoryUrl,
     OpenEditor(String),
@@ -5626,17 +5866,43 @@ fn context_controls<'a>(
     modal_open: bool,
     git: bool,
     github_ready: bool,
-    editors: &'a [SidebarEditor],
+    editors: &[SidebarEditor],
     selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let menu = (!modal_open && selection_count.is_some()).then(|| {
+    let editors = editors.to_vec();
+    if modal_open || selection_count.is_none() {
+        return content.into();
+    }
+    crate::interaction::context_menu_lazy(content, move || {
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
+            ("New thread".to_owned(), None, ProjectCommand::NewChannel),
         ];
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
+        }
+        if worktree_id.is_some() {
+            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
+            if git {
+                commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
+                commands.push((
+                    "New worktree from this branch…".into(),
+                    None,
+                    ProjectCommand::NewWorktreeFromBranch,
+                ));
+                if github_ready {
+                    commands.push((
+                        "Open or create pull request…".into(),
+                        None,
+                        ProjectCommand::PullRequest,
+                    ));
+                }
+            }
+        } else {
+            commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
+            commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
         }
         commands.extend(editors.iter().map(|editor| {
             (
@@ -5688,11 +5954,7 @@ fn context_controls<'a>(
             })
             .collect();
         items(&std::collections::HashMap::new(), entries)
-    });
-    match menu {
-        Some(menu) => crate::interaction::context_menu(content, menu),
-        None => content.into(),
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5821,7 +6083,7 @@ fn worktree_status_icon(
     worktree: &SidebarWorktree,
     update: bool,
     has_panes: bool,
-) -> Element<'_, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let (handle, pull_request) = worktree
         .chrome
         .pull_request
@@ -6405,7 +6667,7 @@ fn source_control_panel<'a>(
     let body = match tab {
         ChangesTab::Changes => changes_section(state, source, modal_open),
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
-        ChangesTab::History => history_section(source, modal_open),
+        ChangesTab::History => history_section(state, source, modal_open),
     };
     // Committing is the panel's terminal action, so it sits at the panel's
     // bottom edge rather than after however many change rows the scroll
@@ -6422,7 +6684,7 @@ fn source_control_panel<'a>(
         header,
         tabs,
         notices.into(),
-        Some(
+        Some(crate::interaction::keyboard_list(
             widget::scrollable(
                 widget::container(body)
                     .padding(design::with_vertical_rail(Padding::from([
@@ -6434,9 +6696,9 @@ fn source_control_panel<'a>(
             .direction(sidebar_scroll_direction())
             .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        ),
+            .height(Length::Fill),
+            !modal_open,
+        )),
         footer,
     )
 }
@@ -6932,34 +7194,95 @@ fn visible_file_rows<'a>(
 
 /// Change trees start expanded. A folded directory hides its descendants
 /// without walking a second copy of the tree or allocating hidden rows.
+#[cfg(test)]
 fn visible_change_rows<'a>(
     rows: &'a [FileRow],
     collapsed: Option<&BTreeSet<RepoPath>>,
     flat: bool,
 ) -> (Vec<&'a FileRow>, usize) {
-    if flat {
-        return visible_file_rows(rows, &BTreeSet::new(), "", true, true);
-    }
-    let mut visible = Vec::with_capacity(rows.len().min(MAX_VISIBLE_FILE_ROWS));
-    let mut hidden = 0;
+    change_row_page(rows, collapsed, flat, 0)
+}
+
+/// Mount one bounded page, while retaining the complete change model.
+fn change_row_page<'a>(
+    rows: &'a [FileRow],
+    collapsed: Option<&BTreeSet<RepoPath>>,
+    flat: bool,
+    page: usize,
+) -> (Vec<&'a FileRow>, usize) {
+    let mut visible = Vec::with_capacity(rows.len().min(MAX_VISIBLE_CHANGE_ROWS));
+    let mut count = 0;
     let mut skip_below = None;
     for row in rows {
+        if flat && row.directory {
+            continue;
+        }
         if let Some(depth) = skip_below {
             if row.depth > depth {
                 continue;
             }
             skip_below = None;
         }
-        if visible.len() < MAX_VISIBLE_FILE_ROWS {
+        if count >= page.saturating_mul(MAX_VISIBLE_CHANGE_ROWS)
+            && visible.len() < MAX_VISIBLE_CHANGE_ROWS
+        {
             visible.push(row);
-        } else {
-            hidden += 1;
         }
-        if row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) {
+        count += 1;
+        if !flat && row.directory && collapsed.is_some_and(|paths| paths.contains(&row.path)) {
             skip_below = Some(row.depth);
         }
     }
-    (visible, hidden)
+    if visible.is_empty() && count > 0 && page > 0 {
+        return change_row_page(rows, collapsed, flat, (count - 1) / MAX_VISIBLE_CHANGE_ROWS);
+    }
+    (visible, count)
+}
+
+fn change_pager<'a>(
+    state: &SidebarState,
+    key: &ActiveWorktreeKey,
+    scope: ChangeTreeScope,
+    total: usize,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    if total <= MAX_VISIBLE_CHANGE_ROWS {
+        return cosmic::iced::widget::Space::new().height(0).into();
+    }
+    let last = total.saturating_sub(1) / MAX_VISIBLE_CHANGE_ROWS;
+    let page = state
+        .change_pages
+        .get(&scope)
+        .copied()
+        .unwrap_or(0)
+        .min(last);
+    let action = |target| {
+        gated(
+            SidebarAction::ChangePage {
+                key: key.clone(),
+                scope,
+                page: target,
+            },
+            modal_open,
+        )
+    };
+    widget::row::with_children(vec![
+        button::standard("Previous")
+            .on_press_maybe((page > 0).then(|| action(page - 1)).flatten())
+            .into(),
+        design::caption(format!(
+            "{}–{} of {total}",
+            page * MAX_VISIBLE_CHANGE_ROWS + 1,
+            ((page + 1) * MAX_VISIBLE_CHANGE_ROWS).min(total)
+        ))
+        .into(),
+        button::standard("Next")
+            .on_press_maybe((page < last).then(|| action(page + 1)).flatten())
+            .into(),
+    ])
+    .spacing(design::GRID_UNIT)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// The tree/flat switch for a list of changed files, as one action that
@@ -7016,22 +7339,9 @@ fn changes_section<'a>(
         let section = PanelSection::for_area(group.area);
         let expanded = state.section_expanded(section);
         let actions = expanded.then(|| {
-            // Folding is presentation only: bulk commands still cover the
-            // capped change set, including paths inside folded folders.
-            let (tree, _) = visible_file_rows(
-                &group.tree,
-                &state.expanded_directories,
-                "",
-                state.change_list_mode == FileListMode::Flat,
-                true,
-            );
-            let visible: Vec<_> = tree
-                .iter()
-                .filter(|row| !row.directory)
-                .filter_map(|file| group.visible_path(&file.path))
-                .collect();
+            // Bulk commands materialize the complete group when activated.
             widget::container(widget::row::with_children(
-                group_commands(source, group, &visible, modal_open)
+                group_commands(source, group, modal_open)
                     .into_iter()
                     .map(IconCommand::into_element),
             ))
@@ -7137,7 +7447,12 @@ fn branch_changes_section<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Branch;
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, hidden) = visible_change_rows(&branch.tree, collapsed, flat);
+    let (tree, total) = change_row_page(
+        &branch.tree,
+        collapsed,
+        flat,
+        state.change_pages.get(&scope).copied().unwrap_or(0),
+    );
     let mut rows = Vec::with_capacity(tree.len());
     for file in tree {
         if file.directory {
@@ -7207,11 +7522,8 @@ fn branch_changes_section<'a>(
         ) });
     }
     column = column.push(crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT));
-    let hidden = hidden + branch.rows.len().saturating_sub(MAX_VISIBLE_CHANGE_ROWS);
     column
-        .push(slot((hidden > 0).then(|| {
-            design::caption(format!("{hidden} more branch rows not shown")).into()
-        })))
+        .push(change_pager(state, &source.key, scope, total, modal_open))
         .into()
 }
 
@@ -7224,7 +7536,12 @@ fn change_group_view<'a>(
     let flat = state.change_list_mode == FileListMode::Flat;
     let scope = ChangeTreeScope::Area(group.area);
     let collapsed = state.collapsed_change_directories.get(&scope);
-    let (tree, tree_hidden) = visible_change_rows(&group.tree, collapsed, flat);
+    let (tree, total) = change_row_page(
+        &group.tree,
+        collapsed,
+        flat,
+        state.change_pages.get(&scope).copied().unwrap_or(0),
+    );
     // The disclosure header above this view already carries the group's name,
     // its count, and its commands; the body is only the rows.
     let mut rows = Vec::with_capacity(tree.len());
@@ -7272,15 +7589,10 @@ fn change_group_view<'a>(
             });
         }
     }
-    let hidden = group.hidden() + tree_hidden;
     let mut column =
         widget::column::with_children(vec![crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT)])
             .spacing(0);
-    if hidden > 0 {
-        column = column.push(design::caption(format!(
-            "{hidden} more rows not shown; group actions apply only to visible files"
-        )));
-    }
+    column = column.push(change_pager(state, &source.key, scope, total, modal_open));
     column.into()
 }
 
@@ -7475,12 +7787,11 @@ impl<'a> IconCommand<'a> {
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
-    visible: &[&ChangeRow],
     modal_open: bool,
 ) -> Vec<IconCommand<'a>> {
     let key = &source.key;
     let chrome = &group.chrome;
-    if source.busy() || visible.is_empty() {
+    if source.busy() || group.is_empty() {
         return Vec::new();
     }
     let mut commands = Vec::with_capacity(2);
@@ -7489,9 +7800,10 @@ fn group_commands<'a>(
             icon: "list-remove-symbolic",
             name: &chrome.unstage_all_name,
             action: gated(
-                SidebarAction::Unstage {
+                SidebarAction::ChangeGroup {
                     key: key.clone(),
-                    selection: visible.iter().map(|row| row.selection()).collect(),
+                    area: group.area,
+                    command: ChangeGroupCommand::Unstage,
                 },
                 modal_open,
             ),
@@ -7502,9 +7814,10 @@ fn group_commands<'a>(
             icon: "list-add-symbolic",
             name: &chrome.stage_all_name,
             action: gated(
-                SidebarAction::Stage {
+                SidebarAction::ChangeGroup {
                     key: key.clone(),
-                    selection: visible.iter().map(|row| row.selection()).collect(),
+                    area: group.area,
+                    command: ChangeGroupCommand::Stage,
                 },
                 modal_open,
             ),
@@ -7516,14 +7829,10 @@ fn group_commands<'a>(
             icon: "edit-undo-symbolic",
             name: &chrome.discard_all_name,
             action: gated(
-                SidebarAction::RequestDiscard {
+                SidebarAction::ChangeGroup {
                     key: key.clone(),
-                    request: discard_request(
-                        key,
-                        group.area,
-                        visible.iter().map(|row| row.selection()).collect(),
-                        group,
-                    ),
+                    area: group.area,
+                    command: ChangeGroupCommand::Discard,
                 },
                 modal_open,
             ),
@@ -7531,6 +7840,46 @@ fn group_commands<'a>(
         });
     }
     commands
+}
+
+/// Resolve against the current fenced model, rather than cloning every path
+/// into every redraw's button message.
+pub fn resolve_group_command(
+    source: &SourceControlModel,
+    action: &SidebarAction,
+) -> Option<SidebarAction> {
+    let SidebarAction::ChangeGroup { key, area, command } = action else {
+        return None;
+    };
+    if key != &source.key || source.busy() {
+        return None;
+    }
+    let group = source.group(*area)?;
+    if group.is_empty() {
+        return None;
+    }
+    let selection = || group.rows().iter().map(ChangeRow::selection).collect();
+    match command {
+        ChangeGroupCommand::Stage if *area != ChangeArea::Staged => Some(SidebarAction::Stage {
+            key: key.clone(),
+            selection: selection(),
+        }),
+        ChangeGroupCommand::Unstage if *area == ChangeArea::Staged => {
+            Some(SidebarAction::Unstage {
+                key: key.clone(),
+                selection: selection(),
+            })
+        }
+        ChangeGroupCommand::Discard
+            if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) =>
+        {
+            Some(SidebarAction::RequestDiscard {
+                key: key.clone(),
+                request: discard_request(key, *area, selection(), group),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// The same three commands for one row, against that row alone.
@@ -7549,7 +7898,7 @@ fn row_commands<'a>(
     if area == ChangeArea::Staged {
         commands.push(IconCommand {
             icon: "list-remove-symbolic",
-            name: &chrome.accessible_name,
+            name: &chrome.unstage_name,
             action: gated(
                 SidebarAction::Unstage {
                     key: key.clone(),
@@ -7562,7 +7911,7 @@ fn row_commands<'a>(
     } else {
         commands.push(IconCommand {
             icon: "list-add-symbolic",
-            name: &chrome.accessible_name,
+            name: &chrome.stage_name,
             action: gated(
                 SidebarAction::Stage {
                     key: key.clone(),
@@ -7576,7 +7925,7 @@ fn row_commands<'a>(
     if matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked) {
         commands.push(IconCommand {
             icon: "edit-undo-symbolic",
-            name: &chrome.accessible_name,
+            name: &chrome.discard_name,
             action: gated(
                 SidebarAction::RequestDiscard {
                     key: key.clone(),
@@ -7649,37 +7998,90 @@ fn changes_footer<'a>(
     let chrome = &source.chrome;
     let message = state.commit_message();
     let input_key = key.clone();
-    let mut commit_input = widget::text_input("Commit message", message)
+    let can_commit = !modal_open
+        && !source.busy()
+        && !message.trim().is_empty()
+        && (source.staged_count > 0 || (state.amend_commit && source.head_oid.is_some()));
+    let commit_action = SidebarAction::Commit {
+        key: key.clone(),
+        message: message.to_owned(),
+        amend: state.amend_commit,
+    };
+    let submit = commit_action.clone();
+    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
+        .placeholder("Commit subject\n\nOptional description")
         .id(chrome.commit_input_id.clone())
-        .width(Length::Fill)
-        .padding([6, 8]);
+        .height(Length::Fixed(
+            (state.commit_composer.0.line_count().clamp(3, 6) as f32) * design::TEXT_BODY * 1.3
+                + 16.0,
+        ))
+        .font(cosmic::iced::Font::MONOSPACE)
+        .size(design::TEXT_BODY)
+        .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+        .key_binding(move |press| {
+            if press.modifiers.control()
+                && matches!(
+                    press.key,
+                    cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
+                )
+            {
+                can_commit
+                    .then(|| cosmic::iced::widget::text_editor::Binding::Custom(submit.clone()))
+            } else {
+                cosmic::iced::widget::text_editor::Binding::from_key_press(press)
+            }
+        });
     if !modal_open {
-        commit_input = commit_input.on_input(move |message| SidebarAction::CommitMessageChanged {
+        commit_input = commit_input.on_action(move |action| SidebarAction::CommitEditorAction {
             key: input_key.clone(),
-            message,
+            action,
         });
     }
 
-    let mut commit = button::custom(design::caption("Commit"))
-        .class(sidebar_button_style(true))
-        .id(chrome.commit_id.clone())
-        .padding([0, 8])
-        .height(PANEL_ROW_HEIGHT);
-    if source.can_commit(message) && !modal_open {
-        commit = commit.on_press(SidebarAction::Commit {
-            key: key.clone(),
-            message: message.to_owned(),
-        });
+    let mut commit = button::suggested(if state.amend_commit {
+        "Amend commit"
+    } else {
+        "Commit"
+    })
+    .id(chrome.commit_id.clone())
+    .padding([0, 8])
+    .height(PANEL_ROW_HEIGHT);
+    if can_commit {
+        commit = commit.on_press(commit_action);
     }
 
     let mut column = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
     column = column.push(commit_input);
+    column = column.push(
+        widget::checkbox(state.amend_commit)
+            .label("Amend last commit")
+            .on_toggle_maybe(
+                (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+                    let key = key.clone();
+                    move |amend| SidebarAction::AmendChanged {
+                        key: key.clone(),
+                        amend,
+                    }
+                }),
+            ),
+    );
+    if source.staged_count == 0 && !state.amend_commit {
+        column = column.push(design::caption(
+            "Stage changes before committing. Ctrl+Enter commits.",
+        ));
+    }
     let mut buttons = widget::row::with_capacity(2).spacing(spacing.space_xxs);
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
         (Some(branch), Some(target)) => {
-            let mut push = button::custom(design::caption("Push"))
-                .class(sidebar_button_style(false))
+            let push_label = match &source.tracking {
+                TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
+                    format!("Push ↑{ahead} · ↓{behind}")
+                }
+                TrackingState::Compared { ahead, .. } if *ahead > 0 => format!("Push ↑{ahead}"),
+                _ => "Push".to_owned(),
+            };
+            let mut push = button::standard(push_label)
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
                 .height(PANEL_ROW_HEIGHT);
@@ -7693,8 +8095,7 @@ fn changes_footer<'a>(
             buttons = buttons.push(push);
         }
         (Some(branch), None) if !source.upstream_reported() => {
-            let mut publish = button::custom(design::caption("Publish Branch"))
-                .class(sidebar_button_style(false))
+            let mut publish = button::standard("Publish branch")
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
                 .height(PANEL_ROW_HEIGHT);
@@ -7818,6 +8219,7 @@ fn publish_picker<'a>(
 /// [`crate::repository::HistoryRevision::Head`] — so it is the branch's
 /// history. Selecting a row drills into its immutable changed-file list.
 fn commit_changes_section<'a>(
+    state: &'a SidebarState,
     source: &'a SourceControlModel,
     changes: &'a CommitChanges,
     modal_open: bool,
@@ -7906,7 +8308,7 @@ fn commit_changes_section<'a>(
                         oid: commit.oid.clone(),
                         path: entry.path.clone(),
                     }),
-                    false,
+                    matches!(&state.panel_selection, Some(PanelSelection::Commit { oid, path }) if oid == &commit.oid && path == &entry.path),
                     modal_open,
                 ));
             }
@@ -7932,13 +8334,14 @@ fn commit_changes_section<'a>(
 }
 
 fn history_section<'a>(
+    state: &'a SidebarState,
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let key = &source.key;
     if let Some(changes) = &source.commit_changes {
-        return commit_changes_section(source, changes, modal_open);
+        return commit_changes_section(state, source, changes, modal_open);
     }
     // The notice, the row list, and the pager. The notice and the pager are
     // slots because both come and go — the notice the moment the first page
@@ -7959,7 +8362,7 @@ fn history_section<'a>(
     let mut rows = widget::column::with_capacity(source.history.len()).spacing(0);
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(
+        rows = rows.push(crate::interaction::keyboard_list_row(
             button::custom(
                 widget::row::with_children(vec![
                     widget::container(
@@ -8002,7 +8405,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        );
+        ));
     }
     column = column.push(rows);
     column = column.push(slot(source.can_load_history().then(|| {
@@ -8080,7 +8483,7 @@ fn panel_row<'a>(
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let indent = u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(12);
-    crate::interaction::hover(
+    crate::interaction::keyboard_list_row(crate::interaction::hover(
         button::custom(
             widget::row::with_children(vec![
                 cosmic::iced::widget::Space::new()
@@ -8099,7 +8502,7 @@ fn panel_row<'a>(
         .height(Length::Fixed(PANEL_ROW_HEIGHT))
         .width(Length::Fill)
         .on_press_maybe(action.and_then(|action| gated(action, modal_open))),
-    )
+    ))
 }
 
 /// The confirmation the application mounts before any discard runs.
@@ -8199,7 +8602,12 @@ fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
 
 /// Neutral text, transparent rows, and restrained pointer/keyboard feedback.
 pub fn sidebar_button_style(selected: bool) -> theme::Button {
-    fn appearance(
+    row_button_style::<false, true>(selected)
+}
+
+/// Navigation fills span their complete row; project labels remain plain on hover.
+fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> theme::Button {
+    fn appearance<const FLAT: bool>(
         theme: &cosmic::Theme,
         focused: bool,
         selected: bool,
@@ -8218,7 +8626,11 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
         } else {
             design::muted_icon_color(theme)
         });
-        style.border_radius = theme.cosmic().corner_radii.radius_s.into();
+        style.border_radius = if FLAT {
+            [0.0; 4].into()
+        } else {
+            theme.cosmic().corner_radii.radius_s.into()
+        };
         if selected || focused || alpha > 0.0 {
             let mut surface = foreground;
             surface.a = if disabled {
@@ -8232,18 +8644,36 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
     }
     // Noncapturing closures keep the boxed callbacks allocation-free for the
     // hundreds of file rows rebuilt on terminal wakes.
-    fn class<const SELECTED: bool>() -> theme::Button {
+    fn class<const SELECTED: bool, const FLAT: bool, const HOVER: bool>() -> theme::Button {
         theme::Button::Custom {
-            active: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.0, false)),
-            disabled: Box::new(|theme| appearance(theme, false, SELECTED, 0.0, true)),
-            hovered: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.06, false)),
-            pressed: Box::new(|focused, theme| appearance(theme, focused, SELECTED, 0.1, false)),
+            active: Box::new(|focused, theme| {
+                appearance::<FLAT>(theme, focused, SELECTED, 0.0, false)
+            }),
+            disabled: Box::new(|theme| appearance::<FLAT>(theme, false, SELECTED, 0.0, true)),
+            hovered: Box::new(|focused, theme| {
+                appearance::<FLAT>(
+                    theme,
+                    focused,
+                    SELECTED,
+                    if HOVER { 0.06 } else { 0.0 },
+                    false,
+                )
+            }),
+            pressed: Box::new(|focused, theme| {
+                appearance::<FLAT>(
+                    theme,
+                    focused,
+                    SELECTED,
+                    if HOVER { 0.1 } else { 0.0 },
+                    false,
+                )
+            }),
         }
     }
     if selected {
-        class::<true>()
+        class::<true, FLAT, HOVER>()
     } else {
-        class::<false>()
+        class::<false, FLAT, HOVER>()
     }
 }
 
@@ -8294,34 +8724,6 @@ fn icon_action<'a>(
 /// A "new …" command that is a row of its own, on the grid of the rows it
 /// creates.
 ///
-/// The rail lists these under a project's channels and worktrees, so they are
-/// child rows: the same leading slot, the same reserved indicator slot, and
-/// therefore the same content start as the `main` worktree above them.
-/// [`icon_action`] remains the form for a command that lives inside another
-/// row, such as the expanded header's hover-revealed commands.
-fn new_row_action<'a>(
-    icon_name: &'static str,
-    label: impl Into<Cow<'a, str>>,
-    action: Option<SidebarAction>,
-    id: Id,
-) -> Element<'a, SidebarAction> {
-    let grid = RowGrid::child(true);
-    let label = label.into();
-    let control = grid
-        .control(
-            grid.content(
-                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
-                None,
-                None,
-            ),
-            false,
-        )
-        .id(id)
-        .name(label.clone())
-        .on_press_maybe(action);
-    grid.mount(crate::interaction::tooltip(control, label))
-}
-
 /// The rule between the pane and the workspace, doubling as the pane's resize
 /// handle.
 ///
@@ -8442,7 +8844,7 @@ fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Elem
 /// differently is the defect this shares its way out of.
 pub fn status_icon<'a, Message: Clone + 'a>(
     icon_name: &'static str,
-    label: &'a str,
+    label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, Message> {
     crate::interaction::tooltip(toned_icon(icon_name, tone), label)
@@ -8488,12 +8890,20 @@ pub fn visible_selection_rows(
     let mut rows = Vec::new();
     for project in filtered_projects(model, state, compact) {
         rows.push(SelectionRow::Project(project.project.id));
-        if compact || searching || !state.collapsed_projects.contains(&project.project.id) {
+        if searching || !state.collapsed_projects.contains(&project.project.id) {
             rows.extend(
                 project
                     .channels
                     .iter()
                     .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
+                    .filter(|channel| {
+                        !compact
+                            || searching
+                            || channel.selected
+                            || channel.unread
+                            || channel.activity.is_some()
+                            || channel.deletion.is_some()
+                    })
                     .map(|channel| SelectionRow::Channel(channel.id)),
             );
             rows.extend(
@@ -8501,6 +8911,21 @@ pub fn visible_selection_rows(
                     .worktrees
                     .iter()
                     .filter(|worktree| worktree.deletion != Some(RowDeletion::Deleting))
+                    .filter(|worktree| {
+                        !compact
+                            || searching
+                            || state.selection
+                                == Some(SidebarSelection::Worktree {
+                                    project_id: project.project.id,
+                                    worktree_id: worktree.id,
+                                })
+                            || state.has_agent_update(project.project.id, worktree.id)
+                            || state.worktree_has_panes(project.project.id, worktree.id)
+                            || state
+                                .agent_activity(project.project.id, worktree.id)
+                                .is_some()
+                            || worktree.deletion.is_some()
+                    })
                     .map(|worktree| SelectionRow::Worktree(project.project.id, worktree.id)),
             );
         }
@@ -8521,7 +8946,7 @@ fn filtered_projects<'a>(
     } else {
         fold(state.query.trim())
     };
-    model
+    let mut filtered: Vec<_> = model
         .projects
         .iter()
         .filter_map(|project| {
@@ -8542,15 +8967,21 @@ fn filtered_projects<'a>(
                     state,
                 });
             }
-            let channels = channels_in_display_order(project.channels.iter().filter(|channel| {
-                (project_matches || channel.folded_title.contains(query.as_ref()))
-                    && match state.filter {
-                        SidebarFilter::All => true,
-                        SidebarFilter::Attention => channel.unread,
-                        SidebarFilter::PullRequests => false,
-                    }
-            }));
-            let worktrees = worktrees_in_display_order(
+            let mut channels =
+                channels_in_display_order(project.channels.iter().filter(|channel| {
+                    (project_matches
+                        || search_score(&channel.folded_title, query.as_ref()).is_some())
+                        && match state.filter {
+                            SidebarFilter::All => true,
+                            SidebarFilter::Attention => {
+                                channel.unread
+                                    || channel.activity
+                                        == Some(crate::agent::ActivityState::Waiting)
+                            }
+                            SidebarFilter::PullRequests => false,
+                        }
+                }));
+            let mut worktrees = worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
                 project
@@ -8559,10 +8990,21 @@ fn filtered_projects<'a>(
                     .filter(|worktree| match state.filter {
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => worktree.pull_request().is_some(),
-                        SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
+                        SidebarFilter::Attention => {
+                            state.has_agent_update(project.id, worktree.id)
+                                || state.agent_activity(project.id, worktree.id)
+                                    == Some(crate::agent::ActivityState::Waiting)
+                        }
                     })
                     .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
             );
+            if !query.is_empty() {
+                channels.sort_by_key(|channel| {
+                    search_score(&channel.folded_title, &query).unwrap_or(usize::MAX)
+                });
+                worktrees
+                    .sort_by_key(|worktree| worktree.search_rank(&query).unwrap_or(usize::MAX));
+            }
             let visible = match state.filter {
                 SidebarFilter::All => {
                     project_matches || !worktrees.is_empty() || !channels.is_empty()
@@ -8580,7 +9022,30 @@ fn filtered_projects<'a>(
                 state,
             })
         })
-        .collect()
+        .collect();
+    if !query.is_empty() {
+        filtered.sort_by_key(|project| {
+            project
+                .project
+                .search_rank(&query)
+                .into_iter()
+                .chain(
+                    project
+                        .channels
+                        .iter()
+                        .filter_map(|channel| search_score(&channel.folded_title, &query)),
+                )
+                .chain(
+                    project
+                        .worktrees
+                        .iter()
+                        .filter_map(|worktree| worktree.search_rank(&query)),
+                )
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+    }
+    filtered
 }
 
 /// The one place a project's worktree rows are ordered for display.
@@ -8675,6 +9140,14 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
             });
         }
         destinations.extend(
+            channels_in_display_order(&project.channels)
+                .into_iter()
+                .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
+                .map(|channel| SidebarAction::OpenChannel {
+                    channel_id: channel.id,
+                }),
+        );
+        destinations.extend(
             worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
@@ -8688,14 +9161,6 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
                 path: worktree.path.clone(),
             }),
         );
-        destinations.extend(
-            channels_in_display_order(&project.channels)
-                .into_iter()
-                .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
-                .map(|channel| SidebarAction::OpenChannel {
-                    channel_id: channel.id,
-                }),
-        );
     }
     destinations
 }
@@ -8704,6 +9169,140 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
 /// never folds a candidate while rendering.
 fn fold(value: &str) -> Box<str> {
     value.case_fold().collect::<String>().into_boxed_str()
+}
+
+/// Match names first; ordered abbreviations allow narrow searches without
+/// allocating another folded candidate on each frame.
+fn search_score(candidate: &str, query: &str) -> Option<usize> {
+    if let Some(position) = candidate.find(query) {
+        return Some(if position == 0 { 0 } else { 100 + position });
+    }
+    let mut remaining = candidate.chars();
+    let mut skipped = candidate.len();
+    for expected in query.chars() {
+        loop {
+            let actual = remaining.next()?;
+            skipped += 1;
+            if actual == expected {
+                break;
+            }
+        }
+    }
+    Some(1_000 + skipped)
+}
+
+/// Ranges in the displayed spelling, including full Unicode case-fold
+/// expansions. For example, `ss` highlights the single character `ß`.
+fn search_highlight_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let query: Vec<_> = query.trim().case_fold().collect();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let folded: Vec<_> = label
+        .char_indices()
+        .flat_map(|(start, ch)| {
+            let range = start..start + ch.len_utf8();
+            ch.to_string()
+                .case_fold()
+                .map(move |folded| (folded, range.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let contiguous = folded
+        .windows(query.len())
+        .position(|window| window.iter().map(|(ch, _)| ch).eq(query.iter()));
+    let mut ranges = Vec::new();
+    if let Some(start) = contiguous {
+        ranges.extend(
+            folded[start..start + query.len()]
+                .iter()
+                .map(|(_, range)| range.clone()),
+        );
+    } else {
+        let mut offset = 0;
+        for (query_index, expected) in query.iter().enumerate() {
+            // Prefer an intact suffix to scattering it through an earlier
+            // word: `fauth` reads as F + auth in "Feature authentication".
+            let suffix = &query[query_index..];
+            if let Some(position) = folded[offset..]
+                .windows(suffix.len())
+                .position(|window| window.iter().map(|(ch, _)| ch).eq(suffix.iter()))
+            {
+                let start = offset + position;
+                ranges.extend(
+                    folded[start..start + suffix.len()]
+                        .iter()
+                        .map(|(_, range)| range.clone()),
+                );
+                break;
+            }
+            let Some(position) = folded[offset..].iter().position(|(ch, _)| ch == expected) else {
+                return Vec::new();
+            };
+            offset += position;
+            ranges.push(folded[offset].1.clone());
+            offset += 1;
+        }
+    }
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.end >= range.start
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn search_label(
+    label: &str,
+    query: &str,
+    size: f32,
+    class: theme::Text,
+    heading: bool,
+) -> Element<'static, SidebarAction> {
+    use cosmic::iced::widget::text::Span;
+    let font = cosmic::font::Font {
+        weight: if heading {
+            cosmic::iced::font::Weight::Medium
+        } else {
+            cosmic::iced::font::Weight::Normal
+        },
+        ..cosmic::font::default()
+    };
+    let emphasis = cosmic::font::Font {
+        weight: cosmic::iced::font::Weight::Bold,
+        ..font
+    };
+    let mut spans: Vec<Span<'_, ()>> = Vec::new();
+    let mut cursor = 0;
+    for range in search_highlight_ranges(label, query) {
+        if cursor < range.start {
+            spans.push(Span::new(label[cursor..range.start].to_owned()));
+        }
+        spans.push(
+            Span::new(label[range.clone()].to_owned())
+                .font(emphasis)
+                .color(design::accent_color(&cosmic::theme::active())),
+        );
+        cursor = range.end;
+    }
+    if cursor < label.len() {
+        spans.push(Span::new(label[cursor..].to_owned()));
+    }
+    cosmic::iced::widget::rich_text(spans)
+        .size(size)
+        .font(font)
+        .class(class)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            EllipsizeHeightLimit::Lines(1),
+        ))
+        .width(Length::Fill)
+        .into()
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -8800,6 +9399,9 @@ mod row_interaction {
             enabled: bool,
         },
         FilteredScroll(SidebarFilter),
+        Search {
+            enabled: bool,
+        },
         Projects {
             ids: Vec<ProjectId>,
             enabled: bool,
@@ -8898,6 +9500,16 @@ mod row_interaction {
             })
         }
 
+        pub(super) fn search(
+            content: Element<'a, SidebarAction>,
+            enabled: bool,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::Search { enabled },
+            })
+        }
+
         pub(super) fn projects(
             content: Element<'a, SidebarAction>,
             ids: Vec<ProjectId>,
@@ -8944,6 +9556,7 @@ mod row_interaction {
             match self.kind {
                 Kind::Selectable { row, .. } => focus.1 = Some(super::selection_row_focus_id(row)),
                 Kind::Actions { .. } => {}
+                Kind::Search { .. } => focus.1 = Some(super::search_focus_id()),
                 _ => return,
             }
             for ((child, tree), layout) in self
@@ -9206,6 +9819,16 @@ mod row_interaction {
                 _ => {}
             }
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
+            if matches!(self.kind, Kind::Search { enabled: true })
+                && state.focused
+                && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown), modifiers, ..
+                }) if modifiers.is_empty())
+            {
+                shell.publish(SidebarAction::FocusFirstSearchResult);
+                shell.capture_event();
+                return;
+            }
             if let Kind::Selectable {
                 row,
                 selected,
@@ -9241,6 +9864,16 @@ mod row_interaction {
                         modifiers,
                         ..
                     }) if state.focused && modifiers.is_empty() => match key {
+                        keyboard::key::Named::ArrowUp
+                        | keyboard::key::Named::ArrowDown
+                        | keyboard::key::Named::ArrowLeft
+                        | keyboard::key::Named::ArrowRight
+                        | keyboard::key::Named::Home
+                        | keyboard::key::Named::End => {
+                            shell.publish(SidebarAction::NavigateRow { row, key: *key });
+                            shell.capture_event();
+                            return;
+                        }
                         keyboard::key::Named::Delete | keyboard::key::Named::Backspace => {
                             // The focused row is the target unless it belongs
                             // to the explicit selection, as in VS Code: focus
@@ -9360,6 +9993,26 @@ mod row_interaction {
                     _ => {}
                 }
                 if state.dragging {
+                    if let Some(position) = cursor.position() {
+                        state.drop = hovered.then(|| self.drop_at(layout, position));
+                        let margin = 32.0;
+                        let direction = if position.y < viewport.y + margin {
+                            -1.0
+                        } else if position.y > viewport.y + viewport.height - margin {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        if direction != 0.0 && hovered {
+                            if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+                                shell.publish(SidebarAction::ScrollProjects(direction * 8.0));
+                            }
+                            shell.request_redraw();
+                        }
+                    }
+                    if matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. })) {
+                        return;
+                    }
                     shell.capture_event();
                     return;
                 }
@@ -9445,7 +10098,7 @@ mod row_interaction {
                     .and_then(|point| self.header_at(layout, point))
                     .is_some()
             {
-                return mouse::Interaction::Pointer;
+                return mouse::Interaction::Grab;
             }
             self.children
                 .iter()
@@ -9541,13 +10194,12 @@ mod row_interaction {
             // edge over a light neutral fill: distinct from the active row,
             // whose button paints the neutral fill alone, without outlining
             // the whole row in accent (#448). The fill uses the button's own
-            // radius token and bounds, so a row that is both shares one shape.
+            // flat bounds, so a row that is both shares one shape.
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
                 let bounds = state.selection_bounds.unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
-                    let radius = theme.cosmic().corner_radii.radius_s;
                     let edge = Rectangle {
                         x: bounds.x + 1.0,
                         y: bounds.y + bounds.height * 0.25,
@@ -9559,7 +10211,7 @@ mod row_interaction {
                             renderer::Quad {
                                 bounds,
                                 border: cosmic::iced::Border {
-                                    radius: radius.into(),
+                                    radius: 0.0.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
@@ -9780,6 +10432,177 @@ pub(crate) mod tests {
         ProjectId::from_uuid(Uuid::from_u128(value))
     }
 
+    #[test]
+    fn navigation_cache_invalidates_attention_query_and_disclosure_but_reuses_identical_views() {
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let initial = cache.generation(&model, &state);
+        assert_eq!(initial, cache.generation(&model.clone(), &state.clone()));
+        state.apply(&SidebarAction::ToggleProject(project_id(1)));
+        let collapsed = cache.generation(&model, &state);
+        assert_ne!(initial, collapsed);
+        state.query = "fix".into();
+        let searched = cache.generation(&model, &state);
+        assert_ne!(collapsed, searched);
+        state.observe_agent_update(
+            CardId::new(),
+            project_id(1),
+            WorktreeId::from_uuid(Uuid::from_u128(2)),
+        );
+        let attention = cache.generation(&model, &state);
+        assert_ne!(searched, attention);
+        assert_eq!(attention, cache.generation(&model, &state));
+    }
+
+    #[test]
+    fn search_ignores_common_ancestor_paths_and_accepts_name_abbreviations() {
+        let entry = project();
+        assert!(!entry.matches("repo"));
+        assert!(!entry.worktrees[0].matches("repo"));
+        assert!(entry.worktrees[0].matches("/repo/"));
+        assert!(search_score("feature/authentication", "fauth").is_some());
+        assert!(search_score("feature/authentication", "fhz").is_none());
+    }
+
+    #[test]
+    fn compact_search_mounts_matching_rows_without_open_panes_or_attention() {
+        let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
+        let mut state = SidebarState::default();
+        let id = selection_row_focus_id(SelectionRow::Worktree(
+            project_id(1),
+            WorktreeId::from_uuid(Uuid::from_u128(3)),
+        ));
+        let quiet = project_list(&model, &state, true, false);
+        assert!(Tree::new(&quiet).find(&id).is_none());
+        state.controls_expanded = true;
+        state.query = "fix".into();
+        let result = project_list(&model, &state, true, false);
+        assert!(
+            Tree::new(&result).find(&id).is_some(),
+            "a matching inactive worktree must be mounted so Search Down can focus it"
+        );
+    }
+
+    #[test]
+    fn ranked_search_prefers_prefixes_then_substrings_then_abbreviations_and_paths() {
+        let mut entry = project();
+        entry.worktrees = vec![
+            worktree(20, "x-fix-y", false),
+            worktree(21, "fancy-index", false),
+            worktree(22, "fix", false),
+        ];
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        state.query = "fix".into();
+        let filtered = filtered_projects(&model, &state, false);
+        assert_eq!(
+            filtered[0]
+                .worktrees
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [22, 20, 21].map(|id| WorktreeId::from_uuid(Uuid::from_u128(id)))
+        );
+        assert!(search_score("fix", "fix") < search_score("prefix-fix", "fix"));
+        assert!(search_score("prefix-fix", "fix") < search_score("fancy-index", "fix"));
+        assert!(
+            model.projects[0].worktrees[0]
+                .search_rank("/repo/")
+                .unwrap()
+                >= 10_000
+        );
+    }
+
+    #[test]
+    fn fuzzy_highlights_preserve_utf8_boundaries_and_casefold_expansions() {
+        assert_eq!(
+            search_highlight_ranges("Feature authentication", "fauth"),
+            vec![0..1, 8..12]
+        );
+        assert_eq!(search_highlight_ranges("Straße", "ss"), vec![4..6]);
+        assert_eq!(search_highlight_ranges("Éclair", "écl"), vec![0..4]);
+        assert!(search_highlight_ranges("Feature", "missing").is_empty());
+        assert!(search_highlight_ranges("Feature", "").is_empty());
+    }
+
+    #[test]
+    fn search_down_enters_results_only_when_the_enabled_search_input_has_focus() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{Shell, clipboard, widget::operation},
+            keyboard, mouse,
+        };
+        for (focused, modal) in [(false, false), (true, false), (true, true)] {
+            let state = SidebarState::default();
+            let renderer = headless_renderer();
+            let mut element = search(&state, modal);
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            if focused {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                );
+            }
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert_eq!(
+                messages,
+                if focused && !modal {
+                    vec![SidebarAction::FocusFirstSearchResult]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
+        assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
+        assert!(agent_indicator(None, true).is_some());
+        assert!(agent_indicator(None, false).is_none());
+        let mut pr = project().pull_requests[0].clone();
+        pr.needs_review = false;
+        pr.draft = false;
+        pr.state = Some(WorktreePullRequestState::Open);
+        for checks in [
+            CheckStatus::Failing,
+            CheckStatus::Pending,
+            CheckStatus::Passing,
+        ] {
+            pr.checks = checks;
+            assert_eq!(pull_request_tone(&pr), PullRequestTone::Neutral);
+        }
+        pr.state = Some(WorktreePullRequestState::Closed);
+        assert_eq!(pull_request_tone(&pr), PullRequestTone::Danger);
+    }
+
     fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {
         let mut row = SidebarWorktree::from_repository(
             &WorktreeRecord {
@@ -9878,8 +10701,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             visible_selection_rows(&model, &state, true),
-            rows,
-            "compact rail ignores disclosure"
+            vec![SelectionRow::Project(id)],
+            "compact rail respects disclosure"
         );
         state.apply(&SidebarAction::SearchChanged("not-present".into()));
         assert!(visible_selection_rows(&model, &state, false).is_empty());
@@ -9904,7 +10727,7 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, modal, compact, Some(1));
+            let mut element = channel_view(&channel, modal, compact, Some(1), "");
             let mut tree = Tree::new(&element);
             let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -9985,6 +10808,7 @@ pub(crate) mod tests {
                 false,
                 false,
                 Some(1),
+                "",
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -10205,9 +11029,9 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(channels, vec![second, first]);
-        // Channels follow every worktree of their project.
+        // Channel rows precede worktrees in the sidebar.
         assert!(matches!(
-            cycle.last(),
+            cycle.first(),
             Some(SidebarAction::OpenChannel { .. })
         ));
     }
@@ -10375,7 +11199,7 @@ pub(crate) mod tests {
         assert!(projects[0].worktrees.is_empty());
         assert_eq!(projects[0].channels[0].id, channel_id);
         model.projects[0].channels[0].unread = false;
-        assert!(filtered_projects(&model, &state, false).is_empty());
+        assert_eq!(filtered_projects(&model, &state, false).len(), 1);
         assert_eq!(
             model.projects[0].channels[0].activity,
             Some(crate::agent::ActivityState::Waiting),
@@ -10447,7 +11271,7 @@ pub(crate) mod tests {
         // the group hands it.
         let header = |compact: bool, width: f32| {
             laid_out(
-                &mut project_identity_row(&model.projects[0], false, false, compact, false),
+                &mut project_identity_row(&model.projects[0], false, false, compact, false, ""),
                 width,
             )
         };
@@ -10473,9 +11297,12 @@ pub(crate) mod tests {
         assert_eq!((expanded_header.len(), expanded.len()), (1, 3));
         let (head, channel, primary) = (&expanded_header[0].1, &expanded[0].1, &expanded[1].1);
         assert_eq!(
-            channel[0].x, head[1].x,
-            "a child row's icon starts where its project's label does",
+            (channel[0].x, channel[1].x),
+            (head[0].x, head[1].x),
+            "project, channel and worktree glyphs and labels share columns",
         );
+        assert_eq!(expanded[0].0.x, expanded_header[0].0.x);
+        assert_eq!(expanded[0].0.width, expanded_header[0].0.width);
         assert_eq!(
             (channel[0].x, channel[1].x),
             (primary[0].x, primary[1].x),
@@ -10493,18 +11320,8 @@ pub(crate) mod tests {
 
         let compact_header = header(true, COMPACT_ROW_WIDTH);
         let compact = members(true, COMPACT_ROW_WIDTH);
-        // The channel, both worktrees, "New channel" and "New worktree".
-        assert_eq!((compact_header.len(), compact.len()), (1, 5));
-        let (new_channel, primary) = (&compact[3].1, &compact[1].1);
-        assert_eq!(
-            (
-                new_channel[0].x,
-                new_channel[0].width,
-                new_channel[0].height
-            ),
-            (primary[0].x, primary[0].width, primary[0].height),
-            "\"New channel\" and the primary worktree share the rail's grid",
-        );
+        // Quiet children and creation controls do not fill the compact rail.
+        assert_eq!((compact_header.len(), compact.len()), (1, 0));
         for (row, slots) in compact_header.iter().chain(&compact) {
             assert_eq!(slots[0].x, compact_header[0].1[0].x, "one rail column");
             assert_eq!(row.height, design::ROW_HEIGHT);
@@ -10516,6 +11333,33 @@ pub(crate) mod tests {
                 "every rail row reserves the same indicator slot",
             );
         }
+    }
+
+    #[test]
+    fn project_drag_label_has_no_hover_fill_and_navigation_selection_spans_a_flat_row() {
+        let theme = cosmic::Theme::dark();
+        let theme::Button::Custom {
+            active,
+            hovered,
+            pressed,
+            ..
+        } = row_button_style::<true, false>(false)
+        else {
+            unreachable!();
+        };
+        assert!(active(false, &theme).background.is_none());
+        assert!(hovered(false, &theme).background.is_none());
+        assert!(pressed(false, &theme).background.is_none());
+        assert!(
+            hovered(true, &theme).background.is_some(),
+            "keyboard focus remains visible"
+        );
+        let theme::Button::Custom { active, .. } = row_button_style::<true, true>(true) else {
+            unreachable!();
+        };
+        let selected = active(false, &theme);
+        assert!(selected.background.is_some());
+        assert_eq!(selected.border_radius, [0.0; 4].into());
     }
 
     /// The whole point of drawing the header's commands over the row is that
@@ -10533,7 +11377,7 @@ pub(crate) mod tests {
         let width = design::NAVIGATION_DEFAULT_WIDTH;
         let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
         let mut element = project_header_row(
-            project_identity_row(&model.projects[0], false, false, false, false),
+            project_identity_row(&model.projects[0], false, false, false, false, ""),
             vec![
                 icon_action(
                     "go-down-symbolic",
@@ -10679,12 +11523,7 @@ pub(crate) mod tests {
             worktree_glyph_tone(Some(PullRequestTone::Draft), false, false),
             GlyphTone::Draft(RowInk::Muted)
         );
-        for tone in [
-            PullRequestTone::Merged,
-            PullRequestTone::Danger,
-            PullRequestTone::Pending,
-            PullRequestTone::Passing,
-        ] {
+        for tone in [PullRequestTone::Merged, PullRequestTone::Danger] {
             assert_eq!(
                 worktree_glyph_tone(Some(tone), false, false),
                 GlyphTone::PullRequest(tone)
@@ -10733,7 +11572,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false, Some(1));
+            let mut element = channel_view(channel, false, false, Some(1), "");
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -10936,7 +11775,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn group_mutations_never_include_files_hidden_by_the_change_tree() {
+    fn group_mutations_cover_folded_files_and_preserve_rename_halves() {
         let mut snapshot = snapshot();
         let mut renamed = changed(
             repo_path("keep.rs"),
@@ -10962,24 +11801,21 @@ pub(crate) mod tests {
         ];
         let source = SourceControlModel::ready(main_key(), &snapshot);
         let group = source.group(ChangeArea::Unstaged).unwrap();
-        // Directories start collapsed, so `src/hidden.rs` stays hidden until
-        // the user opens `src`.
-        let expanded = BTreeSet::new();
-        let (tree, _) = visible_file_rows(&group.tree, &expanded, "", false, false);
-        let selected = tree
-            .iter()
-            .filter(|row| !row.directory)
-            .filter_map(|row| group.visible_path(&row.path))
-            .collect::<Vec<_>>();
-        let stage = group_commands(&source, group, &selected, false)
+        let stage = group_commands(&source, group, false)
             .into_iter()
-            .find_map(|command| match command.action {
+            .filter_map(|command| command.action)
+            .find_map(|action| match resolve_group_command(&source, &action) {
                 Some(SidebarAction::Stage { selection, .. }) => Some(selection),
                 _ => None,
             })
             .unwrap();
-        assert_eq!(stage, vec![PathSelection::from_changed_path(&renamed)]);
-        assert!(group_commands(&source, group, &[], false).is_empty());
+        assert_eq!(stage.len(), 2);
+        assert!(stage.contains(&PathSelection::from_changed_path(&renamed)));
+        assert!(
+            stage
+                .iter()
+                .any(|selection| selection.path == repo_path("src/hidden.rs"))
+        );
     }
 
     #[test]
@@ -11222,18 +12058,20 @@ pub(crate) mod tests {
     fn interface<'a>(
         model: &'a SidebarModel,
         state: &'a SidebarState,
+        navigation: &'a NavigationCache,
         bounds: Size,
         cache: cosmic::iced::runtime::user_interface::Cache,
         renderer: &mut cosmic::Renderer,
     ) -> cosmic::iced::runtime::UserInterface<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>
     {
         cosmic::iced::runtime::UserInterface::build(
-            view(
+            view_cached(
                 model,
                 state,
                 SidebarMode::Expanded,
                 design::NAVIGATION_DEFAULT_WIDTH,
                 false,
+                navigation,
             ),
             bounds,
             cache,
@@ -11246,6 +12084,7 @@ pub(crate) mod tests {
     /// window shorter than the project list is what makes a scroll offset, and
     /// the menu geometry that depends on it, observable at all.
     struct Sidebar {
+        navigation: NavigationCache,
         model: SidebarModel,
         state: SidebarState,
         renderer: cosmic::Renderer,
@@ -11300,6 +12139,7 @@ pub(crate) mod tests {
                 })
                 .collect();
             Self {
+                navigation: NavigationCache::default(),
                 model,
                 state: SidebarState::default(),
                 renderer: headless_renderer(),
@@ -11318,6 +12158,7 @@ pub(crate) mod tests {
             let mut interface = interface(
                 &self.model,
                 &self.state,
+                &self.navigation,
                 self.bounds,
                 std::mem::take(&mut self.cache),
                 &mut self.renderer,
@@ -11371,6 +12212,14 @@ pub(crate) mod tests {
         /// so that neither the list's scroll position nor hover feedback can
         /// be mistaken for the menu.
         fn menu_rows(scroll: f32) -> Vec<(usize, usize)> {
+            Self::menu_rows_for(Self::roomy, MENU_ROW, scroll)
+        }
+
+        fn menu_rows_for(
+            make: impl Fn() -> Self,
+            anchor: cosmic::iced::Point,
+            scroll: f32,
+        ) -> Vec<(usize, usize)> {
             use cosmic::iced::{
                 Color,
                 advanced::{
@@ -11379,17 +12228,18 @@ pub(crate) mod tests {
                 },
             };
             let frame = |open: bool| {
-                let mut sidebar = Self::roomy();
-                sidebar.scroll(scroll, MENU_ROW);
+                let mut sidebar = make();
+                sidebar.scroll(scroll, anchor);
                 if open {
-                    sidebar.click(mouse::Button::Right, MENU_ROW);
+                    sidebar.click(mouse::Button::Right, anchor);
                 }
-                sidebar.move_to(MENU_ROW);
+                sidebar.move_to(anchor);
                 // The frame that draws has to be the frame that updated: the
                 // runtime keeps an overlay's layout from its own update pass.
                 let mut interface = interface(
                     &sidebar.model,
                     &sidebar.state,
+                    &sidebar.navigation,
                     sidebar.bounds,
                     std::mem::take(&mut sidebar.cache),
                     &mut sidebar.renderer,
@@ -11512,13 +12362,44 @@ pub(crate) mod tests {
             })
             .expect("the rail draws the project's channel row");
 
-        sidebar.click(mouse::Button::Right, row);
-        let entry = Point::new(row.x + 30.0, row.y + 8.0);
-        sidebar.move_to(entry);
+        // The third entry's position follows the native menu's measured
+        // height, including fonts and theme padding. Use its painted bounds
+        // rather than a fixed distance from the right-click anchor.
+        let painted = Sidebar::menu_rows_for(|| Sidebar::with_channel(channel_id), row, 0.0);
+        let (top, bottom) = painted
+            .iter()
+            .find(|(from, to)| *from <= row.y as usize && *to > row.y as usize)
+            .expect("the channel menu paints over its anchor");
+        // Menus include a shadow and theme padding. Probe only the measured
+        // band, remounting each time so another command cannot close the menu
+        // before the Delete entry is reached. Assert the entire event result
+        // so a menu command cannot hide click-through to the row underneath.
+        let attempted: Vec<_> = (*top..=*bottom)
+            .step_by(4)
+            .map(|y| {
+                let mut candidate = Sidebar::with_channel(channel_id);
+                candidate.click(mouse::Button::Right, row);
+                // The redraw requested by opening a native menu initializes
+                // its geometry at the anchor before the pointer leaves it.
+                // Feed that frame just as the application event loop does.
+                candidate.feed(
+                    &[cosmic::iced::Event::Window(
+                        cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now()),
+                    )],
+                    row,
+                );
+                let entry = Point::new(row.x + 30.0, y as f32);
+                candidate.move_to(entry);
+                candidate.click(mouse::Button::Left, entry)
+            })
+            .collect();
+        let selected = attempted
+            .iter()
+            .find(|actions| actions.contains(&SidebarAction::DeleteChannel { channel_id }));
         assert_eq!(
-            sidebar.click(mouse::Button::Left, entry).first(),
-            Some(&SidebarAction::DeleteChannel { channel_id }),
-            "the channel row's only menu entry deletes the channel it was opened over",
+            selected,
+            Some(&vec![SidebarAction::DeleteChannel { channel_id }]),
+            "Delete must target the channel without opening a row underneath: {attempted:?}",
         );
     }
 
@@ -11603,6 +12484,17 @@ pub(crate) mod tests {
         );
         let origin = Point::new(100.0, PROJECT_HEADER_HEIGHT / 2.0);
         let end = Point::new(100.0, 1.9 * PROJECT_HEADER_HEIGHT);
+        assert_eq!(
+            element.as_widget().mouse_interaction(
+                &tree,
+                Layout::new(&node),
+                mouse::Cursor::Available(origin),
+                &viewport,
+                &renderer,
+            ),
+            mouse::Interaction::Grab,
+            "project titles expose their existing drag gesture",
+        );
         let mut dispatch = |event: Event, point: Point| {
             let mut messages = Vec::new();
             element.as_widget_mut().update(
@@ -12420,7 +13312,8 @@ pub(crate) mod tests {
         entry.worktrees[1].deletion = Some(RowDeletion::Deleting);
         entry.channels[0].deletion = Some(RowDeletion::Deleting);
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry.clone()]);
-        let state = SidebarState::default();
+        let mut state = SidebarState::default();
+        state.set_worktrees_with_panes(BTreeSet::from([(project_id, kept)]));
         for compact in [false, true] {
             let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
             assert!(opens(&actions, kept), "compact {compact}: {actions:?}");
@@ -12633,23 +13526,19 @@ pub(crate) mod tests {
     #[test]
     fn the_search_input_carries_the_focus_target_the_application_reveals() {
         let mut state = SidebarState::default();
-        assert_eq!(
-            search(&state, false)
-                .as_widget()
-                .id()
-                .map(|id| id.to_string()),
-            Some(search_focus_id().to_string())
+        assert!(
+            Tree::new(&search(&state, false))
+                .find(&search_focus_id())
+                .is_some()
         );
 
         // A query adds the clear action, which must not cost the input the id
         // the application focuses.
         state.apply(&SidebarAction::SearchChanged("cagents".into()));
-        assert_eq!(
-            search(&state, false)
-                .as_widget()
-                .id()
-                .map(|id| id.to_string()),
-            Some(search_focus_id().to_string())
+        assert!(
+            Tree::new(&search(&state, false))
+                .find(&search_focus_id())
+                .is_some()
         );
     }
 
@@ -13167,6 +14056,52 @@ pub(crate) mod tests {
 
     fn source_control() -> SourceControlModel {
         SourceControlModel::ready(main_key(), &snapshot())
+    }
+
+    #[test]
+    fn change_pages_reach_every_file_and_bulk_commands_cover_the_entire_group() {
+        let paths: Vec<_> = (0..501)
+            .map(|index| repo_path(&format!("file-{index:04}.rs")))
+            .collect();
+        let tree = file_rows(&paths);
+        let mut visited = Vec::new();
+        for page in 0..3 {
+            let (rows, total) = change_row_page(&tree, None, true, page);
+            assert_eq!(total, 501);
+            assert!(rows.len() <= MAX_VISIBLE_CHANGE_ROWS);
+            visited.extend(rows.into_iter().map(|row| row.path.clone()));
+        }
+        assert_eq!(visited, paths);
+        let mut source = source_control();
+        let group = ChangeGroup::new(
+            source.key.worktree_id,
+            ChangeArea::Unstaged,
+            paths
+                .iter()
+                .map(|path| {
+                    ChangeRow::new(
+                        source.key.worktree_id,
+                        &changed(
+                            path.clone(),
+                            ChangeArea::Unstaged,
+                            ChangeKind::Modified,
+                            None,
+                        ),
+                    )
+                })
+                .collect(),
+        );
+        source.groups = vec![group];
+        let command = group_commands(&source, &source.groups[0], false)
+            .into_iter()
+            .find_map(|command| command.action)
+            .unwrap();
+        let command = resolve_group_command(&source, &command).unwrap();
+        let SidebarAction::Stage { selection, .. } = command else {
+            panic!("expected stage-all");
+        };
+        assert_eq!(selection.len(), 501);
+        assert_eq!(selection.last().unwrap().path, paths[500]);
     }
 
     #[test]
@@ -13764,15 +14699,11 @@ pub(crate) mod tests {
 
         // The group command acts on exactly the rows the group drew.
         assert_eq!(
-            group_commands(
-                &source,
-                unstaged,
-                &unstaged.visible().iter().collect::<Vec<_>>(),
-                false
-            )
-            .into_iter()
-            .next()
-            .and_then(|command| command.action),
+            group_commands(&source, unstaged, false)
+                .into_iter()
+                .next()
+                .and_then(|command| command.action)
+                .and_then(|action| resolve_group_command(&source, &action)),
             Some(SidebarAction::Stage {
                 key,
                 selection: unstaged.visible_selection(),
@@ -13788,13 +14719,7 @@ pub(crate) mod tests {
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
         assert!(
-            group_commands(
-                &source,
-                group,
-                &group.visible().iter().collect::<Vec<_>>(),
-                false
-            )
-            .is_empty()
+            group_commands(&source, group, false).is_empty()
                 && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false).is_empty(),
             "two `git add` runs against one index corrupt each other's lock, so the second is not \
              offered at all"
@@ -13808,18 +14733,14 @@ pub(crate) mod tests {
         let group = source
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
-        let request = group_commands(
-            &source,
-            group,
-            &group.visible().iter().collect::<Vec<_>>(),
-            false,
-        )
-        .into_iter()
-        .find_map(|command| match command.action {
-            Some(SidebarAction::RequestDiscard { request, .. }) => Some(request),
-            _ => None,
-        })
-        .expect("the unstaged group offers a discard");
+        let request = group_commands(&source, group, false)
+            .into_iter()
+            .filter_map(|command| command.action)
+            .find_map(|action| match resolve_group_command(&source, &action) {
+                Some(SidebarAction::RequestDiscard { request, .. }) => Some(request),
+                _ => None,
+            })
+            .expect("the unstaged group offers a discard");
         assert!(
             !request.confirmed,
             "the surface may never build a confirmed discard: the service refuses an unconfirmed \
@@ -14315,4 +15236,72 @@ pub(crate) mod tests {
         );
         assert!(previous.can_load_history());
     }
+}
+
+/// Focus a navigation row and reveal it within the Projects scroll viewport.
+pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    use cosmic::iced::advanced::widget::{Operation, operation};
+    struct FocusRow {
+        id: Id,
+        bounds: Option<cosmic::iced::Rectangle>,
+    }
+    impl<T: 'static> Operation<T> for FocusRow {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: cosmic::iced::Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if id == Some(&self.id) {
+                state.focus();
+                self.bounds = Some(bounds);
+            } else {
+                state.unfocus();
+            }
+        }
+        fn finish(&self) -> operation::Outcome<T> {
+            self.bounds.map_or(operation::Outcome::None, |bounds| {
+                operation::Outcome::Chain(Box::new(RevealRow { bounds }))
+            })
+        }
+    }
+    struct RevealRow {
+        bounds: cosmic::iced::Rectangle,
+    }
+    impl<T> Operation<T> for RevealRow {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: cosmic::iced::Rectangle,
+            content: cosmic::iced::Rectangle,
+            translation: cosmic::iced::Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id != Some(&stable_id("sidebar.projects.scroll")) {
+                return;
+            }
+            let row = self.bounds - translation;
+            let delta = if row.y < bounds.y {
+                row.y - bounds.y
+            } else if row.y + row.height > bounds.y + bounds.height {
+                row.y + row.height - bounds.y - bounds.height
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                state.scroll_by(
+                    operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                    bounds,
+                    content,
+                );
+            }
+        }
+    }
+    cosmic::iced::advanced::widget::operate(FocusRow { id, bounds: None })
 }

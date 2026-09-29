@@ -16,6 +16,7 @@ mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -27,6 +28,7 @@ mod sidebar_selection_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
+mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
@@ -86,10 +88,11 @@ use crate::{
     },
     pull_request_review,
     repository::{
-        CancellationToken, CommitOutcome, CommitRequest, CommitSummary, CreateWorktreeRequest,
-        DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome, PushOutcome, PushRequest,
-        RepoPath, RepositoryId, RepositoryInfo, RepositoryService, RepositorySnapshot,
-        StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
+        CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
+        CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
+        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
+        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
+        WorktreeRecord,
     },
     repository_widget::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
@@ -669,10 +672,10 @@ fn quarantined_write_line<'a>(
     card_title: &impl Fn(CardId) -> Option<&'a str>,
 ) -> String {
     let subject = match &write.subject {
-        WriteSubject::Workspace { card: None } => "Window layout and cards".to_owned(),
+        WriteSubject::Workspace { card: None } => "Window layout and panes".to_owned(),
         WriteSubject::Workspace { card: Some(card) } => card_title(*card).map_or_else(
-            || "Window layout and cards (one card was refused)".to_owned(),
-            |title| format!("Window layout and cards (card “{title}” was refused)"),
+            || "Window layout and panes (one pane was refused)".to_owned(),
+            |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
         WriteSubject::CardIdentity {
             card,
@@ -685,7 +688,7 @@ fn quarantined_write_line<'a>(
             card,
             kind: ReplacedIdentity::Chat,
         } => card_title(*card).map_or_else(
-            || "A chat card's new conversation".to_owned(),
+            || "A chat pane's new conversation".to_owned(),
             |title| format!("New conversation in “{title}”"),
         ),
         WriteSubject::Project { name, .. } => format!("Project “{name}”"),
@@ -705,7 +708,7 @@ fn quarantined_write_line<'a>(
         write.subject,
         WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
     ) {
-        line.push_str(" · closing the card clears it");
+        line.push_str(" · closing the pane clears it");
     }
     match write.held_back {
         0 => {}
@@ -1289,7 +1292,7 @@ fn card_control_id(id: CardId, control: &str) -> widget::Id {
 
 fn card_accessible_name(type_label: &str, title: &str, caption: &str, focused: bool) -> String {
     format!(
-        "{type_label} column {title}, {caption}, {}",
+        "{type_label} pane {title}, {caption}, {}",
         if focused { "focused" } else { "not focused" }
     )
 }
@@ -1335,7 +1338,7 @@ fn retire_duplicate_utility_cards(state: &mut WorkspaceState) {
 }
 
 fn card_close_name(type_label: &str, title: &str) -> String {
-    format!("Close {type_label} column {title}")
+    format!("Close {type_label} pane {title}")
 }
 
 fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
@@ -1389,10 +1392,10 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             unavailable: "Automations unavailable",
         },
         None => CardLabels {
-            type_label: "Column",
+            type_label: "Pane",
             icon: "view-grid-symbolic",
-            starting: "Starting column…",
-            unavailable: "Column unavailable",
+            starting: "Starting pane…",
+            unavailable: "Pane unavailable",
         },
     }
 }
@@ -1617,7 +1620,16 @@ fn update_workspace_viewport(
 ) -> (ViewportUpdate, bool) {
     match event {
         WorkspaceViewportEvent::Scrolled(sample) => {
-            (workspace.native_scroll(sample.offset, sample.width), false)
+            let width_changed = sample.width != workspace.viewport_width();
+            let update = if sample.user_input {
+                workspace.native_scroll(sample.offset, sample.width)
+            } else {
+                workspace.native_layout_scroll(sample.offset, sample.width)
+            };
+            let synchronize = !sample.user_input
+                && (width_changed
+                    || (sample.offset - workspace.camera().offset()).abs() > f32::EPSILON);
+            (update, synchronize)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
         WorkspaceViewportEvent::PointerRested(card) => (
@@ -2002,6 +2014,10 @@ pub enum ContextTab {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowView {
+    #[serde(default)]
+    user_titles: HashMap<CardId, String>,
+    #[serde(default)]
+    projects_sidebar_collapsed: bool,
     sidebar_width: f32,
     inspector_width: f32,
     context_inspector_open: bool,
@@ -2220,6 +2236,44 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     )
 }
 
+#[cfg(feature = "integrated-browser")]
+fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
+    use keyboard::{Key, key::Named};
+    let keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if modifiers.logo() || modifiers.shift() {
+        return None;
+    }
+    if modifiers.control() && !modifiers.alt() {
+        return match key
+            .to_latin(*physical_key)
+            .map(|key| key.to_ascii_lowercase())
+        {
+            Some('l') => Some(Message::FocusBrowserAddress(card)),
+            Some('r') => Some(Message::BrowserReload(card)),
+            _ => None,
+        };
+    }
+    match key.as_ref() {
+        Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
+            Some(Message::BrowserBack(card))
+        }
+        Key::Named(Named::ArrowRight) if modifiers.alt() && !modifiers.control() => {
+            Some(Message::BrowserForward(card))
+        }
+        Key::Named(Named::F5) if modifiers.is_empty() => Some(Message::BrowserReload(card)),
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -2359,6 +2413,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
+        | Message::ReviewFilePanelToggle { .. }
+        | Message::ReviewFilePanelResize { .. }
+        | Message::ReviewFilePanelResizeFinished
         | Message::SelectContextTab(_)
         | Message::ContextInspector(_)
         // The settings pane sits under a dialog like any other card, so a
@@ -2370,6 +2427,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
@@ -2384,6 +2442,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
         | Message::BrowserReload(_)
+        | Message::BrowserStop(_)
+        | Message::FocusBrowserAddress(_)
         | Message::BrowserAddressChanged { .. }
         | Message::BrowserNavigate(_) => true,
         _ => false,
@@ -2583,6 +2643,10 @@ pub enum SettingsField {
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
+    ConfirmMultilinePaste,
+    BrowserSearchUrl,
+    EditorFontFamily,
+    EditorFontSize,
     TerminalScrollbackLines,
     ManagedWorktreeDirectory,
     WorktreeSort,
@@ -2592,6 +2656,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    DiffHideUnchanged,
     ChatEnterSends,
     ShowStatusBar,
     RelaunchAgentsOnUpgrade,
@@ -2617,11 +2682,29 @@ pub enum SettingsField {
     ShortcutReviewNextUnviewed,
     ShortcutReviewNextChange,
     ShortcutReviewPreviousChange,
+    ShortcutCommandPalette,
+    ShortcutNewThread,
+    ShortcutToggleInspector,
+    ShortcutOpenSettings,
+    ShortcutMovePaneLeft,
+    ShortcutMovePaneRight,
+    ShortcutReopenPane,
+    ShortcutFocusPane1,
+    ShortcutFocusPane2,
+    ShortcutFocusPane3,
+    ShortcutFocusPane4,
+    ShortcutFocusPane5,
+    ShortcutFocusPane6,
+    ShortcutFocusPane7,
+    ShortcutFocusPane8,
+    ShortcutFocusPane9,
+    ShortcutToggleProjects,
+    ShortcutRenamePane,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 16] = [
+    const SHORTCUTS: [Self; 34] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2638,6 +2721,24 @@ impl SettingsField {
         Self::ShortcutReviewNextUnviewed,
         Self::ShortcutReviewNextChange,
         Self::ShortcutReviewPreviousChange,
+        Self::ShortcutCommandPalette,
+        Self::ShortcutNewThread,
+        Self::ShortcutToggleInspector,
+        Self::ShortcutOpenSettings,
+        Self::ShortcutMovePaneLeft,
+        Self::ShortcutMovePaneRight,
+        Self::ShortcutReopenPane,
+        Self::ShortcutFocusPane1,
+        Self::ShortcutFocusPane2,
+        Self::ShortcutFocusPane3,
+        Self::ShortcutFocusPane4,
+        Self::ShortcutFocusPane5,
+        Self::ShortcutFocusPane6,
+        Self::ShortcutFocusPane7,
+        Self::ShortcutFocusPane8,
+        Self::ShortcutFocusPane9,
+        Self::ShortcutToggleProjects,
+        Self::ShortcutRenamePane,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -2659,7 +2760,7 @@ impl SettingsField {
             Self::TerminalScrollSpeed => "Scroll speed",
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
-            Self::MaxHotCards => "Maximum hot columns",
+            Self::MaxHotCards => "Maximum hot panes",
             Self::HibernationDelayMs => "Hibernation delay (ms)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -2668,10 +2769,33 @@ impl SettingsField {
             Self::WorktreeSort => "Worktree order",
             Self::DefaultWorktreePane => "Default worktree pane",
             Self::DefaultChannelPane => "Default channel pane",
-            Self::DefaultColumnFraction => "New column width",
+            Self::DefaultColumnFraction => "New pane width",
             Self::LinkOpenDestination => "Open links in",
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
+            Self::DiffHideUnchanged => "Hide unchanged diff lines",
+            Self::EditorFontFamily => "Editor font family",
+            Self::EditorFontSize => "Editor font size",
+            Self::BrowserSearchUrl => "Browser search URL",
+            Self::ConfirmMultilinePaste => "Confirm multiline paste",
+            Self::ShortcutToggleProjects => "Toggle Projects sidebar",
+            Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutCommandPalette => "Command palette",
+            Self::ShortcutNewThread => "New thread",
+            Self::ShortcutToggleInspector => "Toggle inspector",
+            Self::ShortcutOpenSettings => "Open settings",
+            Self::ShortcutMovePaneLeft => "Move pane left",
+            Self::ShortcutMovePaneRight => "Move pane right",
+            Self::ShortcutReopenPane => "Reopen closed pane",
+            Self::ShortcutFocusPane1 => "Focus pane 1",
+            Self::ShortcutFocusPane2 => "Focus pane 2",
+            Self::ShortcutFocusPane3 => "Focus pane 3",
+            Self::ShortcutFocusPane4 => "Focus pane 4",
+            Self::ShortcutFocusPane5 => "Focus pane 5",
+            Self::ShortcutFocusPane6 => "Focus pane 6",
+            Self::ShortcutFocusPane7 => "Focus pane 7",
+            Self::ShortcutFocusPane8 => "Focus pane 8",
+            Self::ShortcutFocusPane9 => "Focus pane 9",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
@@ -2684,10 +2808,10 @@ impl SettingsField {
             Self::ShortcutNewTerminal => "New terminal",
             Self::ShortcutNewChannel => "New channel",
             Self::ShortcutClonePane => "Clone focused pane",
-            Self::ShortcutCloseFocusedColumn => "Close focused column",
+            Self::ShortcutCloseFocusedColumn => "Close focused pane",
             Self::ShortcutSearchProjects => "Search projects",
-            Self::ShortcutPreviousColumn => "Previous column",
-            Self::ShortcutNextColumn => "Next column",
+            Self::ShortcutPreviousColumn => "Previous pane",
+            Self::ShortcutNextColumn => "Next pane",
             Self::ShortcutCyclePaneWidth => "Cycle pane width",
             Self::ShortcutPreviousWorkspace => "Previous workspace",
             Self::ShortcutNextWorkspace => "Next workspace",
@@ -2717,6 +2841,7 @@ impl SettingsField {
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackLines
             | Self::ConfirmTerminalClose
+            | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
             | Self::HibernationDelayMs
@@ -2726,14 +2851,36 @@ impl SettingsField {
             | Self::DefaultChannelPane
             | Self::ChatEnterSends
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::EditorAutoSave | Self::EditorWrapLines | Self::EditorSyntaxTheme => {
-                SettingsCategory::Editor
-            }
+            Self::EditorAutoSave
+            | Self::EditorWrapLines
+            | Self::EditorSyntaxTheme
+            | Self::EditorFontFamily
+            | Self::EditorFontSize
+            | Self::DiffHideUnchanged => SettingsCategory::Editor,
             Self::CheckForUpdates => SettingsCategory::About,
-            Self::LinkOpenDestination | Self::LinkOpenGesture | Self::PullRequestOpenTarget => {
-                SettingsCategory::Links
-            }
+            Self::LinkOpenDestination
+            | Self::LinkOpenGesture
+            | Self::PullRequestOpenTarget
+            | Self::BrowserSearchUrl => SettingsCategory::Links,
             Self::ShortcutNewTerminal
+            | Self::ShortcutToggleProjects
+            | Self::ShortcutRenamePane
+            | Self::ShortcutCommandPalette
+            | Self::ShortcutNewThread
+            | Self::ShortcutToggleInspector
+            | Self::ShortcutOpenSettings
+            | Self::ShortcutMovePaneLeft
+            | Self::ShortcutMovePaneRight
+            | Self::ShortcutReopenPane
+            | Self::ShortcutFocusPane1
+            | Self::ShortcutFocusPane2
+            | Self::ShortcutFocusPane3
+            | Self::ShortcutFocusPane4
+            | Self::ShortcutFocusPane5
+            | Self::ShortcutFocusPane6
+            | Self::ShortcutFocusPane7
+            | Self::ShortcutFocusPane8
+            | Self::ShortcutFocusPane9
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
@@ -2770,6 +2917,24 @@ enum SettingsFeedback {
 /// typed it. The parsed form lives in `AppSettings`; this is only the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
+    toggle_projects: String,
+    rename_pane: String,
+    command_palette: String,
+    new_native_thread: String,
+    toggle_inspector: String,
+    open_settings: String,
+    move_pane_left: String,
+    move_pane_right: String,
+    reopen_pane: String,
+    focus_pane_1: String,
+    focus_pane_2: String,
+    focus_pane_3: String,
+    focus_pane_4: String,
+    focus_pane_5: String,
+    focus_pane_6: String,
+    focus_pane_7: String,
+    focus_pane_8: String,
+    focus_pane_9: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -2791,6 +2956,24 @@ struct ShortcutDraft {
 impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
+            toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
+            rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            command_palette: settings::format_chords(&shortcuts.command_palette),
+            new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
+            toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
+            open_settings: settings::format_chords(&shortcuts.open_settings),
+            move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
+            move_pane_right: settings::format_chords(&shortcuts.move_pane_right),
+            reopen_pane: settings::format_chords(&shortcuts.reopen_pane),
+            focus_pane_1: settings::format_chords(&shortcuts.focus_pane_1),
+            focus_pane_2: settings::format_chords(&shortcuts.focus_pane_2),
+            focus_pane_3: settings::format_chords(&shortcuts.focus_pane_3),
+            focus_pane_4: settings::format_chords(&shortcuts.focus_pane_4),
+            focus_pane_5: settings::format_chords(&shortcuts.focus_pane_5),
+            focus_pane_6: settings::format_chords(&shortcuts.focus_pane_6),
+            focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
+            focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
+            focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -2827,6 +3010,10 @@ struct SettingsDraft {
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
+    editor_font_family: String,
+    editor_font_size: String,
+    confirm_multiline_paste: bool,
+    browser_search_url: String,
     terminal_scrollback_lines: String,
     managed_worktree_directory: String,
     worktree_sort: String,
@@ -2835,6 +3022,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
     chat_enter_sends: bool,
@@ -2871,6 +3059,11 @@ impl SettingsDraft {
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
+            editor_font_family: settings.editor_font_family.clone().unwrap_or_default(),
+            editor_font_size: settings
+                .editor_font_size
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
             terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
             managed_worktree_directory: settings.managed_worktree_directory.clone(),
             worktree_sort: match settings.worktree_sort {
@@ -2884,7 +3077,10 @@ impl SettingsDraft {
             default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
+            diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
+            confirm_multiline_paste: settings.confirm_multiline_paste,
+            browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
@@ -2913,6 +3109,10 @@ impl SettingsDraft {
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
+            SettingsField::ConfirmMultilinePaste => self.confirm_multiline_paste = value == "true",
+            SettingsField::BrowserSearchUrl => self.browser_search_url = value,
+            SettingsField::EditorFontFamily => self.editor_font_family = value,
+            SettingsField::EditorFontSize => self.editor_font_size = value,
             SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
             SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::WorktreeSort => self.worktree_sort = value,
@@ -2929,6 +3129,7 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
+            SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
@@ -2958,6 +3159,30 @@ impl SettingsDraft {
                 };
             }
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
+            SettingsField::ShortcutToggleProjects => {
+                self.keyboard_shortcuts.toggle_projects = value
+            }
+            SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutCommandPalette => {
+                self.keyboard_shortcuts.command_palette = value
+            }
+            SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_native_thread = value,
+            SettingsField::ShortcutToggleInspector => {
+                self.keyboard_shortcuts.toggle_inspector = value
+            }
+            SettingsField::ShortcutOpenSettings => self.keyboard_shortcuts.open_settings = value,
+            SettingsField::ShortcutMovePaneLeft => self.keyboard_shortcuts.move_pane_left = value,
+            SettingsField::ShortcutMovePaneRight => self.keyboard_shortcuts.move_pane_right = value,
+            SettingsField::ShortcutReopenPane => self.keyboard_shortcuts.reopen_pane = value,
+            SettingsField::ShortcutFocusPane1 => self.keyboard_shortcuts.focus_pane_1 = value,
+            SettingsField::ShortcutFocusPane2 => self.keyboard_shortcuts.focus_pane_2 = value,
+            SettingsField::ShortcutFocusPane3 => self.keyboard_shortcuts.focus_pane_3 = value,
+            SettingsField::ShortcutFocusPane4 => self.keyboard_shortcuts.focus_pane_4 = value,
+            SettingsField::ShortcutFocusPane5 => self.keyboard_shortcuts.focus_pane_5 = value,
+            SettingsField::ShortcutFocusPane6 => self.keyboard_shortcuts.focus_pane_6 = value,
+            SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
+            SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
+            SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -3023,6 +3248,78 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::ShortcutToggleProjects => {
+            next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRenamePane => {
+            next.keyboard_shortcuts.rename_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCommandPalette => {
+            next.keyboard_shortcuts.command_palette = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNewThread => {
+            next.keyboard_shortcuts.new_native_thread = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutToggleInspector => {
+            next.keyboard_shortcuts.toggle_inspector = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenSettings => {
+            next.keyboard_shortcuts.open_settings = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMovePaneLeft => {
+            next.keyboard_shortcuts.move_pane_left = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMovePaneRight => {
+            next.keyboard_shortcuts.move_pane_right = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReopenPane => {
+            next.keyboard_shortcuts.reopen_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane1 => {
+            next.keyboard_shortcuts.focus_pane_1 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane2 => {
+            next.keyboard_shortcuts.focus_pane_2 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane3 => {
+            next.keyboard_shortcuts.focus_pane_3 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane4 => {
+            next.keyboard_shortcuts.focus_pane_4 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane5 => {
+            next.keyboard_shortcuts.focus_pane_5 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane6 => {
+            next.keyboard_shortcuts.focus_pane_6 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane7 => {
+            next.keyboard_shortcuts.focus_pane_7 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane8 => {
+            next.keyboard_shortcuts.focus_pane_8 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane9 => {
+            next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::Notifications(field) => value
             .parse::<bool>()
             .map(|enabled| next.notifications.set(field, enabled))
@@ -3035,6 +3332,14 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.confirm_terminal_close = enabled)
             .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+        SettingsField::ConfirmMultilinePaste => value
+            .parse::<bool>()
+            .map(|value| next.confirm_multiline_paste = value)
+            .map_err(|_| "Choose whether multiline pastes require confirmation.".to_owned()),
+        SettingsField::BrowserSearchUrl => {
+            next.browser_search_url = value.to_owned();
+            Ok(())
+        }
         SettingsField::ChatEnterSends => value
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
@@ -3083,6 +3388,22 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
             .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
+        SettingsField::EditorFontFamily => {
+            next.editor_font_family = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+            Ok(())
+        }
+        SettingsField::EditorFontSize => {
+            if value.trim().is_empty() {
+                next.editor_font_size = None;
+                Ok(())
+            } else {
+                value.parse::<f32>().map(|size| next.editor_font_size = Some(size)).map_err(|_| "Enter an editor font size from 8 to 40, or leave it blank to follow the terminal.".to_owned())
+            }
+        }
+        SettingsField::DiffHideUnchanged => value
+            .parse::<bool>()
+            .map(|enabled| next.diff_hide_unchanged = enabled)
+            .map_err(|_| "Choose whether unchanged diff lines are folded.".to_owned()),
         SettingsField::AppTheme => AppTheme::from_key(value)
             .map(|theme| next.app_theme = theme)
             .ok_or_else(|| "Choose one of the listed app themes.".to_owned()),
@@ -3148,7 +3469,7 @@ fn settings_update(
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
-            .map_err(|_| "Maximum hot columns must be a whole number.".to_owned()),
+            .map_err(|_| "Maximum hot panes must be a whole number.".to_owned()),
         SettingsField::HibernationDelayMs => value
             .parse::<u64>()
             .map(|value| next.hibernation_delay_ms = value)
@@ -3172,7 +3493,7 @@ fn settings_update(
         SettingsField::DefaultColumnFraction => value
             .parse::<f32>()
             .map(|value| next.default_column_fraction = value)
-            .map_err(|_| "New column width must be a number.".to_owned()),
+            .map_err(|_| "Default pane width must be a number.".to_owned()),
         SettingsField::LinkOpenDestination => match value {
             "integrated_browser" => {
                 next.link_open_destination = LinkOpenDestination::IntegratedBrowser;
@@ -3196,6 +3517,12 @@ fn settings_update(
             _ => Err("Choose a link-opening gesture.".to_owned()),
         },
         SettingsField::ShortcutNewTerminal => {
+            next.keyboard_shortcuts.command_palette =
+                next.keyboard_shortcuts.command_palette.clone();
+            next.keyboard_shortcuts.toggle_inspector =
+                next.keyboard_shortcuts.toggle_inspector.clone();
+            next.keyboard_shortcuts.move_pane_right =
+                next.keyboard_shortcuts.move_pane_right.clone();
             next.keyboard_shortcuts.new_terminal = settings::parse_chords(value);
             Ok(())
         }
@@ -3417,6 +3744,17 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ReviewFilePanelToggle {
+        card: CardId,
+        collapsed: bool,
+    },
+    ReviewFilePanelResize {
+        card: CardId,
+        width: f32,
+    },
+    ReviewFilePanelResizeFinished,
+    Palette(palette_ui::Action),
+    RunCommand(workspace_widget::GlobalShortcut),
     /// A worktree snapshot for the source-control panel.
     ///
     /// `key` is the binding the request was made against. The panel rebinds
@@ -3604,7 +3942,6 @@ pub enum Message {
     OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
-    #[cfg(not(feature = "integrated-browser"))]
     ExternalUrlOpened(Result<(), String>),
     #[cfg(feature = "integrated-browser")]
     BrowserBack(CardId),
@@ -3612,6 +3949,10 @@ pub enum Message {
     BrowserForward(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserReload(CardId),
+    #[cfg(feature = "integrated-browser")]
+    BrowserStop(CardId),
+    #[cfg(feature = "integrated-browser")]
+    FocusBrowserAddress(CardId),
     #[cfg(feature = "integrated-browser")]
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
@@ -3624,6 +3965,13 @@ pub enum Message {
     },
     #[cfg(feature = "integrated-browser")]
     BrowserNavigate(CardId),
+    #[cfg(feature = "integrated-browser")]
+    BrowserAddressFocus {
+        card: CardId,
+        focused: bool,
+    },
+    #[cfg(feature = "integrated-browser")]
+    BrowserProgressTick,
     #[cfg(feature = "integrated-browser")]
     BrowserEvent {
         card: CardId,
@@ -3691,6 +4039,12 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    TerminalFind(terminal_ui::Action),
+    ZoomFont {
+        card: CardId,
+        delta: i8,
+        editor: bool,
+    },
     ToggleContextInspector,
     SelectContextTab(ContextTab),
     ContextInspector(InspectorAction),
@@ -3768,6 +4122,7 @@ impl ApplicationExit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirtyCloseIntent {
+    PaneGroup,
     Card(CardId),
     Application(window::Id),
 }
@@ -3816,7 +4171,6 @@ enum BrowserAddress {
         presented: SanitizedLocation,
     },
     UserInput(String),
-    Invalid(SanitizedLocation),
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -3836,8 +4190,24 @@ impl BrowserAddress {
         match self {
             Self::Location { presented, .. } => presented.as_str(),
             Self::UserInput(value) => value,
-            Self::Invalid(presented) => presented.as_str(),
         }
+    }
+
+    fn editable_str(&self, focused: bool) -> &str {
+        if let Self::Location { authoritative, .. } = self {
+            let local = match authoritative.host() {
+                Some(url::Host::Domain(host)) => {
+                    host == "localhost" || host.ends_with(".localhost")
+                }
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unique_local(),
+                None => false,
+            };
+            if focused || local || authoritative.scheme() == "file" {
+                return authoritative.as_str();
+            }
+        }
+        self.as_str()
     }
 
     /// Resolves the value to navigate without deriving authority from its
@@ -3845,19 +4215,14 @@ impl BrowserAddress {
     /// its complete URL when the user submits the unchanged address, while a
     /// submitted draft is immediately replaced by its safe presentation.
     fn submit(&mut self) -> Result<Url, ()> {
+        self.submit_with_search("https://duckduckgo.com/?q={query}")
+    }
+    fn submit_with_search(&mut self, search_url: &str) -> Result<Url, ()> {
         let result = match self {
             Self::Location { authoritative, .. } => Ok(authoritative.clone()),
             Self::UserInput(value) => {
-                let value = value.trim();
-                Url::parse(value).or_else(|error| {
-                    if has_explicit_url_scheme(value) {
-                        Err(error)
-                    } else {
-                        Url::parse(&format!("https://{value}"))
-                    }
-                })
+                crate::location::navigation_url_with_search(value, search_url)
             }
-            Self::Invalid(_) => return Err(()),
         };
 
         match result {
@@ -3865,25 +4230,9 @@ impl BrowserAddress {
                 *self = Self::location(&url);
                 Ok(url)
             }
-            Err(_) => {
-                *self = Self::Invalid(SanitizedLocation::invalid());
-                Err(())
-            }
+            Err(_) => Err(()),
         }
     }
-}
-
-#[cfg(feature = "integrated-browser")]
-fn has_explicit_url_scheme(value: &str) -> bool {
-    value.split_once(':').is_some_and(|(scheme, _)| {
-        let mut chars = scheme.chars();
-        chars
-            .next()
-            .is_some_and(|first| first.is_ascii_alphabetic())
-            && chars.all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
-            })
-    })
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -3892,6 +4241,9 @@ struct BrowserRuntime {
     ime: Option<InputMethodState>,
     lifecycle: BrowserLifecycle,
     address: BrowserAddress,
+    address_focused: bool,
+    address_error: bool,
+    progress_phase: f32,
     load_state: Option<String>,
 }
 
@@ -3937,6 +4289,8 @@ struct PullRequestPane {
     /// The pull request a restored card was showing, opened once the
     /// project's GitHub state has loaded enough to name the repository.
     pending_number: Option<u64>,
+    file_panel_width: f32,
+    file_panel_collapsed: Option<bool>,
 }
 
 impl PullRequestPane {
@@ -3963,6 +4317,7 @@ struct CardLabels {
 /// is renamed instead of once per rendered frame. Reusing an id also keeps the
 /// card's accessibility node stable across frames.
 struct CardChrome {
+    tooltip: String,
     focus_id: widget::Id,
     title_id: widget::Id,
     container_id: widget::Id,
@@ -3993,6 +4348,11 @@ impl CardChrome {
         shortcuts: &KeyboardShortcuts,
     ) -> Self {
         Self {
+            tooltip: if caption.is_empty() {
+                title.to_owned()
+            } else {
+                format!("{title}\n{caption}")
+            },
             focus_id: workspace_widget::card_focus_id(id),
             title_id: card_control_id(id, "title"),
             container_id: workspace_widget::card_widget_id(id),
@@ -4010,7 +4370,7 @@ impl CardChrome {
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
-            resize_name: format!("Resize {type_label} column {title}"),
+            resize_name: format!("Resize {type_label} pane {title}"),
             close_name: format!(
                 "{}, {}",
                 card_close_name(type_label, title),
@@ -4038,6 +4398,7 @@ impl CardChrome {
 /// Which position-addressed request the inspector asked for.
 #[derive(Debug, Clone, Copy)]
 enum LspRequestKind {
+    Completion,
     Hover,
     Definition,
     References,
@@ -4081,6 +4442,9 @@ struct LspInspectorState {
     failure: Option<String>,
     /// The server's current progress report, if it is still working.
     progress: Option<String>,
+    completion_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
+    editor_hover_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
+    editor_navigation: Option<crate::lsp::LspRequestId>,
 }
 
 impl LspInspectorState {
@@ -4094,6 +4458,9 @@ impl LspInspectorState {
         self.context.hover = None;
         self.context.locations = None;
         self.context.completions.clear();
+        self.completion_request = None;
+        self.editor_hover_request = None;
+        self.editor_navigation = None;
     }
 
     /// Recomputes the single notice the surface renders from the two
@@ -4138,7 +4505,15 @@ pub struct Cagents {
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
+    terminal_working_directories: HashMap<CardId, PathBuf>,
+    terminal_find: HashMap<CardId, terminal_ui::Find>,
+    terminal_context: Option<terminal_ui::Context>,
+    terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
+    card_indices: HashMap<CardId, usize>,
+    navigation_cache: sidebar::NavigationCache,
+    palette: palette_ui::State,
+    recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     lifecycle: LifecycleManager,
     /// The shared language-server client. One manager serves every card; a
     /// session is per project root, not per card, so two cards in one worktree
@@ -4772,8 +5147,13 @@ impl Cagents {
                 CardKind::Repository(view) => {
                     let mut runtime = self.repository_runtime(view);
                     runtime.set_auto_save(self.settings.editor_auto_save);
+                    runtime.set_editor_font(
+                        crate::terminal::monospace_font(self.settings.editor_font_family()),
+                        self.settings.editor_font_size(),
+                    );
                     runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                     runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                    drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
                     runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                     repository_tasks.push(repository_task(runtime.initial_load(card.id)));
                     self.cards
@@ -4982,7 +5362,7 @@ impl Cagents {
                     tasks.push(self.finish_terminal_start(card));
                     return Task::batch(tasks);
                 };
-                if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
+                if let Err(error) = handle.set_theme(self.effective_terminal_theme()) {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not apply terminal theme: {error}"
                     )));
@@ -5054,7 +5434,7 @@ impl Cagents {
         TerminalConfig {
             initially_visible: visible,
             max_scrollback: self.settings.terminal_scrollback_lines,
-            theme: self.settings.terminal_theme,
+            theme: self.effective_terminal_theme(),
             ..TerminalConfig::default()
         }
     }
@@ -5174,10 +5554,15 @@ impl Cagents {
         if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
             return Task::none();
         }
-        let Some(source) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
+        let Some(source) = self
+            .workspace
+            .focused()
+            .and_then(|id| self.card_state(id))
+            .cloned()
+        else {
             return Task::none();
         };
-        if self.project_ui.deleting_card(source) {
+        if self.project_ui.deleting_card(&source) {
             return Task::none();
         }
         // A window holds one of each utility pane; a copy would show the
@@ -5185,17 +5570,37 @@ impl Cagents {
         if !source.existence.is_open() || source.kind.is_utility() {
             return Task::none();
         }
+        self.duplicate_pane(source)
+    }
+
+    fn duplicate_pane(&mut self, source: CardState) -> Task<Message> {
+        let owner = self.card_worktree(&source).map(Path::to_path_buf);
+        self.duplicate_pane_in_scope(source, owner)
+    }
+
+    fn duplicate_pane_in_scope(
+        &mut self,
+        source: CardState,
+        owner: Option<PathBuf>,
+    ) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
         }
-        let mut card = source.clone();
+        let source_id = source.id;
+        let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
+        let save_title = user_title.is_some();
+        let mut card = source;
         card.id = CardId::new();
+        card.existence = Existence::Open;
         card.generation = self.durable.generation;
         card.exposure = Exposure::Visible;
         card.residency = Residency::Hydrating { epoch: 1 };
         match &mut card.kind {
             CardKind::Terminal(session) => {
+                if let Some(path) = self.terminal_working_directories.get(&source_id) {
+                    session.launch.working_directory = path.clone();
+                }
                 if crate::agent::Provider::from_program(&session.launch.program).is_some() {
                     let Some(recipe) = crate::model::agent_recovery::fresh_recipe(&session.launch)
                     else {
@@ -5240,6 +5645,9 @@ impl Cagents {
                 unreachable!("utility panes are refused before cloning")
             }
         }
+        if let Some(title) = &user_title {
+            card.title = title.clone();
+        }
         let (index, durable_index) = self.terminal_insertion_indices();
         let id = card.id;
         let update = match self.workspace.add_card(
@@ -5261,6 +5669,17 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(id);
+        // The descriptor's directory can be a nested editor directory rather
+        // than its containing workspace. Keep the filing across projection.
+        if worktree_ui::card_directory(&card).is_some() {
+            if let Some(owner) = owner {
+                durable.card_scopes.insert(id, owner.clone());
+                self.worktree_owners.insert(id, owner);
+            }
+        }
+        if let Some(title) = user_title {
+            self.chrome_ui.user_titles.insert(id, title);
+        }
         self.register_channel_card(id);
         self.lifecycle
             .register(id, card.exposure, card.residency, Instant::now());
@@ -5277,8 +5696,13 @@ impl Cagents {
             CardKind::Repository(view) => {
                 let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_editor_font(
+                    crate::terminal::monospace_font(self.settings.editor_font_family()),
+                    self.settings.editor_font_size(),
+                );
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                 let load = repository_task(runtime.initial_load(id));
                 self.cards
@@ -5296,7 +5720,13 @@ impl Cagents {
             }
         };
         self.persist();
-        Task::batch([start, self.apply_viewport(update, true, false)])
+        let viewport = self.apply_viewport(update, true, false);
+        let title = if save_title {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
+        Task::batch([start, viewport, title])
     }
 
     fn pull_request_pane(&self, view: &crate::model::PullRequestView) -> PullRequestPane {
@@ -5313,8 +5743,13 @@ impl Cagents {
             worktree: view.repository.clone(),
         });
         runtime.set_standalone(true);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         PullRequestPane {
             repository: view.repository.clone(),
             review: pull_request_review::State::new(
@@ -5326,6 +5761,10 @@ impl Cagents {
             })),
             runtime,
             pending_number: view.selected_number,
+            file_panel_width: view
+                .file_panel_width
+                .map_or(design::NAVIGATION_DEFAULT_WIDTH, f32::from),
+            file_panel_collapsed: view.file_panel_collapsed,
         }
     }
 
@@ -5482,6 +5921,68 @@ impl Cagents {
         ])
     }
 
+    fn navigate_local_diff(
+        &mut self,
+        card: CardId,
+        shortcut: workspace_widget::GlobalShortcut,
+    ) -> Task<Message> {
+        use workspace_widget::GlobalShortcut;
+        match shortcut {
+            GlobalShortcut::ReviewNextChange => {
+                return cosmic::task::message(Message::Repository(RepositoryAction::NextChange {
+                    card,
+                }));
+            }
+            GlobalShortcut::ReviewPreviousChange => {
+                return cosmic::task::message(Message::Repository(
+                    RepositoryAction::PreviousChange { card },
+                ));
+            }
+            GlobalShortcut::ReviewNextFile | GlobalShortcut::ReviewPreviousFile => {}
+            _ => return Task::none(),
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let Some(source) = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+        else {
+            return Task::none();
+        };
+        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
+        let paths: Vec<_> = source
+            .groups()
+            .iter()
+            .filter(|group| (group.area == ChangeArea::Staged) == staged)
+            .flat_map(|group| {
+                group
+                    .rows()
+                    .iter()
+                    .map(move |row| (group.area, &row.entry.path))
+            })
+            .collect();
+        if paths.is_empty() {
+            return Task::none();
+        }
+        let current = paths
+            .iter()
+            .position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
+        let index = match (shortcut, current) {
+            (GlobalShortcut::ReviewPreviousFile, Some(index)) => index.saturating_sub(1),
+            (_, Some(index)) => (index + 1).min(paths.len() - 1),
+            _ => 0,
+        };
+        let (area, path) = paths[index];
+        cosmic::task::message(Message::Sidebar(SidebarAction::OpenChange {
+            key: source.key.clone(),
+            path: path.clone(),
+            area,
+        }))
+    }
+
     fn ensure_pull_request_source(&mut self, card: CardId) -> Task<Message> {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return Task::none();
@@ -5498,6 +5999,13 @@ impl Cagents {
                 repository: repository.clone(),
                 worktree: pane.repository.clone(),
             });
+        let reason = pane
+            .project(&self.sidebar_model)
+            .and_then(|id| self.github_availability.get(&id))
+            .map(GitHubAvailability::guidance);
+        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+            pane.review.set_unavailable_reason(reason);
+        }
         self.apply_pull_request_review(card, pull_request_review::Action::SetSource(source))
     }
 
@@ -5547,6 +6055,8 @@ impl Cagents {
         let view = crate::model::PullRequestView {
             repository: repository.clone(),
             selected_number: None,
+            file_panel_width: None,
+            file_panel_collapsed: None,
         };
         let title = self
             .sidebar_model
@@ -5635,6 +6145,9 @@ impl Cagents {
                 workspace_widget::FocusedPane::Terminal
             }
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
+                workspace_widget::FocusedPane::Review
+            }
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -5745,7 +6258,20 @@ impl Cagents {
         id: CardId,
         pane: &'a PullRequestPane,
     ) -> Element<'a, Message> {
+        iced::widget::responsive(move |size| self.pull_request_card_layout(id, pane, size.width))
+            .into()
+    }
+
+    fn pull_request_card_layout<'a>(
+        &'a self,
+        id: CardId,
+        pane: &'a PullRequestPane,
+        width: f32,
+    ) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
+        let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
+        let max_width = (width - 320.0).clamp(120.0, 600.0);
+        let panel_width = pane.file_panel_width.clamp(120.0, max_width);
         let modal_open = self.modal_is_open();
         let review = &pane.review;
         let mut side: Vec<Element<'a, pull_request_review::Action>> = Vec::new();
@@ -5793,12 +6319,30 @@ impl Cagents {
                 .spacing(0)
                 .height(Length::Fill),
         )
-        .width(Length::Fixed(design::NAVIGATION_DEFAULT_WIDTH))
+        .width(Length::Fixed(panel_width))
         .height(Length::Fill)
         .into();
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
+        main.push(
+            widget::container(
+                widget::button::text(if collapsed {
+                    "Show files"
+                } else {
+                    "Hide files"
+                })
+                .on_press_maybe((!modal_open).then_some(
+                    Message::ReviewFilePanelToggle {
+                        card: id,
+                        collapsed: !collapsed,
+                    },
+                )),
+            )
+            .height(design::DENSE_ROW_HEIGHT)
+            .width(Length::Fill)
+            .into(),
+        );
         let file_comment = review
             .file_comment_control(modal_open, pane.runtime.can_show_file_discussion())
             .map(|control| {
@@ -5820,7 +6364,7 @@ impl Cagents {
             let (title, detail) = if review.is_open() {
                 (
                     "Choose a file",
-                    "Pick a changed file to read its diff. The shortcuts move between files and mark them viewed.",
+                    "Pick a changed file to read its diff. Alt+Down/Up move between files; Alt+J/K move between changes; Alt+V marks a file viewed.",
                 )
             } else {
                 (
@@ -5851,19 +6395,35 @@ impl Cagents {
                 .into(),
             );
         }
-        widget::row::with_children(vec![
-            side,
-            design::vertical_rule(),
-            widget::column::with_children(main)
-                .spacing(0)
-                .width(Length::Fill)
-                .height(Length::Fill)
+        let main = widget::column::with_children(main)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let mut children = Vec::with_capacity(3);
+        if !collapsed {
+            children.push(side);
+            children.push(
+                crate::splitter::Splitter::new(
+                    widget::Id::new(format!("review.files.resize.{id}")),
+                    "Review file panel width",
+                    panel_width,
+                    120.0,
+                    max_width,
+                    crate::splitter::Edge::Trailing,
+                    modal_open,
+                    move |width| Message::ReviewFilePanelResize { card: id, width },
+                    || Message::ReviewFilePanelResizeFinished,
+                )
                 .into(),
-        ])
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+            );
+        }
+        children.push(main);
+        widget::row::with_children(children)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn repository_runtime(&self, view: RepositoryView) -> RepositoryRuntime {
@@ -5923,8 +6483,13 @@ impl Cagents {
         self.register_channel_card(card_id);
         let mut runtime = self.repository_runtime(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_font(
+            crate::terminal::monospace_font(self.settings.editor_font_family()),
+            self.settings.editor_font_size(),
+        );
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         let load = repository_task(runtime.initial_load(card_id));
         self.cards
@@ -6064,7 +6629,6 @@ impl Cagents {
         Self::open_external_url(url)
     }
 
-    #[cfg(not(feature = "integrated-browser"))]
     fn open_external_url(url: Url) -> Task<Message> {
         cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
@@ -6359,16 +6923,28 @@ impl Cagents {
     }
 
     fn card_state(&self, id: CardId) -> Option<&CardState> {
-        self.durable.cards.iter().find(|card| card.id == id)
+        self.card_index(id)
+            .and_then(|index| self.durable.cards.get(index))
+    }
+
+    fn card_index(&self, id: CardId) -> Option<usize> {
+        self.card_indices
+            .get(&id)
+            .copied()
+            .filter(|index| {
+                self.durable
+                    .cards
+                    .get(*index)
+                    .is_some_and(|card| card.id == id)
+            })
+            .or_else(|| self.durable.cards.iter().position(|card| card.id == id))
     }
 
     /// Copy-on-write access; callers must confirm a change is needed first, as
     /// this clones the workspace while the writer thread holds the last snapshot.
     fn card_state_mut(&mut self, id: CardId) -> Option<&mut CardState> {
-        Arc::make_mut(&mut self.durable)
-            .cards
-            .iter_mut()
-            .find(|card| card.id == id)
+        let index = self.card_index(id)?;
+        Arc::make_mut(&mut self.durable).cards.get_mut(index)
     }
 
     /// Renames a card to the title its own runtime reported, and answers whether
@@ -6379,6 +6955,31 @@ impl Cagents {
     /// Storing it would blank the card header, the card's accessible name and
     /// the window title all at once, so the card keeps the name it already had.
     fn apply_reported_title(&mut self, id: CardId, title: String) -> bool {
+        if self.chrome_ui.user_titles.contains_key(&id) {
+            return false;
+        }
+        let title = if title.starts_with('/') || title.starts_with("~/") {
+            self.card_state(id)
+                .and_then(|state| match &state.kind {
+                    CardKind::Terminal(session) => {
+                        let process = Path::new(&session.launch.program)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        let directory = session
+                            .launch
+                            .working_directory
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        Some(format!("{process} · {directory}"))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(title)
+        } else {
+            title
+        };
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
@@ -6397,10 +6998,27 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.card_indices.clear();
+        self.card_indices.extend(
+            self.durable
+                .cards
+                .iter()
+                .enumerate()
+                .map(|(index, card)| (card.id, index)),
+        );
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
             let (title, file_caption) = self.repository_chrome(card);
             let caption = match &card.kind {
+                CardKind::Terminal(_)
+                    if self.terminal_working_directories.contains_key(&card.id) =>
+                {
+                    display_path(&self.terminal_working_directories[&card.id])
+                }
                 CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
                     Cow::Owned(format!(
                         "Relaunched after upgrade · {}",
@@ -6442,13 +7060,24 @@ impl Cagents {
             && let Some(name) = path.file_name()
         {
             return (
-                name.to_string_lossy(),
+                self.chrome_ui.user_titles.get(&card.id).map_or_else(
+                    || name.to_string_lossy(),
+                    |title| Cow::Borrowed(title.as_str()),
+                ),
                 Some(Cow::Owned(
                     display_path(&runtime.descriptor.worktree.join(path)).into_owned(),
                 )),
             );
         }
-        (Cow::Borrowed(&card.title), None)
+        (
+            Cow::Borrowed(
+                self.chrome_ui
+                    .user_titles
+                    .get(&card.id)
+                    .unwrap_or(&card.title),
+            ),
+            None,
+        )
     }
 
     /// Names the window and its header bar after whatever the window is showing.
@@ -6581,6 +7210,13 @@ impl Cagents {
         signal: Option<&str>,
         intentional: bool,
     ) {
+        if self
+            .terminal_paste
+            .as_ref()
+            .is_some_and(|(target, _)| *target == card)
+        {
+            self.terminal_paste = None;
+        }
         // An end is one fact, recorded by whichever report of it arrives
         // first. A surface attached to a terminal that had already ended
         // replays that report; recording it again would move the exit to now
@@ -6723,8 +7359,13 @@ impl Cagents {
             CardKind::Repository(view) => {
                 let mut runtime = self.repository_runtime(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_editor_font(
+                    crate::terminal::monospace_font(self.settings.editor_font_family()),
+                    self.settings.editor_font_size(),
+                );
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                 let task = repository_task(runtime.initial_load(card));
                 self.cards
@@ -6953,7 +7594,8 @@ impl Cagents {
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
-        if focus_changed {
+        if self.chrome_ui.tabs_focus != focused {
+            self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
         }
         // Every focus move lands here, including those whose handlers return
@@ -7316,6 +7958,7 @@ impl Cagents {
         };
         let mut durable_changed = false;
         let mut recovery = None;
+        let mut clipboard_task = Task::none();
         if let Some(proof) = proof
             && ended_terminal(self.card_state(card)).is_none()
         {
@@ -7350,6 +7993,28 @@ impl Cagents {
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
                 }
+                TerminalEvent::WorkingDirectoryChanged(path) => {
+                    self.terminal_working_directories.insert(card, path);
+                }
+                TerminalEvent::ClipboardText { request, text } => {
+                    if let Some(find) = self.terminal_find.get_mut(&card)
+                        && find.pending_copy == Some(request)
+                    {
+                        find.pending_copy = None;
+                        if !text.trim().is_empty() {
+                            clipboard_task = iced::clipboard::write(text).map(cosmic::Action::App);
+                        }
+                    }
+                }
+                TerminalEvent::SearchResults {
+                    request,
+                    query,
+                    matches,
+                    truncated,
+                    ..
+                } => {
+                    self.terminal_search_results(card, request, query, matches, truncated);
+                }
                 TerminalEvent::ConversationTitleChanged(title) => {
                     self.name_channel_from_prompt(card, &title);
                 }
@@ -7362,7 +8027,7 @@ impl Cagents {
                         durable_changed = true;
                     }
                 }
-                TerminalEvent::Bell => {}
+                TerminalEvent::Bell => self.observe_agent_update_for_card(card),
                 // Root exit is not PTY completion: a descendant may still
                 // accept input and produce output. Keep its live surface.
                 TerminalEvent::Exited {
@@ -7374,16 +8039,35 @@ impl Cagents {
                     exit_code,
                     signal,
                     intentional,
+                } => {
+                    self.retire_ended_terminal(card, exit_code, signal.as_deref(), intentional);
+                    durable_changed = true;
                 }
-                | TerminalEvent::Completed {
+                TerminalEvent::Completed {
                     exit_code,
                     signal,
                     intentional,
                 } => {
                     self.retire_ended_terminal(card, exit_code, signal.as_deref(), intentional);
+                    self.refresh_completed_terminal_find(card);
                     durable_changed = true;
                 }
                 TerminalEvent::Error { operation, message } => {
+                    if matches!(
+                        operation,
+                        "retain completed terminal history"
+                            | "retain completed terminal screen"
+                            | "review completed terminal"
+                            | "copy completed terminal selection"
+                            | "copy terminal selection"
+                            | "search terminal"
+                    ) {
+                        if let Some(find) = self.terminal_find.get_mut(&card) {
+                            find.pending_copy = None;
+                        }
+                        self.status = Some(TransientNotice::error(message));
+                        continue;
+                    }
                     // Commands already in flight can lose the race with the
                     // process ending. They cannot turn an end into a failure.
                     if ended_terminal(self.card_state(card)).is_some() {
@@ -7469,7 +8153,7 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return self.start_terminal(card, session, visible, false);
         }
-        Task::none()
+        clipboard_task
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -7704,8 +8388,11 @@ impl Cagents {
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
+            let browser_loading = browser_runtime.is_some_and(|browser| {
+                browser.lifecycle == BrowserLifecycle::Restoring || browser.load_state.is_some()
+            });
             let address = browser_runtime
-                .map(|browser| browser.address.as_str())
+                .map(|browser| browser.address.editable_str(browser.address_focused))
                 .or_else(|| chrome.map(|chrome| chrome.caption.as_str()))
                 .unwrap_or(SanitizedLocation::INVALID);
             let active = browser_runtime.is_some();
@@ -7720,6 +8407,14 @@ impl Cagents {
                 .width(Length::Fill);
             if active {
                 address_input = address_input
+                    .on_focus(Message::BrowserAddressFocus {
+                        card: id,
+                        focused: true,
+                    })
+                    .on_unfocus(Message::BrowserAddressFocus {
+                        card: id,
+                        focused: false,
+                    })
                     .on_input(move |value| Message::BrowserAddressChanged { card: id, value })
                     .on_submit(move |_| Message::BrowserNavigate(id));
             }
@@ -7753,17 +8448,27 @@ impl Cagents {
                     ),
                     crate::interaction::tooltip(
                         widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "view-refresh-symbolic",
+                            if browser_loading {
+                                "process-stop-symbolic"
+                            } else {
+                                "view-refresh-symbolic"
+                            },
                         ))
                         .id(chrome.map_or_else(
                             || card_control_id(id, "browser.reload"),
                             |chrome| chrome.browser_reload_id.clone(),
                         ))
-                        .name("Reload")
+                        .name(if browser_loading { "Stop" } else { "Reload" })
                         .width(ICON_CONTROL_SIZE)
                         .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(active.then_some(Message::BrowserReload(id))),
-                        "Reload",
+                        .on_press_maybe(active.then_some(
+                            if browser_loading {
+                                Message::BrowserStop(id)
+                            } else {
+                                Message::BrowserReload(id)
+                            },
+                        )),
+                        if browser_loading { "Stop" } else { "Reload" },
                     ),
                     address_input.into(),
                 ])
@@ -7783,20 +8488,40 @@ impl Cagents {
             };
             let mut rows: Vec<Element<'a, Message>> =
                 vec![toolbar.into(), crate::design::horizontal_rule()];
-            if browser_loading {
+            if browser_runtime.is_some_and(|browser| browser.address_error) {
                 rows.push(
-                    widget::container(iced::widget::Space::new())
-                        .height(Length::Fixed(BROWSER_PROGRESS_HEIGHT))
-                        .width(Length::Fill)
-                        .class(cosmic::theme::Container::custom(|theme| {
-                            cosmic::iced::widget::container::Style {
-                                background: Some(iced::Background::Color(
-                                    (*theme.cosmic().accent_color()).into(),
-                                )),
-                                ..Default::default()
-                            }
-                        }))
-                        .into(),
+                    crate::design::caption("Invalid URL — edit the address and try again.").into(),
+                );
+            }
+            {
+                let phase = browser_runtime.map_or(0.0, |browser| browser.progress_phase);
+                rows.push(
+                    widget::container(iced::widget::responsive(move |size| {
+                        let width = size.width * 0.25;
+                        widget::row::with_children(vec![
+                            iced::widget::Space::new()
+                                .width((size.width - width) * phase)
+                                .into(),
+                            widget::container(iced::widget::Space::new())
+                                .width(width)
+                                .height(BROWSER_PROGRESS_HEIGHT)
+                                .class(cosmic::theme::Container::custom(move |theme| {
+                                    cosmic::iced::widget::container::Style {
+                                        background: browser_loading.then_some(
+                                            iced::Background::Color(
+                                                (*theme.cosmic().accent_color()).into(),
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    }
+                                }))
+                                .into(),
+                        ])
+                        .into()
+                    }))
+                    .height(Length::Fixed(BROWSER_PROGRESS_HEIGHT))
+                    .width(Length::Fill)
+                    .into(),
                 );
             }
             widget::column::with_children(rows).spacing(0).into()
@@ -7850,46 +8575,134 @@ impl Cagents {
                 }
                 message => message,
             }),
-            Some(CardRuntime::Terminal(handle)) => crate::file_drop::target(
-                TerminalWidget::new(handle.clone())
-                    .read_only(ended_terminal(card).is_some() || self.terminal_close_pending(id))
-                    .on_read_only_submit(
-                        (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
-                            .then_some(Message::RelaunchFromEndedScreen(id)),
-                    )
-                    .id(chrome.map_or_else(
-                        || workspace_widget::card_focus_id(id),
-                        |chrome| chrome.focus_id.clone(),
-                    ))
-                    .font_size(self.settings.terminal_font_size)
-                    .font_family(&self.settings.terminal_font_family)
-                    .line_height(self.settings.terminal_line_height)
-                    .padding(self.settings.terminal_padding)
-                    .scroll_size(self.settings.terminal_scroll_size)
-                    .scroll_speed(self.settings.terminal_scroll_speed)
-                    .cursor_style(self.settings.terminal_cursor_style)
-                    .scale_factor(effective_surface_scale(
-                        self.window_scale_factor,
-                        self.settings.ui_scale,
-                    ))
-                    .model_focused(card_focused)
-                    .on_focus(Message::FocusCard(id))
-                    .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
-                    .on_command_error(move |error| Message::TerminalError {
-                        card: id,
-                        message: error.to_string(),
-                    }),
-                ("terminal", id),
-                // A dialog over the workspace owns the pointer as well as the
-                // keyboard, so a drop aimed through it is refused rather than
-                // typed into a shell the reader cannot see.
-                ended_terminal(card).is_none()
-                    && !self.terminal_close_pending(id)
-                    && !self.workspace_inputs_blocked(),
-                move |payload| Message::TerminalDropped { card: id, payload },
-            ),
+            Some(CardRuntime::Terminal(handle)) => {
+                let find = self.terminal_find.get(&id).filter(|find| find.open);
+                let terminal = crate::file_drop::target(
+                    TerminalWidget::new(handle.clone())
+                        .selection_reset(
+                            self.terminal_find
+                                .get(&id)
+                                .map_or(0, |find| find.selection_reset),
+                        )
+                        .select_all_request(
+                            self.terminal_find
+                                .get(&id)
+                                .map_or(0, |find| find.select_all_request),
+                        )
+                        .on_context(move |point, selection, link| {
+                            Message::TerminalFind(terminal_ui::Action::Context(
+                                id, point, selection, link,
+                            ))
+                        })
+                        .on_paste(move |text| {
+                            Message::TerminalFind(terminal_ui::Action::Paste(id, text))
+                        })
+                        .on_copy(move |range| {
+                            Message::TerminalFind(terminal_ui::Action::CopySelection(id, range))
+                        })
+                        .find_matches(find.map(|find| (find.matches.clone(), find.selected)))
+                        .working_directory(
+                            self.terminal_working_directories
+                                .get(&id)
+                                .cloned()
+                                .or_else(|| {
+                                    card.and_then(|card| match &card.kind {
+                                        CardKind::Terminal(session) => {
+                                            Some(session.launch.working_directory.clone())
+                                        }
+                                        _ => None,
+                                    })
+                                })
+                                .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
+                        )
+                        .read_only(
+                            ended_terminal(card).is_some() || self.terminal_close_pending(id),
+                        )
+                        .on_read_only_submit(
+                            (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
+                                .then_some(Message::RelaunchFromEndedScreen(id)),
+                        )
+                        .id(chrome.map_or_else(
+                            || workspace_widget::card_focus_id(id),
+                            |chrome| chrome.focus_id.clone(),
+                        ))
+                        .font_size(self.settings.terminal_font_size)
+                        .font_family(&self.settings.terminal_font_family)
+                        .line_height(self.settings.terminal_line_height)
+                        .padding(self.settings.terminal_padding)
+                        .scroll_size(self.settings.terminal_scroll_size)
+                        .scroll_speed(self.settings.terminal_scroll_speed)
+                        .cursor_style(self.settings.terminal_cursor_style)
+                        .scale_factor(effective_surface_scale(
+                            self.window_scale_factor,
+                            self.settings.ui_scale,
+                        ))
+                        .model_focused(card_focused && !find.is_some_and(|find| find.focused))
+                        .on_shortcut(move |event| {
+                            let keyboard::Event::KeyPressed {
+                                key,
+                                physical_key,
+                                modifiers,
+                                ..
+                            } = event
+                            else {
+                                return None;
+                            };
+                            if modifiers.control()
+                                && !modifiers.alt()
+                                && !modifiers.logo()
+                                && !modifiers.shift()
+                                && key
+                                    .to_latin(physical_key)
+                                    .is_some_and(|key| key.eq_ignore_ascii_case(&'f'))
+                            {
+                                return Some(Message::TerminalFind(terminal_ui::Action::Open(id)));
+                            }
+                            crate::interaction::font_zoom_chord(&key, physical_key, modifiers).map(
+                                |delta| Message::ZoomFont {
+                                    card: id,
+                                    delta,
+                                    editor: false,
+                                },
+                            )
+                        })
+                        .on_focus(Message::FocusCard(id))
+                        .on_open_link(move |url, gesture| Message::OpenLink(id, url, gesture))
+                        .on_command_error(move |error| Message::TerminalError {
+                            card: id,
+                            message: error.to_string(),
+                        }),
+                    ("terminal", id),
+                    // A dialog over the workspace owns the pointer as well as the
+                    // keyboard, so a drop aimed through it is refused rather than
+                    // typed into a shell the reader cannot see.
+                    ended_terminal(card).is_none()
+                        && !self.terminal_close_pending(id)
+                        && !self.workspace_inputs_blocked(),
+                    move |payload| Message::TerminalDropped { card: id, payload },
+                );
+                let terminal = crate::ui_controls::popover(
+                    terminal,
+                    self.terminal_menu(id),
+                    widget::popover::Position::Point(
+                        self.terminal_context
+                            .as_ref()
+                            .filter(|context| context.card == id)
+                            .map_or(iced::Point::ORIGIN, |context| context.point),
+                    ),
+                    Message::TerminalFind(terminal_ui::Action::DismissContext(id)),
+                );
+                if let Some(strip) = self.terminal_find_view(id) {
+                    widget::column::with_children(vec![strip, terminal])
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    terminal
+                }
+            }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
+                .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(effective_surface_scale(
@@ -7931,7 +8744,7 @@ impl Cagents {
                         widget::row::with_children(vec![
                             crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
                                 .icon()
-                                .size(24)
+                                .size(design::STATUS_ICON_SIZE)
                                 .into(),
                             widget::text::title3(labels.unavailable).into(),
                         ])
@@ -7989,7 +8802,7 @@ impl Cagents {
                     widget::column::with_children(vec![
                         crate::ui_controls::activity_spinner_tone(24.0, design::accent_color),
                         widget::text::title3(labels.starting).into(),
-                        design::caption("Preparing this workspace column…")
+                        design::caption("Preparing this workspace pane…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
                     ])
@@ -8046,13 +8859,19 @@ impl Cagents {
                 .height(Length::Fill),
         )
         .class(cosmic::theme::Container::custom(move |theme| {
-            let mut accent = iced::Color::from(*theme.cosmic().accent_color());
-            accent.a = 0.35;
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {
-                    color: accent,
-                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                    color: if focused {
+                        design::accent_color(theme)
+                    } else {
+                        design::warning_color(theme)
+                    },
+                    width: if focused || attention {
+                        design::BORDER_WIDTH
+                    } else {
+                        0.0
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -8077,7 +8896,7 @@ impl Cagents {
                         |chrome| chrome.resize_id.clone(),
                     ),
                     chrome.map_or_else(
-                        || card.map_or("Resize terminal column", |state| state.title.as_str()),
+                        || card.map_or("Resize terminal pane", |state| state.title.as_str()),
                         |chrome| chrome.resize_name.as_str(),
                     ),
                     width,
@@ -8087,6 +8906,9 @@ impl Cagents {
                     self.modal_is_open(),
                     move |width| Message::ResizeCard { card: id, width },
                     move || Message::ResizeCardFinished(id),
+                )
+                .default_width(
+                    self.settings.default_column_fraction * self.workspace.viewport_width(),
                 )
                 .into()
             } else {
@@ -8235,35 +9057,141 @@ impl Cagents {
             self.workspace_history = previous_history;
             return Task::none();
         }
-        let destination = WorkspaceDestination::from_action(&action);
-        let previous_pane = self.workspace.focused();
-        self.sidebar_state.apply(&action);
-        // Select synchronously: the next key event must see this preview,
-        // rather than queue another selection against an unchanged workspace.
-        let task = match action {
-            SidebarAction::OpenRepository { repository, .. } => {
-                self.select_worktree(repository, true)
-            }
-            SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
-            SidebarAction::OpenChannel { channel_id } => {
-                self.handle_channel_ui(channel_ui::Action::Open(channel_id))
-            }
-            _ => {
-                unreachable!("workspace destinations only contain folders, worktrees and channels")
-            }
-        };
-        if self.active_workspace_destination() != destination {
-            self.workspace_history = previous_history;
-            return task;
-        }
-        self.tab_history.finish(previous_pane);
+        self.chrome_ui.workspace_preview = Some(action);
         self.workspace_cycle_modifiers = modifiers
             & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
         if self.workspace_cycle_modifiers.is_empty() {
-            self.workspace_history
-                .finish(self.active_workspace_destination());
+            return self.commit_workspace_preview();
         }
+        Task::none()
+    }
+
+    fn commit_workspace_preview(&mut self) -> Task<Message> {
+        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+        let action = self.chrome_ui.workspace_preview.take();
+        let task = action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+        self.workspace_history
+            .finish(self.active_workspace_destination());
         task
+    }
+
+    fn workspace_switcher(&self) -> Option<Element<'_, Message>> {
+        let selected =
+            WorkspaceDestination::from_action(self.chrome_ui.workspace_preview.as_ref()?);
+        let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
+        let mut rows: Vec<Element<'_, Message>> = vec![design::heading("Switch workspace").into()];
+        for destination in self.workspace_history.cycle_order()? {
+            let Some(action) = destinations
+                .iter()
+                .find(|action| WorkspaceDestination::from_action(action) == Some(*destination))
+            else {
+                continue;
+            };
+            let (title, detail) = match action {
+                SidebarAction::OpenRepository {
+                    project_id,
+                    repository,
+                } => (
+                    self.sidebar_model.project(*project_id).map_or_else(
+                        || repository.display().to_string(),
+                        |project| project.name.clone(),
+                    ),
+                    display_path(repository).into_owned(),
+                ),
+                SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path,
+                } => {
+                    let Some(project) = self.sidebar_model.project(*project_id) else {
+                        continue;
+                    };
+                    let Some(worktree) = project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == *worktree_id)
+                    else {
+                        continue;
+                    };
+                    let activity = self.sidebar_state.agent_activity(*project_id, *worktree_id);
+                    let status = match activity {
+                        Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
+                        Some(crate::agent::ActivityState::Working) => "Working",
+                        _ if self
+                            .sidebar_state
+                            .has_agent_update(*project_id, *worktree_id) =>
+                        {
+                            "Unread update"
+                        }
+                        _ => "",
+                    };
+                    (
+                        format!("{} · {}", project.name, worktree.label()),
+                        format!("{} {status}", display_path(path)),
+                    )
+                }
+                SidebarAction::OpenChannel { channel_id } => {
+                    let Some(channel) = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .flat_map(|project| &project.channels)
+                        .find(|channel| channel.id == *channel_id)
+                    else {
+                        continue;
+                    };
+                    (
+                        channel.title.clone(),
+                        if channel.unread {
+                            "Channel · Unread update"
+                        } else {
+                            "Channel"
+                        }
+                        .to_owned(),
+                    )
+                }
+                _ => continue,
+            };
+            let active = Some(*destination) == selected;
+            rows.push(
+                widget::container(
+                    widget::column::with_children(vec![
+                        design::body(title).into(),
+                        design::caption(detail).into(),
+                    ])
+                    .spacing(design::GRID_UNIT),
+                )
+                .padding(2.0 * design::GRID_UNIT)
+                .width(Length::Fill)
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: active.then(|| {
+                            iced::Background::Color(
+                                theme
+                                    .current_container()
+                                    .component
+                                    .selected_state_color()
+                                    .into(),
+                            )
+                        }),
+                        ..Default::default()
+                    }
+                }))
+                .into(),
+            );
+        }
+        rows.push(design::caption("Release the modifier to open · Escape to cancel").into());
+        Some(
+            widget::container(
+                widget::scrollable(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                    .height(Length::Shrink),
+            )
+            .class(cosmic::theme::Container::Card)
+            .padding(3.0 * design::GRID_UNIT)
+            .width(440)
+            .max_height(400)
+            .into(),
+        )
     }
 
     fn next_workspace(
@@ -8509,6 +9437,10 @@ impl Cagents {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
                     }
+                    if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                        runtime.set_editor_diagnostics(vec![]);
+                        runtime.dismiss_editor_results();
+                    }
                 }
                 LspIntent::Save { text } => {
                     if let Some(doc) = self.lsp_document(card) {
@@ -8674,11 +9606,40 @@ impl Cagents {
         };
         match event {
             LspEvent::Diagnostics { version, items, .. } => {
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_diagnostics(
+                        if self.lsp.document_version(doc) == Some(version) {
+                            items.clone()
+                        } else {
+                            vec![]
+                        },
+                    );
+                }
                 state.context.diagnostics = items;
                 state.diagnostics_version = Some(version);
             }
-            LspEvent::Completion { items, .. } => state.context.completions = items,
-            LspEvent::Hover { markdown, .. } => state.context.hover = markdown,
+            LspEvent::Completion { request, items, .. } => {
+                if let Some((expected, at)) = state.completion_request
+                    && request == expected
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    && runtime.cursor_position() == Some(at)
+                {
+                    state.completion_request = None;
+                    runtime.set_editor_completions(items.clone());
+                    state.context.completions = items;
+                }
+            }
+            LspEvent::Hover {
+                request, markdown, ..
+            } => {
+                if let Some((expected, at)) = state.editor_hover_request
+                    && request == expected
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                {
+                    runtime.set_editor_hover(markdown.as_deref(), Some(at));
+                }
+                state.context.hover = markdown;
+            }
             LspEvent::Locations { kind, items, .. } => {
                 state.context.locations = Some((kind, items));
             }
@@ -8934,11 +9895,102 @@ impl Cagents {
             return Task::none();
         };
         match kind {
+            LspRequestKind::Completion => {
+                let request = self.lsp.request_completion(doc, at);
+                self.lsp_contexts
+                    .entry(card)
+                    .or_default()
+                    .completion_request = Some((request, at));
+                request
+            }
             LspRequestKind::Hover => self.lsp.request_hover(doc, at),
             LspRequestKind::Definition => self.lsp.request_definition(doc, at),
             LspRequestKind::References => self.lsp.request_references(doc, at),
         };
         Task::none()
+    }
+
+    fn update_editor_lsp(
+        &mut self,
+        card: CardId,
+        action: repository_widget::EditorLspAction,
+    ) -> Task<Message> {
+        use repository_widget::EditorLspAction as Action;
+        match action {
+            Action::Complete => self.request_lsp(card, LspRequestKind::Completion),
+            Action::CompleteAt { doc, version, at }
+                if self.lsp_document(card) == Some(doc)
+                    && self.lsp.document_version(doc) == Some(version)
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at)) =>
+            {
+                self.request_lsp(card, LspRequestKind::Completion)
+            }
+            Action::Hover(at) => {
+                if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                    if let Some((request, _)) = state.editor_hover_request.take() {
+                        self.lsp.cancel(request);
+                    }
+                }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_hover(None, at);
+                }
+                if let Some(at) = at
+                    && let Some(doc) = self.lsp_document(card)
+                {
+                    let request = self.lsp.request_hover(doc, at);
+                    self.lsp_contexts
+                        .entry(card)
+                        .or_default()
+                        .editor_hover_request = Some((request, at));
+                }
+                Task::none()
+            }
+            Action::Definition(at) => {
+                let Some(doc) = self.lsp_document(card) else {
+                    return Task::none();
+                };
+                let at = at.or_else(|| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.cursor_position(),
+                    _ => None,
+                });
+                if let Some(at) = at {
+                    let request = self.lsp.request_definition(doc, at);
+                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(request);
+                }
+                Task::none()
+            }
+            Action::Diagnostics => {
+                self.context_tab = ContextTab::Details;
+                self.context_inspector_open = true;
+                Task::none()
+            }
+            Action::References => {
+                self.context_tab = ContextTab::Details;
+                self.context_inspector_open = true;
+                self.request_lsp(card, LspRequestKind::References)
+            }
+            Action::Choose { index, label } => {
+                let task = self.apply_lsp_completion(card, index, &label);
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.dismiss_editor_results();
+                }
+                task
+            }
+            Action::Next(_) | Action::Dismiss => {
+                if matches!(action, Action::Dismiss) {
+                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                        state.invalidate_answers();
+                    }
+                }
+                match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        repository_task(runtime.update(RepositoryAction::Language { card, action }))
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Action::CompleteAt { .. } => Task::none(),
+        }
     }
 
     fn flush_pending_panel_open(&mut self, card: CardId) -> Task<Message> {
@@ -9247,6 +10299,7 @@ impl Cagents {
             return true;
         }
         self.dirty_repository_close.is_some()
+            || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
@@ -9261,7 +10314,32 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        self.context_inspector_open || self.context_inspector_transition.is_some()
+        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+            && (self.context_inspector_open || self.context_inspector_transition.is_some())
+    }
+
+    fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
+        let action = match row {
+            sidebar::SelectionRow::Project(project) => Some(SidebarAction::ToggleProject(project)),
+            sidebar::SelectionRow::Channel(channel_id) => {
+                Some(SidebarAction::OpenChannel { channel_id })
+            }
+            sidebar::SelectionRow::Worktree(project_id, worktree_id) => self
+                .sidebar_model
+                .project(project_id)
+                .and_then(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == worktree_id)
+                })
+                .map(|worktree| SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path: worktree.path.clone(),
+                }),
+        };
+        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
     }
 
     /// The instant an animation in flight is measured against.
@@ -9295,13 +10373,48 @@ impl Cagents {
 
     fn context_inspector_is_overlay(&self) -> bool {
         matches!(
-            inspector::mount_for_width(self.window_width, self.context_inspector_visible(), true,),
+            self.context_inspector_mount(),
             Some(InspectorLayout::Overlay)
         )
     }
 
+    fn projects_sidebar_mode(&self) -> SidebarMode {
+        if self.chrome_ui.projects_collapsed {
+            SidebarMode::Compact
+        } else {
+            SidebarMode::for_width(self.window_width)
+        }
+    }
+
+    fn context_inspector_mount(&self) -> Option<InspectorLayout> {
+        if !self.context_inspector_visible() {
+            return None;
+        }
+        let navigation = if self.projects_sidebar_mode() == SidebarMode::Compact {
+            design::NAVIGATION_RAIL_WIDTH
+        } else {
+            self.settings.sidebar_width
+        };
+        let inspector = self
+            .settings
+            .inspector_width
+            .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+        Some(
+            if self.window_width - navigation - inspector
+                >= crate::workspace::WidthLimits::default().minimum
+            {
+                InspectorLayout::Docked
+            } else {
+                InspectorLayout::Overlay
+            },
+        )
+    }
+
     fn workspace_inputs_blocked(&self) -> bool {
-        self.modal_is_open() || self.context_inspector_is_overlay() || self.chrome_ui.is_open()
+        self.modal_is_open()
+            || self.context_inspector_is_overlay()
+            || self.chrome_ui.is_open()
+            || self.palette.is_open()
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
@@ -9754,6 +10867,7 @@ impl Cagents {
     ) -> Task<Message> {
         let Some(card) = cards.pop_front() else {
             return match intent {
+                DirtyCloseIntent::PaneGroup => self.close_pane_group(),
                 DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
@@ -9773,6 +10887,15 @@ impl Cagents {
         });
         iced::widget::operation::focus(dirty_close_control_id(card, focused))
             .map(cosmic::Action::App)
+    }
+
+    fn close_pane_group(&mut self) -> Task<Message> {
+        let cards = std::mem::take(&mut self.chrome_ui.closing_group);
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| self.begin_card_close(card))
+            .collect();
+        Task::batch(tasks)
     }
 
     fn advance_dirty_close(&mut self) -> Task<Message> {
@@ -9805,6 +10928,7 @@ impl Cagents {
             .map(cosmic::Action::App);
         }
         match close.intent {
+            DirtyCloseIntent::PaneGroup => self.close_pane_group(),
             DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
@@ -9819,6 +10943,9 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
+        if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
+            self.chrome_ui.closing_group.clear();
+        }
         let restore_focus = self.nested_modal_focus_target().unwrap_or_else(|| {
             resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
                 self.workspace.order().any(|candidate| candidate == card)
@@ -10031,6 +11158,22 @@ impl Cagents {
         self.apply_viewport(update, true, true)
     }
 
+    fn prune_pane_title_overrides(&mut self) {
+        if self.chrome_ui.user_titles.is_empty() {
+            return;
+        }
+        let retained: HashSet<_> = self
+            .durable
+            .cards
+            .iter()
+            .map(|card| card.id)
+            .chain(self.recently_closed.iter().map(|(card, _)| card.id))
+            .collect();
+        self.chrome_ui
+            .user_titles
+            .retain(|id, _| retained.contains(id));
+    }
+
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
         if self.settings_write_blocked {
             return Err(
@@ -10042,7 +11185,10 @@ impl Cagents {
             Some(path) => path,
             None => settings::default_path().map_err(|error| error.to_string())?,
         };
+        self.prune_pane_title_overrides();
         let mut view = WindowView {
+            user_titles: self.chrome_ui.user_titles.clone(),
+            projects_sidebar_collapsed: self.chrome_ui.projects_collapsed,
             sidebar_width: self.settings.sidebar_width,
             inspector_width: self.settings.inspector_width,
             context_inspector_open: self.context_inspector_open,
@@ -10148,17 +11294,33 @@ impl Cagents {
     }
 
     fn synchronize_terminal_theme(&mut self) {
-        for (card, runtime) in &self.cards {
-            if ended_terminal(self.card_state(*card)).is_some() {
-                continue;
-            }
+        let theme = self.effective_terminal_theme();
+        for runtime in self.cards.values() {
             if let CardRuntime::Terminal(surface) = runtime {
-                if let Err(error) = surface.set_theme(self.settings.terminal_theme) {
+                if let Err(error) = surface.set_theme(theme) {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not apply terminal theme: {error}"
                     )));
                 }
             }
+        }
+    }
+
+    fn effective_terminal_theme(&self) -> crate::terminal::TerminalTheme {
+        use crate::terminal::TerminalTheme;
+        match self.settings.terminal_theme {
+            TerminalTheme::Auto
+                if self
+                    .settings
+                    .app_theme
+                    .resolve(self.core.system_theme())
+                    .theme_type
+                    .is_dark() =>
+            {
+                TerminalTheme::Dark
+            }
+            TerminalTheme::Auto => TerminalTheme::Light,
+            theme => theme,
         }
     }
 
@@ -10353,6 +11515,19 @@ impl Cagents {
     fn synchronize_settings(&mut self, previous: &AppSettings) -> Task<Message> {
         self.synchronize_lifecycle_budget();
         let mut tasks = Vec::new();
+        if previous.editor_font_family() != self.settings.editor_font_family()
+            || previous.editor_font_size() != self.settings.editor_font_size()
+        {
+            let font = crate::terminal::monospace_font(self.settings.editor_font_family());
+            let size = self.settings.editor_font_size();
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
+                    _ => {}
+                }
+            }
+        }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
             self.card_chrome.clear();
         }
@@ -10387,6 +11562,18 @@ impl Cagents {
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
                     _ => {}
                 }
+            }
+        }
+        if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
+            for runtime in self.cards.values_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                tasks.push(repository_task(
+                    runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged),
+                ));
             }
         }
         if previous.editor_auto_save != self.settings.editor_auto_save {
@@ -10599,7 +11786,15 @@ impl Application for Cagents {
             workspace,
             durable: Arc::new(durable),
             cards: HashMap::new(),
+            terminal_working_directories: HashMap::new(),
+            terminal_find: HashMap::new(),
+            terminal_context: None,
+            terminal_paste: None,
             card_chrome: HashMap::new(),
+            card_indices: HashMap::new(),
+            navigation_cache: sidebar::NavigationCache::default(),
+            palette: palette_ui::State::default(),
+            recently_closed: Vec::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -10664,7 +11859,18 @@ impl Application for Cagents {
             refresh_ui: refresh_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
-            chrome_ui: chrome_ui::State::default(),
+            chrome_ui: chrome_ui::State::default()
+                .with_user_titles(
+                    window_view
+                        .as_ref()
+                        .map(|view| view.user_titles.clone())
+                        .unwrap_or_default(),
+                )
+                .with_projects_collapsed(
+                    window_view
+                        .as_ref()
+                        .is_some_and(|view| view.projects_sidebar_collapsed),
+                ),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -10862,8 +12068,10 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.tab_history.observe(self.workspace.focused());
-        self.workspace_history
-            .observe(self.active_workspace_destination());
+        if self.chrome_ui.workspace_preview.is_none() {
+            self.workspace_history
+                .observe(self.active_workspace_destination());
+        }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
@@ -10906,7 +12114,10 @@ impl Application for Cagents {
                     ..
                 }
         );
-        let reconcile_row_selection = matches!(
+        let reconcile_row_selection = !matches!(
+            &message,
+            Message::Sidebar(SidebarAction::ScrollProjects(_) | SidebarAction::NavigateRow { .. })
+        ) && matches!(
             &message,
             Message::RepositoryLoaded { .. }
                 | Message::AttachedWorktreePrsResolved { .. }
@@ -10920,6 +12131,10 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::Palette(action) => self.update_palette(action),
+            Message::RunCommand(command) => {
+                self.run_workspace_command(command, keyboard::Modifiers::empty())
+            }
             Message::NewTerminal => self.add_terminal(
                 self.terminal_directory()
                     .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
@@ -11038,7 +12253,6 @@ impl Application for Cagents {
                 self.status = Some(TransientNotice::error(message));
                 Task::none()
             }
-            #[cfg(not(feature = "integrated-browser"))]
             Message::ExternalUrlOpened(result) => {
                 self.status = Some(match result {
                     Ok(()) => TransientNotice::success("Opened in the system browser"),
@@ -11500,6 +12714,9 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::MarkdownLink { card, uri }) => {
                 self.open_document_link(Some(card), &uri)
             }
+            Message::Repository(RepositoryAction::Language { card, action }) => {
+                self.update_editor_lsp(card, action)
+            }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
@@ -11554,6 +12771,44 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
             }
+            Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
+                self.update(Message::ZoomFont {
+                    card,
+                    delta,
+                    editor: true,
+                })
+            }
+            Message::ZoomFont {
+                card,
+                delta,
+                editor,
+            } => {
+                if self.workspace.focused() != Some(card) {
+                    return Task::none();
+                }
+                let current = if editor {
+                    self.settings.editor_font_size()
+                } else {
+                    self.settings.terminal_font_size
+                };
+                let value = if delta == 0 {
+                    if editor {
+                        String::new()
+                    } else {
+                        AppSettings::default().terminal_font_size.to_string()
+                    }
+                } else {
+                    (current + f32::from(delta)).clamp(8.0, 40.0).to_string()
+                };
+                self.update(Message::SettingsChanged {
+                    field: if editor {
+                        SettingsField::EditorFontSize
+                    } else {
+                        SettingsField::TerminalFontSize
+                    },
+                    value,
+                })
+            }
             Message::Repository(action) => {
                 if let RepositoryAction::DiffAnnotations {
                     identity,
@@ -11568,6 +12823,16 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                let completion_character = match &action {
+                    RepositoryAction::EditorAction {
+                        action:
+                            repository_widget::EditorAction::Edit(
+                                repository_widget::EditorEdit::Insert(character),
+                            ),
+                        ..
+                    } => Some(*character),
+                    _ => None,
+                };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 let saved = matches!(
@@ -11603,6 +12868,25 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if let Some(character) = completion_character
+                    && let Some(doc) = self.lsp_document(card)
+                    && self.lsp.completion_trigger(doc, character)
+                    && let Some(version) = self.lsp.document_version(doc)
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    && let Some(at) = runtime.cursor_position()
+                {
+                    tasks.push(cosmic::task::future(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Message::Repository(RepositoryAction::Language {
+                            card,
+                            action: repository_widget::EditorLspAction::CompleteAt {
+                                doc,
+                                version,
+                                at,
+                            },
+                        })
+                    }));
+                }
                 let selected_view = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime))
                         if runtime.descriptor.selected_file.is_some() =>
@@ -11655,6 +12939,17 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
+                    let Some(source) = &self.sidebar_model.source_control else {
+                        return Task::none();
+                    };
+                    let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
+                        return Task::none();
+                    };
+                    resolved
+                } else {
+                    action
+                };
                 // Entering a worktree that is being deleted is refused, and
                 // for the same reason before the selection would claim it.
                 if self
@@ -11684,12 +12979,66 @@ impl Application for Cagents {
                 if let Some(row) = opened {
                     self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
-                self.prune_sidebar_row_selection();
                 match action {
+                    SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
+                    SidebarAction::MarkChannelRead(id) => {
+                        let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
+                        let tasks: Vec<_> = cards.into_iter().map(|card| {
+                            self.sidebar_state.acknowledge_agent_update(card);
+                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                                && let Err(error) = handle.acknowledge_updates()
+                            {
+                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
+                            }
+                            self.acknowledge_chat_updates(card)
+                        }).collect();
+                        self.refresh_sidebar_channels();
+                        Task::batch(tasks)
+                    }
+                    SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
+                        widget::Id::new("sidebar.projects.scroll"),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y },
+                    ).map(cosmic::Action::App),
+                    SidebarAction::OpenFirstSearchResult => {
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
+                            .or_else(|| rows.first()).copied();
+                        row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
+                    }
+                    SidebarAction::FocusFirstSearchResult => {
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
+                            .or_else(|| rows.first()).copied();
+                        row.map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
+                    }
+                    SidebarAction::NavigateRow { row, key } => {
+                        use keyboard::key::Named;
+                        if key == Named::Enter {
+                            return self.open_sidebar_navigation_row(row);
+                        }
+                        if matches!(key, Named::ArrowLeft | Named::ArrowRight) {
+                            if let sidebar::SelectionRow::Project(project) = row {
+                                let expanded = self.sidebar_state.project_expanded(project);
+                                if expanded == (key == Named::ArrowLeft) {
+                                    return self.update(Message::Sidebar(SidebarAction::ToggleProject(project)));
+                                }
+                            }
+                            return Task::none();
+                        }
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let index = rows.iter().position(|candidate| *candidate == row).unwrap_or(0);
+                        let target = match key {
+                            Named::Home => 0,
+                            Named::End => rows.len().saturating_sub(1),
+                            Named::ArrowUp => index.saturating_sub(1),
+                            _ => (index + 1).min(rows.len().saturating_sub(1)),
+                        };
+                        rows.get(target).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
+                    }
                     SidebarAction::SelectRows { row, intent } => {
                         self.select_sidebar_rows(row, intent);
                         if matches!(intent, sidebar::SelectionIntent::Toggle | sidebar::SelectionIntent::Range { .. }) {
-                            iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
+                            sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
@@ -11888,10 +13237,14 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }
+                    | SidebarAction::ChangePage { .. }
+                    | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::CommitEditorAction { .. }
+                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
                     | SidebarAction::PublishBranchChanged { .. }
                     | SidebarAction::CancelPublish
@@ -11968,7 +13321,7 @@ impl Application for Cagents {
                             )
                         })
                     }
-                    SidebarAction::Commit { key, message } => {
+                    SidebarAction::Commit { key, message, amend } => {
                         if !self.begin_mutation(&key, MutationKind::Commit) {
                             return Task::none();
                         }
@@ -11977,7 +13330,7 @@ impl Application for Cagents {
                             message,
                         };
                         Self::mutation_task(key, MutationKind::Commit, move |service, cancel| {
-                            commit_report(service.commit(&request, cancel))
+                            commit_report(service.commit_with_amend(&request, amend, cancel))
                         })
                     }
                     SidebarAction::Push {
@@ -12489,13 +13842,22 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
                 let task = self.apply_viewport(update, false, false);
-                if synchronize_scroll {
-                    Task::batch([task, self.synchronize_workspace_scroll()])
+                // Both native Scrolled feedback and Resized can measure the
+                // narrower strip first. Reveal its active tab independently
+                // of focus activation and attention acknowledgement.
+                let tabs = if previous_width != self.workspace.viewport_width() {
+                    self.reveal_active_tab()
                 } else {
-                    task
+                    Task::none()
+                };
+                if synchronize_scroll {
+                    Task::batch([task, tabs, self.synchronize_workspace_scroll()])
+                } else {
+                    Task::batch([task, tabs])
                 }
             }
             Message::Frame(frame) => {
@@ -12644,19 +14006,58 @@ impl Application for Cagents {
                 |handle| handle.reload(),
                 &mut self.status,
             ),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserStop(card) => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.load_state = None;
+                }
+                browser_command(&self.cards, card, |handle| handle.stop(), &mut self.status)
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::FocusBrowserAddress(card) => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.address_focused = true;
+                }
+                iced::widget::operation::focus(card_control_id(card, "browser.address")).chain(
+                    iced::widget::operation::select_all(card_control_id(card, "browser.address")),
+                )
+            }
             Message::RetryCard(card) => self.retry_card(card),
             Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
                     browser.address = BrowserAddress::user_input(value);
+                    browser.address_error = false;
+                }
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserAddressFocus { card, focused } => {
+                if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
+                    browser.address_focused = focused;
+                }
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserProgressTick => {
+                for runtime in self.cards.values_mut() {
+                    if let CardRuntime::Browser(browser) = runtime {
+                        browser.progress_phase = (browser.progress_phase + 0.035) % 1.0;
+                    }
                 }
                 Task::none()
             }
             #[cfg(feature = "integrated-browser")]
             Message::BrowserNavigate(card) => {
                 let url = match self.cards.get_mut(&card) {
-                    Some(CardRuntime::Browser(browser)) => browser.address.submit(),
+                    Some(CardRuntime::Browser(browser)) => {
+                        let result = browser
+                            .address
+                            .submit_with_search(&self.settings.browser_search_url);
+                        browser.address_error = result.is_err();
+                        result
+                    }
                     _ => return Task::none(),
                 };
                 match url {
@@ -12781,7 +14182,7 @@ impl Application for Cagents {
                             }]);
                         }
                         self.status = Some(TransientNotice::success(format!(
-                            "created worktree {}",
+                            "Created worktree {}",
                             worktree.path.display()
                         )));
                         if let Some(project) = self
@@ -12802,9 +14203,14 @@ impl Application for Cagents {
                             self.repository_load_task(repository, Some(project_id), false),
                         ]);
                     }
-                    Ok(other) => {
+                    Ok(WorktreeCreationOutcome::NotCreated { failure }) => {
                         self.status = Some(TransientNotice::warning(format!(
-                            "worktree outcome: {other:?}"
+                            "Could not create the worktree: {failure}"
+                        )));
+                    }
+                    Ok(WorktreeCreationOutcome::OutcomeUnknown { failure, .. }) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "The worktree creation outcome is unknown. Refresh the project before trying again. {failure}"
                         )));
                     }
                     Err(error) => self.status = Some(TransientNotice::error(error)),
@@ -12926,7 +14332,7 @@ impl Application for Cagents {
             } => match result {
                 Ok(PullRequestCreationOutcome::Created { url, .. }) => {
                     self.status = Some(TransientNotice::success(format!(
-                        "created pull request {url}"
+                        "Created pull request {url}"
                     )));
                     self.open_link(url)
                 }
@@ -12948,13 +14354,47 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if !captured
+                    && !self.workspace_inputs_blocked()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    )
+                    .is_none()
+                    && let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(key),
+                        modifiers,
+                        ..
+                    } = &event
+                    && modifiers.control()
+                    && modifiers.shift()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && key.eq_ignore_ascii_case("s")
+                    && let Some(card) = self.workspace.focused()
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                {
+                    let stage = runtime.selected_staging_selection(true).is_some();
+                    if stage || runtime.selected_staging_selection(false).is_some() {
+                        return cosmic::task::message(Message::Repository(
+                            RepositoryAction::StageSelected { card, stage },
+                        ));
+                    }
+                }
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
                 if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers) {
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        return self.commit_workspace_preview();
+                    }
+                }
+                if is_escape_press(&event) && self.chrome_ui.workspace_preview.take().is_some() {
                     self.workspace_history
                         .finish(self.active_workspace_destination());
                     self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                    return Task::none();
                 }
                 if !self.workspace_inputs_blocked()
                     && !self.focused_repository_is_saving()
@@ -12979,10 +14419,18 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
+                }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
                 }
                 if let Some(task) = self.account_key_event(&event) {
+                    return task;
+                }
+                if !self.workspace_inputs_blocked()
+                    && let Some(task) = self.chat_find_key(&event)
+                {
                     return task;
                 }
                 // A widget that consumed Escape has already answered it - a
@@ -12999,6 +14447,10 @@ impl Application for Cagents {
                     return self.cancel_form_dialog();
                 }
                 if is_escape_press(&event) && !captured {
+                    if let Some((card, _)) = &self.terminal_paste {
+                        return self
+                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
+                    }
                     if self.update_ui.confirmation.is_some() {
                         return self.update_update_ui(update_ui::Action::CancelApply);
                     }
@@ -13067,6 +14519,54 @@ impl Application for Cagents {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
+                if let Some(card) = self.workspace.focused()
+                    && self.terminal_find.get(&card).is_some_and(|find| find.open)
+                    && let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modifiers,
+                        ..
+                    } = &event
+                {
+                    if *key == keyboard::key::Named::Escape {
+                        return self.handle_terminal_find(terminal_ui::Action::Close(card));
+                    }
+                    if *key == keyboard::key::Named::Enter
+                        && self
+                            .terminal_find
+                            .get(&card)
+                            .is_some_and(|find| find.focused)
+                    {
+                        return self.handle_terminal_find(terminal_ui::Action::Next(
+                            card,
+                            modifiers.shift(),
+                        ));
+                    }
+                }
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modifiers,
+                    ..
+                } = &event
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
+                {
+                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                        RepositoryAction::FindPrevious { card }
+                    } else {
+                        RepositoryAction::FindNext { card }
+                    }));
+                }
+                #[cfg(feature = "integrated-browser")]
+                if !captured
+                    && let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+                    && let Some(message) = browser_shortcut(card, &event)
+                {
+                    return cosmic::task::message(message);
+                }
                 if !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
                 }
@@ -13084,83 +14584,12 @@ impl Application for Cagents {
                     &self.settings.keyboard_shortcuts,
                     self.focused_pane(),
                 ) {
-                    Some(workspace_widget::GlobalShortcut::NewTerminal) => {
-                        cosmic::task::message(Message::NewTerminal)
-                    }
-                    Some(workspace_widget::GlobalShortcut::NewChannel) => {
-                        self.new_project_channel()
-                    }
-                    Some(workspace_widget::GlobalShortcut::ClonePane) => self.clone_focused_pane(),
-                    Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
-                        match close_focused_message(&self.workspace) {
-                            Some(message) => cosmic::task::message(message),
-                            None => Task::none(),
-                        }
-                    }
-                    // A focused editor claims the search chord for its own
-                    // buffer, which is what it means in every editor the user
-                    // has, and the settings pane for its own search field.
-                    // A focused terminal never gets here: its scope leaves
-                    // the chord to the shell. Anywhere else it searches
-                    // projects.
-                    Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
-                        if self.settings_card_focused() {
-                            return iced::widget::operation::focus(
-                                crate::settings_widgets::search_id(),
-                            )
-                            .map(cosmic::Action::App);
-                        }
-                        match self.focused_editable_repository_card() {
-                            Some(card) => cosmic::task::message(Message::Repository(
-                                RepositoryAction::OpenFind { card },
-                            )),
-                            None => cosmic::task::message(Message::FocusProjectSearch),
-                        }
-                    }
-                    Some(workspace_widget::GlobalShortcut::FocusAdjacent(direction)) => {
-                        cosmic::task::message(Message::FocusAdjacent(direction))
-                    }
-                    Some(workspace_widget::GlobalShortcut::CyclePaneWidth) => {
-                        cosmic::task::message(Message::CyclePaneWidth)
-                    }
-                    Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
-                        let keyboard::Event::KeyPressed { modifiers, .. } = event else {
-                            unreachable!("shortcuts come from key presses")
+                    Some(command) => {
+                        let modifiers = match event {
+                            keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
+                            _ => keyboard::Modifiers::empty(),
                         };
-                        self.cycle_workspace(direction, modifiers)
-                    }
-                    Some(
-                        shortcut @ (workspace_widget::GlobalShortcut::ReviewToggleViewed
-                        | workspace_widget::GlobalShortcut::ReviewNextFile
-                        | workspace_widget::GlobalShortcut::ReviewPreviousFile
-                        | workspace_widget::GlobalShortcut::ReviewNextUnviewed
-                        | workspace_widget::GlobalShortcut::ReviewNextChange
-                        | workspace_widget::GlobalShortcut::ReviewPreviousChange),
-                    ) => {
-                        let Some(card) = self.workspace.focused().filter(|card| {
-                            matches!(self.cards.get(card), Some(CardRuntime::PullRequests(_)))
-                        }) else {
-                            return Task::none();
-                        };
-                        let action = match shortcut {
-                            workspace_widget::GlobalShortcut::ReviewToggleViewed => {
-                                pull_request_review::Action::ToggleViewedAndAdvance
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextFile => {
-                                pull_request_review::Action::NextFile
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextUnviewed => {
-                                pull_request_review::Action::NextUnviewed
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextChange => {
-                                pull_request_review::Action::NextChange
-                            }
-                            workspace_widget::GlobalShortcut::ReviewPreviousChange => {
-                                pull_request_review::Action::PreviousChange
-                            }
-                            _ => pull_request_review::Action::PreviousFile,
-                        };
-                        self.handle_pull_request_review(card, action)
+                        self.run_workspace_command(command, modifiers)
                     }
                     None => Task::none(),
                 }
@@ -13194,15 +14623,21 @@ impl Application for Cagents {
                 }
             }
             Message::FocusProjectSearch => {
+                if let Some(task) = self.open_chat_find() {
+                    return task;
+                }
+                if let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                {
+                    return self.handle_terminal_find(terminal_ui::Action::Open(card));
+                }
                 // `focus` unfocuses every widget whose id does not match, so
                 // aiming it at an id the pane is not rendering would blur
                 // whatever the user was typing into and focus nothing. Only
                 // the pane knows which densities and models give the search a
                 // control.
-                if !sidebar::search_is_reachable(
-                    &self.sidebar_model,
-                    SidebarMode::for_width(self.window_width),
-                ) {
+                if !sidebar::search_is_reachable(&self.sidebar_model, self.projects_sidebar_mode())
+                {
                     return Task::none();
                 }
                 if !self.sidebar_state.controls_expanded() {
@@ -13214,6 +14649,7 @@ impl Application for Cagents {
                     .map(cosmic::Action::App)
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
+            Message::TerminalFind(action) => self.handle_terminal_find(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
@@ -13254,6 +14690,37 @@ impl Application for Cagents {
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
             }
+            Message::ReviewFilePanelToggle { card, collapsed } => {
+                if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                    pane.file_panel_collapsed = Some(collapsed);
+                }
+                if let Some(state) = self.card_state_mut(card)
+                    && let CardKind::PullRequests(view) = &mut state.kind
+                {
+                    view.file_panel_collapsed = Some(collapsed);
+                }
+                self.persist();
+                Task::none()
+            }
+            Message::ReviewFilePanelResize { card, width } => {
+                if !width.is_finite() {
+                    return Task::none();
+                }
+                let width = width.clamp(120.0, 600.0);
+                if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                    pane.file_panel_width = width;
+                }
+                if let Some(state) = self.card_state_mut(card)
+                    && let CardKind::PullRequests(view) = &mut state.kind
+                {
+                    view.file_panel_width = Some(width.round() as u16);
+                }
+                Task::none()
+            }
+            Message::ReviewFilePanelResizeFinished => {
+                self.persist();
+                Task::none()
+            }
             Message::CommitUi(action) => self.update_commit_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
@@ -13265,12 +14732,13 @@ impl Application for Cagents {
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
+                let mut preview_task = Task::none();
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
                     self.tab_history.finish(self.workspace.focused());
-                    self.workspace_history
-                        .finish(self.active_workspace_destination());
-                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        preview_task = self.commit_workspace_preview();
+                    }
                 }
                 let account_focus = match action {
                     refresh_ui::Action::Focused(id, focused)
@@ -13286,9 +14754,12 @@ impl Application for Cagents {
                 let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
                     self.accounts_focus_changed(focused, regained)
                 });
-                Task::batch([refresh, self.flush_document_tone(), accounts])
+                Task::batch([preview_task, refresh, self.flush_document_tone(), accounts])
             }
             Message::DocumentToneStale => {
+                if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
+                    self.synchronize_terminal_theme();
+                }
                 self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                 self.flush_document_tone()
             }
@@ -13307,7 +14778,40 @@ impl Application for Cagents {
                 self.reset_settings()
             }
             Message::Lsp(event) => {
+                let navigation = if let LspEvent::Locations {
+                    doc,
+                    kind: crate::lsp::LocationKind::Definition,
+                    items,
+                    request,
+                    ..
+                } = &event
+                {
+                    self.lsp_documents.get(doc).copied().and_then(|card| {
+                        let state = self.lsp_contexts.get_mut(&card)?;
+                        if state.editor_navigation != Some(*request) {
+                            return None;
+                        }
+                        state.editor_navigation = None;
+                        Some((card, items.clone()))
+                    })
+                } else {
+                    None
+                };
                 self.apply_lsp_event(event);
+                if let Some((card, locations)) = navigation {
+                    if locations.len() == 1
+                        && let crate::lsp::LspTarget::Workspace { path } = &locations[0].target
+                    {
+                        return self.jump_to_lsp_location(
+                            card,
+                            path.clone(),
+                            locations[0].range.start,
+                            locations[0].coordinates,
+                        );
+                    }
+                    self.context_tab = ContextTab::Details;
+                    self.context_inspector_open = true;
+                }
                 Task::none()
             }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
@@ -13646,10 +15150,19 @@ impl Application for Cagents {
                 );
             }
         }
+        #[cfg(feature = "integrated-browser")]
+        if self.cards.iter().any(|(card, runtime)| matches!(runtime, CardRuntime::Browser(browser) if browser.load_state.is_some() || browser.lifecycle == BrowserLifecycle::Restoring)
+            && self.workspace.visibility(*card) == Some(VisibilityClass::Visible))
+        {
+            subscriptions.push(iced::time::every(Duration::from_millis(50)).map(|_| Message::BrowserProgressTick));
+        }
         Subscription::batch(subscriptions)
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.terminal_paste_dialog() {
+            return Some(dialog);
+        }
         #[cfg(feature = "integrated-browser")]
         if let Some(dialog) = self.browser_import_dialog() {
             return Some(dialog);
@@ -13937,13 +15450,14 @@ impl Application for Cagents {
     fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
-        let sidebar_mode = SidebarMode::for_width(window_width);
-        let sidebar = sidebar::view(
+        let sidebar_mode = self.projects_sidebar_mode();
+        let sidebar = sidebar::view_cached(
             &self.sidebar_model,
             &self.sidebar_state,
             sidebar_mode,
             self.settings.sidebar_width,
             self.modal_is_open(),
+            &self.navigation_cache,
         )
         .map(Message::Sidebar);
 
@@ -13952,7 +15466,7 @@ impl Application for Cagents {
         // `sync_window_title`.
         let docked_context_inspector = self.context_inspector_visible()
             && matches!(
-                inspector::mount_for_width(window_width, true, true),
+                self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
             );
         // A docked inspector's resize handle draws the viewport's trailing
@@ -13966,31 +15480,68 @@ impl Application for Cagents {
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+            let directory = self
+                .terminal_directory()
+                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
+            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
+            let scope_name = self
+                .durable
+                .active_channel
+                .and_then(|id| {
+                    self.durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id)
+                        .map(|channel| channel.title.clone())
+                })
+                .or_else(|| {
+                    directory
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "Workspace".into());
             let action_buttons = || {
-                vec![
-                    widget::button::suggested("New terminal")
-                        .id(widget::Id::new("empty.new-terminal"))
-                        .name("New terminal")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "utilities-terminal-symbolic",
-                        ))
-                        .on_press(Message::NewTerminal)
-                        .into(),
-                    widget::button::standard("Open folder")
-                        .id(widget::Id::new("empty.open-repository"))
-                        .name("Open folder")
-                        .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
-                        .on_press(Message::OpenRepository)
-                        .into(),
-                    widget::button::standard("New browser")
-                        .id(widget::Id::new("empty.new-browser"))
-                        .name("New browser")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "internet-web-browser-symbolic",
-                        ))
-                        .on_press(Message::NewBrowser)
-                        .into(),
-                ]
+                let buttons: Vec<Element<'_, Message>> = vec![
+                    widget::button::suggested(format!(
+                        "New thread · {}",
+                        workspace_widget::shortcut_chords(
+                            workspace_widget::GlobalShortcut::NewThread,
+                            &self.settings.keyboard_shortcuts
+                        )
+                    ))
+                    .name("New thread")
+                    .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                        chrome_ui::NewTab::Thread,
+                    )))
+                    .into(),
+                    widget::button::standard(format!(
+                        "New terminal · {}",
+                        workspace_widget::shortcut_chords(
+                            workspace_widget::GlobalShortcut::NewTerminal,
+                            &self.settings.keyboard_shortcuts
+                        )
+                    ))
+                    .id(widget::Id::new("empty.new-terminal"))
+                    .name("New terminal")
+                    .leading_icon(crate::ui_controls::symbolic_icon(
+                        "utilities-terminal-symbolic",
+                    ))
+                    .on_press(Message::NewTerminal)
+                    .into(),
+                    widget::button::standard(if cfg!(feature = "integrated-browser") {
+                        "New browser"
+                    } else {
+                        "Open in system browser…"
+                    })
+                    .id(widget::Id::new("empty.new-browser"))
+                    .name("New browser")
+                    .leading_icon(crate::ui_controls::symbolic_icon(
+                        "internet-web-browser-symbolic",
+                    ))
+                    .on_press(Message::NewBrowser)
+                    .into(),
+                ];
+                buttons
             };
             let actions: Element<'_, Message> = if matches!(
                 design::ShellLayout::for_width(window_width).dock,
@@ -14011,16 +15562,47 @@ impl Application for Cagents {
                         .icon()
                         .size(32)
                         .into(),
-                    widget::text::title2("Start a workspace").into(),
-                    widget::text::body(
-                        "Open a folder for project context, or start a standalone terminal.",
-                    )
+                    widget::text::title2(if scoped {
+                        format!("{scope_name} has no panes")
+                    } else {
+                        "Start a workspace".into()
+                    })
+                    .into(),
+                    widget::text::body(if scoped {
+                        "Start a thread or terminal in this workspace."
+                    } else {
+                        "Start a conversation or terminal, or open a project folder."
+                    })
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                     .into(),
-                    design::caption(STARTING_DIRECTORY_CAPTION.as_str())
+                    design::caption(format!("Directory: {}", display_path(&directory)))
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                     actions,
+                    if scoped {
+                        iced::widget::Space::new().into()
+                    } else {
+                        let mut providers: Vec<Element<'_, Message>> = crate::agent::Provider::ALL
+                            .into_iter()
+                            .map(|provider| {
+                                widget::row::with_children(vec![
+                                    design::body(provider.label()).width(Length::Fill).into(),
+                                    design::caption(self.account_ui.provider_status(provider))
+                                        .into(),
+                                ])
+                                .spacing(design::GRID_UNIT * 2.0)
+                                .into()
+                            })
+                            .collect();
+                        providers.push(
+                            widget::button::standard("Manage agent accounts")
+                                .on_press(Message::AccountUi(account_ui::Action::OpenPane))
+                                .into(),
+                        );
+                        widget::column::with_children(providers)
+                            .spacing(design::GRID_UNIT)
+                            .into()
+                    },
                 ])
                 .spacing(spacing.space_s)
                 .max_width(CONTENT_MAX_WIDTH),
@@ -14110,13 +15692,15 @@ impl Application for Cagents {
                 |width| Message::ContextInspector(InspectorAction::Resize { width }),
                 || Message::ContextInspector(InspectorAction::ResizeFinished),
             )
+            .default_width(design::INSPECTOR_DEFAULT_WIDTH)
             .into();
             let pane = crate::interaction::reveal_width(
                 self.context_panel(context_model, width),
                 width,
                 progress,
             );
-            match inspector::mount_for_width(window_width, true, true)
+            match self
+                .context_inspector_mount()
                 .expect("an open contextual inspector with a model has a mount")
             {
                 InspectorLayout::Docked => {
@@ -14157,7 +15741,12 @@ impl Application for Cagents {
                                 .class(cosmic::theme::Container::custom(|_| {
                                     iced::widget::container::Style {
                                         background: Some(iced::Background::Color(
-                                            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                                            iced::Color::from_rgba(
+                                                0.0,
+                                                0.0,
+                                                0.0,
+                                                design::SCRIM_ALPHA,
+                                            ),
                                         )),
                                         ..Default::default()
                                     }
@@ -14194,6 +15783,21 @@ impl Application for Cagents {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
+        let switcher = self
+            .palette_surface()
+            .or_else(|| self.pane_rename_surface())
+            .or_else(|| self.workspace_switcher())
+            .map_or_else(
+                || iced::widget::Space::new().into(),
+                |switcher| {
+                    widget::container(switcher)
+                        .align_x(Alignment::Center)
+                        .padding(2.0 * design::HEADER_HEIGHT)
+                        .width(Length::Fill)
+                        .into()
+                },
+            );
+        let surface = crate::interaction::layer(surface, switcher);
         let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
@@ -14279,6 +15883,9 @@ fn spawn_browser(
     };
     BrowserHandle::spawn(restore, visible, fallback)
         .map(|handle| BrowserRuntime {
+            progress_phase: 0.0,
+            address_focused: false,
+            address_error: false,
             handle,
             ime: None,
             lifecycle: if visible {
@@ -15324,12 +16931,12 @@ mod tests {
         let snapshot = write(WriteSubject::Workspace { card: Some(card) });
         let line = quarantined_write_line(&snapshot, &titled);
         assert!(
-            line.starts_with("Window layout and cards (card “build” was refused)"),
+            line.starts_with("Window layout and panes (pane “build” was refused)"),
             "{line}"
         );
-        assert!(line.contains("closing the card clears it"), "{line}");
+        assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&snapshot, &untitled);
-        assert!(line.contains("(one card was refused)"), "{line}");
+        assert!(line.contains("(one pane was refused)"), "{line}");
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,
@@ -15337,11 +16944,11 @@ mod tests {
         });
         let line = quarantined_write_line(&relaunch, &titled);
         assert!(line.starts_with("Relaunched terminal “build”"), "{line}");
-        assert!(line.contains("closing the card clears it"), "{line}");
+        assert!(line.contains("closing the pane clears it"), "{line}");
 
         let line = quarantined_write_line(&write(WriteSubject::Workspace { card: None }), &titled);
-        assert!(line.starts_with("Window layout and cards —"), "{line}");
-        assert!(!line.contains("closing the card"), "{line}");
+        assert!(line.starts_with("Window layout and panes —"), "{line}");
+        assert!(!line.contains("closing the pane"), "{line}");
     }
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
@@ -15370,10 +16977,10 @@ mod tests {
             &KeyboardShortcuts::default(),
         );
         assert_eq!(chrome.caption, caption);
-        assert_eq!(chrome.resize_name, "Resize Browser column Example");
+        assert_eq!(chrome.resize_name, "Resize Browser pane Example");
         assert_eq!(
             chrome.accessible_name(true),
-            "Browser column Example, https://example.test/private%20path, focused"
+            "Browser pane Example, https://example.test/private%20path, focused"
         );
         for presented in [chrome.caption.as_str(), chrome.accessible_name(true)] {
             assert!(!presented.contains("alice"));
@@ -15458,7 +17065,10 @@ mod tests {
             "https://alice:password@example .test/path?token=secret".into(),
         );
         assert_eq!(malformed.submit(), Err(()));
-        assert_eq!(malformed.as_str(), SanitizedLocation::INVALID);
+        assert_eq!(
+            malformed.as_str(),
+            "https://alice:password@example .test/path?token=secret"
+        );
     }
     #[test]
     fn application_close_sequence_visits_every_unresolved_repository_card() {
@@ -15724,6 +17334,7 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(1600.0);
         app.cards.insert(second_id, CardRuntime::Loading);
+        drop(app.update_chrome(chrome_ui::Action::HoverTab(Some(second_id))));
         assert!(!app.workspace_inputs_blocked());
         let renderer = headless_renderer();
         let mut tree = Tree::empty();
@@ -15734,6 +17345,7 @@ mod tests {
             let mut element = frame(&app);
             NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
             tree.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut tree);
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
@@ -15873,6 +17485,7 @@ mod tests {
                 *named.borrow_mut() = state.take_all_named();
             });
             state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
             let node = element.as_widget_mut().layout(
                 &mut state,
                 &renderer,
@@ -16683,6 +18296,7 @@ mod tests {
             *named.borrow_mut() = tree.take_all_named();
         });
         tree.diff(element.as_widget_mut());
+        iced::runtime::user_interface::restore_cached_named_states(tree);
         let node = element.as_widget_mut().layout(
             tree,
             renderer,
@@ -17896,7 +19510,7 @@ mod tests {
         );
 
         app.pull_request_dialog = None;
-        app.window_width = design::WIDE_BREAKPOINT - 1.0;
+        app.window_width = 900.0;
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
@@ -17925,7 +19539,7 @@ mod tests {
 
         // The compositor's first narrow size is the real startup transition.
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
+        let _focus_close = app.update(Message::WindowResized(900.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert!(app.context_inspector_overlay_active);
         assert!(app.workspace_inputs_blocked());
@@ -17985,7 +19599,7 @@ mod tests {
         let _open_docked = app.update(Message::ToggleContextInspector);
         assert!(!app.context_inspector_is_overlay());
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
+        let _focus_close = app.update(Message::WindowResized(900.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
             app.context_inspector_restore_focus
@@ -17994,12 +19608,11 @@ mod tests {
             Some(context_inspector_toggle_id().to_string())
         );
 
-        // An open inspector remains mounted even before a first card arrives,
-        // so its window controls remain reachable on a narrow empty workspace.
+        // A first-run workspace gives the full canvas to onboarding.
         let mut startup = context_inspector_test_app(false);
-        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
-        assert!(startup.context_inspector_is_overlay());
-        assert!(startup.context_inspector_overlay_active);
+        let _narrow = startup.update(Message::WindowResized(900.0, 900.0));
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
         assert_eq!(
             startup
                 .context_inspector_restore_focus
@@ -18035,16 +19648,16 @@ mod tests {
         assert!(!startup.context_inspector_overlay_active);
         assert!(startup.context_inspector_restore_focus.is_none());
 
-        // Closing the final card leaves the open inspector and window controls
-        // mounted; only explicitly closing the inspector restores outer focus.
+        // Closing the final card returns the empty scope to the full canvas;
+        // inspector tools need a focused pane or selected project context.
         let _focus_close = startup.update(Message::ToggleContextInspector);
         assert!(startup.context_inspector_overlay_active);
         let final_card = startup.workspace.focused().unwrap();
         startup.workspace.request_close(final_card).unwrap();
         let _restore_focus = startup.update(Message::CommitClose(final_card));
         assert!(startup.workspace.focused().is_none());
-        assert!(startup.context_inspector_is_overlay());
-        assert!(startup.context_inspector_overlay_active);
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
         let _restore_focus = startup.update(Message::ContextInspector(InspectorAction::Close));
         settle_context_inspector_transition(&mut startup);
         assert!(!startup.context_inspector_is_overlay());
@@ -18641,14 +20254,21 @@ mod tests {
             .unwrap();
         app.cards
             .insert(card, CardRuntime::Terminal(TerminalSurface::from(handle)));
-        let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         server.join().unwrap();
         let notices = app.notices.entries.len();
-
-        drop(app.update(Message::TerminalWake {
-            card,
-            generation: wake.generation,
-        }));
+        // Connecting can announce a repaint before the protocol error arrives.
+        // Drive every wake as the application does, rather than assuming the
+        // first notification already contains the failed attachment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(app.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+            let wake = wake_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the failed attachment wakes the application");
+            drop(app.update(Message::TerminalWake {
+                card,
+                generation: wake.generation,
+            }));
+        }
         // The attach-only path took it up again; a relaunch would have made
         // the card hydrate.
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
@@ -18785,11 +20405,11 @@ mod tests {
         app.refresh_sidebar_channels();
 
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
-        let root = WorkspaceDestination::from_action(&destinations[0]).unwrap();
-        let feature = WorkspaceDestination::from_action(&destinations[1]).unwrap();
+        let root = WorkspaceDestination::from_action(&destinations[1]).unwrap();
+        let feature = WorkspaceDestination::from_action(&destinations[2]).unwrap();
         let channel = WorkspaceDestination::Channel(channel);
-        // Sidebar order is root, feature, channel; visit order deliberately differs.
-        for index in [0, 1, 2, 0] {
+        // Sidebar order is channel, root, feature; visit order deliberately differs.
+        for index in [1, 2, 0, 1] {
             drop(app.update(Message::Sidebar(destinations[index].clone())));
         }
         let next = |modifiers| Message::KeyEvent {
@@ -18806,34 +20426,64 @@ mod tests {
         };
         let alt = keyboard::Modifiers::ALT;
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(channel)
+        );
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(feature)
+        );
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::ModifiersChanged(alt | keyboard::Modifiers::SHIFT),
             captured: false,
         }));
         drop(app.update(next(alt | keyboard::Modifiers::SHIFT)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(root));
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
             captured: false,
         }));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
         // Intermediate feature preview did not become more recent than root.
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(root)
+        );
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
             window::Id::RESERVED,
             false,
         ))));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(channel)
+        );
         app.settings_reset_confirm = true;
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
     }
 
     #[test]
@@ -19101,6 +20751,44 @@ mod tests {
     }
 
     #[test]
+    fn layout_scroll_feedback_requests_camera_sync_without_cancelling_reveal() {
+        let mut workspace = Workspace::default();
+        for index in 0..4 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Pane", CardWidth::Fixed(480.0)).unwrap(),
+                    index,
+                    index == 3,
+                )
+                .unwrap();
+        }
+        workspace.resize_viewport(600.0);
+        workspace.tick(Duration::from_secs(1));
+        let target = workspace.camera().target();
+        let (_, synchronize) = update_workspace_viewport(
+            &mut workspace,
+            WorkspaceViewportEvent::Scrolled(crate::workspace_widget::ViewportSample {
+                offset: 0.0,
+                width: 600.0,
+                user_input: false,
+            }),
+        );
+        assert!(synchronize);
+        assert_eq!(workspace.camera().target(), target);
+
+        let (_, synchronize) = update_workspace_viewport(
+            &mut workspace,
+            WorkspaceViewportEvent::Scrolled(crate::workspace_widget::ViewportSample {
+                offset: 0.0,
+                width: 600.0,
+                user_input: true,
+            }),
+        );
+        assert!(!synchronize);
+        assert_eq!(workspace.camera().target(), 0.0);
+    }
+
+    #[test]
     fn viewport_resize_preserves_focused_card_reveal_and_requests_synchronization() {
         let config = WorkspaceConfig::default();
         let mut workspace = Workspace::new(config).unwrap();
@@ -19184,6 +20872,144 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_rename_task_persists_the_override_for_window_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("title-persistence-test"),
+        )
+        .unwrap();
+        let store = session.operation_store();
+        let mut app = context_inspector_test_app(true);
+        app.session = Some(session);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let source = app.workspace.focused().unwrap();
+        let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+        let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
+        let task = app.update_chrome(chrome_ui::Action::RenameSubmit);
+        settle_settings_task(&mut app, task);
+
+        // Drive the action's actual returned task. A manual capture would
+        // pass even when RenameSubmit forgot to schedule WindowView saving.
+        let saved = store
+            .load_window_view()
+            .unwrap()
+            .expect("rename saved its window view");
+        let restored: WindowView = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.user_titles[&source], "Release review");
+        app.chrome_ui = chrome_ui::State::default().with_user_titles(restored.user_titles);
+        assert!(!app.apply_reported_title(source, "automatic process title".into()));
+        assert_eq!(
+            app.repository_chrome(app.card_state(source).unwrap()).0,
+            "Release review"
+        );
+    }
+
+    #[test]
+    fn pane_clone_preserves_explicit_titles_across_later_process_reports() {
+        for chat in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = context_inspector_test_app(true);
+            app.settings_path = Some(directory.path().join("settings.toml"));
+            app.settings_write_blocked = false;
+            app.context_inspector_open = false;
+            let source = app.workspace.focused().unwrap();
+            if chat {
+                let mut recipe = launch_recipe("/tmp");
+                recipe.program = "claude".into();
+                app.card_state_mut(source).unwrap().kind = CardKind::Chat(crate::chat::Session {
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    id: TerminalId::new(),
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: None,
+                    terminal: None,
+                });
+            }
+            let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+            let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
+            let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
+            app.chrome_ui.tabs_focus = Some(source);
+            let before_clone = app.settings_save_generation;
+            let _ = app.clone_focused_pane();
+            let cloned = app.workspace.focused().unwrap();
+            assert_ne!(cloned, source);
+            assert_eq!(app.chrome_ui.tabs_focus, Some(cloned));
+            assert!(app.settings_save_generation > before_clone);
+            assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
+            assert_eq!(app.chrome_ui.user_titles[&cloned], "Release review");
+            assert!(!app.apply_reported_title(cloned, "automatic process title".into()));
+            assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
+        }
+    }
+
+    #[test]
+    fn reopening_a_renamed_pane_keeps_its_title_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        app.context_inspector_open = false;
+        let source = app.workspace.focused().unwrap();
+        let _ = app.update_chrome(chrome_ui::Action::Rename(source));
+        let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release logs".into()));
+        let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
+        app.recently_closed.push((
+            app.card_state(source).unwrap().clone(),
+            app.active_workspace_destination(),
+        ));
+        app.chrome_ui.tabs_focus = Some(source);
+        let before_reopen = app.settings_save_generation;
+        let _ = app.run_workspace_command(
+            workspace_widget::GlobalShortcut::ReopenPane,
+            keyboard::Modifiers::empty(),
+        );
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, source);
+        assert_eq!(app.chrome_ui.tabs_focus, Some(reopened));
+        assert!(app.settings_save_generation > before_reopen);
+        assert!(app.recently_closed.is_empty());
+        assert_eq!(app.chrome_ui.user_titles[&reopened], "Release logs");
+        assert!(!app.apply_reported_title(reopened, "automatic process title".into()));
+        assert_eq!(app.card_state(reopened).unwrap().title, "Release logs");
+    }
+
+    #[test]
+    fn saved_title_overrides_keep_durable_and_recent_panes_without_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings_write_blocked = false;
+        let durable = app.durable.cards[0].id;
+        let mut recent = app.durable.cards[0].clone();
+        recent.id = CardId::new();
+        let recent_id = recent.id;
+        let orphan = CardId::new();
+        app.recently_closed.push((recent, None));
+        for id in [durable, recent_id, orphan] {
+            app.chrome_ui.user_titles.insert(id, "Custom title".into());
+        }
+        let saved = app.capture_settings_save().unwrap();
+        assert_eq!(saved.view.user_titles.len(), 2);
+        assert!(saved.view.user_titles.contains_key(&durable));
+        assert!(saved.view.user_titles.contains_key(&recent_id));
+        assert!(!app.chrome_ui.user_titles.contains_key(&orphan));
+        app.recently_closed.clear();
+        assert!(
+            !app.capture_settings_save()
+                .unwrap()
+                .view
+                .user_titles
+                .contains_key(&recent_id)
+        );
+    }
+
+    #[test]
     fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
@@ -19208,6 +21034,11 @@ mod tests {
         let _unpolled = app.clone_focused_pane();
         let cloned = app.workspace.focused().unwrap();
         assert_ne!(cloned, source_id);
+        assert_eq!(
+            app.card_state(cloned).unwrap().title,
+            crate::app::chat_ui::chat_card_title(crate::agent::Provider::Claude),
+            "unnamed chat clones retain the provider's default title"
+        );
         let CardKind::Chat(copy) = &app.card_state(cloned).unwrap().kind else {
             panic!("cloned conversation must stay native");
         };
@@ -19279,6 +21110,47 @@ mod tests {
             )),
         );
         card
+    }
+
+    #[test]
+    fn editor_language_results_reveal_details_from_the_files_tab() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        for action in [
+            repository_widget::EditorLspAction::Diagnostics,
+            repository_widget::EditorLspAction::References,
+        ] {
+            app.context_tab = ContextTab::Files;
+            app.context_inspector_open = false;
+            let _ = app.update(Message::Repository(RepositoryAction::Language {
+                card,
+                action,
+            }));
+            assert!(app.context_inspector_open);
+            assert_eq!(
+                app.context_tab,
+                ContextTab::Details,
+                "opening the file tree hides the requested language results"
+            );
+        }
+        let doc = LspDocumentId(1);
+        let request = crate::lsp::LspRequestId(1);
+        app.lsp_documents.insert(doc, card);
+        lsp_state(&mut app, card).editor_navigation = Some(request);
+        app.context_tab = ContextTab::Files;
+        app.context_inspector_open = false;
+        let _ = app.update(Message::Lsp(LspEvent::Locations {
+            doc,
+            request,
+            kind: crate::lsp::LocationKind::Definition,
+            items: Vec::new(),
+        }));
+        assert!(app.context_inspector_open);
+        assert_eq!(
+            app.context_tab,
+            ContextTab::Details,
+            "a definition response that cannot jump must expose its results"
+        );
     }
 
     fn lsp_state(app: &mut Cagents, card: CardId) -> &mut LspInspectorState {
@@ -19967,10 +21839,18 @@ mod tests {
         Cagents {
             workspace,
             durable,
+            terminal_working_directories: HashMap::new(),
+            terminal_find: HashMap::new(),
+            terminal_context: None,
+            terminal_paste: None,
             cards: card_id
                 .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
+            card_indices: HashMap::new(),
+            navigation_cache: sidebar::NavigationCache::default(),
+            palette: palette_ui::State::default(),
+            recently_closed: Vec::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -20757,6 +22637,8 @@ mod tests {
             CardKind::PullRequests(crate::model::PullRequestView {
                 repository: PathBuf::from("/repo"),
                 selected_number: None,
+                file_panel_width: None,
+                file_panel_collapsed: None,
             }),
         ];
         for kind in kinds {
@@ -21229,6 +23111,36 @@ mod tests {
     }
 
     #[test]
+    fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+        assert!(runtime.selected_staging_selection(true).is_some());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let key = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("s".into()),
+                modified_key: keyboard::Key::Character("S".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        };
+        assert!(matches!(
+            task_app_message(app.update(key())),
+            Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
+                if id == card
+        ));
+        app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
+        drop(app.update(key()));
+        assert!(app.palette.is_open());
+    }
+
+    #[test]
     fn ctrl_w_closes_the_focused_card_and_is_a_no_op_without_cards() {
         let mut workspace = Workspace::default();
         assert!(close_focused_message(&workspace).is_none());
@@ -21320,7 +23232,7 @@ mod tests {
         // Deliberately do not execute the returned COSMIC actions: input can
         // arrive before the runtime has applied the previous scale action.
         let _ = app.apply_setting_input(SettingsField::UiScale, "1.25".into());
-        assert!(app.context_inspector_is_overlay());
+        assert!(!app.context_inspector_is_overlay());
         let _ = app.apply_setting_input(SettingsField::UiScale, "1.5".into());
         assert!((app.window_width - original_width / 1.5).abs() < 0.01);
         let _ = app.apply_setting_input(SettingsField::UiScale, "NaN".into());
@@ -21337,7 +23249,7 @@ mod tests {
         assert!(matches!(
             settings_update(&settings, SettingsField::MaxHotCards, "0"),
             SettingsDecision::Invalid(message)
-                if message == "Maximum hot columns must be a whole number, at least 1."
+                if message == "Maximum hot panes must be a whole number, at least 1."
         ));
         assert!(matches!(
             settings_update(&settings, SettingsField::ManagedWorktreeDirectory, " "),
@@ -21618,6 +23530,7 @@ mod tests {
             SidebarAction::Commit {
                 key: discard_key(),
                 message: "wip".into(),
+                amend: false,
             },
             SidebarAction::Refresh,
         ] {

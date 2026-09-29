@@ -328,6 +328,16 @@ fn font(family: &'static str, key: Face) -> Font {
 /// would leak per frame. Each distinct name is therefore leaked exactly once,
 /// so repeated frames - and an edit back to a name already seen - allocate
 /// nothing. The set of families a user types is bounded in practice.
+pub(crate) fn monospace_font(family: &str) -> Font {
+    font(
+        intern_family(family),
+        Face {
+            bold: false,
+            italic: false,
+        },
+    )
+}
+
 fn intern_family(family: &str) -> &'static str {
     static INTERNED: LazyLock<Mutex<HashSet<&'static str>>> =
         LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -663,8 +673,19 @@ impl<'a> SelectionGrid<'a> {
     }
 
     /// Last occupied display cell, including the tail of a wide grapheme.
+    fn wrapped(self, row: u64) -> bool {
+        row.checked_sub(self.offset)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.rows.get(index))
+            .is_some_and(|row| row.wrapped)
+    }
+
+    /// Last occupied display cell, including the tail of a wide grapheme.
     fn content_end(self, row: u64) -> Option<u16> {
         let cells = self.cells(row)?;
+        if self.wrapped(row) {
+            return u16::try_from(cells.len().checked_sub(1)?).ok();
+        }
         let (column, cell) = cells
             .iter()
             .enumerate()
@@ -866,7 +887,7 @@ fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell))
     };
     let mut text = String::new();
     for row in span.0.row..=span.1.row {
-        if row > span.0.row {
+        if row > span.0.row && !grid.wrapped(row - 1) {
             text.push('\n');
         }
         let Some((first, last)) = grid.selected_columns(span, row) else {
@@ -894,7 +915,9 @@ fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell))
                 text.push(' ');
             }
         }
-        text.truncate(line + text[line..].trim_end().len());
+        if !grid.wrapped(row) {
+            text.truncate(line + text[line..].trim_end().len());
+        }
     }
     text
 }
@@ -949,6 +972,11 @@ impl PtySize {
 
 #[derive(Default)]
 struct WidgetState {
+    history_total: u64,
+    completed_read_only: bool,
+    shortcut_keys: Vec<keyboard::key::Physical>,
+    select_all_request: u64,
+    selection_reset: u64,
     pty_size: PtySize,
     input_focused: bool,
     focused: bool,
@@ -1315,6 +1343,14 @@ type LinkMapper<Message> = dyn Fn(url::Url, crate::settings::LinkOpenGesture) ->
 /// Only web addresses and local file URLs are activatable; arbitrary schemes
 /// from terminal output must not invoke external handlers.
 fn printed_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
+    if let Some(link) = row
+        .hyperlinks
+        .iter()
+        .find(|link| link.start <= column && column < link.end)
+    {
+        let url = url::Url::parse(&link.uri).ok()?;
+        return matches!(url.scheme(), "http" | "https" | "file").then_some(url);
+    }
     let column = usize::from(column);
     let cell = row.cells.get(column)?;
     let boundary = |cell: &CellSnapshot| {
@@ -1359,6 +1395,88 @@ fn printed_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
     }
 }
 
+fn terminal_link_at(
+    snapshot: &RenderSnapshot,
+    row: usize,
+    column: u16,
+    cwd: &std::path::Path,
+) -> Option<url::Url> {
+    let line = snapshot.lines.get(row)?;
+    if !line.hyperlinks.is_empty()
+        && let Some(url) = printed_link_at(line, column)
+    {
+        return Some(url);
+    }
+    let mut first = row;
+    while first > 0 && snapshot.lines[first - 1].wrapped {
+        first -= 1;
+    }
+    let mut last = row;
+    while last + 1 < snapshot.lines.len() && snapshot.lines[last].wrapped {
+        last += 1;
+    }
+    let combined = if first == last {
+        std::borrow::Cow::Borrowed(line.as_ref())
+    } else {
+        let mut combined = RowSnapshot::default();
+        for line in &snapshot.lines[first..=last] {
+            combined.cells.extend_from_slice(&line.cells);
+        }
+        std::borrow::Cow::Owned(combined)
+    };
+    let offset = snapshot.lines[first..row]
+        .iter()
+        .map(|row| row.cells.len())
+        .sum::<usize>()
+        + usize::from(column);
+    let offset = u16::try_from(offset).ok()?;
+    if let Some(url) = printed_link_at(&combined, offset) {
+        return Some(url);
+    }
+    // Compiler locations are word tokens, optionally surrounded by prose.
+    let boundary = |cell: &CellSnapshot| {
+        cell.text
+            .as_str()
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
+    };
+    let index = usize::from(offset);
+    if boundary(combined.cells.get(index)?) {
+        return None;
+    }
+    let start = combined.cells[..index]
+        .iter()
+        .rposition(boundary)
+        .map_or(0, |index| index + 1);
+    let end = combined.cells[index..]
+        .iter()
+        .position(boundary)
+        .map_or(combined.cells.len(), |end| index + end);
+    let text: String = combined.cells[start..end]
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect();
+    let text = text.trim_matches(['(', ')', '[', ']', '{', '}', ',', ';']);
+    let (path, final_number) = text.rsplit_once(':')?;
+    let final_number = final_number
+        .parse::<usize>()
+        .ok()
+        .filter(|number| *number > 0)?;
+    let (path, line, column) = match path.rsplit_once(':') {
+        Some((path, line)) if line.parse::<usize>().is_ok() => {
+            (path, line.parse::<usize>().ok()?, final_number)
+        }
+        _ => (path, final_number, 1),
+    };
+    if path.is_empty() || path.contains("://") || line == 0 {
+        return None;
+    }
+    let path = cwd.join(path);
+    let mut url = url::Url::from_file_path(path).ok()?;
+    url.set_fragment(Some(&format!("L{line}:{column}")));
+    Some(url)
+}
+
 /// A lock-free iced view over a single immutable terminal snapshot.
 ///
 /// Construct this in the application's `view` function. It loads ArcSwap once,
@@ -1380,8 +1498,16 @@ pub struct TerminalWidget<Message> {
     model_focused: bool,
     on_focus: Option<Message>,
     on_read_only_submit: Option<Message>,
+    on_shortcut: Option<Box<dyn Fn(keyboard::Event) -> Option<Message>>>,
+    on_context: Option<Box<dyn Fn(Point, Option<super::SearchMatch>, Option<url::Url>) -> Message>>,
+    on_copy: Option<Box<dyn Fn(super::SearchMatch) -> Message>>,
+    on_paste: Option<Box<dyn Fn(String) -> Message>>,
     on_command_error: Option<Arc<ErrorMapper<Message>>>,
     on_open_link: Option<Box<LinkMapper<Message>>>,
+    working_directory: std::path::PathBuf,
+    find_matches: Option<(Arc<[super::SearchMatch]>, usize)>,
+    select_all_request: u64,
+    selection_reset: u64,
     _message: PhantomData<fn() -> Message>,
 }
 
@@ -1416,10 +1542,47 @@ impl<Message> TerminalWidget<Message> {
             model_focused: false,
             on_focus: None,
             on_read_only_submit: None,
+            on_shortcut: None,
+            on_context: None,
+            on_copy: None,
+            on_paste: None,
             on_command_error: None,
             on_open_link: None,
+            working_directory: std::path::PathBuf::from("/"),
+            find_matches: None,
+            select_all_request: 0,
+            selection_reset: 0,
             _message: PhantomData,
         }
+    }
+
+    /// Names the input surface for focus handoffs from tabs and other panes.
+    pub fn find_matches(mut self, matches: Option<(Arc<[super::SearchMatch]>, usize)>) -> Self {
+        self.find_matches = matches;
+        self
+    }
+    pub fn selection_reset(mut self, generation: u64) -> Self {
+        self.selection_reset = generation;
+        self
+    }
+    pub fn select_all_request(mut self, request: u64) -> Self {
+        self.select_all_request = request;
+        self
+    }
+    pub fn on_context(
+        mut self,
+        callback: impl Fn(Point, Option<super::SearchMatch>, Option<url::Url>) -> Message + 'static,
+    ) -> Self {
+        self.on_context = Some(Box::new(callback));
+        self
+    }
+    pub fn on_paste(mut self, callback: impl Fn(String) -> Message + 'static) -> Self {
+        self.on_paste = Some(Box::new(callback));
+        self
+    }
+    pub fn on_copy(mut self, callback: impl Fn(super::SearchMatch) -> Message + 'static) -> Self {
+        self.on_copy = Some(Box::new(callback));
+        self
     }
 
     /// Names the input surface for focus handoffs from tabs and other panes.
@@ -1445,6 +1608,11 @@ impl<Message> TerminalWidget<Message> {
         } else {
             DEFAULT_FONT_SIZE
         };
+        self
+    }
+
+    pub fn working_directory(mut self, path: std::path::PathBuf) -> Self {
+        self.working_directory = path;
         self
     }
 
@@ -1534,6 +1702,14 @@ impl<Message> TerminalWidget<Message> {
         self
     }
 
+    pub fn on_shortcut(
+        mut self,
+        callback: impl Fn(keyboard::Event) -> Option<Message> + 'static,
+    ) -> Self {
+        self.on_shortcut = Some(Box::new(callback));
+        self
+    }
+
     /// Ctrl-click opens a printed web address, including in mouse-reporting TUIs.
     pub fn on_open_link(
         mut self,
@@ -1587,9 +1763,6 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn apply_scroll(&self, scroll: ViewportScroll, shell: &mut Shell<'_, Message>) {
-        if self.read_only {
-            return;
-        }
         if let Err(error) = scroll.apply(&self.handle) {
             self.publish_error(error, shell);
         }
@@ -1634,9 +1807,6 @@ impl<Message> TerminalWidget<Message> {
         geometry: TerminalGeometry,
         shell: &mut Shell<'_, Message>,
     ) {
-        if self.read_only {
-            return;
-        }
         match state
             .pty_size
             .observe(geometry.terminal_size(), Instant::now())
@@ -1732,12 +1902,25 @@ impl<Message> TerminalWidget<Message> {
         let text = selection_text(grid, selection.span(grid));
         (!text.trim().is_empty()).then_some(text)
     }
+    fn selected_range(&self, state: &WidgetState) -> Option<super::SearchMatch> {
+        let (start, end) = state.selection?.span(self.selection_grid());
+        Some(super::SearchMatch {
+            start_row: start.row,
+            start_column: start.column,
+            end_row: end.row,
+            end_column: end.column.saturating_add(1),
+        })
+    }
 
     /// Sends pasted text to the child. The terminal's owner encodes it, since
     /// only the owner knows whether the child is expecting a bracketed paste
     /// at the moment the text arrives.
     fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
         if self.read_only || text.is_empty() {
+            return;
+        }
+        if let Some(callback) = &self.on_paste {
+            shell.publish(callback(text.to_owned()));
             return;
         }
         if let Err(error) = self.handle.paste(text, PasteOrigin::Clipboard) {
@@ -1846,7 +2029,29 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_mut::<WidgetState>();
+        if self.snapshot.scroll.total < state.history_total
+            || (self.read_only && !state.completed_read_only)
+            || self.selection_reset != state.selection_reset
+        {
+            state.selection = None;
+            state.selecting = false;
+            state.selection_click = None;
+        }
+        state.selection_reset = self.selection_reset;
+        state.history_total = self.snapshot.scroll.total;
+        state.completed_read_only = self.read_only;
         self.synchronize_size(state, geometry, shell);
+        if state.select_all_request != self.select_all_request {
+            state.select_all_request = self.select_all_request;
+            state.selection = Some(Selection {
+                anchor: SelectionCell { row: 0, column: 0 },
+                head: SelectionCell {
+                    row: self.snapshot.scroll.total.saturating_sub(1),
+                    column: self.snapshot.columns.saturating_sub(1),
+                },
+                mode: SelectionMode::Line,
+            });
+        }
         self.synchronize_focus(state, shell);
         // Switching to or from the alternate screen replaces the whole grid,
         // and scrollback coordinates do not carry across that swap.
@@ -1859,8 +2064,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar = TerminalScrollbar::new(bounds, self.snapshot.scroll)
-            .filter(|_| self.model_focused && !self.read_only);
+        let scrollbar =
+            TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -1902,6 +2107,29 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         }
 
         match event {
+            Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Right))
+                if cursor.is_over(bounds)
+                    && (!self.snapshot.scroll.mouse_tracking || state.modifiers.shift) =>
+            {
+                if let Some(callback) = &self.on_context {
+                    let cell =
+                        self.cell_at(geometry, cursor.position().expect("cursor over terminal"));
+                    let link = terminal_link_at(
+                        &self.snapshot,
+                        usize::from(cell.1),
+                        cell.0,
+                        &self.working_directory,
+                    );
+                    let pointer = cursor.position().expect("cursor over terminal");
+                    shell.publish(callback(
+                        Point::new(pointer.x - bounds.x, pointer.y - bounds.y),
+                        self.selected_range(state),
+                        link,
+                    ));
+                    shell.capture_event();
+                    return;
+                }
+            }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modified_key,
@@ -1911,6 +2139,19 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 repeat,
                 ..
             }) if self.model_focused => {
+                if let Some(message) = self.on_shortcut.as_ref().and_then(|callback| {
+                    let Event::Keyboard(event) = event else {
+                        return None;
+                    };
+                    callback(event.clone())
+                }) {
+                    if !state.shortcut_keys.contains(physical_key) {
+                        state.shortcut_keys.push(*physical_key);
+                    }
+                    shell.publish(message);
+                    shell.capture_event();
+                    return;
+                }
                 state.modifiers = map_iced_modifiers(*modifiers);
                 // Copy, paste and dropping a selection are this widget's
                 // chords, never the child's, and each is captured even when it
@@ -1918,7 +2159,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if let Some(chord) = clipboard_chord(key, *physical_key, *modifiers) {
                     match chord {
                         ClipboardChord::Copy => {
-                            if let Some(text) = self.selected_text(state) {
+                            if let Some(callback) = &self.on_copy
+                                && let Some(range) = self.selected_range(state)
+                            {
+                                shell.publish(callback(range));
+                            } else if let Some(text) = self.selected_text(state) {
                                 clipboard.write(clipboard::Kind::Standard, text);
                             }
                         }
@@ -1997,6 +2242,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if let Some(index) = state
+                    .shortcut_keys
+                    .iter()
+                    .position(|key| key == physical_key)
+                {
+                    state.shortcut_keys.swap_remove(index);
+                    shell.capture_event();
+                    return;
+                }
                 if self.snapshot.scroll.scrollable()
                     && viewport_scroll(key, *modifiers, geometry.rows).is_some()
                 {
@@ -2027,8 +2281,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     if *button == IcedMouseButton::Left
                         && state.modifiers.control
                         && let Some(open) = &self.on_open_link
-                        && let Some(row) = self.snapshot.lines.get(usize::from(cell.1))
-                        && let Some(url) = printed_link_at(row, cell.0)
+                        && let Some(url) = terminal_link_at(
+                            &self.snapshot,
+                            usize::from(cell.1),
+                            cell.0,
+                            &self.working_directory,
+                        )
                     {
                         shell.publish(open(
                             url,
@@ -2208,10 +2466,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
-                if self.read_only {
-                    shell.capture_event();
-                    return;
-                }
                 let travel = match delta {
                     ScrollDelta::Lines { y, .. } => WheelTravel::Notches(*y),
                     ScrollDelta::Pixels { y, .. } => WheelTravel::Rows(*y / geometry.cell_height),
@@ -2342,7 +2596,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
         if self.snapshot.detached {
@@ -2399,6 +2653,47 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // The wash goes over the cells' own backgrounds and under the
                 // glyphs, so selected text keeps every colour it had and only
                 // gains the accent behind it.
+                if let Some((matches, selected)) = &self.find_matches {
+                    let offset = self.snapshot.scroll.offset;
+                    let first = matches.partition_point(|hit| hit.end_row < offset);
+                    for (index, hit) in matches
+                        .iter()
+                        .enumerate()
+                        .skip(first)
+                        .take_while(|(_, hit)| hit.start_row < offset + rows.len() as u64)
+                    {
+                        for absolute in hit.start_row.max(offset)
+                            ..=hit.end_row.min(offset + rows.len() as u64 - 1)
+                        {
+                            let left = if absolute == hit.start_row {
+                                hit.start_column
+                            } else {
+                                0
+                            };
+                            let right = if absolute == hit.end_row {
+                                hit.end_column
+                            } else {
+                                column_limit as u16
+                            };
+                            if let Some(bounds) = geometry.run_bounds(
+                                left,
+                                right.saturating_sub(left),
+                                (absolute - offset) as u16,
+                            ) {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds,
+                                        border: Border::default(),
+                                        shadow: Shadow::default(),
+                                        snap: true,
+                                    },
+                                    Color::from(*theme.cosmic().accent_color())
+                                        .scale_alpha(if index == *selected { 0.5 } else { 0.2 }),
+                                );
+                            }
+                        }
+                    }
+                }
                 if let Some(selection) = state.selection {
                     let span = selection.span(self.selection_grid());
                     let columns = self.snapshot.columns.min(geometry.columns);
@@ -2457,6 +2752,52 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 drop(shaped);
 
+                if state.modifiers.control
+                    && let Some(position) = geometry.cursor_position(cursor)
+                {
+                    let (column, row) = self.cell_at(geometry, position);
+                    if terminal_link_at(
+                        &self.snapshot,
+                        usize::from(row),
+                        column,
+                        &self.working_directory,
+                    )
+                    .is_some()
+                        && let Some(line) = rows.get(usize::from(row))
+                    {
+                        let span = line
+                            .hyperlinks
+                            .iter()
+                            .find(|span| span.start <= column && column < span.end)
+                            .map(|span| (span.start, span.end))
+                            .unwrap_or_else(|| {
+                                let boundary = |cell: &CellSnapshot| {
+                                    cell.text.as_str().chars().any(char::is_whitespace)
+                                };
+                                let start = line.cells[..usize::from(column)]
+                                    .iter()
+                                    .rposition(boundary)
+                                    .map_or(0, |index| index + 1);
+                                let end = line.cells[usize::from(column)..]
+                                    .iter()
+                                    .position(boundary)
+                                    .map_or(line.cells.len(), |index| usize::from(column) + index);
+                                (start as u16, end as u16)
+                            });
+                        if let Some(bounds) =
+                            geometry.run_bounds(span.0, span.1.saturating_sub(span.0), row)
+                        {
+                            draw_decorations(
+                                renderer,
+                                bounds,
+                                default_foreground,
+                                Underline::Single,
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                }
                 if let Some((cursor, cell_bounds)) = self
                     .snapshot
                     .cursor
@@ -2533,10 +2874,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
-            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| {
-                !self.read_only
-                    && TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused)
-            }) {
+            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll)
+                .filter(|_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused))
+            {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: bar.thumb,
@@ -2596,12 +2936,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             let cell = self.cell_at(geometry, position);
             if tree.state.downcast_ref::<WidgetState>().modifiers.control
                 && self.on_open_link.is_some()
-                && self
-                    .snapshot
-                    .lines
-                    .get(usize::from(cell.1))
-                    .and_then(|row| printed_link_at(row, cell.0))
-                    .is_some()
+                && terminal_link_at(
+                    &self.snapshot,
+                    usize::from(cell.1),
+                    cell.0,
+                    &self.working_directory,
+                )
+                .is_some()
             {
                 return mouse::Interaction::Pointer;
             }
@@ -3208,6 +3549,14 @@ fn clipboard_chord(
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> Option<ClipboardChord> {
+    if key.as_ref() == keyboard::Key::Named(keyboard::key::Named::Insert)
+        && modifiers.shift()
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+    {
+        return Some(ClipboardChord::Paste);
+    }
     if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
         return None;
     }
@@ -3254,6 +3603,7 @@ mod tests {
             len: 20,
             alternate_screen: false,
             mouse_tracking: false,
+            bracketed_paste: false,
         };
         assert!(
             TerminalScrollbar::new(
@@ -3617,6 +3967,7 @@ mod tests {
                     len: 20,
                     alternate_screen: false,
                     mouse_tracking: false,
+                    bracketed_paste: false,
                 };
                 let bar = TerminalScrollbar::new(bounds, scroll).unwrap();
                 assert!(geometry.content_bounds.x + geometry.content_bounds.width <= bar.track.x);
@@ -3660,6 +4011,7 @@ mod tests {
             len: 20,
             alternate_screen: false,
             mouse_tracking: false,
+            bracketed_paste: false,
         };
         for width in [1.0, 4.0, 14.0] {
             let bounds = Rectangle {
@@ -4508,8 +4860,78 @@ mod tests {
 
     fn row(text: &str) -> Arc<RowSnapshot> {
         Arc::new(RowSnapshot {
+            wrapped: false,
+            hyperlinks: Vec::new(),
             cells: cells(text, |_, cell| cell),
         })
+    }
+
+    #[test]
+    fn copying_soft_wrapped_rows_preserves_spaces_and_hard_breaks() {
+        let mut first = (*row("long ")).clone();
+        first.wrapped = true;
+        let rows = vec![Arc::new(first), row("path"), row("next")];
+        let grid = selection_grid(&rows, 5);
+        assert_eq!(
+            selection_text(grid, (at(7, 0), at(9, 3))),
+            "long path\nnext"
+        );
+    }
+
+    #[test]
+    fn shift_insert_pastes_without_ctrl_or_alt() {
+        let key = keyboard::Key::Named(keyboard::key::Named::Insert);
+        let physical = keyboard::key::Physical::Code(keyboard::key::Code::Insert);
+        assert_eq!(
+            clipboard_chord(&key, physical, keyboard::Modifiers::SHIFT),
+            Some(ClipboardChord::Paste)
+        );
+        assert_eq!(
+            clipboard_chord(
+                &key,
+                physical,
+                keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn links_use_osc8_wrapping_and_cwd_relative_file_positions() {
+        let mut first = (*row("https://exam")).clone();
+        first.wrapped = true;
+        let snapshot = RenderSnapshot {
+            lines: vec![Arc::new(first), row("ple.org/a?b=1")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            terminal_link_at(&snapshot, 1, 3, std::path::Path::new("/repo"))
+                .unwrap()
+                .as_str(),
+            "https://example.org/a?b=1"
+        );
+        let snapshot = RenderSnapshot {
+            lines: vec![row("src/lib.rs:42:5")].into(),
+            ..RenderSnapshot::empty()
+        };
+        assert_eq!(
+            terminal_link_at(&snapshot, 0, 4, std::path::Path::new("/repo"))
+                .unwrap()
+                .as_str(),
+            "file:///repo/src/lib.rs#L42:5"
+        );
+        let mut linked = (*row("friendly label")).clone();
+        linked
+            .hyperlinks
+            .push(crate::terminal::snapshot::HyperlinkSpan {
+                start: 0,
+                end: 14,
+                uri: "https://example.org/path".into(),
+            });
+        assert_eq!(
+            printed_link_at(&linked, 9).unwrap().as_str(),
+            "https://example.org/path"
+        );
     }
 
     fn shape_cache_geometry(family: &str) -> TerminalGeometry {
@@ -4753,6 +5175,8 @@ mod tests {
         // A wide cluster's trailing cell carries no text, so the glyph its
         // first cell contributed is not repeated.
         let wide = Arc::new(RowSnapshot {
+            wrapped: false,
+            hyperlinks: Vec::new(),
             cells: vec![
                 CellSnapshot {
                     text: CellText::new("日"),
@@ -4775,6 +5199,8 @@ mod tests {
     #[test]
     fn copying_cursor_addressed_output_preserves_unwritten_spaces() {
         let rows = vec![Arc::new(RowSnapshot {
+            wrapped: false,
+            hyperlinks: Vec::new(),
             cells: vec![
                 CellSnapshot {
                     text: CellText::new("a"),
@@ -4855,6 +5281,8 @@ mod tests {
     #[test]
     fn selections_cover_whole_wide_and_combining_graphemes() {
         let rows = vec![Arc::new(RowSnapshot {
+            wrapped: false,
+            hyperlinks: Vec::new(),
             cells: vec![
                 CellSnapshot {
                     text: CellText::new("e\u{301}"),
@@ -5101,6 +5529,7 @@ mod tests {
         len: 24,
         alternate_screen: false,
         mouse_tracking: false,
+        bracketed_paste: false,
     };
 
     #[test]
@@ -5166,6 +5595,7 @@ mod tests {
 
         let mut tracked = ScrollPump::new(ScrollSnapshot {
             mouse_tracking: true,
+            bracketed_paste: false,
             ..SCROLLBACK
         });
         tracked.wheel(1.0);
@@ -5177,6 +5607,7 @@ mod tests {
         // deferred to a frame.
         let mut reporting = ScrollPump::new(ScrollSnapshot {
             mouse_tracking: true,
+            bracketed_paste: false,
             ..SCROLLBACK
         });
         for _ in 0..3 {
@@ -5192,6 +5623,7 @@ mod tests {
         // reading the wheel, and then it coalesces like any other.
         let mut shifted = ScrollPump::new(ScrollSnapshot {
             mouse_tracking: true,
+            bracketed_paste: false,
             ..SCROLLBACK
         })
         .shifted();
@@ -5219,6 +5651,7 @@ mod tests {
         for speed in [0.25, 4.0] {
             let mut reporting = ScrollPump::new(ScrollSnapshot {
                 mouse_tracking: true,
+                bracketed_paste: false,
                 ..SCROLLBACK
             })
             .with_speed(speed);

@@ -11,6 +11,35 @@ pub enum DocumentLink {
     },
 }
 
+/// Parse the file coordinates emitted by coding agents, preserving URL ports.
+pub fn file_position(target: &str) -> (&str, Option<String>) {
+    if target.contains("://") || target.starts_with("mailto:") {
+        return (target, None);
+    }
+    let Some((prefix, last)) = target.rsplit_once(':') else {
+        return (target, None);
+    };
+    let Ok(last) = last.parse::<u32>() else {
+        return (target, None);
+    };
+    if last == 0 {
+        return (target, None);
+    }
+    let path = prefix
+        .rsplit_once(':')
+        .filter(|(_, line)| line.parse::<u32>().is_ok())
+        .map_or(prefix, |(path, _)| path);
+    if !path.contains('/') && !path.contains('.') {
+        return (target, None);
+    }
+    match prefix.rsplit_once(':') {
+        Some((path, line)) if line.parse::<u32>().is_ok_and(|line| line > 0) => {
+            (path, Some(format!("L{line}:{last}")))
+        }
+        _ => (prefix, Some(format!("L{last}"))),
+    }
+}
+
 pub fn resolve(source: &Path, target: &str) -> Result<DocumentLink, String> {
     let base = Url::from_file_path(source).map_err(|()| "Document path must be absolute")?;
     let url = base.join(target).map_err(|error| error.to_string())?;
@@ -38,6 +67,25 @@ pub fn resolve(source: &Path, target: &str) -> Result<DocumentLink, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coding_agent_coordinates_preserve_url_ports_and_unsupported_schemes() {
+        assert_eq!(
+            file_position("src/app.rs:42:7"),
+            ("src/app.rs", Some("L42:7".into()))
+        );
+        assert_eq!(
+            file_position("/repo/Cargo.toml:3"),
+            ("/repo/Cargo.toml", Some("L3".into()))
+        );
+        for target in [
+            "https://localhost:3000",
+            "javascript:42",
+            "src/app.rs:zero",
+            "src/app.rs:0",
+        ] {
+            assert_eq!(file_position(target), (target, None));
+        }
+    }
     #[test]
     fn local_links_use_the_document_directory_and_decode_url_paths() {
         let source = Path::new("/repo/docs/top_runs.md");
@@ -81,7 +129,8 @@ use cosmic::widget::markdown;
 
 pub(crate) fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
     let mut used = std::collections::HashSet::new();
-    let style = markdown::Settings::from(iced::Theme::Dark).style;
+    let style =
+        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_BODY).style;
     for (index, item) in items.iter().enumerate() {
         if let markdown::Item::Heading(_, text) = item {
             let text: String = text
@@ -121,11 +170,21 @@ pub(crate) fn heading_id(card: crate::model::CardId, index: usize) -> Id {
 }
 
 pub(crate) fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
+    scroll_to_heading_anchored(scroll, target, false)
+}
+
+pub(crate) fn scroll_to_heading_anchored<T: Send + 'static>(
+    scroll: Id,
+    target: Id,
+    bottom: bool,
+) -> iced::Task<T> {
     struct Find {
         scroll: Id,
         target: Id,
         top: Option<f32>,
         offset: Option<f32>,
+        bottom: bool,
+        travel: f32,
     }
     impl<T: 'static> Operation<T> for Find {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
@@ -134,18 +193,26 @@ pub(crate) fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> ic
         fn scrollable(
             &mut self,
             id: Option<&Id>,
-            _: Rectangle,
+            viewport: Rectangle,
             content: Rectangle,
             _: Vector,
             _: &mut dyn operation::Scrollable,
         ) {
             if id == Some(&self.scroll) {
                 self.top = Some(content.y);
+                self.travel = (content.height - viewport.height).max(0.0);
             }
         }
         fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
             if id == Some(&self.target) {
-                self.offset = self.top.map(|top| (bounds.y - top).max(0.0));
+                self.offset = self.top.map(|top| {
+                    let from_top = (bounds.y - top).clamp(0.0, self.travel);
+                    if self.bottom {
+                        self.travel - from_top
+                    } else {
+                        from_top
+                    }
+                });
             }
         }
         fn finish(&self) -> operation::Outcome<T> {
@@ -165,6 +232,8 @@ pub(crate) fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> ic
         target,
         top: None,
         offset: None,
+        bottom,
+        travel: 0.0,
     })
 }
 

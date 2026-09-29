@@ -3,6 +3,15 @@ use crate::interaction::tooltip;
 
 #[derive(Debug, Default)]
 pub(super) struct State {
+    hovered_tab: Option<CardId>,
+    pub(super) closing_group: Vec<CardId>,
+    pub(super) user_titles: HashMap<CardId, String>,
+    /// Tab visibility follows pane focus even when a creation path already
+    /// updated durable focus before applying its viewport changes.
+    pub(super) tabs_focus: Option<CardId>,
+    rename: Option<(RenameTarget, String)>,
+    pub(super) workspace_preview: Option<SidebarAction>,
+    pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
@@ -227,8 +236,16 @@ mod tests {
 }
 
 impl State {
+    pub(super) fn with_user_titles(mut self, titles: HashMap<CardId, String>) -> Self {
+        self.user_titles = titles;
+        self
+    }
+    pub(super) fn with_projects_collapsed(mut self, collapsed: bool) -> Self {
+        self.projects_collapsed = collapsed;
+        self
+    }
     pub(super) fn is_open(&self) -> bool {
-        self.popup.is_some()
+        self.popup.is_some() || self.rename.is_some()
     }
 
     pub(super) fn close(&mut self) {
@@ -273,6 +290,18 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 3] = [
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    HoverTab(Option<CardId>),
+    RenameChannel(crate::model::ChannelId),
+    Rename(CardId),
+    RenameChanged(String),
+    RenameSubmit,
+    RenameCancel,
+    CloseOthers(CardId),
+    CloseToRight(CardId),
+    Clone(CardId),
+    CopyPath(CardId),
+    Reveal(CardId),
+    ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
     Close,
@@ -280,14 +309,53 @@ pub enum Action {
     Launch(NewTab),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RenameTarget {
+    Pane(CardId),
+    Channel(crate::model::ChannelId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneMenuCommand {
+    Rename,
+    Clone,
+    CopyPath,
+    Reveal,
+    CloseOthers,
+    CloseToRight,
+    Close,
+    Switch,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaneMenu(CardId, PaneMenuCommand);
+
+impl widget::menu::Action for PaneMenu {
+    type Message = Message;
+    fn message(&self) -> Message {
+        let id = self.0;
+        Message::ChromeUi(match self.1 {
+            PaneMenuCommand::Rename => Action::Rename(id),
+            PaneMenuCommand::Clone => Action::Clone(id),
+            PaneMenuCommand::CopyPath => Action::CopyPath(id),
+            PaneMenuCommand::Reveal => Action::Reveal(id),
+            PaneMenuCommand::CloseOthers => Action::CloseOthers(id),
+            PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
+            PaneMenuCommand::Close => return Message::CloseCard(id),
+            PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
+        })
+    }
+}
+
 // Tabs retain a neutral keyboard focus cue without an accent outline.
 fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
-            background: focused
-                .then(|| iced::Background::Color(theme.current_container().component.hover.into())),
-            border_width: 0.0,
+            // The tab owns its selection surface. Keep its mark and title
+            // inline rather than painting another button pill inside it.
+            border_width: if focused { 1.0 } else { 0.0 },
+            border_color: iced::Color::from(theme.current_container().on).scale_alpha(0.18),
             icon_color: Some(design::muted_icon_color(theme)),
             ..widget::button::Style::new()
         }
@@ -295,18 +363,34 @@ fn column_title_style() -> cosmic::theme::Button {
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(|_| widget::button::Style::new()),
-        hovered: Box::new(|focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.hover.into(),
-            )),
-            ..appearance(focused, theme)
-        }),
-        pressed: Box::new(|focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.pressed.into(),
-            )),
-            ..appearance(focused, theme)
-        }),
+        hovered: Box::new(appearance),
+        pressed: Box::new(appearance),
+    }
+}
+
+#[cfg(test)]
+mod tab_style_tests {
+    #[test]
+    fn inline_tab_mark_and_title_do_not_paint_a_nested_hover_button() {
+        let cosmic::theme::Button::Custom {
+            active,
+            hovered,
+            pressed,
+            ..
+        } = super::column_title_style()
+        else {
+            unreachable!();
+        };
+        let theme = cosmic::Theme::dark();
+        for appearance in [active, hovered, pressed] {
+            assert!(appearance(false, &theme).background.is_none());
+            let focused = appearance(true, &theme);
+            assert!(focused.background.is_none());
+            assert!(
+                focused.border_width > 0.0,
+                "keyboard focus retains a visible cue"
+            );
+        }
     }
 }
 
@@ -331,6 +415,12 @@ fn command<'a>(
 impl Cagents {
     /// Keep Tab traversal and global shortcuts inside the open popup.
     pub(super) fn chrome_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        if self.chrome_ui.rename.is_some() {
+            if is_escape_press(event) {
+                return Some(self.update_chrome(Action::RenameCancel));
+            }
+            return Some(Task::none());
+        }
         let popup = self.chrome_ui.popup?;
         if self.modal_is_open() {
             self.chrome_ui.close();
@@ -452,6 +542,163 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::HoverTab(card) => {
+                self.chrome_ui.hovered_tab = card;
+                Task::none()
+            }
+            Action::RenameChannel(id) => {
+                let Some(channel) = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                else {
+                    return Task::none();
+                };
+                self.chrome_ui.rename = Some((RenameTarget::Channel(id), channel.title.clone()));
+                iced::widget::operation::focus(widget::Id::new("chrome.rename.input"))
+                    .chain(iced::widget::operation::select_all(widget::Id::new(
+                        "chrome.rename.input",
+                    )))
+                    .map(cosmic::Action::App)
+            }
+            Action::Rename(id) => {
+                let Some(card) = self.card_state(id) else {
+                    return Task::none();
+                };
+                self.chrome_ui.rename = Some((RenameTarget::Pane(id), card.title.clone()));
+                iced::widget::operation::focus(widget::Id::new("chrome.rename.input"))
+                    .chain(iced::widget::operation::select_all(widget::Id::new(
+                        "chrome.rename.input",
+                    )))
+                    .map(cosmic::Action::App)
+            }
+            Action::RenameChanged(value) => {
+                if let Some((_, draft)) = &mut self.chrome_ui.rename {
+                    *draft = value;
+                }
+                Task::none()
+            }
+            Action::RenameCancel => {
+                self.chrome_ui.rename = None;
+                Task::none()
+            }
+            Action::RenameSubmit => {
+                let Some((target, draft)) = self.chrome_ui.rename.take() else {
+                    return Task::none();
+                };
+                let Some(title) = normalize_card_name(&draft) else {
+                    return Task::none();
+                };
+                let id = match target {
+                    RenameTarget::Pane(id) => id,
+                    RenameTarget::Channel(id) => {
+                        if let Some(channel) = Arc::make_mut(&mut self.durable)
+                            .channels
+                            .iter_mut()
+                            .find(|channel| channel.id == id)
+                        {
+                            channel.title = title.clone();
+                        }
+                        self.publish_model_edit(
+                            crate::workspace_model::ModelEdit::RetitleChannel { id, title },
+                        );
+                        self.refresh_sidebar_channels();
+                        self.persist();
+                        return Task::none();
+                    }
+                };
+                self.chrome_ui.user_titles.insert(id, title.clone());
+                if let Some(card) = self.card_state_mut(id) {
+                    card.title = title.clone();
+                }
+                let _ = self.workspace.rename_card(id, title);
+                self.persist();
+                self.save_settings_task(false)
+            }
+            Action::CloseOthers(id) | Action::CloseToRight(id) => {
+                let to_right = matches!(action, Action::CloseToRight(_));
+                let order: Vec<_> = self.workspace.order().collect();
+                let index = order
+                    .iter()
+                    .position(|candidate| *candidate == id)
+                    .unwrap_or(order.len());
+                self.chrome_ui.closing_group = order
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(position, candidate)| {
+                        *candidate != id && (!to_right || *position > index)
+                    })
+                    .map(|(_, id)| id)
+                    .collect();
+                let dirty = self.chrome_ui.closing_group.iter().copied().filter(|id| matches!(self.cards.get(id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())).collect();
+                self.begin_dirty_close(DirtyCloseIntent::PaneGroup, dirty)
+            }
+            Action::Clone(id) => {
+                let focus = self.update(Message::FocusCard(id));
+                if self.workspace.focused() == Some(id) {
+                    Task::batch([focus, self.clone_focused_pane()])
+                } else {
+                    focus
+                }
+            }
+            Action::CopyPath(id) => match self.cards.get(&id) {
+                Some(CardRuntime::Repository(runtime)) => runtime
+                    .selected_path()
+                    .map(|path| runtime.descriptor.worktree.join(path))
+                    .or_else(|| Some(runtime.descriptor.worktree.clone())),
+                _ => self
+                    .card_state(id)
+                    .and_then(super::worktree_ui::card_directory)
+                    .map(Path::to_path_buf),
+            }
+            .map_or_else(Task::none, |path| {
+                iced::clipboard::write(path.display().to_string())
+            }),
+            Action::Reveal(id) => {
+                let focus = self.update(Message::FocusCard(id));
+                if self.workspace.focused() != Some(id) {
+                    return focus;
+                }
+                self.chrome_ui.projects_collapsed = false;
+                self.synchronize_sidebar_selection();
+                let destination = self.active_workspace_destination();
+                let target = self.sidebar_model.projects.iter().find_map(|project| {
+                    let row = match destination {
+                        Some(WorkspaceDestination::Channel(id))
+                            if project.channels.iter().any(|channel| channel.id == id) =>
+                        {
+                            sidebar::SelectionRow::Channel(id)
+                        }
+                        Some(WorkspaceDestination::Worktree(id))
+                            if project.worktrees.iter().any(|worktree| worktree.id == id) =>
+                        {
+                            sidebar::SelectionRow::Worktree(project.id, id)
+                        }
+                        Some(WorkspaceDestination::Folder(id)) if project.id == id => {
+                            sidebar::SelectionRow::Project(id)
+                        }
+                        _ => return None,
+                    };
+                    Some((project.id, row))
+                });
+                if let Some((project, row)) = target {
+                    self.sidebar_state.reveal_project(project);
+                    self.persist();
+                    Task::batch([
+                        focus,
+                        sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                            .map(cosmic::Action::App),
+                    ])
+                } else {
+                    focus
+                }
+            }
+            Action::ToggleProjects => {
+                self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
+                self.persist();
+                Task::none()
+            }
             Action::ToggleNewTab | Action::ToggleNotices => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
@@ -503,7 +750,17 @@ impl Cagents {
         let enabled = !self.modal_is_open() && !self.context_inspector_is_overlay();
         let control = command(
             crate::ui_controls::symbolic_icon("list-add-symbolic"),
-            "New tab",
+            format!(
+                "New tab · Thread {} · Terminal {}",
+                workspace_widget::shortcut_chords(
+                    workspace_widget::GlobalShortcut::NewThread,
+                    &self.settings.keyboard_shortcuts
+                ),
+                workspace_widget::shortcut_chords(
+                    workspace_widget::GlobalShortcut::NewTerminal,
+                    &self.settings.keyboard_shortcuts
+                )
+            ),
             widget::Id::new(TOOLBAR_FOCUS_ID),
             enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
         );
@@ -525,7 +782,23 @@ impl Cagents {
                     crate::ui_controls::popover_item(
                         icon,
                         label,
-                        description,
+                        match kind {
+                            NewTab::Thread => format!(
+                                "{description} · {}",
+                                workspace_widget::shortcut_chords(
+                                    workspace_widget::GlobalShortcut::NewThread,
+                                    &self.settings.keyboard_shortcuts
+                                )
+                            ),
+                            NewTab::Terminal => format!(
+                                "{description} · {}",
+                                workspace_widget::shortcut_chords(
+                                    workspace_widget::GlobalShortcut::NewTerminal,
+                                    &self.settings.keyboard_shortcuts
+                                )
+                            ),
+                            NewTab::Browser => description.to_owned(),
+                        },
                         Message::ChromeUi(Action::Launch(kind)),
                     )
                     .id(widget::Id::new(id))
@@ -540,7 +813,7 @@ impl Cagents {
                 widget::column::with_children(items).spacing(2).into(),
             ])
             .spacing(6)
-            .width(292)
+            .width(design::COMMAND_POPOVER_WIDTH)
             .into()
         });
         crate::ui_controls::popover(
@@ -698,7 +971,7 @@ impl Cagents {
                     .spacing(8),
                 )
                 .padding(6)
-                .width(408)
+                .width(design::NOTICE_POPOVER_WIDTH)
                 .max_height(408)
                 .into()
             });
@@ -760,11 +1033,10 @@ impl Cagents {
     fn sidebar_toggle(&self) -> Element<'_, Message> {
         crate::ui_controls::icon_control(
             crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
-            if self.context_inspector_open {
-                "Hide sidebar"
-            } else {
-                "Show sidebar"
-            },
+            workspace_widget::shortcut_tooltip(
+                workspace_widget::GlobalShortcut::ToggleInspector,
+                &self.settings.keyboard_shortcuts,
+            ),
             self.context_inspector_open,
             !self.modal_is_open(),
             (!self.modal_is_open()).then_some(Message::ToggleContextInspector),
@@ -775,7 +1047,7 @@ impl Cagents {
 
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
-            110.0
+            design::PANE_NAVIGATOR_RESERVED_WIDTH
         } else {
             0.0
         };
@@ -785,7 +1057,7 @@ impl Cagents {
             let count = usize::from(self.core.window.show_close)
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
                 + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
-            count as f32 * 32.0
+            count as f32 * design::WINDOW_CONTROL_SIZE
                 + count.saturating_sub(1) as f32 * cosmic::theme::spacing().space_xxs as f32
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
@@ -819,9 +1091,16 @@ impl Cagents {
         let insets = 2.0 * crate::tab_strip::EDGE_INSET;
         let available =
             (self.workspace.viewport_width() - self.workspace_header_width() - insets).max(0.0);
-        // Match ceditor: tabs keep a readable fixed width and the strip
-        // scrolls as soon as the tab set no longer fits.
-        (available, 184.0)
+        // Reordering uses one shared width. Derive that width from the titles
+        // instead of giving every agent the same eight-character title budget.
+        let desired = self
+            .workspace
+            .order()
+            .filter_map(|id| self.card_chrome.get(&id))
+            .map(|chrome| 80.0 + chrome.title.chars().count().min(28) as f32 * 7.0)
+            .fold(design::TAB_MIN_WIDTH, f32::max)
+            .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
+        (available, desired)
     }
 
     /// Scrolls the tab strip by the least amount that brings the focused tab
@@ -929,6 +1208,15 @@ impl Cagents {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
+        actions.push(command(
+            crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
+            workspace_widget::shortcut_tooltip(
+                workspace_widget::GlobalShortcut::ToggleProjects,
+                &self.settings.keyboard_shortcuts,
+            ),
+            widget::Id::new("command.toggle-projects"),
+            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleProjects)),
+        ));
         let total = self.workspace.cards().len();
         if should_show_card_navigator(total) {
             let current = self
@@ -938,21 +1226,35 @@ impl Cagents {
                 .map_or(0, |index| index + 1);
             actions.push(command(
                 crate::ui_controls::symbolic_icon("go-previous-symbolic"),
-                "Previous column",
+                workspace_widget::shortcut_tooltip(
+                    workspace_widget::GlobalShortcut::FocusAdjacent(
+                        crate::workspace::FocusDirection::Left,
+                    ),
+                    &self.settings.keyboard_shortcuts,
+                ),
                 widget::Id::new("command.previous-column"),
                 (current > 1).then_some(Message::FocusAdjacent(
                     crate::workspace::FocusDirection::Left,
                 )),
             ));
             actions.push(
-                widget::container(crate::design::caption(format!("{current} / {total}")))
+                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
                     .center_y(ICON_CONTROL_SIZE)
-                    .center_x(42)
+                    .align_x(Alignment::Center)
+                    .width(
+                        (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
+                            .max(design::PANE_NAVIGATOR_MIN_WIDTH),
+                    )
                     .into(),
             );
             actions.push(command(
                 crate::ui_controls::symbolic_icon("go-next-symbolic"),
-                "Next column",
+                workspace_widget::shortcut_tooltip(
+                    workspace_widget::GlobalShortcut::FocusAdjacent(
+                        crate::workspace::FocusDirection::Right,
+                    ),
+                    &self.settings.keyboard_shortcuts,
+                ),
                 widget::Id::new("command.next-column"),
                 (current > 0 && current < total).then_some(Message::FocusAdjacent(
                     crate::workspace::FocusDirection::Right,
@@ -1002,6 +1304,41 @@ impl Cagents {
         ]
     }
 
+    pub(super) fn pane_rename_surface(&self) -> Option<Element<'_, Message>> {
+        let (target, draft) = self.chrome_ui.rename.as_ref()?;
+        Some(
+            widget::container(
+                widget::column::with_children(vec![
+                    design::heading(match target {
+                        RenameTarget::Pane(_) => "Rename pane",
+                        RenameTarget::Channel(_) => "Rename channel",
+                    })
+                    .into(),
+                    widget::text_input("Pane name", draft)
+                        .id(widget::Id::new("chrome.rename.input"))
+                        .on_input(|value| Message::ChromeUi(Action::RenameChanged(value)))
+                        .on_submit(|_| Message::ChromeUi(Action::RenameSubmit))
+                        .into(),
+                    widget::row::with_children(vec![
+                        widget::button::standard("Cancel")
+                            .on_press(Message::ChromeUi(Action::RenameCancel))
+                            .into(),
+                        widget::button::suggested("Rename")
+                            .on_press(Message::ChromeUi(Action::RenameSubmit))
+                            .into(),
+                    ])
+                    .spacing(design::GRID_UNIT)
+                    .into(),
+                ])
+                .spacing(2.0 * design::GRID_UNIT),
+            )
+            .padding(3.0 * design::GRID_UNIT)
+            .width(400)
+            .class(cosmic::theme::Container::Card)
+            .into(),
+        )
+    }
+
     /// The mark that names a card wherever the card itself is shown: its tab
     /// and the inspector heading. Agents wear their provider's mark, whether
     /// they run in a native chat or a terminal.
@@ -1037,7 +1374,7 @@ impl Cagents {
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
         let title_control = widget::button::custom(
             widget::row::with_children(vec![
-                self.card_icon(id).icon().size(16).into(),
+                self.card_icon(id).icon().size(design::ROW_ICON_SIZE).into(),
                 design::body(title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
@@ -1067,10 +1404,15 @@ impl Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .on_press(Message::FocusCard(id));
-        let tip = match caption {
-            Some(caption) => format!("{title}\n{caption}"),
-            None => title.to_owned(),
-        };
+        let tip = chrome.map_or_else(
+            || {
+                Cow::Owned(match caption {
+                    Some(caption) => format!("{title}\n{caption}"),
+                    None => title.to_owned(),
+                })
+            },
+            |chrome| Cow::Borrowed(chrome.tooltip.as_str()),
+        );
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
@@ -1089,11 +1431,14 @@ impl Cagents {
         };
         if let Some((label, busy)) = status {
             let indicator: Element<'_, Message> = if busy {
-                crate::ui_controls::activity_spinner_tone(14.0, design::accent_color)
+                crate::ui_controls::activity_spinner_tone(
+                    design::TAB_STATUS_ICON_SIZE as f32,
+                    design::accent_color,
+                )
             } else {
                 crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
                     .icon()
-                    .size(14)
+                    .size(design::TAB_STATUS_ICON_SIZE)
                     .into()
             };
             children.push(tooltip(indicator, label));
@@ -1102,50 +1447,42 @@ impl Cagents {
             children.push(tooltip(
                 crate::ui_controls::symbolic_icon("notifications-symbolic")
                     .icon()
-                    .size(14),
+                    .size(design::TAB_STATUS_ICON_SIZE),
                 "Needs attention",
             ));
         } else if let Some(activity) = self.sidebar_state.card_activity(id) {
             match activity.state {
                 crate::agent::ActivityState::Working => children.push(tooltip(
-                    crate::ui_controls::activity_spinner_tone(14.0, design::warning_color),
+                    crate::ui_controls::activity_spinner_tone(
+                        design::TAB_STATUS_ICON_SIZE as f32,
+                        design::warning_color,
+                    ),
                     "Working",
                 )),
                 crate::agent::ActivityState::Waiting => children.push(tooltip(
                     crate::ui_controls::symbolic_icon("agent-waiting-symbolic")
                         .icon()
-                        .size(14),
+                        .size(design::TAB_STATUS_ICON_SIZE),
                     "Waiting for input",
                 )),
                 _ => {}
             }
         }
-        if self.chat_switch_available(id) {
+        if focused || self.chrome_ui.hovered_tab == Some(id) {
             children.push(command(
-                if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
-                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
-                } else {
-                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
-                },
-                self.chat_switch_label(id),
-                card_control_id(id, "chat"),
-                (!self.modal_is_open() && self.chat_switch_ready(id))
-                    .then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
+                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                chrome.map_or_else(
+                    || Cow::Owned(card_close_name(labels.type_label, title)),
+                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
+                ),
+                chrome.map_or_else(
+                    || card_control_id(id, "close"),
+                    |chrome| chrome.close_id.clone(),
+                ),
+                Some(Message::CloseCard(id)),
             ));
         }
-        children.push(command(
-            crate::ui_controls::symbolic_icon("window-close-symbolic"),
-            chrome.map_or_else(
-                || Cow::Owned(card_close_name(labels.type_label, title)),
-                |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-            ),
-            chrome.map_or_else(
-                || card_control_id(id, "close"),
-                |chrome| chrome.close_id.clone(),
-            ),
-            Some(Message::CloseCard(id)),
-        ));
-        crate::tab_strip::middle_click_close(
+        let tab = crate::tab_strip::middle_click_close(
             widget::container(
                 widget::row::with_children(children)
                     .align_y(Alignment::Center)
@@ -1174,7 +1511,57 @@ impl Cagents {
                 }
             })),
             Message::CloseCard(id),
-        )
+        );
+        let tab = iced::widget::mouse_area(tab)
+            .on_enter(Message::ChromeUi(Action::HoverTab(Some(id))))
+            .on_exit(Message::ChromeUi(Action::HoverTab(None)));
+        crate::interaction::context_menu_lazy(tab, move || {
+            let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
+                widget::menu::Item::Button(
+                    "Rename…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Rename),
+                ),
+                widget::menu::Item::Button(
+                    "Clone pane".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Clone),
+                ),
+                widget::menu::Item::Button(
+                    "Copy path".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::CopyPath),
+                ),
+                widget::menu::Item::Button(
+                    "Reveal in Projects".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Reveal),
+                ),
+                widget::menu::Item::Button(
+                    "Close other panes".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::CloseOthers),
+                ),
+                widget::menu::Item::Button(
+                    "Close panes to the right".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::CloseToRight),
+                ),
+                widget::menu::Item::Button(
+                    "Close pane".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Close),
+                ),
+            ];
+            if self.chat_switch_available(id) && self.chat_switch_ready(id) {
+                entries.push(widget::menu::Item::Button(
+                    self.chat_switch_label(id).into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::Switch),
+                ));
+            }
+            widget::menu::items(&HashMap::new(), entries)
+        })
     }
 
     /// The navigation row the context rail speaks for: the active worktree's

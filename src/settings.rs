@@ -255,6 +255,24 @@ pub struct KeyboardShortcuts {
     pub review_next_unviewed: Vec<String>,
     pub review_next_change: Vec<String>,
     pub review_previous_change: Vec<String>,
+    pub command_palette: Vec<String>,
+    pub new_native_thread: Vec<String>,
+    pub toggle_inspector: Vec<String>,
+    pub open_settings: Vec<String>,
+    pub move_pane_left: Vec<String>,
+    pub move_pane_right: Vec<String>,
+    pub reopen_pane: Vec<String>,
+    pub focus_pane_1: Vec<String>,
+    pub focus_pane_2: Vec<String>,
+    pub focus_pane_3: Vec<String>,
+    pub focus_pane_4: Vec<String>,
+    pub focus_pane_5: Vec<String>,
+    pub focus_pane_6: Vec<String>,
+    pub focus_pane_7: Vec<String>,
+    pub focus_pane_8: Vec<String>,
+    pub focus_pane_9: Vec<String>,
+    pub toggle_projects: Vec<String>,
+    pub rename_pane: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -278,6 +296,24 @@ impl Default for KeyboardShortcuts {
             review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
             review_next_change: vec!["Alt+J".to_owned()],
             review_previous_change: vec!["Alt+K".to_owned()],
+            command_palette: vec!["Ctrl+Shift+P".to_owned()],
+            new_native_thread: vec!["Ctrl+Shift+N".to_owned()],
+            toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
+            open_settings: vec!["Ctrl+Comma".to_owned()],
+            move_pane_left: vec!["Alt+Shift+Left".to_owned()],
+            move_pane_right: vec!["Alt+Shift+Right".to_owned()],
+            reopen_pane: vec!["Ctrl+Shift+Z".to_owned()],
+            focus_pane_1: vec!["Alt+1".to_owned()],
+            focus_pane_2: vec!["Alt+2".to_owned()],
+            focus_pane_3: vec!["Alt+3".to_owned()],
+            focus_pane_4: vec!["Alt+4".to_owned()],
+            focus_pane_5: vec!["Alt+5".to_owned()],
+            focus_pane_6: vec!["Alt+6".to_owned()],
+            focus_pane_7: vec!["Alt+7".to_owned()],
+            focus_pane_8: vec!["Alt+8".to_owned()],
+            focus_pane_9: vec!["Alt+9".to_owned()],
+            toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
+            rename_pane: vec!["F2".to_owned()],
         }
     }
 }
@@ -287,7 +323,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 16] {
+    pub fn actions(&self) -> [&Vec<String>; 34] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -305,6 +341,24 @@ impl KeyboardShortcuts {
             &self.review_next_unviewed,
             &self.review_next_change,
             &self.review_previous_change,
+            &self.command_palette,
+            &self.new_native_thread,
+            &self.toggle_inspector,
+            &self.open_settings,
+            &self.move_pane_left,
+            &self.move_pane_right,
+            &self.reopen_pane,
+            &self.focus_pane_1,
+            &self.focus_pane_2,
+            &self.focus_pane_3,
+            &self.focus_pane_4,
+            &self.focus_pane_5,
+            &self.focus_pane_6,
+            &self.focus_pane_7,
+            &self.focus_pane_8,
+            &self.focus_pane_9,
+            &self.toggle_projects,
+            &self.rename_pane,
         ]
     }
 
@@ -325,7 +379,7 @@ impl KeyboardShortcuts {
                     error: SettingsError::InvalidShortcut(error),
                 })
             };
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=15) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=33) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return fault("every keyboard shortcut needs at least one chord", None);
@@ -349,7 +403,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 16] = [
+const SHORTCUT_ACTIONS: [&str; 34] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -366,6 +420,24 @@ const SHORTCUT_ACTIONS: [&str; 16] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "command_palette",
+    "new_native_thread",
+    "toggle_inspector",
+    "open_settings",
+    "move_pane_left",
+    "move_pane_right",
+    "reopen_pane",
+    "focus_pane_1",
+    "focus_pane_2",
+    "focus_pane_3",
+    "focus_pane_4",
+    "focus_pane_5",
+    "focus_pane_6",
+    "focus_pane_7",
+    "focus_pane_8",
+    "focus_pane_9",
+    "toggle_projects",
+    "rename_pane",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -412,11 +484,22 @@ pub fn format_chords(chords: &[String]) -> String {
 /// separator left mid-edit does not read as an unparsable chord; a line with no
 /// chord at all is rejected by [`KeyboardShortcuts::validate`].
 pub fn parse_chords(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|chord| !chord.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut chords = Vec::new();
+    let mut start = 0;
+    for (index, ch) in raw.char_indices() {
+        if ch == ',' && !raw[..index].ends_with('+') {
+            let chord = raw[start..index].trim();
+            if !chord.is_empty() {
+                chords.push(chord.to_owned());
+            }
+            start = index + 1;
+        }
+    }
+    let chord = raw[start..].trim();
+    if !chord.is_empty() {
+        chords.push(chord.to_owned());
+    }
+    chords
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +521,7 @@ pub enum ShortcutKey {
     Tab,
     PageUp,
     PageDown,
+    Function(u8),
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
@@ -481,22 +565,35 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
                 Some(ShortcutKey::PageDown)
+            } else if token.eq_ignore_ascii_case("comma") {
+                Some(ShortcutKey::Character(','))
+            } else if token.eq_ignore_ascii_case("plus") {
+                Some(ShortcutKey::Character('+'))
+            } else if token
+                .to_ascii_lowercase()
+                .strip_prefix('f')
+                .and_then(|number| number.parse::<u8>().ok())
+                .is_some_and(|number| (1..=12).contains(&number))
+            {
+                Some(ShortcutKey::Function(
+                    token[1..].parse().expect("validated function key"),
+                ))
             } else {
                 let mut characters = token.chars();
                 match (characters.next(), characters.next()) {
-                    (Some(character), None) if character.is_ascii_alphanumeric() => {
+                    (Some(character), None) if character.is_ascii_graphic() => {
                         Some(ShortcutKey::Character(character.to_ascii_lowercase()))
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown",
+                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
                         );
                     }
                 }
             };
         }
     }
-    if !(control || alt || logo) {
+    if !(control || alt || logo) && !matches!(key, Some(ShortcutKey::Function(_))) {
         return Err("keyboard shortcut must include Ctrl, Alt, or Super");
     }
     Ok(ShortcutBinding {
@@ -532,8 +629,15 @@ const fn default_editor_auto_save() -> bool {
     true
 }
 
+const fn default_diff_hide_unchanged() -> bool {
+    true
+}
+
 const fn default_confirm_terminal_close() -> bool {
     true
+}
+fn default_browser_search_url() -> String {
+    "https://duckduckgo.com/?q={query}".into()
 }
 
 const fn default_chat_enter_sends() -> bool {
@@ -711,8 +815,18 @@ pub struct AppSettings {
     pub default_channel_pane: DefaultPane,
     #[serde(default = "default_editor_auto_save")]
     pub editor_auto_save: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_font_size: Option<f32>,
+    #[serde(default = "default_confirm_terminal_close")]
+    pub confirm_multiline_paste: bool,
+    #[serde(default = "default_browser_search_url")]
+    pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default = "default_diff_hide_unchanged")]
+    pub diff_hide_unchanged: bool,
     #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
@@ -797,7 +911,12 @@ impl Default for AppSettings {
             default_worktree_pane: DefaultPane::default(),
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
+            editor_font_family: None,
+            editor_font_size: None,
+            confirm_multiline_paste: true,
+            browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
+            diff_hide_unchanged: default_diff_hide_unchanged(),
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
@@ -1177,7 +1296,25 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 11] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 29] = [
+    "toggle_projects",
+    "rename_pane",
+    "command_palette",
+    "new_native_thread",
+    "toggle_inspector",
+    "open_settings",
+    "move_pane_left",
+    "move_pane_right",
+    "reopen_pane",
+    "focus_pane_1",
+    "focus_pane_2",
+    "focus_pane_3",
+    "focus_pane_4",
+    "focus_pane_5",
+    "focus_pane_6",
+    "focus_pane_7",
+    "focus_pane_8",
+    "focus_pane_9",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",
@@ -1352,6 +1489,16 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    pub fn editor_font_size(&self) -> f32 {
+        self.editor_font_size.unwrap_or(self.terminal_font_size)
+    }
+
+    pub fn editor_font_family(&self) -> &str {
+        self.editor_font_family
+            .as_deref()
+            .unwrap_or(&self.terminal_font_family)
+    }
+
     /// A modified click explicitly selects a browser; ordinary links use the preference.
     pub fn link_destination(&self, gesture: Option<LinkOpenGesture>) -> LinkOpenDestination {
         match gesture {
@@ -1363,6 +1510,15 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
+        if !self.browser_search_url.contains("{query}")
+            || !search_url
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        {
+            return Err(SettingsError::Invalid(
+                "browser_search_url must be an HTTP(S) URL containing {query}",
+            ));
+        }
         if let crate::terminal::TerminalTheme::Custom(palette) = self.terminal_theme {
             // Keep custom colors when selecting another preset, and refresh
             // the active palette after the configuration file is edited.
@@ -1414,9 +1570,26 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
+        if self
+            .editor_font_size
+            .is_some_and(|size| !(8.0..=40.0).contains(&size))
+        {
+            return Err(SettingsError::Invalid(
+                "editor_font_size must be between 8 and 40",
+            ));
+        }
         if self.terminal_font_family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES {
             return Err(SettingsError::Invalid(
                 "terminal_font_family must not exceed 128 bytes",
+            ));
+        }
+        if self
+            .editor_font_family
+            .as_ref()
+            .is_some_and(|family| family.len() > 128)
+        {
+            return Err(SettingsError::Invalid(
+                "editor_font_family must not exceed 128 bytes",
             ));
         }
         if !self.terminal_font_family.is_empty() && self.terminal_font_family.trim().is_empty() {
@@ -2553,6 +2726,24 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn editor_font_inherits_terminal_until_overridden() {
+        let mut settings = super::AppSettings::default();
+        settings.terminal_font_family = "Test Mono".into();
+        settings.terminal_font_size = 19.0;
+        assert_eq!(settings.editor_font_family(), "Test Mono");
+        assert_eq!(settings.editor_font_size(), 19.0);
+        settings.editor_font_family = Some("Editor Mono".into());
+        settings.editor_font_size = Some(16.0);
+        assert_eq!(settings.editor_font_family(), "Editor Mono");
+        assert_eq!(settings.editor_font_size(), 16.0);
+        assert!(settings.confirm_multiline_paste);
+        assert_eq!(
+            settings.terminal_theme,
+            crate::terminal::TerminalTheme::Auto
+        );
+        assert!(settings.validate().is_ok());
+    }
     use super::*;
 
     #[test]
@@ -2843,12 +3034,16 @@ mod tests {
         save(&path, &defaults).unwrap();
         let mut old = toml::Value::try_from(&defaults).unwrap();
         old.as_table_mut().unwrap().remove("editor_wrap_lines");
+        old.as_table_mut().unwrap().remove("diff_hide_unchanged");
         fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
         let mut settings = load(&path).unwrap();
         assert!(!settings.editor_wrap_lines);
+        assert!(settings.diff_hide_unchanged);
         settings.editor_wrap_lines = true;
+        settings.diff_hide_unchanged = false;
         save(&path, &settings).unwrap();
         assert!(load(&path).unwrap().editor_wrap_lines);
+        assert!(!load(&path).unwrap().diff_hide_unchanged);
     }
 
     #[test]
@@ -3332,6 +3527,7 @@ new_thread = "Alt+Shift+G"
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.clone_pane = clone_pane;
             settings.keyboard_shortcuts.new_channel = new_channel;
+            settings.keyboard_shortcuts.new_native_thread.clear();
             save(&path, &settings).unwrap();
             assert_eq!(load(&path).unwrap(), settings);
         }
@@ -3366,6 +3562,17 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn keyboard_shortcuts_are_validated_as_unique_modified_chords() {
+        for (chord, key) in [
+            ("Ctrl+F1", ShortcutKey::Function(1)),
+            ("Alt+F12", ShortcutKey::Function(12)),
+            ("Ctrl+Comma", ShortcutKey::Character(',')),
+            ("Ctrl+=", ShortcutKey::Character('=')),
+            ("Ctrl+-", ShortcutKey::Character('-')),
+            ("Ctrl+Plus", ShortcutKey::Character('+')),
+        ] {
+            assert_eq!(parse_shortcut(chord).unwrap().key, key);
+        }
+        assert!(parse_shortcut("Ctrl+F13").is_err());
         assert_eq!(
             parse_shortcut("Ctrl+Shift+N").unwrap(),
             ShortcutBinding {

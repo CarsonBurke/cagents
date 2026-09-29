@@ -315,6 +315,36 @@ pub enum LspIntent {
 }
 
 #[derive(Debug, Clone)]
+pub enum EditorLspAction {
+    Complete,
+    CompleteAt {
+        doc: LspDocumentId,
+        version: i32,
+        at: LspPosition,
+    },
+    Hover(Option<LspPosition>),
+    Definition(Option<LspPosition>),
+    References,
+    Diagnostics,
+    Choose {
+        index: usize,
+        label: String,
+    },
+    Next(bool),
+    Dismiss,
+}
+
+#[derive(Default)]
+struct EditorLanguageState {
+    diagnostics: Vec<crate::lsp::LspDiagnostic>,
+    marks: Vec<text_editor::Diagnostic>,
+    completions: Vec<LspCompletionItem>,
+    selected: usize,
+    hover: Vec<markdown::Item>,
+    hover_at: Option<text_editor::Position>,
+}
+
+#[derive(Debug, Clone)]
 pub enum RepositoryAction {
     Review {
         card: CardId,
@@ -447,6 +477,10 @@ pub enum RepositoryAction {
     EditorAction {
         card: CardId,
         action: text_editor::Action,
+    },
+    Language {
+        card: CardId,
+        action: EditorLspAction,
     },
     Clipboard {
         card: CardId,
@@ -581,6 +615,31 @@ pub enum RepositoryAction {
     FindPrevious {
         card: CardId,
     },
+    FindInputFocus {
+        card: CardId,
+        focused: bool,
+    },
+    ReplaceQueryChanged {
+        card: CardId,
+        query: String,
+    },
+    ToggleReplace {
+        card: CardId,
+    },
+    ReplaceMatch {
+        card: CardId,
+        all: bool,
+    },
+    ToggleToolbarOverflow {
+        card: CardId,
+    },
+    CloseToolbarOverflow {
+        card: CardId,
+    },
+    ZoomFont {
+        card: CardId,
+        delta: i8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -605,6 +664,7 @@ impl RepositoryAction {
             | Self::OpenCommittedFile { card, .. }
             | Self::SelectBranchBase { card, .. }
             | Self::EditorAction { card, .. }
+            | Self::Language { card, .. }
             | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
             | Self::Reload { card }
@@ -633,6 +693,13 @@ impl RepositoryAction {
             | Self::FindQueryChanged { card, .. }
             | Self::FindNext { card }
             | Self::FindPrevious { card }
+            | Self::FindInputFocus { card, .. }
+            | Self::ReplaceQueryChanged { card, .. }
+            | Self::ToggleReplace { card }
+            | Self::ReplaceMatch { card, .. }
+            | Self::ToggleToolbarOverflow { card }
+            | Self::CloseToolbarOverflow { card }
+            | Self::ZoomFont { card, .. }
             | Self::PdfPage { card, .. }
             | Self::PdfTone { card, .. }
             | Self::PdfZoom { card, .. }
@@ -1770,10 +1837,15 @@ pub struct RepositoryRuntime {
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
+    /// Last comparison stays readable while Git refreshes this file.
+    stale_diff: Option<(PathBuf, DiffBasis, DiffState)>,
+    diff_hide_unchanged: bool,
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
     search_mode: bool,
+    editor_font: Font,
+    editor_font_size: f32,
     find_open: bool,
     /// The find bar's query exactly as the user typed it.
     find_query: String,
@@ -1788,6 +1860,11 @@ pub struct RepositoryRuntime {
     /// renews it.
     find_index: usize,
     find_total: usize,
+    find_input_focused: bool,
+    replace_open: bool,
+    replace_query: String,
+    toolbar_overflow_open: bool,
+    find_matches: Vec<(text_editor::Position, text_editor::Position)>,
     /// One entry per comparison this selection has been asked for.
     ///
     /// A list rather than a map: at most six bases are live at once, and
@@ -1835,6 +1912,7 @@ pub struct RepositoryRuntime {
     /// `None` while nothing is open there. Stored rather than derived: only
     /// the application, which owns the manager, can mint one.
     lsp_document: Option<LspDocumentId>,
+    language: EditorLanguageState,
     /// Protocol notifications this buffer has earned but nobody has performed
     /// yet, oldest first.
     ///
@@ -1932,13 +2010,22 @@ impl RepositoryRuntime {
             file_list_refresh_queued: false,
             background_file_refresh: false,
             mutation_refresh_pending: false,
+            stale_diff: None,
+            diff_hide_unchanged: true,
             files: FileListState::Loading,
             selected: None,
             search_mode: false,
+            editor_font: Font::MONOSPACE,
+            editor_font_size: 14.0,
             find_open: false,
             find_query: String::new(),
             find_index: 0,
             find_total: 0,
+            find_input_focused: false,
+            replace_open: false,
+            replace_query: String::new(),
+            toolbar_overflow_open: false,
+            find_matches: Vec::new(),
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
@@ -1971,6 +2058,7 @@ impl RepositoryRuntime {
             retained_viewports: VecDeque::new(),
             next_save_ticket: 0,
             lsp_document: None,
+            language: EditorLanguageState::default(),
             lsp_intents: Vec::new(),
             pending_lsp_change: None,
             lsp_edits: Vec::new(),
@@ -2021,6 +2109,28 @@ impl RepositoryRuntime {
         self.diffs.clear();
         self.working_diff.applied = None;
         self.working_diff.additions.clear();
+    }
+
+    pub fn set_diff_hide_unchanged(&mut self, enabled: bool) -> Task<RepositoryAction> {
+        if self.diff_hide_unchanged == enabled {
+            return Task::none();
+        }
+        let anchor = self.current_diff_viewport();
+        self.diff_hide_unchanged = enabled;
+        for (_, state) in &mut self.diffs {
+            if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = state {
+                layout.set_folding(model, enabled);
+            }
+        }
+        if let Some((_, _, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) =
+            &mut self.stale_diff
+        {
+            layout.set_folding(model, enabled);
+        }
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.apply_diff_viewport(anchor);
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 
     /// Re-renders the open document page for `theme`.
@@ -2585,6 +2695,16 @@ impl RepositoryRuntime {
     /// open buffer or changing the identity of its loads and saves.
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.mutation_refresh_pending = true;
+        if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
+            && let Some(index) = self.diffs.iter().position(|(basis, state)| {
+                *basis == self.diff_basis
+                    && !basis.is_immutable()
+                    && matches!(state, DiffState::Ready(..))
+            })
+        {
+            let (basis, state) = self.diffs.remove(index);
+            self.stale_diff = Some((path, basis, state));
+        }
         // Resolved branch ranges and commits name immutable objects.
         self.diffs.retain(|(basis, _)| basis.is_immutable());
         self.initial_load(card)
@@ -2661,6 +2781,9 @@ impl RepositoryRuntime {
     /// Records the identity the application minted for the open buffer, or
     /// clears it once the buffer has been closed at the boundary.
     pub fn set_lsp_document(&mut self, doc: Option<LspDocumentId>) {
+        if self.lsp_document != doc {
+            self.language = EditorLanguageState::default();
+        }
         self.lsp_document = doc;
     }
 
@@ -2675,6 +2798,44 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
+        self.language.marks = if let DocumentState::Editable(document) = &self.document {
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    Some(text_editor::Diagnostic {
+                        start: caret_for_position(&document.content, diagnostic.range.start)?,
+                        end: caret_for_position(&document.content, diagnostic.range.end)?,
+                        severity: diagnostic.severity,
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        self.language.diagnostics = diagnostics;
+    }
+
+    pub fn set_editor_completions(&mut self, items: Vec<LspCompletionItem>) {
+        self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
+        self.language.completions = items;
+        self.language.hover.clear();
+    }
+
+    pub fn set_editor_hover(&mut self, markdown: Option<&str>, at: Option<LspPosition>) {
+        self.language.hover = markdown.map_or_else(Vec::new, |raw| markdown::parse(raw).collect());
+        self.language.hover_at = at.and_then(|at| match &self.document {
+            DocumentState::Editable(document) => caret_for_position(&document.content, at),
+            _ => None,
+        });
+    }
+
+    pub fn dismiss_editor_results(&mut self) {
+        self.language.completions.clear();
+        self.language.hover.clear();
+        self.language.hover_at = None;
     }
 
     /// Moves the caret to a protocol position, for jump-to-location.
@@ -2713,31 +2874,21 @@ impl RepositoryRuntime {
             return None;
         };
         document.history.seal();
-        let query = query.trim();
+        self.find_matches = document.content.find_matches(query);
         if query.is_empty() {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let text = document.content.text();
-        let query = query.to_ascii_lowercase();
-        let lower = text.to_ascii_lowercase();
-        let total = lower.match_indices(&query).count();
+        let total = self.find_matches.len();
         if total == 0 {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
             return None;
         }
-        let start = lower
-            .match_indices(&query)
-            .nth(occurrence % total)
-            .map(|(start, _)| start)
-            .expect("an occurrence modulo its total count exists");
-        let end = start + query.len();
-        let start = caret_for_offset(&document.content, start);
-        let end = caret_for_offset(&document.content, end);
+        let (start, end) = self.find_matches[occurrence % total];
         document.content.move_to(text_editor::Cursor {
             position: end,
             selection: Some(start),
@@ -2793,6 +2944,10 @@ impl RepositoryRuntime {
         self.find_open
     }
 
+    pub fn find_input_is_focused(&self) -> bool {
+        self.find_open && self.find_input_focused
+    }
+
     /// Mounts the find strip and selects the occurrence the user is looking
     /// at.
     ///
@@ -2835,6 +2990,8 @@ impl RepositoryRuntime {
         self.find_query.clear();
         self.find_index = 0;
         self.find_total = 0;
+        self.find_input_focused = false;
+        self.find_matches.clear();
         self.set_search_mode(false);
     }
 
@@ -2903,19 +3060,20 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else {
             return 0;
         };
-        let query = self.find_query.trim().to_ascii_lowercase();
+        let query = &self.find_query;
         if query.is_empty() {
             return 0;
         }
         let cursor = document.content.cursor();
-        let mut origin = caret_byte_offset(&document.content, cursor.position);
+        let mut origin = (cursor.position.line, cursor.position.column);
         if let Some(anchor) = cursor.selection {
-            origin = origin.min(caret_byte_offset(&document.content, anchor));
+            origin = origin.min((anchor.line, anchor.column));
         }
-        let mut text = document.content.text();
-        text.make_ascii_lowercase();
-        text.match_indices(&query)
-            .take_while(|(start, _)| *start < origin)
+        document
+            .content
+            .find_matches(query)
+            .iter()
+            .take_while(|(start, _)| (start.line, start.column) < origin)
             .count()
     }
 
@@ -3099,6 +3257,14 @@ impl RepositoryRuntime {
         matches!(self.diff_basis, DiffBasis::PullRequest { .. })
     }
 
+    pub fn shows_diff(&self) -> bool {
+        self.source_surface == SourceSurface::Diff
+    }
+
+    pub fn selected_diff_basis(&self) -> &DiffBasis {
+        &self.diff_basis
+    }
+
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
@@ -3175,6 +3341,30 @@ impl RepositoryRuntime {
         if matches!(self.document, DocumentState::Loading) {
             self.pending_fragment = Some(fragment.to_owned());
             return Task::none();
+        }
+        if let Some(coordinates) = fragment.strip_prefix('L') {
+            let (line, column) = coordinates
+                .split_once(':')
+                .or_else(|| coordinates.split_once('C'))
+                .unwrap_or((coordinates, "1"));
+            if let (Ok(line), Ok(column)) = (line.parse::<u32>(), column.parse::<u32>()) {
+                self.source_surface = SourceSurface::Editor;
+                self.markdown_mode = MarkdownMode::Edit;
+                self.move_cursor_to(LspPosition::new(
+                    line.saturating_sub(1),
+                    column.saturating_sub(1),
+                ));
+                if let DocumentState::Editable(document) = &mut self.document {
+                    document
+                        .content
+                        .restore_scroll_position(text_editor::ScrollPosition {
+                            line: line.saturating_sub(1) as usize,
+                            vertical: 0.0,
+                            horizontal: 0.0,
+                        });
+                }
+                return Task::none();
+            }
         }
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
@@ -3823,7 +4013,7 @@ impl RepositoryRuntime {
                 }
             }
         } else {
-            match self.diff_state(&self.diff_basis) {
+            match self.displayed_diff_state() {
                 None => (Some("No changes"), None, Some(0), Some(0), None),
                 Some(DiffState::Loading { .. }) => (Some("Loading"), None, None, None, None),
                 Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => {
@@ -3963,6 +4153,11 @@ impl RepositoryRuntime {
         }
     }
 
+    pub fn set_editor_font(&mut self, font: Font, size: f32) {
+        self.editor_font = font;
+        self.editor_font_size = size;
+    }
+
     fn auto_save_revision(&self) -> Option<u64> {
         match &self.document {
             DocumentState::Editable(document)
@@ -4072,6 +4267,19 @@ impl RepositoryRuntime {
     }
 
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
+        if matches!(
+            &action,
+            RepositoryAction::Save { .. }
+                | RepositoryAction::DiscardEdits { .. }
+                | RepositoryAction::StageSelected { .. }
+                | RepositoryAction::ApplySourceSurface { .. }
+                | RepositoryAction::ApplyMarkdownMode { .. }
+                | RepositoryAction::ApplyDiffMode { .. }
+                | RepositoryAction::ApplyDiffBasis { .. }
+                | RepositoryAction::OpenExternal { .. }
+        ) {
+            self.toolbar_overflow_open = false;
+        }
         match action {
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
@@ -4492,6 +4700,9 @@ impl RepositoryRuntime {
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
+                    if current {
+                        self.stale_diff = None;
+                    }
                     self.set_diff_state(basis, DiffState::ready(content));
                     if current {
                         self.diff_change =
@@ -4512,6 +4723,9 @@ impl RepositoryRuntime {
                 if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
+                if !matches!(action, text_editor::Action::Scroll { .. }) {
+                    self.dismiss_editor_results();
+                }
                 let applied = match &mut self.document {
                     DocumentState::Editable(document) => document.apply(action),
                     _ => Applied::Unchanged,
@@ -4527,6 +4741,21 @@ impl RepositoryRuntime {
                     }
                     Applied::Unchanged => Task::none(),
                 }
+            }
+            RepositoryAction::Language { action, .. } => {
+                match action {
+                    EditorLspAction::Next(forward) if !self.language.completions.is_empty() => {
+                        let count = self.language.completions.len();
+                        self.language.selected = if forward {
+                            (self.language.selected + 1) % count
+                        } else {
+                            (self.language.selected + count - 1) % count
+                        };
+                    }
+                    EditorLspAction::Dismiss => self.dismiss_editor_results(),
+                    _ => {}
+                }
+                Task::none()
             }
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::AutoSaveDue {
@@ -4711,6 +4940,9 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.capture_native_viewport();
+                if surface == SourceSurface::Editor {
+                    self.align_editor_to_diff();
+                }
                 self.source_surface = surface;
                 self.restore_native_viewport();
                 Task::batch([
@@ -4723,6 +4955,11 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.capture_native_viewport();
+                // Preview has its own retained viewport. Only an explicit
+                // return to Edit follows the source line currently in Diff.
+                if !preview {
+                    self.align_editor_to_diff();
+                }
                 self.source_surface = SourceSurface::Editor;
                 self.diffs
                     .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
@@ -4976,15 +5213,25 @@ impl RepositoryRuntime {
                 }
                 self.diff_viewport = ListViewport { offset, height };
                 self.diff_horizontal = horizontal;
+                if user_initiated
+                    && let (Some(model), Some(layout)) = (self.diff_model(), self.diff_layout())
+                {
+                    let rows = layout.rows(self.diff_mode);
+                    self.diff_change = model
+                        .change_starts(self.diff_mode)
+                        .partition_point(|row| {
+                            rows.offset(layout.folded(self.diff_mode).display(*row)) <= offset + 0.5
+                        })
+                        .saturating_sub(1);
+                }
                 Task::none()
             }
             RepositoryAction::PreviousChange { .. } => {
                 if !self.can_navigate_diff() {
                     return Task::none();
                 }
-                let changes = self.change_count();
-                if changes != 0 {
-                    self.diff_change = (self.diff_change + changes - 1) % changes;
+                if !self.navigate_change(false) {
+                    return Task::none();
                 }
                 self.realize_current_change();
                 self.scroll_to_change()
@@ -4993,9 +5240,8 @@ impl RepositoryRuntime {
                 if !self.can_navigate_diff() {
                     return Task::none();
                 }
-                let changes = self.change_count();
-                if changes != 0 {
-                    self.diff_change = (self.diff_change + 1) % changes;
+                if !self.navigate_change(true) {
+                    return Task::none();
                 }
                 self.realize_current_change();
                 self.scroll_to_change()
@@ -5078,6 +5324,61 @@ impl RepositoryRuntime {
                 self.step_find(false);
                 Task::none()
             }
+            RepositoryAction::FindInputFocus { focused, .. } => {
+                self.find_input_focused = focused;
+                Task::none()
+            }
+            RepositoryAction::ReplaceQueryChanged { query, .. } => {
+                self.replace_query = query;
+                Task::none()
+            }
+            RepositoryAction::ToggleReplace { .. } => {
+                self.replace_open = !self.replace_open;
+                Task::none()
+            }
+            RepositoryAction::ReplaceMatch { card, all } => {
+                if self.is_saving() {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if self.find_matches.is_empty() {
+                    return Task::none();
+                }
+                if all {
+                    let mut text = document.content.text();
+                    for (start, end) in self.find_matches.iter().rev() {
+                        let start = caret_byte_offset(&document.content, *start);
+                        let end = caret_byte_offset(&document.content, *end);
+                        text.replace_range(start..end, &self.replace_query);
+                    }
+                    document.content.perform(text_editor::Action::SelectAll);
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(text),
+                    )));
+                } else {
+                    let (start, end) = self.find_matches[self.find_index];
+                    document.content.move_to(text_editor::Cursor {
+                        position: end,
+                        selection: Some(start),
+                    });
+                    document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        Arc::new(self.replace_query.clone()),
+                    )));
+                }
+                self.push_lsp_change(None);
+                self.markdown_task(card)
+            }
+            RepositoryAction::ToggleToolbarOverflow { .. } => {
+                self.toolbar_overflow_open = !self.toolbar_overflow_open;
+                Task::none()
+            }
+            RepositoryAction::CloseToolbarOverflow { .. } => {
+                self.toolbar_overflow_open = false;
+                Task::none()
+            }
+            RepositoryAction::ZoomFont { .. } => Task::none(),
         }
     }
 
@@ -5117,6 +5418,9 @@ impl RepositoryRuntime {
                 }
                 rebuilt = Some(anchor);
             }
+        }
+        if let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state {
+            layout.set_folding(model, self.diff_hide_unchanged);
         }
         match self
             .diffs
@@ -5463,6 +5767,54 @@ impl RepositoryRuntime {
         }
     }
 
+    fn align_editor_to_diff(&mut self) {
+        if self.source_surface != SourceSurface::Diff {
+            return;
+        }
+        let Some(diff_layout::Anchor::Row { row, fraction }) = self.current_diff_viewport().row
+        else {
+            return;
+        };
+        let Some(model) = self.diff_model() else {
+            return;
+        };
+        let line = match self.diff_mode {
+            DiffMode::Inline => model
+                .inline_rows
+                .iter()
+                .skip(row)
+                .find_map(|row| row.new_line)
+                .or_else(|| {
+                    model
+                        .inline_rows
+                        .iter()
+                        .take(row)
+                        .rev()
+                        .find_map(|row| row.new_line)
+                }),
+            DiffMode::Split => model
+                .split_rows
+                .iter()
+                .skip(row)
+                .find_map(|row| row.new_line)
+                .or_else(|| {
+                    model
+                        .split_rows
+                        .iter()
+                        .take(row)
+                        .rev()
+                        .find_map(|row| row.new_line)
+                }),
+        };
+        if let Some(line) = line {
+            self.viewports.editor = text_editor::ScrollPosition {
+                line: (line as usize).saturating_sub(1),
+                vertical: fraction as f32 * self.editor_font_size * self.line_height,
+                horizontal: self.diff_horizontal,
+            };
+        }
+    }
+
     fn retain_viewports(&mut self) {
         if self.selected.is_none() {
             return;
@@ -5553,17 +5905,35 @@ impl RepositoryRuntime {
     }
 
     fn diff_model(&self) -> Option<&DiffModel> {
-        match self.diff_state(&self.diff_basis) {
+        match self.displayed_diff_state() {
             Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
             _ => None,
         }
     }
 
     fn diff_layout(&self) -> Option<&DiffLayout> {
-        match self.diff_state(&self.diff_basis) {
+        match self.displayed_diff_state() {
             Some(DiffState::Ready(_, layout)) => Some(layout),
             _ => None,
         }
+    }
+
+    fn displayed_diff_state(&self) -> Option<&DiffState> {
+        let current = self.diff_state(&self.diff_basis);
+        if matches!(current, Some(DiffState::Ready(..))) {
+            return current;
+        }
+        self.stale_diff
+            .as_ref()
+            .filter(|(path, basis, _)| {
+                *basis == self.diff_basis
+                    && self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|file| file.path == *path)
+            })
+            .map(|(_, _, state)| state)
+            .or(current)
     }
 
     fn diff_rows(&self) -> Option<&RowOffsets> {
@@ -5601,6 +5971,42 @@ impl RepositoryRuntime {
     fn change_count(&self) -> usize {
         self.diff_model()
             .map_or(0, |model| model.change_starts(self.diff_mode).len())
+    }
+
+    fn change_target(&self, next: bool) -> Option<usize> {
+        let (model, layout) = (self.diff_model()?, self.diff_layout()?);
+        let rows = layout.rows(self.diff_mode);
+        let starts = model.change_starts(self.diff_mode);
+        let offset = self.diff_viewport.offset;
+        // A short folded comparison may clamp multiple changes to the same
+        // reachable scroll offset. Keep explicit stepping exact there.
+        if self
+            .current_change_offset()
+            .is_some_and(|current| (current - offset).abs() < 0.5)
+        {
+            return if next {
+                (self.diff_change + 1 < starts.len()).then_some(self.diff_change + 1)
+            } else {
+                self.diff_change.checked_sub(1)
+            };
+        }
+        let position = |row: &usize| rows.offset(layout.folded(self.diff_mode).display(*row));
+        if next {
+            let target = starts.partition_point(|row| position(row) <= offset + 0.5);
+            (target < starts.len()).then_some(target)
+        } else {
+            starts
+                .partition_point(|row| position(row) < offset - 0.5)
+                .checked_sub(1)
+        }
+    }
+
+    fn navigate_change(&mut self, next: bool) -> bool {
+        let Some(target) = self.change_target(next) else {
+            return false;
+        };
+        self.diff_change = target;
+        true
     }
 
     /// The offset that puts the current change at the top of the viewport.
@@ -6606,7 +7012,7 @@ pub fn selected_file_toolbar_with<'a>(
         };
         let one_line = |text: widget::text::Text<'static, cosmic::Theme, cosmic::Renderer>| {
             text.wrapping(iced::widget::text::Wrapping::None).ellipsize(
-                iced::widget::text::Ellipsize::End(
+                iced::widget::text::Ellipsize::Start(
                     iced::advanced::text::EllipsizeHeightLimit::Lines(1),
                 ),
             )
@@ -6617,13 +7023,15 @@ pub fn selected_file_toolbar_with<'a>(
             // The name gives way to the caption only when there is one; on
             // its own it fills the slot as it always has.
             label.push(
-                one_line(widget::text::body(file_name(&selected.path)))
-                    .width(if linked.is_some() {
-                        Length::Shrink
-                    } else {
-                        Length::Fill
-                    })
-                    .into(),
+                one_line(widget::text::body(
+                    selected.path.to_string_lossy().into_owned(),
+                ))
+                .width(if linked.is_some() {
+                    Length::Shrink
+                } else {
+                    Length::Fill
+                })
+                .into(),
             );
         }
         let tooltip = match linked {
@@ -6727,7 +7135,7 @@ pub fn selected_file_toolbar_with<'a>(
             )
             .into(),
         );
-        document_actions.push(
+        controls.push(
             icon_control(
                 crate::ui_controls::symbolic_icon("document-save-symbolic"),
                 if runtime.is_saving() {
@@ -6788,6 +7196,31 @@ pub fn selected_file_toolbar_with<'a>(
     if runtime.source_surface == SourceSurface::Diff {
         controls.push(diff_review_controls(card, runtime));
     }
+    if editing && runtime.lsp_document.is_some() {
+        let errors = runtime
+            .language
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == crate::lsp::LspSeverity::Error)
+            .count();
+        let warnings = runtime
+            .language
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == crate::lsp::LspSeverity::Warning)
+            .count();
+        controls.push(
+            widget::button::custom(crate::design::caption(format!(
+                "{errors} errors · {warnings} warnings"
+            )))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Diagnostics,
+            })
+            .into(),
+        );
+    }
     let mut secondary = Vec::new();
     if !runtime.standalone
         && let Some(editor) = runtime.external_editors.first()
@@ -6829,30 +7262,40 @@ pub fn selected_file_toolbar_with<'a>(
             ));
         }
     }
-    // The action lane scrolls when space is tight while the secondary launch
-    // actions stay anchored on the right, leaving a clean left/right split.
-    let actions = widget::scrollable(
-        widget::row::with_children(controls)
-            .spacing(crate::design::TOOLBAR_GROUP_SPACING)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
-    )
-    .direction(iced::widget::scrollable::Direction::Horizontal(
-        // The compact rail fits below the centered controls in their existing
-        // inset. Reserving the full content gutter only on this lane shifted
-        // its controls above the filename and the shell's trailing actions.
-        crate::design::scrollbar().margin(0),
-    ))
-    .width(Length::FillPortion(4))
-    .height(crate::design::HEADER_CONTENT_HEIGHT);
-    let mut header = Vec::with_capacity(4);
+    // The common commands stay visible. File, comparison, review and external
+    // editor commands use a popover rather than clipping an icon rail.
+    let primary_count = if editable { 2 } else { 1 };
+    let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
+    overflow.extend(secondary);
+    let more = icon_control(
+        crate::ui_controls::symbolic_icon("view-more-symbolic"),
+        "More file actions",
+        runtime.toolbar_overflow_open,
+        true,
+        Some(RepositoryAction::ToggleToolbarOverflow { card }),
+    );
+    controls.push(crate::ui_controls::popover(
+        more,
+        runtime.toolbar_overflow_open.then(|| {
+            widget::container(
+                widget::column::with_children(overflow)
+                    .spacing(crate::design::TOOLBAR_GROUP_SPACING),
+            )
+            .padding(crate::design::TOOLBAR_INSET)
+            .into()
+        }),
+        widget::popover::Position::Bottom,
+        RepositoryAction::CloseToolbarOverflow { card },
+    ));
+    let actions = widget::row::with_children(controls)
+        .spacing(crate::design::TOOLBAR_GROUP_SPACING)
+        .align_y(Alignment::Center)
+        .height(crate::design::HEADER_CONTENT_HEIGHT);
+    let mut header = Vec::with_capacity(3);
     if let Some(title) = title {
         header.push(title.into());
     }
     header.push(actions.into());
-    if !secondary.is_empty() {
-        header.push(toolbar_group(secondary));
-    }
     header.extend(trailing);
     let toolbar = widget::container(
         widget::row::with_children(header)
@@ -6886,10 +7329,25 @@ fn find_strip<'a>(
     }
     let matched = runtime.find_total != 0;
     let mut row: Vec<Element<'a, RepositoryAction>> = vec![
+        icon_control(
+            crate::ui_controls::symbolic_icon("edit-find-symbolic"),
+            "Find and replace",
+            runtime.replace_open,
+            true,
+            Some(RepositoryAction::ToggleReplace { card }),
+        )
+        .into(),
         widget::text_input("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
             .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
-            .on_submit(move |_| RepositoryAction::FindNext { card })
+            .on_focus(RepositoryAction::FindInputFocus {
+                card,
+                focused: true,
+            })
+            .on_unfocus(RepositoryAction::FindInputFocus {
+                card,
+                focused: false,
+            })
             .size(crate::design::TEXT_BODY)
             .padding([0.0, crate::design::GRID_UNIT * 2.0])
             .width(Length::Fill)
@@ -6897,7 +7355,7 @@ fn find_strip<'a>(
     ];
     // A count is read off the cache the search filled in; an empty query has
     // not searched for anything and says nothing rather than "No results".
-    if !runtime.find_query.trim().is_empty() {
+    if !runtime.find_query.is_empty() {
         row.push(
             crate::design::caption(if matched {
                 format!("{} of {}", runtime.find_index + 1, runtime.find_total)
@@ -6940,17 +7398,41 @@ fn find_strip<'a>(
         )
         .into(),
     );
+    let find = widget::row::with_children(row)
+        .spacing(crate::design::GRID_UNIT * 2.0)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+    let mut strips: Vec<Element<'a, RepositoryAction>> = vec![find.into()];
+    if runtime.replace_open {
+        strips.push(
+            widget::row::with_children(vec![
+                widget::text_input("Replace with", &runtime.replace_query)
+                    .on_input(move |query| RepositoryAction::ReplaceQueryChanged { card, query })
+                    .width(Length::Fill)
+                    .into(),
+                widget::button::standard("Replace")
+                    .on_press_maybe(
+                        (matched && !runtime.is_saving())
+                            .then_some(RepositoryAction::ReplaceMatch { card, all: false }),
+                    )
+                    .into(),
+                widget::button::standard("Replace all")
+                    .on_press_maybe(
+                        (matched && !runtime.is_saving())
+                            .then_some(RepositoryAction::ReplaceMatch { card, all: true }),
+                    )
+                    .into(),
+            ])
+            .spacing(crate::design::GRID_UNIT * 2.0)
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
     Some(
-        widget::container(
-            widget::row::with_children(row)
-                .spacing(crate::design::GRID_UNIT * 2.0)
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
-        )
-        .padding([0.0, crate::design::GRID_UNIT * 3.0])
-        .height(crate::design::DENSE_ROW_HEIGHT)
-        .width(Length::Fill)
-        .into(),
+        widget::container(widget::column::with_children(strips))
+            .padding([0.0, crate::design::GRID_UNIT * 3.0])
+            .width(Length::Fill)
+            .into(),
     )
 }
 
@@ -7348,7 +7830,10 @@ fn editable_document_view<'a>(
                         .map(|(index, item)| {
                             let content = markdown::item(
                                 &crate::document_link::PreviewViewer,
-                                markdown::Settings::from(cosmic::iced::Theme::Dark),
+                                crate::design::markdown_settings(
+                                    &cosmic::theme::active(),
+                                    crate::design::TEXT_BODY,
+                                ),
                                 item,
                                 index,
                             )
@@ -7360,9 +7845,12 @@ fn editable_document_view<'a>(
                         .collect::<Vec<_>>(),
                 )
                 .spacing(
-                    markdown::Settings::from(cosmic::iced::Theme::Dark)
-                        .spacing
-                        .0,
+                    crate::design::markdown_settings(
+                        &cosmic::theme::active(),
+                        crate::design::TEXT_BODY,
+                    )
+                    .spacing
+                    .0,
                 ),
             )
             .padding(spacing.space_m)
@@ -7380,6 +7868,99 @@ fn editable_document_view<'a>(
         .width(Length::Fill)
         .into()
     } else {
+        let popup: Option<Element<'a, RepositoryAction>> = if !runtime
+            .language
+            .completions
+            .is_empty()
+        {
+            let selected = runtime.language.selected;
+            let first = selected.saturating_sub(4);
+            let choices = runtime
+                .language
+                .completions
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(10)
+                .map(|(index, item)| {
+                    let label = crate::design::body(&item.label).width(Length::Fill);
+                    let detail = crate::design::caption(item.detail.as_deref().unwrap_or_default())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ));
+                    widget::button::custom(widget::column::with_children(vec![
+                        label.into(),
+                        detail.into(),
+                    ]))
+                    .class(crate::ui_controls::control_style(index == selected, None))
+                    .width(Length::Fill)
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::Choose {
+                            index,
+                            label: item.label.clone(),
+                        },
+                    })
+                    .into()
+                })
+                .collect::<Vec<_>>();
+            Some(
+                widget::container(
+                    widget::column::with_children(choices)
+                        .spacing(crate::design::GRID_UNIT)
+                        .width(360),
+                )
+                .class(crate::design::surface(
+                    Some(crate::design::raised),
+                    [crate::design::RADIUS_S; 4],
+                    true,
+                ))
+                .padding(spacing.space_xs)
+                .into(),
+            )
+        } else if !runtime.language.hover.is_empty() {
+            let settings = crate::design::markdown_settings(
+                &cosmic::theme::active(),
+                crate::design::TEXT_BODY,
+            );
+            Some(
+                widget::container(
+                    widget::scrollable(
+                        widget::column::with_children(
+                            runtime
+                                .language
+                                .hover
+                                .iter()
+                                .enumerate()
+                                .map(|(index, item)| {
+                                    markdown::item(
+                                        &crate::document_link::PreviewViewer,
+                                        settings,
+                                        item,
+                                        index,
+                                    )
+                                    .map(move |uri| RepositoryAction::MarkdownLink { card, uri })
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .spacing(spacing.space_xs),
+                    )
+                    .height(Length::Shrink),
+                )
+                .max_height(240)
+                .max_width(420)
+                .class(crate::design::surface(
+                    Some(crate::design::raised),
+                    [crate::design::RADIUS_S; 4],
+                    true,
+                ))
+                .padding(spacing.space_xs)
+                .into(),
+            )
+        } else {
+            None
+        };
         let editor = text_editor::TextEditor::new(&document.content)
             // Before `highlight_with`: `id` is only offered by the
             // not-yet-highlighted builder.
@@ -7392,8 +7973,16 @@ fn editable_document_view<'a>(
                 ),
                 |highlight, _theme: &cosmic::Theme| highlight.to_format(),
             )
-            .font(Font::MONOSPACE)
-            .size(14.0)
+            .font(runtime.editor_font)
+            .find_matches(
+                if runtime.find_open {
+                    &runtime.find_matches
+                } else {
+                    &[]
+                },
+                runtime.find_index,
+            )
+            .size(runtime.editor_font_size)
             .line_height(iced::widget::text::LineHeight::Relative(
                 runtime.line_height,
             ))
@@ -7401,6 +7990,25 @@ fn editable_document_view<'a>(
                 &runtime.working_diff.additions
             } else {
                 &[]
+            })
+            .diagnostics(&runtime.language.marks)
+            .popup(
+                popup,
+                if runtime.language.completions.is_empty() {
+                    runtime.language.hover_at
+                } else {
+                    None
+                },
+            )
+            .on_hover(move |at| RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Hover(
+                    at.and_then(|at| caret_position(&document.content, at)),
+                ),
+            })
+            .on_definition(move |at| RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Definition(caret_position(&document.content, at)),
             })
             .wrapping(if runtime.wrap_lines {
                 iced::advanced::text::Wrapping::WordOrGlyph
@@ -7415,18 +8023,69 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(move |press| match text_editor::history_command(&press) {
-                Some(text_editor::HistoryCommand::Undo) => {
-                    Some(text_editor::Binding::Custom(RepositoryAction::Undo {
+            .key_binding(move |press| {
+                use iced::keyboard::{Key, key::Named};
+                if let Some(delta) = crate::interaction::font_zoom_chord(
+                    &press.key,
+                    press.physical_key,
+                    press.modifiers,
+                ) {
+                    return Some(text_editor::Binding::Custom(RepositoryAction::ZoomFont {
                         card,
-                    }))
+                        delta,
+                    }));
                 }
-                Some(text_editor::HistoryCommand::Redo) => {
-                    Some(text_editor::Binding::Custom(RepositoryAction::Redo {
-                        card,
-                    }))
+                if let Some(command) = text_editor::history_command(&press) {
+                    return Some(text_editor::Binding::Custom(match command {
+                        text_editor::HistoryCommand::Undo => RepositoryAction::Undo { card },
+                        text_editor::HistoryCommand::Redo => RepositoryAction::Redo { card },
+                    }));
                 }
-                None => text_editor::default_bindings(press),
+                if !matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return text_editor::default_bindings(press);
+                }
+                let action = match &press.key {
+                    Key::Character(character)
+                        if character.as_str() == " " && press.modifiers.command() =>
+                    {
+                        Some(EditorLspAction::Complete)
+                    }
+                    Key::Named(Named::F12) => Some(if press.modifiers.shift() {
+                        EditorLspAction::References
+                    } else {
+                        EditorLspAction::Definition(None)
+                    }),
+                    Key::Named(Named::Escape)
+                        if !runtime.language.completions.is_empty()
+                            || !runtime.language.hover.is_empty() =>
+                    {
+                        Some(EditorLspAction::Dismiss)
+                    }
+                    Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
+                        Some(EditorLspAction::Next(true))
+                    }
+                    Key::Named(Named::ArrowUp) if !runtime.language.completions.is_empty() => {
+                        Some(EditorLspAction::Next(false))
+                    }
+                    Key::Named(Named::Tab | Named::Enter)
+                        if !runtime.language.completions.is_empty() =>
+                    {
+                        let index = runtime.language.selected;
+                        Some(EditorLspAction::Choose {
+                            index,
+                            label: runtime.language.completions[index].label.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                action
+                    .map(|action| {
+                        text_editor::Binding::Custom(RepositoryAction::Language { card, action })
+                    })
+                    .or_else(|| text_editor::default_bindings(press))
             });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
@@ -7504,12 +8163,33 @@ fn diff_review_controls(
     card: CardId,
     runtime: &RepositoryRuntime,
 ) -> Element<'_, RepositoryAction> {
-    let model = match runtime.diff_state(&runtime.diff_basis) {
+    let model = match runtime.displayed_diff_state() {
         Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
         _ => None,
     };
     let change_count = model.map_or(0, |model| model.change_starts(runtime.diff_mode).len());
     let mut controls = vec![
+        crate::interaction::tooltip(
+            widget::container(
+                if runtime.mutation_refresh_pending
+                    || (runtime.stale_diff.is_some()
+                        && matches!(
+                            runtime.diff_state(&runtime.diff_basis),
+                            Some(DiffState::Loading { .. })
+                        ))
+                {
+                    crate::ui_controls::activity_spinner_tone(
+                        f32::from(crate::design::ROW_ICON_SIZE),
+                        crate::design::warning_color,
+                    )
+                } else {
+                    iced::widget::Space::new().into()
+                },
+            )
+            .width(crate::design::ROW_ICON_SIZE)
+            .height(crate::design::ROW_ICON_SIZE),
+            "Refreshing diff",
+        ),
         crate::ui_controls::segmented_controls(vec![
             icon_control(
                 crate::ui_controls::symbolic_icon("view-list-symbolic"),
@@ -7534,7 +8214,7 @@ fn diff_review_controls(
                 crate::ui_controls::symbolic_icon("go-up-symbolic"),
                 "Previous change",
                 false,
-                runtime.can_navigate_diff(),
+                runtime.can_navigate_diff() && runtime.change_target(false).is_some(),
                 Some(RepositoryAction::PreviousChange { card }),
             )
             .into(),
@@ -7559,7 +8239,7 @@ fn diff_review_controls(
                 crate::ui_controls::symbolic_icon("go-down-symbolic"),
                 "Next change",
                 false,
-                runtime.can_navigate_diff(),
+                runtime.can_navigate_diff() && runtime.change_target(true).is_some(),
                 Some(RepositoryAction::NextChange { card }),
             )
             .into(),
@@ -7613,7 +8293,10 @@ fn diff_surface<'a>(
     runtime: &'a RepositoryRuntime,
     review: Option<&'a crate::pull_request_review::State>,
 ) -> Element<'a, RepositoryAction> {
-    if runtime.mutation_refresh_pending && !runtime.diff_basis.is_immutable() {
+    if runtime.mutation_refresh_pending
+        && runtime.displayed_diff_state().is_none()
+        && !runtime.diff_basis.is_immutable()
+    {
         return match &runtime.files {
             FileListState::Failed(error) => {
                 information_state("Could not refresh file status", error.clone())
@@ -7637,7 +8320,7 @@ fn diff_surface<'a>(
         Some(BasisResolution::Unavailable(message)) => {
             information_state("Comparison unavailable", message.clone())
         }
-        None => match runtime.diff_state(&runtime.diff_basis) {
+        None => match runtime.displayed_diff_state() {
             None => information_state(
                 "Nothing to compare",
                 "This file has nothing to show for the selected comparison.",
@@ -8275,7 +8958,7 @@ impl DiffScrollGeometry {
         let viewport_width = (width - crate::design::SCROLLBAR_GUTTER).max(0.0);
         let code_viewport = match mode {
             DiffMode::Inline => {
-                viewport_width - gutter - DIFF_MARKER_WIDTH - 2.0 * DIFF_ROW_PADDING
+                viewport_width - 2.0 * gutter - DIFF_MARKER_WIDTH - 2.0 * DIFF_ROW_PADDING
             }
             DiffMode::Split => {
                 (viewport_width - DIFF_SPLIT_DIVIDER) / 2.0 - gutter - 2.0 * DIFF_ROW_PADDING
@@ -8319,7 +9002,20 @@ fn inline_diff_row_with_review<'a>(
     };
     diff_container(
         widget::row::with_children(vec![
-            diff_review_gutter(row.new_line.or(row.old_line), gutter, action),
+            diff_review_gutter(
+                row.old_line,
+                gutter,
+                if row.new_line.is_none() {
+                    action.clone()
+                } else {
+                    None
+                },
+            ),
+            diff_review_gutter(
+                row.new_line,
+                gutter,
+                if row.new_line.is_some() { action } else { None },
+            ),
             widget::text::body(marker)
                 .size(DIFF_FONT_SIZE)
                 .font(Font::MONOSPACE)
@@ -8392,7 +9088,7 @@ fn split_diff_row_with_review<'a>(
             .height(DIFF_ROW_HEIGHT)
             .class(cosmic::theme::Container::custom(|theme| {
                 let mut color: iced::Color = theme.current_container().on.into();
-                color.a = 0.16;
+                color.a = crate::design::DIFF_DIVIDER_ALPHA;
                 iced::widget::container::Style {
                     background: Some(iced::Background::Color(color)),
                     ..Default::default()
@@ -8468,7 +9164,7 @@ fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryActi
             .width(Length::Fill)
             .class(cosmic::theme::Text::Custom(|theme| {
                 let mut color: iced::Color = theme.current_container().on.into();
-                color.a = 0.48;
+                color.a = crate::design::DIFF_GUTTER_ALPHA;
                 iced::widget::text::Style {
                     color: Some(color),
                     ..Default::default()
@@ -8480,11 +9176,11 @@ fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryActi
     .into()
 }
 
-fn diff_color(kind: DiffRowKind, alpha: f32) -> iced::Color {
+fn diff_highlight_color(theme: &cosmic::Theme, kind: DiffRowKind, alpha: f32) -> iced::Color {
     // Keep additions and deletions distinct without obscuring their text.
     let mut color = match kind {
-        DiffRowKind::Addition => iced::Color::from_rgb8(46, 160, 93),
-        DiffRowKind::Deletion => iced::Color::from_rgb8(224, 78, 90),
+        DiffRowKind::Addition => crate::design::success_color(theme),
+        DiffRowKind::Deletion => crate::design::destructive_color(theme),
         DiffRowKind::Context | DiffRowKind::Modification => return iced::Color::TRANSPARENT,
     };
     color.a = alpha;
@@ -8553,17 +9249,11 @@ fn diff_tint(tint: iced::Color, background: iced::Color) -> iced::Color {
 }
 
 fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> iced::Color {
-    diff_tint(
-        diff_color(
-            kind,
-            if theme.theme_type.is_dark() {
-                0.10
-            } else {
-                0.075
-            },
-        ),
-        theme.cosmic().bg_color().into(),
-    )
+    match kind {
+        DiffRowKind::Addition => crate::design::diff_added_color(theme),
+        DiffRowKind::Deletion => crate::design::diff_removed_color(theme),
+        _ => theme.cosmic().bg_color().into(),
+    }
 }
 
 fn diff_text<'a>(
@@ -8588,7 +9278,11 @@ fn diff_text<'a>(
         text,
         changed,
         syntax,
-        diff_color(kind, if cosmic::theme::is_dark() { 0.24 } else { 0.18 }),
+        diff_highlight_color(
+            &theme,
+            kind,
+            if cosmic::theme::is_dark() { 0.24 } else { 0.18 },
+        ),
     );
     for span in &mut spans {
         let background = match span
@@ -9812,7 +10506,7 @@ mod tests {
         for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
             for kind in [DiffRowKind::Addition, DiffRowKind::Deletion] {
                 let row = diff_row_background(&theme, kind);
-                let highlight = color_over(diff_color(kind, 0.18), row);
+                let highlight = color_over(diff_highlight_color(&theme, kind, 0.18), row);
                 let faint = iced::Color::from_rgba(0.6, 0.6, 0.6, 0.7);
                 for background in [row, highlight] {
                     let foreground = readable_diff_color(faint, background);
@@ -10268,11 +10962,11 @@ mod tests {
                 for mode in [DiffMode::Split, DiffMode::Inline, DiffMode::Split] {
                     let geometry = DiffScrollGeometry::new(width, 44.0, mode);
                     if mode == DiffMode::Inline {
-                        let single_gutter_code = geometry.viewport_width
-                            - 44.0
+                        let two_gutter_code = geometry.viewport_width
+                            - 2.0 * 44.0
                             - DIFF_MARKER_WIDTH
                             - 2.0 * DIFF_ROW_PADDING;
-                        assert!((geometry.code_viewport - single_gutter_code).abs() < 0.01);
+                        assert!((geometry.code_viewport - two_gutter_code).abs() < 0.01);
                     }
                     let offset = geometry.overflow(code_width);
                     if widest <= geometry.code_viewport {
@@ -10453,27 +11147,14 @@ mod tests {
             assert!(targets > 0);
         }
 
-        // Horizontal only: the compact toolbar thumb fits into the controls'
-        // existing symmetric inset, with no right or bottom-only padding.
+        // The compact toolbar keeps its primary actions visible and moves
+        // secondary actions into a menu instead of a horizontal scroll lane.
         let toolbar = laid_out(
             selected_file_toolbar(card, &runtime).expect("a selected file has a toolbar"),
             &renderer,
             iced::Size::new(240.0, crate::design::HEADER_HEIGHT),
         );
-        let (viewport, content) = *scroll_viewports(&toolbar)
-            .first()
-            .expect("the action lane scrolls");
-        assert!(content.size().width > viewport.size().width);
-        let controls = occupied(content);
-        assert!(
-            content.size().width - (controls.x + controls.width) < 0.5,
-            "a horizontal-only lane reserves no right rail"
-        );
-        let bottom = content.size().height - (controls.y + controls.height);
-        assert!(
-            bottom >= crate::design::SCROLLBAR_THUMB_WIDTH,
-            "the lowest control leaves {bottom} below it, clear of the compact thumb"
-        );
+        assert!(scroll_viewports(&toolbar).is_empty());
 
         // Vertical only: the Markdown preview, whose inset comes from the
         // theme's medium spacing. That is wider than the rail today, and this
@@ -12231,6 +12912,128 @@ mod tests {
     }
 
     #[test]
+    fn change_navigation_follows_manual_scroll_and_stops_at_the_ends() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let mut model = model_with(2);
+        model.inline_rows = (0..20)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        model.inline_change_starts = vec![2, 7, 15];
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(model)),
+        );
+        let middle = runtime.diff_rows().unwrap().offset(7);
+        let last = runtime.diff_rows().unwrap().offset(15);
+        runtime.diff_viewport.offset = middle + 1.0;
+        runtime.navigate_change(true);
+        assert_eq!(runtime.diff_change, 2);
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_viewport.offset, last);
+        runtime.navigate_change(true);
+        assert_eq!(runtime.diff_change, 2);
+        runtime.diff_viewport.offset = middle + 1.0;
+        runtime.navigate_change(false);
+        assert_eq!(runtime.diff_change, 1);
+        runtime.diff_viewport.offset = 0.0;
+        assert!(!runtime.navigate_change(false));
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+    }
+
+    #[test]
+    fn mutation_refresh_keeps_only_the_same_files_comparison_visible() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(model_with(3))),
+        );
+        runtime.diff_viewport.offset = 180.0;
+        drop(runtime.refresh_after_mutation(card));
+        assert!(runtime.diff_model().is_some());
+        assert_eq!(runtime.diff_viewport.offset, 180.0);
+        assert!(runtime.selected_staging_selection(true).is_none());
+        runtime.selected.as_mut().unwrap().path = PathBuf::from("another.rs");
+        assert!(runtime.diff_model().is_none());
+    }
+
+    #[test]
+    fn folded_changes_step_exactly_when_every_scroll_target_is_clamped() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let before = (0..100)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "first change\n")
+            .replace("line 80\n", "second change\n");
+        runtime.diff_viewport.height = 2000.0;
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        assert_eq!(runtime.change_count(), 2);
+        runtime.diff_change = 0;
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(runtime.navigate_change(true));
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_change, 1);
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(!runtime.navigate_change(true));
+        assert!(runtime.navigate_change(false));
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_change, 0);
+        assert!(!runtime.navigate_change(false));
+    }
+
+    #[test]
+    fn changing_folding_preference_preserves_the_logical_viewport() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let before = (0..100)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let after = before.replace("line 50\n", "changed\n");
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        let row = runtime
+            .diff_model()
+            .unwrap()
+            .change_starts(runtime.diff_mode)[0];
+        let display = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(runtime.diff_mode)
+            .display(row);
+        runtime.diff_viewport = ListViewport {
+            offset: runtime.diff_rows().unwrap().offset(display),
+            height: 20.0,
+        };
+        let folded_offset = runtime.diff_viewport.offset;
+        drop(runtime.set_diff_hide_unchanged(false));
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            runtime.diff_rows().unwrap().offset(row)
+        );
+        drop(runtime.set_diff_hide_unchanged(true));
+        assert_eq!(runtime.diff_viewport.offset, folded_offset);
+    }
+
+    #[test]
     fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
@@ -12860,6 +13663,63 @@ mod tests {
             DocumentState::Editable(document) => document.revision,
             _ => panic!("test expects an editable buffer"),
         }
+    }
+
+    #[test]
+    fn editor_diagnostic_marks_map_unicode_and_bare_carriage_return_positions() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "α\rbeta\nsecond\n");
+        runtime.set_editor_diagnostics(vec![crate::lsp::LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 6)),
+            severity: crate::lsp::LspSeverity::Error,
+            message: "bad beta".into(),
+            source: None,
+            code: None,
+        }]);
+        assert_eq!(runtime.language.marks.len(), 1);
+        assert_eq!(
+            runtime.language.marks[0].start,
+            text_editor::Position { line: 1, column: 0 }
+        );
+        assert_eq!(
+            runtime.language.marks[0].end,
+            text_editor::Position { line: 1, column: 4 }
+        );
+        assert_eq!(runtime.language.diagnostics.len(), 1);
+        runtime.set_lsp_document(Some(LspDocumentId(1)));
+        assert!(
+            runtime.language.marks.is_empty(),
+            "a new document cannot retain the old document's ranges"
+        );
+    }
+
+    #[test]
+    fn completion_keyboard_navigation_wraps_and_edits_dismiss_the_popup() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "hello\n");
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 5)),
+                "world",
+            ),
+            vec![],
+        );
+        runtime.set_editor_completions(vec![item.clone(), item]);
+        drop(runtime.update(RepositoryAction::Language {
+            card,
+            action: EditorLspAction::Next(false),
+        }));
+        assert_eq!(runtime.language.selected, 1);
+        drop(runtime.update(RepositoryAction::Language {
+            card,
+            action: EditorLspAction::Next(true),
+        }));
+        assert_eq!(runtime.language.selected, 0);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
+        assert!(runtime.language.completions.is_empty());
     }
 
     fn lsp_version(runtime: &RepositoryRuntime) -> i32 {
@@ -15898,6 +16758,65 @@ mod tests {
             "a closed find bar that left search mode on would swallow every keystroke that \
              followed it"
         );
+    }
+
+    #[test]
+    fn unicode_find_replace_all_is_one_edit_and_renews_matches() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "Straße STRASSE\n");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "strasse".into(),
+        }));
+        assert_eq!(runtime.find_total, 2);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "road".into(),
+        }));
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!()
+        };
+        assert_eq!(document.content.text(), "road road\n");
+        assert!(runtime.is_dirty());
+        assert_eq!(runtime.find_total, 0);
+    }
+
+    #[test]
+    fn returning_from_diff_to_edit_preserves_the_visible_source_line() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "line\n".repeat(100).as_str());
+        runtime.source_surface = SourceSurface::Diff;
+        let mut model = model_with(1);
+        model.inline_rows = (0..100)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        runtime.set_diff_state(
+            runtime.diff_basis.clone(),
+            DiffState::ready(staged_text_diff(model)),
+        );
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 30.0 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: false,
+        }));
+        assert_eq!(runtime.viewports.editor.line, 30);
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
     }
 
     #[test]

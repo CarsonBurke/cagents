@@ -29,9 +29,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   `cagents channel spawn --repository PATH` accept the same folders.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
-  selected worktree or channel. Some settings and shortcut labels call a pane
-  in the strip a **column**, and a few messages call it a **card**; all three
-  mean the same thing.
+  selected worktree or channel. A **pane** is one independently focused surface;
+  editor **tabs** select files within an editor pane.
 - **New terminal** (`Ctrl+Shift+T`) starts in the selected worktree and opens directly
   to the right of the focused pane. The **New tab** menu offers **New
   thread**, **Terminal**, and **Browser** with keyboard navigation; New thread
@@ -47,21 +46,22 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
   use their OMP, Claude, or Codex provider mark.
-- Drag a tab title to reorder panes, or hold **Alt** and drag a pane. The
+- Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
-  first, and the sort control orders the rest by newest, oldest, or name.
+  first; **Settings → General → Worktrees** orders the rest by newest, oldest,
+  or name.
 - Worktree labels prefer the matching pull request title and fall back to a
   readable branch basename; tooltips and search keep the full branch name.
   Rows show matching pull requests and their CI status. Unread updates stay
-  emphasized until acknowledged, and viewing a waiting agent clears its
-  attention badge without changing its activity. The All, Attention, and Pull requests views keep separate
+  emphasized until acknowledged. **Waiting for input** stays visible until the
+  agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
-  after one second.
+  after 300 milliseconds.
 - Contextual external-editor icons open the current project, worktree, or file
   in your external editor.
 
@@ -70,27 +70,36 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Action | Default |
 | --- | --- |
 | New terminal | `Ctrl+Shift+T` |
+| New native thread | `Ctrl+Shift+N` |
+| Command palette | `Ctrl+Shift+P` |
+| Open settings | `Ctrl+Comma` |
+| Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
+| Rename focused pane | `F2` |
+| Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
+| Reopen closed pane | `Ctrl+Shift+Z` |
+| Focus pane 1–9 | `Alt+1` through `Alt+9` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
-| Close focused column | `Ctrl+Shift+W` |
-| Search projects | `Ctrl+F` (outside terminals) |
-| Previous / next column | `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Close focused pane | `Ctrl+Shift+W` |
+| Find in the focused pane / search projects | `Ctrl+F` |
+| Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Ctrl+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
 | Next unviewed review file | `Alt+Shift+Down` |
-| Next / previous changed hunk in a review | `Alt+J` / `Alt+K` |
+| Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
+| Stage / unstage the open file | `Ctrl+Shift+S` |
 
-Every shortcut is configurable; see
+Workspace and review shortcuts are configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
 
 - The defaults leave the keys shells, editors, and agent CLIs use to the
   focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
   deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
-  bind is withheld from the terminal, except **Search projects**, which a
-  focused terminal receives as input (in an editor it finds in the file), and
-  the review chords, which act only in a pull request pane. As in those
+  bind is withheld from the terminal. **Ctrl+F** finds in the focused terminal,
+  chat transcript or editor, and otherwise searches projects. The
+  review chords act in pull request and local diff panes. As in those
   terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
   longer reach terminal programs such as Vim.
 - Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
@@ -98,16 +107,23 @@ Every shortcut is configurable; see
   those defaults move to the new ones; any shortcut you changed is kept. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
-- Hold the column shortcuts to move repeatedly. Navigation scrolls only far
+- Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
   enough to reveal the target pane.
+- **Ctrl+Tab** previews recently used panes. Release **Ctrl** to focus the
+  highlighted pane, or press **Escape** to cancel.
+- Use the command palette to search commands, panes, channels and workspaces.
+  Keyboard settings let you record a chord, remove it, or reset a command;
+  conflicts name the command that already uses the chord.
 - **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Activate panes on hover** is off by default. Turn it on in Settings to
-  activate a pane, without scrolling, after the pointer moves into it and stays
-  there for a moment. Typing or clicking before then keeps focus where it is.
+- **Activate panes on hover** is off by default. When enabled, it previews the
+  pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
+- Hold **Alt+Tab** to preview recently used worktrees and channels. Release
+  **Alt** to open the highlighted workspace, or press **Escape** to cancel.
+  Previewing does not start panes in the workspaces you pass.
 - Switching worktrees remembers each strip's scroll position and focused
   pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree
@@ -387,6 +403,14 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
+Press Ctrl+F in a terminal to search its output, including scrollback. Completed
+terminals keep read-only search, scrolling, selection and copying without keeping
+their process alive. Completed history is bounded to 8 MiB per terminal, including
+text, cell coordinates, colors and links. If older rows exceed this limit, a
+notice identifies how many rows were omitted. Closing the terminal releases its
+retained history. Resizing a completed terminal changes its viewport height while
+preserving the original line wrapping and column coordinates.
+
 The Accounts pane also explains which settings new provider homes share or copy.
 See [Account configuration](account-configuration.md) for Claude settings and MCP
 copies, Codex's independent configuration option, and keyring isolation.
@@ -407,7 +431,7 @@ account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify for the focused pane** is enabled. They name the provider and
+unless **Notify while focused** is enabled. They name the provider and
 folder, without copying prompts or output. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
@@ -435,6 +459,15 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   to save manually.
 - **Wrap long lines** is off by default. Editor and terminal text default to 14
   logical pixels; a terminal font size you already saved is kept.
+- Editor settings can override the terminal font family and size. **Ctrl+=**,
+  **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
+- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
+  **Shift+Enter** move forward and backward; replacement controls offer one
+  match or all matches.
+- With a language server running, diagnostics appear in the gutter and under
+  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  result and **Tab** or **Enter** applies it. Hover over a symbol for details,
+  use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
 - Working-tree diffs edit the real file buffer with the same selection, IME,
@@ -444,6 +477,18 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
 - Comparisons load on demand and cancelled jobs stop. Switching files or modes
   keeps bounded in-memory viewport positions without duplicating buffers or
   writing every scroll to disk.
+- Unchanged diff regions fold by default, with context around each change.
+  Expand a region from either end or reveal it entirely. Editor settings can
+  turn off **Hide unchanged diff lines**; switching the preference keeps the
+  logical reading position and review comments.
+
+## Browser panes
+
+The address bar keeps the complete URL and accepts local addresses such as
+`localhost:3000`. Failed navigation keeps your input available to correct.
+**Ctrl+L** focuses the address bar; **Ctrl+R** or **F5** reloads, and **Alt+Left**
+and **Alt+Right** navigate history. The loading indicator reserves its space,
+and Stop cancels navigation. Search input uses the configured search URL.
 
 ## Native agent chat
 
@@ -554,6 +599,24 @@ Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
 
+- Drag over an answer paragraph or fenced code block and press `Ctrl+C` to
+  copy the selected text. Each code block also has its own **Copy** button.
+- With chat focused, `Ctrl+F` finds matching transcript turns, including tool
+  output. Enter visits the next match, Shift+Enter the previous one, and
+  Escape closes find. Matching prose is highlighted and matching tools expand.
+- While Claude is working, **Queue** holds one follow-up for the next turn.
+  **Undo** returns it to the composer. Escape in the composer interrupts active
+  work when no picker is open. `Ctrl+End` returns to the latest messages;
+  **New activity** indicates messages received while reading earlier history.
+- Type `@` to search tracked files by name. Attachment chips show the file name,
+  offer removal, and reveal the full path on hover. Up and Down in an empty
+  composer recall earlier prompts, including restored conversation history.
+- Claude permission controls describe each available mode and follow changes
+  reported by the provider. Finished reasoning collapses into a summary that
+  can be expanded. Long user prompts also offer an expand control.
+- Relative file links resolve from the conversation's working directory.
+  Links such as `src/main.rs:42:5` open the editor at that line and column.
+
 Chat work keeps running in the background when you switch worktrees or close
 the window. **Stop and close chat** interrupts active work and waits for the
 daemon before removing the pane. Disconnects keep the draft and offer
@@ -565,13 +628,20 @@ the source for resumed history.
 
 ## Terminals and agent status
 
+- **Ctrl+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
+  navigate matches; the search controls can match case. The current match has
+  a stronger highlight than the other matches.
+- Right-click for copy, paste, select all, clear scrollback and link actions.
+  **Shift+Insert** pastes. A multiline paste asks before sending commands to a
+  shell unless bracketed paste is active; the confirmation can be disabled in
+  Terminal settings.
 - Drag over terminal output to select text, then press `Ctrl+Shift+C` to copy.
   Agent terminals keep ordinary clicks available to the CLI while drags select
   text. Hold Alt to send a drag to the agent, or Shift to select text in other
   mouse-aware terminal applications. Empty rows and right-side padding do not
   start selections.
-- Ctrl-click an HTTP or HTTPS address in a terminal to open it using the
-  configured link behavior.
+- Ctrl-click an HTTP or HTTPS address, an OSC 8 link, or a compiler
+  `path:line:column` location to open it using the configured link behavior.
 - Ctrl-click a local `file://` address in a terminal, or follow one in chat,
   to open an editor beside the current pane. A visible clean file editor is
   reused; unsaved buffers stay open. HTML opens as source; **Preview HTML**

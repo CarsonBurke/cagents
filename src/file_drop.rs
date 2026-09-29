@@ -74,6 +74,30 @@ pub fn target<'a, Message: 'static>(
         .into()
 }
 
+/// A drop target which reports entry and departure for attachment feedback.
+pub fn target_with_hover<'a, Message: 'static>(
+    content: impl Into<Element<'a, Message>>,
+    key: impl Hash,
+    accepting: bool,
+    on_drop: impl Fn(Payload) -> Message + 'static,
+    on_hover: impl Fn(bool) -> Message + 'static,
+) -> Element<'a, Message> {
+    let on_hover = std::sync::Arc::new(on_hover);
+    let entering = on_hover.clone();
+    widget::dnd_destination(content, MIME_TYPES.into_iter().map(Cow::Borrowed).collect())
+        .drag_id(drag_id(key))
+        .action(if accepting {
+            DndAction::Copy
+        } else {
+            DndAction::empty()
+        })
+        .preferred_action(DndAction::Copy)
+        .on_enter(move |_, _, _| entering(accepting))
+        .on_leave(move || on_hover(false))
+        .on_finish(move |mime, data, _, _, _| on_drop(Payload::new(mime, data)))
+        .into()
+}
+
 /// A drag id for the target named `key`.
 ///
 /// Ids are shared by every drop target in the window. Iced numbers the ones

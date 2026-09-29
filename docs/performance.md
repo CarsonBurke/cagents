@@ -26,8 +26,9 @@ prerequisites.
 The metric is **requested state committed to first matching-view
 RedrawRequested**. It measures redraw scheduling latency, not renderer
 submission, compositor presentation, scanout, or arbitrary input-to-visible
-latency. `card_focus`, and the planned `palette_open` and `palette_query`, are
-separate actions. Superseded or unfinished generations settle as abandoned,
+latency. The recorder currently samples `card_focus`. The command palette is
+available in the application; recording its `palette_open` and `palette_query`
+actions is planned. Superseded or unfinished generations settle as abandoned,
 never as a successful redraw.
 
 The run emits private raw JSON, median/p95/p99/worst summaries, a

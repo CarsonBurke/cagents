@@ -15,10 +15,19 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) => runtime
                 .selected_path()
                 .map(|path| runtime.descriptor.worktree.join(path)),
+            Some(CardRuntime::Chat(runtime)) => Some(
+                runtime
+                    .session
+                    .launch
+                    .recipe
+                    .working_directory
+                    .join(".chat"),
+            ),
             _ => None,
         });
-        // Relative links have meaning inside a document, but not in chat or a
-        // terminal. An explicit local URL is decoded by the same resolver.
+        // Chat paths use the conversation's working directory; document
+        // paths use the open file's directory. Explicit file URLs work in both.
+        let (target, position) = document_link::file_position(target);
         let resolved = if document.is_none()
             && !Url::parse(target)
                 .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
@@ -29,7 +38,7 @@ impl Cagents {
         };
         match resolved {
             Ok(DocumentLink::Local { path, fragment }) => {
-                self.open_local_file(source, path, fragment)
+                self.open_local_file(source, path, position.or(fragment))
             }
             Ok(DocumentLink::External(url)) => self.open_clicked_link(url),
             Err(error) => {

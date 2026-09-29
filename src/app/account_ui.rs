@@ -24,6 +24,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
+
+fn install_url(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "https://code.claude.com/docs/en/setup",
+        Provider::Codex => "https://developers.openai.com/codex/cli/",
+        Provider::Omp => "https://github.com/can1357/oh-my-pi",
+    }
+}
 use crate::account::{
     self, Account, AccountId, Identity, LiveReport, UsageSnapshot, UsageSource, UsageStatus,
     UsageWindow,
@@ -69,6 +77,7 @@ const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 
 pub(super) struct State {
     accounts: Vec<AccountState>,
+    installed: BTreeMap<Provider, bool>,
     registry: Registry,
     store: Option<Store>,
     homes: Option<Homes>,
@@ -141,6 +150,16 @@ impl OmpRecord {
 }
 
 impl State {
+    pub(super) fn provider_status(&self, provider: Provider) -> &'static str {
+        match self.installed.get(&provider) {
+            None => "Checking provider…",
+            Some(false) => "CLI not found on PATH",
+            Some(true) if self.of(provider).any(|account| account.identity.is_some()) => {
+                "Account available"
+            }
+            Some(true) => "Installed · sign in to get started",
+        }
+    }
     /// The state of a real window, sharing figures with every other window
     /// of this installation through the cache in its state directory, and
     /// accounts through the registry in its configuration directory.
@@ -158,6 +177,7 @@ impl State {
         let registry = Registry::default();
         let mut state = Self {
             accounts: Vec::new(),
+            installed: BTreeMap::new(),
             registry,
             store,
             homes,
@@ -683,6 +703,7 @@ pub struct Loaded {
     registry: Result<Registry, String>,
     restored: Vec<Restored>,
     catalogs: BTreeMap<Provider, Catalog>,
+    installed: BTreeMap<Provider, bool>,
     /// Whether presence was judged on the interface's own `PATH` because the
     /// shell had not yet said what a terminal would search.
     provisional: bool,
@@ -698,10 +719,14 @@ pub struct Restored {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Install(Provider),
     Tick,
     Loaded(Loaded),
     /// Presence judged again on the shell's `PATH`, once it is known.
-    Located(Vec<Restored>),
+    Located {
+        restored: Vec<Restored>,
+        installed: BTreeMap<Provider, bool>,
+    },
     Probed {
         id: AccountId,
         outcome: Outcome,
@@ -803,6 +828,7 @@ impl Action {
         matches!(
             self,
             Self::Refresh(_)
+                | Self::Install(_)
                 | Self::Popover(Some(_))
                 | Self::ShowAccount(_)
                 | Self::OpenPane
@@ -853,7 +879,7 @@ fn restore(
     accounts: &[Account],
     cache: Option<&Cache>,
     now: Millis,
-    search_path: Option<&std::ffi::OsStr>,
+    installed: &BTreeMap<Provider, bool>,
 ) -> Vec<Restored> {
     let mut entries = cache.map(|cache| cache.load(now)).unwrap_or_default();
     accounts
@@ -861,8 +887,20 @@ fn restore(
         .map(|account| Restored {
             id: account.id(),
             present: account.resolved_home().is_some_and(|home| home.is_dir())
-                && probe::find_executable(account.provider.executable(), search_path).is_some(),
+                && installed.get(&account.provider) == Some(&true),
             entry: account.cache_key().and_then(|key| entries.remove(&key)),
+        })
+        .collect()
+}
+
+fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Provider, bool> {
+    Provider::ALL
+        .into_iter()
+        .map(|provider| {
+            (
+                provider,
+                probe::find_executable(provider.executable(), search_path).is_some(),
+            )
         })
         .collect()
 }
@@ -1335,7 +1373,8 @@ impl Cagents {
                     .map(|registry| registry.accounts(homes.as_ref()))
                     .unwrap_or_else(|_| Account::system_accounts().into());
                 let now = now_ms();
-                let restored = restore(&accounts, cache.as_ref(), now, search_path.as_deref());
+                let installed = provider_installations(search_path.as_deref());
+                let restored = restore(&accounts, cache.as_ref(), now, &installed);
                 let catalogs = cache
                     .as_ref()
                     .map(|cache| cache.catalogs(now))
@@ -1353,6 +1392,7 @@ impl Cagents {
                     registry,
                     restored,
                     catalogs,
+                    installed,
                     provisional,
                 }
             })
@@ -1361,6 +1401,7 @@ impl Cagents {
                 registry: Err("The accounts could not be read".into()),
                 restored: Vec::new(),
                 catalogs: BTreeMap::new(),
+                installed: BTreeMap::new(),
                 provisional,
             });
             Message::AccountUi(Action::Loaded(loaded))
@@ -1385,12 +1426,19 @@ impl Cagents {
         let cache = self.account_ui.cache.clone();
         cosmic::task::future(async move {
             let search_path = probe::search_path().await;
-            let restored = tokio::task::spawn_blocking(move || {
-                restore(&accounts, cache.as_ref(), now_ms(), search_path.as_deref())
+            let (restored, installed) = tokio::task::spawn_blocking(move || {
+                let installed = provider_installations(search_path.as_deref());
+                (
+                    restore(&accounts, cache.as_ref(), now_ms(), &installed),
+                    installed,
+                )
             })
             .await
             .unwrap_or_default();
-            Message::AccountUi(Action::Located(restored))
+            Message::AccountUi(Action::Located {
+                restored,
+                installed,
+            })
         })
     }
 
@@ -1762,6 +1810,7 @@ impl Cagents {
         match action {
             Action::Tick => self.probe_accounts(Trigger::Tick),
             Action::Loaded(loaded) => {
+                self.account_ui.installed = loaded.installed;
                 let mut migration = Task::none();
                 match loaded.registry {
                     Ok(mut registry) => {
@@ -1797,7 +1846,11 @@ impl Cagents {
                 };
                 Task::batch([self.probe_accounts(Trigger::Focus), locate, migration])
             }
-            Action::Located(restored) => {
+            Action::Located {
+                restored,
+                installed,
+            } => {
+                self.account_ui.installed = installed;
                 self.account_ui.restore(restored);
                 Task::none()
             }
@@ -2123,6 +2176,9 @@ impl Cagents {
                 }
                 Task::none()
             }
+            Action::Install(provider) => self.open_clicked_link(
+                url::Url::parse(install_url(provider)).expect("fixed install URL"),
+            ),
             Action::RenameCommit => {
                 let Some((id, draft)) = self.account_ui.table.rename.take() else {
                     return Task::none();
@@ -4020,6 +4076,20 @@ mod tests {
     const NOW: Millis = 1_790_000_000_000;
 
     #[test]
+    fn provider_installation_probe_includes_omp_without_any_registered_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(Provider::Omp.executable());
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let installations = provider_installations(Some(directory.path().as_os_str()));
+        assert_eq!(installations.len(), Provider::ALL.len());
+        assert_eq!(installations.get(&Provider::Omp), Some(&true));
+        assert_eq!(installations.get(&Provider::Claude), Some(&false));
+        assert_eq!(installations.get(&Provider::Codex), Some(&false));
+    }
+
+    #[test]
     fn browser_login_preflight_allows_normal_startup_after_a_stale_socket() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -5050,6 +5120,7 @@ mod app_tests {
             registry: Ok(app.account_ui.registry.clone()),
             restored: Vec::new(),
             catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached"))]),
+            installed: BTreeMap::new(),
             provisional: false,
         })));
         let listed = |app: &Cagents, provider| {
@@ -5233,6 +5304,7 @@ mod app_tests {
             registry: Ok(Registry::default()),
             restored: judged(false),
             catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
             provisional: true,
         })));
         for id in [&claude, &codex] {
@@ -5251,7 +5323,10 @@ mod app_tests {
                 snapshot: probed.clone(),
             },
         }));
-        let _ = app.update(Message::AccountUi(Action::Located(judged(true))));
+        let _ = app.update(Message::AccountUi(Action::Located {
+            restored: judged(true),
+            installed: BTreeMap::new(),
+        }));
         let state = app.account_ui.account(&claude).unwrap();
         assert!(state.present);
         let restored = state.snapshot.as_ref().unwrap();
@@ -5280,11 +5355,15 @@ mod app_tests {
             registry: Ok(Registry::default()),
             restored: judged(true),
             catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
             provisional: true,
         })));
         let _ = app.update(Message::AccountUi(Action::Popover(Some(claude.clone()))));
         assert_eq!(app.account_ui.popover.as_ref(), Some(&claude));
-        let _ = app.update(Message::AccountUi(Action::Located(judged(false))));
+        let _ = app.update(Message::AccountUi(Action::Located {
+            restored: judged(false),
+            installed: BTreeMap::new(),
+        }));
         assert!(!app.account_ui.account(&claude).unwrap().present);
         assert_eq!(app.account_ui.popover, None);
     }
@@ -5565,6 +5644,7 @@ mod app_tests {
             registry: Ok(registry),
             restored: Vec::new(),
             catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
             provisional: false,
         })));
 

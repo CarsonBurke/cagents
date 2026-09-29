@@ -385,29 +385,19 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
         state.table.add_menu.then(|| {
             widget::container(
                 widget::column::with_children(vec![
-                    widget::checkbox(state.table.own_codex_config)
-                        .label("Give new Codex accounts their own config copy")
-                        .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
-                        .into(),
-                    design::caption("Otherwise Codex shares config.toml, including forced_login_method and cli_auth_credentials_store. Changes affect every linked account; each home has its own keyring identity.")
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .into(),
-                    design::caption("New Claude accounts copy settings.json and user MCP servers once. Later edits stay separate; login and project trust state are not copied.")
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .into(),
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Claude),
-                        "Claude",
-                        "Sign in with a Claude subscription",
-                        action(Action::Add {
+                        if state.installed.get(&Provider::Claude) == Some(&false) { "Install Claude" } else { "Claude" },
+                        if state.installed.get(&Provider::Claude) == Some(&false) { "CLI not found on PATH" } else { "Sign in with a Claude subscription" },
+                        action(if state.installed.get(&Provider::Claude) == Some(&false) { Action::Install(Provider::Claude) } else { Action::Add {
                             provider: Provider::Claude,
                             device: false,
-                        }),
+                        }}),
                     )
                     .into(),
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Codex),
-                        "ChatGPT (Codex)",
+                        if state.installed.get(&Provider::Codex) == Some(&false) { "Install Codex" } else { "ChatGPT (Codex)" },
                         if browser_busy {
                             "A browser sign-in is pending; finish it or use a code"
                         } else {
@@ -419,20 +409,19 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                         }),
                     )
                     .on_press_maybe((!browser_busy).then(|| {
-                        action(Action::Add {
+                        action(if state.installed.get(&Provider::Codex) == Some(&false) { Action::Install(Provider::Codex) } else { Action::Add {
                             provider: Provider::Codex,
                             device: false,
-                        })
+                        }})
                     }))
                     .into(),
                     crate::ui_controls::popover_item(
                         crate::ui_controls::provider_icon(Provider::Codex),
                         "ChatGPT (Codex) with a code",
                         "Sign in on another device with a one-time code",
-                        action(Action::Add {
-                            provider: Provider::Codex,
-                            device: true,
-                        }),
+                        action(if state.installed.get(&Provider::Codex) == Some(&false) {
+                            Action::Install(Provider::Codex)
+                        } else { Action::Add { provider: Provider::Codex, device: true } }),
                     )
                     .into(),
                     crate::ui_controls::popover_item(
@@ -449,6 +438,13 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                         action(Action::LinkStart(Provider::Codex)),
                     )
                     .into(),
+                    design::horizontal_rule(),
+                    widget::checkbox(state.table.own_codex_config)
+                        .label("Keep a separate Codex configuration")
+                        .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
+                        .into(),
+                    design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
                 ])
                 .spacing(2),
             )
@@ -547,7 +543,7 @@ fn group<'a>(
         .into(),
         iced::widget::Space::new().width(Length::Fill).into(),
     ];
-    if Account::PROVIDERS.contains(&provider) {
+    if Account::PROVIDERS.contains(&provider) && state.installed.get(&provider) != Some(&false) {
         header.push(
             crate::ui_controls::compact_icon_control(
                 crate::ui_controls::symbolic_icon("list-add-symbolic"),
@@ -582,6 +578,10 @@ fn group<'a>(
                 "{problem}, so the accounts {} keeps cannot be listed.",
                 probe::cli_name(provider)
             ),
+            None if state.installed.get(&provider) == Some(&false) => format!(
+                "{} CLI not found on PATH. Install it, then refresh Accounts.",
+                probe::cli_name(provider)
+            ),
             None => format!(
                 "No {} account yet. {} signs in with its own login, in a terminal here.",
                 provider.label(),
@@ -595,6 +595,13 @@ fn group<'a>(
             .padding([design::GRID_UNIT * 3.0, design::GRID_UNIT * 3.0])
             .into(),
         );
+        if state.installed.get(&provider) == Some(&false) {
+            lines.push(
+                widget::button::suggested(format!("Install {}", provider.label()))
+                    .on_press(Message::AccountUi(Action::Install(provider)))
+                    .into(),
+            );
+        }
     }
     widget::column::with_children(vec![
         widget::container(header)

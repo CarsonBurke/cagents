@@ -90,6 +90,19 @@ pub enum TerminalEvent {
         intentional: bool,
     },
     ConversationTitleChanged(String),
+    WorkingDirectoryChanged(std::path::PathBuf),
+    ClipboardText {
+        request: uuid::Uuid,
+        text: String,
+    },
+    SearchResults {
+        /// Daemon client that owns the response; omitted on the client wire.
+        owner: Option<u64>,
+        request: u64,
+        query: String,
+        matches: Vec<super::SearchMatch>,
+        truncated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -40,6 +40,37 @@ struct Overlay {
     interaction: mouse::Interaction,
 }
 
+// A cached/lazy widget can skip child diffing even though the runtime extracted
+// all its named descendants. Reclaim only surviving State::None placeholders;
+// ordinary reconciliation already consumed the states for rebuilt widgets.
+/// Restores extracted named states in retained cached widget subtrees.
+///
+/// Custom event loops that use `Tree::take_all_named` must call this after
+/// reconciliation and before layout, just as [`UserInterface::build`] does.
+pub fn restore_cached_named_states(tree: &mut widget::Tree) {
+    if matches!(tree.state, widget::tree::State::None)
+        && let Some(crate::core::id::Id(crate::core::id::Internal::Custom(_, name))) = &tree.id
+        && let Some((state, children)) = NAMED.with(|named| named.borrow_mut().remove(name))
+    {
+        // A rebuilt stateless widget may reuse a removed stateful widget's
+        // name. Its State::None is fresh rather than an extracted placeholder.
+        // Do not install the old widget's state or child shape into it.
+        if tree.tag != widget::tree::Tag::stateless()
+            || matches!(state, widget::tree::State::None)
+        {
+            tree.state = state;
+            for (index, child) in children {
+                if let Some(slot) = tree.children.get_mut(index) {
+                    *slot = child;
+                }
+            }
+        }
+    }
+    for child in &mut tree.children {
+        restore_cached_named_states(child);
+    }
+}
+
 impl<'a, Message, Theme, Renderer> UserInterface<'a, Message, Theme, Renderer>
 where
     Renderer: crate::core::Renderer,
@@ -110,6 +141,11 @@ where
         });
 
         state.diff(root.as_widget_mut());
+
+        // Lazy widgets can retain their exact child widgets and skip child
+        // diffing. Restore their extracted named states before layout.
+        // States belonging to removed widgets are still discarded below.
+        restore_cached_named_states(&mut state);
 
         let base = root.as_widget_mut().layout(
             &mut state,

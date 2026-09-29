@@ -5,6 +5,10 @@
 //! navigation, inspector, dock, and task surfaces.
 
 pub const GRID_UNIT: f32 = 4.0;
+pub const SCRIM_ALPHA: f32 = 0.48;
+pub const ATTENTION_BORDER_ALPHA: f32 = 0.35;
+pub const DIFF_GUTTER_ALPHA: f32 = 0.48;
+pub const DIFF_DIVIDER_ALPHA: f32 = 0.16;
 
 pub const HEADER_HEIGHT: f32 = 44.0;
 /// Every standard header includes its bottom separator in HEADER_HEIGHT.
@@ -26,6 +30,15 @@ pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 /// this role - navigation rows, panel rows, header status - uses this token, so
 /// the same role cannot be 16px in one pane and 14px in the next.
 pub const ROW_ICON_SIZE: u16 = 16;
+pub const TAB_STATUS_ICON_SIZE: u16 = 14;
+pub const WINDOW_CONTROL_SIZE: f32 = 32.0;
+pub const COMMAND_POPOVER_WIDTH: f32 = 292.0;
+pub const NOTICE_POPOVER_WIDTH: f32 = 408.0;
+pub const PANE_NAVIGATOR_MIN_WIDTH: f32 = 42.0;
+pub const PANE_NAVIGATOR_RESERVED_WIDTH: f32 = 110.0;
+pub const TAB_MIN_WIDTH: f32 = 160.0;
+pub const TAB_MAX_WIDTH: f32 = 280.0;
+pub const PULL_REQUEST_BROWSER_ROW_HEIGHT: f32 = 48.0;
 /// Icons that stand alone as the illustration of a whole pane state.
 pub const STATUS_ICON_SIZE: u16 = 20;
 /// A control that sits inside prose rather than in a toolbar, and its icon.
@@ -42,6 +55,85 @@ pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_PROSE: f32 = 14.0;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_HEADING: f32 = 13.0;
+
+/// Markdown shares the shell's semantic palette and a compact heading scale.
+pub fn markdown_settings(theme: &cosmic::Theme, size: f32) -> cosmic::widget::markdown::Settings {
+    use cosmic::{iced, widget::markdown};
+    let mut style = markdown::Style::from(if theme.theme_type.is_dark() {
+        iced::Theme::Dark
+    } else {
+        iced::Theme::Light
+    });
+    style.link_color = accent_color(theme);
+    style.inline_code_color = theme.cosmic().background(false).on.into();
+    style.inline_code_highlight.background = raised(theme).into();
+    style.inline_code_highlight.border.radius = RADIUS_XS.into();
+    markdown::Settings {
+        h1_size: (size + GRID_UNIT).into(),
+        h2_size: (size + GRID_UNIT / 2.0).into(),
+        h3_size: (size + 1.0).into(),
+        h4_size: size.into(),
+        h5_size: size.into(),
+        h6_size: size.into(),
+        code_size: size.into(),
+        spacing: (GRID_UNIT * 2.0).into(),
+        ..markdown::Settings::with_text_size(size, style)
+    }
+}
+
+pub fn comment_card<'a, Message: 'a>(
+    author: &str,
+    created_at: &str,
+    body: cosmic::Element<'a, Message>,
+    actions: cosmic::Element<'a, Message>,
+) -> cosmic::Element<'a, Message> {
+    use cosmic::{
+        iced::{Alignment, Length},
+        widget,
+    };
+    let initial = author
+        .chars()
+        .next()
+        .map(|ch| ch.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    let age = created_at.parse::<jiff::Timestamp>().ok().map(|date| {
+        jiff::Timestamp::now()
+            .as_second()
+            .saturating_sub(date.as_second())
+            .max(0)
+    });
+    let time = match age {
+        Some(seconds) if seconds < 60 => "Just now".to_owned(),
+        Some(seconds) if seconds < 3600 => format!("{}m ago", seconds / 60),
+        Some(seconds) if seconds < 86400 => format!("{}h ago", seconds / 3600),
+        Some(seconds) => format!("{}d ago", seconds / 86400),
+        None => created_at.to_owned(),
+    };
+    widget::container(
+        widget::column::with_children(vec![
+            widget::row::with_children(vec![
+                widget::container(heading(initial))
+                    .center_x(24)
+                    .center_y(24)
+                    .class(surface(Some(raised), [RADIUS_M; 4], false))
+                    .into(),
+                heading(author.to_owned()).width(Length::Fill).into(),
+                caption(time).into(),
+                actions,
+            ])
+            .spacing(2.0 * GRID_UNIT)
+            .align_y(Alignment::Center)
+            .into(),
+            body,
+        ])
+        .spacing(2.0 * GRID_UNIT)
+        .width(Length::Fill),
+    )
+    .padding(2.0 * GRID_UNIT)
+    .width(Length::Fill)
+    .class(surface(Some(raised), [RADIUS_S; 4], true))
+    .into()
+}
 
 /// The shell's "working" tone: something is in flight and may still fail.
 pub fn warning_color(theme: &cosmic::Theme) -> cosmic::iced::Color {

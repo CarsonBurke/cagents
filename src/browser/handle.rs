@@ -29,6 +29,7 @@ pub(crate) enum Command {
     Back,
     Forward,
     Reload,
+    Stop,
     Hibernate,
     Restore,
     Input(BrowserInput),
@@ -412,6 +413,10 @@ impl BrowserHandle {
 
     pub fn reload(&self) -> Result<(), BrowserError> {
         self.mailbox.send(Command::Reload)
+    }
+
+    pub fn stop(&self) -> Result<(), BrowserError> {
+        self.mailbox.send(Command::Stop)
     }
 
     /// Sets the full physical size Servo renders at, independently of how much

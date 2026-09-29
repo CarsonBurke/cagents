@@ -128,12 +128,12 @@ pub(super) fn code_surface<'a>(
         .into(),
         None => body.into(),
     };
-    code_frame(body, caption, copy)
+    code_frame(body, caption.map(str::to_owned), copy)
 }
 
-fn code_frame<'a>(
+pub(super) fn code_frame<'a>(
     body: Element<'a, Message>,
-    caption: Option<&'a str>,
+    caption: Option<String>,
     copy: Option<Action>,
 ) -> Element<'a, Message> {
     let Some(caption) = caption else {
@@ -265,7 +265,7 @@ impl Runtime {
             block.view(self.syntax_theme, limit, move |event| {
                 action(Action::ToolText(target, id.clone(), part.clone(), event))
             }),
-            Some(caption),
+            Some(caption.to_owned()),
             Some(copy),
         )
     }
@@ -485,7 +485,12 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
             ItemContent::Text { .. } => {
-                rows.push(prose::view(cached, settings));
+                rows.push(prose::view(
+                    cached,
+                    settings,
+                    self.target,
+                    self.find.as_deref(),
+                ));
             }
             ItemContent::Command {
                 working_directory,

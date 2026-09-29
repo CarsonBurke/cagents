@@ -1319,6 +1319,16 @@ pub enum GitHubAvailability {
 }
 
 impl GitHubAvailability {
+    pub fn guidance(&self) -> String {
+        match self {
+            Self::MissingCli => "GitHub CLI was not found on PATH. Install it from https://cli.github.com, then refresh.".into(),
+            Self::Unauthenticated => "GitHub CLI is not signed in. Run gh auth login in a terminal, then refresh.".into(),
+            Self::NotAssociated => "This repository has no supported GitHub remote. Add a GitHub remote, then refresh.".into(),
+            Self::Loading { .. } => "Connecting to GitHub…".into(),
+            Self::Failed { detail } => format!("Could not connect to GitHub: {detail}. Check your connection and refresh to retry."),
+            Self::Ready { .. } => self.label().into(),
+        }
+    }
     pub fn repository_key(&self) -> Option<&GitHubRepoKey> {
         match self {
             Self::Ready { repository_key, .. } => Some(repository_key),
@@ -1329,17 +1339,17 @@ impl GitHubAvailability {
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::MissingCli => "GitHub CLI is unavailable; local Git remains available.",
-            Self::Unauthenticated => {
-                "GitHub authentication is required; local Git remains available."
-            }
-            Self::NotAssociated => "No supported GitHub remote is associated.",
+            Self::MissingCli => "Install GitHub CLI from cli.github.com, then refresh.",
+            Self::Unauthenticated => "Sign in with gh auth login, then refresh.",
+            Self::NotAssociated => "Add a GitHub remote to browse pull requests.",
             Self::Loading { .. } => "Refreshing GitHub.",
             Self::Ready { pull_requests, .. } if pull_requests.is_empty() => {
                 "GitHub is up to date; no open pull requests."
             }
             Self::Ready { .. } => "GitHub is up to date.",
-            Self::Failed { .. } => "GitHub refresh failed; retry to authorize mutations.",
+            Self::Failed { .. } => {
+                "Could not connect to GitHub. Check your connection and refresh."
+            }
         }
     }
 

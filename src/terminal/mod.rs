@@ -2,7 +2,9 @@
 pub(crate) mod holder;
 mod hosted;
 pub mod ipc;
+mod search;
 mod snapshot;
+pub use search::SearchMatch;
 #[cfg(feature = "ui")]
 mod surface;
 mod theme;
@@ -10,6 +12,8 @@ mod types;
 pub use theme::{TerminalPalette, TerminalTheme, ThemeColor};
 #[cfg(feature = "ui")]
 mod widget;
+#[cfg(feature = "ui")]
+pub(crate) use widget::monospace_font;
 #[cfg(feature = "host")]
 mod worker;
 

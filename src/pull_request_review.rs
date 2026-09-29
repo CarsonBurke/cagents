@@ -11,7 +11,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -142,6 +142,10 @@ pub enum ViewedOutcome {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    BrowserViewport {
+        offset: f32,
+        height: f32,
+    },
     FilePage(file_pages::PageAction),
     BrowserFenced {
         generation: u64,
@@ -375,6 +379,7 @@ impl ReviewSource {
 }
 
 pub struct State {
+    unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -394,6 +399,8 @@ pub struct State {
     list_appending: bool,
     list_error: Option<String>,
     browser_query: String,
+    browser_keys: BTreeMap<u64, (String, String)>,
+    browser_viewport: (f32, f32),
     browser_filter: BrowserFilter,
     requests: request_ui::State,
     target: Option<ReviewTarget>,
@@ -568,6 +575,7 @@ impl State {
 
     pub fn new(api: Arc<dyn GitHubReviewApi>, git: RepositoryService) -> Self {
         Self {
+            unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
             api,
             cache: None,
@@ -586,6 +594,8 @@ impl State {
             list_appending: false,
             list_error: None,
             browser_query: String::new(),
+            browser_keys: BTreeMap::new(),
+            browser_viewport: (0.0, 480.0),
             browser_filter: BrowserFilter::default(),
             requests: request_ui::State::default(),
             target: None,
@@ -628,6 +638,8 @@ impl State {
         self.list_loading = false;
         self.list_error = None;
         self.browser_query.clear();
+        self.browser_keys.clear();
+        self.browser_viewport.0 = 0.0;
         self.browser_filter = BrowserFilter::default();
         let closed = self.close();
         match self.source {
@@ -774,13 +786,25 @@ impl State {
             Action::LoadMore => self.load_list_page(true),
             Action::BrowserQuery(query) => {
                 self.browser_query = query;
+                self.browser_viewport.0 = 0.0;
+                iced::widget::operation::scroll_to(
+                    widget::Id::new("pr.browser"),
+                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                )
+            }
+            Action::BrowserViewport { offset, height } => {
+                self.browser_viewport = (offset, height);
                 ActionTask::none()
             }
             Action::BrowserFilterIndex(index) => {
                 if let Some(filter) = BrowserFilter::ALL.get(index) {
                     self.browser_filter = *filter;
+                    self.browser_viewport.0 = 0.0;
                 }
-                ActionTask::none()
+                iced::widget::operation::scroll_to(
+                    widget::Id::new("pr.browser"),
+                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: 0.0 },
+                )
             }
             Action::ListLoaded { generation, result } => {
                 if generation != self.list_generation {
@@ -805,6 +829,20 @@ impl State {
                                 .filter(|row| known.insert(row.number))
                                 .map(Arc::new),
                         );
+                        self.browser_keys = rows
+                            .iter()
+                            .map(|row| {
+                                (
+                                    row.number,
+                                    (
+                                        row.title.to_lowercase(),
+                                        row.author.as_ref().map_or_else(String::new, |author| {
+                                            author.login.to_lowercase()
+                                        }),
+                                    ),
+                                )
+                            })
+                            .collect();
                         self.list = ListState::Ready(rows);
                         self.list_error = None;
                     }
@@ -2054,7 +2092,7 @@ impl State {
         ));
         let name = design::body(&*row.label)
             .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
+            .ellipsize(iced::widget::text::Ellipsize::Start(
                 EllipsizeHeightLimit::Lines(1),
             ))
             .width(Length::Fill);
@@ -2166,17 +2204,26 @@ impl State {
 /// The list a shell without a project sidebar shows, one row per open pull
 /// request. Choosing a row emits [`Action::Select`].
 impl State {
+    pub fn set_unavailable_reason(&mut self, reason: Option<String>) {
+        self.unavailable_reason = reason;
+    }
+
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         let spacing = cosmic::theme::spacing();
         if self.source.is_none() {
             return widget::container(
-                design::caption("Open an authenticated GitHub repository to browse pull requests.")
-                    .wrapping(iced::widget::text::Wrapping::Word),
+                design::caption(
+                    self.unavailable_reason
+                        .as_deref()
+                        .unwrap_or("Open a project with a GitHub remote to browse pull requests."),
+                )
+                .wrapping(iced::widget::text::Wrapping::Word),
             )
             .padding(spacing.space_xs)
             .into();
         }
         let query = self.browser_query.trim().to_lowercase();
+        let mut browser_count = 0;
         let mut rows: Vec<Element<'a, Action>> = match &self.list {
             ListState::Idle | ListState::Loading => {
                 vec![design::caption("Loading pull requests…").into()]
@@ -2201,34 +2248,70 @@ impl State {
                     .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
                     .into(),
             ],
-            ListState::Ready(pull_requests) => pull_requests
-                .iter()
-                .filter(|pr| {
-                    self.browser_filter
-                        .matches(pr, self.requests.requested().get(&pr.number))
-                        && (query.is_empty()
-                            || pr.title.to_lowercase().contains(&query)
-                            || pr.number.to_string() == query.trim_start_matches('#')
-                            || pr.author.as_ref().is_some_and(|author| {
-                                author
-                                    .login
-                                    .to_lowercase()
-                                    .contains(query.trim_start_matches('@'))
-                            }))
-                })
-                .map(|pull_request| {
-                    browser_row(
+            ListState::Ready(pull_requests) => {
+                let matches: Vec<_> = pull_requests
+                    .iter()
+                    .filter(|pr| {
+                        self.browser_filter
+                            .matches(pr, self.requests.requested().get(&pr.number))
+                            && (query.is_empty()
+                                || self.browser_keys.get(&pr.number).map_or_else(
+                                    || pr.title.to_lowercase().contains(&query),
+                                    |(title, _)| title.contains(&query),
+                                )
+                                || pr.number.to_string() == query.trim_start_matches('#')
+                                || pr.author.as_ref().is_some_and(|author| {
+                                    self.browser_keys.get(&pr.number).map_or_else(
+                                        || {
+                                            author
+                                                .login
+                                                .to_lowercase()
+                                                .contains(query.trim_start_matches('@'))
+                                        },
+                                        |(_, author)| {
+                                            author.contains(query.trim_start_matches('@'))
+                                        },
+                                    )
+                                }))
+                    })
+                    .collect();
+                browser_count = matches.len();
+                let window = browser_row_window(
+                    matches.len(),
+                    self.browser_viewport.0,
+                    self.browser_viewport.1,
+                );
+                let mut rows: Vec<Element<'a, Action>> = vec![
+                    widget::Space::new()
+                        .height(window.start as f32 * design::PULL_REQUEST_BROWSER_ROW_HEIGHT)
+                        .into(),
+                ];
+                rows.extend(matches[window.clone()].iter().map(|pull_request| {
+                    let row: Element<'a, Action> = widget::container(browser_row(
                         pull_request,
                         self.requests.label(pull_request.number),
-                        false,
+                        self.target.as_ref().is_some_and(|target| {
+                            target.pull_request.number == pull_request.number
+                        }),
                         modal_open,
-                    )
-                    .map(|action| Action::BrowserFenced {
+                    ))
+                    .height(design::PULL_REQUEST_BROWSER_ROW_HEIGHT)
+                    .into();
+                    row.map(|action| Action::BrowserFenced {
                         generation: self.list_generation,
                         action: Box::new(action),
                     })
-                })
-                .collect(),
+                }));
+                rows.push(
+                    widget::Space::new()
+                        .height(
+                            (matches.len() - window.end) as f32
+                                * design::PULL_REQUEST_BROWSER_ROW_HEIGHT,
+                        )
+                        .into(),
+                );
+                rows
+            }
         };
         // Request discovery is independent of the visible list's first page.
         // Offer exact numbers discovered later without inventing missing PR DTOs.
@@ -2273,7 +2356,7 @@ impl State {
             }
         }
         let count = match &self.list {
-            ListState::Ready(pull_requests) if !pull_requests.is_empty() => rows.len(),
+            ListState::Ready(pull_requests) if !pull_requests.is_empty() => browser_count,
             _ => 0,
         };
         let list: Element<'a, Action> = widget::scrollable(
@@ -2284,6 +2367,11 @@ impl State {
                 ])))
                 .width(Length::Fill),
         )
+        .id(widget::Id::new("pr.browser"))
+        .on_scroll(|viewport| Action::BrowserViewport {
+            offset: viewport.absolute_offset().y,
+            height: viewport.bounds().height,
+        })
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -3785,5 +3873,36 @@ pub(crate) mod tests {
         drop(state.set_source(None));
         assert!(state.target.is_none());
         assert_eq!(state.list, ListState::Idle);
+    }
+}
+
+fn browser_row_window(total: usize, offset: f32, height: f32) -> std::ops::Range<usize> {
+    const OVERSCAN: usize = 8;
+    let height = height.max(0.0);
+    let offset = offset
+        .max(0.0)
+        .min((total as f32 * design::PULL_REQUEST_BROWSER_ROW_HEIGHT - height).max(0.0));
+    let first = (offset / design::PULL_REQUEST_BROWSER_ROW_HEIGHT).floor() as usize;
+    let start = first.saturating_sub(OVERSCAN).min(total);
+    let end =
+        (first + (height / design::PULL_REQUEST_BROWSER_ROW_HEIGHT).ceil() as usize + OVERSCAN)
+            .min(total);
+    start..end
+}
+
+#[cfg(test)]
+mod browser_window_tests {
+    use super::*;
+    #[test]
+    fn loaded_pr_window_is_bounded_and_reaches_the_end() {
+        let window = browser_row_window(
+            10_000,
+            5000.0 * design::PULL_REQUEST_BROWSER_ROW_HEIGHT,
+            480.0,
+        );
+        assert!(window.len() <= 26);
+        assert!(window.contains(&5000));
+        assert_eq!(browser_row_window(10_000, f32::MAX, 480.0).end, 10_000);
+        assert!(browser_row_window(0, 10.0, 480.0).is_empty());
     }
 }

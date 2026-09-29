@@ -1006,6 +1006,10 @@ pub fn trim_browser_history(history: &mut Vec<Url>, index: &mut usize) {
 pub struct PullRequestView {
     pub repository: PathBuf,
     pub selected_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_collapsed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1127,13 +1131,12 @@ pub struct WorkspaceState {
     pub channels: Vec<ProjectChannel>,
     #[serde(default, alias = "active_thread")]
     pub active_channel: Option<ChannelId>,
-    /// The workspace scope a card was filed under when its launch directory
-    /// belongs to no known worktree.
+    /// Explicit workspace filing, independent of a card's launch directory.
     ///
-    /// Adopting a daemon-owned terminal is the only producer: the launch recipe
-    /// is never rewritten to relocate a card, so a terminal started outside
-    /// every project needs its filing recorded somewhere durable or the user
-    /// would find it somewhere else after a restart.
+    /// Adoption records the chosen workspace without rewriting launch recipes.
+    /// Cloning and reopening preserve that ownership, including editors whose
+    /// descriptor points into a nested directory, so startup projection keeps
+    /// them in the workspace where they were opened.
     #[serde(default)]
     pub card_scopes: HashMap<CardId, PathBuf>,
     /// Unsent native-chat composer text, keyed by the card that owns it.
@@ -1216,6 +1219,22 @@ mod tests {
                 .unwrap()
                 .get("selected_file")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn review_file_panel_preferences_round_trip_and_old_descriptors_keep_auto_layout() {
+        let mut view: PullRequestView = serde_json::from_value(
+            serde_json::json!({ "repository": "/repo", "selected_number": 12 }),
+        )
+        .unwrap();
+        assert_eq!(view.file_panel_width, None);
+        assert_eq!(view.file_panel_collapsed, None);
+        view.file_panel_width = Some(360);
+        view.file_panel_collapsed = Some(true);
+        assert_eq!(
+            serde_json::from_slice::<PullRequestView>(&serde_json::to_vec(&view).unwrap()).unwrap(),
+            view
         );
     }
 

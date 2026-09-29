@@ -668,6 +668,10 @@ impl State {
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             );
+            let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
+            if own {
+                rows.push(design::caption("GitHub allows comments on your own pull request, but not approval or requests for changes.").into());
+            }
             let mut editor = text_editor::TextEditor::new(&self.discussion.summary)
                 .placeholder("Leave a comment on the pull request (optional)")
                 .padding(spacing.space_xs)
@@ -676,7 +680,6 @@ impl State {
                 editor = editor.on_action(Action::Summary);
             }
             rows.push(editor.into());
-            let own = self.context.as_ref().is_some_and(|c| c.viewer_is_author);
             let mut choices: Vec<Element<'_, Action>> = [
                 (
                     ReviewEvent::Comment,
@@ -1166,33 +1169,31 @@ impl State {
                 continue;
             }
             for comment in &thread.comments {
-                rows.push(
-                    design::caption(format!(
-                        "{}{}",
-                        comment
-                            .author
-                            .as_ref()
-                            .map_or("Deleted account", |a| a.login.as_str()),
-                        if comment.is_pending() {
-                            " · Pending"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .into(),
-                );
-                if let Some(items) = comment
+                let body = if let Some(items) = comment
                     .id
                     .as_ref()
                     .and_then(|id| self.discussion.markdown.get(id))
                 {
-                    rows.push(
-                        markdown::view(items, markdown::Settings::from(iced::Theme::Dark))
-                            .map(|uri| Action::OpenLink(uri.to_string())),
-                    );
+                    let theme = cosmic::theme::active();
+                    markdown::view(items, design::markdown_settings(&theme, design::TEXT_BODY))
+                        .map(|uri| Action::OpenLink(uri.to_string()))
                 } else {
-                    rows.push(design::body(&comment.body).into());
-                }
+                    design::body(&comment.body).into()
+                };
+                let actions = if comment.is_pending() {
+                    design::caption("Pending").into()
+                } else {
+                    cosmic::iced::widget::Space::new().into()
+                };
+                rows.push(design::comment_card(
+                    comment
+                        .author
+                        .as_ref()
+                        .map_or("Deleted account", |author| author.login.as_str()),
+                    &comment.created_at,
+                    body,
+                    actions,
+                ));
                 if comment.viewer_did_author
                     && comment.is_pending()
                     && let Some(id) = &comment.id
@@ -1258,7 +1259,10 @@ impl State {
                 rows.push(
                     markdown::view(
                         &composer.markdown,
-                        markdown::Settings::from(iced::Theme::Dark),
+                        crate::design::markdown_settings(
+                            &cosmic::theme::active(),
+                            crate::design::TEXT_BODY,
+                        ),
                     )
                     .map(|uri| Action::OpenLink(uri.to_string())),
                 );

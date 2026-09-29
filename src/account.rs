@@ -1591,6 +1591,12 @@ mod credential_guard {
                     text = text.replace(&format!("\"{name}\""), "\"credential-variable-name\"");
                 }
             }
+            // The Accounts install action opens this fixed documentation page
+            // in a browser. It does not read credentials or call a service API.
+            if file.ends_with("src/app/account_ui.rs") {
+                let documentation = ["https://developers.open", "ai.com/codex/cli/"].concat();
+                text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
+            }
             for needle in &forbidden {
                 if text.contains(needle.as_str()) {
                     violations.push(format!("{} names {needle}", file.display()));

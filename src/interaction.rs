@@ -17,8 +17,178 @@ use serde::Deserialize;
 
 mod context_menu;
 
+/// Let a focused field answer Escape before its native blur handler runs.
+pub fn focused_escape<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_escape: impl Fn() -> Message + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusedEscape,
+        tip: None,
+        on_escape: Some(Box::new(on_escape)),
+    }
+    .into()
+}
+
+#[derive(Default)]
+struct ChildFocus(bool);
+
+impl Operation for ChildFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        self.0 |= state.is_focused();
+    }
+}
+
+/// Arrow navigation stays inside the list that owns native keyboard focus.
+pub fn keyboard_list<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyboardList(enabled),
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+pub fn keyboard_list_row<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ListRow,
+        tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+struct ListRowMarker;
+
+#[derive(Default)]
+struct ListFocus {
+    rows: Vec<Rectangle>,
+    focused: Option<usize>,
+    active: Option<usize>,
+}
+
+impl Operation for ListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<ListRowMarker>() {
+            self.active = Some(self.rows.len());
+            self.rows.push(bounds);
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take()
+            && state.is_focused()
+        {
+            self.focused = Some(index);
+        }
+    }
+}
+
+struct MoveListFocus {
+    target: usize,
+    index: usize,
+    active: Option<usize>,
+    bounds: Rectangle,
+}
+
+impl Operation for MoveListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<ListRowMarker>() {
+            self.active = Some(self.index);
+            self.index += 1;
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take() {
+            if index == self.target {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+        }
+    }
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        _translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        let delta = if self.bounds.y < bounds.y {
+            self.bounds.y - bounds.y
+        } else if self.bounds.y + self.bounds.height > bounds.y + bounds.height {
+            self.bounds.y + self.bounds.height - bounds.y - bounds.height
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            state.scroll_by(
+                operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                bounds,
+                content,
+            );
+        }
+    }
+}
+
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
+
+pub fn font_zoom_chord(
+    key: &cosmic::iced::keyboard::Key,
+    physical: cosmic::iced::keyboard::key::Physical,
+    modifiers: cosmic::iced::keyboard::Modifiers,
+) -> Option<i8> {
+    use cosmic::iced::keyboard::{
+        Key,
+        key::{Code, Physical},
+    };
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match (key.as_ref(), physical) {
+        (Key::Character("=" | "+"), _) | (_, Physical::Code(Code::Equal)) => Some(1),
+        (Key::Character("-"), _) | (_, Physical::Code(Code::Minus)) if !modifiers.shift() => {
+            Some(-1)
+        }
+        (Key::Character("0"), _) | (_, Physical::Code(Code::Digit0)) if !modifiers.shift() => {
+            Some(0)
+        }
+        _ => None,
+    }
+}
 
 /// Reserve tab-history keys before editor widgets can treat Tab as indentation.
 /// The application's keyboard subscription owns navigation and Control release.
@@ -30,6 +200,7 @@ pub fn reserve_tab_history<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::TabHistory(enabled),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -41,6 +212,7 @@ pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         content: content.into(),
         kind: Kind::Hover,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -54,6 +226,7 @@ pub fn drive_animation<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::DriveAnimation(active),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -146,6 +319,7 @@ fn reveal_width_aligned<'a, Message: 'a>(
             leading,
         },
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -165,6 +339,7 @@ pub fn fade<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Fade(progress.clamp(0.0, 1.0)),
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -191,6 +366,7 @@ pub fn tooltip<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Tooltip,
         tip: Some(Tip { content: tip }),
+        on_escape: None,
     }
     .into()
 }
@@ -208,6 +384,21 @@ pub fn context_menu<'a, Message: Clone + 'static>(
         content: layer(content.into(), context_menu::surface(menu)),
         kind: Kind::ContextMenu,
         tip: None,
+        on_escape: None,
+    }
+    .into()
+}
+
+/// Blocks click-through without hiding the child's accessibility tree.
+pub fn context_menu_lazy<'a, Message: Clone + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::lazy_surface(builder)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -218,6 +409,7 @@ pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elem
         content: content.into(),
         kind: Kind::Opaque,
         tip: None,
+        on_escape: None,
     }
     .into()
 }
@@ -903,6 +1095,9 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 
 #[derive(Clone, Copy)]
 enum Kind {
+    KeyboardList(bool),
+    FocusedEscape,
+    ListRow,
     TabHistory(bool),
     Hover,
     ContextMenu,
@@ -921,6 +1116,7 @@ struct Effect<'a, Message> {
     content: Element<'a, Message>,
     kind: Kind,
     tip: Option<Tip<'a, Message>>,
+    on_escape: Option<Box<dyn Fn() -> Message + 'a>>,
 }
 
 struct Tip<'a, Message> {
@@ -931,6 +1127,9 @@ struct Tip<'a, Message> {
 // hover/fade clock when a conditional wrapper changes kind.
 struct HoverTag;
 struct TabHistoryTag;
+struct KeyboardListTag;
+struct FocusedEscapeTag;
+struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
@@ -981,6 +1180,9 @@ impl Default for State {
 impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
+            Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
+            Kind::FocusedEscape => tree::Tag::of::<FocusedEscapeTag>(),
+            Kind::ListRow => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
@@ -1068,6 +1270,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        if matches!(self.kind, Kind::ListRow) {
+            operation.custom(
+                None,
+                layout.bounds() - layout.virtual_offset(),
+                &mut ListRowMarker,
+            );
+        }
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
             effect_layout(self.kind, layout),
@@ -1086,6 +1295,78 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Some(on_escape) = &self.on_escape
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                    key: cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Escape
+                    ),
+                    ..
+                })
+            )
+            && !shell.is_event_captured()
+        {
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0 {
+                shell.publish(on_escape());
+                shell.capture_event();
+                return;
+            }
+        }
+        if let Kind::KeyboardList(true) = self.kind
+            && let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(key),
+                modifiers,
+                ..
+            }) = event
+            && modifiers.is_empty()
+            && matches!(
+                key,
+                cosmic::iced::keyboard::key::Named::ArrowUp
+                    | cosmic::iced::keyboard::key::Named::ArrowDown
+                    | cosmic::iced::keyboard::key::Named::Home
+                    | cosmic::iced::keyboard::key::Named::End
+            )
+        {
+            let mut focus = ListFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if let Some(current) = focus.focused {
+                use cosmic::iced::keyboard::key::Named;
+                let target = match key {
+                    Named::ArrowUp => current.saturating_sub(1),
+                    Named::ArrowDown => (current + 1).min(focus.rows.len().saturating_sub(1)),
+                    Named::Home => 0,
+                    _ => focus.rows.len().saturating_sub(1),
+                };
+                let mut movement = MoveListFocus {
+                    target,
+                    index: 0,
+                    active: None,
+                    bounds: focus.rows[target],
+                };
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut movement,
+                );
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+        }
         if let Kind::TabHistory(true) = self.kind
             && let Event::Keyboard(
                 cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }
@@ -1423,6 +1704,205 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn font_zoom_accepts_layout_variants_without_claiming_typing() {
+        use cosmic::iced::keyboard::{
+            Key, Modifiers,
+            key::{Code, Physical},
+        };
+        let equal = Physical::Code(Code::Equal);
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::CTRL),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("+".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("-".into()),
+                Physical::Code(Code::Minus),
+                Modifiers::CTRL
+            ),
+            Some(-1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("0".into()),
+                Physical::Code(Code::Digit0),
+                Modifiers::CTRL
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::empty()),
+            None
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("=".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::ALT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn focused_escape_answers_before_the_native_field_blurs() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let id = Id::from("escape.find");
+        let mut element = focused_escape(
+            widget::text_input("Find", "needle")
+                .id(id.clone())
+                .on_input(|_| 0_u8)
+                .on_unfocus(2_u8),
+            || 1_u8,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 100.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut published = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut published),
+            &bounds,
+        );
+        assert!(
+            published.is_empty(),
+            "an unfocused find field cannot steal Escape"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(id),
+        );
+        let mut shell = Shell::new(&mut published);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(shell.is_event_captured());
+        assert_eq!(
+            published,
+            [1],
+            "Escape closes find before COSMIC publishes blur"
+        );
+    }
+
+    #[test]
+    fn list_arrows_move_native_focus_and_enter_activates_only_the_destination() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let first = Id::from("list.first");
+        let second = Id::from("list.second");
+        let mut element = keyboard_list(
+            widget::column::with_children(vec![
+                keyboard_list_row(
+                    widget::button::text("First")
+                        .id(first.clone())
+                        .on_press(1_u8),
+                ),
+                keyboard_list_row(widget::button::text("Second").id(second).on_press(2_u8)),
+            ]),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(first),
+        );
+        let mut published = Vec::new();
+        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Enter] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &bounds,
+            );
+        }
+        assert_eq!(published, [2]);
+    }
 
     #[test]
     fn a_vertical_wheel_becomes_horizontal_pixels() {
@@ -1517,7 +1997,113 @@ mod tests {
                 .into()
         }
 
+        #[test]
+        fn unchanged_lazy_named_buttons_keep_pressed_state_across_native_rebuilds() {
+            let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+            let cached_button = || -> Element<'static, Act> {
+                let builds = builds.clone();
+                cosmic::iced::widget::lazy(0_u64, move |_| {
+                    builds.set(builds.get() + 1);
+                    // Exercise named descendants beneath both a named parent
+                    // and unnamed decorators, as in cached project rows.
+                    let content: Element<'static, Act> = widget::container(hover(
+                        widget::button::standard("Cached action")
+                            .id(Id::new("test.cached.named-button"))
+                            .on_press(Act::Item(7)),
+                    ))
+                    .id(Id::new("test.cached.named-container"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into();
+                    content
+                })
+                .into()
+            };
+            let mut frames = Frames::new();
+            frames.frame(cached_button(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(frames.messages, vec![Act::Item(7)]);
+            assert_eq!(
+                builds.get(),
+                1,
+                "native rebuilds must restore state without rebuilding cached widgets"
+            );
+            // Removing the cached subtree must discard its named states.
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(bare_row(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(
+                frames.messages,
+                vec![Act::Item(7)],
+                "a new button must not inherit an old press"
+            );
+        }
+
         const ROW_HEIGHT: f32 = 32.0;
+
+        #[test]
+        fn reusing_a_named_button_id_for_stateless_content_discards_the_button_state() {
+            let mut frames = Frames::new();
+            let button = || -> Element<'static, Act> {
+                widget::button::standard("Old action")
+                    .id(Id::new("test.reused.named-control"))
+                    .on_press(Act::Item(9))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            let replacement = || -> Element<'static, Act> {
+                widget::container(widget::text("Replacement"))
+                    .id(Id::new("test.reused.named-control"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(replacement(), &[], ANCHOR);
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert!(
+                frames.messages.is_empty(),
+                "a type change must not revive an old button press"
+            );
+        }
         const WINDOW: Size = Size {
             width: 400.0,
             height: 400.0,

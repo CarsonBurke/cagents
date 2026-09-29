@@ -20,8 +20,8 @@ use super::*;
 use iced::widget::text::Span;
 
 /// How a link in an answer reaches the surface.
-fn link(uri: markdown::Uri) -> Message {
-    action(Action::OpenUrl(uri.to_string()))
+fn link(target: Target, uri: markdown::Uri) -> Message {
+    action(Action::OpenDocument(target, uri.to_string()))
 }
 
 /// A fenced block ready to draw: all of its lines as one paragraph of spans,
@@ -30,7 +30,7 @@ fn link(uri: markdown::Uri) -> Message {
 /// Built once when the block's text changes, so a frame costs a reference
 /// count rather than a pass over the block's lines.
 pub(super) struct CodeBlock {
-    spans: [Arc<[Span<'static>]>; 2],
+    spans: [Arc<[Span<'static, String>]>; 2],
 }
 
 impl CodeBlock {
@@ -42,7 +42,7 @@ impl CodeBlock {
         let syntax = language
             .filter(|_| code.len() <= CachedItem::HIGHLIGHT_LIMIT)
             .map(|language| crate::diff_view::highlight_snippet(code, language, theme));
-        let palette = |index: usize| -> Arc<[Span<'static>]> {
+        let palette = |index: usize| -> Arc<[Span<'static, String>]> {
             let mut spans = Vec::new();
             for (number, line) in code.lines().enumerate() {
                 if number > 0 {
@@ -55,7 +55,21 @@ impl CodeBlock {
                             lines[index].get(number).map_or(&[][..], Vec::as_slice),
                         )
                         .into_iter()
-                        .map(Span::to_static),
+                        .map(|span| {
+                            let span = span.to_static();
+                            Span {
+                                text: span.text,
+                                size: span.size,
+                                line_height: span.line_height,
+                                font: span.font,
+                                color: span.color,
+                                link: None,
+                                highlight: span.highlight,
+                                padding: span.padding,
+                                underline: span.underline,
+                                strikethrough: span.strikethrough,
+                            }
+                        }),
                     ),
                     None => spans.push(Span::new(line.to_owned())),
                 }
@@ -74,21 +88,30 @@ impl CodeBlock {
     }
 
     /// The block's spans in the palette the current appearance uses.
-    pub(super) fn spans(&self, dark: bool) -> &Arc<[Span<'static>]> {
+    pub(super) fn spans(&self, dark: bool) -> &Arc<[Span<'static, String>]> {
         &self.spans[usize::from(dark)]
     }
 }
 
 /// An item's parsed Markdown as an element that owns what it draws.
-pub(super) fn view(cached: &CachedItem, settings: markdown::Settings) -> Element<'static, Message> {
+pub(super) fn view(
+    cached: &CachedItem,
+    settings: markdown::Settings,
+    target: Target,
+    find: Option<&str>,
+) -> Element<'static, Message> {
     Renderer {
+        target,
         cached,
         dark: cosmic::theme::is_dark(),
+        find,
     }
     .items(cached.markdown.items(), settings)
 }
 
 struct Renderer<'c> {
+    find: Option<&'c str>,
+    target: Target,
     cached: &'c CachedItem,
     dark: bool,
 }
@@ -118,8 +141,10 @@ impl Renderer<'_> {
     ) -> Element<'static, Message> {
         use markdown::Item;
         match item {
-            Item::Heading(level, text) => heading(settings, *level, text, index),
-            Item::Paragraph(text) => paragraph(settings, text),
+            Item::Heading(level, text) => {
+                heading(settings, *level, text, index, self.target, self.find)
+            }
+            Item::Paragraph(text) => paragraph(settings, text, self.target, self.find),
             Item::CodeBlock { language, code, .. } => {
                 self.code_block(settings, language.as_deref(), code)
             }
@@ -133,7 +158,10 @@ impl Renderer<'_> {
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
             Item::Image { alt, .. } => widget::container(
-                iced::widget::rich_text(alt.spans(settings.style)).on_link_click(link),
+                iced::widget::rich_text(alt.spans(settings.style)).on_link_click({
+                    let target = self.target;
+                    move |uri| link(target, uri)
+                }),
             )
             .padding(settings.spacing.0)
             .class(design::surface(
@@ -243,35 +271,29 @@ impl Renderer<'_> {
         language: Option<&str>,
         code: &str,
     ) -> Element<'static, Message> {
-        let text: Element<'static, Message> = match self.cached.block(language, code) {
-            Some(block) => iced::widget::rich_text(block.spans(self.dark).clone())
-                .font(settings.style.code_block_font)
-                .size(settings.code_size)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            // Every fence is cached as it is parsed; this is only reachable
-            // if the two ever disagree, and plain text is still the block.
-            None => iced::widget::text(code.trim_end_matches('\n').to_owned())
-                .font(settings.style.code_block_font)
-                .size(settings.code_size)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        };
-        widget::container(
+        let spans = self
+            .cached
+            .block(language, code)
+            .map(|block| block.spans(self.dark).clone())
+            .unwrap_or_else(|| vec![Span::new(code.to_owned())].into());
+        let text = selectable_prose::text(
+            spans,
+            settings.code_size,
+            settings.style.code_block_font,
+            self.target,
+            self.find,
+        );
+        step::code_frame(
             widget::scrollable(
                 widget::container(text).padding([step::GAP_S as u16, step::GAP_M as u16]),
             )
             .direction(iced::widget::scrollable::Direction::Horizontal(
                 design::scrollbar(),
-            )),
+            ))
+            .into(),
+            Some(language.unwrap_or("Code").to_owned()),
+            Some(Action::CopyLiteral(code.to_owned())),
         )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_S; 4],
-            true,
-        ))
-        .width(Length::Fill)
-        .into()
     }
 }
 
@@ -280,20 +302,24 @@ fn heading(
     level: markdown::HeadingLevel,
     text: &markdown::Text,
     index: usize,
+    target: Target,
+    find: Option<&str>,
 ) -> Element<'static, Message> {
     use markdown::HeadingLevel;
-    widget::container(
-        iced::widget::rich_text(text.spans(settings.style))
-            .on_link_click(link)
-            .size(match level {
-                HeadingLevel::H1 => settings.h1_size,
-                HeadingLevel::H2 => settings.h2_size,
-                HeadingLevel::H3 => settings.h3_size,
-                HeadingLevel::H4 => settings.h4_size,
-                HeadingLevel::H5 => settings.h5_size,
-                HeadingLevel::H6 => settings.h6_size,
-            }),
-    )
+    widget::container(selectable_prose::text(
+        text.spans(settings.style),
+        match level {
+            HeadingLevel::H1 => settings.h1_size,
+            HeadingLevel::H2 => settings.h2_size,
+            HeadingLevel::H3 => settings.h3_size,
+            HeadingLevel::H4 => settings.h4_size,
+            HeadingLevel::H5 => settings.h5_size,
+            HeadingLevel::H6 => settings.h6_size,
+        },
+        settings.style.font,
+        target,
+        find,
+    ))
     .padding(iced::Padding::ZERO.top(if index > 0 {
         settings.text_size.0 / 2.0
     } else {
@@ -302,11 +328,19 @@ fn heading(
     .into()
 }
 
-fn paragraph(settings: markdown::Settings, text: &markdown::Text) -> Element<'static, Message> {
-    iced::widget::rich_text(text.spans(settings.style))
-        .size(settings.text_size)
-        .on_link_click(link)
-        .into()
+fn paragraph(
+    settings: markdown::Settings,
+    text: &markdown::Text,
+    target: Target,
+    find: Option<&str>,
+) -> Element<'static, Message> {
+    selectable_prose::text(
+        text.spans(settings.style),
+        settings.text_size,
+        settings.style.font,
+        target,
+        find,
+    )
 }
 
 /// A table column's alignment as the layout takes it.

@@ -358,6 +358,7 @@ impl FoldedRows {
 /// unfolded, and for each layout the folded mapping and its geometry.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct DiffLayout {
+    folding: bool,
     reveals: FoldReveals,
     folded: [FoldedRows; 2],
     offsets: [RowOffsets; 2],
@@ -379,6 +380,7 @@ impl DiffLayout {
             .each_ref()
             .map(|folded| RowOffsets::uniform(folded.len(), row_height));
         Self {
+            folding: true,
             reveals,
             folded,
             offsets,
@@ -435,6 +437,14 @@ impl DiffLayout {
         &self.folded[layout_index(mode)]
     }
 
+    pub fn set_folding(&mut self, model: &DiffModel, enabled: bool) -> bool {
+        if self.folding == enabled {
+            return false;
+        }
+        self.folding = enabled;
+        self.rebuild(model)
+    }
+
     /// Reveals part of fold `fold` in both layouts. Measured annotations
     /// follow the model rows they belong to, so the rows around the fold keep
     /// their review threads' heights instead of waiting to be measured again.
@@ -443,10 +453,18 @@ impl DiffLayout {
             return false;
         }
         self.reveals.expand(fold, expansion);
+        self.rebuild(model)
+    }
+
+    fn rebuild(&mut self, model: &DiffModel) -> bool {
         let mut changed = false;
         for mode in [DiffMode::Inline, DiffMode::Split] {
             let index = layout_index(mode);
-            let folded = Self::fold(Some(model), mode, &self.reveals);
+            let folded = if self.folding {
+                Self::fold(Some(model), mode, &self.reveals)
+            } else {
+                FoldedRows::unfolded(model.row_count(mode))
+            };
             if folded == self.folded[index] {
                 continue;
             }
@@ -470,6 +488,43 @@ impl DiffLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folding_preference_preserves_reveals_and_logical_annotation_rows() {
+        let before = (0..100)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let after = before.replace("line 50\n", "changed\n");
+        let model = crate::diff_view::build_diff(&before, &after);
+        let mut layout = DiffLayout::new(Some(&model), 20.0);
+        let initial_rows = layout.folded(DiffMode::Inline).len();
+        assert!(initial_rows < model.row_count(DiffMode::Inline));
+        let annotated = layout.folded(DiffMode::Inline).display(50);
+        layout
+            .rows_mut(DiffMode::Inline)
+            .annotate(15.0, &[(annotated, 80.0)]);
+        assert!(layout.set_folding(&model, false));
+        assert_eq!(
+            layout.folded(DiffMode::Inline).len(),
+            model.row_count(DiffMode::Inline)
+        );
+        assert_eq!(
+            layout.rows(DiffMode::Inline).annotations().get(&50),
+            Some(&80.0)
+        );
+        assert_eq!(layout.rows(DiffMode::Inline).leading_height(), 15.0);
+        assert!(layout.set_folding(&model, true));
+        assert_eq!(layout.folded(DiffMode::Inline).len(), initial_rows);
+        assert_eq!(
+            layout.rows(DiffMode::Inline).annotations().get(&annotated),
+            Some(&80.0)
+        );
+        assert!(layout.expand(&model, 0, FoldExpansion::All));
+        let expanded_rows = layout.folded(DiffMode::Inline).len();
+        layout.set_folding(&model, false);
+        layout.set_folding(&model, true);
+        assert_eq!(layout.folded(DiffMode::Inline).len(), expanded_rows);
+    }
 
     /// Changes at rows 40..42 and 70 of a 100-row model.
     fn runs() -> Vec<Range<usize>> {
