@@ -42,8 +42,11 @@ impl Cagents {
                 });
             }
         }
-        self.automation_ui
-            .set_choices(targets, self.automation_account_choices());
+        self.automation_ui.set_choices(
+            targets,
+            self.automation_account_choices(),
+            self.automation_models(),
+        );
     }
 
     pub(super) fn open_automations(&mut self) -> Task<Message> {

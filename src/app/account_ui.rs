@@ -1092,6 +1092,17 @@ pub(super) struct ChatAccounts {
 }
 
 impl Cagents {
+    /// The models, and their efforts, a new conversation's composer offers.
+    pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
+        Provider::ALL
+            .into_iter()
+            .filter_map(|provider| {
+                let catalog = self.account_ui.catalog(provider)?;
+                Some((provider, catalog.models.clone()))
+            })
+            .collect()
+    }
+
     pub(super) fn automation_account_choices(&self) -> Vec<crate::automation_ui::AccountChoice> {
         let mut choices = self
             .account_ui

@@ -14,6 +14,12 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+/// The Codex configuration key for a thread's reasoning effort. A launch
+/// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
+/// Codex CLI takes it, and a new thread receives it as a `thread/start`
+/// configuration override.
+pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.
 fn skill_source<'a>(path: &str, others: impl Iterator<Item = &'a str>) -> String {
@@ -189,6 +195,29 @@ fn create_inner(
                     };
                     start[key] = json!(value);
                 }
+            }
+            "--config" | "-c" if launch.session_id.is_none() => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                // Only an override with a typed `thread/start` equivalent is
+                // translated; any other key would silently change meaning.
+                let effort = value
+                    .strip_prefix(REASONING_EFFORT_KEY)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .map(|effort| {
+                        effort
+                            .strip_prefix('"')
+                            .and_then(|effort| effort.strip_suffix('"'))
+                            .unwrap_or(effort)
+                    })
+                    .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
+                    .ok_or_else(|| {
+                        format!(
+                            "Codex launch option {arg} {value:?} cannot safely be translated to native app-server mode"
+                        )
+                    })?;
+                start["config"][REASONING_EFFORT_KEY] = json!(effort);
             }
             "--profile" | "-p" | "--config" | "-c" | "--add-dir" | "--remote-auth-token-env"
                 if launch.session_id.is_some() =>
@@ -2718,6 +2747,52 @@ mod tests {
             .unwrap();
         assert_eq!(start["params"]["sandbox"], json!("danger-full-access"));
         assert_eq!(start["params"]["approvalPolicy"], json!("never"));
+    }
+
+    #[test]
+    fn a_new_thread_takes_its_reasoning_effort_as_a_start_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let launch = |arguments: &[&str]| Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                unset_environment: Default::default(),
+                program: "codex".into(),
+                arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.path().to_str().unwrap().into(),
+                )]),
+            },
+        };
+        for (arguments, effort) in [
+            (&["--config", "model_reasoning_effort=low"][..], "low"),
+            (&["-c", "model_reasoning_effort=\"xhigh\""][..], "xhigh"),
+        ] {
+            let (spec, mut adapter) = create(&launch(arguments)).unwrap();
+            // The override is a thread setting, never a server-wide flag.
+            assert_eq!(spec.arguments, vec!["app-server"]);
+            let initialize = adapter.initialize().unwrap();
+            let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
+            let start = step
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/start")
+                .unwrap();
+            assert_eq!(
+                start["params"]["config"],
+                json!({REASONING_EFFORT_KEY: effort})
+            );
+        }
+        for arguments in [
+            &["--config", "model=\"other\""][..],
+            &["-c", "model_reasoning_effort=--yolo"][..],
+            &["-c", "model_reasoning_effort_extra=low"][..],
+            &["--config"][..],
+        ] {
+            assert!(create(&launch(arguments)).is_err(), "{arguments:?}");
+        }
     }
 
     /// The completion list is bounded whatever the account's skill tree looks
