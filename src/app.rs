@@ -9295,6 +9295,12 @@ impl Cagents {
         if self.exit.is_some() {
             return Task::none();
         }
+        // The process outlives its window by the reap and the teardown below.
+        // An activation acknowledged in that time would tell `cagents ui` a
+        // window is being raised, and it would open none. Refused, the
+        // launcher waits for this process to release the window lease and
+        // starts a fresh window.
+        self.activation_rx.close();
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
         self.persist();
@@ -15318,6 +15324,31 @@ mod tests {
         let _ = app.update(Message::WindowCloseRequested(window));
         assert!(app.dirty_repository_close.is_none());
         assert_eq!(app.exit, closing);
+    }
+
+    /// Once the window is gone, an activation must be refused rather than
+    /// acknowledged, so `cagents ui` opens a new window instead of reporting
+    /// one that is already running.
+    #[test]
+    fn committed_exit_stops_accepting_activations() {
+        let mut app = context_inspector_test_app(false);
+        let (activations, receiver) = async_channel::unbounded();
+        app.activation_rx = receiver;
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        assert!(!activations.is_closed());
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        assert!(activations.is_closed());
+        assert!(
+            activations
+                .send_blocking(instance::UiActivation {
+                    token: None,
+                    update: None,
+                })
+                .is_err()
+        );
     }
 
     /// Neither half of the exit may end the process alone: servers reaped
