@@ -171,6 +171,10 @@ impl State {
             && self.discussion.unknown.is_none()
     }
 
+    fn can_discard_draft(&self) -> bool {
+        !self.discussion.busy && self.discussion.unknown.is_none()
+    }
+
     fn send_discussion(&mut self, authority: Authority, mutation: Mutation) -> ActionTask {
         if !self.can_mutate_discussion() {
             return ActionTask::none();
@@ -347,6 +351,10 @@ impl State {
             Action::Summary(action) if !self.discussion.busy => {
                 self.discussion.summary.perform(action)
             }
+            // Discarding a draft sends nothing, so a refresh does not hold it.
+            // A write whose outcome was lost does: the draft is what the
+            // reader compares with GitHub.
+            Action::Cancel if self.can_discard_draft() => self.discussion.composer = None,
             Action::OpenLink(raw) => {
                 if let Ok(url) = Url::parse(&raw)
                     && matches!(url.scheme(), "https" | "http")
@@ -438,8 +446,7 @@ impl State {
                     markdown: markdown::parse(&comment.body).collect(),
                 });
             }
-            Action::Composer(_) | Action::Preview | Action::Summary(_) => {}
-            Action::Cancel => self.discussion.composer = None,
+            Action::Composer(_) | Action::Preview | Action::Summary(_) | Action::Cancel => {}
             Action::Event(event) => {
                 self.discussion.event = event;
                 self.discussion.confirmation = None;
@@ -1235,11 +1242,13 @@ impl State {
                                 .then_some(Action::Save),
                         )
                         .into(),
+                    // Local to the draft, so live through a background
+                    // refresh, as typing is; only a write in flight holds them.
                     button::text(if composer.preview { "Write" } else { "Preview" })
-                        .on_press_maybe(enabled.then_some(Action::Preview))
+                        .on_press_maybe((!self.discussion.busy).then_some(Action::Preview))
                         .into(),
                     button::text("Cancel")
-                        .on_press_maybe(enabled.then_some(Action::Cancel))
+                        .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
                         .into(),
                 ])
                 .spacing(8)
@@ -1560,6 +1569,17 @@ mod tests {
                 .trim(),
             "x"
         );
+        // Preview and Cancel are just as local, but not while a write is in
+        // flight.
+        drop(state.update_discussion(Action::Preview));
+        assert!(!state.discussion.composer.as_ref().unwrap().preview);
+        drop(state.update_discussion(Action::Cancel));
+        assert!(state.discussion.composer.is_some());
+        state.discussion.busy = false;
+        drop(state.update_discussion(Action::Preview));
+        assert!(state.discussion.composer.as_ref().unwrap().preview);
+        drop(state.update_discussion(Action::Cancel));
+        assert!(state.discussion.composer.is_none());
     }
 
     #[test]
