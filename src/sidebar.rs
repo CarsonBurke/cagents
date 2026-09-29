@@ -755,13 +755,13 @@ impl SidebarWorktree {
         }
     }
 
-    /// Builds the row for a worktree known only from durable session state,
-    /// before repository discovery has produced a status snapshot.
     /// The name the row shows: the branch's last segment, or the directory.
     pub fn label(&self) -> &str {
         &self.chrome.label
     }
 
+    /// Builds the row for a worktree known only from durable session state,
+    /// before repository discovery has produced a status snapshot.
     pub fn from_durable(id: WorktreeId, path: PathBuf, branch: Option<String>) -> Self {
         let detached = branch.is_none();
         Self::new(id, path, branch, detached, false, None, None, None)

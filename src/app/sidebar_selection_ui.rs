@@ -223,6 +223,20 @@ mod tests {
             "no member of a blocked group is removed"
         );
         assert!(app.sidebar_selection_ui.dialog.is_some());
+
+        // The blocker clears in the background; the open dialog notices
+        // without being reopened, and one Confirm removes the whole group.
+        app.project_ui
+            .removing
+            .remove(Path::new("/selection-project"));
+        drop(app.update_sidebar_selection(Action::Confirm));
+        assert!(app.sidebar_selection_ui.dialog.is_none());
+        assert!(
+            app.project_ui
+                .removing
+                .contains_key(Path::new("/other-project")),
+            "the confirmed group proceeds once nothing blocks it"
+        );
     }
 
     #[test]
@@ -470,12 +484,10 @@ impl Cagents {
         // Revalidate every target before starting any operation. A reload may
         // have changed a path, removed a row, or dirtied a worktree while
         // confirmation was open.
-        let mut changed = false;
         dialog.error = None;
         for target in &mut dialog.targets {
             match self.selected_row_target(target.row) {
                 Ok(current) if current.directory == target.directory => {
-                    changed |= current.blocker != target.blocker;
                     target.blocker = current.blocker;
                 }
                 Ok(_) => {
@@ -486,7 +498,7 @@ impl Cagents {
                 Err(error) => dialog.error = Some(error),
             }
         }
-        if dialog.error.is_some() || changed || dialog.blocked() > 0 {
+        if dialog.error.is_some() || dialog.blocked() > 0 {
             let focus = dialog.focus_target();
             self.sidebar_selection_ui.dialog = Some(dialog);
             return iced::widget::operation::focus(focus).map(cosmic::Action::App);
@@ -593,13 +605,25 @@ impl Cagents {
             SelectionRow::Project(_) => format!("Remove {count} projects from cagents?"),
             _ => format!("{}?", kind.deletion_label(count)),
         };
+        // Blockers clear in the background (a removal finishes, a buffer is
+        // saved), so read them live rather than from when the dialog opened.
+        // Confirm revalidates again before anything is deleted.
+        let blockers = dialog
+            .targets
+            .iter()
+            .map(|target| match self.selected_row_target(target.row) {
+                Ok(current) => current.blocker,
+                Err(_) => target.blocker.clone(),
+            })
+            .collect::<Vec<_>>();
         let members = widget::column::with_children(
             dialog
                 .targets
                 .iter()
-                .map(|target| {
-                    let detail: Element<'_, Message> = match &target.blocker {
-                        Some(blocker) => widget::text::caption(blocker.as_str())
+                .zip(blockers.iter().cloned())
+                .map(|(target, blocker)| {
+                    let detail: Element<'_, Message> = match blocker {
+                        Some(blocker) => widget::text::caption(blocker)
                             .class(cosmic::theme::Text::Custom(design::warning_text))
                             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                             .width(Length::Fill)
@@ -626,7 +650,7 @@ impl Cagents {
             rows.push(super::notice_body(cascade));
         }
         rows.push(super::notice_detail(note));
-        let blocked = dialog.blocked();
+        let blocked = blockers.iter().filter(|blocker| blocker.is_some()).count();
         if blocked > 0 {
             let verb = match kind {
                 SelectionRow::Project(_) => "removed",
