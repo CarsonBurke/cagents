@@ -2874,10 +2874,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
-            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| {
-                !self.read_only
-                    && TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused)
-            }) {
+            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll)
+                .filter(|_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused))
+            {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: bar.thumb,
