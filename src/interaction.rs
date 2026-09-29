@@ -1844,7 +1844,113 @@ mod tests {
                 .into()
         }
 
+        #[test]
+        fn unchanged_lazy_named_buttons_keep_pressed_state_across_native_rebuilds() {
+            let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+            let cached_button = || -> Element<'static, Act> {
+                let builds = builds.clone();
+                cosmic::iced::widget::lazy(0_u64, move |_| {
+                    builds.set(builds.get() + 1);
+                    // Exercise named descendants beneath both a named parent
+                    // and unnamed decorators, as in cached project rows.
+                    let content: Element<'static, Act> = widget::container(hover(
+                        widget::button::standard("Cached action")
+                            .id(Id::new("test.cached.named-button"))
+                            .on_press(Act::Item(7)),
+                    ))
+                    .id(Id::new("test.cached.named-container"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into();
+                    content
+                })
+                .into()
+            };
+            let mut frames = Frames::new();
+            frames.frame(cached_button(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(frames.messages, vec![Act::Item(7)]);
+            assert_eq!(
+                builds.get(),
+                1,
+                "native rebuilds must restore state without rebuilding cached widgets"
+            );
+            // Removing the cached subtree must discard its named states.
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(bare_row(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(
+                frames.messages,
+                vec![Act::Item(7)],
+                "a new button must not inherit an old press"
+            );
+        }
+
         const ROW_HEIGHT: f32 = 32.0;
+
+        #[test]
+        fn reusing_a_named_button_id_for_stateless_content_discards_the_button_state() {
+            let mut frames = Frames::new();
+            let button = || -> Element<'static, Act> {
+                widget::button::standard("Old action")
+                    .id(Id::new("test.reused.named-control"))
+                    .on_press(Act::Item(9))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            let replacement = || -> Element<'static, Act> {
+                widget::container(widget::text("Replacement"))
+                    .id(Id::new("test.reused.named-control"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(replacement(), &[], ANCHOR);
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert!(
+                frames.messages.is_empty(),
+                "a type change must not revive an old button press"
+            );
+        }
         const WINDOW: Size = Size {
             width: 400.0,
             height: 400.0,

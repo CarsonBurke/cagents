@@ -19550,16 +19550,16 @@ mod tests {
         assert!(!startup.context_inspector_overlay_active);
         assert!(startup.context_inspector_restore_focus.is_none());
 
-        // Closing the final card leaves the open inspector and window controls
-        // mounted; only explicitly closing the inspector restores outer focus.
+        // Closing the final card returns the empty scope to the full canvas;
+        // inspector tools need a focused pane or selected project context.
         let _focus_close = startup.update(Message::ToggleContextInspector);
         assert!(startup.context_inspector_overlay_active);
         let final_card = startup.workspace.focused().unwrap();
         startup.workspace.request_close(final_card).unwrap();
         let _restore_focus = startup.update(Message::CommitClose(final_card));
         assert!(startup.workspace.focused().is_none());
-        assert!(startup.context_inspector_is_overlay());
-        assert!(startup.context_inspector_overlay_active);
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
         let _restore_focus = startup.update(Message::ContextInspector(InspectorAction::Close));
         settle_context_inspector_transition(&mut startup);
         assert!(!startup.context_inspector_is_overlay());
