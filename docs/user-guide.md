@@ -540,6 +540,24 @@ Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.
 
+- Drag over an answer paragraph or fenced code block and press `Ctrl+C` to
+  copy the selected text. Each code block also has its own **Copy** button.
+- With chat focused, `Ctrl+F` finds matching transcript turns, including tool
+  output. Enter visits the next match, Shift+Enter the previous one, and
+  Escape closes find. Matching prose is highlighted and matching tools expand.
+- While Claude is working, **Queue** holds one follow-up for the next turn.
+  **Undo** returns it to the composer. Escape in the composer interrupts active
+  work when no picker is open. `Ctrl+End` returns to the latest messages;
+  **New activity** indicates messages received while reading earlier history.
+- Type `@` to search tracked files by name. Attachment chips show the file name,
+  offer removal, and reveal the full path on hover. Up and Down in an empty
+  composer recall earlier prompts, including restored conversation history.
+- Claude permission controls describe each available mode and follow changes
+  reported by the provider. Finished reasoning collapses into a summary that
+  can be expanded. Long user prompts also offer an expand control.
+- Relative file links resolve from the conversation's working directory.
+  Links such as `src/main.rs:42:5` open the editor at that line and column.
+
 Chat work keeps running in the background when you switch worktrees or close
 the window. **Stop and close chat** interrupts active work and waits for the
 daemon before removing the pane. Disconnects keep the draft and offer
