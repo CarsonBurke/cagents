@@ -543,7 +543,7 @@ fn group<'a>(
         .into(),
         iced::widget::Space::new().width(Length::Fill).into(),
     ];
-    if Account::PROVIDERS.contains(&provider) {
+    if Account::PROVIDERS.contains(&provider) && state.installed.get(&provider) != Some(&false) {
         header.push(
             crate::ui_controls::compact_icon_control(
                 crate::ui_controls::symbolic_icon("list-add-symbolic"),
