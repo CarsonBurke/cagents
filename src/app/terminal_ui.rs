@@ -28,6 +28,35 @@ pub enum Action {
 mod tests {
     use super::*;
     #[test]
+    fn closed_find_rejects_delayed_results_for_its_current_request() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        app.terminal_find.insert(
+            card,
+            Find {
+                query: "needle".into(),
+                request: 7,
+                ..Find::default()
+            },
+        );
+        app.terminal_search_results(
+            card,
+            7,
+            "needle".into(),
+            vec![crate::terminal::SearchMatch {
+                start_row: 12,
+                start_column: 0,
+                end_row: 12,
+                end_column: 6,
+            }],
+            true,
+        );
+        let find = &app.terminal_find[&card];
+        assert!(find.matches.is_empty());
+        assert!(!find.truncated);
+    }
+
+    #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let card = CardId::new();
@@ -100,7 +129,8 @@ impl Cagents {
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
             return Task::none();
         };
-        let restore_query_focus = matches!(&action, Action::Case(_));
+        let opening = matches!(&action, Action::Open(_));
+        let restore_query_focus = opening || matches!(&action, Action::Case(_));
         let find = self.terminal_find.entry(card).or_default();
         match action {
             Action::Context(_, point, selection, link) => {
@@ -183,9 +213,8 @@ impl Cagents {
             Action::Open(_) => {
                 self.terminal_context = None;
                 find.open = true;
-                return iced::widget::operation::focus(input_id(card))
-                    .chain(iced::widget::operation::select_all(input_id(card)))
-                    .map(cosmic::Action::App);
+                // Reopening must search the current live or retained history, rather
+                // than reuse matches from before output changed or completion.
             }
             Action::Close(_) => {
                 find.open = false;
@@ -218,7 +247,13 @@ impl Cagents {
         find.truncated = false;
         let focus = if restore_query_focus {
             find.focused = true;
-            iced::widget::operation::focus(input_id(card)).map(cosmic::Action::App)
+            let focus = iced::widget::operation::focus(input_id(card));
+            if opening {
+                focus.chain(iced::widget::operation::select_all(input_id(card)))
+            } else {
+                focus
+            }
+            .map(cosmic::Action::App)
         } else {
             Task::none()
         };
