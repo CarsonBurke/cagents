@@ -92,7 +92,8 @@ use crate::{
 /// Version 30 makes notification activation and lifecycle identity typed.
 /// Version 31 adds explicit user automation management and durable run routing.
 /// Version 32 binds update preparation to typed, daemon-owned session impact.
-pub const PROTOCOL_VERSION: u16 = 32;
+/// Version 33 carries an optional reasoning effort in agent and automation specs.
+pub const PROTOCOL_VERSION: u16 = 33;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

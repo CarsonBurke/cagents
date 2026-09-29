@@ -337,7 +337,8 @@ this shape (the repository must already be open):
     },
     "surface": "Chat",
     "model": null,
-    "permission_mode": null
+    "permission_mode": null,
+    "reasoning_effort": null
   },
   "schedule": {
     "pattern": { "daily": { "hour": 9, "minute": 0 } },
@@ -347,6 +348,11 @@ this shape (the repository must already be open):
   "precheck": null
 }
 ```
+
+`reasoning_effort` is optional: omit it, or use `null`, for the provider's
+default, or name a level the model offers, such as `"low"`. In the editor, the
+**Reasoning effort** picker lists the levels the chosen model advertises, as the
+chat composer does.
 
 An omitted account selection resolves once when the definition is saved and is
 then pinned in the saved definition. Review that account before enabling. Agent

@@ -9,12 +9,14 @@ use crate::{
         Automation, Definition, Firing, HistoryCursor, Request, Response, RunDetail, Schedule,
         SchedulePattern, SessionMode, Summary,
     },
+    chat::Model,
 };
 use cosmic::{
     Element,
     iced::{Length, widget::text_editor},
     widget,
 };
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 const PAGE: usize = 50;
@@ -40,6 +42,17 @@ pub struct AccountChoice {
     pub label: String,
     pub provider: Provider,
     pub id: AccountId,
+}
+
+/// The models each provider last listed: the catalog the chat composer
+/// offers. A provider absent here has not listed any yet.
+pub type Models = BTreeMap<Provider, Vec<Model>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChoice {
+    Default,
+    Listed(String),
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +82,8 @@ pub enum Action {
     Field(Field, String),
     Provider(usize),
     Account(usize),
+    Model(ModelChoice),
+    Effort(Option<String>),
     Target(usize),
     Schedule(usize),
     Weekday(usize),
@@ -129,6 +144,9 @@ pub struct Draft {
     base: Option<(Uuid, u64)>,
     name: String,
     model: String,
+    /// Whether the model is typed rather than chosen from the catalog.
+    custom_model: bool,
+    effort: Option<String>,
     permission: String,
     timezone: String,
     hour: String,
@@ -159,6 +177,8 @@ impl Draft {
             base: None,
             name: String::new(),
             model: String::new(),
+            custom_model: false,
+            effort: None,
             permission: String::new(),
             timezone: "UTC".into(),
             hour: "9".into(),
@@ -182,6 +202,7 @@ impl Draft {
             value.base = Some((automation.id, automation.revision));
             value.name = definition.name.clone();
             value.model = definition.agent.model.clone().unwrap_or_default();
+            value.effort = definition.agent.reasoning_effort.clone();
             value.permission = definition.agent.permission_mode.clone().unwrap_or_default();
             value.timezone = definition.schedule.timezone.clone();
             value.provider = provider_index(definition.agent.provider);
@@ -246,7 +267,72 @@ impl Draft {
         value
     }
 
-    fn definition(&self) -> Result<Definition, String> {
+    /// The listed model this draft names, whose efforts it chooses among.
+    fn listed<'a>(&self, models: &'a Models) -> Option<&'a Model> {
+        let id = self.model.trim();
+        models
+            .get(&provider(self.provider))?
+            .iter()
+            .find(|model| model.id == id)
+    }
+
+    /// Whether the model is a typed ID: chosen as one, or saved as one the
+    /// provider does not list.
+    fn custom(&self, models: &Models) -> bool {
+        self.custom_model || (!self.model.trim().is_empty() && self.listed(models).is_none())
+    }
+
+    /// The efforts the picker offers: the listed model's own, as the chat
+    /// composer offers them, and a saved effort it does not list, which stays
+    /// visible so that it can be reviewed and cleared.
+    fn efforts(&self, models: &Models) -> Vec<String> {
+        let mut efforts = self
+            .listed(models)
+            .map(|model| model.reasoning.clone())
+            .unwrap_or_default();
+        if let Some(effort) = &self.effort
+            && !efforts.contains(effort)
+        {
+            efforts.push(effort.clone());
+        }
+        efforts
+    }
+
+    fn choose_model(&mut self, choice: ModelChoice, models: &Models) {
+        match choice {
+            ModelChoice::Default => {
+                self.model.clear();
+                self.custom_model = false;
+            }
+            ModelChoice::Listed(id) => {
+                self.model = id;
+                self.custom_model = false;
+            }
+            ModelChoice::Custom => self.custom_model = true,
+        }
+        // An effort carries over to a model that offers it, as it does in the
+        // composer. A typed model's efforts are unknown, so it keeps its own.
+        let offered = match self.listed(models) {
+            Some(model) => self
+                .effort
+                .as_ref()
+                .is_some_and(|effort| model.reasoning.contains(effort)),
+            None => self.custom(models),
+        };
+        if !offered {
+            self.effort = None;
+        }
+    }
+
+    fn definition(&self, models: &Models) -> Result<Definition, String> {
+        if let (Some(model), Some(effort)) = (self.listed(models), &self.effort)
+            && !model.reasoning.contains(effort)
+        {
+            return Err(format!(
+                "{} does not offer the {effort} reasoning effort; choose one it lists",
+                model.label
+            ));
+        }
         let parse = |text: &str, label: &str| {
             text.parse::<u8>()
                 .map_err(|_| format!("Enter a valid {label}"))
@@ -291,6 +377,7 @@ impl Draft {
                 surface: Surface::Chat,
                 model: optional(&self.model),
                 permission_mode: optional(&self.permission),
+                reasoning_effort: self.effort.clone(),
             },
             schedule: Schedule {
                 pattern,
@@ -338,6 +425,7 @@ pub struct State {
     notice: Option<String>,
     targets: Vec<TargetChoice>,
     accounts: Vec<AccountChoice>,
+    models: Models,
 }
 
 impl State {
@@ -349,9 +437,15 @@ impl State {
                 Some((_, Pending::Save | Pending::Mutate | Pending::OpenRun))
             )
     }
-    pub fn set_choices(&mut self, targets: Vec<TargetChoice>, accounts: Vec<AccountChoice>) {
+    pub fn set_choices(
+        &mut self,
+        targets: Vec<TargetChoice>,
+        accounts: Vec<AccountChoice>,
+        models: Models,
+    ) {
         self.targets = targets;
         self.accounts = accounts;
+        self.models = models;
     }
     fn request(&mut self, pending: Pending, request: Request) -> Option<Effect> {
         self.sequence = self.sequence.wrapping_add(1);
@@ -582,7 +676,7 @@ impl State {
             Action::CancelEdit => self.draft = None,
             Action::Save => {
                 if let Some(draft) = &self.draft {
-                    match draft.definition() {
+                    match draft.definition(&self.models) {
                         Ok(definition) => {
                             let request = match draft.base {
                                 Some((id, revision)) => Request::Edit {
@@ -613,9 +707,23 @@ impl State {
                 }
             }
             Action::Provider(index) if index < PROVIDERS.len() => {
-                if let Some(draft) = &mut self.draft {
+                if let Some(draft) = &mut self.draft
+                    && draft.provider != index
+                {
                     draft.provider = index;
                     draft.account = None;
+                    // Model IDs and effort names belong to one provider.
+                    draft.choose_model(ModelChoice::Default, &self.models);
+                }
+            }
+            Action::Model(choice) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.choose_model(choice, &self.models);
+                }
+            }
+            Action::Effort(effort) => {
+                if let Some(draft) = &mut self.draft {
+                    draft.effort = effort;
                 }
             }
             Action::Account(index) => {
@@ -806,7 +914,7 @@ impl State {
                 .wrap(),
             );
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy));
+            content = content.push(draft.view(busy, &self.models));
         } else {
             content = content.push(
                 widget::row::with_children(vec![
@@ -1015,7 +1123,7 @@ impl State {
 }
 
 impl Draft {
-    fn view(&self, busy: bool) -> Element<'_, Action> {
+    fn view<'a>(&'a self, busy: bool, models: &'a Models) -> Element<'a, Action> {
         let provider_accounts = self
             .accounts
             .iter()
@@ -1054,11 +1162,8 @@ impl Draft {
                 Action::Account,
             )
             .into(),
-            input(
-                "Model (blank uses provider default)",
-                &self.model,
-                Field::Model,
-            ),
+            self.model_picker(models),
+            self.effort_picker(models),
             input(
                 "Permission mode (blank uses provider default)",
                 &self.permission,
@@ -1095,7 +1200,7 @@ impl Draft {
             }
         }
         fields = fields.push(widget::checkbox(self.reuse).label("Reuse this automation's idle agent").on_toggle(Action::Reuse))
-            .push(widget::text::body("Fresh sessions close after a result. Reuse keeps the same account, model and permissions; interactive takeover pauses automation reuse."))
+            .push(widget::text::body("Fresh sessions close after a result. Reuse keeps the same account, model, reasoning effort and permissions; interactive takeover pauses automation reuse."))
             .push(widget::checkbox(self.precheck).label("Run a shell precheck").on_toggle(Action::Precheck));
         if self.precheck {
             fields = fields.push(widget::text::body("Runs once in the selected directory. A non-zero exit skips the agent; commands can change files."))
@@ -1104,6 +1209,102 @@ impl Draft {
         }
         fields.push(widget::text::body("New automations start paused. Changing the schedule or execution settings requires enabling them again. Missed runs older than 15 minutes are skipped; overlapping runs never start."))
             .push(widget::row::with_children(vec![button("Cancel", Action::CancelEdit, !busy), button("Save", Action::Save, !busy)]).spacing(8).wrap()).into()
+    }
+}
+
+impl Draft {
+    /// The provider's listed models, as the composer offers them, or a typed
+    /// ID for one it does not list. Before a provider has listed any, the
+    /// model is typed.
+    fn model_picker<'a>(&'a self, models: &'a Models) -> Element<'a, Action> {
+        let listed = models
+            .get(&provider(self.provider))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if listed.is_empty() {
+            return input(
+                "Model (blank uses provider default)",
+                &self.model,
+                Field::Model,
+            );
+        }
+        let custom = self.custom(models);
+        let labels = std::iter::once("Provider default".to_owned())
+            .chain(listed.iter().map(|model| model.label.clone()))
+            .chain(std::iter::once("Custom model ID…".to_owned()))
+            .collect::<Vec<_>>();
+        let selected = if custom {
+            labels.len() - 1
+        } else {
+            self.listed(models)
+                .and_then(|model| listed.iter().position(|entry| entry.id == model.id))
+                .map_or(0, |index| index + 1)
+        };
+        let ids = listed
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let mut column = widget::column::with_children(vec![
+            widget::text::body("Model").into(),
+            widget::dropdown(labels, Some(selected), move |index| {
+                Action::Model(match index {
+                    0 => ModelChoice::Default,
+                    index => ids
+                        .get(index - 1)
+                        .cloned()
+                        .map_or(ModelChoice::Custom, ModelChoice::Listed),
+                })
+            })
+            .into(),
+        ])
+        .spacing(4);
+        if custom {
+            column = column.push(
+                widget::text_input("Model ID", &self.model)
+                    .on_input(|value| Action::Field(Field::Model, value)),
+            );
+        }
+        column.into()
+    }
+
+    /// The efforts the chosen model advertises. The provider default, or a
+    /// model that advertises none, runs at the provider's default effort.
+    fn effort_picker<'a>(&'a self, models: &'a Models) -> Element<'a, Action> {
+        let efforts = self.efforts(models);
+        if efforts.is_empty() {
+            return widget::column::with_children(vec![
+                widget::text::body("Reasoning effort").into(),
+                widget::text::caption(if self.listed(models).is_some() {
+                    "Provider default. This model does not offer a choice."
+                } else {
+                    "Provider default. Choose a listed model to pick an effort."
+                })
+                .into(),
+            ])
+            .spacing(4)
+            .into();
+        }
+        let selected = self
+            .effort
+            .as_ref()
+            .and_then(|effort| efforts.iter().position(|entry| entry == effort))
+            .map_or(0, |index| index + 1);
+        let labels = std::iter::once("Provider default".to_owned())
+            .chain(efforts.iter().cloned())
+            .collect::<Vec<_>>();
+        widget::column::with_children(vec![
+            widget::text::body("Reasoning effort").into(),
+            widget::dropdown(labels, Some(selected), move |index| {
+                Action::Effort(
+                    index
+                        .checked_sub(1)
+                        .and_then(|index| efforts.get(index).cloned()),
+                )
+            })
+            .into(),
+        ])
+        .spacing(4)
+        .into()
     }
 }
 
@@ -1118,7 +1319,7 @@ fn launch_description<'a>(
         .map(|account| account.label.as_str())
         .unwrap_or("Saved account is unavailable");
     let description = format!(
-        "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
+        "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
         PROVIDERS[provider_index(definition.agent.provider)],
         account,
         definition.agent.target.repository.display(),
@@ -1126,6 +1327,11 @@ fn launch_description<'a>(
         definition
             .agent
             .model
+            .as_deref()
+            .unwrap_or("Provider default"),
+        definition
+            .agent
+            .reasoning_effort
             .as_deref()
             .unwrap_or("Provider default"),
         definition
@@ -1245,6 +1451,7 @@ mod tests {
                     surface: Surface::Chat,
                     model: None,
                     permission_mode: None,
+                    reasoning_effort: None,
                 },
                 schedule: Schedule {
                     pattern: SchedulePattern::Daily { hour: 9, minute: 0 },
@@ -1331,13 +1538,16 @@ mod tests {
             selected: Some(existing.clone()),
             ..State::default()
         };
-        state.set_choices(vec![target], vec![account]);
+        state.set_choices(vec![target], vec![account], Models::new());
         state.update(Action::Edit);
         // A refresh may remove or reorder the live catalog while the editor
         // is open; its numeric selections must retain their original meaning.
-        state.set_choices(Vec::new(), Vec::new());
+        state.set_choices(Vec::new(), Vec::new(), Models::new());
         let draft = state.draft.as_ref().unwrap();
-        assert_eq!(draft.definition().unwrap(), existing.definition);
+        assert_eq!(
+            draft.definition(&Models::new()).unwrap(),
+            existing.definition
+        );
         assert_eq!(draft.accounts[0].label, "Original account");
         assert_eq!(draft.targets[0].label, "Original target");
         assert!(state.accounts.is_empty());
@@ -1469,13 +1679,124 @@ mod tests {
         assert!(state.pending.is_some());
     }
 
+    fn models() -> Models {
+        let model = |id: &str, reasoning: &[&str]| Model {
+            id: id.into(),
+            label: id.to_uppercase(),
+            reasoning: reasoning.iter().map(|&effort| effort.into()).collect(),
+        };
+        Models::from([(
+            Provider::Codex,
+            vec![
+                model("luna", &["low", "medium", "high"]),
+                model("sol", &["medium", "xhigh"]),
+                model("plain", &[]),
+            ],
+        )])
+    }
+
+    /// An editor open on a saved Codex definition with every choice present.
+    fn editing(model: Option<&str>, effort: Option<&str>) -> (State, Automation) {
+        let mut existing = automation();
+        let agent = &mut existing.definition.agent;
+        agent.provider = Provider::Codex;
+        agent.account = Some(crate::account::Account::system(Provider::Codex).id());
+        agent.model = model.map(Into::into);
+        agent.reasoning_effort = effort.map(Into::into);
+        let agent = existing.definition.agent.clone();
+        let mut state = State {
+            selected: Some(existing.clone()),
+            ..State::default()
+        };
+        state.set_choices(
+            vec![TargetChoice {
+                label: "Fixture".into(),
+                target: agent.target.clone(),
+            }],
+            vec![AccountChoice {
+                label: "Codex".into(),
+                provider: Provider::Codex,
+                id: agent.account.clone().unwrap(),
+            }],
+            models(),
+        );
+        state.update(Action::Edit);
+        (state, existing)
+    }
+
+    fn saved_effort(state: &State) -> Result<Option<String>, String> {
+        let draft = state.draft.as_ref().unwrap();
+        draft
+            .definition(&state.models)
+            .map(|definition| definition.agent.reasoning_effort)
+    }
+
+    #[test]
+    fn a_saved_reasoning_effort_reopens_and_saves_unchanged() {
+        let (state, existing) = editing(Some("luna"), Some("low"));
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.efforts(&state.models), ["low", "medium", "high"]);
+        assert_eq!(
+            draft.definition(&state.models).unwrap(),
+            existing.definition
+        );
+    }
+
+    #[test]
+    fn efforts_follow_the_models_the_composer_lists() {
+        let (mut state, _) = editing(Some("luna"), None);
+        state.update(Action::Effort(Some("medium".into())));
+        assert_eq!(saved_effort(&state), Ok(Some("medium".into())));
+        // An effort carries over to a model that offers it, and only to one.
+        state.update(Action::Model(ModelChoice::Listed("sol".into())));
+        assert_eq!(saved_effort(&state), Ok(Some("medium".into())));
+        state.update(Action::Model(ModelChoice::Listed("plain".into())));
+        assert_eq!(saved_effort(&state), Ok(None));
+        assert!(
+            state
+                .draft
+                .as_ref()
+                .unwrap()
+                .efforts(&state.models)
+                .is_empty()
+        );
+        state.update(Action::Model(ModelChoice::Listed("sol".into())));
+        state.update(Action::Effort(Some("xhigh".into())));
+        state.update(Action::Model(ModelChoice::Default));
+        assert_eq!(saved_effort(&state), Ok(None));
+        // A typed model keeps the effort chosen for it; the provider decides.
+        state.update(Action::Model(ModelChoice::Listed("luna".into())));
+        state.update(Action::Effort(Some("high".into())));
+        state.update(Action::Model(ModelChoice::Custom));
+        state.update(Action::Field(Field::Model, "gpt-future".into()));
+        assert_eq!(saved_effort(&state), Ok(Some("high".into())));
+        // Model IDs and efforts belong to the provider they were chosen for.
+        state.update(Action::Provider(provider_index(Provider::Claude)));
+        let draft = state.draft.as_ref().unwrap();
+        assert!(draft.model.is_empty() && draft.effort.is_none());
+    }
+
+    #[test]
+    fn an_effort_the_listed_model_does_not_offer_is_refused_by_name() {
+        // A definition written through the CLI is shown as saved, not dropped.
+        let (state, _) = editing(Some("sol"), Some("low"));
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.efforts(&state.models), ["medium", "xhigh", "low"]);
+        let error = saved_effort(&state).unwrap_err();
+        assert!(error.contains("SOL does not offer the low"), "{error}");
+        // A model the provider has not listed cannot be checked here.
+        let (state, _) = editing(Some("unlisted"), Some("low"));
+        assert!(state.draft.as_ref().unwrap().custom(&state.models));
+        assert_eq!(saved_effort(&state), Ok(Some("low".into())));
+    }
+
     #[test]
     fn absent_saved_account_cannot_silently_switch_to_a_default() {
         let selected = automation();
         let draft = Draft::new(&[], &[], Some(&selected));
         assert!(
             draft
-                .definition()
+                .definition(&Models::new())
                 .unwrap_err()
                 .contains("explicit provider account")
         );
