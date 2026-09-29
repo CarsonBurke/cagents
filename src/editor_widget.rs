@@ -2890,7 +2890,7 @@ mod tests {
                     Vector::new(-900.0, 0.0),
                 )
                 .expect("the translated pane's visible anchor must retain its popup");
-            let popup_layout = popup.layout(&renderer, viewport.size());
+            let popup_layout = popup.as_overlay_mut().layout(&renderer, viewport.size());
             assert!(viewport.contains(popup_layout.bounds().position()));
             assert!(popup_layout.bounds().x >= 100.0);
             drop(popup);
