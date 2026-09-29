@@ -6338,6 +6338,10 @@ impl Cagents {
             durable_state.residency = residency;
         }
         self.status = None;
+        if let Some((expected_terminal_id, _)) = &terminal_replacement {
+            // The ended identity's final-screen outcome is spent.
+            self.retained_outputs.remove(expected_terminal_id);
+        }
         if let Some((expected_terminal_id, replacement)) = terminal_replacement
             && let Some(session) = &self.session
         {

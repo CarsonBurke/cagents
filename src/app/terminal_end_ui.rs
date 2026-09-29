@@ -12,6 +12,12 @@ use crate::{control::ControlClient, terminal::HostedTerminalHandle};
 /// How long a restored card waits for the daemon to hand back a final screen.
 const RETAINED_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a card whose final screen could not be loaded waits before it
+/// asks again. A host that was briefly unreachable at startup must not leave
+/// the card saying so for good, but the next visibility pass must not hammer
+/// a host that stays unreachable either.
+const RETAINED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long after a process ends Enter on its final screen is still taken as
 /// typing meant for the process. A command's Enter can arrive a moment after
 /// the process exits -- the reader typed ahead, or pressed it twice -- and
@@ -24,8 +30,14 @@ pub(super) enum RetainedOutput {
     Attaching,
     /// The daemon no longer holds the screen.
     Discarded,
-    /// The daemon could not be asked, or could not hand the screen back.
-    Unreachable,
+    /// The daemon could not be asked, or could not hand the screen back. The
+    /// card asks again once `retry_at` has passed and it is in view.
+    Unreachable {
+        retry_at: Instant,
+    },
+    /// A sign-in's screen is never attached: it can hold a pasted
+    /// authorization code.
+    Withheld,
 }
 
 /// The relaunch an ended terminal's card offers as its primary action.
@@ -228,12 +240,14 @@ impl Cagents {
     }
 
     /// Asks the daemon for the final screens of ended cards that are coming
-    /// into view. Each terminal is asked once: a screen the daemon no longer
-    /// holds does not come back.
+    /// into view. A screen the daemon no longer holds does not come back, so
+    /// that answer is final; a daemon that could not be reached is asked
+    /// again after a pause.
     pub(super) fn attach_retained_outputs(
         &mut self,
         cards: impl IntoIterator<Item = CardId>,
     ) -> Task<Message> {
+        let now = Instant::now();
         let mut tasks = Vec::new();
         for card in cards {
             if !matches!(self.cards.get(&card), Some(CardRuntime::Completed))
@@ -247,10 +261,16 @@ impl Cagents {
             };
             // A sign-in's screen can hold a pasted authorization code, which
             // is why it keeps no saved output either; it stays gone.
-            if self.retained_outputs.contains_key(&session.id)
-                || account_ui::is_sign_in(&session.launch)
-            {
+            if account_ui::is_sign_in(&session.launch) {
+                self.retained_outputs
+                    .entry(session.id)
+                    .or_insert(RetainedOutput::Withheld);
                 continue;
+            }
+            match self.retained_outputs.get(&session.id) {
+                None => {}
+                Some(RetainedOutput::Unreachable { retry_at }) if *retry_at <= now => {}
+                Some(_) => continue,
             }
             self.retained_outputs
                 .insert(session.id, RetainedOutput::Attaching);
@@ -308,7 +328,9 @@ impl Cagents {
             Ok(None) => RetainedOutput::Discarded,
             Err(error) => {
                 tracing::debug!(%terminal, %error, "final terminal screen could not be attached");
-                RetainedOutput::Unreachable
+                RetainedOutput::Unreachable {
+                    retry_at: Instant::now() + RETAINED_RETRY_INTERVAL,
+                }
             }
         };
         self.retained_outputs.insert(terminal, outcome);
@@ -423,9 +445,12 @@ impl Cagents {
         let outcome = session.and_then(|session| self.retained_outputs.get(&session.id));
         let detail = match outcome {
             Some(RetainedOutput::Discarded) => {
-                "Its final screen was not kept after the terminal host restarted."
+                "The terminal host no longer holds its final screen."
             }
-            Some(RetainedOutput::Unreachable) => {
+            Some(RetainedOutput::Withheld) => {
+                "Sign-in output is not kept, so codes are not left on screen."
+            }
+            Some(RetainedOutput::Unreachable { .. }) => {
                 "Its final screen could not be loaded from the terminal host."
             }
             // Not asked for yet, or on its way: usually answered within a
@@ -610,14 +635,59 @@ mod tests {
             terminal,
             result: Err("daemon unreachable".into()),
         });
-        assert_eq!(
+        assert!(matches!(
             app.retained_outputs.get(&terminal),
-            Some(&RetainedOutput::Unreachable)
-        );
+            Some(RetainedOutput::Unreachable { .. })
+        ));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
         // The end is already reported in the card; a missing old screen is
         // not an error the reader has to acknowledge.
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn an_unreachable_host_is_asked_again_after_a_pause() {
+        let (mut app, card, terminal) = restored_ended_card();
+        drop(app.attach_retained_outputs([card]));
+        let _ = app.update(Message::RetainedTerminalAttached {
+            card,
+            terminal,
+            result: Err("daemon unreachable".into()),
+        });
+        // The next visibility pass, moments later, does not ask again.
+        drop(app.attach_retained_outputs([card]));
+        assert!(matches!(
+            app.retained_outputs.get(&terminal),
+            Some(RetainedOutput::Unreachable { .. })
+        ));
+
+        // Once the pause has passed, it does.
+        app.retained_outputs.insert(
+            terminal,
+            RetainedOutput::Unreachable {
+                retry_at: Instant::now(),
+            },
+        );
+        drop(app.attach_retained_outputs([card]));
+        assert_eq!(
+            app.retained_outputs.get(&terminal),
+            Some(&RetainedOutput::Attaching)
+        );
+    }
+
+    #[test]
+    fn an_ended_sign_in_withholds_its_final_screen() {
+        let (mut app, card, terminal) = restored_ended_card();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        session.launch.program = "claude".into();
+        session.launch.arguments = vec!["auth".into(), "login".into()];
+        drop(app.attach_retained_outputs([card]));
+        assert_eq!(
+            app.retained_outputs.get(&terminal),
+            Some(&RetainedOutput::Withheld)
+        );
     }
 
     #[test]
