@@ -1435,6 +1435,7 @@ impl Worker {
                 terminal_id = %self.terminal_id, bytes = bytes.len(),
                 elapsed_ns = started.elapsed().as_nanos() as u64);
         }
+        self.observe_synchronized_output(&bytes);
 
         // Hand the batch over instead of copying up to PTY_BATCH_LIMIT bytes
         // into a channel that drops them under exactly the flood that makes
@@ -1710,7 +1711,12 @@ impl Worker {
                 size.cell_width_px,
                 size.cell_height_px,
             ) {
-                Ok(()) => self.applied_parser_size = size,
+                Ok(()) => {
+                    self.applied_parser_size = size;
+                    // The parser ends an update when it resizes; the next one
+                    // gets its own full hold.
+                    self.synchronized_since = None;
+                }
                 Err(error) => self.error("resize terminal", error.to_string()),
             }
         }
@@ -1882,6 +1888,26 @@ impl Worker {
             .synchronized_since
             .get_or_insert_with(std::time::Instant::now);
         since.elapsed() < SYNCHRONIZED_OUTPUT_TIMEOUT
+    }
+
+    /// Times synchronized updates per read batch, whether or not the batch
+    /// can publish. A capture samples the mode only when credit allows, so an
+    /// update that ends and restarts inside one batch, or across batches while
+    /// the consumer owes credit, would otherwise read as one long update and
+    /// lose its hold to the timeout under sustained output.
+    fn observe_synchronized_output(&mut self, bytes: &[u8]) {
+        const END: &[u8] = b"\x1b[?2026l";
+        let ended = bytes.windows(END.len()).any(|window| window == END);
+        // A read error is reported by the capture that consults the mode.
+        let active = self.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false);
+        if ended || !active {
+            self.synchronized_since = None;
+        }
+        // Nothing is published while away, so only a visible card times one.
+        if active && self.visibility == Visibility::Visible {
+            self.synchronized_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
     }
 
     /// How long until the update holding back a dirty grid loses its hold.
@@ -3731,6 +3757,35 @@ mod tests {
         assert_eq!(worker.generation, before + 1);
         assert_eq!(published_row(&worker, 0), "stuck");
         assert_eq!(worker.synchronized_release_after(), None);
+        worker.run();
+    }
+
+    #[test]
+    fn an_update_restarted_while_credit_is_owed_gets_its_own_hold() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"old".to_vec());
+        let published = worker.generation;
+        assert_eq!(published_row(&worker, 0), "old");
+
+        // The consumer still owes credit for that frame while an update runs
+        // long enough that its own hold would have lapsed.
+        worker.process_output(b"\x1b[?2026hhalf".to_vec());
+        worker.synchronized_since = Some(std::time::Instant::now() - SYNCHRONIZED_OUTPUT_TIMEOUT);
+        // One read ends it and begins the next; no capture sees the gap.
+        worker.process_output(b" done\x1b[?2026l\x1b[?2026hnext".to_vec());
+        present(&worker);
+        worker.capture_if_ready();
+        assert_eq!(
+            worker.generation, published,
+            "the next update's half-drawn frame was published"
+        );
+        assert_eq!(published_row(&worker, 0), "old");
+
+        worker.process_output(b" frame\x1b[?2026l".to_vec());
+        assert_eq!(worker.generation, published + 1);
+        assert_eq!(published_row(&worker, 0), "oldhalf donenext frame");
         worker.run();
     }
 
