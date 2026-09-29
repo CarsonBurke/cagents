@@ -710,22 +710,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         ));
         if state.description_open {
             let theme = cosmic::theme::active();
-            let settings = markdown::Settings {
-                h1_size: design::TEXT_HEADING.into(),
-                h2_size: design::TEXT_HEADING.into(),
-                h3_size: design::TEXT_HEADING.into(),
-                h4_size: design::TEXT_HEADING.into(),
-                spacing: 8.into(),
-                code_size: design::TEXT_CAPTION.into(),
-                ..markdown::Settings::with_text_size(
-                    design::TEXT_BODY,
-                    if theme.theme_type.is_dark() {
-                        iced::Theme::Dark
-                    } else {
-                        iced::Theme::Light
-                    },
-                )
-            };
+            let settings = design::markdown_settings(&theme, design::TEXT_BODY);
             children.push(
                 markdown::view(&state.description, settings)
                     .map(|uri| Action::OpenMarkdownLink(uri.to_string())),

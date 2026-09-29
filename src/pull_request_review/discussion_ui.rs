@@ -757,8 +757,14 @@ impl State {
                     .and_then(|id| self.discussion.markdown.get(id))
                 {
                     rows.push(
-                        markdown::view(items, markdown::Settings::from(iced::Theme::Dark))
-                            .map(|uri| Action::OpenLink(uri.to_string())),
+                        markdown::view(
+                            items,
+                            crate::design::markdown_settings(
+                                &cosmic::theme::active(),
+                                crate::design::TEXT_BODY,
+                            ),
+                        )
+                        .map(|uri| Action::OpenLink(uri.to_string())),
                     );
                 } else {
                     rows.push(design::body(&comment.body).into());
@@ -827,7 +833,10 @@ impl State {
                 rows.push(
                     markdown::view(
                         &composer.markdown,
-                        markdown::Settings::from(iced::Theme::Dark),
+                        crate::design::markdown_settings(
+                            &cosmic::theme::active(),
+                            crate::design::TEXT_BODY,
+                        ),
                     )
                     .map(|uri| Action::OpenLink(uri.to_string())),
                 );

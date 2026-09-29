@@ -43,6 +43,31 @@ pub const TEXT_PROSE: f32 = 14.0;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_HEADING: f32 = 13.0;
 
+/// Markdown shares the shell's semantic palette and a compact heading scale.
+pub fn markdown_settings(theme: &cosmic::Theme, size: f32) -> cosmic::widget::markdown::Settings {
+    use cosmic::{iced, widget::markdown};
+    let mut style = markdown::Style::from(if theme.theme_type.is_dark() {
+        iced::Theme::Dark
+    } else {
+        iced::Theme::Light
+    });
+    style.link_color = accent_color(theme);
+    style.inline_code_color = theme.cosmic().background(false).on.into();
+    style.inline_code_highlight.background = raised(theme).into();
+    style.inline_code_highlight.border.radius = RADIUS_XS.into();
+    markdown::Settings {
+        h1_size: (size + GRID_UNIT).into(),
+        h2_size: (size + GRID_UNIT / 2.0).into(),
+        h3_size: (size + 1.0).into(),
+        h4_size: size.into(),
+        h5_size: size.into(),
+        h6_size: size.into(),
+        code_size: size.into(),
+        spacing: (GRID_UNIT * 2.0).into(),
+        ..markdown::Settings::with_text_size(size, style)
+    }
+}
+
 /// The shell's "working" tone: something is in flight and may still fail.
 pub fn warning_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     theme.cosmic().warning.base.into()
