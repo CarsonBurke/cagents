@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::state::{ClientId, HostState, SharedHost};
 use crate::{
     model::TerminalId,
-    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target},
+    notifications::{Event, Notice, Preferences, Presence, Snapshot, Target, TestOutcome},
 };
 
 const MAX_PENDING: usize = 2048;
@@ -101,7 +101,8 @@ struct Pending {
     portal_owner: Option<Option<zbus::names::OwnedUniqueName>>,
     reload: bool,
     preferences: Option<Preferences>,
-    test: bool,
+    /// Requesters waiting on a test notification, each answered once.
+    tests: Vec<std::sync::mpsc::Sender<TestOutcome>>,
     stopped: bool,
 }
 
@@ -166,12 +167,23 @@ impl Handle {
         });
     }
 
-    pub fn reload(&self, preferences: Option<Preferences>, test: bool) {
+    pub fn reload(&self, preferences: Option<Preferences>) {
         self.change(|pending| {
             pending.reload = true;
             pending.preferences = preferences;
-            pending.test |= test;
         });
+    }
+
+    /// Queues a test notification. The receiver yields its outcome once the
+    /// broker has tried it, and disconnects if the broker stops first.
+    pub fn test(&self) -> std::sync::mpsc::Receiver<TestOutcome> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.change(|pending| {
+            if pending.tests.len() < MAX_PENDING {
+                pending.tests.push(sender);
+            }
+        });
+        receiver
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -634,6 +646,23 @@ async fn send(portal: &Portal, notice: &Notice, application_action: bool) -> Res
     .map_err(|error| format!("Desktop notifications unavailable: {error}"))
 }
 
+async fn send_test(backend: &Portal) -> TestOutcome {
+    let test = Notification::new("cagents notifications work")
+        .body("Agent completion and attention alerts appear here.");
+    match tokio::time::timeout(
+        PORTAL_TIMEOUT,
+        backend
+            .proxy
+            .add_notification("cagents-notification-test", test),
+    )
+    .await
+    {
+        Ok(Ok(())) => TestOutcome::Sent,
+        Ok(Err(error)) => TestOutcome::Unavailable(error.to_string()),
+        Err(_) => TestOutcome::TimedOut,
+    }
+}
+
 async fn remove(proxy: &Portal, id: Uuid) -> Result<(), String> {
     tokio::time::timeout(
         PORTAL_TIMEOUT,
@@ -659,6 +688,13 @@ fn queue_withdrawal(queue: &mut BTreeSet<Uuid>, id: Uuid) {
         queue.pop_first();
     }
     queue.insert(id);
+}
+
+fn answer_tests(requesters: &[std::sync::mpsc::Sender<TestOutcome>], outcome: &TestOutcome) {
+    for requester in requesters {
+        // A requester that gave up waiting has nothing left to tell.
+        let _ = requester.send(outcome.clone());
+    }
 }
 
 async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>) -> bool {
@@ -707,6 +743,29 @@ mod tests {
             pending.events[&Target::Session(session)].evidence.key,
             "new"
         );
+    }
+
+    #[test]
+    fn every_test_requester_is_answered_or_released() {
+        let (wake, _receiver) = mpsc::channel(1);
+        let handle = Handle(Arc::new(Shared {
+            pending: Mutex::default(),
+            presence: Mutex::default(),
+            snapshot: Mutex::default(),
+            wake,
+        }));
+        let first = handle.test();
+        let second = handle.test();
+        let pending = std::mem::take(&mut *handle.0.pending.lock().unwrap());
+        answer_tests(&pending.tests, &TestOutcome::Sent);
+        assert_eq!(first.recv(), Ok(TestOutcome::Sent));
+        assert_eq!(second.recv(), Ok(TestOutcome::Sent));
+
+        // A broker that stops with a test still queued releases its waiter
+        // instead of leaving the request to time out.
+        let orphaned = handle.test();
+        drop(std::mem::take(&mut *handle.0.pending.lock().unwrap()));
+        assert!(orphaned.recv().is_err());
     }
 
     #[test]
@@ -1010,6 +1069,26 @@ async fn run(
             next_attempt = Instant::now();
         }
         let Ok(journal) = &mut journal else {
+            // Without a journal there is no backlog to deliver, but the
+            // portal may be fine, so a test is still answered by the portal
+            // itself rather than dropped as if the broker had stopped.
+            if !pending.tests.is_empty() {
+                if proxy.is_none() {
+                    match connect(shared.clone(), application, &mut activation).await {
+                        Ok(connected) => proxy = Some(connected),
+                        Err(error) => {
+                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                        }
+                    }
+                }
+                if let Some(backend) = &proxy {
+                    let outcome = send_test(backend).await;
+                    if outcome != TestOutcome::Sent {
+                        proxy = None;
+                    }
+                    answer_tests(&pending.tests, &outcome);
+                }
+            }
             continue;
         };
         if let Some(current) = current_presence {
@@ -1125,10 +1204,13 @@ async fn run(
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
-        if (!delivery.is_empty() || !withdrawals.is_empty() || pending.test)
-            && proxy.is_none()
-            && Instant::now() >= next_attempt
-        {
+        let backlog_due =
+            (!delivery.is_empty() || !withdrawals.is_empty()) && Instant::now() >= next_attempt;
+        // A test is a person asking right now, so it retries a portal that
+        // the backlog is still backing off from. Its failure is answered to
+        // that person rather than raised as every window's diagnostic, and
+        // leaves the backlog's schedule alone.
+        if proxy.is_none() && (backlog_due || !pending.tests.is_empty()) {
             match connect(shared.clone(), application, &mut activation).await {
                 Ok(connected) => {
                     proxy = Some(connected);
@@ -1136,17 +1218,32 @@ async fn run(
                     retry_delay = RETRY_DELAY;
                 }
                 Err(error) => {
-                    snapshot.diagnostic = Some(error);
-                    next_attempt = Instant::now() + retry_delay;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
+                    if backlog_due {
+                        snapshot.diagnostic = Some(error);
+                        next_attempt = Instant::now() + retry_delay;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
+                    }
                 }
             }
         }
         if let Some(backend) = &proxy {
             let mut failed = false;
+            // Ahead of the backlog, so the answer is not held behind it.
+            if !pending.tests.is_empty() {
+                let outcome = send_test(backend).await;
+                failed = outcome != TestOutcome::Sent;
+                answer_tests(&pending.tests, &outcome);
+            }
             // Yield to coalesced lifecycle/focus/acknowledgment work between
             // bounded batches, rather than delaying it behind thousands of alerts.
-            let batch: Vec<_> = delivery.values().take(8).cloned().collect();
+            // A portal that just failed the test is dropped below, not
+            // handed the backlog as well.
+            let batch: Vec<_> = if failed {
+                Vec::new()
+            } else {
+                delivery.values().take(8).cloned().collect()
+            };
             for notice in batch {
                 if stopped(&shared) {
                     return;
@@ -1171,6 +1268,9 @@ async fn run(
                 if stopped(&shared) {
                     return;
                 }
+                if failed {
+                    break;
+                }
                 let Some(id) = withdrawals.pop_first() else {
                     break;
                 };
@@ -1179,32 +1279,6 @@ async fn run(
                     snapshot.diagnostic = Some(error);
                     failed = true;
                     break;
-                }
-            }
-            if pending.test {
-                let test = Notification::new("cagents notifications work")
-                    .body("Agent completion and attention alerts appear here.");
-                match tokio::time::timeout(
-                    PORTAL_TIMEOUT,
-                    backend
-                        .proxy
-                        .add_notification("cagents-notification-test", test),
-                )
-                .await
-                {
-                    Ok(Ok(())) => snapshot.diagnostic = Some(
-                        "Test notification sent. Your desktop controls its presentation and sound."
-                            .into(),
-                    ),
-                    Ok(Err(error)) => {
-                        failed = true;
-                        snapshot.diagnostic =
-                            Some(format!("Desktop notifications unavailable: {error}"))
-                    }
-                    Err(_) => {
-                        failed = true;
-                        snapshot.diagnostic = Some("Desktop notification portal timed out".into())
-                    }
                 }
             }
             if failed {

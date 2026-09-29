@@ -345,6 +345,9 @@ pub struct WorktreeOperationRow {
     pub detail: String,
     pub phase: WorktreeOperationPhase,
     pub cancellable: bool,
+    /// A failure whose input the create dialog can take back, to edit or to
+    /// run again.
+    pub reopenable: bool,
 }
 
 /// A deletion the user has confirmed, as the row being deleted shows it.
@@ -753,6 +756,11 @@ impl SidebarWorktree {
             deletion: None,
             chrome,
         }
+    }
+
+    /// The name the row shows: the branch's last segment, or the directory.
+    pub fn label(&self) -> &str {
+        &self.chrome.label
     }
 
     /// Builds the row for a worktree known only from durable session state,
@@ -2688,9 +2696,31 @@ impl SidebarState {
     pub fn has_row_selection(&self) -> bool {
         !self.rows.is_empty()
     }
+    /// Whether the search controls narrow the list: a query, or the pull
+    /// request filter that lives beside it. Attention is not counted; its
+    /// toggle stays in the header whether or not the controls show.
+    pub fn search_filters_active(&self) -> bool {
+        !self.query.trim().is_empty() || self.filter == SidebarFilter::PullRequests
+    }
+
+    /// Hiding the search controls ends the search. A query or filter nobody
+    /// can see would keep hiding rows, and the pull request filter would keep
+    /// changing what a click on a row does, with nothing on screen to say so.
+    fn clear_search_filters(&mut self) {
+        self.query.clear();
+        if self.filter == SidebarFilter::PullRequests {
+            self.filter = SidebarFilter::All;
+        }
+    }
+
     pub fn saved_view(&self) -> SidebarView {
         SidebarView {
-            query: self.query.clone(),
+            // A hidden query is not applied, so there is nothing to restore.
+            query: if self.controls_expanded {
+                self.query.clone()
+            } else {
+                String::new()
+            },
             controls_expanded: self.controls_expanded,
             collapsed_projects: self.collapsed_projects.clone(),
             selection: self.selection,
@@ -2704,7 +2734,12 @@ impl SidebarState {
     }
 
     pub fn restore_view(&mut self, view: SidebarView) {
-        self.query = view.query;
+        // Views saved before hidden queries were dropped may still hold one.
+        self.query = if view.controls_expanded {
+            view.query
+        } else {
+            String::new()
+        };
         self.controls_expanded = view.controls_expanded;
         self.collapsed_projects = view.collapsed_projects;
         self.selection = view.selection;
@@ -2981,7 +3016,12 @@ impl SidebarState {
         match action {
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
             SidebarAction::SetFilter(filter) => self.filter = *filter,
-            SidebarAction::ToggleControls => self.controls_expanded = !self.controls_expanded,
+            SidebarAction::ToggleControls => {
+                self.controls_expanded = !self.controls_expanded;
+                if !self.controls_expanded {
+                    self.clear_search_filters();
+                }
+            }
             SidebarAction::ToggleProject(project_id) => {
                 toggle_membership(&mut self.collapsed_projects, *project_id);
             }
@@ -3080,6 +3120,8 @@ impl SidebarState {
             SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::DismissWorktreeOperation(_)
+            | SidebarAction::EditWorktreeOperation(_)
+            | SidebarAction::RetryWorktreeOperation(_)
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
@@ -3110,6 +3152,7 @@ impl SidebarState {
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
+            | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::ClearRowSelection => {}
         }
@@ -3137,6 +3180,8 @@ pub enum SidebarAction {
         row: SelectionRow,
         intent: SelectionIntent,
     },
+    /// Delete or remove one row, confirmed exactly as its context menu is.
+    DeleteRow(SelectionRow),
     DeleteSelectedRows,
     ClearRowSelection,
     DragWindow,
@@ -3154,6 +3199,10 @@ pub enum SidebarAction {
     CancelWorktreeOperation(crate::model::OperationId),
     /// Removes the row of a creation that ended without a worktree.
     DismissWorktreeOperation(crate::model::OperationId),
+    /// Reopens a failed creation's input in the create dialog.
+    EditWorktreeOperation(crate::model::OperationId),
+    /// Runs a failed creation's input again.
+    RetryWorktreeOperation(crate::model::OperationId),
     /// Runs a confirmed worktree deletion again after it failed.
     RetryWorktreeDeletion {
         project_id: ProjectId,
@@ -3495,17 +3544,21 @@ pub fn view<'a>(
     .into()
 }
 
+/// The bulk bar. It exists only while the user has explicitly picked rows
+/// with Ctrl or Shift; opening a row never mounts it.
 fn selection_controls(
     state: &SidebarState,
     compact: bool,
     modal_open: bool,
 ) -> Element<'static, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
     let count = state.rows.len();
-    let homogeneous = state
+    // Every member must be one kind: a project is removed, a worktree or
+    // channel deleted, and one confirmation cannot promise both.
+    let kind = state
         .rows
         .first()
-        .and_then(|row| state.rows.group_size(row))
-        .is_some();
+        .filter(|row| state.rows.group_size(*row).is_some());
     let mut controls = Vec::with_capacity(3);
     if !compact {
         controls.push(
@@ -3516,29 +3569,32 @@ fn selection_controls(
     }
     controls.push(icon_action(
         "edit-delete-symbolic",
-        format!("Delete {count} selected rows"),
-        homogeneous
-            .then(|| gated(SidebarAction::DeleteSelectedRows, modal_open))
-            .flatten(),
+        kind.map_or_else(
+            || "Select one kind of row to delete together".to_owned(),
+            |row| format!("{}…", row.deletion_label(count)),
+        ),
+        kind.and_then(|_| gated(SidebarAction::DeleteSelectedRows, modal_open)),
         stable_id("selection.delete"),
     ));
     controls.push(icon_action(
         "window-close-symbolic",
-        "Clear row selection",
+        "Clear selection",
         gated(SidebarAction::ClearRowSelection, modal_open),
         stable_id("selection.clear"),
     ));
     let controls: Element<'static, SidebarAction> = if compact {
         widget::column::with_children(controls)
             .align_x(Alignment::Center)
+            .spacing(spacing.space_xxxs)
             .into()
     } else {
         widget::row::with_children(controls)
             .align_y(Alignment::Center)
+            .spacing(spacing.space_xxxs)
             .into()
     };
     widget::container(controls)
-        .padding(4)
+        .padding([spacing.space_xxxs, spacing.space_xxs])
         .width(Length::Fill)
         .into()
 }
@@ -3576,7 +3632,7 @@ fn header<'a>(
                 "Show projects needing attention"
             },
         ));
-        let selected = state.controls_expanded || (!compact && !state.query.is_empty());
+        let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
             button::icon(crate::ui_controls::symbolic_icon("edit-find-symbolic"))
                 .class(sidebar_button_style(selected))
@@ -3586,7 +3642,12 @@ fn header<'a>(
                 .width(ICON_CONTROL_SIZE)
                 .height(ICON_CONTROL_SIZE)
                 .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
-            "Search projects",
+            // Closing the controls also ends the search, so say so.
+            if state.controls_expanded && state.search_filters_active() {
+                "Close and clear search"
+            } else {
+                "Search projects"
+            },
         );
         if compact {
             actions.push(crate::ui_controls::popover(
@@ -3641,6 +3702,12 @@ fn header<'a>(
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
     window_gestures(header)
+}
+
+/// The search toggle is lit whenever the controls narrow the list, not only
+/// while they show, so an active search can never pass for the full list.
+fn search_toggle_lit(state: &SidebarState) -> bool {
+    state.controls_expanded || state.search_filters_active()
 }
 
 /// The pane's top strip is part of the titlebar.
@@ -3901,7 +3968,8 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     if compact {
         return widget::container(
             widget::column::with_children(vec![
-                widget::icon::from_name("dialog-warning-symbolic")
+                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                    .icon()
                     .size(STATUS_ICON_SIZE)
                     .into(),
                 icon_action(
@@ -3920,7 +3988,8 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
     }
     widget::container(
         widget::column::with_children(vec![
-            widget::icon::from_name("dialog-warning-symbolic")
+            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                .icon()
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading("Couldn’t load projects").into(),
@@ -3969,7 +4038,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
             SidebarFilter::PullRequests => (
-                "vcs-merge-request-symbolic",
+                "pull-request-symbolic",
                 "No pull requests found",
                 "Open a repository or change the current filter.",
                 "Show all",
@@ -4284,16 +4353,37 @@ fn operation_rows<'a>(
             Some(label),
             operation_status(operation.phase),
         );
+        // A failure the dialog can take back opens there, beside the input
+        // that caused it.
         let control = grid
             .control(content, false)
             .name(operation_accessible_name(operation))
+            .on_press_maybe(
+                gated(
+                    SidebarAction::EditWorktreeOperation(operation.id),
+                    modal_open,
+                )
+                .filter(|_| operation.reopenable),
+            )
             .width(Length::Fill);
         let control = crate::interaction::tooltip(control, &*operation.detail);
+        let retry = operation.reopenable.then(|| {
+            icon_action(
+                "view-refresh-symbolic",
+                format!("Retry creating {}", operation.label),
+                gated(
+                    SidebarAction::RetryWorktreeOperation(operation.id),
+                    modal_open,
+                ),
+                stable_id(format!("operation.{}.retry", operation.id)),
+            )
+        });
         let trailing = operation_control(operation, modal_open);
         grid.mount(
-            widget::row::with_capacity(2)
+            widget::row::with_capacity(3)
                 .align_y(Alignment::Center)
                 .push(control)
+                .push_maybe(retry)
                 .push_maybe(trailing),
         )
     })
@@ -4400,6 +4490,12 @@ fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
         WorktreeOperationPhase::Working => {
             format!(
                 "Creating worktree {}: {}",
+                operation.label, operation.detail
+            )
+        }
+        WorktreeOperationPhase::Failed if operation.reopenable => {
+            format!(
+                "Worktree {} was not created: {}. Activate to edit and retry.",
                 operation.label, operation.detail
             )
         }
@@ -5138,10 +5234,12 @@ fn channel_context_controls<'a>(
         items(
             &std::collections::HashMap::new(),
             vec![Item::Button(
-                if selection_count.unwrap_or(1) > 1 {
-                    format!("Delete {} selected channels…", selection_count.unwrap())
-                } else {
-                    "Delete channel…".to_owned()
+                match selection_count {
+                    Some(count) if count > 1 => format!(
+                        "{}…",
+                        SelectionRow::Channel(channel_id).deletion_label(count)
+                    ),
+                    _ => "Delete channel…".to_owned(),
                 },
                 None,
                 ChannelContextCommand(channel_id, selection_count.unwrap_or(1) > 1),
@@ -5477,14 +5575,18 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
             .width(size)
             .height(size)
             .into(),
-        None => widget::container(widget::icon::from_name("folder-symbolic").size(size))
-            .class(theme::Container::custom(move |theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_icon_color(theme)),
-                    ..Default::default()
-                }
-            }))
-            .into(),
+        None => widget::container(
+            crate::ui_controls::symbolic_icon("folder-symbolic")
+                .icon()
+                .size(size),
+        )
+        .class(theme::Container::custom(move |theme| {
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(design::muted_icon_color(theme)),
+                ..Default::default()
+            }
+        }))
+        .into(),
     }
 }
 
@@ -5554,27 +5656,20 @@ fn context_controls<'a>(
             commands.clear();
         }
         if let Some(count) = selection_count {
-            if worktree_id.is_some() {
-                commands.push((
-                    if count > 1 {
-                        format!("Delete {count} selected worktrees…")
-                    } else {
-                        "Delete worktree…".to_owned()
-                    },
-                    None,
+            // Every row names its own kind, so one label covers both counts.
+            let (row, command) = match worktree_id {
+                Some(worktree_id) => (
+                    SelectionRow::Worktree(project_id, worktree_id),
                     ProjectCommand::Delete,
-                ));
+                ),
+                None => (SelectionRow::Project(project_id), ProjectCommand::Remove),
+            };
+            let label = if count > 1 {
+                row.deletion_label(count)
             } else {
-                commands.push((
-                    if count > 1 {
-                        format!("Remove {count} selected projects…")
-                    } else {
-                        "Remove project…".to_owned()
-                    },
-                    None,
-                    ProjectCommand::Remove,
-                ));
-            }
+                format!("{} {}", row.deletion_verb(), row.noun(1))
+            };
+            commands.push((format!("{label}…"), None, command));
         }
         let entries = commands
             .iter()
@@ -6563,9 +6658,13 @@ fn panel_section<'a>(
     let parts = SectionHeader::new(key, section, count, expanded, modal_open);
     let row = button::custom(
         widget::row::with_children(vec![
-            widget::container(icon::from_name(parts.icon).size(ROW_ICON_SIZE))
-                .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                .into(),
+            widget::container(
+                crate::ui_controls::symbolic_icon(parts.icon)
+                    .icon()
+                    .size(ROW_ICON_SIZE),
+            )
+            .center_x(Length::Fixed(ROW_ICON_WIDTH))
+            .into(),
             design::heading(parts.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -7730,7 +7829,8 @@ fn commit_changes_section<'a>(
         .push(
             button::custom(
                 widget::row::with_children(vec![
-                    icon::from_name("go-previous-symbolic")
+                    crate::ui_controls::symbolic_icon("go-previous-symbolic")
+                        .icon()
                         .size(ROW_ICON_SIZE)
                         .into(),
                     design::body("History").into(),
@@ -7862,9 +7962,13 @@ fn history_section<'a>(
         rows = rows.push(
             button::custom(
                 widget::row::with_children(vec![
-                    widget::container(icon::from_name("vcs-commit-symbolic").size(ROW_ICON_SIZE))
-                        .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                        .into(),
+                    widget::container(
+                        crate::ui_controls::symbolic_icon("vcs-commit-symbolic")
+                            .icon()
+                            .size(ROW_ICON_SIZE),
+                    )
+                    .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                    .into(),
                     widget::column::with_children(vec![
                         design::body(&*chrome.subject)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -8404,8 +8508,9 @@ pub fn visible_selection_rows(
     rows
 }
 
-/// A compact query applies only while its search popover is available, so
-/// hiding the popover cannot leave an invisible query filtering the rail.
+/// A compact query applies only while its search popover is available.
+/// Closing the controls clears the query anyway; this keeps a query restored
+/// from an older saved view from filtering the rail invisibly.
 fn filtered_projects<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -8688,7 +8793,10 @@ mod row_interaction {
     enum Kind {
         Selectable {
             row: super::SelectionRow,
+            /// This row is in the explicit multi-selection.
             selected: bool,
+            /// Some row is, so Escape has a selection to clear.
+            any_selected: bool,
             enabled: bool,
         },
         FilteredScroll(SidebarFilter),
@@ -8775,6 +8883,7 @@ mod row_interaction {
                 kind: Kind::Selectable {
                     row,
                     selected: state.rows.contains(row),
+                    any_selected: !state.rows.is_empty(),
                     enabled,
                 },
             })
@@ -9098,7 +9207,10 @@ mod row_interaction {
             }
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
             if let Kind::Selectable {
-                row, enabled: true, ..
+                row,
+                selected,
+                any_selected,
+                enabled: true,
             } = self.kind
             {
                 let additive = state.modifiers.control() || state.modifiers.logo();
@@ -9109,12 +9221,14 @@ mod row_interaction {
                                 .selection_bounds
                                 .is_some_and(|bounds| cursor.is_over(bounds)) =>
                     {
+                        // A plain click is navigation: the row's own button
+                        // opens it, and the selection only learns the anchor.
                         let intent = if state.modifiers.shift() {
                             super::SelectionIntent::Range { extend: additive }
                         } else if additive {
                             super::SelectionIntent::Toggle
                         } else {
-                            super::SelectionIntent::Replace
+                            super::SelectionIntent::Navigate
                         };
                         shell.publish(SidebarAction::SelectRows { row, intent });
                         if additive || state.modifiers.shift() {
@@ -9122,25 +9236,27 @@ mod row_interaction {
                             return;
                         }
                     }
-                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) if hovered => {
-                        shell.publish(SidebarAction::SelectRows {
-                            row,
-                            intent: super::SelectionIntent::Context,
-                        });
-                    }
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(key),
                         modifiers,
                         ..
                     }) if state.focused && modifiers.is_empty() => match key {
                         keyboard::key::Named::Delete | keyboard::key::Named::Backspace => {
-                            // A Ctrl-click can leave focus on a deselected row.
-                            // Delete acts on the current selection, not that row.
-                            shell.publish(SidebarAction::DeleteSelectedRows);
+                            // The focused row is the target unless it belongs
+                            // to the explicit selection, as in VS Code: focus
+                            // moved off a selection, or a Ctrl-click that
+                            // deselected this row, must not aim at other rows.
+                            shell.publish(if selected {
+                                SidebarAction::DeleteSelectedRows
+                            } else {
+                                SidebarAction::DeleteRow(row)
+                            });
                             shell.capture_event();
                             return;
                         }
-                        keyboard::key::Named::Escape => {
+                        // Escape belongs to whatever else wants it unless there
+                        // is a selection for it to end.
+                        keyboard::key::Named::Escape if any_selected => {
                             shell.publish(SidebarAction::ClearRowSelection);
                             shell.capture_event();
                             return;
@@ -9421,22 +9537,46 @@ mod row_interaction {
                 }
                 return;
             }
-            // Keep bulk selection visible with the same neutral vocabulary as
-            // navigation selection, without outlining the whole row in accent.
+            // Multi-selection is marked by a short accent bar at the leading
+            // edge over a light neutral fill: distinct from the active row,
+            // whose button paints the neutral fill alone, without outlining
+            // the whole row in accent (#448). The fill uses the button's own
+            // radius token and bounds, so a row that is both shares one shape.
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
-                if let Some(clip) = layout.bounds().intersection(viewport) {
+                // The row's own button, not the indented slot around it, so
+                // the mark lines up with the active row's highlight.
+                let bounds = state.selection_bounds.unwrap_or(layout.bounds());
+                if let Some(clip) = bounds.intersection(viewport) {
+                    let radius = theme.cosmic().corner_radii.radius_s;
+                    let edge = Rectangle {
+                        x: bounds.x + 1.0,
+                        y: bounds.y + bounds.height * 0.25,
+                        width: 2.0,
+                        height: bounds.height * 0.5,
+                    };
                     renderer.with_layer(clip, |renderer| {
                         renderer.fill_quad(
                             renderer::Quad {
-                                bounds: layout.bounds().shrink(1.0),
+                                bounds,
                                 border: cosmic::iced::Border {
-                                    radius: 3.0.into(),
+                                    radius: radius.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()
                             },
                             cosmic::iced::Color::from(theme.current_container().on)
-                                .scale_alpha(0.10),
+                                .scale_alpha(0.08),
+                        );
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: edge,
+                                border: cosmic::iced::Border {
+                                    radius: 1.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            super::design::accent_color(theme),
                         );
                     });
                 }
@@ -9546,12 +9686,14 @@ mod row_interaction {
                         child.as_widget().a11y_nodes(layout, tree, cursor)
                     }),
             );
-            if let Kind::Selectable { selected, .. } = self.kind {
+            // Membership adds to the button's own selected state, which marks
+            // the active row, rather than replacing it.
+            if let Kind::Selectable { selected: true, .. } = self.kind {
                 let mut applied = false;
                 let mut select = |node: &mut iced_accessibility::A11yNode| {
                     if !applied && node.node().role() == iced_accessibility::accesskit::Role::Button
                     {
-                        node.node_mut().set_selected(selected);
+                        node.node_mut().set_selected(true);
                         applied = true;
                     }
                 };
@@ -9865,7 +10007,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn row_modifier_selection_does_not_activate_and_delete_requires_row_focus() {
+    fn row_selection_is_explicit_and_delete_targets_the_focused_row_unless_selected() {
         use cosmic::iced::{
             Event, Point, Rectangle,
             advanced::{Shell, clipboard, widget::operation},
@@ -9954,8 +10096,71 @@ pub(crate) mod tests {
         );
         assert_eq!(
             dispatch(&mut element, &mut tree, key()),
-            vec![SidebarAction::DeleteSelectedRows],
-            "keyboard deletion must not reselect a focused row that Ctrl-click deselected"
+            vec![SidebarAction::DeleteRow(row)],
+            "a focused row outside the selection is its own target"
+        );
+        assert!(
+            dispatch(
+                &mut element,
+                &mut tree,
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                })
+            )
+            .is_empty(),
+            "Escape with nothing selected is left for the rest of the window"
+        );
+        dispatch(
+            &mut element,
+            &mut tree,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::empty(),
+            )),
+        );
+        assert_eq!(
+            dispatch(
+                &mut element,
+                &mut tree,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            ),
+            vec![SidebarAction::SelectRows {
+                row,
+                intent: SelectionIntent::Navigate
+            }],
+            "a plain click navigates and selects nothing"
+        );
+
+        // The same focused row, now a member of the selection, deletes the
+        // whole selection instead.
+        let mut selected = SidebarState::default();
+        selected.select_rows(row, SelectionIntent::Toggle, &[row]);
+        let mut element = RowInteraction::selectable(
+            button::custom(widget::text::body("Project"))
+                .id(selection_row_focus_id(row))
+                .width(120)
+                .height(32)
+                .on_press(SidebarAction::OpenRepositoryPicker)
+                .into(),
+            row,
+            &selected,
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(selection_row_focus_id(row)),
+        );
+        assert_eq!(
+            dispatch(&mut element, &mut tree, key()),
+            vec![SidebarAction::DeleteSelectedRows]
         );
     }
 
@@ -11831,6 +12036,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hiding_the_search_controls_ends_the_search_they_held() {
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("sidebar".into()));
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
+        assert!(state.search_filters_active());
+        assert_eq!(state.saved_view().query, "sidebar");
+
+        state.apply(&SidebarAction::ToggleControls);
+        assert!(!state.controls_expanded());
+        assert_eq!(state.query(), "");
+        assert_eq!(
+            state.filter(),
+            SidebarFilter::All,
+            "a hidden pull request filter would silently change row clicks"
+        );
+        assert!(!state.search_filters_active());
+
+        // Attention keeps its own always-visible header toggle.
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::ToggleControls);
+        assert_eq!(state.filter(), SidebarFilter::Attention);
+        assert!(!state.search_filters_active());
+    }
+
+    #[test]
+    fn a_hidden_query_is_neither_saved_nor_restored() {
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("kept".into()));
+        let mut restored = SidebarState::default();
+        restored.restore_view(state.saved_view());
+        assert_eq!(restored.query(), "kept", "a visible search survives");
+
+        // A view saved before hiding cleared the query.
+        let legacy: SidebarView = serde_json::from_value(serde_json::json!({
+            "query": "stale",
+            "controls_expanded": false,
+            "collapsed_projects": [],
+            "selection": null,
+        }))
+        .unwrap();
+        let mut restored = SidebarState::default();
+        restored.restore_view(legacy);
+        assert_eq!(restored.query(), "");
+        assert_eq!(restored.saved_view().query, "");
+    }
+
+    #[test]
+    fn the_search_toggle_is_lit_while_any_search_filter_applies() {
+        for (controls_expanded, query, filter, lit) in [
+            (false, "", SidebarFilter::All, false),
+            (false, "", SidebarFilter::Attention, false),
+            (false, "  ", SidebarFilter::All, false),
+            (true, "", SidebarFilter::All, true),
+            // Neither can arise through the pane any more, but a state that
+            // holds one must still show it.
+            (false, "q", SidebarFilter::All, true),
+            (false, "", SidebarFilter::PullRequests, true),
+        ] {
+            let state = SidebarState {
+                controls_expanded,
+                query: query.into(),
+                filter,
+                ..SidebarState::default()
+            };
+            assert_eq!(
+                search_toggle_lit(&state),
+                lit,
+                "controls={controls_expanded} query={query:?} filter={filter:?}"
+            );
+        }
+    }
+
+    #[test]
     fn filtering_matches_descendants_and_attention_state() {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
@@ -12097,6 +12378,7 @@ pub(crate) mod tests {
             detail: "Running git".into(),
             phase: WorktreeOperationPhase::Working,
             cancellable: true,
+            reopenable: false,
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
@@ -12206,6 +12488,7 @@ pub(crate) mod tests {
             detail: "Cancelled before git ran".into(),
             phase: WorktreeOperationPhase::Failed,
             cancellable: false,
+            reopenable: false,
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
@@ -12220,6 +12503,41 @@ pub(crate) mod tests {
                 "compact {compact}: a finished operation still offers cancel: {actions:?}"
             );
         }
+    }
+
+    /// A failure this session started keeps its input: the row reopens it in
+    /// the dialog to edit, or runs it again, beside dismissing it (#499).
+    #[test]
+    fn a_reopenable_failed_worktree_operation_offers_edit_and_retry() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        let operation = crate::model::OperationId::new();
+        entry.operations.push(WorktreeOperationRow {
+            id: operation,
+            label: "review".into(),
+            detail: "destination already exists".into(),
+            phase: WorktreeOperationPhase::Failed,
+            cancellable: false,
+            reopenable: true,
+        });
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false));
+        for action in [
+            SidebarAction::EditWorktreeOperation(operation),
+            SidebarAction::RetryWorktreeOperation(operation),
+            SidebarAction::DismissWorktreeOperation(operation),
+        ] {
+            assert!(actions.contains(&action), "{action:?} missing: {actions:?}");
+        }
+        let behind_a_dialog = frame_enter_presses(&renderer, body(&model, &state, false, true));
+        assert!(
+            !behind_a_dialog.iter().any(|action| matches!(
+                action,
+                SidebarAction::EditWorktreeOperation(_) | SidebarAction::RetryWorktreeOperation(_)
+            )),
+            "{behind_a_dialog:?}"
+        );
     }
 
     #[test]
@@ -12287,20 +12605,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compact_search_applies_only_while_reachable_and_pr_filter_remains_available() {
+    fn compact_search_and_pr_filter_apply_while_the_popover_is_open() {
         let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
         let mut state = SidebarState::default();
-        state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
         state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
         assert_eq!(
             filtered_projects(&model, &state, true)[0].worktrees.len(),
             1
         );
-        state.apply(&SidebarAction::ToggleControls);
-        assert_eq!(
-            filtered_projects(&model, &state, true)[0].worktrees.len(),
-            2
-        );
+        state.apply(&SidebarAction::SearchChanged(String::new()));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
         let filtered = filtered_projects(&model, &state, true);
         assert_eq!(
@@ -12308,6 +12622,12 @@ pub(crate) mod tests {
             Some("fix-sidebar")
         );
         assert_eq!(filtered[0].worktrees.len(), 1);
+        // Dismissing the popover ends both.
+        state.apply(&SidebarAction::ToggleControls);
+        assert_eq!(
+            filtered_projects(&model, &state, true)[0].worktrees.len(),
+            2
+        );
     }
 
     #[test]

@@ -224,7 +224,15 @@ impl LinkOpenGesture {
 /// the arrow keys, and binding one must not cost the other. Every chord in the
 /// table, across all actions, must be distinct, and a chord bound here is also
 /// reserved - the workspace consumes it instead of forwarding it to the
-/// process inside a card.
+/// process inside a card, except where the action's scope leaves it to a
+/// focused terminal (see `workspace_widget::ShortcutScope`).
+///
+/// The defaults are chords a shell, an editor, or an agent CLI has no use for,
+/// the ones terminal emulators bind for the same actions: `Ctrl+Shift` plus a
+/// letter, and `Ctrl+PageUp`/`Ctrl+PageDown` between columns. A default that
+/// changes bumps [`SHORTCUT_DEFAULTS_REVISION`] and records the chords it
+/// replaces in [`RETIRED_SHORTCUT_DEFAULTS`], so a file still holding them
+/// moves to the new ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyboardShortcuts {
@@ -250,14 +258,16 @@ pub struct KeyboardShortcuts {
 impl Default for KeyboardShortcuts {
     fn default() -> Self {
         Self {
-            new_terminal: vec!["Ctrl+T".to_owned()],
-            new_channel: vec!["Alt+G".to_owned()],
-            clone_pane: vec!["Alt+E".to_owned()],
-            close_focused_column: vec!["Ctrl+W".to_owned()],
+            new_terminal: vec!["Ctrl+Shift+T".to_owned()],
+            new_channel: vec!["Ctrl+Shift+G".to_owned()],
+            clone_pane: vec!["Ctrl+Shift+D".to_owned()],
+            close_focused_column: vec!["Ctrl+Shift+W".to_owned()],
+            // A focused terminal receives this chord as forward-char; every
+            // other pane takes it as its search (see `ShortcutScope`).
             search_projects: vec!["Ctrl+F".to_owned()],
-            previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
-            next_column: vec!["Alt+W".to_owned(), "Alt+Right".to_owned()],
-            cycle_pane_width: vec!["Alt+R".to_owned()],
+            previous_column: vec!["Ctrl+PageUp".to_owned()],
+            next_column: vec!["Ctrl+PageDown".to_owned()],
+            cycle_pane_width: vec!["Ctrl+Shift+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned()],
             review_toggle_viewed: vec!["Alt+V".to_owned()],
@@ -367,10 +377,10 @@ struct ShortcutFault {
 /// Why a chord must not be bound, or `None` when binding it is safe.
 ///
 /// A bound chord is also a reserved one: the card widget captures it and never
-/// forwards it to the process inside the card. That is the point for `Ctrl+W`,
-/// but the control characters that carry a signal or end input are how a user
-/// stops a runaway program, and a card that swallows them offers no clue that
-/// it is doing so.
+/// forwards it to the process inside the card. That is the point for
+/// `Ctrl+Shift+W`, but the control characters that carry a signal or end
+/// input are how a user stops a runaway program, and a card that swallows
+/// them offers no clue that it is doing so.
 fn withheld_from_the_card(binding: ShortcutBinding) -> Option<&'static str> {
     if !binding.control || binding.alt || binding.shift || binding.logo {
         // Only the bare `Ctrl` chord reaches a child as a control character.
@@ -424,6 +434,8 @@ pub enum ShortcutKey {
     ArrowUp,
     ArrowDown,
     Tab,
+    PageUp,
+    PageDown,
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
@@ -463,6 +475,10 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowDown)
             } else if token.eq_ignore_ascii_case("tab") {
                 Some(ShortcutKey::Tab)
+            } else if token.eq_ignore_ascii_case("pageup") {
+                Some(ShortcutKey::PageUp)
+            } else if token.eq_ignore_ascii_case("pagedown") {
+                Some(ShortcutKey::PageDown)
             } else {
                 let mut characters = token.chars();
                 match (characters.next(), characters.next()) {
@@ -471,7 +487,7 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be A-Z, 0-9, Left, Right, Up, Down, or Tab",
+                            "keyboard shortcut key must be A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown",
                         );
                     }
                 }
@@ -528,6 +544,10 @@ const fn default_show_status_bar() -> bool {
 
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
+}
+
+const fn default_shortcut_defaults_revision() -> u32 {
+    SHORTCUT_DEFAULTS_REVISION
 }
 
 /// Main stays first; imported worktrees without creation evidence sort by path.
@@ -712,6 +732,13 @@ pub struct AppSettings {
     /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,
+    /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
+    /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
+    /// without it is read as revision 1, and loading records the revision it
+    /// was upgraded to, so a chord chosen afterwards is never taken for an
+    /// old default again. A newer build's revision is kept as it is.
+    #[serde(default = "default_shortcut_defaults_revision")]
+    pub shortcut_defaults_revision: u32,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -766,6 +793,7 @@ impl Default for AppSettings {
             chat_enter_sends: default_chat_enter_sends(),
             show_status_bar: default_show_status_bar(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
+            shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
@@ -922,21 +950,239 @@ struct V2TomlSettings {
     keyboard_shortcuts: KeyboardShortcuts,
 }
 
-fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str, default: &str) {
+/// The revision of the built-in shortcut defaults this build writes.
+///
+/// A file records the revision its shortcut table was last upgraded to as
+/// `shortcut_defaults_revision`; one without it predates the first change of
+/// defaults and is at revision 1. Loading a file at an older revision moves
+/// every action still bound to that revision's default onto this build's.
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 2;
+
+/// The first revision, and the one a file without a recorded revision is at.
+const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
+
+/// A built-in default that a later revision replaced.
+struct RetiredShortcutDefault {
+    /// The serialized action name.
+    action: &'static str,
+    /// The first revision whose default is no longer `chords`.
+    retired_in: u32,
+    chords: &'static [&'static str],
+}
+
+/// Every default a revision replaced, oldest revision first.
+///
+/// Revision 2 moved the workspace chords off keys a shell already uses:
+/// `Ctrl+W` deleted a word in readline and fish but closed the pane, and
+/// `Ctrl+T` and the `Alt` letters and arrows are readline, fish, vim, and
+/// agent CLI keys. `search_projects` kept `Ctrl+F`; a focused terminal now
+/// receives it instead.
+const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
+    RetiredShortcutDefault {
+        action: "new_terminal",
+        retired_in: 2,
+        chords: &["Ctrl+T"],
+    },
+    RetiredShortcutDefault {
+        action: "new_channel",
+        retired_in: 2,
+        chords: &["Alt+G"],
+    },
+    RetiredShortcutDefault {
+        action: "clone_pane",
+        retired_in: 2,
+        chords: &["Alt+E"],
+    },
+    RetiredShortcutDefault {
+        action: "close_focused_column",
+        retired_in: 2,
+        chords: &["Ctrl+W"],
+    },
+    RetiredShortcutDefault {
+        action: "previous_column",
+        retired_in: 2,
+        chords: &["Alt+Q", "Alt+Left"],
+    },
+    RetiredShortcutDefault {
+        action: "next_column",
+        retired_in: 2,
+        chords: &["Alt+W", "Alt+Right"],
+    },
+    RetiredShortcutDefault {
+        action: "cycle_pane_width",
+        retired_in: 2,
+        chords: &["Alt+R"],
+    },
+];
+
+/// Column navigation's defaults while each action took a single chord, before
+/// the arrow chords joined them. Only a version-2 file can hold these.
+const SINGLE_CHORD_DEFAULTS: [(&str, &[&str]); 2] =
+    [("previous_column", &["Alt+Q"]), ("next_column", &["Alt+W"])];
+
+/// The default `action` had at `revision`, when a later revision replaced it.
+fn retired_default(action: &str, revision: u32) -> Option<&'static [&'static str]> {
+    RETIRED_SHORTCUT_DEFAULTS
+        .iter()
+        .find(|retired| retired.action == action && retired.retired_in > revision)
+        .map(|retired| retired.chords)
+}
+
+/// This build's default chords for the serialized `action`.
+fn default_chords(action: &str) -> Vec<String> {
+    let defaults = KeyboardShortcuts::default();
+    SHORTCUT_ACTIONS
+        .iter()
+        .position(|name| *name == action)
+        .map(|index| defaults.actions()[index].clone())
+        .unwrap_or_default()
+}
+
+/// The chords of a shortcut table entry, parsed; `None` when the entry is not
+/// a list of chords this build reads.
+fn parsed_chords(value: &toml::Value) -> Option<Vec<ShortcutBinding>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|chord| parse_shortcut(chord.as_str()?).ok())
+        .collect()
+}
+
+/// Every chord the table binds, other than those of the `excluded` actions.
+fn bound_chords(shortcuts: &toml::Table, excluded: &[&str]) -> Vec<ShortcutBinding> {
+    shortcuts
+        .iter()
+        .filter(|(action, _)| !excluded.contains(&action.as_str()))
+        .filter_map(|(_, chords)| chords.as_array())
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .collect()
+}
+
+/// Of `chords`, those that are not in `bound`.
+fn free_defaults(chords: Vec<String>, bound: &[ShortcutBinding]) -> Vec<String> {
+    chords
+        .into_iter()
+        .filter(|chord| parse_shortcut(chord).is_ok_and(|binding| !bound.contains(&binding)))
+        .collect()
+}
+
+/// Moves every action a table at `revision` still binds to that revision's
+/// default onto this build's default.
+///
+/// Only an action whose chords are exactly the old default, or one of the
+/// `also_retired` chord sets the caller knows its table held by default,
+/// moves, compared as parsed chords in any order; one a user changed,
+/// extended, or emptied stays as it is. A new chord another action already
+/// binds is not taken from it; an action whose new chords are all taken keeps
+/// what it had, which may in turn keep another action from a chord it would
+/// have moved to.
+///
+/// An action the table lacks was on its default too, and the user chose the
+/// table's chords around it, so it takes part as if it held its old default.
+/// One introduced after the table was written never had one; it is left to
+/// `preserve_existing_shortcut`.
+fn adopt_shortcut_defaults(
+    shortcuts: &mut toml::Table,
+    revision: u32,
+    also_retired: &[(&str, &[&str])],
+) {
+    let parse = |chords: &[&str]| -> Vec<ShortcutBinding> {
+        chords
+            .iter()
+            .map(|chord| parse_shortcut(chord).expect("retired defaults parse"))
+            .collect()
+    };
+    let same = |left: &[ShortcutBinding], right: &[ShortcutBinding]| {
+        left.len() == right.len()
+            && left.iter().all(|chord| right.contains(chord))
+            && right.iter().all(|chord| left.contains(chord))
+    };
+    let mut implied = Vec::new();
+    for action in SHORTCUT_ACTIONS {
+        if !shortcuts.contains_key(action)
+            && !INTRODUCED_SHORTCUT_ACTIONS.contains(&action)
+            && let Some(retired) = retired_default(action, revision)
+        {
+            shortcuts.insert(action.into(), retired.to_vec().into());
+            implied.push(action);
+        }
+    }
+    let mut moving: Vec<&str> = SHORTCUT_ACTIONS
+        .into_iter()
+        .filter(|action| {
+            let Some(chords) = shortcuts.get(*action).and_then(parsed_chords) else {
+                return false;
+            };
+            retired_default(action, revision)
+                .into_iter()
+                .chain(
+                    also_retired
+                        .iter()
+                        .filter(|(name, _)| name == action)
+                        .map(|(_, retired)| *retired),
+                )
+                .any(|retired| same(&chords, &parse(retired)))
+        })
+        .collect();
+    let adopted = loop {
+        let bound = bound_chords(shortcuts, &moving);
+        let (adopted, stuck): (Vec<_>, Vec<_>) = moving
+            .iter()
+            .map(|action| (*action, free_defaults(default_chords(action), &bound)))
+            .partition(|(_, chords)| !chords.is_empty());
+        if stuck.is_empty() {
+            break adopted;
+        }
+        moving.retain(|action| !stuck.iter().any(|(stuck, _)| stuck == action));
+    };
+    for (action, chords) in adopted {
+        if implied.contains(&action) && chords == default_chords(action) {
+            // Absent, it reads as that default anyway; the file stays as
+            // sparse as it was.
+            shortcuts.remove(action);
+        } else {
+            shortcuts.insert(action.into(), chords.into());
+        }
+    }
+}
+
+/// Gives an action a table lacks, one introduced after the table was written,
+/// the default chords no other action in it binds. One whose defaults are all
+/// taken stays unbound rather than steal a user's chord or invalidate the
+/// table; an empty list says so, and is written, so that it still holds once
+/// the chord is free.
+fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
     if shortcuts.contains_key(action) {
         return;
     }
-    let reserved = parse_shortcut(default).expect("built-in shortcut");
-    let occupied = shortcuts
-        .values()
-        .filter_map(toml::Value::as_array)
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .any(|chord| parse_shortcut(chord).is_ok_and(|binding| binding == reserved));
-    if occupied {
-        // A new default must not invalidate or steal an existing custom chord.
-        // Leave only this newly introduced action unbound until configured.
-        shortcuts.insert(action.into(), toml::Value::Array(Vec::new()));
+    let defaults = default_chords(action);
+    let free = free_defaults(defaults.clone(), &bound_chords(shortcuts, &[]));
+    if free != defaults {
+        shortcuts.insert(action.into(), free.into());
+    }
+}
+
+/// The actions added after the shortcut table was introduced, each of which
+/// an older table may lack.
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 11] = [
+    "cycle_pane_width",
+    "new_channel",
+    "clone_pane",
+    "previous_workspace",
+    "next_workspace",
+    "review_toggle_viewed",
+    "review_next_file",
+    "review_previous_file",
+    "review_next_unviewed",
+    "review_next_change",
+    "review_previous_change",
+];
+
+fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
+    for action in INTRODUCED_SHORTCUT_ACTIONS {
+        preserve_existing_shortcut(shortcuts, action);
     }
 }
 
@@ -955,23 +1201,15 @@ fn adopt_legacy_channel_shortcut(shortcuts: &mut toml::Table) {
     }
 }
 
+/// Decodes a current-schema shortcut table, which `normalize_current` has
+/// already brought up to this build's defaults revision.
 fn deserialize_keyboard_shortcuts<'de, D>(deserializer: D) -> Result<KeyboardShortcuts, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
     adopt_legacy_channel_shortcut(&mut shortcuts);
-    preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
-    preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
-    preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
-    preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
-    preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
-    preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_unviewed", "Alt+Shift+Down");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_change", "Alt+J");
-    preserve_existing_shortcut(&mut shortcuts, "review_previous_change", "Alt+K");
+    preserve_introduced_shortcuts(&mut shortcuts);
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -983,22 +1221,29 @@ where
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
     adopt_legacy_channel_shortcut(&mut shortcuts);
+    let scalar: Vec<String> = shortcuts
+        .iter()
+        .filter(|(_, binding)| binding.is_str())
+        .map(|(action, _)| action.clone())
+        .collect();
     for (_, binding) in &mut shortcuts {
         if let toml::Value::String(chord) = binding {
             *binding = toml::Value::Array(vec![toml::Value::String(std::mem::take(chord))]);
         }
     }
-    preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
-    preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
-    preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
-    preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
-    preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
-    preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_unviewed", "Alt+Shift+Down");
-    preserve_existing_shortcut(&mut shortcuts, "review_next_change", "Alt+J");
-    preserve_existing_shortcut(&mut shortcuts, "review_previous_change", "Alt+K");
+    // A version-2 file predates every change of defaults. One that spells a
+    // shortcut as a single string predates chord lists as well, when column
+    // navigation had no arrow chord beside its letter; a list with the letter
+    // alone was chosen, since lists shipped with both.
+    adopt_shortcut_defaults(
+        &mut shortcuts,
+        FIRST_SHORTCUT_DEFAULTS_REVISION,
+        &SINGLE_CHORD_DEFAULTS
+            .into_iter()
+            .filter(|(action, _)| scalar.iter().any(|name| name == action))
+            .collect::<Vec<_>>(),
+    );
+    preserve_introduced_shortcuts(&mut shortcuts);
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -1490,14 +1735,34 @@ fn load_toml(path: &Path) -> Result<Loaded, SettingsError> {
     Ok(Loaded::complete(settings.validate()?))
 }
 
-/// Renames the short-lived scroll-speed key from the first implementation of
-/// the preference. Its value represented lines per wheel notch, so it is the
-/// same setting; the old default of one is promoted to the new default of two.
+/// Brings a current-schema document up to what this build reads: moves the
+/// pre-rename channel shortcut, upgrades a shortcut table written against
+/// older defaults (see [`adopt_shortcut_defaults`]), and renames the
+/// short-lived scroll-speed key from the first implementation of that
+/// preference. Its value represented lines per wheel notch, so it is the same
+/// setting; the old default of one is promoted to the new default of two.
 fn normalize_current(table: &mut toml::Table) {
     // Decoding moves it too; moving it first lets a setting set aside or
     // kept be found under the name this build writes.
     if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
         adopt_legacy_channel_shortcut(shortcuts);
+    }
+    // A revision that is not a number this build reads is set aside by
+    // decoding, like any unreadable value, and the table left as it is.
+    let revision = match table.get("shortcut_defaults_revision") {
+        None => Some(FIRST_SHORTCUT_DEFAULTS_REVISION),
+        Some(value) => value
+            .as_integer()
+            .and_then(|revision| u32::try_from(revision).ok()),
+    };
+    if let Some(revision) = revision.filter(|revision| *revision < SHORTCUT_DEFAULTS_REVISION) {
+        if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
+            adopt_shortcut_defaults(shortcuts, revision, &[]);
+        }
+        table.insert(
+            "shortcut_defaults_revision".to_owned(),
+            i64::from(SHORTCUT_DEFAULTS_REVISION).into(),
+        );
     }
     if !table.contains_key("terminal_scroll_size")
         && matches!(
@@ -2711,6 +2976,13 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.terminal_font_size, 15.0);
         assert_eq!(migrated.default_column_fraction, 0.72);
         assert!(migrated.focus_follows_mouse);
+        // Every shortcut the file held was a default then, so each takes
+        // today's default.
+        assert_eq!(migrated.keyboard_shortcuts, KeyboardShortcuts::default());
+        assert_eq!(
+            migrated.shortcut_defaults_revision,
+            SHORTCUT_DEFAULTS_REVISION
+        );
     }
 
     #[test]
@@ -2734,24 +3006,26 @@ next_column = ["Alt+W", "Alt+Right"]
         .unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert_eq!(migrated.keyboard_shortcuts.new_channel, ["Alt+G"]);
-        assert_eq!(migrated.keyboard_shortcuts.clone_pane, ["Alt+E"]);
-        assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Alt+Q"]);
-        assert_eq!(
-            migrated.keyboard_shortcuts.next_column,
-            ["Alt+W", "Alt+Right"]
-        );
+        assert_eq!(migrated.keyboard_shortcuts.new_channel, ["Ctrl+Shift+G"]);
+        assert_eq!(migrated.keyboard_shortcuts.clone_pane, ["Ctrl+Shift+D"]);
+        // A single-string Alt+Q was the default then, and the list was the
+        // default later; both move.
+        assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Ctrl+PageUp"]);
+        assert_eq!(migrated.keyboard_shortcuts.next_column, ["Ctrl+PageDown"]);
         assert!(migrated.editor_auto_save);
-        assert_eq!(migrated.keyboard_shortcuts.cycle_pane_width, ["Alt+R"]);
+        assert_eq!(
+            migrated.keyboard_shortcuts.cycle_pane_width,
+            ["Ctrl+Shift+R"]
+        );
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
     }
 
     #[test]
-    fn introducing_pane_cycling_preserves_an_existing_alt_r_binding() {
+    fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        for (version, binding) in [(2, "\"Alt+R\""), (3, "[\"Alt+R\"]")] {
+        for (version, binding) in [(2, "\"Ctrl+Shift+R\""), (3, "[\"Ctrl+Shift+R\"]")] {
             let inspector = if version == 3 {
                 "inspector_width = 380.0\n"
             } else {
@@ -2759,10 +3033,221 @@ next_column = ["Alt+W", "Alt+Right"]
             };
             fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {binding}\n")).unwrap();
             let migrated = load(&path).unwrap();
-            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+R"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+R"]);
             assert!(migrated.keyboard_shortcuts.cycle_pane_width.is_empty());
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
+        }
+    }
+
+    /// A current-schema document as a build before shortcut defaults
+    /// revision 2 wrote it: every action on its default of the time, and no
+    /// recorded revision.
+    fn revision_one_document(path: &Path, extend: impl FnOnce(&mut toml::Table)) {
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        document.remove("shortcut_defaults_revision");
+        let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+        for retired in RETIRED_SHORTCUT_DEFAULTS {
+            shortcuts.insert(retired.action.into(), retired.chords.to_vec().into());
+        }
+        extend(shortcuts);
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shortcuts_on_retired_defaults_move_to_the_current_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_document(&path, |_| {});
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, AppSettings::default());
+
+        // Saving anything records the upgrade in the file.
+        let desired = AppSettings {
+            max_hot_cards: loaded.max_hot_cards + 1,
+            ..loaded.clone()
+        };
+        save_merged(&path, &loaded, &desired).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["shortcut_defaults_revision"],
+            i64::from(SHORTCUT_DEFAULTS_REVISION).into()
+        );
+        assert_eq!(
+            file["keyboard_shortcuts"]["close_focused_column"],
+            vec!["Ctrl+Shift+W"].into()
+        );
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    #[test]
+    fn a_shortcut_the_user_chose_survives_the_move_to_new_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_document(&path, |shortcuts| {
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+Alt+T"].into());
+            // A subset of the old default is a choice, not the default.
+            shortcuts.insert("next_column".into(), vec!["Alt+W"].into());
+            shortcuts.insert("cycle_pane_width".into(), Vec::<String>::new().into());
+            // The old default in another order or spelling is still it.
+            shortcuts.insert("previous_column".into(), vec!["alt+left", "Alt+q"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Ctrl+Alt+T"]);
+        assert_eq!(shortcuts.next_column, ["Alt+W"]);
+        assert!(shortcuts.cycle_pane_width.is_empty());
+        assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
+
+        // Once upgraded, an old default chosen again is a choice too.
+        let mut desired = loaded.clone();
+        desired.keyboard_shortcuts.close_focused_column = vec!["Ctrl+W".into()];
+        save_merged(&path, &loaded, &desired).unwrap();
+        assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    #[test]
+    fn a_new_default_another_action_already_binds_is_not_taken() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_document(&path, |shortcuts| {
+            shortcuts.insert("clone_pane".into(), vec!["Ctrl+Shift+W"].into());
+            shortcuts.insert("review_toggle_viewed".into(), vec!["Ctrl+PageDown"].into());
+        });
+        let loaded = load(&path).unwrap();
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+W"]);
+        assert_eq!(
+            shortcuts.close_focused_column,
+            ["Ctrl+W"],
+            "kept, not stolen"
+        );
+        assert_eq!(shortcuts.review_toggle_viewed, ["Ctrl+PageDown"]);
+        assert_eq!(shortcuts.next_column, ["Alt+W", "Alt+Right"]);
+        // The rest move.
+        assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
+        assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
+        save(&path, &loaded).unwrap();
+        assert_eq!(load(&path).unwrap(), loaded);
+    }
+
+    #[test]
+    fn a_version_two_file_on_old_defaults_moves_to_the_current_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        fs::write(
+            &path,
+            r#"schema_version = 2
+max_hot_cards = 6
+hibernation_delay_ms = 30000
+terminal_font_size = 14.0
+sidebar_width = 280.0
+default_column_fraction = 0.5
+[keyboard_shortcuts]
+new_terminal = "Ctrl+T"
+close_focused_column = "Ctrl+W"
+search_projects = "Ctrl+F"
+previous_column = "Alt+Q"
+next_column = ["Alt+W"]
+new_thread = "Alt+Shift+G"
+"#,
+        )
+        .unwrap();
+        let shortcuts = load(&path).unwrap().keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
+        assert_eq!(shortcuts.search_projects, ["Ctrl+F"]);
+        // A single string predates chord lists, when Alt+Q alone was the
+        // default; a list holding it alone was a choice, since lists shipped
+        // with the arrow chord beside it.
+        assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
+        assert_eq!(shortcuts.next_column, ["Alt+W"]);
+        assert_eq!(shortcuts.new_channel, ["Alt+Shift+G"]);
+        assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+D"]);
+    }
+
+    /// A table that leaves an action out had it on its old default, and a
+    /// chord chosen around that default must not collide with the new one.
+    #[test]
+    fn an_action_an_old_table_leaves_out_takes_part_in_the_move() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (version, chord) in [(2, "\"Ctrl+Shift+W\""), (3, "[\"Ctrl+Shift+W\"]")] {
+            let inspector = if version == 3 {
+                "inspector_width = 380.0\n"
+            } else {
+                ""
+            };
+            fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.5\n{inspector}[keyboard_shortcuts]\nnew_channel = {chord}\n")).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.set_aside().count(), 0, "version {version}");
+            let shortcuts = &loaded.settings.keyboard_shortcuts;
+            assert_eq!(shortcuts.new_channel, ["Ctrl+Shift+W"]);
+            assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
+            assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
+            save(&path, &loaded.settings).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded.settings);
+        }
+
+        // An action that moves cleanly stays out of a sparse table.
+        fs::write(
+            &path,
+            "schema_version = 3\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ninspector_width = 380.0\ndefault_column_fraction = 0.5\n[keyboard_shortcuts]\nsearch_projects = [\"Alt+S\"]\n",
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.keyboard_shortcuts,
+            KeyboardShortcuts {
+                search_projects: vec!["Alt+S".into()],
+                ..KeyboardShortcuts::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_newer_shortcut_defaults_revision_is_left_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_document(&path, |_| {});
+        let mut document = saved(&path);
+        document.insert(
+            "shortcut_defaults_revision".into(),
+            i64::from(SHORTCUT_DEFAULTS_REVISION + 1).into(),
+        );
+        fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.shortcut_defaults_revision,
+            SHORTCUT_DEFAULTS_REVISION + 1
+        );
+        assert_eq!(loaded.keyboard_shortcuts.close_focused_column, ["Ctrl+W"]);
+        save(&path, &loaded).unwrap();
+        assert_eq!(
+            saved(&path)["shortcut_defaults_revision"],
+            i64::from(SHORTCUT_DEFAULTS_REVISION + 1).into()
+        );
+    }
+
+    #[test]
+    fn every_retired_default_names_an_action_and_parses() {
+        for retired in RETIRED_SHORTCUT_DEFAULTS {
+            assert!(
+                SHORTCUT_ACTIONS.contains(&retired.action),
+                "{}",
+                retired.action
+            );
+            assert!(retired.retired_in <= SHORTCUT_DEFAULTS_REVISION);
+            assert_ne!(
+                default_chords(retired.action),
+                retired.chords,
+                "{} did not change",
+                retired.action
+            );
+            for chord in retired.chords {
+                parse_shortcut(chord).unwrap();
+            }
         }
     }
 
@@ -2775,17 +3260,17 @@ next_column = ["Alt+W", "Alt+Right"]
         shortcuts.remove("new_channel");
         shortcuts.insert(
             "new_terminal".into(),
-            toml::Value::Array(vec![toml::Value::String("Alt+g".into())]),
+            toml::Value::Array(vec![toml::Value::String("Ctrl+Shift+g".into())]),
         );
         fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
         let migrated = load(&path).unwrap();
-        assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+g"]);
+        assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+g"]);
         assert!(migrated.keyboard_shortcuts.new_channel.is_empty());
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
 
         let mut conflicting = migrated;
-        conflicting.keyboard_shortcuts.new_channel = vec!["Alt+G".into()];
+        conflicting.keyboard_shortcuts.new_channel = vec!["Ctrl+Shift+G".into()];
         assert!(matches!(
             conflicting.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -2797,8 +3282,8 @@ next_column = ["Alt+W", "Alt+Right"]
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         for (version, terminal, channel) in [
-            (2, "\"Alt+e\"", "\"Ctrl+Shift+T\""),
-            (3, "[\"Alt+e\"]", "[\"Ctrl+Shift+T\"]"),
+            (2, "\"Ctrl+Shift+d\"", "\"Ctrl+Shift+T\""),
+            (3, "[\"Ctrl+Shift+d\"]", "[\"Ctrl+Shift+T\"]"),
         ] {
             let inspector = if version == 3 {
                 "inspector_width = 380.0\n"
@@ -2810,14 +3295,14 @@ next_column = ["Alt+W", "Alt+Right"]
             // the current schema version as well as at version 2.
             fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {terminal}\nnew_thread = {channel}\n")).unwrap();
             let migrated = load(&path).unwrap();
-            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+e"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+d"]);
             assert_eq!(migrated.keyboard_shortcuts.new_channel, ["Ctrl+Shift+T"]);
             assert!(migrated.keyboard_shortcuts.clone_pane.is_empty());
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
 
             let mut conflicting = migrated;
-            conflicting.keyboard_shortcuts.clone_pane = vec!["Alt+E".into()];
+            conflicting.keyboard_shortcuts.clone_pane = vec!["Ctrl+Shift+D".into()];
             assert!(matches!(
                 conflicting.validate(),
                 Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -2830,7 +3315,7 @@ next_column = ["Alt+W", "Alt+Right"]
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         for (clone_pane, new_channel) in [
-            (vec!["Alt+Shift+E".into()], vec!["Ctrl+Shift+T".into()]),
+            (vec!["Alt+Shift+E".into()], vec!["Ctrl+Shift+N".into()]),
             (Vec::new(), Vec::new()),
         ] {
             let mut settings = AppSettings::default();
@@ -2895,6 +3380,22 @@ next_column = ["Alt+W", "Alt+Right"]
         assert!(parse_shortcut("Tab").is_err());
         assert!(parse_shortcut("Ctrl+Alt+Left").is_ok());
         assert!(parse_shortcut("Ctrl+NotAKey").is_err());
+        assert_eq!(
+            parse_shortcut("ctrl+pageup").unwrap(),
+            ShortcutBinding {
+                control: true,
+                alt: false,
+                shift: false,
+                logo: false,
+                key: ShortcutKey::PageUp,
+            }
+        );
+        assert_eq!(
+            parse_shortcut("Ctrl+Shift+PageDown").unwrap().key,
+            ShortcutKey::PageDown
+        );
+        // Shift+PageUp scrolls a terminal's own scrollback.
+        assert!(parse_shortcut("Shift+PageUp").is_err());
 
         // Conflicts are detected across actions and across every chord in an
         // action, not just the first.
@@ -2910,7 +3411,7 @@ next_column = ["Alt+W", "Alt+Right"]
         alternate_conflict
             .keyboard_shortcuts
             .new_terminal
-            .push("Alt+Left".to_owned());
+            .push("Ctrl+PageUp".to_owned());
         assert!(matches!(
             alternate_conflict.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -2924,11 +3425,6 @@ next_column = ["Alt+W", "Alt+Right"]
             Err(SettingsError::InvalidShortcut(_))
         ));
 
-        // Column navigation answers to a letter chord and an arrow, so binding
-        // one never costs the other.
-        let defaults = KeyboardShortcuts::default();
-        assert!(defaults.previous_column.iter().any(|c| c == "Alt+Left"));
-        assert!(defaults.next_column.iter().any(|c| c == "Alt+Right"));
         assert!(AppSettings::default().validate().is_ok());
     }
 
@@ -3509,7 +4005,7 @@ next_column = ["Alt+W", "Alt+Right"]
         newer_build_document(&path, |document| {
             let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
             shortcuts.insert("new_terminal".into(), vec!["Ctrl+F13"].into());
-            shortcuts.insert("search_projects".into(), vec!["Ctrl+T"].into());
+            shortcuts.insert("search_projects".into(), vec!["Ctrl+Shift+T"].into());
         });
         let original = saved(&path)["keyboard_shortcuts"].clone();
         let loaded = load(&path).unwrap();
@@ -3583,7 +4079,7 @@ next_column = ["Alt+W", "Alt+Right"]
             let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
             shortcuts.remove("search_projects");
             shortcuts.insert("new_terminal".into(), vec!["Ctrl+F"].into());
-            shortcuts.insert("future_action".into(), vec!["Ctrl+T"].into());
+            shortcuts.insert("future_action".into(), vec!["Ctrl+Shift+T"].into());
         });
         let loaded = load(&path).unwrap();
         let mut desired = loaded.clone();

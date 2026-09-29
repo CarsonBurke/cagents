@@ -9,15 +9,18 @@ use jiff::{
     tz::{AmbiguousOffset, TimeZone},
 };
 
-use crate::automations::{MISFIRE_GRACE_MS, Occurrence, Schedule};
+#[cfg(feature = "host")]
+use crate::automations::MISFIRE_GRACE_MS;
+use crate::automations::{Occurrence, Schedule};
 
-pub(super) struct Compiled {
+pub struct Compiled {
     cron: Cron,
     timezone: TimeZone,
 }
 
+#[cfg(feature = "host")]
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Due {
+pub struct Due {
     pub fire: Option<Occurrence>,
     pub next: Occurrence,
     /// At least one older due occurrence was omitted. A single history entry
@@ -75,6 +78,7 @@ impl Compiled {
         Err("Schedule exceeded the bounded timezone-transition search".into())
     }
 
+    #[cfg(feature = "host")]
     /// At most one catch-up firing: the latest due minute inside the grace
     /// window. Looking only inside that window bounds work after long downtime.
     pub fn due(&self, persisted: &Occurrence, now_ms: u64) -> Result<Due, String> {
@@ -113,6 +117,53 @@ fn timestamp(milliseconds: u64) -> Result<Timestamp, String> {
         i64::try_from(milliseconds).map_err(|_| "Clock is outside the supported range")?,
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "ui")]
+/// The system's IANA timezone, which a new schedule starts in. A system
+/// configured without one, or with only a fixed offset, has no name to save.
+pub fn system_timezone() -> Option<String> {
+    TimeZone::system().iana_name().map(str::to_owned)
+}
+
+#[cfg(feature = "ui")]
+/// Every IANA timezone name the database knows, in its own order.
+pub fn timezones() -> Vec<String> {
+    jiff::tz::db()
+        .available()
+        .map(|name| name.as_str().to_owned())
+        .collect()
+}
+
+#[cfg(feature = "ui")]
+/// When `schedule` next runs after `now_ms`, in its own timezone, followed by
+/// the same instant in `reader`'s timezone where that zone differs.
+pub fn describe_next(
+    schedule: &Schedule,
+    now_ms: u64,
+    reader: &TimeZone,
+) -> Result<String, String> {
+    let compiled = Compiled::new(schedule)?;
+    let instant = timestamp(compiled.next_after(now_ms)?.due_ms)?;
+    let there = instant.to_zoned(compiled.timezone.clone());
+    let mut text = format!(
+        "{} {}",
+        there.strftime("%a %b %-d, %H:%M"),
+        schedule.timezone
+    );
+    let here = instant.to_zoned(reader.clone());
+    if reader.iana_name() != Some(schedule.timezone.as_str()) && here.offset() != there.offset() {
+        let day = if here.date() == there.date() {
+            ""
+        } else {
+            "%a "
+        };
+        text.push_str(&format!(
+            " ({} your time)",
+            here.strftime(&format!("{day}%H:%M"))
+        ));
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -171,6 +222,43 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ui")]
+    #[test]
+    fn next_run_reads_in_the_schedule_zone_and_the_readers() {
+        let schedule = Schedule {
+            pattern: SchedulePattern::Weekdays { hour: 9, minute: 0 },
+            timezone: "America/Vancouver".into(),
+        };
+        // Saturday 2026-09-26 in Vancouver: the next weekday run is Monday.
+        let now = ms("2026-09-26T19:00:00Z");
+        let vancouver = jiff::tz::db().get("America/Vancouver").unwrap();
+        assert_eq!(
+            describe_next(&schedule, now, &vancouver).unwrap(),
+            "Mon Sep 28, 09:00 America/Vancouver"
+        );
+        let berlin = jiff::tz::db().get("Europe/Berlin").unwrap();
+        assert_eq!(
+            describe_next(&schedule, now, &berlin).unwrap(),
+            "Mon Sep 28, 09:00 America/Vancouver (18:00 your time)"
+        );
+        let tokyo = jiff::tz::db().get("Asia/Tokyo").unwrap();
+        assert_eq!(
+            describe_next(&schedule, now, &tokyo).unwrap(),
+            "Mon Sep 28, 09:00 America/Vancouver (Tue 01:00 your time)"
+        );
+        let unknown = Schedule {
+            timezone: "Mars/Olympus".into(),
+            ..schedule
+        };
+        assert!(
+            describe_next(&unknown, now, &berlin)
+                .unwrap_err()
+                .contains("Mars/Olympus")
+        );
+        assert!(timezones().iter().any(|name| name == "America/Vancouver"));
+    }
+
+    #[cfg(feature = "host")]
     #[test]
     fn long_downtime_catches_up_only_latest_due_minute() {
         let schedule = cron("* * * * *", "UTC");
@@ -181,6 +269,7 @@ mod tests {
         assert_eq!(due.next.local, "2026-09-26T12:35");
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn clock_rollback_does_not_reopen_persisted_future_occurrence() {
         let schedule = cron("0 * * * *", "UTC");
