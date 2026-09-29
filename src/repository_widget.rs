@@ -314,6 +314,36 @@ pub enum LspIntent {
 }
 
 #[derive(Debug, Clone)]
+pub enum EditorLspAction {
+    Complete,
+    CompleteAt {
+        doc: LspDocumentId,
+        version: i32,
+        at: LspPosition,
+    },
+    Hover(Option<LspPosition>),
+    Definition(Option<LspPosition>),
+    References,
+    Diagnostics,
+    Choose {
+        index: usize,
+        label: String,
+    },
+    Next(bool),
+    Dismiss,
+}
+
+#[derive(Default)]
+struct EditorLanguageState {
+    diagnostics: Vec<crate::lsp::LspDiagnostic>,
+    marks: Vec<text_editor::Diagnostic>,
+    completions: Vec<LspCompletionItem>,
+    selected: usize,
+    hover: Vec<markdown::Item>,
+    hover_at: Option<text_editor::Position>,
+}
+
+#[derive(Debug, Clone)]
 pub enum RepositoryAction {
     Review {
         card: CardId,
@@ -447,6 +477,10 @@ pub enum RepositoryAction {
         card: CardId,
         action: text_editor::Action,
     },
+    Language {
+        card: CardId,
+        action: EditorLspAction,
+    },
     Clipboard {
         card: CardId,
         op: ClipboardOp,
@@ -579,6 +613,7 @@ impl RepositoryAction {
             | Self::OpenCommittedFile { card, .. }
             | Self::SelectBranchBase { card, .. }
             | Self::EditorAction { card, .. }
+            | Self::Language { card, .. }
             | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
             | Self::Reload { card }
@@ -1619,6 +1654,7 @@ pub struct RepositoryRuntime {
     /// `None` while nothing is open there. Stored rather than derived: only
     /// the application, which owns the manager, can mint one.
     lsp_document: Option<LspDocumentId>,
+    language: EditorLanguageState,
     /// Protocol notifications this buffer has earned but nobody has performed
     /// yet, oldest first.
     ///
@@ -1755,6 +1791,7 @@ impl RepositoryRuntime {
             retained_viewports: VecDeque::new(),
             next_save_ticket: 0,
             lsp_document: None,
+            language: EditorLanguageState::default(),
             lsp_intents: Vec::new(),
             pending_lsp_change: None,
             lsp_edits: Vec::new(),
@@ -2445,6 +2482,9 @@ impl RepositoryRuntime {
     /// Records the identity the application minted for the open buffer, or
     /// clears it once the buffer has been closed at the boundary.
     pub fn set_lsp_document(&mut self, doc: Option<LspDocumentId>) {
+        if self.lsp_document != doc {
+            self.language = EditorLanguageState::default();
+        }
         self.lsp_document = doc;
     }
 
@@ -2459,6 +2499,44 @@ impl RepositoryRuntime {
             return None;
         };
         caret_position(&document.content, document.content.cursor().position)
+    }
+
+    pub fn set_editor_diagnostics(&mut self, diagnostics: Vec<crate::lsp::LspDiagnostic>) {
+        self.language.marks = if let DocumentState::Editable(document) = &self.document {
+            diagnostics
+                .iter()
+                .filter_map(|diagnostic| {
+                    Some(text_editor::Diagnostic {
+                        start: caret_for_position(&document.content, diagnostic.range.start)?,
+                        end: caret_for_position(&document.content, diagnostic.range.end)?,
+                        severity: diagnostic.severity,
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        self.language.diagnostics = diagnostics;
+    }
+
+    pub fn set_editor_completions(&mut self, items: Vec<LspCompletionItem>) {
+        self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
+        self.language.completions = items;
+        self.language.hover.clear();
+    }
+
+    pub fn set_editor_hover(&mut self, markdown: Option<&str>, at: Option<LspPosition>) {
+        self.language.hover = markdown.map_or_else(Vec::new, |raw| markdown::parse(raw).collect());
+        self.language.hover_at = at.and_then(|at| match &self.document {
+            DocumentState::Editable(document) => caret_for_position(&document.content, at),
+            _ => None,
+        });
+    }
+
+    pub fn dismiss_editor_results(&mut self) {
+        self.language.completions.clear();
+        self.language.hover.clear();
+        self.language.hover_at = None;
     }
 
     /// Moves the caret to a protocol position, for jump-to-location.
@@ -4253,6 +4331,9 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 let is_edit = action.is_edit();
+                if !matches!(action, text_editor::Action::Scroll { .. }) {
+                    self.dismiss_editor_results();
+                }
                 // Measured before the action lands: an edit names the range
                 // it is about to replace, in the document the server holds.
                 let edit = match (&action, &self.document) {
@@ -4270,6 +4351,21 @@ impl RepositoryRuntime {
                 if is_edit {
                     self.push_lsp_change(edit);
                     return self.markdown_task(card);
+                }
+                Task::none()
+            }
+            RepositoryAction::Language { action, .. } => {
+                match action {
+                    EditorLspAction::Next(forward) if !self.language.completions.is_empty() => {
+                        let count = self.language.completions.len();
+                        self.language.selected = if forward {
+                            (self.language.selected + 1) % count
+                        } else {
+                            (self.language.selected + count - 1) % count
+                        };
+                    }
+                    EditorLspAction::Dismiss => self.dismiss_editor_results(),
+                    _ => {}
                 }
                 Task::none()
             }
@@ -6248,6 +6344,31 @@ pub fn selected_file_toolbar(
     if runtime.source_surface == SourceSurface::Diff {
         controls.push(diff_review_controls(card, runtime));
     }
+    if editing && runtime.lsp_document.is_some() {
+        let errors = runtime
+            .language
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == crate::lsp::LspSeverity::Error)
+            .count();
+        let warnings = runtime
+            .language
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == crate::lsp::LspSeverity::Warning)
+            .count();
+        controls.push(
+            widget::button::custom(crate::design::caption(format!(
+                "{errors} errors · {warnings} warnings"
+            )))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Diagnostics,
+            })
+            .into(),
+        );
+    }
     let mut secondary = Vec::new();
     if !runtime.standalone
         && let Some(editor) = runtime.external_editors.first()
@@ -6845,6 +6966,99 @@ fn editable_document_view<'a>(
         .width(Length::Fill)
         .into()
     } else {
+        let popup: Option<Element<'a, RepositoryAction>> = if !runtime
+            .language
+            .completions
+            .is_empty()
+        {
+            let selected = runtime.language.selected;
+            let first = selected.saturating_sub(4);
+            let choices = runtime
+                .language
+                .completions
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(10)
+                .map(|(index, item)| {
+                    let label = crate::design::body(&item.label).width(Length::Fill);
+                    let detail = crate::design::caption(item.detail.as_deref().unwrap_or_default())
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                        ));
+                    widget::button::custom(widget::column::with_children(vec![
+                        label.into(),
+                        detail.into(),
+                    ]))
+                    .class(crate::ui_controls::control_style(index == selected, None))
+                    .width(Length::Fill)
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::Choose {
+                            index,
+                            label: item.label.clone(),
+                        },
+                    })
+                    .into()
+                })
+                .collect::<Vec<_>>();
+            Some(
+                widget::container(
+                    widget::column::with_children(choices)
+                        .spacing(crate::design::GRID_UNIT)
+                        .width(360),
+                )
+                .class(crate::design::surface(
+                    Some(crate::design::raised),
+                    [crate::design::RADIUS_S; 4],
+                    true,
+                ))
+                .padding(spacing.space_xs)
+                .into(),
+            )
+        } else if !runtime.language.hover.is_empty() {
+            let settings = crate::design::markdown_settings(
+                &cosmic::theme::active(),
+                crate::design::TEXT_BODY,
+            );
+            Some(
+                widget::container(
+                    widget::scrollable(
+                        widget::column::with_children(
+                            runtime
+                                .language
+                                .hover
+                                .iter()
+                                .enumerate()
+                                .map(|(index, item)| {
+                                    markdown::item(
+                                        &crate::document_link::PreviewViewer,
+                                        settings,
+                                        item,
+                                        index,
+                                    )
+                                    .map(move |uri| RepositoryAction::MarkdownLink { card, uri })
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .spacing(spacing.space_xs),
+                    )
+                    .height(Length::Shrink),
+                )
+                .max_height(240)
+                .max_width(420)
+                .class(crate::design::surface(
+                    Some(crate::design::raised),
+                    [crate::design::RADIUS_S; 4],
+                    true,
+                ))
+                .padding(spacing.space_xs)
+                .into(),
+            )
+        } else {
+            None
+        };
         let editor = text_editor::TextEditor::new(&document.content)
             // Before `highlight_with`: `id` is only offered by the
             // not-yet-highlighted builder.
@@ -6867,6 +7081,25 @@ fn editable_document_view<'a>(
             } else {
                 &[]
             })
+            .diagnostics(&runtime.language.marks)
+            .popup(
+                popup,
+                if runtime.language.completions.is_empty() {
+                    runtime.language.hover_at
+                } else {
+                    None
+                },
+            )
+            .on_hover(move |at| RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Hover(
+                    at.and_then(|at| caret_position(&document.content, at)),
+                ),
+            })
+            .on_definition(move |at| RepositoryAction::Language {
+                card,
+                action: EditorLspAction::Definition(caret_position(&document.content, at)),
+            })
             .wrapping(if runtime.wrap_lines {
                 iced::advanced::text::Wrapping::WordOrGlyph
             } else {
@@ -6880,7 +7113,57 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(text_editor::default_bindings);
+            .key_binding(move |press| {
+                use iced::keyboard::{Key, key::Named};
+                if !matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
+                    return text_editor::default_bindings(press);
+                }
+                let action = match &press.key {
+                    Key::Named(Named::Space) if press.modifiers.command() => {
+                        Some(EditorLspAction::Complete)
+                    }
+                    Key::Character(character)
+                        if character.as_str() == " " && press.modifiers.command() =>
+                    {
+                        Some(EditorLspAction::Complete)
+                    }
+                    Key::Named(Named::F12) => Some(if press.modifiers.shift() {
+                        EditorLspAction::References
+                    } else {
+                        EditorLspAction::Definition(None)
+                    }),
+                    Key::Named(Named::Escape)
+                        if !runtime.language.completions.is_empty()
+                            || !runtime.language.hover.is_empty() =>
+                    {
+                        Some(EditorLspAction::Dismiss)
+                    }
+                    Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
+                        Some(EditorLspAction::Next(true))
+                    }
+                    Key::Named(Named::ArrowUp) if !runtime.language.completions.is_empty() => {
+                        Some(EditorLspAction::Next(false))
+                    }
+                    Key::Named(Named::Tab | Named::Enter)
+                        if !runtime.language.completions.is_empty() =>
+                    {
+                        let index = runtime.language.selected;
+                        Some(EditorLspAction::Choose {
+                            index,
+                            label: runtime.language.completions[index].label.clone(),
+                        })
+                    }
+                    _ => None,
+                };
+                action
+                    .map(|action| {
+                        text_editor::Binding::Custom(RepositoryAction::Language { card, action })
+                    })
+                    .or_else(|| text_editor::default_bindings(press))
+            });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         let entries = [
@@ -11718,6 +12001,63 @@ mod tests {
         runtime
             .editor_text()
             .expect("test expects an editable buffer")
+    }
+
+    #[test]
+    fn editor_diagnostic_marks_map_unicode_and_bare_carriage_return_positions() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "α\rbeta\nsecond\n");
+        runtime.set_editor_diagnostics(vec![crate::lsp::LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 6)),
+            severity: crate::lsp::LspSeverity::Error,
+            message: "bad beta".into(),
+            source: None,
+            code: None,
+        }]);
+        assert_eq!(runtime.language.marks.len(), 1);
+        assert_eq!(
+            runtime.language.marks[0].start,
+            text_editor::Position { line: 1, column: 0 }
+        );
+        assert_eq!(
+            runtime.language.marks[0].end,
+            text_editor::Position { line: 1, column: 4 }
+        );
+        assert_eq!(runtime.language.diagnostics.len(), 1);
+        runtime.set_lsp_document(Some(LspDocumentId(1)));
+        assert!(
+            runtime.language.marks.is_empty(),
+            "a new document cannot retain the old document's ranges"
+        );
+    }
+
+    #[test]
+    fn completion_keyboard_navigation_wraps_and_edits_dismiss_the_popup() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "hello\n");
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 5)),
+                "world",
+            ),
+            vec![],
+        );
+        runtime.set_editor_completions(vec![item.clone(), item]);
+        drop(runtime.update(RepositoryAction::Language {
+            card,
+            action: EditorLspAction::Next(false),
+        }));
+        assert_eq!(runtime.language.selected, 1);
+        drop(runtime.update(RepositoryAction::Language {
+            card,
+            action: EditorLspAction::Next(true),
+        }));
+        assert_eq!(runtime.language.selected, 0);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
+        assert!(runtime.language.completions.is_empty());
     }
 
     fn lsp_version(runtime: &RepositoryRuntime) -> i32 {

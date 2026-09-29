@@ -1732,6 +1732,7 @@ struct SessionContext {
     snapshots: Arc<SnapshotStore>,
     events: EventSink,
     status: Arc<Mutex<LspStatus>>,
+    completion_triggers: Arc<Mutex<Option<Vec<String>>>>,
     /// Set the moment the manager stops using this session, so a process that
     /// is still winding down cannot publish into the documents its
     /// replacement now owns.
@@ -2095,6 +2096,13 @@ async fn run_session(
         }
     };
     let sync = SyncSupport::negotiate(negotiated.capabilities.text_document_sync.as_ref());
+    *context
+        .completion_triggers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = negotiated
+        .capabilities
+        .completion_provider
+        .map(|provider| provider.trigger_characters.unwrap_or_default());
     // `initialized` is legal only after the response has been received.
     let _ = server.notify::<notification::Initialized>(lsp_types::InitializedParams {});
     context.set_status(LspStatus::Ready).await;
@@ -3117,6 +3125,7 @@ struct RetiringSession {
 struct SessionHandle {
     commands: mpsc::UnboundedSender<SessionCommand>,
     status: Arc<Mutex<LspStatus>>,
+    completion_triggers: Arc<Mutex<Option<Vec<String>>>>,
     /// Shared with the session's router: set before the handle is dropped so
     /// a retiring server cannot publish into its replacement's documents.
     retired: Arc<AtomicBool>,
@@ -3484,6 +3493,28 @@ impl LspManager {
         self.request(doc, at, RequestKind::Completion)
     }
 
+    /// Automatic completion starts only after the server advertises support.
+    pub fn completion_trigger(&self, doc: LspDocumentId, character: char) -> bool {
+        let Some(session) = self
+            .documents
+            .get(&doc)
+            .and_then(|document| self.sessions.get(&document.session))
+        else {
+            return false;
+        };
+        let triggers = session
+            .completion_triggers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        triggers.as_ref().is_some_and(|triggers| {
+            character.is_alphanumeric()
+                || character == '_'
+                || triggers
+                    .iter()
+                    .any(|trigger| trigger.chars().eq(std::iter::once(character)))
+        })
+    }
+
     pub fn request_hover(&mut self, doc: LspDocumentId, at: LspPosition) -> LspRequestId {
         self.request(doc, at, RequestKind::Hover)
     }
@@ -3769,6 +3800,7 @@ impl LspManager {
         let handle = SessionHandle {
             commands: tx,
             status: Arc::new(Mutex::new(LspStatus::Starting)),
+            completion_triggers: Arc::new(Mutex::new(None)),
             retired: Arc::new(AtomicBool::new(false)),
             retirement: Arc::new(tokio::sync::Notify::new()),
             process_group: Arc::new(AtomicU32::new(0)),
@@ -3784,6 +3816,7 @@ impl LspManager {
             snapshots: Arc::clone(&self.snapshots),
             events: self.events.clone(),
             status: Arc::clone(&handle.status),
+            completion_triggers: Arc::clone(&handle.completion_triggers),
             retired: Arc::clone(&handle.retired),
             retirement: Arc::clone(&handle.retirement),
             process_group: Arc::clone(&handle.process_group),
