@@ -12,9 +12,16 @@ pub struct Setting<'a, Message> {
     detail: Cow<'a, str>,
     control: Element<'a, Message>,
     error: Option<&'a str>,
+    label_in_control: bool,
 }
 
 impl<'a, Message: Clone + 'a> Setting<'a, Message> {
+    /// Keep the label searchable when the native control already displays it.
+    pub fn label_in_control(mut self) -> Self {
+        self.label_in_control = true;
+        self
+    }
+
     /// Reports why the value last entered was not saved, directly under the
     /// control that holds it.
     pub fn error(mut self, error: Option<&'a str>) -> Self {
@@ -27,10 +34,11 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     }
 
     fn view(self) -> Element<'a, Message> {
-        let mut children = vec![
-            widget::text::caption_heading(self.label).into(),
-            self.control,
-        ];
+        let mut children = Vec::new();
+        if !self.label_in_control {
+            children.push(widget::text::caption_heading(self.label).into());
+        }
+        children.push(self.control);
         if let Some(error) = self.error {
             children.push(
                 design::caption(error)
@@ -70,6 +78,7 @@ pub fn field<'a, Message: Clone + 'a>(
         detail: detail.into(),
         control,
         error: None,
+        label_in_control: false,
     }
 }
 

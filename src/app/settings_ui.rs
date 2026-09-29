@@ -260,6 +260,7 @@ fn settings_category_controls<'a>(
                             },
                         ),
                     )
+                    .label_in_control()
                 })
                 .collect();
             controls.push(setting_field(
