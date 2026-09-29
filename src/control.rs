@@ -1886,11 +1886,18 @@ fn describe_unattached(
 }
 
 /// Escapes control characters, such as terminal escape sequences in a
-/// provider's error, before text recorded by the daemon reaches a terminal.
+/// provider's error, and bidirectional formatting characters, which can
+/// visually reorder what follows them, before text recorded by the daemon
+/// reaches a terminal.
 fn printable(text: &str) -> String {
     let mut printable = String::with_capacity(text.len());
     for character in text.chars() {
-        if character.is_control() {
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        {
             printable.extend(character.escape_default());
         } else {
             printable.push(character);
@@ -2889,6 +2896,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn printable_escapes_terminal_and_bidirectional_controls() {
+        assert_eq!(
+            printable("a\u{1b}[2Jb\u{202E}c\u{2066}d\u{061C}e\u{200F}f"),
+            "a\\u{1b}[2Jb\\u{202e}c\\u{2066}d\\u{61c}e\\u{200f}f"
+        );
+        assert_eq!(printable("plain é 日本"), "plain é 日本");
+    }
 
     #[test]
     fn unattached_upgrade_conversations_are_named_with_their_reasons() {
