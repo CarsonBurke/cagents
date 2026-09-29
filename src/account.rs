@@ -59,8 +59,10 @@ fn fraction(value: f64) -> f32 {
 ///
 /// The system default is whatever the CLI would use on its own - the
 /// `CLAUDE_CONFIG_DIR` or `CODEX_HOME` cagents itself was started with, and
-/// otherwise the CLI's documented default under the user's home. It is never
-/// moved or rewritten. A managed home is a directory cagents created for a
+/// otherwise the CLI's documented default under the user's home - except a
+/// home cagents selected for the launch cagents was started from, which is
+/// that account's and never the system's (see [`inherited_selections`]). It
+/// is never moved or rewritten. A managed home is a directory cagents created for a
 /// further login of the same provider; the CLI is pointed at it through the
 /// same variable, so two accounts never share a credential store.
 ///
@@ -210,6 +212,70 @@ pub fn managed_home_identity(root: &Path, path: &Path) -> Option<(Provider, uuid
             .join(key.hyphenated().to_string())
             == path)
         .then_some((provider, key))
+}
+
+/// Whether `path` has the shape of a home a cagents installation manages:
+/// `<data dir>/accounts/<provider>/<uuid>`. Every installation - a development
+/// instance included - uses that shape, so a path that has it is an account
+/// cagents selected, never the provider's own default.
+pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
+    let mut components = path.components().rev();
+    let mut name = || {
+        components
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+    };
+    name().is_some_and(|key| uuid::Uuid::parse_str(key).is_ok())
+        && name() == Some(provider.executable())
+        && name() == Some("accounts")
+}
+
+/// Set on every terminal cagents starts, whose shell carries the provider
+/// homes cagents selected for it.
+const TERMINAL_MARKER: &str = "CAGENTS_TERMINAL_ID";
+
+/// The provider home variables to drop from an inherited environment, read
+/// through `environment`: those that only record an account cagents selected
+/// for a launch, which a cagents process started under that launch must not
+/// take for the provider's own default.
+///
+/// The system account is whatever home the provider's CLI resolves outside
+/// cagents. cagents points every terminal it starts, and every conversation,
+/// at the home of the account chosen for it. A cagents window, daemon or
+/// command started from inside one - by an agent running `cagents`, by the
+/// reader, or by a daemon such a command started - inherited that choice and
+/// took it for the system account: the system and the chosen account then
+/// named one home and reported one login, system work ran on the chosen
+/// account, and signing in to the system account signed the chosen
+/// account's home in to the system login.
+pub fn inherited_selections(environment: &dyn Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    let in_terminal = environment(TERMINAL_MARKER).is_some();
+    Account::PROVIDERS
+        .into_iter()
+        .filter_map(|provider| {
+            let variable = home_variable(provider)?;
+            let value = environment(variable)?;
+            (in_terminal || is_account_namespace(provider, Path::new(&value))).then_some(variable)
+        })
+        .collect()
+}
+
+/// Forgets the provider homes this process inherited from an account
+/// cagents selected (see [`inherited_selections`]), so that neither it nor
+/// any process it starts takes that account for the system one.
+///
+/// # Safety
+///
+/// Must be called before the process starts a second thread: it changes the
+/// process environment, which another thread may be reading.
+pub unsafe fn detach_inherited_selections() {
+    let removed = inherited_selections(&|name| {
+        std::env::var_os(name).map(|value| value.to_string_lossy().into_owned())
+    });
+    for variable in removed {
+        // SAFETY: the caller guarantees the process is still single-threaded.
+        unsafe { std::env::remove_var(variable) };
+    }
 }
 
 /// Effective spawn policy also protects recipes saved before explicit removals
@@ -374,7 +440,9 @@ impl Account {
             }
             AccountHome::System => {
                 let variable = home_variable(self.provider)?;
-                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty()) {
+                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
+                    && !inherited_selections(environment).contains(&variable)
+                {
                     return Some(PathBuf::from(explicit));
                 }
                 let home = environment("HOME").filter(|value| !value.is_empty())?;
@@ -1140,6 +1208,128 @@ mod tests {
         );
         assert_ne!(managed.lock_name(), codex.lock_name());
         assert!(!managed.is_system() && codex.is_system());
+    }
+
+    /// Regression for #520: a cagents process started from inside a
+    /// conversation or terminal on a chosen account inherited that account's
+    /// home and took it for the system account.
+    #[test]
+    fn the_system_account_is_never_a_home_cagents_selected() {
+        let environment = |pairs: Vec<(&'static str, String)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let key = uuid::Uuid::new_v4();
+        let chosen_codex = format!("/data/cagents/accounts/codex/{key}");
+        let chosen_claude = format!("/data-dev/cagents-dev/accounts/claude/{key}/");
+        assert!(is_account_namespace(
+            Provider::Codex,
+            Path::new(&chosen_codex)
+        ));
+        assert!(is_account_namespace(
+            Provider::Claude,
+            Path::new(&chosen_claude)
+        ));
+        // Only that exact shape, for that provider.
+        for (provider, path) in [
+            (Provider::Claude, chosen_codex.clone()),
+            (Provider::Codex, format!("/data/accounts/codex/{key}/sub")),
+            (Provider::Codex, format!("/data/homes/codex/{key}")),
+            (Provider::Codex, "/data/accounts/codex/not-a-key".into()),
+            (Provider::Codex, "/home/a/.codex".into()),
+        ] {
+            assert!(!is_account_namespace(provider, Path::new(&path)), "{path}");
+        }
+
+        // A daemon started by `cagents` in an agent's shell on a chosen
+        // Codex account, with the reader's own Claude directory.
+        let inherited = environment(vec![
+            ("HOME", "/home/a".into()),
+            ("CODEX_HOME", chosen_codex.clone()),
+            ("CLAUDE_CONFIG_DIR", "/home/a/work-claude".into()),
+        ]);
+        assert_eq!(inherited_selections(&inherited), ["CODEX_HOME"]);
+        let codex = Account::system(Provider::Codex);
+        let claude = Account::system(Provider::Claude);
+        assert_eq!(
+            codex.home_directory(&inherited),
+            Some(PathBuf::from("/home/a/.codex"))
+        );
+        // A directory the reader chose themselves is still their default.
+        assert_eq!(
+            claude.home_directory(&inherited),
+            Some(PathBuf::from("/home/a/work-claude"))
+        );
+
+        // Inside a cagents terminal both homes are the ones cagents chose
+        // for that terminal, whatever directories they name.
+        let in_terminal = environment(vec![
+            ("HOME", "/home/a".into()),
+            ("CAGENTS_TERMINAL_ID", "1".into()),
+            ("CODEX_HOME", "/home/a/linked-codex".into()),
+            ("CLAUDE_CONFIG_DIR", "/home/a/linked-claude".into()),
+        ]);
+        assert_eq!(
+            inherited_selections(&in_terminal),
+            ["CLAUDE_CONFIG_DIR", "CODEX_HOME"]
+        );
+        assert_eq!(
+            codex.home_directory(&in_terminal),
+            Some(PathBuf::from("/home/a/.codex"))
+        );
+        assert_eq!(
+            claude.home_directory(&in_terminal),
+            Some(PathBuf::from("/home/a/.claude"))
+        );
+        // Nothing inherited, nothing dropped.
+        assert!(inherited_selections(&environment(vec![("HOME", "/home/a".into())])).is_empty());
+    }
+
+    /// The binaries forget an inherited selection before anything reads the
+    /// environment, so every daemon, window and terminal they start inherits
+    /// the reader's own default instead.
+    #[test]
+    fn a_cagents_process_forgets_an_inherited_account_selection() {
+        const CHILD: &str = "CAGENTS_TEST_DETACH_SELECTIONS";
+        if std::env::var_os(CHILD).is_none() {
+            let key = uuid::Uuid::new_v4();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::tests::a_cagents_process_forgets_an_inherited_account_selection",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", "/home/a")
+                .env("CODEX_HOME", format!("/data/accounts/codex/{key}"))
+                .env("CLAUDE_CONFIG_DIR", "/home/a/own-claude")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        // SAFETY: the harness runs this child with a single test thread, and
+        // nothing else in it reads the environment concurrently.
+        unsafe { detach_inherited_selections() };
+        assert_eq!(std::env::var_os("CODEX_HOME"), None);
+        assert_eq!(
+            std::env::var("CLAUDE_CONFIG_DIR").as_deref(),
+            Ok("/home/a/own-claude")
+        );
+        assert_eq!(
+            Account::system(Provider::Codex).resolved_home(),
+            Some(PathBuf::from("/home/a/.codex"))
+        );
     }
 
     #[test]

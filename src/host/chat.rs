@@ -1,4 +1,6 @@
 use super::state::{ClientId, HostState, SharedHost};
+#[cfg(test)]
+mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
 #[cfg(test)]
