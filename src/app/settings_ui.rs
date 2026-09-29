@@ -169,12 +169,22 @@ fn default_account_choice<'a>(
     )
 }
 
+/// What the settings pane shows besides the draft being edited, gathered
+/// from the rest of the application once per frame.
+pub(super) struct SettingsContext<'a> {
+    pub feedback: Option<&'a SettingsFeedback>,
+    /// Refused values, by the field that refused them.
+    pub invalid: &'a HashMap<SettingsField, String>,
+    pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    pub updates: update_ui::UpdateSummary,
+}
+
 fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
-    invalid: &'a HashMap<SettingsField, String>,
-    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    context: &SettingsContext<'a>,
 ) -> Vec<Group<'a, Message>> {
+    let invalid = context.invalid;
     match category {
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
@@ -234,8 +244,82 @@ fn settings_category_controls<'a>(
                 controls,
             )]
         }
+        SettingsCategory::About => {
+            let updates = &context.updates;
+            let version = if crate::instance::NAME == "development" {
+                format!("{} (development build)", crate::VERSION)
+            } else {
+                crate::VERSION.to_owned()
+            };
+            let status = design::body(updates.status.clone())
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill);
+            let mut update_row: Vec<Element<'a, Message>> = vec![if updates.failed {
+                status
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .into()
+            } else {
+                status.into()
+            }];
+            if let Some((_, url)) = &updates.available {
+                update_row.push(update_ui::release_notes_button(url));
+                update_row.push(
+                    widget::button::suggested("Review update")
+                        .on_press(Message::UpdateUi(update_ui::Action::Apply))
+                        .into(),
+                );
+            } else {
+                update_row.push(
+                    widget::button::standard(if updates.checking {
+                        "Checking…"
+                    } else {
+                        "Check for updates"
+                    })
+                    .id(widget::Id::new("settings.updates.check"))
+                    .on_press_maybe(
+                        updates
+                            .can_check
+                            .then_some(Message::UpdateUi(update_ui::Action::CheckNow)),
+                    )
+                    .into(),
+                );
+            }
+            vec![settings_group(
+                "cagents",
+                "The build you are running and how it stays current.",
+                vec![
+                    setting_field(
+                        "Version",
+                        "The terminal service and every window run this same build.",
+                        design::body(version).into(),
+                    ),
+                    setting_field(
+                        "Updates",
+                        updates.detail.clone(),
+                        widget::row::with_children(update_row)
+                            .align_y(Alignment::Center)
+                            .spacing(2.0 * design::GRID_UNIT)
+                            .width(Length::Fill)
+                            .into(),
+                    ),
+                    setting_field(
+                        SettingsField::CheckForUpdates.label(),
+                        "Look for a new release at startup and every six hours. A check that cannot reach the server is retried quietly; only one you ask for reports a failure.",
+                        crate::settings_widgets::toggle(
+                            "Check for updates automatically",
+                            draft.check_for_updates,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::CheckForUpdates,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
+                ],
+            )]
+        }
         SettingsCategory::Accounts => {
-            let mut settings: Vec<Setting<'a, Message>> = accounts
+            let mut settings: Vec<Setting<'a, Message>> = context
+                .accounts
                 .iter()
                 .filter(|(_, choices)| !choices.is_empty())
                 .map(|(provider, choices)| default_account_choice(*provider, choices))
@@ -743,6 +827,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
         SettingsCategory::Editor => "accessories-text-editor-symbolic",
         SettingsCategory::Accounts => "system-users-symbolic",
+        SettingsCategory::About => "help-about-symbolic",
     }
 }
 
@@ -845,14 +930,10 @@ pub(super) fn settings_pane<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
-    feedback: Option<&'a SettingsFeedback>,
-    invalid: &'a HashMap<SettingsField, String>,
-    accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    context: SettingsContext<'a>,
 ) -> Element<'a, Message> {
     iced::widget::responsive(move |size| {
-        settings_layout(
-            category, draft, query, feedback, invalid, &accounts, size.width,
-        )
+        settings_layout(category, draft, query, &context, size.width)
     })
     .into()
 }
@@ -861,11 +942,10 @@ fn settings_layout<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
-    feedback: Option<&'a SettingsFeedback>,
-    invalid: &'a HashMap<SettingsField, String>,
-    accounts: &[(crate::agent::Provider, Vec<account_ui::DefaultChoice>)],
+    context: &SettingsContext<'a>,
     width: f32,
 ) -> Element<'a, Message> {
+    let (feedback, invalid) = (context.feedback, context.invalid);
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
@@ -971,7 +1051,7 @@ fn settings_layout<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft, invalid, accounts)
+            settings_category_controls(category, draft, context)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );

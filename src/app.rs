@@ -2142,10 +2142,11 @@ pub enum SettingsCategory {
     Links,
     Keyboard,
     Accounts,
+    About,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
@@ -2154,6 +2155,7 @@ impl SettingsCategory {
         Self::Links,
         Self::Keyboard,
         Self::Accounts,
+        Self::About,
     ];
 
     const fn label(self) -> &'static str {
@@ -2166,6 +2168,7 @@ impl SettingsCategory {
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
+            Self::About => "About",
         }
     }
 }
@@ -2614,6 +2617,7 @@ pub enum SettingsField {
     ChatEnterSends,
     ShowStatusBar,
     RelaunchAgentsOnUpgrade,
+    CheckForUpdates,
     EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
@@ -2693,6 +2697,7 @@ impl SettingsField {
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
+            Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::ConfirmTerminalClose => "Active processes",
             Self::FocusFollowsMouse => "Pane activation",
@@ -2746,6 +2751,7 @@ impl SettingsField {
             Self::EditorAutoSave | Self::EditorWrapLines | Self::EditorSyntaxTheme => {
                 SettingsCategory::Editor
             }
+            Self::CheckForUpdates => SettingsCategory::About,
             Self::LinkOpenDestination | Self::LinkOpenGesture | Self::PullRequestOpenTarget => {
                 SettingsCategory::Links
             }
@@ -2856,6 +2862,7 @@ struct SettingsDraft {
     chat_enter_sends: bool,
     show_status_bar: bool,
     relaunch_agents_on_upgrade: bool,
+    check_for_updates: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
@@ -2903,6 +2910,7 @@ impl SettingsDraft {
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
+            check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -2949,6 +2957,7 @@ impl SettingsDraft {
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
+            SettingsField::CheckForUpdates => self.check_for_updates = value == "true",
             SettingsField::EditorSyntaxTheme => {
                 if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
                     self.editor_syntax_theme = theme;
@@ -3060,6 +3069,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
             .map_err(|_| "Choose whether upgrades relaunch unresumable agents.".to_owned()),
+        SettingsField::CheckForUpdates => value
+            .parse::<bool>()
+            .map(|enabled| next.check_for_updates = enabled)
+            .map_err(|_| "Choose whether to check for updates automatically.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -7823,9 +7836,12 @@ impl Cagents {
                 self.settings_category,
                 &self.settings_draft,
                 &self.settings_search,
-                self.settings_feedback.as_ref(),
-                &self.settings_invalid,
-                self.default_account_choices(),
+                settings_ui::SettingsContext {
+                    feedback: self.settings_feedback.as_ref(),
+                    invalid: &self.settings_invalid,
+                    accounts: self.default_account_choices(),
+                    updates: self.update_summary(),
+                },
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
@@ -10236,6 +10252,7 @@ impl Cagents {
                     | SettingsField::TerminalCursorStyle
                     | SettingsField::ConfirmTerminalClose
                     | SettingsField::RelaunchAgentsOnUpgrade
+                    | SettingsField::CheckForUpdates
                     | SettingsField::ChatEnterSends
                     | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
