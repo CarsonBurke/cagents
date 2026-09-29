@@ -116,6 +116,10 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // A page with a return arrow distinguishes discarding edits from Undo.
+    static REVERT_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6M9.5 1.75v3.5H13M5 7 2 10l3 3M2 10h6a2.5 2.5 0 0 0 0-5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     // A page plus an inward arrow makes the open action unambiguous at 16px.
     static OPEN_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6zM9.5 1.75v3.5H13M2 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
@@ -243,6 +247,7 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
         "document-open-symbolic" => &OPEN_FILE,
         "folder-open-symbolic" => &OPEN_FOLDER,
         "document-save-symbolic" | "document-save-as-symbolic" => &SAVE,
+        "document-revert-symbolic" => &REVERT_FILE,
         "emblem-system-symbolic" | "preferences-system-symbolic" => &SETTINGS,
         "preferences-desktop-keyboard-symbolic" => &KEYBOARD,
         "insert-text-symbolic" => &INSERT_TEXT,

@@ -983,9 +983,43 @@ where
         }
     }
 
-    /// Replaces the text between `start` and `end` with `replacement`,
-    /// leaving the caret after it.
-    pub fn replace_range(&mut self, start: Position, end: Position, replacement: &str) {
+    /// Measures a whole-document replacement against the native line map,
+    /// including boundaries which serializing and reparsing would change.
+    pub fn replacement_to_text(&self, replacement: &str) -> Option<TextChange> {
+        history::replacement(
+            &self.excerpt(0, self.line_count().saturating_sub(1)),
+            &Excerpt::document(replacement),
+            usize::MAX,
+        )
+    }
+
+    pub fn replace_range_recorded(
+        &mut self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) -> Option<TextChange> {
+        self.set_cursor(Cursor {
+            position: end,
+            selection: ((start.line, start.column) != (end.line, end.column)).then_some(start),
+        });
+        self.perform_edit(if replacement.is_empty() {
+            Edit::Delete
+        } else {
+            Edit::Paste(Arc::new(replacement.to_owned()))
+        })
+        .map(|edit| edit.change)
+    }
+
+    /// Replays native line fragments separately. Combining their bytes into
+    /// one paste can join LF and CR into a different pair of line endings.
+    pub fn replace_range_with_breaks(
+        &mut self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+        breaks: &[usize],
+    ) {
         let empty = (start.line, start.column) == (end.line, end.column);
         self.perform(Action::ClearSelection);
         self.move_to(Cursor {
@@ -993,7 +1027,23 @@ where
             selection: (!empty).then_some(start),
         });
         if !replacement.is_empty() {
-            self.perform(Action::Edit(Edit::Paste(Arc::new(replacement.to_owned()))));
+            if history::canonical_breaks(replacement, breaks) {
+                self.perform(Action::Edit(Edit::Paste(Arc::new(replacement.to_owned()))));
+                return;
+            }
+            let mut previous = 0;
+            for end in breaks
+                .iter()
+                .copied()
+                .chain(std::iter::once(replacement.len()))
+            {
+                if end > previous {
+                    self.perform(Action::Edit(Edit::Paste(Arc::new(
+                        replacement[previous..end].to_owned(),
+                    ))));
+                }
+                previous = end;
+            }
         } else if !empty {
             self.perform(Action::Edit(Edit::Delete));
         }
@@ -1056,11 +1106,17 @@ impl<R> history::EditBuffer for Content<R>
 where
     R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
-    fn replace(&mut self, start: Position, expected: &str, replacement: &str) -> bool {
+    fn replace(
+        &mut self,
+        start: Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
         let Some(end) = self.range_end(start, expected) else {
             return false;
         };
-        self.replace_range(start, end, replacement);
+        self.replace_range_with_breaks(start, end, replacement, replacement_breaks);
         true
     }
 
@@ -3095,9 +3151,18 @@ mod tests {
             (seed % bound.max(1) as u64) as usize
         };
         let original = "fn main() {\r\n    let é = 1;\n\n\tprintln!(\"漢字\");\r\n}\n";
+        let native_lines = |content: &Content| {
+            (0..content.line_count())
+                .map(|index| {
+                    let line = content.line(index).unwrap();
+                    (line.text.into_owned(), line.ending)
+                })
+                .collect::<Vec<_>>()
+        };
         let start = Instant::now();
         for round in 0..60 {
             let mut content: Content = Content::with_text(original);
+            let original_lines = native_lines(&content);
             let mut history = History::default();
             for step in 0..30 {
                 let lines = content.line_count();
@@ -3148,11 +3213,108 @@ mod tests {
                 }
             }
             let last = content.text();
+            let last_lines = native_lines(&content);
             while history.undo(&mut content) == Replay::Applied {}
             assert_eq!(content.text(), original, "round {round}");
+            assert_eq!(
+                native_lines(&content),
+                original_lines,
+                "native undo, round {round}"
+            );
             while history.redo(&mut content) == Replay::Applied {}
             assert_eq!(content.text(), last, "round {round}");
+            assert_eq!(
+                native_lines(&content),
+                last_lines,
+                "native redo, round {round}"
+            );
         }
+    }
+
+    #[test]
+    fn deleting_lf_then_crlf_preserves_native_line_boundaries_on_replay() {
+        use history::{EditKind, History, Replay};
+        let original = "a\r\nb\n";
+        let mut content: Content = Content::with_text(original);
+        let mut history = History::default();
+        let cursor = Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        };
+        content.set_cursor(cursor);
+        let now = Instant::now();
+        let edit = content.perform_edit(Edit::Enter).unwrap();
+        history.record(
+            edit.change,
+            EditKind::Insert,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        content.set_cursor(cursor);
+        history.seal();
+        for _ in 0..2 {
+            let edit = content.perform_edit(Edit::Delete).unwrap();
+            history.record(
+                edit.change,
+                EditKind::DeleteForward,
+                edit.before,
+                content.cursor(),
+                now,
+            );
+        }
+        assert_eq!(content.text(), "ab\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), original);
+        assert_eq!(history.undo(&mut content), Replay::Empty);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "ab\n");
+    }
+
+    #[test]
+    fn replacing_multiple_native_lines_preserves_their_boundaries_on_replay() {
+        use history::{EditKind, History, Replay};
+        let original = "a\r\nb\n";
+        let mut content: Content = Content::with_text(original);
+        let mut history = History::default();
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        });
+        let now = Instant::now();
+        let edit = content.perform_edit(Edit::Enter).unwrap();
+        history.record(
+            edit.change,
+            EditKind::Insert,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        content.set_cursor(Cursor {
+            position: Position { line: 2, column: 1 },
+            selection: Some(Position { line: 0, column: 1 }),
+        });
+        let edit = content.perform_edit(Edit::Delete).unwrap();
+        assert_eq!(edit.change.removed_breaks, [2, 4, 6]);
+        history.record(
+            edit.change,
+            EditKind::Other,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        assert_eq!(content.text(), "a\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "a\n\r\nb\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), original);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "a\n");
     }
 
     #[test]
@@ -3299,9 +3461,9 @@ mod tests {
             content.range_end(at, "e\r\ntwo\n"),
             Some(Position { line: 2, column: 0 })
         );
-        assert!(!content.replace(at, "x", "y"));
+        assert!(!content.replace(at, "x", "y", &[]));
         assert_eq!(content.text(), "one\r\ntwo\n");
-        assert!(content.replace(at, "e\r\ntw", "E"));
+        assert!(content.replace(at, "e\r\ntw", "E", &[]));
         assert_eq!(content.text(), "onEo\n");
     }
 

@@ -38,7 +38,7 @@ use crate::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
         SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
     },
-    editor_history::{EditBuffer, EditKind, Excerpt, History, Replay, TextChange},
+    editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
         LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
     },
@@ -860,7 +860,7 @@ impl EditorDocument {
         // they were rather than following the replaced text.
         let scroll = self.content.scroll_position();
         let cursor = self.content.cursor();
-        let change = replacement_between(&self.content.text(), &self.saved_text);
+        let change = self.content.replacement_to_text(&self.saved_text);
         let mut edits = Vec::new();
         if let Some(change) = change {
             let mut buffer = ProtocolTracked {
@@ -870,7 +870,12 @@ impl EditorDocument {
             // Verified afterwards as well as before: the change was measured
             // on the text re-split into lines, and a buffer whose own lines
             // disagree with that split is rebuilt rather than trusted.
-            let replaced = buffer.replace(change.start, &change.removed, &change.inserted);
+            let replaced = buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            );
             let replayed = buffer.edits;
             if replaced && content_matches(&self.content, &self.saved_text) {
                 edits = replayed;
@@ -952,12 +957,9 @@ impl EditorDocument {
             }
             let start = caret_for_offset(&self.content, span.start);
             let end = self.content.range_end(start, removed)?;
-            self.content.replace_range(start, end, inserted);
-            changes.push(TextChange {
-                start,
-                removed: removed.to_owned(),
-                inserted: inserted.to_owned(),
-            });
+            if let Some(change) = self.content.replace_range_recorded(start, end, inserted) {
+                changes.push(change);
+            }
         }
         self.text_changed();
         Some(changes)
@@ -995,16 +997,6 @@ fn edit_kind(edit: &text_editor::Edit, before: text_editor::Cursor) -> EditKind 
     }
 }
 
-/// The single replacement that turns the whole document `before` into
-/// `after`, or `None` when they are equal.
-fn replacement_between(before: &str, after: &str) -> Option<TextChange> {
-    crate::editor_history::replacement(
-        &Excerpt::document(before),
-        &Excerpt::document(after),
-        usize::MAX,
-    )
-}
-
 /// The editor buffer as the history replays into it, recording each
 /// replacement as the protocol edit that describes it.
 struct ProtocolTracked<'a> {
@@ -1013,7 +1005,13 @@ struct ProtocolTracked<'a> {
 }
 
 impl EditBuffer for ProtocolTracked<'_> {
-    fn replace(&mut self, start: text_editor::Position, expected: &str, replacement: &str) -> bool {
+    fn replace(
+        &mut self,
+        start: text_editor::Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
         let Some(end) = self.content.range_end(start, expected) else {
             return false;
         };
@@ -1023,7 +1021,8 @@ impl EditBuffer for ProtocolTracked<'_> {
             .zip(caret_position(self.content, end))
             .map(|(start, end)| LspRange::new(start, end));
         let trailing_cr = trailing_carriage_return(self.content).is_some();
-        self.content.replace_range(start, end, replacement);
+        self.content
+            .replace_range_with_breaks(start, end, replacement, replacement_breaks);
         // A final bare carriage return has no protocol column. Replaying
         // its removal would otherwise report an empty range and leave the
         // server holding a byte that the editor has removed.
