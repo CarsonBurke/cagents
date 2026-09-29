@@ -470,6 +470,19 @@ impl TerminalGeometry {
         )
     }
 
+    /// [`Self::cell_at`], limited to a published grid of `columns` x `rows`.
+    ///
+    /// While a resize is pending the snapshot still has the old size, so a
+    /// cell past its edge would name text that is not there - the draw path
+    /// clips to the same bound.
+    fn cell_within(self, position: Point, columns: u16, rows: u16) -> (u16, u16) {
+        let (column, row) = self.cell_at(position);
+        (
+            column.min(columns.saturating_sub(1)),
+            row.min(rows.saturating_sub(1)),
+        )
+    }
+
     /// The clipped rectangle covering `length` consecutive cells starting at
     /// `column`.
     ///
@@ -1677,6 +1690,12 @@ impl<Message> TerminalWidget<Message> {
         }
     }
 
+    /// The cell under a pointer position, within both the laid-out grid and
+    /// the published one.
+    fn cell_at(&self, geometry: TerminalGeometry, position: Point) -> (u16, u16) {
+        geometry.cell_within(position, self.snapshot.columns, self.snapshot.rows)
+    }
+
     /// The grid this frame's selection resolves against.
     fn selection_grid(&self) -> SelectionGrid<'_> {
         SelectionGrid {
@@ -1988,7 +2007,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 if let Some(position) = geometry.cursor_position(cursor) {
                     state.last_cursor = Some(position);
-                    let cell = geometry.cell_at(position);
+                    let cell = self.cell_at(geometry, position);
                     state.last_motion_cell = Some(cell);
                     if *button == IcedMouseButton::Left
                         && state.modifiers.control
@@ -2131,7 +2150,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 // Clamping happens in `cell_at`, so a pointer dragged outside
                 // the grid still extends along its nearest edge.
-                let cell = geometry.cell_at(Point::new(position.x - grid.x, position.y - grid.y));
+                let cell = self.cell_at(
+                    geometry,
+                    Point::new(position.x - grid.x, position.y - grid.y),
+                );
                 // A scrolled viewport puts a different absolute row under an
                 // unchanged cell, so that case may not be deduplicated away.
                 if scrolled || state.last_motion_cell != Some(cell) {
@@ -2150,7 +2172,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // channel the user's keystrokes queue in. Report only what
                     // can be observed - tracking enabled, or a drag in progress
                     // - and then only on a cell crossing.
-                    let cell = geometry.cell_at(position);
+                    let cell = self.cell_at(geometry, position);
                     if (self.snapshot.scroll.mouse_tracking || state.pressed_buttons != 0)
                         && state.last_motion_cell != Some(cell)
                     {
@@ -2556,7 +2578,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         if let Some(position) = geometry.cursor_position(cursor) {
-            let cell = geometry.cell_at(position);
+            let cell = self.cell_at(geometry, position);
             if tree.state.downcast_ref::<WidgetState>().modifiers.control
                 && self.on_open_link.is_some()
                 && self
@@ -3513,6 +3535,40 @@ mod tests {
         );
         assert_eq!(key(cell.x + cell.width + 0.5, cell.y + 0.5), Some((4, 2)));
         assert_eq!(key(cell.x + 0.5, cell.y + cell.height + 0.5), Some((3, 3)));
+    }
+
+    #[test]
+    fn pointer_cells_stay_inside_a_grid_still_awaiting_its_resize() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let geometry = TerminalGeometry::new(
+            bounds,
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let corner = geometry
+            .cell_bounds(geometry.columns - 1, geometry.rows - 1)
+            .unwrap();
+        let position = Point::new(
+            corner.center_x() - geometry.grid_bounds.x,
+            corner.center_y() - geometry.grid_bounds.y,
+        );
+        let laid_out = (geometry.columns - 1, geometry.rows - 1);
+        assert_eq!(geometry.cell_at(position), laid_out);
+        // The published grid is still the smaller one from before the resize.
+        assert_eq!(geometry.cell_within(position, 5, 3), (4, 2));
+        // A larger published grid never extends past the laid-out one.
+        assert_eq!(
+            geometry.cell_within(position, geometry.columns + 5, geometry.rows + 5),
+            laid_out
+        );
     }
 
     #[test]
