@@ -152,6 +152,13 @@ pub struct Draft {
     effort: Option<String>,
     permission: String,
     timezone: String,
+    /// The saved automation's timezone exactly as stored. The daemon treats
+    /// any change in its spelling as a material edit, so the same zone typed
+    /// in another case saves this string unchanged.
+    loaded_timezone: Option<String>,
+    /// Zones suggested for the typed timezone, or `None` once it resolves;
+    /// recomputed when the timezone changes rather than on every redraw.
+    timezone_matches: Option<Vec<&'static str>>,
     hour: String,
     minute: String,
     cron: String,
@@ -188,6 +195,8 @@ impl Draft {
             permission: String::new(),
             timezone: crate::automations::schedule::system_timezone()
                 .unwrap_or_else(|| "UTC".into()),
+            loaded_timezone: None,
+            timezone_matches: None,
             hour: "9".into(),
             minute: "0".into(),
             cron: "0 9 * * 1-5".into(),
@@ -213,6 +222,7 @@ impl Draft {
             value.effort = definition.agent.reasoning_effort.clone();
             value.permission = definition.agent.permission_mode.clone().unwrap_or_default();
             value.timezone = definition.schedule.timezone.clone();
+            value.loaded_timezone = Some(definition.schedule.timezone.clone());
             value.provider = provider_index(definition.agent.provider);
             value.account = value
                 .accounts
@@ -276,7 +286,17 @@ impl Draft {
             }
         }
         value.preselect_account();
+        value.refresh_timezone_matches();
         value
+    }
+
+    /// Suggestions for the typed timezone; none once it names a zone.
+    fn refresh_timezone_matches(&mut self) {
+        let query = self.timezone.trim();
+        self.timezone_matches = jiff::tz::db()
+            .get(query)
+            .is_err()
+            .then(|| timezone_matches(query, 6));
     }
 
     /// Unless the reader picked one, the account is the target's default for
@@ -393,14 +413,17 @@ impl Draft {
         pattern.expression()?;
         let typed = self.timezone.trim();
         // The daemon resolves the zone the same way, ignoring case; the saved
-        // name is the database's own spelling of it.
+        // name is the database's own spelling of it, except that the saved
+        // automation's zone keeps its stored spelling so an unchanged zone is
+        // not a material edit.
         let zone = jiff::tz::db()
             .get(typed)
             .map_err(|_| format!("Choose a timezone from the list; {typed:?} is not one"))?;
-        Ok(Schedule {
-            pattern,
-            timezone: zone.iana_name().unwrap_or(typed).into(),
-        })
+        let timezone = match &self.loaded_timezone {
+            Some(loaded) if loaded.trim().eq_ignore_ascii_case(typed) => loaded.clone(),
+            _ => zone.iana_name().unwrap_or(typed).into(),
+        };
+        Ok(Schedule { pattern, timezone })
     }
 
     fn definition(&self, models: &Models) -> Result<Definition, String> {
@@ -756,6 +779,9 @@ impl State {
                         Field::Cron => &mut draft.cron,
                         Field::Timeout => &mut draft.timeout,
                     } = value;
+                    if matches!(field, Field::Timezone) {
+                        draft.refresh_timezone_matches();
+                    }
                 }
             }
             Action::Provider(index) if index < PROVIDERS.len() => {
@@ -1275,17 +1301,15 @@ impl Draft {
                 .into(),
         ])
         .spacing(4);
-        let query = self.timezone.trim();
-        if jiff::tz::db().get(query).is_err() {
-            let matches = timezone_matches(query, 6);
+        if let Some(matches) = &self.timezone_matches {
             if matches.is_empty() {
-                column = column.push(widget::text::caption(if query.is_empty() {
+                column = column.push(widget::text::caption(if self.timezone.trim().is_empty() {
                     "Type a city or region to find its timezone."
                 } else {
                     "No timezone matches this search."
                 }));
             }
-            for name in matches {
+            for name in matches.iter().copied() {
                 column = column.push(
                     widget::button::custom(widget::text::body(name))
                         .class(crate::ui_controls::control_style(false, None))
@@ -2043,6 +2067,21 @@ mod tests {
             .unwrap();
         assert_eq!(saved.schedule.timezone, "America/Vancouver");
         assert_eq!(saved.agent, existing.definition.agent);
+    }
+
+    #[test]
+    fn a_saved_timezone_keeps_its_spelling_so_a_rename_stays_immaterial() {
+        let mut existing = automation();
+        existing.definition.schedule.timezone = "america/vancouver".into();
+        let mut draft = Draft::new(&[], &[], Some(&existing));
+        draft.name = "Renamed review".into();
+        assert_eq!(draft.schedule().unwrap(), existing.definition.schedule);
+        // The same zone typed in another case is still the saved one.
+        draft.timezone = "America/Vancouver".into();
+        assert_eq!(draft.schedule().unwrap().timezone, "america/vancouver");
+        // A different zone takes the database's spelling.
+        draft.timezone = "europe/london".into();
+        assert_eq!(draft.schedule().unwrap().timezone, "Europe/London");
     }
 
     #[test]
