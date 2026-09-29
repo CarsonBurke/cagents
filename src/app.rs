@@ -9864,7 +9864,6 @@ impl Cagents {
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
-        let previous_scale = self.settings.ui_scale;
         match settings_update(&self.settings, field, &value) {
             SettingsDecision::Invalid(message) => {
                 self.settings_invalid.insert(field, message);
