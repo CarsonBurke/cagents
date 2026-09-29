@@ -440,7 +440,12 @@ impl Cagents {
             }
             (false, Some(restore)) => {
                 self.chrome_ui.restore_keyboard_nav = None;
-                self.core.set_keyboard_nav(restore);
+                // A close dialog that opened over the popup recorded the
+                // popup's suppressed traversal as its own restore point, and
+                // it owns Tab now: hand it the reader's real choice instead.
+                if !self.adopt_terminal_close_keyboard_nav(restore) {
+                    self.core.set_keyboard_nav(restore);
+                }
             }
             _ => {}
         }
