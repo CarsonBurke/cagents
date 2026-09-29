@@ -22,8 +22,10 @@ const ENTER_RELAUNCH_GRACE_MS: i64 = 750;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RetainedOutput {
     Attaching,
-    /// The daemon no longer holds the screen, or could not hand it back.
-    Unavailable,
+    /// The daemon no longer holds the screen.
+    Discarded,
+    /// The daemon could not be asked, or could not hand the screen back.
+    Unreachable,
 }
 
 /// The relaunch an ended terminal's card offers as its primary action.
@@ -236,13 +238,18 @@ impl Cagents {
         for card in cards {
             if !matches!(self.cards.get(&card), Some(CardRuntime::Completed))
                 || self.terminal_close_pending(card)
+                || self.closed_terminal_cards.contains(&card)
             {
                 continue;
             }
             let Some(session) = ended_terminal(self.card_state(card)).cloned() else {
                 continue;
             };
-            if self.retained_outputs.contains_key(&session.id) {
+            // A sign-in's screen can hold a pasted authorization code, which
+            // is why it keeps no saved output either; it stays gone.
+            if self.retained_outputs.contains_key(&session.id)
+                || account_ui::is_sign_in(&session.launch)
+            {
                 continue;
             }
             self.retained_outputs
@@ -275,26 +282,41 @@ impl Cagents {
         // while the daemon answered; then this screen belongs to nobody.
         let current = matches!(self.cards.get(&card), Some(CardRuntime::Completed))
             && !self.terminal_close_pending(card)
+            && !self.closed_terminal_cards.contains(&card)
             && ended_terminal(self.card_state(card)).is_some_and(|session| session.id == terminal);
-        match result {
+        let outcome = match result {
             Ok(Some(surface)) if current => {
                 self.retained_outputs.remove(&terminal);
                 self.cards.insert(card, CardRuntime::Terminal(surface));
-                return self.drain_terminal(card, 0);
+                let mut tasks = vec![self.drain_terminal(card, 0)];
+                // Keyboard focus sat on the relaunch button while the card had
+                // no screen. Leaving it there would let one Enter reach both
+                // the button and the screen.
+                if self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
+                    tasks.push(
+                        iced::widget::operation::focus(self.card_keyboard_focus(card))
+                            .map(cosmic::Action::App),
+                    );
+                }
+                return Task::batch(tasks);
             }
             Ok(Some(surface)) => {
                 self.retained_outputs.remove(&terminal);
                 self.retire_terminal_surface(surface, false);
+                return Task::none();
             }
-            Ok(None) => {
-                self.retained_outputs
-                    .insert(terminal, RetainedOutput::Unavailable);
-            }
+            Ok(None) => RetainedOutput::Discarded,
             Err(error) => {
                 tracing::debug!(%terminal, %error, "final terminal screen could not be attached");
-                self.retained_outputs
-                    .insert(terminal, RetainedOutput::Unavailable);
+                RetainedOutput::Unreachable
             }
+        };
+        self.retained_outputs.insert(terminal, outcome);
+        // Without a screen to type into, the keyboard belongs on the
+        // relaunch, so Enter still does what the footer says it does.
+        if current && self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
+            return iced::widget::operation::focus(self.card_keyboard_focus(card))
+                .map(cosmic::Action::App);
         }
         Task::none()
     }
@@ -305,7 +327,6 @@ impl Cagents {
         &self,
         card: CardId,
         session: &TerminalSession,
-        focused: bool,
     ) -> Element<'a, Message> {
         let report = terminal_end_report(session);
         let relaunch = self.terminal_relaunch(card, session);
@@ -329,16 +350,7 @@ impl Cagents {
             .spacing(spacing.space_xs)
             .align_y(Alignment::Center);
 
-        let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(4);
-        if focused {
-            // The final screen keeps keyboard focus, so the key it answers
-            // to is named where the reader is already looking.
-            actions.push(
-                design::caption(format!("Enter to {}", relaunch.label().to_lowercase()))
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .into(),
-            );
-        }
+        let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(3);
         if session.transcript_path.is_some() {
             actions.push(
                 crate::ui_controls::icon_control(
@@ -359,11 +371,13 @@ impl Cagents {
                 .on_press(Message::CloseCard(card))
                 .into(),
         );
+        // The final screen keeps keyboard focus, and Enter there presses
+        // this; the tooltip is where that is said without crowding the row.
         actions.push(crate::interaction::tooltip(
             widget::button::suggested(relaunch.label())
                 .id(card_control_id(card, "ended.relaunch"))
                 .on_press(Message::RetryCard(card)),
-            relaunch.explanation(session),
+            format!("{} (Enter)", relaunch.explanation(session)),
         ));
 
         widget::container(
@@ -382,6 +396,9 @@ impl Cagents {
         )
         .padding([spacing.space_xxs, spacing.space_s])
         .width(Length::Fill)
+        // A narrow card gives the summary up first, then clips the actions
+        // rather than spilling them over its neighbour.
+        .clip(true)
         .class(cosmic::theme::Container::custom(|theme| {
             widget::container::Style {
                 background: Some(iced::Background::Color(design::raised(theme))),
@@ -400,40 +417,51 @@ impl Cagents {
     /// daemon is asked for it and once the daemon has said it kept none.
     pub(super) fn ended_terminal_placeholder<'a>(
         &self,
+        card: CardId,
         session: Option<&TerminalSession>,
     ) -> Element<'a, Message> {
-        let attaching = session.is_some_and(|session| {
-            self.retained_outputs.get(&session.id) == Some(&RetainedOutput::Attaching)
-        });
-        if attaching {
-            // Usually answered within a frame or two; a message that flashes
-            // up and away would be noise.
-            return iced::widget::Space::new()
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-        }
-        let spacing = cosmic::theme::spacing();
-        let detail = if session.is_some_and(|session| session.transcript_path.is_some()) {
-            "Its final screen was not kept after cagents restarted. The saved output log still has everything it printed."
-        } else {
-            "Its final screen was not kept after cagents restarted."
+        let outcome = session.and_then(|session| self.retained_outputs.get(&session.id));
+        let detail = match outcome {
+            Some(RetainedOutput::Discarded) => {
+                "Its final screen was not kept after the terminal host restarted."
+            }
+            Some(RetainedOutput::Unreachable) => {
+                "Its final screen could not be loaded from the terminal host."
+            }
+            // Not asked for yet, or on its way: usually answered within a
+            // frame or two, so a message that flashes up and away is noise.
+            Some(RetainedOutput::Attaching) | None => {
+                return iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
         };
-        widget::container(
-            widget::column::with_children(vec![
-                crate::ui_controls::passive_icon(
-                    widget::icon::from_name("utilities-terminal-symbolic").handle(),
-                    design::STATUS_ICON_SIZE,
-                ),
-                design::heading("Output no longer available").into(),
-                design::caption(detail)
-                    .align_x(Alignment::Center)
-                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+        let saved = session.is_some_and(|session| session.transcript_path.is_some());
+        let spacing = cosmic::theme::spacing();
+        let mut children: Vec<Element<'a, Message>> = vec![
+            crate::ui_controls::passive_icon(
+                widget::icon::from_name("utilities-terminal-symbolic").handle(),
+                design::STATUS_ICON_SIZE,
+            ),
+            design::heading("Output not available").into(),
+            design::caption(detail)
+                .align_x(Alignment::Center)
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+        ];
+        if saved {
+            children.push(
+                widget::button::text("Open saved output")
+                    .on_press_maybe(session.map(|_| Message::OpenTerminalOutput(card)))
                     .into(),
-            ])
-            .align_x(Alignment::Center)
-            .spacing(spacing.space_xxs)
-            .max_width(STATUS_SURFACE_MAX_WIDTH),
+            );
+        }
+        widget::container(
+            widget::column::with_children(children)
+                .align_x(Alignment::Center)
+                .spacing(spacing.space_xxs)
+                .max_width(STATUS_SURFACE_MAX_WIDTH),
         )
         .center(Length::Fill)
         .padding(spacing.space_m)
@@ -560,7 +588,7 @@ mod tests {
         });
         assert_eq!(
             app.retained_outputs.get(&terminal),
-            Some(&RetainedOutput::Unavailable)
+            Some(&RetainedOutput::Discarded)
         );
         // The card keeps its place and its end; nothing asks again.
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
@@ -568,7 +596,7 @@ mod tests {
         drop(app.attach_retained_outputs([card]));
         assert_eq!(
             app.retained_outputs.get(&terminal),
-            Some(&RetainedOutput::Unavailable)
+            Some(&RetainedOutput::Discarded)
         );
     }
 
@@ -584,7 +612,7 @@ mod tests {
         });
         assert_eq!(
             app.retained_outputs.get(&terminal),
-            Some(&RetainedOutput::Unavailable)
+            Some(&RetainedOutput::Unreachable)
         );
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
         // The end is already reported in the card; a missing old screen is
@@ -599,6 +627,27 @@ mod tests {
         app.cards.insert(card, CardRuntime::Loading);
         drop(app.attach_retained_outputs([card]));
         assert!(app.retained_outputs.is_empty());
+    }
+
+    #[test]
+    fn a_second_relaunch_waits_for_the_first() {
+        let (mut app, card, terminal) = restored_ended_card();
+        // Dropping the task never launches anything.
+        drop(app.retry_card(card));
+        let CardKind::Terminal(first) = &app.card_state(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        let first = first.id;
+        assert_ne!(first, terminal);
+        assert!(app.terminal_start_in_flight(card));
+
+        // The same Enter reaching both the final screen and a focused
+        // Restart button must not start, and so tear down, a second one.
+        drop(app.retry_card(card));
+        let CardKind::Terminal(current) = &app.card_state(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        assert_eq!(current.id, first);
     }
 
     #[test]

@@ -6287,6 +6287,9 @@ impl Cagents {
             .card_state(card)
             .is_none_or(|state| !state.existence.is_open())
             || self.chat_start_pending(card)
+            // One relaunch at a time: a second would replace the identity the
+            // first is starting and tear down whatever it launched.
+            || self.terminal_start_in_flight(card)
             || self.refuse_for_deleting_card(card)
         {
             return Task::none();
@@ -6772,9 +6775,8 @@ impl Cagents {
             }
         }
         // An ended card holds no lifecycle slot, so the reconcile below never
-        // brings it up; its final screen is asked for as it comes into view.
-        let retained =
-            self.attach_retained_outputs(visible.union(&prefetch).copied().collect::<Vec<_>>());
+        // brings it up; its final screen is asked for once it is on screen.
+        let retained = self.attach_retained_outputs(visible.iter().copied().collect::<Vec<_>>());
         Task::batch([self.reconcile_lifecycle(&visible, &prefetch), retained])
     }
 
@@ -7556,7 +7558,9 @@ impl Cagents {
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
-            Some(CardRuntime::Completed) => self.ended_terminal_placeholder(ended_terminal(card)),
+            Some(CardRuntime::Completed) => {
+                self.ended_terminal_placeholder(id, ended_terminal(card))
+            }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -7669,7 +7673,7 @@ impl Cagents {
         if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
             // Under the final screen, where the reader's eye already is when
             // the output stops: the last lines it printed stay in view.
-            rows.push(self.ended_terminal_footer(id, session, card_focused));
+            rows.push(self.ended_terminal_footer(id, session));
         }
         let surface: Element<'a, Message> = widget::container(
             widget::column::with_children(rows)
