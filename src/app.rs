@@ -4053,6 +4053,7 @@ impl CardChrome {
 /// Which position-addressed request the inspector asked for.
 #[derive(Debug, Clone, Copy)]
 enum LspRequestKind {
+    Completion,
     Hover,
     Definition,
     References,
@@ -4096,6 +4097,9 @@ struct LspInspectorState {
     failure: Option<String>,
     /// The server's current progress report, if it is still working.
     progress: Option<String>,
+    completion_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
+    editor_hover_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
+    editor_navigation: Option<crate::lsp::LspRequestId>,
 }
 
 impl LspInspectorState {
@@ -4109,6 +4113,9 @@ impl LspInspectorState {
         self.context.hover = None;
         self.context.locations = None;
         self.context.completions.clear();
+        self.completion_request = None;
+        self.editor_hover_request = None;
+        self.editor_navigation = None;
     }
 
     /// Recomputes the single notice the surface renders from the two
@@ -8649,6 +8656,10 @@ impl Cagents {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
                     }
+                    if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                        runtime.set_editor_diagnostics(vec![]);
+                        runtime.dismiss_editor_results();
+                    }
                 }
                 LspIntent::Save { text } => {
                     if let Some(doc) = self.lsp_document(card) {
@@ -8814,11 +8825,40 @@ impl Cagents {
         };
         match event {
             LspEvent::Diagnostics { version, items, .. } => {
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_diagnostics(
+                        if self.lsp.document_version(doc) == Some(version) {
+                            items.clone()
+                        } else {
+                            vec![]
+                        },
+                    );
+                }
                 state.context.diagnostics = items;
                 state.diagnostics_version = Some(version);
             }
-            LspEvent::Completion { items, .. } => state.context.completions = items,
-            LspEvent::Hover { markdown, .. } => state.context.hover = markdown,
+            LspEvent::Completion { request, items, .. } => {
+                if let Some((expected, at)) = state.completion_request
+                    && request == expected
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    && runtime.cursor_position() == Some(at)
+                {
+                    state.completion_request = None;
+                    runtime.set_editor_completions(items.clone());
+                    state.context.completions = items;
+                }
+            }
+            LspEvent::Hover {
+                request, markdown, ..
+            } => {
+                if let Some((expected, at)) = state.editor_hover_request
+                    && request == expected
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                {
+                    runtime.set_editor_hover(markdown.as_deref(), Some(at));
+                }
+                state.context.hover = markdown;
+            }
             LspEvent::Locations { kind, items, .. } => {
                 state.context.locations = Some((kind, items));
             }
@@ -9074,11 +9114,100 @@ impl Cagents {
             return Task::none();
         };
         match kind {
+            LspRequestKind::Completion => {
+                let request = self.lsp.request_completion(doc, at);
+                self.lsp_contexts
+                    .entry(card)
+                    .or_default()
+                    .completion_request = Some((request, at));
+                request
+            }
             LspRequestKind::Hover => self.lsp.request_hover(doc, at),
             LspRequestKind::Definition => self.lsp.request_definition(doc, at),
             LspRequestKind::References => self.lsp.request_references(doc, at),
         };
         Task::none()
+    }
+
+    fn update_editor_lsp(
+        &mut self,
+        card: CardId,
+        action: repository_widget::EditorLspAction,
+    ) -> Task<Message> {
+        use repository_widget::EditorLspAction as Action;
+        match action {
+            Action::Complete => self.request_lsp(card, LspRequestKind::Completion),
+            Action::CompleteAt { doc, version, at }
+                if self.lsp_document(card) == Some(doc)
+                    && self.lsp.document_version(doc) == Some(version)
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at)) =>
+            {
+                self.request_lsp(card, LspRequestKind::Completion)
+            }
+            Action::Hover(at) => {
+                if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                    if let Some((request, _)) = state.editor_hover_request.take() {
+                        self.lsp.cancel(request);
+                    }
+                }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.set_editor_hover(None, at);
+                }
+                if let Some(at) = at
+                    && let Some(doc) = self.lsp_document(card)
+                {
+                    let request = self.lsp.request_hover(doc, at);
+                    self.lsp_contexts
+                        .entry(card)
+                        .or_default()
+                        .editor_hover_request = Some((request, at));
+                }
+                Task::none()
+            }
+            Action::Definition(at) => {
+                let Some(doc) = self.lsp_document(card) else {
+                    return Task::none();
+                };
+                let at = at.or_else(|| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.cursor_position(),
+                    _ => None,
+                });
+                if let Some(at) = at {
+                    let request = self.lsp.request_definition(doc, at);
+                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(request);
+                }
+                Task::none()
+            }
+            Action::Diagnostics => {
+                self.context_inspector_open = true;
+                Task::none()
+            }
+            Action::References => {
+                self.context_inspector_open = true;
+                self.request_lsp(card, LspRequestKind::References)
+            }
+            Action::Choose { index, label } => {
+                let task = self.apply_lsp_completion(card, index, &label);
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                    runtime.dismiss_editor_results();
+                }
+                task
+            }
+            Action::Next(_) | Action::Dismiss => {
+                if matches!(action, Action::Dismiss) {
+                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                        state.invalidate_answers();
+                    }
+                }
+                match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        repository_task(runtime.update(RepositoryAction::Language { card, action }))
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Action::CompleteAt { .. } => Task::none(),
+        }
     }
 
     fn flush_pending_panel_open(&mut self, card: CardId) -> Task<Message> {
@@ -11640,6 +11769,9 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::MarkdownLink { card, uri }) => {
                 self.open_document_link(Some(card), &uri)
             }
+            Message::Repository(RepositoryAction::Language { card, action }) => {
+                self.update_editor_lsp(card, action)
+            }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
@@ -11708,6 +11840,16 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                let completion_character = match &action {
+                    RepositoryAction::EditorAction {
+                        action:
+                            repository_widget::EditorAction::Edit(
+                                repository_widget::EditorEdit::Insert(character),
+                            ),
+                        ..
+                    } => Some(*character),
+                    _ => None,
+                };
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 let saved = matches!(
@@ -11743,6 +11885,25 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if let Some(character) = completion_character
+                    && let Some(doc) = self.lsp_document(card)
+                    && self.lsp.completion_trigger(doc, character)
+                    && let Some(version) = self.lsp.document_version(doc)
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    && let Some(at) = runtime.cursor_position()
+                {
+                    tasks.push(cosmic::task::future(async move {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Message::Repository(RepositoryAction::Language {
+                            card,
+                            action: repository_widget::EditorLspAction::CompleteAt {
+                                doc,
+                                version,
+                                at,
+                            },
+                        })
+                    }));
+                }
                 let selected_view = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime))
                         if runtime.descriptor.selected_file.is_some() =>
@@ -13532,7 +13693,39 @@ impl Application for Cagents {
                 self.reset_settings()
             }
             Message::Lsp(event) => {
+                let navigation = if let LspEvent::Locations {
+                    doc,
+                    kind: crate::lsp::LocationKind::Definition,
+                    items,
+                    request,
+                    ..
+                } = &event
+                {
+                    self.lsp_documents.get(doc).copied().and_then(|card| {
+                        let state = self.lsp_contexts.get_mut(&card)?;
+                        if state.editor_navigation != Some(*request) {
+                            return None;
+                        }
+                        state.editor_navigation = None;
+                        Some((card, items.clone()))
+                    })
+                } else {
+                    None
+                };
                 self.apply_lsp_event(event);
+                if let Some((card, locations)) = navigation {
+                    if locations.len() == 1
+                        && let crate::lsp::LspTarget::Workspace { path } = &locations[0].target
+                    {
+                        return self.jump_to_lsp_location(
+                            card,
+                            path.clone(),
+                            locations[0].range.start,
+                            locations[0].coordinates,
+                        );
+                    }
+                    self.context_inspector_open = true;
+                }
                 Task::none()
             }
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
