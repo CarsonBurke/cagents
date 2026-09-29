@@ -105,8 +105,9 @@ Every shortcut is configurable; see
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Activate panes on hover** is on by default and changes focus without
-  scrolling; turn it off in Settings to require a click.
+- **Activate panes on hover** is off by default. Turn it on in Settings to
+  activate a pane, without scrolling, after the pointer moves into it and stays
+  there for a moment. Typing or clicking before then keeps focus where it is.
 - Switching worktrees remembers each strip's scroll position and focused
   pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree
