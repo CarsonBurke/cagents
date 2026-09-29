@@ -17256,6 +17256,7 @@ mod tests {
             let mut element = frame(&app);
             NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
             tree.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut tree);
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
@@ -17395,6 +17396,7 @@ mod tests {
                 *named.borrow_mut() = state.take_all_named();
             });
             state.diff(element.as_widget_mut());
+            iced::runtime::user_interface::restore_cached_named_states(&mut state);
             let node = element.as_widget_mut().layout(
                 &mut state,
                 &renderer,
@@ -18205,6 +18207,7 @@ mod tests {
             *named.borrow_mut() = tree.take_all_named();
         });
         tree.diff(element.as_widget_mut());
+        iced::runtime::user_interface::restore_cached_named_states(tree);
         let node = element.as_widget_mut().layout(
             tree,
             renderer,
@@ -22787,6 +22790,36 @@ mod tests {
         app.settings_reset_confirm = true;
         drop(app.update(next()));
         assert_eq!(app.workspace.focused(), Some(ids[2]));
+    }
+
+    #[test]
+    fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+        assert!(runtime.selected_staging_selection(true).is_some());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let key = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("s".into()),
+                modified_key: keyboard::Key::Character("S".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                text: None,
+                repeat: false,
+            },
+            captured: false,
+        };
+        assert!(matches!(
+            task_app_message(app.update(key())),
+            Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
+                if id == card
+        ));
+        app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
+        drop(app.update(key()));
+        assert!(app.palette.is_open());
     }
 
     #[test]
