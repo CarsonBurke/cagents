@@ -13,6 +13,8 @@ use std::sync::{
 };
 
 mod completion;
+mod prose;
+mod retained;
 mod scroll;
 mod step;
 mod tool_text;
@@ -427,7 +429,7 @@ fn tail_digest(seed: u64, text: &str) -> u64 {
 /// changed must therefore not touch its body: the window holds up to 128 items
 /// and a long answer is megabytes. The content's shape, its field lengths, and
 /// a bounded tail digest answer that question in constant time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ChangeToken {
     /// The content variant plus the flags that sit beside its text.
     shape: u8,
@@ -759,11 +761,11 @@ struct CachedItem {
     token: ChangeToken,
     markdown: markdown::Content,
     code: CodeScan,
-    /// The highlighted spans of each fenced block the Markdown parsed, keyed
-    /// by the block's language and text: what a frame looks a block up by.
-    /// The palette is the runtime's, applied when the block is highlighted,
-    /// so a change of syntax theme rehighlights rather than restyles.
-    blocks: HashMap<u64, crate::diff_view::SyntaxLines>,
+    /// Each fenced block the Markdown parsed, ready to draw, keyed by the
+    /// block's language and text: what a frame looks a block up by. The
+    /// palette is the runtime's, applied when the block is highlighted, so a
+    /// change of syntax theme rehighlights rather than restyles.
+    blocks: HashMap<u64, prose::CodeBlock>,
     /// A step's trailing metadata — exit status and duration — formed once per
     /// change rather than once per frame.
     detail: Option<String>,
@@ -917,22 +919,19 @@ impl CachedItem {
     /// agent pasted rather than a snippet it is showing.
     const HIGHLIGHT_LIMIT: usize = 64 * 1024;
 
-    /// Highlights every fenced block the Markdown now holds, keeping the
-    /// spans of blocks that are unchanged since the last pass. A streamed
-    /// block changes on every refresh until its fence closes, so it is the
-    /// one block a refresh usually rehighlights.
+    /// Prepares every fenced block the Markdown now holds, keeping the blocks
+    /// that are unchanged since the last pass. A streamed block changes on
+    /// every refresh until its fence closes, so it is the one block a
+    /// refresh usually prepares again.
     fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         let mut previous = std::mem::take(&mut self.blocks);
         let mut blocks = HashMap::new();
         for_each_fence(self.markdown.items(), &mut |language, code| {
-            if code.len() > Self::HIGHLIGHT_LIMIT {
-                return;
-            }
-            let key = fence_key(language, code);
-            let spans = previous
+            let key = fence_key(language.unwrap_or_default(), code);
+            let block = previous
                 .remove(&key)
-                .unwrap_or_else(|| crate::diff_view::highlight_snippet(code, language, theme));
-            blocks.insert(key, spans);
+                .unwrap_or_else(|| prose::CodeBlock::new(language, code, theme));
+            blocks.insert(key, block);
         });
         self.blocks = blocks;
     }
@@ -944,27 +943,23 @@ impl CachedItem {
         self.highlight(theme);
     }
 
-    /// The highlighted lines of the fence whose info string is `language`
-    /// and whose text is `code`, where the cache holds them.
-    fn block(&self, language: Option<&str>, code: &str) -> Option<&crate::diff_view::SyntaxLines> {
-        self.blocks.get(&fence_key(language?, code))
+    /// The fence whose info string is `language` and whose text is `code`,
+    /// where the cache holds it.
+    fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
+        self.blocks
+            .get(&fence_key(language.unwrap_or_default(), code))
     }
 }
 
-/// Visits every fenced block among `items` that names a language, in the
-/// order the Markdown draws them, descending into lists and quotes the way
-/// the drawing does.
+/// Visits every fenced block among `items`, in the order the Markdown draws
+/// them, descending into lists and quotes the way the drawing does.
 fn for_each_fence<'a>(
     items: impl IntoIterator<Item = &'a markdown::Item>,
-    visit: &mut impl FnMut(&'a str, &'a str),
+    visit: &mut impl FnMut(Option<&'a str>, &'a str),
 ) {
     for item in items {
         match item {
-            markdown::Item::CodeBlock {
-                language: Some(language),
-                code,
-                ..
-            } => visit(language, code),
+            markdown::Item::CodeBlock { language, code, .. } => visit(language.as_deref(), code),
             markdown::Item::List { bullets, .. } => {
                 for bullet in bullets {
                     let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
@@ -986,72 +981,6 @@ fn fence_key(language: &str, code: &str) -> u64 {
     language.hash(&mut hasher);
     code.hash(&mut hasher);
     hasher.finish()
-}
-
-/// The transcript's Markdown, drawn with the shell's own code blocks.
-///
-/// Everything but a fenced block is iced's rendering; a fence is drawn from
-/// its cached highlighting on the sunken surface commands and outputs use, in
-/// the palette the editor's syntax theme chose for the current appearance.
-struct Prose<'a> {
-    cached: &'a CachedItem,
-}
-
-impl<'a> Prose<'a> {
-    fn view(cached: &'a CachedItem, settings: markdown::Settings) -> Element<'a, Message> {
-        markdown::view_with(cached.markdown.items(), settings, &Self { cached })
-    }
-}
-
-impl<'a> markdown::Viewer<'a, Message, cosmic::Theme, cosmic::Renderer> for Prose<'a> {
-    fn on_link_click(uri: markdown::Uri) -> Message {
-        action(Action::OpenUrl(uri.to_string()))
-    }
-
-    fn code_block(
-        &self,
-        settings: markdown::Settings,
-        language: Option<&'a str>,
-        code: &'a str,
-        _lines: &'a [markdown::Text],
-    ) -> Element<'a, Message> {
-        let palette = self
-            .cached
-            .block(language, code)
-            .map(|lines| &lines[usize::from(cosmic::theme::is_dark())]);
-        let rows: Vec<Element<'a, Message>> = code
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let spans = palette
-                    .and_then(|lines| lines.get(index))
-                    .map_or(&[][..], Vec::as_slice);
-                let line: Element<'a, Message> =
-                    iced::widget::rich_text(crate::diff_view::syntax_spans(line, spans))
-                        .font(settings.style.code_block_font)
-                        .size(settings.code_size)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into();
-                line
-            })
-            .collect();
-        widget::container(
-            widget::scrollable(
-                widget::container(widget::column::with_children(rows))
-                    .padding([step::GAP_S as u16, step::GAP_M as u16]),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            )),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_S; 4],
-            true,
-        ))
-        .width(Length::Fill)
-        .into()
-    }
 }
 
 /// Provider snapshots also cover restored chats and prompts sent through the
@@ -8932,58 +8861,40 @@ mod tests {
     }
 
     /// A fence that names its language is highlighted in both of the
-    /// editor's palettes the moment it is cached, and looked up by exactly
-    /// what the Markdown hands the viewer; a fence without one is left to
-    /// draw plain rather than guessed at.
+    /// editor's palettes the moment it is cached, as one paragraph whose lines
+    /// are joined the way the fence wrote them, and looked up by exactly what
+    /// the Markdown hands the renderer; a fence without one is cached to draw
+    /// plain rather than guessed at.
     #[test]
     fn a_named_fence_is_highlighted_in_both_palettes() {
         const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
         let cached = CachedItem::new(
-            &text(
-                "```rust
-fn main() {}
-```
-
-```
-plain
-```
-",
-            ),
+            &text("```rust\nfn main() {}\nlet x = 1;\n```\n\n```\nplain\n```\n"),
             THEME,
         );
-        let lines = cached
-            .block(
-                Some("rust"),
-                "fn main() {}
-",
-            )
-            .expect("the Rust fence is highlighted");
-        for palette in lines {
-            assert_eq!(palette.len(), 1, "one line of spans per line of code");
+        let text_of = |spans: &[iced::widget::text::Span<'static>]| {
+            spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>()
+        };
+        let block = cached
+            .block(Some("rust"), "fn main() {}\nlet x = 1;\n")
+            .expect("the Rust fence is cached");
+        for dark in [false, true] {
+            let spans = block.spans(dark);
+            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;");
             assert!(
-                crate::diff_view::syntax_spans("fn main() {}", &palette[0])
-                    .iter()
-                    .any(|span| span.color.is_some()),
+                spans.iter().any(|span| span.color.is_some()),
                 "a keyword takes a color"
             );
         }
-        assert!(
-            cached
-                .block(
-                    None, "plain
-"
-                )
-                .is_none()
-        );
-        assert!(
-            cached
-                .block(
-                    Some("rust"),
-                    "fn other() {}
-"
-                )
-                .is_none()
-        );
+        let plain = cached
+            .block(None, "plain\n")
+            .expect("an unnamed fence is cached too");
+        assert_eq!(text_of(plain.spans(true)), "plain");
+        assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
+        assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
     }
 
     /// The token is what licenses reusing a parse, so it must refuse anything

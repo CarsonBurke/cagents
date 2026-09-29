@@ -17,28 +17,14 @@
 
 use super::super::*;
 use super::Place;
-use cosmic::iced::advanced::renderer::Headless;
 use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
-use cosmic::iced::{Font, Pixels, Size, mouse};
+use cosmic::iced::{Size, mouse};
 use std::time::{Duration, Instant};
 
 const FRAMES: usize = 240;
 /// What one 50 ms presentation frame of a streaming answer adds.
 const CHUNK: &str = "streamed words arrive in small appended pieces, ";
 const WINDOW: Size = Size::new(960.0, 1_200.0);
-
-fn renderer() -> cosmic::Renderer {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("executor")
-        .block_on(cosmic::Renderer::new(
-            Font::default(),
-            Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .expect("a headless renderer")
-}
 
 fn answer(turn: usize) -> String {
     let mut text = format!(
@@ -83,7 +69,7 @@ fn prose(text: String, thinking: bool, phase: chat::Phase) -> ItemContent {
 
 /// Sixteen exchanges of eight items: a prompt, reasoning, four commands with
 /// output, narration, and an answer with two fenced blocks.
-fn transcript(turns: usize) -> Vec<chat::Item> {
+pub(super) fn transcript(turns: usize) -> Vec<chat::Item> {
     let mut items = Vec::new();
     for turn in 0..turns {
         items.push(item(
@@ -168,7 +154,8 @@ fn a_streaming_frame_of_a_full_window() {
     }
 }
 
-fn measure(turns: usize) {
+/// A live runtime showing `items`, and the handle that publishes to it.
+pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
     let account = Account::system(Provider::Claude);
     let session = fresh_chat_session(
         Provider::Claude,
@@ -177,11 +164,9 @@ fn measure(turns: usize) {
         &account,
     )
     .expect("a session");
-    let mut items = transcript(turns);
-    let streaming = items.len() - 1;
     let base = Snapshot {
         ready: true,
-        items: items.clone(),
+        items: items.to_vec(),
         ..Snapshot::default()
     };
     let handle = Arc::new(ClientHandle::fixture(session.clone(), base));
@@ -189,15 +174,22 @@ fn measure(turns: usize) {
         card: CardId::new(),
         generation: 1,
     };
-    let mut runtime = Runtime::new(
+    let runtime = Runtime::new(
         target,
         session,
         Connection::Live(handle.clone()),
         true,
         crate::settings::EditorSyntaxTheme::default(),
     );
+    (runtime, handle)
+}
+
+fn measure(turns: usize) {
+    let mut items = transcript(turns);
+    let streaming = items.len() - 1;
+    let (mut runtime, handle) = live_runtime(&items);
     let theme = cosmic::Theme::dark();
-    let mut renderer = renderer();
+    let mut renderer = crate::app::tests::headless_renderer();
     let mut cache = Cache::new();
     let (mut update, mut view, mut layout, mut draw) = (
         Stage::default(),

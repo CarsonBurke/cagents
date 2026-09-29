@@ -279,18 +279,21 @@ impl Runtime {
     /// this only reads it: resolving it here on every frame is what made a
     /// strip the reader was reading spring shut the instant its last step
     /// finished.
+    ///
+    /// `steps` draws the rows of an open strip, and is only asked for them
+    /// when the strip is open.
     pub(super) fn step_strip<'a>(
-        &'a self,
-        key: &'a str,
-        turn: &'a turn::Turn,
-        settings: markdown::Settings,
+        &self,
+        turn: &turn::Turn,
+        steps: impl FnOnce() -> Vec<Element<'a, Message>>,
     ) -> Element<'a, Message> {
         let target = self.target;
+        let key = turn.key.as_str();
         // Every rendered group has a record, written when the group was first
         // seen. This fallback is the same value that record was seeded with,
         // so the two cannot disagree.
         let open = self.opened.get(key).copied().unwrap_or(turn.running);
-        let mut line: Vec<Element<'a, Message>> = vec![
+        let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(if open {
                 "pan-down-symbolic"
             } else {
@@ -306,7 +309,7 @@ impl Runtime {
             }
             None => None,
         };
-        line.push(design::caption(turn.summary.as_str()).into());
+        line.push(design::caption(turn.summary.clone()).into());
         // How long this stretch of work has taken. It is measured as the view
         // is built rather than stored on the group, so a running group's label
         // advances with the frames the arriving provider items already cause
@@ -340,16 +343,7 @@ impl Runtime {
         if !open {
             return header.into();
         }
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
-        for placed in &turn.steps {
-            let Some(item) = self.snapshot.items.get(placed.index) else {
-                continue;
-            };
-            let Some(cached) = self.cache.get(&item.id) else {
-                continue;
-            };
-            rows.push(self.step_view(item, cached, settings));
-        }
+        let rows = steps();
         widget::column::with_children(vec![
             header.into(),
             // One hairline beside the rows rather than a border on each of
@@ -392,11 +386,36 @@ impl Runtime {
         cached: &'a CachedItem,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
-        let target = self.target;
         let open = self.expanded.contains(&item.id);
+        let header = self.step_header(item, cached, open);
+        if !open {
+            return header;
+        }
+        let detail = self.step_detail(item, cached, settings);
+        widget::column::with_children(vec![
+            header,
+            widget::container(detail)
+                .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(GAP_XS)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// A step's summary line, which is the whole of a closed step and owns
+    /// what it draws, so a finished exchange can keep it between frames.
+    pub(super) fn step_header(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        open: bool,
+    ) -> Element<'static, Message> {
+        let target = self.target;
         let verb = turn::step_verb(&item.content);
         let label = turn::step_label(&item.content);
-        let mut line: Vec<Element<'a, Message>> = vec![
+        let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(if open {
                 "pan-down-symbolic"
             } else {
@@ -418,7 +437,7 @@ impl Runtime {
         // the outcome beside it: a pane is often narrow, and a row whose end
         // is hidden is a row the reader cannot check.
         if matches!(item.content, ItemContent::Tool { .. }) {
-            let mut preview = vec![design::body(label).into()];
+            let mut preview = vec![design::body(label.to_owned()).into()];
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
@@ -432,7 +451,7 @@ impl Runtime {
             line.push(cached.preview.view());
         }
         if let Some(detail) = &cached.detail {
-            line.push(design::caption(detail.as_str()).into());
+            line.push(design::caption(detail.clone()).into());
         }
         let name = if verb.is_empty() {
             label.to_owned()
@@ -449,20 +468,7 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        if !open {
-            return header.into();
-        }
-        let detail = self.step_detail(item, cached, settings);
-        widget::column::with_children(vec![
-            header.into(),
-            widget::container(detail)
-                .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(GAP_XS)
-        .width(Length::Fill)
-        .into()
+        header.into()
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
@@ -479,7 +485,7 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
             ItemContent::Text { .. } => {
-                rows.push(Prose::view(cached, settings));
+                rows.push(prose::view(cached, settings));
             }
             ItemContent::Command {
                 working_directory,
