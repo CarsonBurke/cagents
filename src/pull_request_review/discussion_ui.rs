@@ -1064,6 +1064,37 @@ impl State {
             || self.composer_on(path, old, new, leading)
     }
 
+    /// How many discussions, counting an open composer, are anchored to a
+    /// line in `old` or `new`, so a diff that folds those lines away can say
+    /// what it is hiding. Costs one pass over the file's anchored lines.
+    pub fn discussions_within(
+        &self,
+        path: &str,
+        old: std::ops::RangeInclusive<u32>,
+        new: std::ops::RangeInclusive<u32>,
+    ) -> usize {
+        use crate::github::ReviewDiffSide::{Left, Right};
+        let within = |side, line: u64| {
+            let range = match side {
+                Left => &old,
+                Right => &new,
+            };
+            u32::try_from(line).is_ok_and(|line| range.contains(&line))
+        };
+        let threads = self.discussion.threads.get(path).map_or(0, |file| {
+            file.lines
+                .iter()
+                .filter(|((side, line), _)| within(*side, *line))
+                .map(|(_, threads)| threads.len())
+                .sum()
+        });
+        let composer = self.discussion.composer.as_ref().is_some_and(|composer| {
+            matches!(&composer.destination, Destination::Line(anchor)
+                if anchor.path == path && within(anchor.side, anchor.line))
+        });
+        threads + usize::from(composer)
+    }
+
     /// Natural-height content; the diff measures this before reserving space.
     pub fn annotation<'a>(
         &'a self,

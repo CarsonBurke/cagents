@@ -14,7 +14,7 @@ use std::{
 mod text_editor;
 
 mod diff_layout;
-use diff_layout::RowOffsets;
+use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
@@ -544,6 +544,19 @@ pub enum RepositoryAction {
     RevealDiffTop {
         card: CardId,
     },
+    /// Reveals rows of a folded run of unchanged lines. `run` is the rows
+    /// that run held in `mode` when the fold was drawn: a fold index names a
+    /// run of one model, and a rebuilt model may number its runs differently.
+    /// Anything else may change in between; a second click lands as a second
+    /// reveal, as a reader clicking twice expects.
+    ExpandDiffFold {
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        mode: DiffMode,
+        fold: usize,
+        run: Range<usize>,
+        expansion: FoldExpansion,
+    },
     MarkdownLink {
         card: CardId,
         uri: markdown::Uri,
@@ -626,6 +639,7 @@ impl RepositoryAction {
             | Self::PdfPageRendered { card, .. } => *card,
             Self::ReviewLine { identity, .. }
             | Self::DiffAnnotations { identity, .. }
+            | Self::ExpandDiffFold { identity, .. }
             | Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
@@ -1525,19 +1539,19 @@ enum DiffState {
         request: u64,
         cancellation: CancellationToken,
     },
-    Ready(RenderedDiff, [RowOffsets; 2]),
+    Ready(RenderedDiff, DiffLayout),
 }
 
 impl DiffState {
     fn ready(content: RenderedDiff) -> Self {
-        let rows = [DiffMode::Inline, DiffMode::Split].map(|mode| {
-            let count = match &content {
-                RenderedDiff::Text { model, .. } => model.row_count(mode),
-                _ => 0,
-            };
-            RowOffsets::uniform(count, DIFF_ROW_HEIGHT)
-        });
-        Self::Ready(content, rows)
+        let layout = DiffLayout::new(
+            match &content {
+                RenderedDiff::Text { model, .. } => Some(model),
+                _ => None,
+            },
+            DIFF_ROW_HEIGHT,
+        );
+        Self::Ready(content, layout)
     }
 }
 
@@ -1628,12 +1642,37 @@ struct ListViewport {
     height: f32,
 }
 
+/// Which rows of a folded run of unchanged lines to reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldExpansion {
+    /// The run's first rows, continuing the content above the fold.
+    Down,
+    /// The run's last rows, leading into the content below the fold.
+    Up,
+    All,
+}
+
+/// A logical diff position. `row` is in model rows, not display rows, so
+/// neither expanding a fold nor rebuilding the model can move it.
 #[derive(Debug, Clone, Copy, Default)]
 struct DiffViewportAnchor {
     offset: f32,
     row: Option<diff_layout::Anchor>,
     horizontal: f32,
     change: usize,
+    /// A comparison opened for the first time: show its first change, with
+    /// context, as soon as its rows exist.
+    first_change: bool,
+}
+
+impl DiffViewportAnchor {
+    const FIRST_CHANGE: Self = Self {
+        offset: 0.0,
+        row: None,
+        horizontal: 0.0,
+        change: 0,
+        first_change: true,
+    };
 }
 
 /// Scroll coordinates only: the selected document remains the sole live buffer.
@@ -3541,6 +3580,7 @@ impl RepositoryRuntime {
             .as_ref()
             .is_some_and(|active| active.cancellation.is_cancelled());
         self.working_diff.active = None;
+        let mut installed = false;
         let completed = Some((identity.generation, revision, Arc::clone(&before)));
         if !cancelled
             && self.accepts_selected(&identity)
@@ -3572,6 +3612,7 @@ impl RepositoryRuntime {
                         }),
                     );
                     self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
+                    installed = true;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -3580,7 +3621,13 @@ impl RepositoryRuntime {
                 }
             }
         }
-        self.working_diff_task(identity.card)
+        let next = self.working_diff_task(identity.card);
+        // A rebuild re-anchors the viewport in rows of the new model; a
+        // mounted comparison has to be moved to match.
+        if installed && self.source_surface == SourceSurface::Diff {
+            return Task::batch([next, self.restore_visible_scroll()]);
+        }
+        next
     }
 
     fn file_has_basis(&self, file: &RepositoryFile, basis: &DiffBasis) -> bool {
@@ -4709,10 +4756,19 @@ impl RepositoryRuntime {
                 }
                 self.capture_native_viewport();
                 self.capture_diff_viewport();
-                let previous = self.current_diff_viewport();
+                let mut previous = self.current_diff_viewport();
+                // On the first visit to the other layout, keep the same line
+                // on screen: the layouts number their rows differently.
+                // Subsequent visits restore that layout independently.
+                if let Some(model) = self.diff_model()
+                    && let Some(diff_layout::Anchor::Row { row, fraction }) = previous.row
+                {
+                    previous.row = Some(diff_layout::Anchor::Row {
+                        row: corresponding_row((model, self.diff_mode), row, (model, mode)),
+                        fraction,
+                    });
+                }
                 self.diff_mode = mode;
-                // On the first visit to the other layout, retain the approximate
-                // location. Subsequent visits restore that layout independently.
                 let anchor = self.viewports.diff[self.diff_mode_index()].unwrap_or(previous);
                 self.apply_diff_viewport(anchor);
                 self.restore_native_viewport();
@@ -4965,11 +5021,31 @@ impl RepositoryRuntime {
                 self.apply_diff_viewport(DiffViewportAnchor {
                     offset: 0.0,
                     row: Some(diff_layout::Anchor::Leading(0.0)),
+                    first_change: false,
                     horizontal: self.diff_horizontal,
                     change: self.diff_change,
                 });
                 self.capture_diff_viewport();
                 Task::batch([surface, self.restore_visible_scroll()])
+            }
+            RepositoryAction::ExpandDiffFold {
+                identity,
+                basis,
+                mode,
+                fold,
+                run,
+                expansion,
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.diff_basis != basis
+                    || !self.can_change_diff_layout()
+                    || self
+                        .diff_model()
+                        .is_none_or(|model| model.unchanged_runs(mode).get(fold) != Some(&run))
+                {
+                    return Task::none();
+                }
+                self.expand_diff_fold(fold, expansion)
             }
             RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
@@ -5013,9 +5089,35 @@ impl RepositoryRuntime {
             .map(|(_, state)| state)
     }
 
-    fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+    fn set_diff_state(&mut self, basis: DiffBasis, mut state: DiffState) {
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
+        // The rows on screen before a rebuild, which a rebuild must not move:
+        // display rows and pixel offsets both change meaning with the model.
+        let mut rebuilt = None;
+        if restores_current
+            && let Some(previous) = self.diff_model()
+            && let Some(DiffState::Ready(_, previous_layout)) = self.diff_state(&basis)
+            && let DiffState::Ready(RenderedDiff::Text { model, .. }, layout) = &mut state
+        {
+            // What the reader unfolded survives whatever the viewport awaits.
+            layout.carry_reveals(model, (previous, previous_layout));
+            // A pending anchor is logical and is applied below as it stands.
+            if self.pending_diff_anchor.is_none() {
+                let mut anchor = self.current_diff_viewport();
+                if let Some(diff_layout::Anchor::Row { row, fraction }) = anchor.row {
+                    anchor.row = Some(diff_layout::Anchor::Row {
+                        row: corresponding_row(
+                            (previous, self.diff_mode),
+                            row,
+                            (model, self.diff_mode),
+                        ),
+                        fraction,
+                    });
+                }
+                rebuilt = Some(anchor);
+            }
+        }
         match self
             .diffs
             .iter_mut()
@@ -5027,12 +5129,19 @@ impl RepositoryRuntime {
                 self.prune_committed_diffs();
             }
         }
-        if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
+        if let Some(mut anchor) = rebuilt {
+            anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
+            self.apply_diff_viewport(anchor);
+        } else if restores_current && let Some(mut anchor) = self.pending_diff_anchor {
             anchor.change = anchor.change.min(self.change_count().saturating_sub(1));
             self.apply_diff_viewport(anchor);
             // Leading threads may not be measured yet; retain their logical
             // anchor until the first annotation projection or actual scroll.
-            self.pending_diff_anchor = Some(anchor);
+            // A first visit resolves itself, and is only held while it sits
+            // at the top, above which file-level threads may still appear.
+            if !anchor.first_change {
+                self.pending_diff_anchor = Some(anchor);
+            }
         }
     }
 
@@ -5165,7 +5274,9 @@ impl RepositoryRuntime {
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = basis.clone();
         self.committed_selection = Some((basis.clone(), old_path.clone()));
-        self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
+        self.apply_diff_viewport(
+            self.viewports.diff[self.diff_mode_index()].unwrap_or(DiffViewportAnchor::FIRST_CHANGE),
+        );
         let identity = self.next_identity(card, path);
         self.request_diff(identity, basis, old_path)
     }
@@ -5222,7 +5333,9 @@ impl RepositoryRuntime {
         self.document = DocumentState::Loading;
         self.diffs.clear();
         self.basis_resolution = None;
-        self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
+        self.apply_diff_viewport(
+            self.viewports.diff[self.diff_mode_index()].unwrap_or(DiffViewportAnchor::FIRST_CHANGE),
+        );
         self.diff_basis = if file.unstaged {
             DiffBasis::IndexToWorktree
         } else {
@@ -5246,13 +5359,17 @@ impl RepositoryRuntime {
         if let Some(anchor) = self.pending_diff_anchor {
             return anchor;
         }
+        let mode = self.diff_mode;
         DiffViewportAnchor {
             offset: self.diff_viewport.offset,
-            row: self
-                .diff_rows()
-                .map(|rows| rows.anchor(self.diff_viewport.offset)),
+            row: self.diff_layout().map(|layout| {
+                layout
+                    .folded(mode)
+                    .to_model(layout.rows(mode).anchor(self.diff_viewport.offset))
+            }),
             horizontal: self.diff_horizontal,
             change: self.diff_change,
+            first_change: false,
         }
     }
 
@@ -5262,23 +5379,67 @@ impl RepositoryRuntime {
     }
 
     fn apply_diff_viewport(&mut self, anchor: DiffViewportAnchor) {
+        if anchor.first_change {
+            self.diff_horizontal = anchor.horizontal;
+            self.diff_change = 0;
+            let offset = self.first_change_offset();
+            // Until the comparison has rows, the first change has no place;
+            // at the top, file-level threads measured later belong above it.
+            self.pending_diff_anchor = offset.is_none_or(|offset| offset == 0.0).then_some(anchor);
+            self.diff_viewport.offset = offset.unwrap_or(0.0);
+            return;
+        }
         let awaiting_geometry = anchor.row.is_some()
             && self.diff_rows().is_none_or(|rows| {
                 matches!(anchor.row, Some(diff_layout::Anchor::Leading(_)))
                     && rows.leading_height() == 0.0
             });
         self.pending_diff_anchor = awaiting_geometry.then_some(anchor);
-        self.diff_viewport.offset = anchor
-            .row
-            .zip(self.diff_rows())
-            .map_or(anchor.offset, |(anchor, rows)| rows.restore(anchor));
+        let mode = self.diff_mode;
+        self.diff_viewport.offset =
+            anchor
+                .row
+                .zip(self.diff_layout())
+                .map_or(anchor.offset, |(anchor, layout)| {
+                    let offset = layout
+                        .rows(mode)
+                        .restore(layout.folded(mode).to_display(anchor));
+                    self.reachable_diff_offset(layout.rows(mode), offset)
+                });
         self.diff_horizontal = anchor.horizontal;
         self.diff_change = anchor.change;
     }
 
+    /// Where a first visit to the current comparison starts: its first
+    /// change, below its [`diff_layout::FOLD_CONTEXT`] rows of context and
+    /// the row before them, which is the fold when one precedes the context,
+    /// so the reader sees what was folded away. A change that close to the
+    /// top starts at the top, which keeps any file-level review threads above
+    /// the first row in view. `None` while the comparison is still loading.
+    fn first_change_offset(&self) -> Option<f32> {
+        let (model, layout) = match self.diff_state(&self.diff_basis)? {
+            DiffState::Ready(RenderedDiff::Text { model, .. }, layout) => (model, layout),
+            DiffState::Ready(..) => return Some(0.0),
+            DiffState::Loading { .. } => return None,
+        };
+        let Some(&first) = model.change_starts(self.diff_mode).first() else {
+            return Some(0.0);
+        };
+        let row = layout
+            .folded(self.diff_mode)
+            .display(first)
+            .saturating_sub(diff_layout::FOLD_CONTEXT + 1);
+        let rows = layout.rows(self.diff_mode);
+        Some(if row == 0 {
+            0.0
+        } else {
+            self.reachable_diff_offset(rows, rows.offset(row))
+        })
+    }
+
     fn reset_diff_viewports(&mut self) {
         self.viewports.diff = [None; 2];
-        self.apply_diff_viewport(DiffViewportAnchor::default());
+        self.apply_diff_viewport(DiffViewportAnchor::FIRST_CHANGE);
     }
 
     /// The editable buffer's scroll position, retained while a surface that
@@ -5398,11 +5559,15 @@ impl RepositoryRuntime {
         }
     }
 
-    fn diff_rows(&self) -> Option<&RowOffsets> {
+    fn diff_layout(&self) -> Option<&DiffLayout> {
         match self.diff_state(&self.diff_basis) {
-            Some(DiffState::Ready(_, rows)) => Some(&rows[self.diff_mode_index()]),
+            Some(DiffState::Ready(_, layout)) => Some(layout),
             _ => None,
         }
+    }
+
+    fn diff_rows(&self) -> Option<&RowOffsets> {
+        self.diff_layout().map(|layout| layout.rows(self.diff_mode))
     }
 
     /// Installs measured review blocks for the active comparison. The caller
@@ -5416,15 +5581,14 @@ impl RepositoryRuntime {
         measurements: &[(usize, f32)],
     ) -> Task<RepositoryAction> {
         let anchor = self.current_diff_viewport();
-        let index = usize::from(mode == DiffMode::Split);
-        let Some((_, DiffState::Ready(_, rows))) = self
+        let Some((_, DiffState::Ready(_, layout))) = self
             .diffs
             .iter_mut()
             .find(|(basis, _)| *basis == self.diff_basis)
         else {
             return Task::none();
         };
-        let changed = rows[index].annotate(leading, measurements);
+        let changed = layout.rows_mut(mode).annotate(leading, measurements);
         if mode != self.diff_mode || (!changed && self.pending_diff_anchor.is_none()) {
             return Task::none();
         }
@@ -5439,34 +5603,86 @@ impl RepositoryRuntime {
             .map_or(0, |model| model.change_starts(self.diff_mode).len())
     }
 
+    /// The offset that puts the current change at the top of the viewport.
+    /// Changes are never folded, so the change's own row is always drawn.
+    fn current_change_offset(&self) -> Option<f32> {
+        let row = *self
+            .diff_model()?
+            .change_starts(self.diff_mode)
+            .get(self.diff_change)?;
+        let layout = self.diff_layout()?;
+        let rows = layout.rows(self.diff_mode);
+        Some(self.reachable_diff_offset(
+            rows,
+            rows.offset(layout.folded(self.diff_mode).display(row)),
+        ))
+    }
+
+    /// `offset` limited to what the scrollable can actually reach. Folding
+    /// makes comparisons short, so a change near the end is often less than
+    /// a viewport from the bottom. The scrollable clamps a jump there on its
+    /// own, but virtualization reads this runtime offset: left unclamped, it
+    /// mounts rows below the ones on screen and the viewport draws blank.
+    fn reachable_diff_offset(&self, rows: &RowOffsets, offset: f32) -> f32 {
+        let height = self.diff_viewport.height;
+        if !(height.is_finite() && height > 0.0) {
+            return offset;
+        }
+        // The column ends with the horizontal thumb's rail.
+        let content = rows.total_height() + crate::design::SCROLLBAR_GUTTER;
+        offset.min((content - height).max(0.0))
+    }
+
     fn realize_current_change(&mut self) {
-        let row = self
-            .diff_model()
-            .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
-            .copied();
-        if let Some(row) = row {
-            self.diff_viewport.offset = self.diff_rows().map_or(0.0, |rows| rows.offset(row));
+        // An explicit step supersedes whatever position was still waiting for
+        // geometry; measuring review threads later must not undo it.
+        self.pending_diff_anchor = None;
+        if let Some(offset) = self.current_change_offset() {
+            self.diff_viewport.offset = offset;
         }
     }
 
     fn scroll_to_change(&self) -> Task<RepositoryAction> {
-        let Some(model) = self.diff_model() else {
-            return Task::none();
-        };
-        let starts = model.change_starts(self.diff_mode);
-        let Some(row) = starts.get(self.diff_change) else {
-            return Task::none();
-        };
-        let Some(rows) = self.diff_rows() else {
+        let Some(offset) = self.current_change_offset() else {
             return Task::none();
         };
         iced::widget::scrollable::scroll_to(
             self.diff_scroll_id.clone(),
             iced::widget::scrollable::AbsoluteOffset {
                 x: None,
-                y: Some(rows.offset(*row)),
+                y: Some(offset),
             },
         )
+    }
+
+    /// Reveals rows of fold `fold` while keeping the rows on screen where
+    /// they are: the viewport is anchored in model rows across the change.
+    fn expand_diff_fold(
+        &mut self,
+        fold: usize,
+        expansion: FoldExpansion,
+    ) -> Task<RepositoryAction> {
+        // The reader is acting on what is on screen, not on a position that
+        // was still waiting to be placed.
+        self.pending_diff_anchor = None;
+        let anchor = self.current_diff_viewport();
+        let basis = self.diff_basis.clone();
+        let Some((_, DiffState::Ready(RenderedDiff::Text { model, .. }, layout))) = self
+            .diffs
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == basis)
+        else {
+            return Task::none();
+        };
+        if !layout.expand(model, fold, expansion) {
+            return Task::none();
+        }
+        // Display rows moved: annotation measurements taken against the old
+        // rows no longer name the rows they measured.
+        self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+        self.apply_diff_viewport(anchor);
+        self.capture_diff_viewport();
+        self.restore_visible_scroll()
     }
 }
 
@@ -7599,9 +7815,11 @@ fn diff_model_view<'a>(
             let viewport_width = geometry.viewport_width;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
-            let rows = runtime
-                .diff_rows()
+            let layout = runtime
+                .diff_layout()
                 .expect("rendered comparison owns its row layout");
+            let rows = layout.rows(runtime.diff_mode);
+            let folded = layout.folded(runtime.diff_mode);
             let visible = visible_diff_rows(rows, runtime.diff_viewport);
             let context = review.and_then(|review| {
                 let path = runtime.selected.as_ref()?.path.to_str()?;
@@ -7619,8 +7837,11 @@ fn diff_model_view<'a>(
                 .annotations()
                 .iter()
                 .filter(|(index, _)| {
+                    let DisplayRow::Code(row) = folded.row(**index) else {
+                        return false;
+                    };
                     context.is_some_and(|ctx| {
-                        let (old, new) = diff_row_lines(model, runtime.diff_mode, **index);
+                        let (old, new) = diff_row_lines(model, runtime.diff_mode, row);
                         ctx.review.has_annotation(ctx.path, old, new, false)
                     })
                 })
@@ -7638,10 +7859,39 @@ fn diff_model_view<'a>(
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
             for index in visible.start..visible.end {
-                let (old, new) = diff_row_lines(model, runtime.diff_mode, index);
+                let row = match folded.row(index) {
+                    DisplayRow::Code(row) => row,
+                    DisplayRow::Fold { fold, rows: hidden } => {
+                        let discussions = context.map_or(0, |ctx| {
+                            let (first, last) = (
+                                diff_row_lines(model, runtime.diff_mode, hidden.start),
+                                diff_row_lines(model, runtime.diff_mode, hidden.end - 1),
+                            );
+                            ctx.review.discussions_within(
+                                ctx.path,
+                                first.0.unwrap_or(0)..=last.0.unwrap_or(0),
+                                first.1.unwrap_or(0)..=last.1.unwrap_or(0),
+                            )
+                        });
+                        children.push(diff_fold_row(
+                            card,
+                            runtime,
+                            model,
+                            DiffFold {
+                                fold,
+                                hidden,
+                                discussions,
+                            },
+                            gutter,
+                            viewport_width,
+                        ));
+                        continue;
+                    }
+                };
+                let (old, new) = diff_row_lines(model, runtime.diff_mode, row);
                 let code = match runtime.diff_mode {
                     DiffMode::Inline => inline_diff_row_with_review(
-                        &model.inline_rows[index],
+                        &model.inline_rows[row],
                         &model.syntax,
                         gutter,
                         code_width,
@@ -7649,7 +7899,7 @@ fn diff_model_view<'a>(
                         context.and_then(|ctx| ctx.line_action(old, new)),
                     ),
                     DiffMode::Split => split_diff_row_with_review(
-                        &model.split_rows[index],
+                        &model.split_rows[row],
                         &model.syntax,
                         gutter,
                         code_width,
@@ -7796,6 +8046,35 @@ impl<'a> DiffReviewContext<'a> {
     }
 }
 
+/// The row of `to` showing the line `row` of `from` shows, or the first row
+/// after it when that line is gone. Lines, unlike rows, mean the same thing in
+/// both layouts and across a rebuild. A linear scan, run once per rebuild or
+/// layout switch, never per frame.
+fn corresponding_row(
+    (from, from_mode): (&DiffModel, DiffMode),
+    row: usize,
+    (to, to_mode): (&DiffModel, DiffMode),
+) -> usize {
+    let (from_rows, to_rows) = (from.row_count(from_mode), to.row_count(to_mode));
+    if row >= from_rows {
+        return to_rows + (row - from_rows);
+    }
+    let (old, new) = diff_row_lines(from, from_mode, row);
+    (0..to_rows)
+        .position(|candidate| {
+            let (candidate_old, candidate_new) = diff_row_lines(to, to_mode, candidate);
+            // The old side is the comparison's baseline, which an edit to
+            // the working file does not renumber; an added line has only
+            // its new number.
+            match (old, new) {
+                (Some(line), _) => candidate_old.is_some_and(|candidate| candidate >= line),
+                (None, Some(line)) => candidate_new.is_some_and(|candidate| candidate >= line),
+                (None, None) => false,
+            }
+        })
+        .unwrap_or(to_rows)
+}
+
 fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u32>, Option<u32>) {
     match mode {
         DiffMode::Inline => model
@@ -7808,6 +8087,161 @@ fn diff_row_lines(model: &DiffModel, mode: DiffMode, index: usize) -> (Option<u3
             .map(|row| (row.old_line, row.new_line)),
     }
     .unwrap_or_default()
+}
+
+/// One folded run of unchanged rows, as drawn.
+struct DiffFold {
+    /// Which unchanged run of the model this fold belongs to.
+    fold: usize,
+    /// The model rows the fold stands in for.
+    hidden: Range<usize>,
+    /// Review discussions anchored to hidden lines.
+    discussions: usize,
+}
+
+/// The row that stands in for folded unchanged lines.
+///
+/// Its gutter holds the directional reveals, beside the line numbers they
+/// continue; the label reveals the whole run. A run that opens the file has
+/// nothing above it to continue, and one that ends the file nothing below.
+fn diff_fold_row<'a>(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    model: &DiffModel,
+    fold: DiffFold,
+    gutter: f32,
+    width: f32,
+) -> Element<'a, RepositoryAction> {
+    let mode = runtime.diff_mode;
+    let run = &model.unchanged_runs(mode)[fold.fold];
+    let count = fold.hidden.len();
+    let identity = runtime
+        .selected
+        .as_ref()
+        .map(|file| runtime.current_identity(card, file.path.clone()));
+    let action = |expansion| {
+        identity
+            .clone()
+            .map(|identity| RepositoryAction::ExpandDiffFold {
+                identity,
+                basis: runtime.diff_basis.clone(),
+                mode,
+                fold: fold.fold,
+                run: run.clone(),
+                expansion,
+            })
+    };
+    let step = diff_layout::FOLD_STEP;
+    let reveal = |icon: &str, label: String, expansion| -> Element<'a, RepositoryAction> {
+        crate::ui_controls::compact_icon_control(
+            crate::ui_controls::symbolic_icon(icon),
+            label,
+            action(expansion),
+        )
+        .into()
+    };
+    let mut controls = Vec::with_capacity(2);
+    // A step that would leave too few rows to fold opens the whole run, so
+    // offer that honestly instead of a step that reveals more than it says.
+    if count >= step + diff_layout::FOLD_MIN_HIDDEN {
+        if run.start > 0 {
+            controls.push(reveal(
+                "diff-expand-down-symbolic",
+                format!("Expand down {step} lines"),
+                FoldExpansion::Down,
+            ));
+        }
+        if run.end < model.row_count(mode) {
+            controls.push(reveal(
+                "diff-expand-up-symbolic",
+                format!("Expand up {step} lines"),
+                FoldExpansion::Up,
+            ));
+        }
+    } else {
+        controls.push(reveal(
+            "diff-expand-all-symbolic",
+            format!("Show {count} unchanged lines"),
+            FoldExpansion::All,
+        ));
+    }
+    // Room for both reveals in either layout; a split half has no marker
+    // column, but the fold row spans both halves and needs no alignment.
+    let gutter_width = gutter + DIFF_MARKER_WIDTH;
+    let mut label = vec![
+        widget::text::body(format!("{count} unchanged lines"))
+            .size(12)
+            .class(cosmic::theme::Text::Custom(crate::design::muted_text))
+            .into(),
+    ];
+    if fold.discussions > 0 {
+        label.push(
+            widget::text::body(if fold.discussions == 1 {
+                "· 1 comment".to_owned()
+            } else {
+                format!("· {} comments", fold.discussions)
+            })
+            .size(12)
+            .class(cosmic::theme::Text::Custom(|theme| {
+                iced::widget::text::Style {
+                    color: Some(crate::design::accent_color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into(),
+        );
+    }
+    let expand_all = crate::interaction::tooltip(
+        crate::interaction::hover(
+            widget::button::custom(
+                widget::row::with_children(label)
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .name(format!("Show all {count} unchanged lines"))
+            .class(crate::ui_controls::control_style(false, None))
+            .padding([2, 8])
+            .on_press_maybe(action(FoldExpansion::All)),
+        ),
+        format!("Show all {count} lines"),
+    );
+    widget::container(
+        widget::row::with_children([
+            widget::container(
+                widget::row::with_children(controls)
+                    .spacing(2)
+                    .align_y(Alignment::Center),
+            )
+            .align_x(Alignment::End)
+            .padding([0, 4])
+            .width(gutter_width)
+            .into(),
+            expand_all,
+        ])
+        .spacing(DIFF_ROW_PADDING)
+        .align_y(Alignment::Center),
+    )
+    .class(cosmic::theme::Container::custom(|theme| {
+        let mut accent = crate::design::accent_color(theme);
+        accent.a = if theme.theme_type.is_dark() {
+            0.10
+        } else {
+            0.07
+        };
+        iced::widget::container::Style {
+            background: Some(iced::Background::Color(diff_tint(
+                accent,
+                theme.cosmic().bg_color().into(),
+            ))),
+            ..Default::default()
+        }
+    }))
+    .padding([0.0, DIFF_ROW_PADDING])
+    .height(DIFF_ROW_HEIGHT)
+    .width(width)
+    .align_y(Alignment::Center)
+    .clip(true)
+    .into()
 }
 
 fn review_begin_anchor(
@@ -11259,6 +11693,7 @@ mod tests {
                 split_rows: Vec::new(),
                 inline_change_starts: vec![0, 2],
                 split_change_starts: vec![0, 2],
+                unchanged: Default::default(),
                 additions: 3,
                 deletions: 2,
                 max_line_width: [0; 2],
@@ -11756,7 +12191,7 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
         let mut model = model_with(2);
-        model.inline_rows = (0..10)
+        model.inline_rows = (0..20)
             .map(|line| InlineDiffRow {
                 old_line: Some(line + 1),
                 new_line: Some(line + 1),
@@ -11991,6 +12426,7 @@ mod tests {
                 split_rows: vec![split; 100_000],
                 inline_change_starts: vec![0, 50_000, 99_999],
                 split_change_starts: vec![0, 50_000, 99_999],
+                unchanged: Default::default(),
                 additions: 1,
                 deletions: 1,
                 max_line_width: [34; 2],
@@ -12009,6 +12445,316 @@ mod tests {
             let element = diff_surface(card, &runtime, None);
             assert!(widget_nodes(&element) < 1_500, "diff widget tree was eager");
         }
+    }
+
+    /// Opens the working comparison afresh and completes its load with `model`.
+    fn load_fresh_diff(runtime: &mut RepositoryRuntime, card: CardId, model: DiffModel) {
+        runtime.diffs.clear();
+        runtime.reset_diff_viewports();
+        drop(runtime.ensure_current_diff(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("a fresh comparison loads");
+        };
+        let request = *request;
+        let path = runtime.selected.as_ref().unwrap().path.clone();
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity: runtime.current_identity(card, path),
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(model),
+        }));
+    }
+
+    /// Two changed lines, at lines 50 and 150 of 200.
+    fn two_change_model() -> DiffModel {
+        let before: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        let after = before
+            .replace("line 50\n", "fifty\n")
+            .replace("line 150\n", "one hundred fifty\n");
+        crate::diff_view::build_diff(&before, &after)
+    }
+
+    #[test]
+    fn a_first_visit_opens_at_the_first_change_with_context() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        // Unfolded rows, as a model without unchanged runs has: the first
+        // change is far below the top.
+        let mut model = model_with(1);
+        model.inline_rows = (0..100)
+            .map(|line| InlineDiffRow {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                text: "line".into(),
+                kind: DiffRowKind::Context,
+                changed: Vec::new(),
+            })
+            .collect();
+        model.inline_change_starts = vec![60, 80];
+        load_fresh_diff(&mut runtime, card, model);
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            (60 - diff_layout::FOLD_CONTEXT - 1) as f32 * DIFF_ROW_HEIGHT
+        );
+        assert_eq!(runtime.diff_change, 0);
+
+        // Folded, the first change is a fold and three context rows down, so
+        // the comparison opens at its top.
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let layout = runtime.diff_layout().unwrap();
+        let folded = layout.folded(DiffMode::Inline);
+        assert!(matches!(folded.row(0), DisplayRow::Fold { fold: 0, .. }));
+        assert_eq!(folded.display(49), 4, "the first change");
+        assert!(
+            folded.len() < 30,
+            "two changes in 200 lines fold to a screen"
+        );
+
+        // A position the reader chose is theirs: a reload keeps it.
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 150.0,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let file = runtime.selected.clone().unwrap();
+        drop(runtime.open_file_entry(card, file.clone()));
+        runtime.source_surface = SourceSurface::Diff;
+        drop(runtime.ensure_current_diff(card));
+        let Some(DiffState::Loading { request, .. }) =
+            runtime.diff_state(&DiffBasis::IndexToWorktree)
+        else {
+            panic!("a reopened comparison loads");
+        };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity: runtime.current_identity(card, file.path),
+            basis: DiffBasis::IndexToWorktree,
+            request,
+            content: staged_text_diff(two_change_model()),
+        }));
+        assert_eq!(runtime.diff_viewport.offset, 150.0);
+    }
+
+    #[test]
+    fn expanding_a_fold_keeps_the_rows_on_screen_and_navigation_exact() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        let layout = runtime.diff_layout().unwrap();
+        let folded = layout.folded(DiffMode::Inline).clone();
+        // Model row 148, the second context row above the second change,
+        // a third of the way in.
+        let display = folded.display(148);
+        assert!(matches!(
+            folded.row(display - 2),
+            DisplayRow::Fold { fold: 1, .. }
+        ));
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        let expand = |run: Range<usize>, expansion| RepositoryAction::ExpandDiffFold {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run,
+            expansion,
+        };
+        // A click on a fold drawn from another model names another run.
+        drop(runtime.update(expand(52..150, FoldExpansion::Up)));
+        assert!(matches!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline).row(display - 2),
+            DisplayRow::Fold { fold: 1, rows } if rows == (54..147)
+        ));
+        drop(runtime.update(expand(51..150, FoldExpansion::Up)));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+        let display = folded.display(148);
+        assert_eq!(
+            display,
+            folded.display(127) + 21,
+            "twenty rows revealed above"
+        );
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            "the row that was on screen stays on screen"
+        );
+
+        // Change navigation lands on the change's row in the folded layout,
+        // or as near it as the now short document can scroll.
+        drop(runtime.update(RepositoryAction::NextChange { card }));
+        let bottom =
+            folded.len() as f32 * DIFF_ROW_HEIGHT + crate::design::SCROLLBAR_GUTTER - 300.0;
+        assert!(bottom < folded.display(150) as f32 * DIFF_ROW_HEIGHT);
+        assert_eq!(runtime.diff_viewport.offset, bottom);
+        // Reveals are shared by both layouts.
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        let split = runtime.diff_layout().unwrap().folded(DiffMode::Split);
+        // Split row 126 is line 127, the first line revealed inline.
+        let DisplayRow::Code(row) = split.row(split.display(126)) else {
+            panic!("the rows revealed inline are revealed side by side");
+        };
+        assert_eq!(
+            runtime.diff_model().unwrap().split_rows[row].new_line,
+            Some(127)
+        );
+        assert!(matches!(
+            split.row(split.display(125)),
+            DisplayRow::Fold { fold: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_rebuild_keeps_what_was_unfolded_and_the_line_on_screen() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        // The top of the viewport on the second fold itself, expanded down:
+        // the fold's first rows take its place.
+        let fold = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .display(60);
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: fold as f32 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+        drop(runtime.update(RepositoryAction::ExpandDiffFold {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run: 51..150,
+            expansion: FoldExpansion::Down,
+        }));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+        assert_eq!(folded.row(fold), DisplayRow::Code(54));
+        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+
+        // The same comparison read again keeps its reveal and its place.
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(two_change_model())),
+        );
+        assert_eq!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+            &folded
+        );
+        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+
+        // An edit above renumbers the new side and shifts every row by one;
+        // the runs keep their lengths, so the reveal holds, and the same line
+        // stays at the top.
+        let before: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        let after = format!("new first line\n{}", before)
+            .replace("line 50\n", "fifty\n")
+            .replace("line 150\n", "one hundred fifty\n");
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        let layout = runtime.diff_layout().unwrap();
+        let line_54 = runtime
+            .diff_model()
+            .unwrap()
+            .inline_rows
+            .iter()
+            .position(|row| row.old_line == Some(54))
+            .unwrap();
+        let diff_layout::Anchor::Row { row, .. } = layout
+            .rows(DiffMode::Inline)
+            .anchor(runtime.diff_viewport.offset)
+        else {
+            panic!("a code row is on screen");
+        };
+        assert_eq!(
+            row,
+            layout.folded(DiffMode::Inline).display(line_54),
+            "line 54, first on screen before the edit, is still at the top"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_awaiting_its_anchor_still_keeps_what_was_unfolded() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        load_fresh_diff(&mut runtime, card, two_change_model());
+        drop(runtime.update(RepositoryAction::ExpandDiffFold {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            mode: DiffMode::Inline,
+            fold: 1,
+            run: 51..150,
+            expansion: FoldExpansion::Down,
+        }));
+        let folded = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(DiffMode::Inline)
+            .clone();
+
+        // A working-diff rebuild lands while the viewport still waits to
+        // place an anchor.
+        runtime.pending_diff_anchor = Some(runtime.current_diff_viewport());
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(two_change_model())),
+        );
+        assert_eq!(
+            runtime.diff_layout().unwrap().folded(DiffMode::Inline),
+            &folded
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_removes_the_anchored_line_keeps_visible_rows_mounted() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_viewport.height = 300.0;
+        let large: String = (1..=200).map(|line| format!("line {line}\n")).collect();
+        load_fresh_diff(&mut runtime, card, crate::diff_view::build_diff("", &large));
+        drop(runtime.update(RepositoryAction::DiffViewport {
+            card,
+            offset: 150.0 * DIFF_ROW_HEIGHT,
+            height: 300.0,
+            horizontal: 0.0,
+            user_initiated: true,
+        }));
+
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "only\n"))),
+        );
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let visible = visible_diff_rows(runtime.diff_rows().unwrap(), runtime.diff_viewport);
+        assert_eq!((visible.start, visible.end), (0, 1));
     }
 
     #[test]
@@ -12034,6 +12780,7 @@ mod tests {
                 split_rows: Vec::new(),
                 inline_change_starts: vec![0, 50_000, 99_999],
                 split_change_starts: Vec::new(),
+                unchanged: Default::default(),
                 additions: 1,
                 deletions: 1,
                 max_line_width: [34; 2],
@@ -14151,6 +14898,7 @@ mod tests {
             split_rows: Vec::new(),
             inline_change_starts: Vec::new(),
             split_change_starts: Vec::new(),
+            unchanged: Default::default(),
             additions,
             deletions: 0,
             max_line_width: [0; 2],
