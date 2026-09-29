@@ -422,10 +422,19 @@ async fn serve_application_actions(
         )?
         .build()
         .await?;
-    connection
+    // Without queueing, a name another process owns is refused with a reply,
+    // not an error; clicks addressed to it would reach that process.
+    match connection
         .request_name_with_flags(desktop_id, zbus::fdo::RequestNameFlags::DoNotQueue.into())
-        .await?;
-    Ok(connection)
+        .await?
+    {
+        zbus::fdo::RequestNameReply::PrimaryOwner | zbus::fdo::RequestNameReply::AlreadyOwner => {
+            Ok(connection)
+        }
+        zbus::fdo::RequestNameReply::InQueue | zbus::fdo::RequestNameReply::Exists => {
+            Err(zbus::Error::NameTaken)
+        }
+    }
 }
 
 /// Receives desktop notification clicks for the daemon's lifetime.
@@ -438,6 +447,9 @@ struct Activation {
     registration: Registration,
     /// The portal instance that decided `registration`.
     portal: Option<zbus::names::OwnedUniqueName>,
+    /// The portal was reached but the bus would not name its owner, so the
+    /// next owner change cannot be compared and counts as a replacement.
+    portal_unknown: bool,
     actions: Option<zbus::Connection>,
 }
 
@@ -452,6 +464,18 @@ impl Activation {
     /// replaced. Returns whether the portal must be reconnected so the new
     /// instance hears `Register` before any other call.
     fn portal_changed(&mut self, owner: Option<zbus::names::OwnedUniqueName>) -> bool {
+        if self.portal_unknown {
+            self.portal_unknown = false;
+            // The instance may still be the one we registered with, which
+            // rejects a second `Register` as already associated; `Unknown`
+            // reads that rejection as the registration it is.
+            self.registration = match self.registration {
+                Registration::Registered => Registration::Unknown,
+                _ => Registration::Untried,
+            };
+            self.portal = None;
+            return true;
+        }
         if self.portal.is_none() || self.portal == owner {
             return false;
         }
@@ -516,6 +540,7 @@ async fn connect(
                 .get_name_owner(proxy.destination().to_owned())
                 .await
                 .ok();
+            activation.portal_unknown = activation.portal.is_none();
         }
         let listener = NotificationProxy::new()
             .await
@@ -809,6 +834,29 @@ mod tests {
         };
         assert!(refused.portal_changed(Some(name(":1.2"))));
         assert!(refused.registration.needs_attempt());
+    }
+
+    #[test]
+    fn a_portal_of_unknown_owner_takes_its_first_change_as_a_replacement() {
+        let name = |name: &str| zbus::names::OwnedUniqueName::try_from(name).unwrap();
+        let mut activation = Activation {
+            registration: Registration::Registered,
+            portal_unknown: true,
+            ..Default::default()
+        };
+        assert!(activation.portal_changed(Some(name(":1.9"))));
+        assert!(!activation.portal_unknown);
+        // Re-registering with the same instance must still read as registered.
+        assert_eq!(activation.registration, Registration::Unknown);
+        assert_eq!(
+            activation
+                .registration
+                .settle(Err("Connection already associated".into())),
+            Registration::Registered
+        );
+        // With the owner looked up again, only a real change counts.
+        activation.portal = Some(name(":1.9"));
+        assert!(!activation.portal_changed(Some(name(":1.9"))));
     }
 
     #[test]
