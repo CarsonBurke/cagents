@@ -199,6 +199,23 @@ impl Default for Preferences {
     }
 }
 
+/// How long the daemon waits for a test notification's outcome. It covers
+/// a portal connection and the notification itself, each bounded by the
+/// daemon's own portal timeout, behind at most one bounded delivery batch.
+pub const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What became of one requested test notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestOutcome {
+    /// The desktop accepted it; how it is presented, and whether it makes a
+    /// sound, is the desktop's own choice.
+    Sent,
+    /// The desktop notification service could not be reached or refused it.
+    Unavailable(String),
+    /// The desktop notification service did not answer in time.
+    TimedOut,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Notice {
     pub id: uuid::Uuid,

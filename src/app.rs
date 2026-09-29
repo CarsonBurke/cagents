@@ -7546,6 +7546,7 @@ impl Cagents {
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
                 self.default_account_choices(),
+                self.notification_ui.testing,
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
@@ -9937,7 +9938,7 @@ impl Cagents {
                     SettingsField::ShowStatusBar => self.accounts_surface_changed(),
                     SettingsField::Notifications(_) => {
                         self.notification_ui
-                            .preferences(self.settings.notifications, false);
+                            .preferences(self.settings.notifications);
                         Task::none()
                     }
                     SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
