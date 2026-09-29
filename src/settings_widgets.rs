@@ -106,11 +106,20 @@ pub fn toggle<'a, Message: 'static>(
     value: bool,
     on_toggle: impl Fn(bool) -> Message + 'a,
 ) -> Element<'a, Message> {
+    toggle_enabled(label, value, true, on_toggle)
+}
+
+pub fn toggle_enabled<'a, Message: 'static>(
+    label: &str,
+    value: bool,
+    enabled: bool,
+    on_toggle: impl Fn(bool) -> Message + 'a,
+) -> Element<'a, Message> {
     widget::toggler(value)
         .label(label.to_owned())
         .spacing(3.0 * design::GRID_UNIT)
         .width(Length::Fill)
-        .on_toggle(on_toggle)
+        .on_toggle_maybe(enabled.then_some(on_toggle))
         .into()
 }
 

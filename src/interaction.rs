@@ -17,6 +17,119 @@ use serde::Deserialize;
 
 mod context_menu;
 
+/// Arrow navigation stays inside the list that owns native keyboard focus.
+pub fn keyboard_list<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyboardList(enabled),
+        tip: None,
+    }
+    .into()
+}
+
+pub fn keyboard_list_row<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ListRow,
+        tip: None,
+    }
+    .into()
+}
+
+struct ListRowMarker;
+
+#[derive(Default)]
+struct ListFocus {
+    rows: Vec<Rectangle>,
+    focused: Option<usize>,
+    active: Option<usize>,
+}
+
+impl Operation for ListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<ListRowMarker>() {
+            self.active = Some(self.rows.len());
+            self.rows.push(bounds);
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take()
+            && state.is_focused()
+        {
+            self.focused = Some(index);
+        }
+    }
+}
+
+struct MoveListFocus {
+    target: usize,
+    index: usize,
+    active: Option<usize>,
+    bounds: Rectangle,
+}
+
+impl Operation for MoveListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<ListRowMarker>() {
+            self.active = Some(self.index);
+            self.index += 1;
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take() {
+            if index == self.target {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+        }
+    }
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        _translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        let delta = if self.bounds.y < bounds.y {
+            self.bounds.y - bounds.y
+        } else if self.bounds.y + self.bounds.height > bounds.y + bounds.height {
+            self.bounds.y + self.bounds.height - bounds.y - bounds.height
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            state.scroll_by(
+                operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                bounds,
+                content,
+            );
+        }
+    }
+}
+
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 
@@ -903,6 +1016,8 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 
 #[derive(Clone, Copy)]
 enum Kind {
+    KeyboardList(bool),
+    ListRow,
     TabHistory(bool),
     Hover,
     ContextMenu,
@@ -931,6 +1046,8 @@ struct Tip<'a, Message> {
 // hover/fade clock when a conditional wrapper changes kind.
 struct HoverTag;
 struct TabHistoryTag;
+struct KeyboardListTag;
+struct ListRowTag;
 struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
@@ -981,6 +1098,8 @@ impl Default for State {
 impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
+            Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
+            Kind::ListRow => tree::Tag::of::<ListRowTag>(),
             Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
@@ -1068,6 +1187,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
+        if matches!(self.kind, Kind::ListRow) {
+            operation.custom(
+                None,
+                layout.bounds() - layout.virtual_offset(),
+                &mut ListRowMarker,
+            );
+        }
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
             effect_layout(self.kind, layout),
@@ -1086,6 +1212,53 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Kind::KeyboardList(true) = self.kind
+            && let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(key),
+                modifiers,
+                ..
+            }) = event
+            && modifiers.is_empty()
+            && matches!(
+                key,
+                cosmic::iced::keyboard::key::Named::ArrowUp
+                    | cosmic::iced::keyboard::key::Named::ArrowDown
+                    | cosmic::iced::keyboard::key::Named::Home
+                    | cosmic::iced::keyboard::key::Named::End
+            )
+        {
+            let mut focus = ListFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if let Some(current) = focus.focused {
+                use cosmic::iced::keyboard::key::Named;
+                let target = match key {
+                    Named::ArrowUp => current.saturating_sub(1),
+                    Named::ArrowDown => (current + 1).min(focus.rows.len().saturating_sub(1)),
+                    Named::Home => 0,
+                    _ => focus.rows.len().saturating_sub(1),
+                };
+                let mut movement = MoveListFocus {
+                    target,
+                    index: 0,
+                    active: None,
+                    bounds: focus.rows[target],
+                };
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut movement,
+                );
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+        }
         if let Kind::TabHistory(true) = self.kind
             && let Event::Keyboard(
                 cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }
@@ -1423,6 +1596,75 @@ impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_arrows_move_native_focus_and_enter_activates_only_the_destination() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let first = Id::from("list.first");
+        let second = Id::from("list.second");
+        let mut element = keyboard_list(
+            widget::column::with_children(vec![
+                keyboard_list_row(
+                    widget::button::text("First")
+                        .id(first.clone())
+                        .on_press(1_u8),
+                ),
+                keyboard_list_row(widget::button::text("Second").id(second).on_press(2_u8)),
+            ]),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(first),
+        );
+        let mut published = Vec::new();
+        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Enter] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &bounds,
+            );
+        }
+        assert_eq!(published, [2]);
+    }
 
     #[test]
     fn a_vertical_wheel_becomes_horizontal_pixels() {

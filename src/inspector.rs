@@ -1838,7 +1838,7 @@ pub fn view(
 ) -> Element<'static, InspectorAction> {
     let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
-        widget::icon(icon).size(16).into(),
+        widget::icon(icon).size(design::ROW_ICON_SIZE).into(),
         widget::column::with_children(vec![
             design::heading(model.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)

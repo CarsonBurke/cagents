@@ -1,6 +1,48 @@
 use super::*;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
 
+fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
+    static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let fonts = cosmic::iced::advanced::graphics::text::font_system()
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut names: Vec<_> = fonts
+            .db()
+            .faces()
+            .filter(|face| face.monospaced)
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    });
+    let mut values = vec![String::new()];
+    values.extend(FAMILIES.iter().cloned());
+    if !values.iter().any(|value| value == family) {
+        values.push(family.to_owned());
+    }
+    let selected = values.iter().position(|value| value == family);
+    let labels: Vec<_> = values
+        .iter()
+        .map(|value| {
+            if value.is_empty() {
+                "System monospace".to_owned()
+            } else {
+                value.clone()
+            }
+        })
+        .collect();
+    setting_field(
+        "Installed monospace fonts",
+        "Choose a fixed-pitch font installed on this computer.",
+        widget::dropdown(labels, selected, move |index| Message::SettingsChanged {
+            field,
+            value: values[index].clone(),
+        })
+        .into(),
+    )
+}
+
 fn setting_input<'a>(
     label: &'static str,
     detail: impl Into<Cow<'a, str>> + 'a,
@@ -129,42 +171,22 @@ fn default_account_choice<'a>(
             "The account new ChatGPT conversations and shell terminals use unless the project has its own choice. Existing sessions keep their account.",
         ),
     };
-    let buttons: Vec<Element<'a, Message>> = choices
+    let selected = choices.iter().position(|choice| choice.selected);
+    let labels = choices
         .iter()
-        .map(|choice| {
-            let marker: Element<'a, Message> = if choice.selected {
-                settings_icon("object-select-symbolic").into()
-            } else {
-                iced::widget::Space::new().width(16).height(16).into()
-            };
-            crate::interaction::hover(
-                widget::button::custom(
-                    widget::row::with_children(vec![
-                        marker,
-                        widget::text::body(choice.label.clone()).into(),
-                    ])
-                    .spacing(2.0 * design::GRID_UNIT)
-                    .align_y(Alignment::Center),
-                )
-                .name(choice.label.clone())
-                .class(crate::sidebar::sidebar_button_style(choice.selected))
-                .selected(choice.selected)
-                .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
-                .height(design::ROW_HEIGHT)
-                .width(Length::Fill)
-                .on_press(Message::AccountUi(account_ui::Action::SetDefault(
-                    choice.id.clone(),
-                ))),
-            )
-        })
-        .collect();
+        .map(|choice| choice.label.clone())
+        .collect::<Vec<_>>();
+    let ids = choices
+        .iter()
+        .map(|choice| choice.id.clone())
+        .collect::<Vec<_>>();
     setting_field(
         label,
         detail,
-        widget::column::with_children(buttons)
-            .spacing(design::GRID_UNIT)
-            .width(Length::Fill)
-            .into(),
+        widget::dropdown(labels, selected, move |index| {
+            Message::AccountUi(account_ui::Action::SetDefault(ids[index].clone()))
+        })
+        .into(),
     )
 }
 
@@ -196,7 +218,7 @@ fn settings_category_controls<'a>(
                 (
                     Field::Waiting,
                     "Waiting for you",
-                    "Notify when an agent needs input or approval.",
+                    "Notify when an agent needs input or approval, or its outcome could not be confirmed.",
                 ),
                 (
                     Field::ReviewRequests,
@@ -215,9 +237,10 @@ fn settings_category_controls<'a>(
                     setting_field(
                         label,
                         detail,
-                        crate::settings_widgets::toggle(
+                        crate::settings_widgets::toggle_enabled(
                             label,
                             draft.notifications.get(field),
+                            field == Field::Enabled || draft.notifications.get(Field::Enabled),
                             move |enabled| Message::SettingsChanged {
                                 field: SettingsField::Notifications(field),
                                 value: enabled.to_string(),
@@ -266,14 +289,12 @@ fn settings_category_controls<'a>(
                 settings,
             )]
         }
-        SettingsCategory::General => vec![settings_group(
-            "Runtime",
-            "Control how many live columns cagents keeps active and when background work is suspended.",
-            vec![
+        SettingsCategory::General => {
+            let mut controls = vec![
                 setting_field(
                     "Reset all settings",
                     "Restore default preferences; saved conversations and tabs are preserved.",
-                    widget::button::standard("Reset all settings")
+                    widget::button::destructive("Reset all settings")
                         .id(widget::Id::new("settings.reset"))
                         .on_press(Message::ResetSettings)
                         .into(),
@@ -330,14 +351,14 @@ fn settings_category_controls<'a>(
                     ),
                 ),
                 setting_input(
-                    "Maximum hot columns",
-                    "Applies immediately; extra background columns may hibernate.",
+                    "Maximum hot panes",
+                    "At least 1 pane. Extra background panes may hibernate.",
                     &draft.max_hot_cards,
                     SettingsField::MaxHotCards,
                 ),
                 setting_input(
                     "Hibernation delay (ms)",
-                    "Applies immediately to background columns.",
+                    "Milliseconds before an inactive pane hibernates; 0 suspends immediately.",
                     &draft.hibernation_delay_ms,
                     SettingsField::HibernationDelayMs,
                 ),
@@ -353,8 +374,36 @@ fn settings_category_controls<'a>(
                         },
                     ),
                 ),
-            ],
-        )],
+            ];
+            let reset = controls.remove(0);
+            let chat = controls.pop().expect("chat control");
+            let performance = controls.split_off(5);
+            let activation = controls.pop().expect("activation control");
+            let channel = controls.remove(2);
+            vec![
+                settings_group(
+                    "Worktrees",
+                    "Locations, ordering and the first pane in a worktree.",
+                    controls,
+                ),
+                settings_group(
+                    "Workspace",
+                    "Channels and pane focus.",
+                    vec![channel, activation],
+                ),
+                settings_group("Chat", "Choose how to send messages.", vec![chat]),
+                settings_group(
+                    "Performance",
+                    "Balance active panes and background resource use.",
+                    performance,
+                ),
+                settings_group(
+                    "Reset",
+                    "Restore preferences without removing conversations or panes.",
+                    vec![reset],
+                ),
+            ]
+        }
         SettingsCategory::Editor => vec![settings_group(
             "Editor",
             "Shared native editor and diff preferences.",
@@ -428,8 +477,8 @@ fn settings_category_controls<'a>(
                 "Workspace layout",
                 "Keep navigation and context readable without giving up working space.",
                 vec![setting_stepper(
-                    "New column width",
-                    "Fraction of the workspace. Existing column widths are preserved.",
+                    "New pane width",
+                    "Fraction of the workspace. Existing pane widths are preserved.",
                     &draft.default_column_fraction,
                     SettingsField::DefaultColumnFraction,
                     0.25,
@@ -462,15 +511,9 @@ fn settings_category_controls<'a>(
                         &draft.terminal_font_family,
                         SettingsField::TerminalFontFamily,
                     ),
-                    settings_choice(
-                        "Font preset",
-                        "Choose System to reset a custom family; enter any installed monospace family above.",
+                    monospace_font_setting(
+                        &draft.terminal_font_family,
                         SettingsField::TerminalFontFamily,
-                        [(
-                            "System monospace",
-                            "",
-                            draft.terminal_font_family.is_empty(),
-                        )],
                     ),
                     setting_stepper(
                         "Line height",
@@ -485,7 +528,7 @@ fn settings_category_controls<'a>(
                     ),
                     setting_stepper(
                         "Inner padding",
-                        "Breathing room between terminal text and the column edge.",
+                        "Breathing room between terminal text and the pane edge.",
                         &draft.terminal_padding,
                         SettingsField::TerminalPadding,
                         0.0,
@@ -496,7 +539,7 @@ fn settings_category_controls<'a>(
                     ),
                     setting_input(
                         "Scroll size",
-                        "Base lines moved per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
+                        "1–10 lines per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
                         &draft.terminal_scroll_size,
                         SettingsField::TerminalScrollSize,
                     ),
@@ -647,7 +690,7 @@ fn settings_category_controls<'a>(
             vec![
                 setting_input(
                     "New terminal",
-                    "Creates a terminal column.",
+                    "Creates a terminal pane.",
                     &draft.keyboard_shortcuts.new_terminal,
                     SettingsField::ShortcutNewTerminal,
                 ),
@@ -664,8 +707,8 @@ fn settings_category_controls<'a>(
                     SettingsField::ShortcutClonePane,
                 ),
                 setting_input(
-                    "Close focused column",
-                    "Closes the active workspace column. A terminal running a program asks first while close confirmation is on.",
+                    "Close focused pane",
+                    "Closes the active workspace pane. A terminal running a program asks first while close confirmation is on.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
                 ),
@@ -676,13 +719,13 @@ fn settings_category_controls<'a>(
                     SettingsField::ShortcutSearchProjects,
                 ),
                 setting_input(
-                    "Previous column",
+                    "Previous pane",
                     "Moves focus left and may repeat while held.",
                     &draft.keyboard_shortcuts.previous_column,
                     SettingsField::ShortcutPreviousColumn,
                 ),
                 setting_input(
-                    "Next column",
+                    "Next pane",
                     "Moves focus right and may repeat while held.",
                     &draft.keyboard_shortcuts.next_column,
                     SettingsField::ShortcutNextColumn,
@@ -695,13 +738,13 @@ fn settings_category_controls<'a>(
                 ),
                 setting_input(
                     "Previous workspace",
-                    "Opens the worktree or channel before this one in the sidebar; may repeat while held.",
+                    "Previews the previous recently used workspace. Release the shortcut's modifiers to switch.",
                     &draft.keyboard_shortcuts.previous_workspace,
                     SettingsField::ShortcutPreviousWorkspace,
                 ),
                 setting_input(
                     "Next workspace",
-                    "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
+                    "Previews the next recently used workspace. Release the shortcut's modifiers to switch.",
                     &draft.keyboard_shortcuts.next_workspace,
                     SettingsField::ShortcutNextWorkspace,
                 ),
@@ -796,7 +839,6 @@ fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> El
 const RAIL_BREAKPOINT: f32 = 560.0;
 /// Card width below which two category columns no longer fit their labels,
 /// so the picker collapses to a single dropdown under the search field.
-const GRID_BREAKPOINT: f32 = 340.0;
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
 
 /// The settings pane's body. Its layout follows the card's width, which the
@@ -847,7 +889,7 @@ fn settings_layout<'a>(
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
         // Search results span every category, so the picker gives its room
         // to them while a query is active.
-        if !searching && width < GRID_BREAKPOINT {
+        if !searching {
             let labels = SettingsCategory::ALL.map(SettingsCategory::label).to_vec();
             let selected = SettingsCategory::ALL
                 .iter()
@@ -859,22 +901,6 @@ fn settings_layout<'a>(
                 .width(Length::Fill)
                 .into(),
             );
-        } else if !searching {
-            // Two columns keep every category readable without an
-            // overflowing tab strip.
-            rows.extend(SettingsCategory::ALL.chunks(2).map(|items| {
-                let mut buttons: Vec<_> = items
-                    .iter()
-                    .map(|item| category_button(*item, category))
-                    .collect();
-                if items.len() == 1 {
-                    buttons.push(iced::widget::Space::new().width(Length::Fill).into());
-                }
-                widget::row::with_children(buttons)
-                    .spacing(design::GRID_UNIT)
-                    .width(Length::Fill)
-                    .into()
-            }));
         }
         widget::container(
             widget::column::with_children(rows)

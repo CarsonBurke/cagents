@@ -4720,8 +4720,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &CommitRequest,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
-        let command = self.commit_command(request)?;
-        if !self.has_staged_changes(&request.worktree, cancellation)?
+        self.commit_with_amend(request, false, cancellation)
+    }
+
+    pub fn commit_with_amend(
+        &self,
+        request: &CommitRequest,
+        amend: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
+        let mut command = self.commit_command(request)?;
+        if amend {
+            command = command.arg("--amend");
+        }
+        if !amend
+            && !self.has_staged_changes(&request.worktree, cancellation)?
             && !self.has_pending_commit_state(&request.worktree, cancellation)?
         {
             return Ok(CommitOutcome::NotCreated {
@@ -4759,6 +4772,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let moved = match &after {
             Some(oid) if Some(oid) != before.as_ref() => Some(oid),
+            // An identical amend can produce the same object within one second.
+            Some(oid) if amend && failure.is_none() => Some(oid),
             _ => None,
         };
         let Some(oid) = moved else {
@@ -6180,6 +6195,41 @@ mod tests {
 
         fn service() -> RepositoryService<IsolatedExecutor> {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
+        }
+
+        #[test]
+        fn amend_changes_the_message_without_requiring_staged_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("file.txt"), "original\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            git(root, &["commit", "-m", "original"]);
+            let before = git_output(root, &["rev-parse", "HEAD"]);
+            let request = CommitRequest {
+                worktree: root.into(),
+                message: "New subject\n\nA full description\n".into(),
+            };
+            let result = service()
+                .commit_with_amend(&request, true, &CancellationToken::new())
+                .unwrap();
+            assert!(
+                matches!(result, CommitOutcome::Created { .. }),
+                "{result:?}"
+            );
+            assert_ne!(git_output(root, &["rev-parse", "HEAD"]), before);
+            assert_eq!(
+                git_output(root, &["log", "-1", "--format=%B"]).as_slice(),
+                b"New subject\n\nA full description\n\n"
+            );
+            assert_eq!(git_output(root, &["rev-list", "--count", "HEAD"]), b"1\n");
+            let repeated = service()
+                .commit_with_amend(&request, true, &CancellationToken::new())
+                .unwrap();
+            assert!(
+                matches!(repeated, CommitOutcome::Created { .. }),
+                "{repeated:?}"
+            );
         }
 
         #[test]

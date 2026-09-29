@@ -369,6 +369,7 @@ impl ReviewSource {
 }
 
 pub struct State {
+    unavailable_reason: Option<String>,
     discussion: discussion_ui::DiscussionState,
     api: Arc<dyn GitHubReviewApi>,
     cache: Option<Arc<dyn cache::Store>>,
@@ -562,6 +563,7 @@ impl State {
 
     pub fn new(api: Arc<dyn GitHubReviewApi>, git: RepositoryService) -> Self {
         Self {
+            unavailable_reason: None,
             discussion: discussion_ui::DiscussionState::default(),
             api,
             cache: None,
@@ -1979,7 +1981,7 @@ impl State {
         ));
         let name = design::body(&*row.label)
             .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
+            .ellipsize(iced::widget::text::Ellipsize::Start(
                 EllipsizeHeightLimit::Lines(1),
             ))
             .width(Length::Fill);
@@ -2091,12 +2093,20 @@ impl State {
 /// The list a shell without a project sidebar shows, one row per open pull
 /// request. Choosing a row emits [`Action::Select`].
 impl State {
+    pub fn set_unavailable_reason(&mut self, reason: Option<String>) {
+        self.unavailable_reason = reason;
+    }
+
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         let spacing = cosmic::theme::spacing();
         if self.source.is_none() {
             return widget::container(
-                design::caption("Open an authenticated GitHub repository to browse pull requests.")
-                    .wrapping(iced::widget::text::Wrapping::Word),
+                design::caption(
+                    self.unavailable_reason
+                        .as_deref()
+                        .unwrap_or("Open a project with a GitHub remote to browse pull requests."),
+                )
+                .wrapping(iced::widget::text::Wrapping::Word),
             )
             .padding(spacing.space_xs)
             .into();
@@ -2145,7 +2155,9 @@ impl State {
                     browser_row(
                         pull_request,
                         self.requests.label(pull_request.number),
-                        false,
+                        self.target.as_ref().is_some_and(|target| {
+                            target.pull_request.number == pull_request.number
+                        }),
                         modal_open,
                     )
                     .map(|action| Action::BrowserFenced {

@@ -532,6 +532,23 @@ impl State {
         })
     }
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        if matches!(
+            &action,
+            Action::Field(..)
+                | Action::Provider(..)
+                | Action::Model(..)
+                | Action::Effort(..)
+                | Action::Account(..)
+                | Action::Target(..)
+                | Action::Schedule(..)
+                | Action::Weekday(..)
+                | Action::Reuse(..)
+                | Action::Precheck(..)
+                | Action::Prompt(..)
+                | Action::Shell(..)
+        ) {
+            self.error = None;
+        }
         if let Action::Received { sequence, result } = action {
             let Some((expected, pending)) = self.pending else {
                 return None;
@@ -961,17 +978,31 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
+        cosmic::iced::widget::responsive(move |size| self.view_layout(size.width)).into()
+    }
+
+    fn view_layout(&self, width: f32) -> Element<'_, Action> {
         let busy = self.pending.is_some();
+        let mut listing: Vec<Element<'_, Action>> = Vec::new();
         let mut content = widget::column::with_children(vec![
             widget::text::title3("Automations").into(),
             widget::text::body("Recurring agent work continues while this window is closed.")
                 .into(),
         ])
-        .spacing(12)
-        .padding(16)
+        .spacing(3.0 * crate::design::GRID_UNIT)
+        .padding(4.0 * crate::design::GRID_UNIT)
         .width(Length::Fill);
-        if let Some(error) = &self.error {
-            content = content.push(widget::text::body(error));
+        if let Some(error) = &self.error
+            && self.draft.is_none()
+        {
+            content = content.push(
+                crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(crate::design::destructive_color(theme)),
+                        ..Default::default()
+                    }
+                })),
+            );
         }
         if let Some(notice) = &self.notice {
             content = content.push(widget::text::body(notice));
@@ -991,13 +1022,21 @@ impl State {
             content = content.push(
                 widget::row::with_children(vec![
                     button("Cancel", Action::CancelConfirmation, !busy),
-                    button("Confirm", Action::Confirm(confirmation.generation), !busy),
+                    if matches!(confirmation.request, Request::Remove { .. }) {
+                        widget::button::destructive("Remove automation")
+                            .on_press_maybe(
+                                (!busy).then_some(Action::Confirm(confirmation.generation)),
+                            )
+                            .into()
+                    } else {
+                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
+                    },
                 ])
-                .spacing(8)
+                .spacing(2.0 * crate::design::GRID_UNIT)
                 .wrap(),
             );
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy, &self.models));
+            content = content.push(draft.view(busy, &self.models, self.error.as_deref()));
         } else {
             content = content.push(
                 widget::row::with_children(vec![
@@ -1010,14 +1049,15 @@ impl State {
                     button("Refresh", Action::Refresh, !busy),
                     button("All run history", Action::AllHistory, !busy),
                 ])
-                .spacing(8)
+                .spacing(2.0 * crate::design::GRID_UNIT)
                 .wrap(),
             );
             if self.run.is_none() {
                 if !self.all_history {
-                    content = content.push(
+                    listing.push(
                         widget::text_input("Search loaded automations", &self.search)
-                            .on_input(Action::Search),
+                            .on_input(Action::Search)
+                            .into(),
                     );
                     let query = self.search.to_lowercase();
                     for row in self.rows.iter().filter(|row| {
@@ -1033,17 +1073,42 @@ impl State {
                             .as_ref()
                             .map(|next| next.local.as_str())
                             .unwrap_or("—");
-                        let label = format!(
-                            "{} · {}\n{}\nNext: {} · Last: {}",
-                            row.name,
-                            if row.enabled { "Enabled" } else { "Paused" },
-                            row.directory.display(),
-                            next,
-                            row.last_state.map(state_label).unwrap_or("No runs")
+                        let selected = self
+                            .selected
+                            .as_ref()
+                            .is_some_and(|selected| selected.id == row.id);
+                        listing.push(
+                            widget::button::custom(
+                                widget::column::with_children(vec![
+                                    crate::design::heading(&row.name).into(),
+                                    crate::design::caption(if row.enabled {
+                                        "Enabled"
+                                    } else {
+                                        "Paused"
+                                    })
+                                    .into(),
+                                    crate::design::caption(row.directory.display().to_string())
+                                        .into(),
+                                    crate::design::caption(format!("Next: {next}")).into(),
+                                    crate::design::caption(format!(
+                                        "Last: {}",
+                                        row.last_state.map(state_label).unwrap_or("No runs")
+                                    ))
+                                    .into(),
+                                ])
+                                .spacing(crate::design::GRID_UNIT),
+                            )
+                            .name(format!("Select automation {}", row.name))
+                            .class(crate::sidebar::sidebar_button_style(selected))
+                            .selected(selected)
+                            .padding(2.0 * crate::design::GRID_UNIT)
+                            .height(Length::Shrink)
+                            .width(Length::Fill)
+                            .on_press_maybe((!busy).then_some(Action::Select(row.id)))
+                            .into(),
                         );
-                        content = content.push(button_owned(label, Action::Select(row.id), !busy));
                         if let Some(blocked) = &row.blocked {
-                            content = content.push(widget::text::body(blocked));
+                            listing.push(crate::design::caption(blocked).into());
                         }
                     }
                     if self.rows.is_empty() {
@@ -1109,7 +1174,7 @@ impl State {
                                         && selected.blocked.is_none(),
                                 ),
                             ])
-                            .spacing(8)
+                            .spacing(2.0 * crate::design::GRID_UNIT)
                             .wrap(),
                         );
                     }
@@ -1193,20 +1258,50 @@ impl State {
                                     .is_some_and(|agent| !agent.closed && agent.session.is_some()),
                         ),
                     ])
-                    .spacing(8)
+                    .spacing(2.0 * crate::design::GRID_UNIT)
                     .wrap(),
                 );
             }
         }
-        widget::scrollable(content)
+        let content: Element<'_, Action> = widget::scrollable(content)
             .height(Length::Fill)
             .width(Length::Fill)
+            .into();
+        if listing.is_empty() {
+            return content;
+        }
+        let list = widget::scrollable(
+            widget::column::with_children(listing)
+                .spacing(crate::design::GRID_UNIT)
+                .padding(2.0 * crate::design::GRID_UNIT),
+        );
+        if width >= 700.0 {
+            widget::row::with_children(vec![
+                list.width(240).height(Length::Fill).into(),
+                crate::design::vertical_rule(),
+                content,
+            ])
+            .height(Length::Fill)
             .into()
+        } else {
+            widget::column::with_children(vec![
+                list.width(Length::Fill).height(200).into(),
+                crate::design::horizontal_rule(),
+                content,
+            ])
+            .height(Length::Fill)
+            .into()
+        }
     }
 }
 
 impl Draft {
-    fn view<'a>(&'a self, busy: bool, models: &'a Models) -> Element<'a, Action> {
+    fn view<'a>(
+        &'a self,
+        busy: bool,
+        models: &'a Models,
+        error: Option<&'a str>,
+    ) -> Element<'a, Action> {
         let provider_accounts = self
             .accounts
             .iter()
@@ -1260,7 +1355,7 @@ impl Draft {
             widget::text::body("Schedule").into(),
             widget::dropdown(SCHEDULES.to_vec(), Some(self.schedule), Action::Schedule).into(),
         ])
-        .spacing(8)
+        .spacing(2.0 * crate::design::GRID_UNIT)
         .width(Length::Fill);
         if self.schedule == 4 {
             fields = fields.push(input("Five-field cron", &self.cron, Field::Cron));
@@ -1286,8 +1381,29 @@ impl Draft {
                 .push(cosmic::iced::widget::text_editor(&self.shell).on_action(Action::Shell).height(100))
                 .push(input("Precheck timeout in seconds (1–300)", &self.timeout, Field::Timeout));
         }
-        fields.push(widget::text::body("New automations start paused. Changing the schedule or execution settings requires enabling them again. Missed runs older than 15 minutes are skipped; overlapping runs never start."))
-            .push(widget::row::with_children(vec![button("Cancel", Action::CancelEdit, !busy), button("Save", Action::Save, !busy)]).spacing(8).wrap()).into()
+        fields = fields.push(widget::text::body("New automations start paused. Changing the schedule or execution settings requires enabling them again. Missed runs older than 15 minutes are skipped; overlapping runs never start."));
+        if let Some(error) = error {
+            fields = fields.push(
+                crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(crate::design::destructive_color(theme)),
+                        ..Default::default()
+                    }
+                })),
+            );
+        }
+        fields
+            .push(
+                widget::row::with_children(vec![
+                    button("Cancel", Action::CancelEdit, !busy),
+                    widget::button::suggested("Save")
+                        .on_press_maybe((!busy).then_some(Action::Save))
+                        .into(),
+                ])
+                .spacing(2.0 * crate::design::GRID_UNIT)
+                .wrap(),
+            )
+            .into()
     }
 }
 
@@ -1300,7 +1416,7 @@ impl Draft {
                 .on_input(|value| Action::Field(Field::Timezone, value))
                 .into(),
         ])
-        .spacing(4);
+        .spacing(crate::design::GRID_UNIT);
         if let Some(matches) = &self.timezone_matches {
             if matches.is_empty() {
                 column = column.push(widget::text::caption(if self.timezone.trim().is_empty() {
@@ -1383,7 +1499,7 @@ impl Draft {
             })
             .into(),
         ])
-        .spacing(4);
+        .spacing(crate::design::GRID_UNIT);
         if custom {
             column = column.push(
                 widget::text_input("Model ID", &self.model)
@@ -1407,7 +1523,7 @@ impl Draft {
                 })
                 .into(),
             ])
-            .spacing(4)
+            .spacing(crate::design::GRID_UNIT)
             .into();
         }
         let selected = self
@@ -1429,7 +1545,7 @@ impl Draft {
             })
             .into(),
         ])
-        .spacing(4)
+        .spacing(crate::design::GRID_UNIT)
         .into()
     }
 }
@@ -1482,7 +1598,7 @@ fn launch_description<'a>(
         widget::text::body(description).into(),
         widget::text::body(definition.prompt.as_str()).into(),
     ])
-    .spacing(8);
+    .spacing(2.0 * crate::design::GRID_UNIT);
     if let Some(precheck) = &definition.precheck {
         column = column.push(widget::text::body(format!(
             "Shell precheck ({} seconds):\n{}",
@@ -1503,7 +1619,7 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
     // a single-line height, hiding target and scheduling details.
     let mut button = widget::button::custom(widget::text::body(label.clone()))
         .name(label)
-        .padding(12)
+        .padding(3.0 * crate::design::GRID_UNIT)
         .class(crate::sidebar::sidebar_button_style(false))
         .height(Length::Shrink);
     if enabled {
@@ -1518,7 +1634,7 @@ fn input<'a>(label: &'static str, value: &'a str, field: Field) -> Element<'a, A
             .on_input(move |value| Action::Field(field, value))
             .into(),
     ])
-    .spacing(4)
+    .spacing(crate::design::GRID_UNIT)
     .into()
 }
 fn timestamp(milliseconds: u64) -> String {

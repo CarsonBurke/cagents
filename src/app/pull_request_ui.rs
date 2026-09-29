@@ -63,6 +63,7 @@ pub struct State {
     hide_resolved: bool,
     description_open: bool,
     description: Vec<markdown::Item>,
+    comment_markdown: HashMap<String, Vec<markdown::Item>>,
     checks_collapsed: bool,
     discussion_collapsed: bool,
 }
@@ -91,6 +92,7 @@ impl State {
         self.loading = false;
         self.filter.clear();
         self.description.clear();
+        self.comment_markdown.clear();
         self.refresh()
     }
 
@@ -106,8 +108,8 @@ impl State {
         self.loading = true;
         self.error = None;
         self.link_error = None;
-        // Clearing old content avoids presenting a prior head's checks as fresh.
-        self.inspection = None;
+        // Keep this target's content visible while the disabled refresh control
+        // reports the in-flight refresh. Target changes clear it in synchronize.
         ActionTask::perform(
             async move {
                 let work = target.clone();
@@ -162,6 +164,9 @@ impl State {
                     Ok(None) => {
                         self.preview = None;
                         self.pull_request = None;
+                        self.inspection = None;
+                        self.comment_markdown.clear();
+                        self.description.clear();
                         self.loading = false;
                         self.loaded = true;
                         return ActionTask::none();
@@ -179,6 +184,14 @@ impl State {
                         .unwrap_or("No description provided."),
                 )
                 .collect();
+                if self
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|old| old.number != pull_request.number)
+                {
+                    self.inspection = None;
+                    self.comment_markdown.clear();
+                }
                 self.pull_request = Some(Arc::clone(&pull_request));
                 self.preview = None;
                 let cancellation = self.cancellation.clone();
@@ -213,6 +226,27 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
+                        self.comment_markdown.clear();
+                        if let Some(inspection) = &inspection
+                            && let Ok(conversation) = &inspection.conversation
+                        {
+                            for comment in conversation
+                                .comments
+                                .iter()
+                                .chain(conversation.reviews.iter().map(|review| &review.comment))
+                                .chain(
+                                    conversation
+                                        .threads
+                                        .iter()
+                                        .flat_map(|thread| &thread.comments),
+                                )
+                            {
+                                self.comment_markdown.insert(
+                                    comment.url.to_string(),
+                                    markdown::parse(&comment.body).collect(),
+                                );
+                            }
+                        }
                         self.description = markdown::parse(
                             inspection
                                 .as_ref()
@@ -281,31 +315,35 @@ fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
         .into()
 }
 
-fn comment<'a>(comment: &'a PullRequestComment, reply: bool) -> Element<'a, Action> {
+fn comment<'a>(
+    comment: &'a PullRequestComment,
+    reply: bool,
+    items: Option<&'a Vec<markdown::Item>>,
+) -> Element<'a, Action> {
     let author = comment
         .author
         .as_ref()
         .map_or("Deleted account", |author| author.login.as_str());
-    widget::container(
-        widget::column::with_children(vec![
-            widget::row::with_children(vec![
-                design::heading(author).width(Length::Fill).into(),
-                design::caption(comment.created_at.get(..10).unwrap_or(&comment.created_at)).into(),
-                crate::ui_controls::compact_icon_control(
-                    crate::ui_controls::symbolic_icon("external-link-symbolic"),
-                    "Open comment on GitHub",
-                    Some(Action::OpenUrl(comment.url.clone())),
-                )
-                .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(4)
-            .into(),
-            design::body(&comment.body).width(Length::Fill).into(),
-        ])
-        .spacing(4)
-        .width(Length::Fill),
+    let theme = cosmic::theme::active();
+    let body = items.map_or_else(
+        || design::body(&comment.body).width(Length::Fill).into(),
+        |items| {
+            markdown::view(items, design::markdown_settings(&theme, design::TEXT_BODY))
+                .map(|uri| Action::OpenMarkdownLink(uri.to_string()))
+        },
+    );
+    let actions = crate::ui_controls::compact_icon_control(
+        crate::ui_controls::symbolic_icon("external-link-symbolic"),
+        "Open comment on GitHub",
+        Some(Action::OpenUrl(comment.url.clone())),
     )
+    .into();
+    widget::container(design::comment_card(
+        author,
+        &comment.created_at,
+        body,
+        actions,
+    ))
     .padding(cosmic::iced::Padding {
         top: 4.,
         right: 0.,
@@ -499,11 +537,22 @@ pub fn view(state: &State) -> Element<'_, Action> {
                 state
                     .preview
                     .as_ref()
-                    .map_or_else(|| "Pull request".to_owned(), |pr| pr.title.clone())
+                    .map_or_else(|| "Pull request".to_owned(), |pr| format!("#{}", pr.number))
             },
-            |pr| pr.title.clone(),
+            |pr| format!("#{} · {}", pr.number, readable_state(&pr.state.0)),
         ))
         .width(Length::Fill)
+        .into(),
+        widget::container(if state.loading {
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(design::ROW_ICON_SIZE),
+                design::warning_color,
+            )
+        } else {
+            iced::widget::Space::new().into()
+        })
+        .width(design::ROW_ICON_SIZE)
+        .height(design::ROW_ICON_SIZE)
         .into(),
         crate::ui_controls::icon_control(
             crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
@@ -546,7 +595,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
     // content the user is already reading tells them nothing they can act on,
     // and the disabled Refresh control already reports that one is in flight.
     if state.loading && state.pull_request.is_none() && state.preview.is_none() {
-        children.push(crate::design::caption("Loading pull request…").into());
+        children.push(
+            widget::container(cosmic::iced::widget::Space::new().height(48))
+                .width(Length::Fill)
+                .into(),
+        );
     }
     if let Some(error) = &state.error {
         children.push(design::body(format!("Unable to load pull request: {error}")).into());
@@ -922,7 +975,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         ];
                         // Preserve the whole matching thread so replies retain context.
                         for (index, item) in thread.comments.iter().enumerate() {
-                            thread_rows.push(comment(item, index != 0));
+                            thread_rows.push(comment(
+                                item,
+                                index != 0,
+                                state.comment_markdown.get(item.url.as_str()),
+                            ));
                         }
                         if thread.truncated {
                             thread_rows.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
@@ -946,7 +1003,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                     readable_state(&review.state.0),
                                     design::Tone::Themed(tone),
                                 ),
-                                comment(&review.comment, false),
+                                comment(
+                                    &review.comment,
+                                    false,
+                                    state.comment_markdown.get(review.comment.url.as_str()),
+                                ),
                             ]));
                         }
                     }
@@ -956,7 +1017,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     for item in &conversation.comments {
                         if comment_matches(item, &filter) {
                             shown += 1;
-                            children.push(block(vec![comment(item, false)]));
+                            children.push(block(vec![comment(
+                                item,
+                                false,
+                                state.comment_markdown.get(item.url.as_str()),
+                            )]));
                         }
                     }
                     if shown == 0 {
@@ -1123,16 +1188,22 @@ impl Cagents {
                     "Refresh the worktree to inspect its pull request."
                 }
                 Some(source) if source.branch.is_none() => "This worktree has no named branch.",
-                Some(_) => "This worktree has no authenticated GitHub remote.",
+                Some(_) => "Connect this repository to GitHub to inspect pull requests.",
             };
+            let reason = source
+                .filter(|source| {
+                    source.data_state == SidebarDataState::Ready && source.branch.is_some()
+                })
+                .and_then(|source| self.github_availability.get(&source.key.project_id))
+                .map_or_else(|| reason.to_owned(), GitHubAvailability::guidance);
             if self.pull_request_inspector.target.is_none()
-                && self.pull_request_inspector.unavailable.as_deref() == Some(reason)
+                && self.pull_request_inspector.unavailable.as_deref() == Some(reason.as_str())
             {
                 return Task::none();
             }
             return self
                 .pull_request_inspector
-                .synchronize(None, Some(reason.to_owned()))
+                .synchronize(None, Some(reason))
                 .map(Message::PullRequestUi)
                 .map(cosmic::Action::App);
         };

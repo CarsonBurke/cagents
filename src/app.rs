@@ -85,10 +85,11 @@ use crate::{
     },
     pull_request_review,
     repository::{
-        CancellationToken, CommitOutcome, CommitRequest, CommitSummary, CreateWorktreeRequest,
-        DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome, PushOutcome, PushRequest,
-        RepoPath, RepositoryId, RepositoryInfo, RepositoryService, RepositorySnapshot,
-        StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
+        CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
+        CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
+        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
+        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
+        WorktreeRecord,
     },
     repository_widget::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
@@ -668,10 +669,10 @@ fn quarantined_write_line<'a>(
     card_title: &impl Fn(CardId) -> Option<&'a str>,
 ) -> String {
     let subject = match &write.subject {
-        WriteSubject::Workspace { card: None } => "Window layout and cards".to_owned(),
+        WriteSubject::Workspace { card: None } => "Window layout and panes".to_owned(),
         WriteSubject::Workspace { card: Some(card) } => card_title(*card).map_or_else(
-            || "Window layout and cards (one card was refused)".to_owned(),
-            |title| format!("Window layout and cards (card “{title}” was refused)"),
+            || "Window layout and panes (one pane was refused)".to_owned(),
+            |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
         WriteSubject::CardIdentity {
             card,
@@ -684,7 +685,7 @@ fn quarantined_write_line<'a>(
             card,
             kind: ReplacedIdentity::Chat,
         } => card_title(*card).map_or_else(
-            || "A chat card's new conversation".to_owned(),
+            || "A chat pane's new conversation".to_owned(),
             |title| format!("New conversation in “{title}”"),
         ),
         WriteSubject::Project { name, .. } => format!("Project “{name}”"),
@@ -704,7 +705,7 @@ fn quarantined_write_line<'a>(
         write.subject,
         WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
     ) {
-        line.push_str(" · closing the card clears it");
+        line.push_str(" · closing the pane clears it");
     }
     match write.held_back {
         0 => {}
@@ -1316,7 +1317,7 @@ fn card_control_id(id: CardId, control: &str) -> widget::Id {
 
 fn card_accessible_name(type_label: &str, title: &str, caption: &str, focused: bool) -> String {
     format!(
-        "{type_label} column {title}, {caption}, {}",
+        "{type_label} pane {title}, {caption}, {}",
         if focused { "focused" } else { "not focused" }
     )
 }
@@ -1362,7 +1363,7 @@ fn retire_duplicate_utility_cards(state: &mut WorkspaceState) {
 }
 
 fn card_close_name(type_label: &str, title: &str) -> String {
-    format!("Close {type_label} column {title}")
+    format!("Close {type_label} pane {title}")
 }
 
 fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
@@ -1416,10 +1417,10 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             unavailable: "Automations unavailable",
         },
         None => CardLabels {
-            type_label: "Column",
+            type_label: "Pane",
             icon: "view-grid-symbolic",
-            starting: "Starting column…",
-            unavailable: "Column unavailable",
+            starting: "Starting pane…",
+            unavailable: "Pane unavailable",
         },
     }
 }
@@ -2383,6 +2384,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
+        | Message::ReviewFilePanelToggle { .. }
+        | Message::ReviewFilePanelResize { .. }
+        | Message::ReviewFilePanelResizeFinished
         | Message::SelectContextTab(_)
         | Message::ContextInspector(_)
         // The settings pane sits under a dialog like any other card, so a
@@ -3028,7 +3032,7 @@ fn settings_update(
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
-            .map_err(|_| "Maximum hot columns must be a whole number.".to_owned()),
+            .map_err(|_| "Maximum hot panes must be a whole number.".to_owned()),
         SettingsField::HibernationDelayMs => value
             .parse::<u64>()
             .map(|value| next.hibernation_delay_ms = value)
@@ -3052,7 +3056,7 @@ fn settings_update(
         SettingsField::DefaultColumnFraction => value
             .parse::<f32>()
             .map(|value| next.default_column_fraction = value)
-            .map_err(|_| "Default column fraction must be a number.".to_owned()),
+            .map_err(|_| "Default pane width must be a number.".to_owned()),
         SettingsField::LinkOpenDestination => match value {
             "integrated_browser" => {
                 next.link_open_destination = LinkOpenDestination::IntegratedBrowser;
@@ -3167,6 +3171,15 @@ fn settings_update(
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ReviewFilePanelToggle {
+        card: CardId,
+        collapsed: bool,
+    },
+    ReviewFilePanelResize {
+        card: CardId,
+        width: f32,
+    },
+    ReviewFilePanelResizeFinished,
     /// A worktree snapshot for the source-control panel.
     ///
     /// `key` is the binding the request was made against. The panel rebinds
@@ -3676,6 +3689,8 @@ struct PullRequestPane {
     /// The pull request a restored card was showing, opened once the
     /// project's GitHub state has loaded enough to name the repository.
     pending_number: Option<u64>,
+    file_panel_width: f32,
+    file_panel_collapsed: Option<bool>,
 }
 
 impl PullRequestPane {
@@ -3749,7 +3764,7 @@ impl CardChrome {
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
-            resize_name: format!("Resize {type_label} column {title}"),
+            resize_name: format!("Resize {type_label} pane {title}"),
             close_name: format!(
                 "{}, {}",
                 card_close_name(type_label, title),
@@ -5058,6 +5073,10 @@ impl Cagents {
             })),
             runtime,
             pending_number: view.selected_number,
+            file_panel_width: view
+                .file_panel_width
+                .map_or(design::NAVIGATION_DEFAULT_WIDTH, f32::from),
+            file_panel_collapsed: view.file_panel_collapsed,
         }
     }
 
@@ -5214,6 +5233,68 @@ impl Cagents {
         ])
     }
 
+    fn navigate_local_diff(
+        &mut self,
+        card: CardId,
+        shortcut: workspace_widget::GlobalShortcut,
+    ) -> Task<Message> {
+        use workspace_widget::GlobalShortcut;
+        match shortcut {
+            GlobalShortcut::ReviewNextChange => {
+                return cosmic::task::message(Message::Repository(RepositoryAction::NextChange {
+                    card,
+                }));
+            }
+            GlobalShortcut::ReviewPreviousChange => {
+                return cosmic::task::message(Message::Repository(
+                    RepositoryAction::PreviousChange { card },
+                ));
+            }
+            GlobalShortcut::ReviewNextFile | GlobalShortcut::ReviewPreviousFile => {}
+            _ => return Task::none(),
+        }
+        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let Some(source) = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+        else {
+            return Task::none();
+        };
+        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
+        let paths: Vec<_> = source
+            .groups()
+            .iter()
+            .filter(|group| (group.area == ChangeArea::Staged) == staged)
+            .flat_map(|group| {
+                group
+                    .rows()
+                    .iter()
+                    .map(move |row| (group.area, &row.entry.path))
+            })
+            .collect();
+        if paths.is_empty() {
+            return Task::none();
+        }
+        let current = paths
+            .iter()
+            .position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
+        let index = match (shortcut, current) {
+            (GlobalShortcut::ReviewPreviousFile, Some(index)) => index.saturating_sub(1),
+            (_, Some(index)) => (index + 1).min(paths.len() - 1),
+            _ => 0,
+        };
+        let (area, path) = paths[index];
+        cosmic::task::message(Message::Sidebar(SidebarAction::OpenChange {
+            key: source.key.clone(),
+            path: path.clone(),
+            area,
+        }))
+    }
+
     fn ensure_pull_request_source(&mut self, card: CardId) -> Task<Message> {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
             return Task::none();
@@ -5230,6 +5311,13 @@ impl Cagents {
                 repository: repository.clone(),
                 worktree: pane.repository.clone(),
             });
+        let reason = pane
+            .project(&self.sidebar_model)
+            .and_then(|id| self.github_availability.get(&id))
+            .map(GitHubAvailability::guidance);
+        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+            pane.review.set_unavailable_reason(reason);
+        }
         self.apply_pull_request_review(card, pull_request_review::Action::SetSource(source))
     }
 
@@ -5279,6 +5367,8 @@ impl Cagents {
         let view = crate::model::PullRequestView {
             repository: repository.clone(),
             selected_number: None,
+            file_panel_width: None,
+            file_panel_collapsed: None,
         };
         let title = self
             .sidebar_model
@@ -5367,6 +5457,9 @@ impl Cagents {
                 workspace_widget::FocusedPane::Terminal
             }
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
+                workspace_widget::FocusedPane::Review
+            }
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -5473,7 +5566,20 @@ impl Cagents {
         id: CardId,
         pane: &'a PullRequestPane,
     ) -> Element<'a, Message> {
+        iced::widget::responsive(move |size| self.pull_request_card_layout(id, pane, size.width))
+            .into()
+    }
+
+    fn pull_request_card_layout<'a>(
+        &'a self,
+        id: CardId,
+        pane: &'a PullRequestPane,
+        width: f32,
+    ) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
+        let collapsed = pane.file_panel_collapsed.unwrap_or(width < 640.0);
+        let max_width = (width - 320.0).clamp(120.0, 600.0);
+        let panel_width = pane.file_panel_width.clamp(120.0, max_width);
         let modal_open = self.modal_is_open();
         let review = &pane.review;
         let mut side: Vec<Element<'a, pull_request_review::Action>> = Vec::new();
@@ -5520,12 +5626,30 @@ impl Cagents {
                 .spacing(0)
                 .height(Length::Fill),
         )
-        .width(Length::Fixed(design::NAVIGATION_DEFAULT_WIDTH))
+        .width(Length::Fixed(panel_width))
         .height(Length::Fill)
         .into();
         let side = side.map(move |action| Message::PullRequestReview { card: id, action });
 
         let mut main: Vec<Element<'a, Message>> = Vec::new();
+        main.push(
+            widget::container(
+                widget::button::text(if collapsed {
+                    "Show files"
+                } else {
+                    "Hide files"
+                })
+                .on_press_maybe((!modal_open).then_some(
+                    Message::ReviewFilePanelToggle {
+                        card: id,
+                        collapsed: !collapsed,
+                    },
+                )),
+            )
+            .height(design::DENSE_ROW_HEIGHT)
+            .width(Length::Fill)
+            .into(),
+        );
         if let Some(toolbar) = repository_widget::selected_file_toolbar(id, &pane.runtime) {
             main.push(toolbar.map(Message::Repository));
             main.push(design::horizontal_rule());
@@ -5539,7 +5663,7 @@ impl Cagents {
             let (title, detail) = if review.is_open() {
                 (
                     "Choose a file",
-                    "Pick a changed file to read its diff. The shortcuts move between files and mark them viewed.",
+                    "Pick a changed file to read its diff. Alt+Down/Up move between files; Alt+J/K move between changes; Alt+V marks a file viewed.",
                 )
             } else {
                 (
@@ -5578,19 +5702,35 @@ impl Cagents {
                     .map(move |action| Message::PullRequestReview { card: id, action }),
             );
         }
-        widget::row::with_children(vec![
-            side,
-            design::vertical_rule(),
-            widget::column::with_children(main)
-                .spacing(0)
-                .width(Length::Fill)
-                .height(Length::Fill)
+        let main = widget::column::with_children(main)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let mut children = Vec::with_capacity(3);
+        if !collapsed {
+            children.push(side);
+            children.push(
+                crate::splitter::Splitter::new(
+                    widget::Id::new(format!("review.files.resize.{id}")),
+                    "Review file panel width",
+                    panel_width,
+                    120.0,
+                    max_width,
+                    crate::splitter::Edge::Trailing,
+                    modal_open,
+                    move |width| Message::ReviewFilePanelResize { card: id, width },
+                    || Message::ReviewFilePanelResizeFinished,
+                )
                 .into(),
-        ])
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+            );
+        }
+        children.push(main);
+        widget::row::with_children(children)
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn repository_runtime(&self, view: RepositoryView) -> RepositoryRuntime {
@@ -7614,7 +7754,7 @@ impl Cagents {
                         widget::row::with_children(vec![
                             crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
                                 .icon()
-                                .size(24)
+                                .size(design::STATUS_ICON_SIZE)
                                 .into(),
                             widget::text::title3(labels.unavailable).into(),
                         ])
@@ -7672,7 +7812,7 @@ impl Cagents {
                     widget::column::with_children(vec![
                         crate::ui_controls::activity_spinner_tone(24.0, design::accent_color),
                         widget::text::title3(labels.starting).into(),
-                        design::caption("Preparing this workspace column…")
+                        design::caption("Preparing this workspace pane…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
                     ])
@@ -7760,7 +7900,7 @@ impl Cagents {
         )
         .class(cosmic::theme::Container::custom(move |theme| {
             let mut accent = iced::Color::from(*theme.cosmic().accent_color());
-            accent.a = 0.35;
+            accent.a = design::ATTENTION_BORDER_ALPHA;
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {
@@ -7790,7 +7930,7 @@ impl Cagents {
                         |chrome| chrome.resize_id.clone(),
                     ),
                     chrome.map_or_else(
-                        || card.map_or("Resize terminal column", |state| state.title.as_str()),
+                        || card.map_or("Resize terminal pane", |state| state.title.as_str()),
                         |chrome| chrome.resize_name.as_str(),
                     ),
                     width,
@@ -11362,6 +11502,17 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
+                let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
+                    let Some(source) = &self.sidebar_model.source_control else {
+                        return Task::none();
+                    };
+                    let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
+                        return Task::none();
+                    };
+                    resolved
+                } else {
+                    action
+                };
                 // Entering a worktree that is being deleted is refused, and
                 // for the same reason before the selection would claim it.
                 if self
@@ -11595,10 +11746,14 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }
+                    | SidebarAction::ChangePage { .. }
+                    | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::CommitEditorAction { .. }
+                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
                     | SidebarAction::PublishBranchChanged { .. }
                     | SidebarAction::CancelPublish
@@ -11675,7 +11830,7 @@ impl Application for Cagents {
                             )
                         })
                     }
-                    SidebarAction::Commit { key, message } => {
+                    SidebarAction::Commit { key, message, amend } => {
                         if !self.begin_mutation(&key, MutationKind::Commit) {
                             return Task::none();
                         }
@@ -11684,7 +11839,7 @@ impl Application for Cagents {
                             message,
                         };
                         Self::mutation_task(key, MutationKind::Commit, move |service, cancel| {
-                            commit_report(service.commit(&request, cancel))
+                            commit_report(service.commit_with_amend(&request, amend, cancel))
                         })
                     }
                     SidebarAction::Push {
@@ -12481,7 +12636,7 @@ impl Application for Cagents {
                             }]);
                         }
                         self.status = Some(TransientNotice::success(format!(
-                            "created worktree {}",
+                            "Created worktree {}",
                             worktree.path.display()
                         )));
                         if let Some(project) = self
@@ -12502,9 +12657,14 @@ impl Application for Cagents {
                             self.repository_load_task(repository, Some(project_id), false),
                         ]);
                     }
-                    Ok(other) => {
+                    Ok(WorktreeCreationOutcome::NotCreated { failure }) => {
                         self.status = Some(TransientNotice::warning(format!(
-                            "worktree outcome: {other:?}"
+                            "Could not create the worktree: {failure}"
+                        )));
+                    }
+                    Ok(WorktreeCreationOutcome::OutcomeUnknown { failure, .. }) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "The worktree creation outcome is unknown. Refresh the project before trying again. {failure}"
                         )));
                     }
                     Err(error) => self.status = Some(TransientNotice::error(error)),
@@ -12626,7 +12786,7 @@ impl Application for Cagents {
             } => match result {
                 Ok(PullRequestCreationOutcome::Created { url, .. }) => {
                     self.status = Some(TransientNotice::success(format!(
-                        "created pull request {url}"
+                        "Created pull request {url}"
                     )));
                     self.open_link(url)
                 }
@@ -12648,6 +12808,28 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if !captured
+                    && !self.workspace_inputs_blocked()
+                    && let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(key),
+                        modifiers,
+                        ..
+                    } = &event
+                    && modifiers.control()
+                    && modifiers.shift()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && key.eq_ignore_ascii_case("s")
+                    && let Some(card) = self.workspace.focused()
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                {
+                    let stage = runtime.selected_staging_selection(true).is_some();
+                    if stage || runtime.selected_staging_selection(false).is_some() {
+                        return cosmic::task::message(Message::Repository(
+                            RepositoryAction::StageSelected { card, stage },
+                        ));
+                    }
+                }
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
@@ -12837,11 +13019,15 @@ impl Application for Cagents {
                         | workspace_widget::GlobalShortcut::ReviewNextChange
                         | workspace_widget::GlobalShortcut::ReviewPreviousChange),
                     ) => {
-                        let Some(card) = self.workspace.focused().filter(|card| {
-                            matches!(self.cards.get(card), Some(CardRuntime::PullRequests(_)))
-                        }) else {
+                        let Some(card) = self.workspace.focused() else {
                             return Task::none();
                         };
+                        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
+                            return self.navigate_local_diff(card, shortcut);
+                        }
+                        if !matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_))) {
+                            return Task::none();
+                        }
                         let action = match shortcut {
                             workspace_widget::GlobalShortcut::ReviewToggleViewed => {
                                 pull_request_review::Action::ToggleViewedAndAdvance
@@ -12953,6 +13139,37 @@ impl Application for Cagents {
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::ReviewFilePanelToggle { card, collapsed } => {
+                if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                    pane.file_panel_collapsed = Some(collapsed);
+                }
+                if let Some(state) = self.card_state_mut(card)
+                    && let CardKind::PullRequests(view) = &mut state.kind
+                {
+                    view.file_panel_collapsed = Some(collapsed);
+                }
+                self.persist();
+                Task::none()
+            }
+            Message::ReviewFilePanelResize { card, width } => {
+                if !width.is_finite() {
+                    return Task::none();
+                }
+                let width = width.clamp(120.0, 600.0);
+                if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                    pane.file_panel_width = width;
+                }
+                if let Some(state) = self.card_state_mut(card)
+                    && let CardKind::PullRequests(view) = &mut state.kind
+                {
+                    view.file_panel_width = Some(width.round() as u16);
+                }
+                Task::none()
+            }
+            Message::ReviewFilePanelResizeFinished => {
+                self.persist();
+                Task::none()
             }
             Message::CommitUi(action) => self.update_commit_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
@@ -13856,7 +14073,12 @@ impl Application for Cagents {
                                 .class(cosmic::theme::Container::custom(|_| {
                                     iced::widget::container::Style {
                                         background: Some(iced::Background::Color(
-                                            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                                            iced::Color::from_rgba(
+                                                0.0,
+                                                0.0,
+                                                0.0,
+                                                design::SCRIM_ALPHA,
+                                            ),
                                         )),
                                         ..Default::default()
                                     }
@@ -15022,12 +15244,12 @@ mod tests {
         let snapshot = write(WriteSubject::Workspace { card: Some(card) });
         let line = quarantined_write_line(&snapshot, &titled);
         assert!(
-            line.starts_with("Window layout and cards (card “build” was refused)"),
+            line.starts_with("Window layout and panes (pane “build” was refused)"),
             "{line}"
         );
-        assert!(line.contains("closing the card clears it"), "{line}");
+        assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&snapshot, &untitled);
-        assert!(line.contains("(one card was refused)"), "{line}");
+        assert!(line.contains("(one pane was refused)"), "{line}");
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,
@@ -15035,11 +15257,11 @@ mod tests {
         });
         let line = quarantined_write_line(&relaunch, &titled);
         assert!(line.starts_with("Relaunched terminal “build”"), "{line}");
-        assert!(line.contains("closing the card clears it"), "{line}");
+        assert!(line.contains("closing the pane clears it"), "{line}");
 
         let line = quarantined_write_line(&write(WriteSubject::Workspace { card: None }), &titled);
-        assert!(line.starts_with("Window layout and cards —"), "{line}");
-        assert!(!line.contains("closing the card"), "{line}");
+        assert!(line.starts_with("Window layout and panes —"), "{line}");
+        assert!(!line.contains("closing the pane"), "{line}");
     }
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
@@ -15068,10 +15290,10 @@ mod tests {
             &KeyboardShortcuts::default(),
         );
         assert_eq!(chrome.caption, caption);
-        assert_eq!(chrome.resize_name, "Resize Browser column Example");
+        assert_eq!(chrome.resize_name, "Resize Browser pane Example");
         assert_eq!(
             chrome.accessible_name(true),
-            "Browser column Example, https://example.test/private%20path, focused"
+            "Browser pane Example, https://example.test/private%20path, focused"
         );
         for presented in [chrome.caption.as_str(), chrome.accessible_name(true)] {
             assert!(!presented.contains("alice"));
@@ -20400,6 +20622,8 @@ mod tests {
             CardKind::PullRequests(crate::model::PullRequestView {
                 repository: PathBuf::from("/repo"),
                 selected_number: None,
+                file_panel_width: None,
+                file_panel_collapsed: None,
             }),
         ];
         for kind in kinds {
@@ -21169,6 +21393,7 @@ mod tests {
             SidebarAction::Commit {
                 key: discard_key(),
                 message: "wip".into(),
+                amend: false,
             },
             SidebarAction::Refresh,
         ] {

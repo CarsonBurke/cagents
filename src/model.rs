@@ -1006,6 +1006,10 @@ pub fn trim_browser_history(history: &mut Vec<Url>, index: &mut usize) {
 pub struct PullRequestView {
     pub repository: PathBuf,
     pub selected_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_width: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_panel_collapsed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1216,6 +1220,22 @@ mod tests {
                 .unwrap()
                 .get("selected_file")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn review_file_panel_preferences_round_trip_and_old_descriptors_keep_auto_layout() {
+        let mut view: PullRequestView = serde_json::from_value(
+            serde_json::json!({ "repository": "/repo", "selected_number": 12 }),
+        )
+        .unwrap();
+        assert_eq!(view.file_panel_width, None);
+        assert_eq!(view.file_panel_collapsed, None);
+        view.file_panel_width = Some(360);
+        view.file_panel_collapsed = Some(true);
+        assert_eq!(
+            serde_json::from_slice::<PullRequestView>(&serde_json::to_vec(&view).unwrap()).unwrap(),
+            view
         );
     }
 

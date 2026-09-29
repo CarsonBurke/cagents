@@ -29,9 +29,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   `cagents channel spawn --repository PATH` accept the same folders.
 - Each worktree has a horizontal strip of panes: terminals, native chats,
   editors, repository views, and browsers. A tab strip contains only its
-  selected worktree or channel. Some settings and shortcut labels call a pane
-  in the strip a **column**, and a few messages call it a **card**; all three
-  mean the same thing.
+  selected worktree or channel. A **pane** is one independently focused surface;
+  editor **tabs** select files within an editor pane.
 - **New terminal** (`Ctrl+Shift+T`) starts in the selected worktree and opens directly
   to the right of the focused pane. The **New tab** menu offers **New
   thread**, **Terminal**, and **Browser** with keyboard navigation; New thread
@@ -47,21 +46,22 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
   use their OMP, Claude, or Codex provider mark.
-- Drag a tab title to reorder panes, or hold **Alt** and drag a pane. The
+- Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
-  first, and the sort control orders the rest by newest, oldest, or name.
+  first; **Settings → General → Worktrees** orders the rest by newest, oldest,
+  or name.
 - Worktree labels prefer the matching pull request title and fall back to a
   readable branch basename; tooltips and search keep the full branch name.
   Rows show matching pull requests and their CI status. Unread updates stay
-  emphasized until acknowledged, and viewing a waiting agent clears its
-  attention badge without changing its activity. The All, Attention, and Pull requests views keep separate
+  emphasized until acknowledged. **Waiting for input** stays visible until the
+  agent resumes or finishes. The All, Attention, and Pull requests views keep separate
   scroll positions.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
-  after one second.
+  after 300 milliseconds.
 - Contextual external-editor icons open the current project, worktree, or file
   in your external editor.
 
@@ -72,15 +72,16 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | New terminal | `Ctrl+Shift+T` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
-| Close focused column | `Ctrl+Shift+W` |
+| Close focused pane | `Ctrl+Shift+W` |
 | Search projects | `Ctrl+F` (outside terminals) |
-| Previous / next column | `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Ctrl+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
 | Next unviewed review file | `Alt+Shift+Down` |
-| Next / previous changed hunk in a review | `Alt+J` / `Alt+K` |
+| Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
+| Stage / unstage the open file | `Ctrl+Shift+S` |
 
 Every shortcut is configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
@@ -90,7 +91,7 @@ Every shortcut is configurable; see
   deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
   bind is withheld from the terminal, except **Search projects**, which a
   focused terminal receives as input (in an editor it finds in the file), and
-  the review chords, which act only in a pull request pane. As in those
+  the review chords, which act in pull request and local diff panes. As in those
   terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
   longer reach terminal programs such as Vim.
 - Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
@@ -98,15 +99,18 @@ Every shortcut is configurable; see
   those defaults move to the new ones; any shortcut you changed is kept. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
-- Hold the column shortcuts to move repeatedly. Navigation scrolls only far
+- Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
   enough to reveal the target pane.
 - **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Activate panes on hover** is on by default and changes focus without
-  scrolling; turn it off in Settings to require a click.
+- **Activate panes on hover** is off by default. When enabled, it previews the
+  pane under the pointer; keyboard focus moves when you click or type into it.
+- Hold **Alt+Tab** to preview recently used worktrees and channels. Release
+  **Alt** to open the highlighted workspace, or press **Escape** to cancel.
+  Previewing does not start panes in the workspaces you pass.
 - Switching worktrees remembers each strip's scroll position and focused
   pane. Hidden terminals release their presentation while their PTYs keep
   running, and editor buffers stay intact. Scroll positions, worktree
@@ -393,7 +397,7 @@ account registries prevent this orphan cleanup.
 
 **Notifications** controls background agent completion, failure or cancellation,
 and requests for attention. Alerts are suppressed while their pane is focused
-unless **Notify for the focused pane** is enabled. They name the provider and
+unless **Notify while focused** is enabled. They name the provider and
 folder, without copying prompts or output. **Send test notification** reports
 whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
