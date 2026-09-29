@@ -2221,7 +2221,9 @@ fn apply_size(
 }
 
 /// Runs while HostLease is held, before binding the public listener.
-pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
+/// Returns the retained native conversations this restore left unattached:
+/// their reattachment was just refused, so startup must not retry it at once.
+pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
     restore_upgrade_from(
         host,
         crate::upgrade::handoff::Store::discover()?,
@@ -2363,7 +2365,7 @@ fn restore_upgrade_from(
     store: crate::upgrade::handoff::Store,
     proc_root: &std::path::Path,
     holders: Option<&std::path::Path>,
-) -> Result<(), String> {
+) -> Result<Vec<TerminalId>, String> {
     use crate::upgrade::{
         ensure_no_surviving_process,
         handoff::{Phase, UnattachedChat},
@@ -2383,7 +2385,7 @@ fn restore_upgrade_from(
     };
     let Some(mut checkpoint) = store.load()? else {
         publish();
-        return Ok(());
+        return Ok(Vec::new());
     };
     checkpoint.validate()?;
     if checkpoint.chats.iter().any(|chat| {
@@ -2432,7 +2434,7 @@ fn restore_upgrade_from(
             checkpoint = %store.path.display(),
             "skipped upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
@@ -2593,7 +2595,7 @@ fn restore_upgrade_from(
                 %error,
                 "abandoned upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
         return Err(format!(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
@@ -2609,7 +2611,7 @@ fn restore_upgrade_from(
             "the daemon upgrade finished, but retained native conversations need attention"
         );
     }
-    Ok(())
+    Ok(unattached.iter().map(|chat| chat.summary.id).collect())
 }
 
 /// Forgets unattached conversations whose native holder no longer exists,
@@ -2636,21 +2638,27 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     let departed = conversations
         .iter()
         .filter(|conversation| {
-            match registry::evidence(&registry::socket(&directory, conversation.id), Kind::Native) {
-                Ok(None) => {
-                    tracing::warn!(session = %conversation.id,
-                        conversation = ?conversation.conversation,
-                        working_directory = %conversation.working_directory.display(),
-                        "the native holder of an unattached conversation is gone; reopen it from its provider's session storage if it is still wanted");
-                    true
-                }
-                Ok(Some(_)) => false,
+            let gone = match registry::evidence(
+                &registry::socket(&directory, conversation.id),
+                Kind::Native,
+            ) {
+                Ok(None) => true,
+                // A record outliving its holder process, as after that holder
+                // was killed, leaves nothing to reattach or close either.
+                Ok(Some(record)) => !record.holder.is_current(),
                 Err(error) => {
                     tracing::warn!(session = %conversation.id, %error,
                         "kept unattached conversation whose holder evidence cannot be read");
                     false
                 }
+            };
+            if gone {
+                tracing::warn!(session = %conversation.id,
+                    conversation = ?conversation.conversation,
+                    working_directory = %conversation.working_directory.display(),
+                    "the native holder of an unattached conversation is gone; reopen it from its provider's session storage if it is still wanted");
             }
+            gone
         })
         .map(|conversation| conversation.id)
         .collect::<Vec<_>>();

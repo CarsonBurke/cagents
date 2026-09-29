@@ -160,7 +160,7 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
             let successor = Arc::new(Mutex::new(state));
             // Startup discovery failed before the UI asked for an upgrade
             // mapping. Preserve the precise refusal for every issued alias.
-            super::super::chat::restore_orphaned_native(&successor).unwrap();
+            super::super::chat::restore_orphaned_native(&successor, &[]).unwrap();
             for issued_source in [&source, &stale_source] {
                 let refusal = super::super::client::process_request(
                     &successor,
@@ -711,7 +711,12 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         .record_unattached(std::slice::from_ref(&departed), &[])
         .unwrap();
     let rollback = replace_daemon("rollback");
-    restore_upgrade_from(&rollback, store(), &empty_proc, Some(&holders)).unwrap();
+    let refused = restore_upgrade_from(&rollback, store(), &empty_proc, Some(&holders)).unwrap();
+    assert_eq!(
+        refused,
+        [id],
+        "startup learns which conversation was refused"
+    );
     assert!(store().load().unwrap().is_none(), "checkpoint was consumed");
     for &(terminal, pid) in &terminals {
         let handle = rollback.lock().unwrap().terminals[&terminal].handle.clone();
@@ -767,7 +772,12 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
     // Once the rollout is back, the next discovery reattaches the very same
     // server, and the conversation no longer needs attention.
     fs::create_dir_all(root.join("home/.codex")).unwrap();
-    super::super::chat::restore_orphaned_native(&rollback).unwrap();
+    // Startup's own discovery does not retry a reattachment its upgrade
+    // restore just refused; that would repeat the whole confirmation wait.
+    super::super::chat::restore_orphaned_native(&rollback, &refused).unwrap();
+    assert!(!rollback.lock().unwrap().chats.contains_key(&id));
+    assert_eq!(store().unattached().unwrap().len(), 1);
+    super::super::chat::restore_orphaned_native(&rollback, &[]).unwrap();
     assert!(rollback.lock().unwrap().chats.contains_key(&id));
     assert!(store().unattached().unwrap().is_empty());
     assert!(!store().unattached_path().exists());

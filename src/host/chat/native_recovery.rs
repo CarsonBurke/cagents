@@ -390,7 +390,14 @@ fn retained_upgrade_sources(
         .collect()
 }
 
-pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), String> {
+/// `refused` names conversations whose reattachment this startup already
+/// attempted and refused, as an upgrade restore's unattached ones: retrying
+/// them at once would only repeat that refusal after another confirmation
+/// wait. A later discovery still considers them.
+pub(in crate::host) fn restore_orphaned_native(
+    host: &SharedHost,
+    refused: &[TerminalId],
+) -> Result<(), String> {
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -398,6 +405,9 @@ pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), 
         .clone();
     let directory = registry::directory(Kind::Native)?;
     for record in registry::discover(&directory, &proof.boot_id, Kind::Native)? {
+        if refused.contains(&record.terminal) {
+            continue;
+        }
         if host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
