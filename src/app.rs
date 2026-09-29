@@ -3426,7 +3426,6 @@ pub enum Message {
     OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
-    #[cfg(not(feature = "integrated-browser"))]
     ExternalUrlOpened(Result<(), String>),
     #[cfg(feature = "integrated-browser")]
     BrowserBack(CardId),
@@ -11090,7 +11089,6 @@ impl Application for Cagents {
                 self.status = Some(TransientNotice::error(message));
                 Task::none()
             }
-            #[cfg(not(feature = "integrated-browser"))]
             Message::ExternalUrlOpened(result) => {
                 self.status = Some(match result {
                     Ok(()) => TransientNotice::success("Opened in the system browser"),
