@@ -200,6 +200,13 @@ const BROWSER_TOOLBAR_HEIGHT: f32 = design::ROW_HEIGHT;
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const DIALOG_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+/// How long an exit waits once its window is gone: a frame, which lets winit
+/// finish its pass and flush the window's destruction before iced tears down.
+const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(16);
+/// How long an exit waits for iced to report its window gone. iced reports it
+/// within a frame; the bound only keeps a lost report from leaving an
+/// invisible process holding the session lease, so no new window could open.
+const EXIT_WINDOW_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTENT_MAX_WIDTH: f32 = 560.0;
 const STATUS_SURFACE_MAX_WIDTH: f32 = 360.0;
 
@@ -3266,6 +3273,8 @@ pub enum Message {
     CloseCard(CardId),
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
+    /// iced has removed a window, and winit has queued its destruction.
+    WindowClosed(window::Id),
     NewWindow,
     NewWindowOpened {
         saved: Result<SettingsSaved, String>,
@@ -3477,6 +3486,25 @@ pub enum Message {
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
     DismissAllNotices,
+}
+
+/// An application exit in progress.
+///
+/// The window closes as soon as the exit is committed. The process ends only
+/// once both halves below are done: before the window is gone, iced's
+/// teardown would run while it is still on screen, and before the servers
+/// are reaped it would take away the runtime that stops them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ApplicationExit {
+    /// The window the exit closed, until iced reports it gone.
+    closing: Option<window::Id>,
+    servers_reaped: bool,
+}
+
+impl ApplicationExit {
+    fn is_complete(self) -> bool {
+        self.closing.is_none() && self.servers_reaped
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3916,6 +3944,9 @@ pub struct Cagents {
     update_flush_pending: bool,
     update_generation: u64,
     update_committed: bool,
+    /// Set once the application has committed to exiting. No later close
+    /// request may start the exit again.
+    exit: Option<ApplicationExit>,
     /// A shell theme change has landed that the open document pages were not
     /// rendered for. It is recorded rather than acted on, because the notice
     /// arrives on a path whose returned task libcosmic discards, and it is
@@ -9244,7 +9275,15 @@ impl Cagents {
         )
     }
 
-    /// Exits once the language servers have actually been reaped.
+    /// Leaves the application: the window first, the process once the window
+    /// is gone and the language servers have actually been reaped.
+    ///
+    /// The window is the only part of the exit anyone sees, so it goes at
+    /// once. What follows - the reap below, the final session flush in
+    /// `Drop`, the renderer and runtime teardown after `run` returns - takes
+    /// seconds on a busy machine, and winit destroys a closed toplevel only on
+    /// an event-loop pass after the close: an exit that reaches iced first
+    /// leaves the window on screen, unresponsive, until the process is gone.
     ///
     /// `shutdown` only *asks*: the processes are stopped by session tasks on
     /// the tokio runtime, and `iced::exit()` takes that runtime away. Waiting
@@ -9253,11 +9292,104 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.exit.is_some() {
+            return Task::none();
+        }
+        // `Drop` writes the final state; this snapshot is queued now because
+        // someone who has watched the window close may power off before then.
+        self.persist();
         let reaped = self.lsp.begin_shutdown();
-        cosmic::task::future(async move {
+        let reap = cosmic::task::future(async move {
             reaped.await;
             Message::LanguageServersReaped
-        })
+        });
+        let close = self.close_main_window();
+        self.exit = Some(ApplicationExit {
+            closing: close.as_ref().map(|(window, _)| *window),
+            servers_reaped: false,
+        });
+        let Some((window, close)) = close else {
+            return reap;
+        };
+        let close_timeout = cosmic::task::future(async move {
+            tokio::time::sleep(EXIT_WINDOW_CLOSE_TIMEOUT).await;
+            Message::WindowClosed(window)
+        });
+        Task::batch([close, reap, close_timeout])
+    }
+
+    /// Records one half of the exit and ends the process once both are done.
+    fn advance_exit(&mut self, advance: impl FnOnce(&mut ApplicationExit)) -> Task<Message> {
+        let Some(exit) = self.exit.as_mut() else {
+            return Task::none();
+        };
+        advance(exit);
+        if !exit.is_complete() {
+            return Task::none();
+        }
+        // The window's closed report and this exit can land in the very
+        // event-loop pass that destroyed the window, and iced would then tear
+        // down before winit flushed that destruction to the compositor.
+        iced::Task::future(async { tokio::time::sleep(EXIT_FLUSH_GRACE).await })
+            .discard()
+            .chain(iced::exit())
+    }
+
+    /// Closes the main window while the application keeps running, or
+    /// `None` when there is no window to close.
+    ///
+    /// libcosmic answers the main window closing with an immediate
+    /// `iced::exit()`, which would take the runtime away from the reap that
+    /// [`Self::exit_after_language_servers`] is still waiting on and orphan
+    /// every server not yet stopped. With no main window the close is only a
+    /// close; [`Application::view_window`] draws the window empty until iced
+    /// removes it.
+    fn close_main_window(&mut self) -> Option<(window::Id, Task<Message>)> {
+        let window = self.core.main_window_id()?;
+        #[cfg(feature = "integrated-browser")]
+        self.release_browser_parent();
+        self.core.set_main_window_id(None);
+        Some((window, iced::window::close(window)))
+    }
+
+    /// Tears down everything that borrows the main window's Wayland surface.
+    ///
+    /// Exact Wayland parent invariant, which must hold before the parent
+    /// window is closed or dropped:
+    /// 1. request and join every browser still owned by a card;
+    /// 2. join every off-UI-path card-close reaper;
+    /// 3. drop the raw-handle factory/Wayland host;
+    /// 4. deactivate/drop the parent lifetime guard.
+    ///
+    /// Idempotent: the exit path runs it before closing the window, and
+    /// `Drop` runs it again for an exit this application did not drive.
+    #[cfg(feature = "integrated-browser")]
+    fn release_browser_parent(&mut self) {
+        let cards = self
+            .cards
+            .iter()
+            .filter(|(_, runtime)| matches!(runtime, CardRuntime::Browser(_)))
+            .map(|(card, _)| *card)
+            .collect::<Vec<_>>();
+        let mut browsers = Vec::with_capacity(cards.len());
+        for card in cards {
+            if let Some(CardRuntime::Browser(browser)) = self.cards.remove(&card) {
+                // Every engine is asked before any is awaited, so they tear
+                // down together rather than one after another.
+                browser.handle.request_shutdown();
+                browsers.push(browser);
+            }
+        }
+        for mut browser in browsers {
+            browser.handle.shutdown();
+        }
+        for teardown in self.browser_teardowns.drain(..) {
+            let _ = teardown.join();
+        }
+        self.browser_factory.take();
+        if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
+            parent_lifetime.deactivate();
+        }
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
@@ -10229,6 +10361,7 @@ impl Application for Cagents {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            exit: None,
             document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
@@ -11930,7 +12063,9 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
-                if self.dirty_repository_close.is_some() {
+                // libcosmic reports the closed window through this same
+                // request, and a second close must not reopen the exit.
+                if self.exit.is_some() || self.dirty_repository_close.is_some() {
                     return Task::none();
                 }
                 let dirty = self
@@ -12096,6 +12231,24 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            // The exit released the parent before closing it. A factory that
+            // captured the window just before must not start browsers on a
+            // surface that is gone, nor mark the cards it would have loaded
+            // failed in the state the exit is about to save.
+            #[cfg(feature = "integrated-browser")]
+            Message::InitializeBrowserFactory if self.exit.is_some() => Task::none(),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserFactoryReady(result) if self.exit.is_some() => {
+                if let Ok(BrowserFactoryBinding {
+                    factory,
+                    parent_lifetime,
+                }) = result
+                {
+                    drop(factory);
+                    parent_lifetime.deactivate();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -12885,7 +13038,12 @@ impl Application for Cagents {
                 self.apply_lsp_event(event);
                 Task::none()
             }
-            Message::LanguageServersReaped => iced::exit().map(cosmic::Action::App),
+            Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
+            Message::WindowClosed(window) => self.advance_exit(|exit| {
+                if exit.closing == Some(window) {
+                    exit.closing = None;
+                }
+            }),
             Message::SessionSaveHealthChanged(event) => {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
@@ -13164,6 +13322,9 @@ impl Application for Cagents {
                 }
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
+                }
+                iced::Event::Window(window::Event::Closed) => {
+                    Some(Message::WindowClosed(event_window))
                 }
                 iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, true),
@@ -13559,6 +13720,13 @@ impl Application for Cagents {
         ))
     }
 
+    /// The application opens no window but its main one, which stops being
+    /// the main window only when the exit closes it. libcosmic's default
+    /// panics, and iced may still draw the window before it removes it.
+    fn view_window(&self, _id: window::Id) -> Element<'_, Message> {
+        widget::Space::new().into()
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
@@ -13853,30 +14021,13 @@ impl Drop for Cagents {
         self.lsp.shutdown();
         self.lsp.kill_retired_now();
 
-        // Exact Wayland parent invariant:
-        // 1. request and join every browser still owned by a card;
-        // 2. join every off-UI-path card-close reaper;
-        // 3. drop the raw-handle factory/Wayland host;
-        // 4. deactivate/drop the parent lifetime guard;
-        // 5. only then may Rust drop `core` and its parent window.
+        // The exit path already released the parent before closing the
+        // window. Otherwise the window is still open, and this must complete
+        // before Rust drops `core` and, with it, the parent window.
         #[cfg(feature = "integrated-browser")]
-        for runtime in std::mem::take(&mut self.cards).into_values() {
-            if let CardRuntime::Browser(mut browser) = runtime {
-                browser.handle.shutdown();
-            }
-        }
+        self.release_browser_parent();
         for teardown in self.terminal_teardowns.drain(..) {
             let _ = teardown.join();
-        }
-        #[cfg(feature = "integrated-browser")]
-        for teardown in self.browser_teardowns.drain(..) {
-            let _ = teardown.join();
-        }
-        #[cfg(feature = "integrated-browser")]
-        self.browser_factory.take();
-        #[cfg(feature = "integrated-browser")]
-        if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
-            parent_lifetime.deactivate();
         }
     }
 }
@@ -15133,6 +15284,112 @@ mod tests {
             resolve_restore_card(Some(origin), Some(replacement), |_| false),
             Some(replacement)
         );
+    }
+
+    /// The window is the only part of an exit anyone sees, so it closes as
+    /// soon as the exit is committed; the language-server reap, the final
+    /// session flush and the process teardown all happen after it has gone.
+    #[test]
+    fn committed_exit_closes_the_window_before_the_process_exits() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        let closing = Some(ApplicationExit {
+            closing: Some(window),
+            servers_reaped: false,
+        });
+        assert_eq!(app.exit, closing);
+        // Released, so libcosmic's report of the closed window cannot end the
+        // application under the reap the exit is still waiting on, and the
+        // frames iced may draw before it removes the window must not panic.
+        assert_eq!(app.core.main_window_id(), None);
+        let _ = app.view_window(window);
+
+        // That report arrives as another close request. It must not start the
+        // exit again or raise a dialog in a window that no longer exists.
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let _ = app.update(Message::WindowCloseRequested(window));
+        assert!(app.dirty_repository_close.is_none());
+        assert_eq!(app.exit, closing);
+    }
+
+    /// Neither half of the exit may end the process alone: servers reaped
+    /// before the window is destroyed would tear iced down with the window
+    /// still on screen, and a destroyed window before the reap would take the
+    /// runtime away from servers still stopping.
+    #[test]
+    fn exit_waits_for_both_the_window_and_the_language_servers() {
+        for window_first in [true, false] {
+            let mut app = context_inspector_test_app(false);
+            let window = window::Id::unique();
+            app.core.set_main_window_id(Some(window));
+            let _ = app.update(Message::WindowCloseRequested(window));
+
+            let (first, second) = if window_first {
+                (
+                    Message::WindowClosed(window),
+                    Message::LanguageServersReaped,
+                )
+            } else {
+                (
+                    Message::LanguageServersReaped,
+                    Message::WindowClosed(window),
+                )
+            };
+            let _ = app.update(first);
+            assert!(!app.exit.unwrap().is_complete());
+            let _ = app.update(second);
+            assert!(app.exit.unwrap().is_complete());
+        }
+    }
+
+    /// Only the window the exit closed can finish it.
+    #[test]
+    fn another_window_closing_does_not_finish_the_exit() {
+        let mut app = context_inspector_test_app(false);
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        let _ = app.update(Message::LanguageServersReaped);
+        let _ = app.update(Message::WindowClosed(window::Id::unique()));
+
+        assert!(!app.exit.unwrap().is_complete());
+    }
+
+    /// iced reports every window it removes; outside an exit that is not half
+    /// of one.
+    #[test]
+    fn window_closed_outside_an_exit_is_ignored() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::WindowClosed(window::Id::unique()));
+        let _ = app.update(Message::LanguageServersReaped);
+        assert_eq!(app.exit, None);
+    }
+
+    #[test]
+    fn unresolved_repository_keeps_the_window_open_on_close() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        app.core.set_main_window_id(Some(window));
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+
+        assert!(app.dirty_repository_close.is_some());
+        assert_eq!(app.exit, None);
+        assert_eq!(app.core.main_window_id(), Some(window));
     }
 
     #[test]
@@ -19480,6 +19737,7 @@ mod tests {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            exit: None,
             document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
