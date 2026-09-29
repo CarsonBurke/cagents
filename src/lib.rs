@@ -43,6 +43,8 @@ pub mod github;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]
+pub mod input_trace;
+#[cfg(feature = "ui")]
 pub mod inspector;
 mod install_guard;
 pub mod instance;
