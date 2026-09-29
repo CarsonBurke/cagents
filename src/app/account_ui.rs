@@ -89,8 +89,8 @@ pub(super) struct State {
     /// Accounts being signed out and deleted.
     removing: BTreeSet<AccountId>,
     /// Accounts whose home was found signed in to another login than the
-    /// one it was added with, and already reported as such.
-    login_changes_reported: BTreeSet<AccountId>,
+    /// one it was added with, and the login each was reported signed in to.
+    login_changes_reported: BTreeMap<AccountId, Identity>,
     /// Accounts whose home reported another login, waiting for the
     /// registry to be read again before that is reported.
     login_changes_unconfirmed: BTreeSet<AccountId>,
@@ -171,7 +171,7 @@ impl State {
             table: table::Table::default(),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
-            login_changes_reported: BTreeSet::new(),
+            login_changes_reported: BTreeMap::new(),
             login_changes_unconfirmed: BTreeSet::new(),
             catalogs: BTreeMap::new(),
             catalogs_unsaved: BTreeSet::new(),
@@ -2262,7 +2262,12 @@ impl Cagents {
                     registry.adopt_identity(key, &identity);
                 });
             }
-            if self.account_ui.login_changes_reported.contains(id) {
+            if self
+                .account_ui
+                .login_changes_reported
+                .get(id)
+                .is_some_and(|reported| reported.same_login(&identity))
+            {
                 return Task::none();
             }
             // Another window may have just signed this account in to the
@@ -2288,20 +2293,26 @@ impl Cagents {
         })
     }
 
-    /// Reports, once, that `id`'s home is signed in to another login than
-    /// the one it was added with - if it still is.
+    /// Reports, once per login, that `id`'s home is signed in to another
+    /// login than the one it was added with - if it still is.
     fn report_login_change(&mut self, id: &AccountId) {
         let Some(account) = self.account_ui.account(id) else {
             return;
         };
-        if !matches!(
-            self.account_ui.login_conflict(account),
-            Some(LoginConflict::Changed { .. })
-        ) {
+        let Some(LoginConflict::Changed { now, .. }) = self.account_ui.login_conflict(account)
+        else {
             return;
-        }
+        };
+        let Some(identity) = account.identity.clone() else {
+            return;
+        };
         let name = self.account_ui.display_name(account);
-        if !self.account_ui.login_changes_reported.insert(id.clone()) {
+        if self
+            .account_ui
+            .login_changes_reported
+            .insert(id.clone(), identity.clone())
+            .is_some_and(|reported| reported.same_login(&identity))
+        {
             return;
         }
         tracing::warn!(
@@ -2309,7 +2320,7 @@ impl Cagents {
             "account home reports a different login than it was added with"
         );
         self.status = Some(TransientNotice::error(format!(
-            "{name} is now signed in to a different login than it was added with. Sign it in again, or remove it."
+            "{name} is now signed in to a different login ({now}) than it was added with. Sign it in again, or remove it."
         )));
     }
 
@@ -4744,6 +4755,11 @@ mod app_tests {
             Some("work@example.com")
         );
         assert_eq!(login_changes_noticed(&app), 1);
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(login_changes_noticed(&app), 1, "once per login");
+        // Replaced again, by yet another login: that is a change of its own.
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(login_changes_noticed(&app), 2);
     }
 
     fn login_changes_noticed(app: &Cagents) -> usize {
