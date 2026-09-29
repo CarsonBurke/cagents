@@ -20165,14 +20165,21 @@ mod tests {
             .unwrap();
         app.cards
             .insert(card, CardRuntime::Terminal(TerminalSurface::from(handle)));
-        let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         server.join().unwrap();
         let notices = app.notices.entries.len();
-
-        drop(app.update(Message::TerminalWake {
-            card,
-            generation: wake.generation,
-        }));
+        // Connecting can announce a repaint before the protocol error arrives.
+        // Drive every wake as the application does, rather than assuming the
+        // first notification already contains the failed attachment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(app.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+            let wake = wake_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the failed attachment wakes the application");
+            drop(app.update(Message::TerminalWake {
+                card,
+                generation: wake.generation,
+            }));
+        }
         // The attach-only path took it up again; a relaunch would have made
         // the card hydrate.
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
