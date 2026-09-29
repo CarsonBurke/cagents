@@ -93,6 +93,7 @@ impl RestoreFixture {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            chat_drafts: HashMap::new(),
             workspace_model_identity: None,
             cards: vec![
                 CardState {

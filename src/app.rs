@@ -10168,6 +10168,7 @@ impl Application for Cagents {
             })
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
+        let chat_drafts = durable.chat_drafts.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
         // the whole of its life, so the observer starts with the window rather
@@ -10250,7 +10251,7 @@ impl Application for Cagents {
             project_ui: project_ui::State::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
-            chat_ui: chat_ui::State::default(),
+            chat_ui: chat_ui::State::with_drafts(chat_drafts),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
