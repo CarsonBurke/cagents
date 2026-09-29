@@ -2695,7 +2695,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 16] = [
+    const SHORTCUTS: [Self; 34] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2712,6 +2712,24 @@ impl SettingsField {
         Self::ShortcutReviewNextUnviewed,
         Self::ShortcutReviewNextChange,
         Self::ShortcutReviewPreviousChange,
+        Self::ShortcutCommandPalette,
+        Self::ShortcutNewThread,
+        Self::ShortcutToggleInspector,
+        Self::ShortcutOpenSettings,
+        Self::ShortcutMovePaneLeft,
+        Self::ShortcutMovePaneRight,
+        Self::ShortcutReopenPane,
+        Self::ShortcutFocusPane1,
+        Self::ShortcutFocusPane2,
+        Self::ShortcutFocusPane3,
+        Self::ShortcutFocusPane4,
+        Self::ShortcutFocusPane5,
+        Self::ShortcutFocusPane6,
+        Self::ShortcutFocusPane7,
+        Self::ShortcutFocusPane8,
+        Self::ShortcutFocusPane9,
+        Self::ShortcutToggleProjects,
+        Self::ShortcutRenamePane,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -2746,6 +2764,29 @@ impl SettingsField {
             Self::LinkOpenDestination => "Open links in",
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
+            Self::DiffHideUnchanged => "Hide unchanged diff lines",
+            Self::EditorFontFamily => "Editor font family",
+            Self::EditorFontSize => "Editor font size",
+            Self::BrowserSearchUrl => "Browser search URL",
+            Self::ConfirmMultilinePaste => "Confirm multiline paste",
+            Self::ShortcutToggleProjects => "Toggle Projects sidebar",
+            Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutCommandPalette => "Command palette",
+            Self::ShortcutNewThread => "New thread",
+            Self::ShortcutToggleInspector => "Toggle inspector",
+            Self::ShortcutOpenSettings => "Open settings",
+            Self::ShortcutMovePaneLeft => "Move pane left",
+            Self::ShortcutMovePaneRight => "Move pane right",
+            Self::ShortcutReopenPane => "Reopen closed pane",
+            Self::ShortcutFocusPane1 => "Focus pane 1",
+            Self::ShortcutFocusPane2 => "Focus pane 2",
+            Self::ShortcutFocusPane3 => "Focus pane 3",
+            Self::ShortcutFocusPane4 => "Focus pane 4",
+            Self::ShortcutFocusPane5 => "Focus pane 5",
+            Self::ShortcutFocusPane6 => "Focus pane 6",
+            Self::ShortcutFocusPane7 => "Focus pane 7",
+            Self::ShortcutFocusPane8 => "Focus pane 8",
+            Self::ShortcutFocusPane9 => "Focus pane 9",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
@@ -2791,6 +2832,7 @@ impl SettingsField {
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackLines
             | Self::ConfirmTerminalClose
+            | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
             | Self::HibernationDelayMs
@@ -2800,14 +2842,36 @@ impl SettingsField {
             | Self::DefaultChannelPane
             | Self::ChatEnterSends
             | Self::FocusFollowsMouse => SettingsCategory::General,
-            Self::EditorAutoSave | Self::EditorWrapLines | Self::EditorSyntaxTheme => {
-                SettingsCategory::Editor
-            }
+            Self::EditorAutoSave
+            | Self::EditorWrapLines
+            | Self::EditorSyntaxTheme
+            | Self::EditorFontFamily
+            | Self::EditorFontSize
+            | Self::DiffHideUnchanged => SettingsCategory::Editor,
             Self::CheckForUpdates => SettingsCategory::About,
-            Self::LinkOpenDestination | Self::LinkOpenGesture | Self::PullRequestOpenTarget => {
-                SettingsCategory::Links
-            }
+            Self::LinkOpenDestination
+            | Self::LinkOpenGesture
+            | Self::PullRequestOpenTarget
+            | Self::BrowserSearchUrl => SettingsCategory::Links,
             Self::ShortcutNewTerminal
+            | Self::ShortcutToggleProjects
+            | Self::ShortcutRenamePane
+            | Self::ShortcutCommandPalette
+            | Self::ShortcutNewThread
+            | Self::ShortcutToggleInspector
+            | Self::ShortcutOpenSettings
+            | Self::ShortcutMovePaneLeft
+            | Self::ShortcutMovePaneRight
+            | Self::ShortcutReopenPane
+            | Self::ShortcutFocusPane1
+            | Self::ShortcutFocusPane2
+            | Self::ShortcutFocusPane3
+            | Self::ShortcutFocusPane4
+            | Self::ShortcutFocusPane5
+            | Self::ShortcutFocusPane6
+            | Self::ShortcutFocusPane7
+            | Self::ShortcutFocusPane8
+            | Self::ShortcutFocusPane9
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
