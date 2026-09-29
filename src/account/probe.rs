@@ -445,8 +445,18 @@ fn command(account: &Account, program: &Path) -> Command {
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
     }
-    if let Some((variable, home)) = account.probe_environment() {
-        command.env(variable, home);
+    match account.probe_environment() {
+        Some((variable, home)) => {
+            command.env(variable, home);
+        }
+        // The system account is the home the CLI resolves on its own, which
+        // an account cagents selected for this process is not.
+        None if account.is_system() => {
+            for variable in super::inherited_selections(&|name| std::env::var(name).ok()) {
+                command.env_remove(variable);
+            }
+        }
+        None => {}
     }
     if let Some(path) = shell_search_path() {
         command.env("PATH", path);

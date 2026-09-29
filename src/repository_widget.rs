@@ -5975,13 +5975,6 @@ pub fn find_focus_id(card: CardId) -> widget::Id {
 pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.view"))
 }
-fn comparison_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M12 4v16M6 10h3M15 10h3M16.5 8.5v3M6 15h3M15 15h3"/></g></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
-}
-
 fn branch_comparison_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 7v10M18 7c0 7-12 3-12 10"/></g></svg>"#[..]).symbolic(true)
@@ -6147,7 +6140,7 @@ pub fn selected_file_toolbar(
             preview.into(),
             edit.into(),
             icon_control(
-                comparison_icon(),
+                crate::ui_controls::symbolic_icon("vcs-diff-symbolic"),
                 "View diff",
                 runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
                 runtime.can_show_diff(),
@@ -6964,7 +6957,7 @@ fn diff_review_controls(
             )
             .into(),
             icon_control(
-                comparison_icon(),
+                crate::ui_controls::symbolic_icon("vcs-diff-symbolic"),
                 "Side-by-side diff",
                 runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Split,
                 runtime.can_change_diff_layout(),
@@ -8512,7 +8505,8 @@ fn information_state_height<'a>(
     widget::container(
         widget::container(
             widget::column::with_children(vec![
-                widget::icon::from_name("dialog-information-symbolic")
+                crate::ui_controls::symbolic_icon("dialog-information-symbolic")
+                    .icon()
                     .size(28)
                     .into(),
                 widget::text::title3(title.into()).into(),

@@ -924,6 +924,7 @@ mod tests {
                 surface: Surface::Chat,
                 model: None,
                 permission_mode: None,
+                reasoning_effort: None,
             },
             channel: target,
             session: Some(HostedSession::Chat(session.clone())),

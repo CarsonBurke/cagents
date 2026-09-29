@@ -74,6 +74,19 @@ impl Cagents {
             .is_some_and(|intent| intent.active || intent.detail.is_some())
     }
 
+    /// Gives a visible close dialog the keyboard traversal to restore when it
+    /// closes, in place of the one it recorded while a popup had suppressed
+    /// it. Returns whether a dialog took it.
+    pub(super) fn adopt_terminal_close_keyboard_nav(&mut self, restore: bool) -> bool {
+        match self.terminal_close.as_mut() {
+            Some(intent) if intent.active || intent.detail.is_some() => {
+                intent.restore_keyboard_nav = restore;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn terminal_close_pending(&self, card: CardId) -> bool {
         self.terminal_close
             .as_ref()
@@ -780,6 +793,56 @@ mod tests {
             outcome: CloseOutcome::Closed,
         });
         assert!(app.closed_terminal_cards.contains(&card));
+    }
+
+    #[test]
+    fn close_dialog_over_a_popup_restores_the_readers_keyboard_nav() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        let source = session.clone();
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("paired"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        app.notices.record(TransientNotice::warning("first"));
+        app.core.set_keyboard_nav(true);
+        let _ = app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices));
+        assert!(app.chrome_ui.is_open());
+        assert!(!app.core.keyboard_nav());
+
+        // The completed close's confirmation arrives while the popup still
+        // holds the shell's traversal aside.
+        let _ = app.begin_card_close(card);
+        let _ = app.update(Message::CompletedTerminalClosed {
+            card,
+            session: source,
+            result: Ok(CompletedCloseOutcome::Active(proof)),
+        });
+        assert!(app.terminal_close_dialog().is_some());
+        assert!(
+            !app.core.keyboard_nav(),
+            "the dialog owns Tab while it is open"
+        );
+
+        let _ = app.update(Message::CancelTerminalClose);
+        assert!(app.terminal_close.is_none());
+        assert!(!app.chrome_ui.is_open());
+        assert!(
+            app.core.keyboard_nav(),
+            "the reader's traversal survives the popup and the dialog"
+        );
     }
 
     #[test]

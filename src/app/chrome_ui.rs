@@ -5,6 +5,10 @@ use crate::interaction::tooltip;
 pub(super) struct State {
     popup: Option<Popup>,
     focus_index: usize,
+    /// The shell's own Tab traversal, set aside while a popup owns Tab: the
+    /// two would each move focus on one key press, and whichever landed last
+    /// won.
+    restore_keyboard_nav: Option<bool>,
     /// Last reported horizontal offset of the tab strip.
     ///
     /// The native scrollable only accepts absolute offsets, so revealing a tab
@@ -17,6 +21,80 @@ pub(super) struct State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_reaches_every_control_in_the_notices_popup() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.notices.record(TransientNotice::warning("first"));
+        app.notices.record(TransientNotice::error("second"));
+        let _ = app.update_chrome(Action::ToggleNotices);
+        let ring = app.popup_focus_ring(Popup::Notices);
+        let ids: Vec<String> = app
+            .notices
+            .recent()
+            .map(|entry| notice_dismiss_id(entry.id))
+            .collect();
+        assert_eq!(
+            ring,
+            [
+                NOTICES_DISMISS_ALL_ID,
+                NOTICES_CLOSE_ID,
+                ids[0].as_str(),
+                ids[1].as_str()
+            ]
+        );
+        // Opening lands on close, and Tab walks on to each notice's Dismiss.
+        assert_eq!(ring[app.chrome_ui.focus_index], NOTICES_CLOSE_ID);
+        let tab = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let mut visited = Vec::new();
+        for _ in 0..ring.len() {
+            assert!(app.chrome_key_event(&tab).is_some());
+            visited.push(ring[app.chrome_ui.focus_index].clone());
+        }
+        assert_eq!(
+            visited,
+            [
+                ids[0].as_str(),
+                ids[1].as_str(),
+                NOTICES_DISMISS_ALL_ID,
+                NOTICES_CLOSE_ID
+            ]
+        );
+
+        // Dismissing the last notice from the keyboard keeps focus in the
+        // popup, on what took its place.
+        app.chrome_ui.focus_index = 3;
+        let last = app.notices.recent().last().unwrap().id;
+        let _ = app.update(Message::DismissNotice(last));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(app.chrome_ui.focus_index, 2);
+    }
+
+    #[test]
+    fn an_open_popup_owns_tab_until_it_closes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.notices.record(TransientNotice::warning("first"));
+        app.core.set_keyboard_nav(true);
+        let _ = app.update(Message::ChromeUi(Action::ToggleNotices));
+        // The shell's traversal would move focus a second time per Tab.
+        assert!(!app.core.keyboard_nav());
+        let _ = app.update(Message::ChromeUi(Action::Close));
+        assert!(app.core.keyboard_nav());
+
+        // A shell that had its traversal off keeps it off.
+        app.core.set_keyboard_nav(false);
+        let _ = app.update(Message::ChromeUi(Action::ToggleNewTab));
+        let _ = app.update(Message::ChromeUi(Action::Close));
+        assert!(!app.core.keyboard_nav());
+    }
 
     #[test]
     fn terminal_activation_leaves_enter_for_the_input_surface() {
@@ -202,20 +280,6 @@ pub enum Action {
     Launch(NewTab),
 }
 
-fn browser_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/></g></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
-}
-
-fn chat_icon() -> widget::icon::Handle {
-    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm2 5h10M7 13h7"/></svg>"#[..]).symbolic(true)
-    });
-    ICON.clone()
-}
-
 // Tabs retain a neutral keyboard focus cue without an accent outline.
 fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
@@ -244,6 +308,13 @@ fn column_title_style() -> cosmic::theme::Button {
             ..appearance(focused, theme)
         }),
     }
+}
+
+const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
+const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
+
+fn notice_dismiss_id(id: u64) -> String {
+    format!("chrome.notices.dismiss.{id}")
 }
 
 fn command<'a>(
@@ -281,46 +352,99 @@ impl Cagents {
             _ => None,
         });
         if let Some(backwards) = backwards {
-            // The two popups have unrelated row counts, and padding the
-            // shorter one to the longer one's length made the menu's length a
-            // hidden constraint on unrelated code.
-            let ids: Vec<&str> = match popup {
-                Popup::NewTab => NEW_TAB_CHOICES.iter().map(|(_, _, _, id)| *id).collect(),
-                Popup::Notices => {
-                    let health = self.save_health.as_ref();
-                    // In the order the notices draw them: the lane's own notice,
-                    // then the refused writes. Only one of them offers a retry.
-                    let acknowledge = health
-                        .is_some_and(|health| {
-                            matches!(health.health, SessionSaveHealth::Recovered { .. })
-                        })
-                        .then_some("session-save.acknowledge-recovery");
-                    let retry = health
-                        .is_some_and(SaveHealthState::offers_retry)
-                        .then_some("session-save.retry");
-                    [
-                        Some("chrome.notices.close"),
-                        (!self.notices.is_empty()).then_some("chrome.notices.dismiss"),
-                        acknowledge,
-                        retry,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                }
-            };
-            let count = ids.len();
+            let ring = self.popup_focus_ring(popup);
+            let count = ring.len();
             self.chrome_ui.focus_index = if backwards {
-                (self.chrome_ui.focus_index + count - 1) % count
+                (self.chrome_ui.focus_index.min(count - 1) + count - 1) % count
             } else {
                 (self.chrome_ui.focus_index + 1) % count
             };
-            return Some(
-                iced::widget::operation::focus(widget::Id::new(ids[self.chrome_ui.focus_index]))
-                    .map(cosmic::Action::App),
-            );
+            return Some(self.focus_popup_control(ring));
         }
         Some(Task::none())
+    }
+
+    /// Every control the open popup draws, in the order it draws them, so
+    /// Tab reaches each one - including a notice's own Dismiss and the
+    /// update's Review - rather than a fixed subset. Never empty: the notices
+    /// popup always has its close control.
+    fn popup_focus_ring(&self, popup: Popup) -> Vec<Cow<'static, str>> {
+        match popup {
+            Popup::NewTab => NEW_TAB_CHOICES
+                .iter()
+                .map(|(_, _, _, id)| Cow::Borrowed(*id))
+                .collect(),
+            Popup::Notices => {
+                let mut ring = Vec::new();
+                if !self.notices.is_empty() {
+                    ring.push(Cow::Borrowed(NOTICES_DISMISS_ALL_ID));
+                }
+                ring.push(Cow::Borrowed(NOTICES_CLOSE_ID));
+                if self.retained_update_notice() && self.window_update_blocker().is_none() {
+                    ring.push(Cow::Borrowed(super::update_ui::REVIEW_UPDATE_ID));
+                }
+                ring.extend(
+                    self.notices
+                        .recent()
+                        .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
+                );
+                // In the order the notices draw them: the lane's own notice,
+                // then the refused writes. Only one of them offers a retry.
+                let health = self.save_health.as_ref();
+                if health.is_some_and(|health| {
+                    matches!(health.health, SessionSaveHealth::Recovered { .. })
+                }) {
+                    ring.push(Cow::Borrowed("session-save.acknowledge-recovery"));
+                }
+                if health.is_some_and(SaveHealthState::offers_retry) {
+                    ring.push(Cow::Borrowed("session-save.retry"));
+                }
+                ring
+            }
+        }
+    }
+
+    /// Focuses the ring's control at `focus_index`, or its last one when the
+    /// ring has shrunk under it.
+    fn focus_popup_control(&mut self, ring: Vec<Cow<'static, str>>) -> Task<Message> {
+        let Some(last) = ring.len().checked_sub(1) else {
+            return Task::none();
+        };
+        self.chrome_ui.focus_index = self.chrome_ui.focus_index.min(last);
+        let id = ring[self.chrome_ui.focus_index].clone();
+        iced::widget::operation::focus(widget::Id::new(id)).map(cosmic::Action::App)
+    }
+
+    /// Gives an open popup sole ownership of Tab, and hands it back to the
+    /// shell's traversal once the popup is gone or a dialog has taken over.
+    pub(super) fn sync_popup_keyboard_nav(&mut self) {
+        let owned = self.chrome_ui.popup.is_some() && !self.modal_is_open();
+        match (owned, self.chrome_ui.restore_keyboard_nav) {
+            (true, None) => {
+                self.chrome_ui.restore_keyboard_nav = Some(self.core.keyboard_nav());
+                self.core.set_keyboard_nav(false);
+            }
+            (false, Some(restore)) => {
+                self.chrome_ui.restore_keyboard_nav = None;
+                // A close dialog that opened over the popup recorded the
+                // popup's suppressed traversal as its own restore point, and
+                // it owns Tab now: hand it the reader's real choice instead.
+                if !self.adopt_terminal_close_keyboard_nav(restore) {
+                    self.core.set_keyboard_nav(restore);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps keyboard focus inside the notices popup after a notice leaves
+    /// it, on the control that took the dismissed one's place.
+    pub(super) fn refocus_notices(&mut self) -> Task<Message> {
+        if self.chrome_ui.popup != Some(Popup::Notices) || self.modal_is_open() {
+            return Task::none();
+        }
+        let ring = self.popup_focus_ring(Popup::Notices);
+        self.focus_popup_control(ring)
     }
 
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
@@ -338,12 +462,17 @@ impl Cagents {
                     return self.update_chrome(Action::Close);
                 }
                 self.chrome_ui.popup = Some(popup);
-                self.chrome_ui.focus_index = 0;
-                iced::widget::operation::focus(widget::Id::new(match popup {
-                    Popup::NewTab => NEW_TAB_CHOICES[0].3,
-                    Popup::Notices => "chrome.notices.close",
-                }))
-                .map(cosmic::Action::App)
+                // The notices popup opens on its close control, which is not
+                // the first stop when "Dismiss all" precedes it.
+                let ring = self.popup_focus_ring(popup);
+                self.chrome_ui.focus_index = match popup {
+                    Popup::NewTab => 0,
+                    Popup::Notices => ring
+                        .iter()
+                        .position(|id| id == NOTICES_CLOSE_ID)
+                        .unwrap_or_default(),
+                };
+                self.focus_popup_control(ring)
             }
             Action::Close => {
                 let popup = self.chrome_ui.popup.take();
@@ -386,8 +515,12 @@ impl Cagents {
                         NewTab::Terminal => {
                             crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                         }
-                        NewTab::Thread => chat_icon(),
-                        NewTab::Browser => browser_icon(),
+                        NewTab::Thread => {
+                            crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
+                        }
+                        NewTab::Browser => {
+                            crate::ui_controls::symbolic_icon("internet-web-browser-symbolic")
+                        }
                     };
                     crate::ui_controls::popover_item(
                         icon,
@@ -511,7 +644,7 @@ impl Cagents {
                             entry.notice.severity,
                             "Dismiss",
                             "Dismiss application notice",
-                            widget::Id::new(format!("chrome.notices.dismiss.{}", entry.id)),
+                            widget::Id::new(notice_dismiss_id(entry.id)),
                             Message::DismissNotice(entry.id),
                         )),
                         false,
@@ -530,7 +663,7 @@ impl Cagents {
                 if !self.notices.is_empty() {
                     heading_children.push(
                         widget::button::text("Dismiss all")
-                            .id(widget::Id::new("chrome.notices.dismiss"))
+                            .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
                             .name("Dismiss every application notice")
                             .on_press(Message::DismissAllNotices)
                             .into(),
@@ -539,7 +672,7 @@ impl Cagents {
                 heading_children.push(command(
                     crate::ui_controls::symbolic_icon("window-close-symbolic"),
                     "Close application notices",
-                    widget::Id::new("chrome.notices.close"),
+                    widget::Id::new(NOTICES_CLOSE_ID),
                     Some(Message::ChromeUi(Action::Close)),
                 ));
                 let heading = widget::row::with_children(heading_children)
@@ -804,7 +937,7 @@ impl Cagents {
                 .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
                 .map_or(0, |index| index + 1);
             actions.push(command(
-                widget::icon::from_name("go-previous-symbolic"),
+                crate::ui_controls::symbolic_icon("go-previous-symbolic"),
                 "Previous column",
                 widget::Id::new("command.previous-column"),
                 (current > 1).then_some(Message::FocusAdjacent(
@@ -818,7 +951,7 @@ impl Cagents {
                     .into(),
             );
             actions.push(command(
-                widget::icon::from_name("go-next-symbolic"),
+                crate::ui_controls::symbolic_icon("go-next-symbolic"),
                 "Next column",
                 widget::Id::new("command.next-column"),
                 (current > 0 && current < total).then_some(Message::FocusAdjacent(
@@ -869,6 +1002,27 @@ impl Cagents {
         ]
     }
 
+    /// The mark that names a card wherever the card itself is shown: its tab
+    /// and the inspector heading. Agents wear their provider's mark, whether
+    /// they run in a native chat or a terminal.
+    pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
+        let kind = self.card_state(id).map(|card| &card.kind);
+        let generic = || crate::ui_controls::symbolic_icon(card_kind_labels(kind).icon);
+        match kind {
+            Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
+            Some(CardKind::Chat(session)) => {
+                crate::ui_controls::provider_icon(session.launch.provider)
+            }
+            Some(CardKind::Terminal(session)) => self
+                .sidebar_state
+                .card_activity(id)
+                .map(|activity| activity.provider)
+                .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
+                .map_or_else(generic, crate::ui_controls::provider_icon),
+            _ => generic(),
+        }
+    }
+
     fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -881,35 +1035,9 @@ impl Cagents {
         let caption = chrome
             .map(|chrome| Cow::Borrowed(chrome.caption.as_str()))
             .or_else(|| card.map(|card| card_kind_caption(&card.kind)));
-        let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
-            Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
-            Some(CardKind::Repository(_)) => {
-                crate::ui_controls::ceditor_icon().icon().size(16).into()
-            }
-            Some(CardKind::Chat(session)) => {
-                crate::ui_controls::provider_icon(session.launch.provider)
-                    .icon()
-                    .size(16)
-                    .into()
-            }
-            Some(CardKind::Terminal(session)) => self
-                .sidebar_state
-                .card_activity(id)
-                .map(|activity| activity.provider)
-                .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
-                .map(crate::ui_controls::provider_icon)
-                .unwrap_or_else(|| crate::ui_controls::symbolic_icon(labels.icon))
-                .icon()
-                .size(16)
-                .into(),
-            _ => crate::ui_controls::symbolic_icon(labels.icon)
-                .icon()
-                .size(16)
-                .into(),
-        };
         let title_control = widget::button::custom(
             widget::row::with_children(vec![
-                icon,
+                self.card_icon(id).icon().size(16).into(),
                 design::body(title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
@@ -963,7 +1091,8 @@ impl Cagents {
             let indicator: Element<'_, Message> = if busy {
                 crate::ui_controls::activity_spinner_tone(14.0, design::accent_color)
             } else {
-                widget::icon::from_name("dialog-warning-symbolic")
+                crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                    .icon()
                     .size(14)
                     .into()
             };
@@ -994,9 +1123,9 @@ impl Cagents {
         if self.chat_switch_available(id) {
             children.push(command(
                 if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
-                    widget::icon::from_name("utilities-terminal-symbolic").into()
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                 } else {
-                    chat_icon()
+                    crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
                 },
                 self.chat_switch_label(id),
                 card_control_id(id, "chat"),
@@ -1199,7 +1328,9 @@ impl Cagents {
                 },
                 |model| {
                     let diagnostics_open = self.inspector_diagnostics_card == Some(model.card_id);
-                    inspector::view(model, width, diagnostics_open).map(Message::ContextInspector)
+                    let icon = self.card_icon(model.card_id);
+                    inspector::view(model, icon, width, diagnostics_open)
+                        .map(Message::ContextInspector)
                 },
             ),
         };

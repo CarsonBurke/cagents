@@ -1,4 +1,10 @@
-//! Transient row selection, separate from the active workspace.
+//! Explicit multi-row selection, separate from the active workspace.
+//!
+//! Navigation and selection are different things: opening a row makes it the
+//! active workspace and only moves the range anchor, while the selection holds
+//! rows the user picked on purpose with Ctrl or Shift. The selection is
+//! therefore empty almost all of the time, and anything that acts on it - the
+//! bulk footer, group deletion - is absent unless the user asked for it.
 
 use std::collections::BTreeSet;
 
@@ -11,12 +17,44 @@ pub enum Row {
     Channel(ChannelId),
 }
 
+impl Row {
+    /// Projects leave cagents and stay on disk, so they are removed; the other
+    /// kinds are deleted.
+    pub fn deletion_verb(self) -> &'static str {
+        match self {
+            Row::Project(_) => "Remove",
+            Row::Worktree(..) | Row::Channel(_) => "Delete",
+        }
+    }
+
+    pub fn noun(self, count: usize) -> &'static str {
+        match (self, count == 1) {
+            (Row::Project(_), true) => "project",
+            (Row::Project(_), false) => "projects",
+            (Row::Worktree(..), true) => "worktree",
+            (Row::Worktree(..), false) => "worktrees",
+            (Row::Channel(_), true) => "channel",
+            (Row::Channel(_), false) => "channels",
+        }
+    }
+
+    /// The command deleting `count` rows of this kind, as buttons name it:
+    /// "Remove 2 projects", "Delete 1 worktree".
+    pub fn deletion_label(self, count: usize) -> String {
+        format!("{} {count} {}", self.deletion_verb(), self.noun(count))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
-    Replace,
+    /// A plain click: clears any explicit selection and anchors a later
+    /// Shift-click range at this row, without selecting it.
+    Navigate,
+    /// Ctrl-click: adds or removes one row.
     Toggle,
+    /// Shift-click: selects from the anchor to this row, keeping the existing
+    /// selection when Ctrl is also held.
     Range { extend: bool },
-    Context,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -67,25 +105,33 @@ impl Selection {
             .collect()
     }
 
+    /// Applies one selection gesture. `visible` is the drawn row order; a
+    /// plain click reads none of it, so a caller may pass an empty slice for
+    /// [`Intent::Navigate`] rather than derive it.
     pub(super) fn select(&mut self, row: Row, intent: Intent, visible: &[Row]) {
+        let extend = match intent {
+            Intent::Navigate => {
+                // A stale anchor is harmless: a later range resolves it
+                // against the rows visible then, or starts at its own row.
+                self.clear();
+                self.anchor = Some(row);
+                return;
+            }
+            Intent::Toggle => None,
+            Intent::Range { extend } => Some(extend),
+        };
         self.retain_visible(visible);
         let Some(end) = visible.iter().position(|candidate| *candidate == row) else {
             return;
         };
-        match intent {
-            Intent::Context if self.rows.contains(&row) => {}
-            Intent::Replace | Intent::Context => {
-                self.rows.clear();
-                self.rows.insert(row);
-                self.anchor = Some(row);
-            }
-            Intent::Toggle => {
+        match extend {
+            None => {
                 if !self.rows.remove(&row) {
                     self.rows.insert(row);
                 }
                 self.anchor = Some(row);
             }
-            Intent::Range { extend } => {
+            Some(extend) => {
                 let start = self
                     .anchor
                     .and_then(|anchor| visible.iter().position(|row| *row == anchor))
@@ -106,20 +152,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn range_uses_visible_order_and_context_preserves_the_group() {
+    fn navigation_anchors_ranges_without_selecting_and_toggles_are_explicit() {
         let rows = (0..4)
             .map(|_| Row::Channel(ChannelId::new()))
             .collect::<Vec<_>>();
         let mut selection = Selection::default();
-        selection.select(rows[1], Intent::Replace, &rows);
+        selection.select(rows[1], Intent::Navigate, &[]);
+        assert!(selection.is_empty(), "opening a row selects nothing");
         selection.select(rows[3], Intent::Range { extend: false }, &rows);
-        assert_eq!(selection.ordered(&rows), rows[1..]);
-        selection.select(rows[2], Intent::Context, &rows);
-        assert_eq!(selection.ordered(&rows), rows[1..]);
+        assert_eq!(
+            selection.ordered(&rows),
+            rows[1..],
+            "Shift-click ranges from the row last opened"
+        );
         selection.select(rows[0], Intent::Toggle, &rows);
         assert_eq!(selection.ordered(&rows), rows);
         selection.select(rows[1], Intent::Toggle, &rows);
         assert_eq!(selection.ordered(&rows), vec![rows[0], rows[2], rows[3]]);
+        selection.select(rows[2], Intent::Navigate, &[]);
+        assert!(
+            selection.is_empty(),
+            "a plain click ends the multi-selection"
+        );
+        selection.select(rows[0], Intent::Toggle, &rows);
+        assert_eq!(
+            selection.ordered(&rows),
+            vec![rows[0]],
+            "Ctrl-click adds only the clicked row, never the active one"
+        );
     }
 
     #[test]
@@ -127,7 +187,7 @@ mod tests {
         let first = Row::Project(ProjectId::new());
         let second = Row::Project(ProjectId::new());
         let mut selection = Selection::default();
-        selection.select(first, Intent::Replace, &[first, second]);
+        selection.select(first, Intent::Toggle, &[first, second]);
         selection.select(second, Intent::Range { extend: true }, &[second]);
         assert_eq!(selection.ordered(&[first, second]), vec![second]);
         assert_eq!(selection.anchor, Some(second));

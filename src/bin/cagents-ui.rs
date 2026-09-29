@@ -27,6 +27,8 @@ Options:
 ";
 
 fn main() -> std::process::ExitCode {
+    // SAFETY: first statement of main, before any thread exists.
+    unsafe { cagents::account::detach_inherited_selections() };
     // The document render helper answers before anything else exists. Its
     // stdout is a binary page frame, so a tracing subscriber, a panic hook
     // writing a crash record, the window lease or the launcher handshake

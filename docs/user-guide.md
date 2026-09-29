@@ -270,9 +270,13 @@ showing that session. Closing a window leaves its processes running.
 ## Scheduled automations
 
 Open **Automations** from the clock button in the sidebar footer. Choose an open
-project or worktree, provider, account, prompt, model, and permission mode. Pick
-an hourly, daily, weekday, weekly, or five-field cron schedule with an explicit
-IANA timezone. New definitions are paused. **Enable…** and **Run now…** show the
+project or worktree, provider, account, prompt, model, and permission mode. The
+account starts as the one a new conversation in that directory would use, and
+follows the provider and directory until you pick another. Pick an hourly,
+daily, weekday, weekly, or five-field cron schedule with an explicit IANA
+timezone: it starts as the system's, and typing a city or region searches the
+known zones. The editor shows when the schedule as entered runs next, in its
+timezone and, if that differs, in yours. New definitions are paused. **Enable…** and **Run now…** show the
 exact saved launch settings before confirmation; changing those settings or the
 schedule pauses future runs until you confirm again. Renaming preserves the
 existing execution settings.
@@ -337,7 +341,8 @@ this shape (the repository must already be open):
     },
     "surface": "Chat",
     "model": null,
-    "permission_mode": null
+    "permission_mode": null,
+    "reasoning_effort": null
   },
   "schedule": {
     "pattern": { "daily": { "hour": 9, "minute": 0 } },
@@ -347,6 +352,11 @@ this shape (the repository must already be open):
   "precheck": null
 }
 ```
+
+`reasoning_effort` is optional: omit it, or use `null`, for the provider's
+default, or name a level the model offers, such as `"low"`. In the editor, the
+**Reasoning effort** picker lists the levels the chosen model advertises, as the
+chat composer does.
 
 An omitted account selection resolves once when the definition is saved and is
 then pinned in the saved definition. Review that account before enabling. Agent
@@ -454,6 +464,23 @@ checks supported process tokens before persistent credentials; its
 [workload identity implementation](https://github.com/openai/codex/blob/7b7d934408e6df20950a7a2501a669650279ab06/codex-rs/login/src/auth/workload_identity.rs)
 selects process authentication using the federation markers. `OPENAI_API_KEY`
 is also removed for provider/version compatibility.
+
+**System default** is the home the provider CLI uses outside cagents:
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
+`~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
+Every cagents terminal and conversation exports its account's home, and one on
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
+cagents window, daemon, or `cagents` command started from one - by you or by an
+agent - ignores a variable that still holds the listed home, or any path inside
+a cagents `accounts/<provider>/<id>` directory, when deciding the system
+default. A daemon started before this protection keeps its environment until it
+restarts.
+
+The Accounts pane flags a row whose home is not a login of its own: **Login
+changed** when a managed or linked home reports a different login than the one
+it was added with (the recorded login is kept; sign that account in again to
+accept the new one, or remove it), and **Same home** or **Same login** when two
+rows are the same directory or signed in to the same login.
 
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies

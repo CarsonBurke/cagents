@@ -219,6 +219,7 @@ done
     spec.provider = Provider::Omp;
     spec.model = Some("fixture/model".into());
     spec.permission_mode = Some("write".into());
+    spec.reasoning_effort = Some("low".into());
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !root.join("omp-before-result").exists() {
@@ -271,6 +272,7 @@ done
     let arguments = std::fs::read_to_string(root.join("omp-arguments")).unwrap();
     assert!(arguments.contains("--model\nfixture/model\n"));
     assert!(arguments.contains("--approval-mode\nwrite\n"));
+    assert!(arguments.contains("--thinking\nlow\n"));
     assert_upgrade_environment(&host, accepted.agent.id);
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }
@@ -812,6 +814,7 @@ fn fixture() -> (SharedHost, Submit, std::path::PathBuf) {
             surface: Surface::Chat,
             model: None,
             permission_mode: None,
+            reasoning_effort: None,
         }),
         prompt: "Read the owned fixture".into(),
         idempotency_key: "first".into(),
@@ -849,6 +852,7 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     };
     spec.model = Some("fixture-model".into());
     spec.permission_mode = Some("plan".into());
+    spec.reasoning_effort = Some("high".into());
     let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
     // A second connection sees the accepted durable identity independently of
     // provider progress; no child is launched inside the acceptance transaction.
@@ -872,6 +876,7 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     let arguments = std::fs::read_to_string(root.join("claude-arguments")).unwrap();
     assert!(arguments.contains("--model\nfixture-model\n"));
     assert!(arguments.contains("--permission-mode\nplan\n"));
+    assert!(arguments.contains("--effort\nhigh\n"));
     assert_eq!(
         std::fs::read_to_string(root.join("spawns")).unwrap(),
         "spawn\n"
@@ -954,6 +959,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     spec.provider = Provider::Codex;
     spec.model = Some("fixture-model".into());
     spec.permission_mode = Some("on-request".into());
+    spec.reasoning_effort = Some("low".into());
     let server_root = root.clone();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1022,6 +1028,10 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                 "thread/start" => {
                     assert_eq!(frame["params"]["model"], "fixture-model");
                     assert_eq!(frame["params"]["approvalPolicy"], "on-request");
+                    assert_eq!(
+                        frame["params"]["config"],
+                        json!({"model_reasoning_effort": "low"})
+                    );
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),

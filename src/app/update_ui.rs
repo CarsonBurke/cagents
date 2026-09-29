@@ -1,6 +1,9 @@
 use super::*;
 use crate::update::{UpdateJob, UpdatePhase, UpdateState};
 
+/// The update notice's "Review update" control, for keyboard focus.
+pub(super) const REVIEW_UPDATE_ID: &str = "update.review";
+
 #[derive(Default)]
 pub(super) struct State {
     result: Option<UpdateState>,
@@ -223,6 +226,7 @@ impl Cagents {
                 .width(Length::Fill)
                 .into(),
             widget::button::standard("Review update")
+                .id(widget::Id::new(REVIEW_UPDATE_ID))
                 .on_press_maybe((blocker.is_none()).then_some(Message::UpdateUi(action)))
                 .into(),
         ];
