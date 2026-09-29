@@ -548,6 +548,10 @@ const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
 
+const fn default_check_for_updates() -> bool {
+    true
+}
+
 const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
 }
@@ -734,6 +738,10 @@ pub struct AppSettings {
     /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,
+    /// Whether windows look for a new release on their own, at startup and
+    /// every few hours. A check the user asks for runs either way.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
     /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
     /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
     /// without it is read as revision 1, and loading records the revision it
@@ -795,6 +803,7 @@ impl Default for AppSettings {
             chat_enter_sends: default_chat_enter_sends(),
             show_status_bar: default_show_status_bar(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
+            check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),

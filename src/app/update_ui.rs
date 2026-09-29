@@ -21,6 +21,78 @@ pub(super) struct State {
     submitted_confirmation: Option<String>,
     dismissed: Option<String>,
     dismissal_loaded: bool,
+    /// When a check last reached the release server.
+    last_checked: Option<std::time::SystemTime>,
+    /// Background checks that failed in a row, which spaces out the next.
+    check_failures: u32,
+    /// Why the last check the user asked for failed. A background check's
+    /// failure is only logged: a laptop that starts offline has not failed
+    /// to update anything.
+    check_error: Option<String>,
+    /// Whether the check in flight was asked for, so its failure is shown.
+    manual_check: bool,
+}
+
+/// How long background checks wait between attempts.
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// The first retry after a failed background check; each further failure
+/// doubles it, up to [`CHECK_INTERVAL`].
+const FIRST_CHECK_RETRY: Duration = Duration::from_secs(2 * 60);
+
+/// When the next background check is due after `failures` in a row.
+fn background_check_interval(failures: u32) -> Duration {
+    if failures == 0 {
+        return CHECK_INTERVAL;
+    }
+    FIRST_CHECK_RETRY
+        .saturating_mul(1 << (failures - 1).min(16))
+        .min(CHECK_INTERVAL)
+}
+
+/// "just now", "5 minutes ago", "3 hours ago", "2 days ago".
+fn elapsed_label(since: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    let seconds = now.duration_since(since).unwrap_or_default().as_secs();
+    let (count, unit) = match seconds {
+        0..60 => return "just now".into(),
+        60..3_600 => (seconds / 60, "minute"),
+        3_600..86_400 => (seconds / 3_600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    format!("{count} {unit}{} ago", if count == 1 { "" } else { "s" })
+}
+
+/// When the next background check runs, worded from the backoff that
+/// failed checks put it on.
+fn next_check_label(failures: u32) -> String {
+    let interval = background_check_interval(failures);
+    if interval >= CHECK_INTERVAL {
+        return "Checks again every six hours.".into();
+    }
+    let minutes = interval.as_secs().div_ceil(60).max(1);
+    let (count, unit) = if minutes < 120 {
+        (minutes, "minute")
+    } else {
+        (minutes / 60, "hour")
+    };
+    format!(
+        "Could not reach the release server; retrying in about {count} {unit}{}.",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// What the About settings page shows about updates.
+pub(super) struct UpdateSummary {
+    pub status: String,
+    /// Whether `status` reports a failed check.
+    pub failed: bool,
+    pub checking: bool,
+    /// Whether "Check for updates" can run now.
+    pub can_check: bool,
+    /// A newer release: its version and release notes.
+    pub available: Option<(String, String)>,
+    /// Why this window would refuse to apply `available` right now.
+    pub apply_blocker: Option<&'static str>,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug)]
@@ -29,8 +101,13 @@ pub enum Action {
     DismissalLoaded(Result<Option<String>, String>),
     DismissNotice(String),
     DismissalSaved(Result<(), String>),
+    /// A background check, which stays quiet when it cannot reach the
+    /// release server and retries with backoff.
     Check,
+    /// A check the user asked for, whose outcome is always shown.
+    CheckNow,
     Checked(Result<UpdateState, String>),
+    OpenReleaseNotes(String),
     Apply,
     ChoosePolicy(crate::update::impact::Policy),
     Decided {
@@ -48,6 +125,13 @@ pub enum Action {
     InspectInstallation,
     InstallationInspected(Option<PathBuf>),
     Restart,
+}
+
+/// Opens a release's notes in the system browser.
+pub(super) fn release_notes_button<'a>(url: &str) -> Element<'a, Message> {
+    widget::button::text("Release notes")
+        .on_press(Message::UpdateUi(Action::OpenReleaseNotes(url.to_owned())))
+        .into()
 }
 
 impl State {
@@ -92,8 +176,20 @@ impl Cagents {
         use crate::update::impact::{Disposition, Policy};
         let confirmation = self.update_ui.confirmation.as_ref()?;
         let preview = &confirmation.preview;
+        let title: Element<'_, Message> =
+            widget::text::title3(format!("Update to {}?", preview.candidate.version))
+                .width(Length::Fill)
+                .into();
+        // Read what changes before every window restarts for it.
+        let heading = match self.release_notes_for(&preview.candidate.version) {
+            Some(url) => widget::row::with_children(vec![title, release_notes_button(url)])
+                .align_y(Alignment::Center)
+                .spacing(8)
+                .into(),
+            None => title,
+        };
         let mut body = vec![
-            widget::text::title3(format!("Update to {}?", preview.candidate.version)).into(),
+            heading,
             notice_body(if preview.replaces_daemon {
                 "The terminal service will be replaced. Your windows and tabs will reopen automatically. Review what happens to each session below."
             } else {
@@ -182,6 +278,16 @@ impl Cagents {
         ))
     }
 
+    /// The release notes of the available release, when it is `version`.
+    fn release_notes_for(&self, version: &str) -> Option<&str> {
+        match &self.update_ui.result {
+            Some(UpdateState::Available { release }) if release.version == version => {
+                Some(release.url.as_str())
+            }
+            _ => None,
+        }
+    }
+
     fn available_update_notice(&self) -> Option<(String, String, Action)> {
         if !self.update_ui.dismissal_loaded
             || self.update_ui.updating()
@@ -225,11 +331,18 @@ impl Cagents {
             widget::column::with_children(description)
                 .width(Length::Fill)
                 .into(),
-            widget::button::standard("Review update")
-                .id(widget::Id::new(REVIEW_UPDATE_ID))
-                .on_press_maybe((blocker.is_none()).then_some(Message::UpdateUi(action)))
-                .into(),
         ];
+        // An installed build waiting for a restart is already chosen; notes
+        // belong to a release still being decided on.
+        if let (Action::Apply, Some(UpdateState::Available { release })) =
+            (&action, &self.update_ui.result)
+        {
+            controls.push(release_notes_button(&release.url));
+        }
+        controls.extend([widget::button::standard("Review update")
+            .id(widget::Id::new(REVIEW_UPDATE_ID))
+            .on_press_maybe((blocker.is_none()).then_some(Message::UpdateUi(action)))
+            .into()]);
         if !retained {
             controls.push(
                 crate::ui_controls::icon_control(
@@ -313,9 +426,11 @@ impl Cagents {
         }
         let progress = if self.update_ui.updating() || self.update_ui.poll_retry {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
-        } else {
-            iced::time::every(Duration::from_secs(6 * 60 * 60))
+        } else if self.settings.check_for_updates {
+            iced::time::every(background_check_interval(self.update_ui.check_failures))
                 .map(|_| Message::UpdateUi(Action::Check))
+        } else {
+            Subscription::none()
         };
         Subscription::batch([progress, installation])
     }
@@ -360,7 +475,7 @@ impl Cagents {
                 _ => (
                     "dialog-warning-symbolic",
                     format!("Update failed: {error}. Check again"),
-                    Some(Message::UpdateUi(Action::Check)),
+                    Some(Message::UpdateUi(Action::CheckNow)),
                 ),
             }
         } else if let Some(UpdateState::Available { release }) = &state.result {
@@ -401,6 +516,98 @@ impl Cagents {
             .id(widget::Id::new("application-update"))
             .into(),
         )
+    }
+
+    /// Asks the release server whether a newer build exists. A check the
+    /// user asked for joins one already in flight rather than racing it, and
+    /// is the only kind whose failure is reported.
+    fn start_update_check(&mut self, manual: bool) -> Task<Message> {
+        if crate::instance::NAME == "development" || self.update_ui.updating() {
+            return Task::none();
+        }
+        if manual {
+            self.update_ui.manual_check = true;
+            self.update_ui.check_error = None;
+            // The header's "Check again" after a failed update lands here.
+            self.update_ui.error = None;
+        }
+        if std::mem::replace(&mut self.update_ui.checking, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            let result = tokio::task::spawn_blocking(|| {
+                crate::update::check(&crate::update::CancellationToken::default())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::UpdateUi(Action::Checked(result))
+        })
+    }
+
+    /// The About page's account of updates: what this build is, what the
+    /// last check found, and whether one can run now.
+    pub(super) fn update_summary(&self) -> UpdateSummary {
+        self.summarize_updates(crate::instance::NAME == "development")
+    }
+
+    /// `development` builds never check, whatever else is true.
+    fn summarize_updates(&self, development: bool) -> UpdateSummary {
+        let state = &self.update_ui;
+        let now = std::time::SystemTime::now();
+        let available = match &state.result {
+            Some(UpdateState::Available { release }) => {
+                Some((release.version.clone(), release.url.clone()))
+            }
+            _ => None,
+        };
+        let (status, failed) = if development {
+            (
+                "Update checks are off in development builds".to_owned(),
+                false,
+            )
+        } else if state.checking {
+            ("Checking for updates…".to_owned(), false)
+        } else if let Some(error) = &state.check_error {
+            (format!("Could not check for updates: {error}"), true)
+        } else {
+            match &state.result {
+                Some(UpdateState::Available { release }) => {
+                    (format!("cagents {} is available", release.version), false)
+                }
+                Some(UpdateState::Current { .. }) => ("cagents is up to date".to_owned(), false),
+                Some(UpdateState::Unsupported { reason }) => (reason.clone(), false),
+                None => ("Not checked yet".to_owned(), false),
+            }
+        };
+        let detail = match (state.last_checked, self.settings.check_for_updates) {
+            _ if development => {
+                "A source build does not download releases; install cagents to update it.".into()
+            }
+            (Some(checked), true) => format!(
+                "Last checked {}. {}",
+                elapsed_label(checked, now),
+                next_check_label(state.check_failures)
+            ),
+            (Some(checked), false) => format!("Last checked {}.", elapsed_label(checked, now)),
+            (None, true) if state.check_failures == 0 => {
+                "Checks at startup and every six hours.".into()
+            }
+            (None, true) => next_check_label(state.check_failures),
+            (None, false) => "Automatic checks are off.".into(),
+        };
+        UpdateSummary {
+            status,
+            failed,
+            checking: state.checking,
+            can_check: !development && !state.checking && !state.updating(),
+            apply_blocker: available
+                .as_ref()
+                .and_then(|_| self.window_update_blocker()),
+            available,
+            detail,
+        }
     }
 
     pub(super) fn update_update_ui(&mut self, action: Action) -> Task<Message> {
@@ -462,36 +669,53 @@ impl Cagents {
                 Task::none()
             }
             Action::Check => {
-                if crate::instance::NAME == "development"
-                    || self.update_ui.checking
-                    || self.update_ui.updating()
-                {
+                if !self.settings.check_for_updates {
                     return Task::none();
                 }
-                self.update_ui.checking = true;
-                self.update_ui.error = None;
-                cosmic::task::future(async {
-                    let result = tokio::task::spawn_blocking(|| {
-                        crate::update::check(&crate::update::CancellationToken::default())
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                    Message::UpdateUi(Action::Checked(result))
-                })
+                self.start_update_check(false)
             }
+            Action::CheckNow => self.start_update_check(true),
+            Action::OpenReleaseNotes(url) => match Url::parse(&url) {
+                Ok(url) => Self::open_external_url(url),
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not open the release notes: {error}"
+                    )));
+                    Task::none()
+                }
+            },
             Action::Checked(result) => {
                 self.update_ui.checking = false;
+                let manual = std::mem::take(&mut self.update_ui.manual_check);
                 match result {
                     Ok(result) => {
+                        self.update_ui.last_checked = Some(std::time::SystemTime::now());
+                        self.update_ui.check_failures = 0;
+                        self.update_ui.check_error = None;
                         let supported = !matches!(result, UpdateState::Unsupported { .. });
                         self.update_ui.result = Some(result);
                         if supported {
                             return self.update_update_ui(Action::Poll);
                         }
                     }
-                    Err(error) => self.update_ui.error = Some(error),
+                    Err(error) if manual => {
+                        // The header's "Check again" has already cleared the
+                        // failure it showed, and `check_error` is only shown
+                        // on the About page, so say so where the user is.
+                        self.status = Some(TransientNotice::error(format!(
+                            "Could not check for updates: {error}"
+                        )));
+                        self.update_ui.check_error = Some(error);
+                    }
+                    Err(error) => {
+                        self.update_ui.check_failures =
+                            self.update_ui.check_failures.saturating_add(1);
+                        tracing::info!(
+                            %error,
+                            failures = self.update_ui.check_failures,
+                            "background update check failed; retrying later"
+                        );
+                    }
                 }
                 Task::none()
             }
@@ -702,6 +926,79 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_background_check_that_cannot_connect_stays_quiet_and_backs_off() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.update_ui.checking = true;
+        drop(app.update_update_ui(Action::Checked(Err("network is unreachable".into()))));
+        // Nothing was being updated, so nothing "failed" in the header.
+        assert!(app.update_ui.error.is_none());
+        assert!(app.update_ui.check_error.is_none());
+        assert!(!app.has_update_control());
+        assert_eq!(app.update_ui.check_failures, 1);
+        // The About page says when the backed-off retry runs, not the
+        // six-hour cadence it will return to.
+        app.settings.check_for_updates = true;
+        assert_eq!(
+            app.summarize_updates(false).detail,
+            "Could not reach the release server; retrying in about 2 minutes."
+        );
+        assert_eq!(next_check_label(0), "Checks again every six hours.");
+        assert_eq!(
+            next_check_label(7),
+            "Could not reach the release server; retrying in about 2 hours."
+        );
+        assert_eq!(next_check_label(40), "Checks again every six hours.");
+        assert_eq!(background_check_interval(1), FIRST_CHECK_RETRY);
+        assert_eq!(background_check_interval(2), FIRST_CHECK_RETRY * 2);
+        assert_eq!(background_check_interval(40), CHECK_INTERVAL);
+        assert_eq!(background_check_interval(0), CHECK_INTERVAL);
+
+        // A check the user asked for says why it failed, where they asked.
+        app.update_ui.checking = true;
+        app.status = None;
+        app.update_ui.manual_check = true;
+        drop(app.update_update_ui(Action::Checked(Err("network is unreachable".into()))));
+        assert!(app.update_ui.check_error.is_some());
+        // The header control that sent it is gone, so a notice says why.
+        assert!(app.status.is_some());
+        assert!(app.summarize_updates(false).failed);
+        assert!(!app.update_ui.manual_check);
+
+        // Success clears both the failure and the backoff.
+        app.update_ui.checking = true;
+        drop(
+            app.update_update_ui(Action::Checked(Ok(UpdateState::Unsupported {
+                reason: "fixture".into(),
+            }))),
+        );
+        assert_eq!(app.update_ui.check_failures, 0);
+        assert!(app.update_ui.check_error.is_none());
+        assert!(app.update_ui.last_checked.is_some());
+    }
+
+    #[test]
+    fn automatic_checks_can_be_turned_off() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.check_for_updates = false;
+        drop(app.update_update_ui(Action::Check));
+        assert!(!app.update_ui.checking);
+        assert_eq!(
+            app.summarize_updates(false).detail,
+            "Automatic checks are off."
+        );
+    }
+
+    #[test]
+    fn check_times_read_as_elapsed_time() {
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |seconds| elapsed_label(now - Duration::from_secs(seconds), now);
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(60), "1 minute ago");
+        assert_eq!(ago(3 * 3_600 + 5), "3 hours ago");
+        assert_eq!(ago(2 * 86_400), "2 days ago");
+    }
 
     #[test]
     fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
