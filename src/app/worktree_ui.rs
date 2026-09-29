@@ -1347,7 +1347,7 @@ mod tests {
             workspace_widget::view(
                 &workspace,
                 &shortcuts,
-                false,
+                workspace_widget::FocusedPane::Other,
                 true,
                 300.0,
                 id,

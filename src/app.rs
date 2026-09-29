@@ -5319,12 +5319,27 @@ impl Cagents {
         self.apply_pull_request_review(card, action)
     }
 
-    /// Whether the focused card is a pull request pane, which is when the
-    /// review chords are withheld from other cards' processes.
-    fn review_pane_focused(&self) -> bool {
-        self.workspace
-            .focused()
-            .is_some_and(|card| matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_))))
+    /// The kind of the focused pane, which decides which shortcut scopes
+    /// apply. A terminal counts as focused exactly when it is the one its own
+    /// widget forwards keys from, so a chord its scope leaves to the terminal
+    /// always reaches one.
+    ///
+    /// A terminal that has ended, or is closing, is read-only and forwards
+    /// nothing, so it counts as any other pane.
+    fn focused_pane(&self) -> workspace_widget::FocusedPane {
+        let Some(card) = self.workspace.focused() else {
+            return workspace_widget::FocusedPane::Other;
+        };
+        match self.cards.get(&card) {
+            Some(CardRuntime::Terminal(_))
+                if ended_terminal(self.card_state(card)).is_none()
+                    && !self.terminal_close_pending(card) =>
+            {
+                workspace_widget::FocusedPane::Terminal
+            }
+            Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            _ => workspace_widget::FocusedPane::Other,
+        }
     }
 
     /// [`Self::handle_pull_request_review`] without the modal gate, for
@@ -12642,9 +12657,10 @@ impl Application for Cagents {
                     return self.cycle_dirty_close_focus(backwards);
                 }
                 // A chord typed at a dialog is not the workspace's to act on:
-                // Ctrl+W must not close the card behind the dialog. The dialog
-                // is an overlay, so it has already seen the keystroke by the
-                // time this runs, and what it does with one is its own affair.
+                // the close chord must not close the card behind the dialog.
+                // The dialog is an overlay, so it has already seen the
+                // keystroke by the time this runs, and what it does with one
+                // is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -12660,7 +12676,11 @@ impl Application for Cagents {
                         overwrite: false,
                     }));
                 }
-                match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts) {
+                match workspace_widget::global_shortcut(
+                    &event,
+                    &self.settings.keyboard_shortcuts,
+                    self.focused_pane(),
+                ) {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
                         cosmic::task::message(Message::NewTerminal)
                     }
@@ -12677,7 +12697,9 @@ impl Application for Cagents {
                     // A focused editor claims the search chord for its own
                     // buffer, which is what it means in every editor the user
                     // has, and the settings pane for its own search field.
-                    // Anywhere else it keeps its existing meaning.
+                    // A focused terminal never gets here: its scope leaves
+                    // the chord to the shell. Anywhere else it searches
+                    // projects.
                     Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
                         if self.settings_card_focused() {
                             return iced::widget::operation::focus(
@@ -13661,7 +13683,7 @@ impl Application for Cagents {
             workspace_widget::view(
                 &self.workspace,
                 &self.settings.keyboard_shortcuts,
-                self.review_pane_focused(),
+                self.focused_pane(),
                 self.settings.focus_follows_mouse,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
