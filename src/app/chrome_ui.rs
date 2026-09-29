@@ -3,6 +3,7 @@ use crate::interaction::tooltip;
 
 #[derive(Debug, Default)]
 pub(super) struct State {
+    pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
@@ -227,6 +228,10 @@ mod tests {
 }
 
 impl State {
+    pub(super) fn with_projects_collapsed(mut self, collapsed: bool) -> Self {
+        self.projects_collapsed = collapsed;
+        self
+    }
     pub(super) fn is_open(&self) -> bool {
         self.popup.is_some()
     }
@@ -273,6 +278,7 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 3] = [
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
     Close,
@@ -452,6 +458,11 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::ToggleProjects => {
+                self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
+                self.persist();
+                Task::none()
+            }
             Action::ToggleNewTab | Action::ToggleNotices => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
@@ -761,9 +772,9 @@ impl Cagents {
         crate::ui_controls::icon_control(
             crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
             if self.context_inspector_open {
-                "Hide sidebar"
+                "Hide inspector"
             } else {
-                "Show sidebar"
+                "Show inspector"
             },
             self.context_inspector_open,
             !self.modal_is_open(),
@@ -929,6 +940,16 @@ impl Cagents {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
+        actions.push(command(
+            crate::ui_controls::symbolic_icon("view-split-left-symbolic"),
+            if self.chrome_ui.projects_collapsed {
+                "Expand Projects sidebar"
+            } else {
+                "Collapse Projects sidebar"
+            },
+            widget::Id::new("command.toggle-projects"),
+            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleProjects)),
+        ));
         let total = self.workspace.cards().len();
         if should_show_card_navigator(total) {
             let current = self

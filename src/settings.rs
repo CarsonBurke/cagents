@@ -436,6 +436,7 @@ pub enum ShortcutKey {
     Tab,
     PageUp,
     PageDown,
+    Function(u8),
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
@@ -479,15 +480,28 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::PageUp)
             } else if token.eq_ignore_ascii_case("pagedown") {
                 Some(ShortcutKey::PageDown)
+            } else if token.eq_ignore_ascii_case("comma") {
+                Some(ShortcutKey::Character(','))
+            } else if token.eq_ignore_ascii_case("plus") {
+                Some(ShortcutKey::Character('+'))
+            } else if token
+                .to_ascii_lowercase()
+                .strip_prefix('f')
+                .and_then(|number| number.parse::<u8>().ok())
+                .is_some_and(|number| (1..=12).contains(&number))
+            {
+                Some(ShortcutKey::Function(
+                    token[1..].parse().expect("validated function key"),
+                ))
             } else {
                 let mut characters = token.chars();
                 match (characters.next(), characters.next()) {
-                    (Some(character), None) if character.is_ascii_alphanumeric() => {
+                    (Some(character), None) if character.is_ascii_graphic() => {
                         Some(ShortcutKey::Character(character.to_ascii_lowercase()))
                     }
                     _ => {
                         return Err(
-                            "keyboard shortcut key must be A-Z, 0-9, Left, Right, Up, Down, Tab, PageUp, or PageDown",
+                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
                         );
                     }
                 }
@@ -3355,6 +3369,17 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn keyboard_shortcuts_are_validated_as_unique_modified_chords() {
+        for (chord, key) in [
+            ("Ctrl+F1", ShortcutKey::Function(1)),
+            ("Alt+F12", ShortcutKey::Function(12)),
+            ("Ctrl+Comma", ShortcutKey::Character(',')),
+            ("Ctrl+=", ShortcutKey::Character('=')),
+            ("Ctrl+-", ShortcutKey::Character('-')),
+            ("Ctrl+Plus", ShortcutKey::Character('+')),
+        ] {
+            assert_eq!(parse_shortcut(chord).unwrap().key, key);
+        }
+        assert!(parse_shortcut("Ctrl+F13").is_err());
         assert_eq!(
             parse_shortcut("Ctrl+Shift+N").unwrap(),
             ShortcutBinding {

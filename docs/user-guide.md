@@ -47,7 +47,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
   use their OMP, Claude, or Codex provider mark.
-- Drag a tab title to reorder panes, or hold **Alt** and drag a pane. The
+- Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.

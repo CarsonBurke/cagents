@@ -2029,6 +2029,8 @@ pub enum ContextTab {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowView {
+    #[serde(default)]
+    projects_sidebar_collapsed: bool,
     sidebar_width: f32,
     inspector_width: f32,
     context_inspector_open: bool,
@@ -7759,13 +7761,19 @@ impl Cagents {
                 .height(Length::Fill),
         )
         .class(cosmic::theme::Container::custom(move |theme| {
-            let mut accent = iced::Color::from(*theme.cosmic().accent_color());
-            accent.a = 0.35;
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {
-                    color: accent,
-                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                    color: if focused {
+                        design::accent_color(theme)
+                    } else {
+                        design::warning_color(theme)
+                    },
+                    width: if focused || attention {
+                        design::BORDER_WIDTH
+                    } else {
+                        0.0
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -7800,6 +7808,9 @@ impl Cagents {
                     self.modal_is_open(),
                     move |width| Message::ResizeCard { card: id, width },
                     move || Message::ResizeCardFinished(id),
+                )
+                .default_width(
+                    self.settings.default_column_fraction * self.workspace.viewport_width(),
                 )
                 .into()
             } else {
@@ -8974,7 +8985,32 @@ impl Cagents {
     }
 
     fn context_inspector_visible(&self) -> bool {
-        self.context_inspector_open || self.context_inspector_transition.is_some()
+        (!self.sidebar_model.projects.is_empty() || !self.workspace.cards().is_empty())
+            && (self.context_inspector_open || self.context_inspector_transition.is_some())
+    }
+
+    fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
+        let action = match row {
+            sidebar::SelectionRow::Project(project) => Some(SidebarAction::ToggleProject(project)),
+            sidebar::SelectionRow::Channel(channel_id) => {
+                Some(SidebarAction::OpenChannel { channel_id })
+            }
+            sidebar::SelectionRow::Worktree(project_id, worktree_id) => self
+                .sidebar_model
+                .project(project_id)
+                .and_then(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == worktree_id)
+                })
+                .map(|worktree| SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path: worktree.path.clone(),
+                }),
+        };
+        action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)))
     }
 
     /// The instant an animation in flight is measured against.
@@ -9008,8 +9044,40 @@ impl Cagents {
 
     fn context_inspector_is_overlay(&self) -> bool {
         matches!(
-            inspector::mount_for_width(self.window_width, self.context_inspector_visible(), true,),
+            self.context_inspector_mount(),
             Some(InspectorLayout::Overlay)
+        )
+    }
+
+    fn projects_sidebar_mode(&self) -> SidebarMode {
+        if self.chrome_ui.projects_collapsed {
+            SidebarMode::Compact
+        } else {
+            SidebarMode::for_width(self.window_width)
+        }
+    }
+
+    fn context_inspector_mount(&self) -> Option<InspectorLayout> {
+        if !self.context_inspector_visible() {
+            return None;
+        }
+        let navigation = if self.projects_sidebar_mode() == SidebarMode::Compact {
+            design::NAVIGATION_RAIL_WIDTH
+        } else {
+            self.settings.sidebar_width
+        };
+        let inspector = self
+            .settings
+            .inspector_width
+            .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+        Some(
+            if self.window_width - navigation - inspector
+                >= crate::workspace::WidthLimits::default().minimum
+            {
+                InspectorLayout::Docked
+            } else {
+                InspectorLayout::Overlay
+            },
         )
     }
 
@@ -9756,6 +9824,7 @@ impl Cagents {
             None => settings::default_path().map_err(|error| error.to_string())?,
         };
         let mut view = WindowView {
+            projects_sidebar_collapsed: self.chrome_ui.projects_collapsed,
             sidebar_width: self.settings.sidebar_width,
             inspector_width: self.settings.inspector_width,
             context_inspector_open: self.context_inspector_open,
@@ -10379,7 +10448,11 @@ impl Application for Cagents {
             refresh_ui: refresh_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
-            chrome_ui: chrome_ui::State::default(),
+            chrome_ui: chrome_ui::State::default().with_projects_collapsed(
+                window_view
+                    .as_ref()
+                    .is_some_and(|view| view.projects_sidebar_collapsed),
+            ),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -11393,6 +11466,40 @@ impl Application for Cagents {
                 }
                 self.prune_sidebar_row_selection();
                 match action {
+                    SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
+                        widget::Id::new("sidebar.projects.scroll"),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y },
+                    ).map(cosmic::Action::App),
+                    SidebarAction::OpenFirstSearchResult => {
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
+                            .or_else(|| rows.first()).copied();
+                        row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
+                    }
+                    SidebarAction::NavigateRow { row, key } => {
+                        use keyboard::key::Named;
+                        if key == Named::Enter {
+                            return self.open_sidebar_navigation_row(row);
+                        }
+                        if matches!(key, Named::ArrowLeft | Named::ArrowRight) {
+                            if let sidebar::SelectionRow::Project(project) = row {
+                                let expanded = self.sidebar_state.project_expanded(project);
+                                if expanded == (key == Named::ArrowLeft) {
+                                    return self.update(Message::Sidebar(SidebarAction::ToggleProject(project)));
+                                }
+                            }
+                            return Task::none();
+                        }
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let index = rows.iter().position(|candidate| *candidate == row).unwrap_or(0);
+                        let target = match key {
+                            Named::Home => 0,
+                            Named::End => rows.len().saturating_sub(1),
+                            Named::ArrowUp => index.saturating_sub(1),
+                            _ => (index + 1).min(rows.len().saturating_sub(1)),
+                        };
+                        rows.get(target).map_or_else(Task::none, |row| iced::widget::operation::focus(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
+                    }
                     SidebarAction::SelectRows { row, intent } => {
                         self.select_sidebar_rows(row, intent);
                         if matches!(intent, sidebar::SelectionIntent::Toggle | sidebar::SelectionIntent::Range { .. }) {
@@ -12899,10 +13006,8 @@ impl Application for Cagents {
                 // whatever the user was typing into and focus nothing. Only
                 // the pane knows which densities and models give the search a
                 // control.
-                if !sidebar::search_is_reachable(
-                    &self.sidebar_model,
-                    SidebarMode::for_width(self.window_width),
-                ) {
+                if !sidebar::search_is_reachable(&self.sidebar_model, self.projects_sidebar_mode())
+                {
                     return Task::none();
                 }
                 if !self.sidebar_state.controls_expanded() {
@@ -13637,7 +13742,7 @@ impl Application for Cagents {
     fn view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
-        let sidebar_mode = SidebarMode::for_width(window_width);
+        let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view(
             &self.sidebar_model,
             &self.sidebar_state,
@@ -13652,7 +13757,7 @@ impl Application for Cagents {
         // `sync_window_title`.
         let docked_context_inspector = self.context_inspector_visible()
             && matches!(
-                inspector::mount_for_width(window_width, true, true),
+                self.context_inspector_mount(),
                 Some(InspectorLayout::Docked)
             );
         // A docked inspector's resize handle draws the viewport's trailing
@@ -13666,9 +13771,18 @@ impl Application for Cagents {
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+            let directory = self
+                .terminal_directory()
+                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
+            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
             let action_buttons = || {
-                vec![
-                    widget::button::suggested("New terminal")
+                let mut buttons: Vec<Element<'_, Message>> = vec![
+                    widget::button::suggested("New thread")
+                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                            chrome_ui::NewTab::Thread,
+                        )))
+                        .into(),
+                    widget::button::standard("New terminal")
                         .id(widget::Id::new("empty.new-terminal"))
                         .name("New terminal")
                         .leading_icon(crate::ui_controls::symbolic_icon(
@@ -13676,21 +13790,31 @@ impl Application for Cagents {
                         ))
                         .on_press(Message::NewTerminal)
                         .into(),
-                    widget::button::standard("Open folder")
-                        .id(widget::Id::new("empty.open-repository"))
-                        .name("Open folder")
-                        .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
-                        .on_press(Message::OpenRepository)
-                        .into(),
-                    widget::button::standard("New browser")
-                        .id(widget::Id::new("empty.new-browser"))
-                        .name("New browser")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "internet-web-browser-symbolic",
-                        ))
-                        .on_press(Message::NewBrowser)
-                        .into(),
-                ]
+                    widget::button::standard(if cfg!(feature = "integrated-browser") {
+                        "New browser"
+                    } else {
+                        "Open in system browser…"
+                    })
+                    .id(widget::Id::new("empty.new-browser"))
+                    .name("New browser")
+                    .leading_icon(crate::ui_controls::symbolic_icon(
+                        "internet-web-browser-symbolic",
+                    ))
+                    .on_press(Message::NewBrowser)
+                    .into(),
+                ];
+                if self.sidebar_model.projects.is_empty() {
+                    buttons.insert(
+                        0,
+                        widget::button::standard("Open folder")
+                            .id(widget::Id::new("empty.open-repository"))
+                            .name("Open folder")
+                            .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
+                            .on_press(Message::OpenRepository)
+                            .into(),
+                    );
+                }
+                buttons
             };
             let actions: Element<'_, Message> = if matches!(
                 design::ShellLayout::for_width(window_width).dock,
@@ -13711,13 +13835,20 @@ impl Application for Cagents {
                         .icon()
                         .size(32)
                         .into(),
-                    widget::text::title2("Start a workspace").into(),
-                    widget::text::body(
-                        "Open a folder for project context, or start a standalone terminal.",
-                    )
+                    widget::text::title2(if scoped {
+                        "This workspace has no panes"
+                    } else {
+                        "Start a workspace"
+                    })
+                    .into(),
+                    widget::text::body(if scoped {
+                        "Start a thread or terminal in this workspace."
+                    } else {
+                        "Start a conversation or terminal, or open a project folder."
+                    })
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                     .into(),
-                    design::caption(STARTING_DIRECTORY_CAPTION.as_str())
+                    design::caption(format!("Directory: {}", display_path(&directory)))
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                     actions,
@@ -13809,13 +13940,15 @@ impl Application for Cagents {
                 |width| Message::ContextInspector(InspectorAction::Resize { width }),
                 || Message::ContextInspector(InspectorAction::ResizeFinished),
             )
+            .default_width(design::INSPECTOR_DEFAULT_WIDTH)
             .into();
             let pane = crate::interaction::reveal_width(
                 self.context_panel(context_model, width),
                 width,
                 progress,
             );
-            match inspector::mount_for_width(window_width, true, true)
+            match self
+                .context_inspector_mount()
                 .expect("an open contextual inspector with a model has a mount")
             {
                 InspectorLayout::Docked => {

@@ -470,6 +470,25 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageDown)
             ),
+            ShortcutKey::Function(number) => {
+                use keyboard::key::Named;
+                let keys = [
+                    Named::F1,
+                    Named::F2,
+                    Named::F3,
+                    Named::F4,
+                    Named::F5,
+                    Named::F6,
+                    Named::F7,
+                    Named::F8,
+                    Named::F9,
+                    Named::F10,
+                    Named::F11,
+                    Named::F12,
+                ];
+                keys.get(usize::from(number).saturating_sub(1))
+                    .is_some_and(|expected| key.as_ref() == keyboard::Key::Named(*expected))
+            }
         }
 }
 
@@ -477,7 +496,7 @@ fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Opti
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
         if let (Some(character), None) = (characters.next(), characters.next())
-            && character.is_ascii_alphanumeric()
+            && character.is_ascii_graphic()
         {
             return Some(character.to_ascii_lowercase());
         }
@@ -602,29 +621,9 @@ where
                 .collect(),
         );
     let on_viewport_for_scroll = on_viewport.clone();
-    let on_select = on_viewport.clone();
-    let on_drop = on_viewport.clone();
-    let on_drag_scroll = on_viewport.clone();
-    let strip = crate::reorder::strip(
-        strip,
-        workspace
-            .presentation_geometry()
-            .cards()
-            .iter()
-            .map(|card| crate::reorder::Item {
-                id: card.id,
-                start: card.start,
-                width: card.width(),
-            })
-            .collect(),
-        true,
-        true,
-        Some(Box::new(move |offset| {
-            on_drag_scroll(WorkspaceViewportEvent::DragScrolled(offset))
-        })),
-        move |id| on_select(WorkspaceViewportEvent::PointerFocused(id)),
-        move |card, before| on_drop(WorkspaceViewportEvent::Reordered { card, before }),
-    );
+    // Reordering belongs to the tab strip's explicit title handles. A wrapper
+    // around pane bodies intercepts Alt drags before terminals can route them
+    // to mouse-tracking applications.
     let scrollable = cosmic::widget::scrollable::horizontal(strip)
         .direction(widget::scrollable::Direction::Horizontal(
             widget::scrollable::Scrollbar::hidden(),
