@@ -90,6 +90,17 @@ pub enum TerminalEvent {
         intentional: bool,
     },
     ConversationTitleChanged(String),
+    WorkingDirectoryChanged(std::path::PathBuf),
+    ClipboardText {
+        request: uuid::Uuid,
+        text: String,
+    },
+    SearchResults {
+        request: u64,
+        query: String,
+        matches: Vec<super::SearchMatch>,
+        truncated: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

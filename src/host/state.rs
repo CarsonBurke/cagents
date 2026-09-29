@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,6 +65,7 @@ pub(crate) struct TerminalRecord {
     events: VecDeque<(u64, WireTerminalEvent)>,
     /// Stable provider metadata must survive eviction from the transition log.
     conversation_title: Option<(u64, String)>,
+    working_directory: Option<(u64, PathBuf)>,
 }
 
 #[derive(Default)]
@@ -1061,6 +1063,7 @@ impl HostState {
                 event_sequence: 0,
                 events: VecDeque::new(),
                 conversation_title: None,
+                working_directory: None,
             },
         );
         let visibility = if initially_visible {
@@ -1228,7 +1231,25 @@ impl HostState {
             .iter()
             .filter(|(sequence, _)| *sequence > after_sequence)
             .cloned();
-        Ok(title.chain(events).collect())
+        let cwd = record
+            .working_directory
+            .iter()
+            .filter(|(sequence, _)| {
+                *sequence > after_sequence
+                    && record
+                        .events
+                        .front()
+                        .is_none_or(|(first, _)| sequence < first)
+            })
+            .map(|(sequence, path)| {
+                (
+                    *sequence,
+                    WireTerminalEvent::WorkingDirectoryChanged { path: path.clone() },
+                )
+            });
+        let mut replay: Vec<_> = title.chain(cwd).chain(events).collect();
+        replay.sort_by_key(|(sequence, _)| *sequence);
+        Ok(replay)
     }
 
     fn inventory_count(&mut self) -> u64 {
@@ -3533,6 +3554,9 @@ fn record_event_from(
         if let WireTerminalEvent::ConversationTitleChanged { title } = &wire_event {
             record.conversation_title = Some((sequence, title.clone()));
         }
+        if let WireTerminalEvent::WorkingDirectoryChanged { path } = &wire_event {
+            record.working_directory = Some((sequence, path.clone()));
+        }
         if let WireTerminalEvent::Exited {
             exit_code, signal, ..
         } = &wire_event
@@ -3547,7 +3571,14 @@ fn record_event_from(
                 occurred_at_unix_ms: unix_time_ms(),
             });
         }
-        record.events.push_back((sequence, wire_event.clone()));
+        if matches!(wire_event, WireTerminalEvent::SearchResults { .. }) {
+            record
+                .events
+                .retain(|(_, event)| !matches!(event, WireTerminalEvent::SearchResults { .. }));
+        }
+        if !matches!(wire_event, WireTerminalEvent::ClipboardText { .. }) {
+            record.events.push_back((sequence, wire_event.clone()));
+        }
         while record.events.len() > EVENT_REPLAY_CAPACITY {
             record.events.pop_front();
         }

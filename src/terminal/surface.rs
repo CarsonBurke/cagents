@@ -104,9 +104,28 @@ impl TerminalSurface {
     pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
         self.0.scroll_to_row(row)
     }
+    pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
+        self.0.clear_scrollback()
+    }
+    pub fn copy_selection(
+        &self,
+        request: uuid::Uuid,
+        selection: super::SearchMatch,
+    ) -> Result<(), TerminalSendError> {
+        self.0.copy_selection(request, selection)
+    }
 
     pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
         self.0.set_theme(theme)
+    }
+
+    pub fn search(
+        &self,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(), TerminalSendError> {
+        self.0.search(request, query, case_sensitive)
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {

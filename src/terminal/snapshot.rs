@@ -180,6 +180,16 @@ pub struct CellSnapshot {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowSnapshot {
     pub cells: Vec<CellSnapshot>,
+    /// The next row continues this logical line without a hard line break.
+    pub wrapped: bool,
+    pub hyperlinks: Vec<HyperlinkSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HyperlinkSpan {
+    pub start: u16,
+    pub end: u16,
+    pub uri: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -209,6 +219,7 @@ pub struct ScrollSnapshot {
     pub len: u64,
     pub alternate_screen: bool,
     pub mouse_tracking: bool,
+    pub bracketed_paste: bool,
 }
 
 impl ScrollSnapshot {
@@ -270,6 +281,7 @@ pub(crate) struct VisualResources {
     /// to a caller-provided `String`; owning one keeps the per-cell cost at a
     /// memcpy into `CellText` instead of an allocate-and-free pair.
     grapheme_scratch: String,
+    hyperlink_scratch: Vec<u8>,
 }
 
 #[cfg(feature = "host")]
@@ -281,6 +293,7 @@ impl VisualResources {
             cells: CellIterator::new()?,
             previous: None,
             grapheme_scratch: String::new(),
+            hyperlink_scratch: vec![0; 4096],
         })
     }
 
@@ -300,6 +313,7 @@ impl VisualResources {
             len: scrollbar.len,
             alternate_screen: terminal.active_screen()? == libghostty_vt::screen::Screen::Alternate,
             mouse_tracking: terminal.is_mouse_tracking()?,
+            bracketed_paste: terminal.mode(libghostty_vt::terminal::Mode::BRACKETED_PASTE)?,
         };
         let snapshot = self.render_state.update(terminal)?;
         let damage = snapshot.dirty()?;
@@ -340,7 +354,43 @@ impl VisualResources {
             if rebuild_all || row_dirty {
                 let mut cell_iteration = self.cells.update(row)?;
                 let mut owned_cells = Vec::with_capacity(usize::from(columns));
+                let mut hyperlinks: Vec<HyperlinkSpan> = Vec::new();
                 while let Some(cell) = cell_iteration.next() {
+                    if cell.raw_cell()?.has_hyperlink()? {
+                        let column = owned_cells.len() as u16;
+                        let reference =
+                            terminal.grid_ref(libghostty_vt::terminal::Point::Viewport(
+                                libghostty_vt::terminal::PointCoordinate {
+                                    x: column,
+                                    y: row_index as u32,
+                                },
+                            ))?;
+                        let length = match reference.hyperlink_uri(&mut self.hyperlink_scratch) {
+                            Err(libghostty_vt::Error::OutOfSpace { required })
+                                if required <= 65536 =>
+                            {
+                                self.hyperlink_scratch.resize(required, 0);
+                                reference
+                                    .hyperlink_uri(&mut self.hyperlink_scratch)
+                                    .unwrap_or(0)
+                            }
+                            result => result.unwrap_or(0),
+                        };
+                        if let Ok(uri) = std::str::from_utf8(&self.hyperlink_scratch[..length]) {
+                            if let Some(last) = hyperlinks
+                                .last_mut()
+                                .filter(|last| last.end == column && last.uri == uri)
+                            {
+                                last.end += 1;
+                            } else if !uri.is_empty() {
+                                hyperlinks.push(HyperlinkSpan {
+                                    start: column,
+                                    end: column + 1,
+                                    uri: uri.to_owned(),
+                                });
+                            }
+                        }
+                    }
                     let style = cell.style()?;
                     let mut cell_foreground = cell.fg_color()?.unwrap_or(colors.foreground);
                     let mut cell_background = cell.bg_color()?.unwrap_or(colors.background);
@@ -368,7 +418,11 @@ impl VisualResources {
                     });
                 }
 
-                let line = Arc::new(RowSnapshot { cells: owned_cells });
+                let line = Arc::new(RowSnapshot {
+                    cells: owned_cells,
+                    wrapped: row.raw_row()?.is_wrapped()?,
+                    hyperlinks,
+                });
                 if rebuild_all {
                     if row_index < row_count {
                         lines.push(line);
@@ -462,6 +516,30 @@ fn map_cursor(value: CursorVisualStyle) -> CursorShape {
 mod tests {
     use super::*;
     use libghostty_vt::TerminalOptions;
+
+    #[test]
+    fn capture_keeps_wrap_flags_and_coalesces_osc8_spans() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 3,
+            max_scrollback: 16,
+        })
+        .unwrap();
+        terminal.vt_write(b"\x1b]8;;https://example.com/\x1b\\abcdefghij\x1b]8;;\x1b\\\r\nnext");
+        let mut visual = VisualResources::new().unwrap();
+        let snapshot = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        assert!(snapshot.lines[0].wrapped);
+        assert!(!snapshot.lines[1].wrapped);
+        assert_eq!(
+            snapshot.lines[0].hyperlinks,
+            vec![HyperlinkSpan {
+                start: 0,
+                end: 8,
+                uri: "https://example.com/".into()
+            }]
+        );
+        assert_eq!(snapshot.lines[1].hyperlinks[0].end, 2);
+    }
 
     #[test]
     fn scroll_metadata_tracks_output_absolute_boundaries_and_alternate_screen() {

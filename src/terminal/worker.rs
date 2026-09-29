@@ -80,6 +80,16 @@ enum Command {
     Resize(TerminalSize),
     Scroll(ScrollCommand),
     SetTheme(TerminalTheme),
+    ClearScrollback,
+    CopySelection {
+        request: uuid::Uuid,
+        selection: super::SearchMatch,
+    },
+    Search {
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    },
     Hide,
     Reveal,
     Hibernate,
@@ -177,6 +187,7 @@ enum Effect {
     PtyWrite(Vec<u8>),
     Bell,
     Title(String),
+    WorkingDirectoryChanged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +211,7 @@ struct PublishedState {
     agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
     conversation_title: Mutex<Option<String>>,
+    latest_search: AtomicU64,
     completed: AtomicBool,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
@@ -236,6 +248,7 @@ impl PublishedState {
             agent_observer: OnceLock::new(),
             semantic_events: OnceLock::new(),
             conversation_title: Mutex::new(None),
+            latest_search: AtomicU64::new(0),
             completed: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -602,6 +615,33 @@ impl TerminalHandle {
 
     pub fn set_theme(&self, theme: TerminalTheme) -> Result<(), TerminalSendError> {
         self.try_command(Command::SetTheme(theme))
+    }
+    pub fn clear_scrollback(&self) -> Result<(), TerminalSendError> {
+        self.try_command(Command::ClearScrollback)
+    }
+    pub fn copy_selection(
+        &self,
+        request: uuid::Uuid,
+        selection: super::SearchMatch,
+    ) -> Result<(), TerminalSendError> {
+        self.try_command(Command::CopySelection { request, selection })
+    }
+
+    pub fn search(
+        &self,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(), TerminalSendError> {
+        self.inner
+            .published
+            .latest_search
+            .store(request, Ordering::Release);
+        self.try_command(Command::Search {
+            request,
+            query,
+            case_sensitive,
+        })
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {
@@ -1004,6 +1044,13 @@ impl Worker {
                 }
             })
             .map_err(|error| format!("register title effect: {error}"))?;
+
+        terminal
+            .on_pwd_changed({
+                let effects = Rc::clone(&effects);
+                move |_| effects.borrow_mut().push(Effect::WorkingDirectoryChanged)
+            })
+            .map_err(|error| format!("register working directory effect: {error}"))?;
 
         let mut command = match &config.execution_environment {
             Some(environment) => {
@@ -1623,7 +1670,35 @@ impl Worker {
                     }
                 }
             }
+            Command::Search {
+                request,
+                query,
+                case_sensitive,
+            } => {
+                match super::search::search(&self.terminal, &query, case_sensitive, || {
+                    self.published.latest_search.load(Ordering::Acquire) != request
+                }) {
+                    Ok(Some((matches, truncated))) => self.emit(TerminalEvent::SearchResults {
+                        request,
+                        query,
+                        matches,
+                        truncated,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => self.error("search terminal", error.to_string()),
+                }
+            }
             Command::Hide => self.set_hidden(),
+            Command::ClearScrollback => {
+                self.terminal.vt_write(b"\x1b[3J");
+                self.publish_snapshot(true);
+            }
+            Command::CopySelection { request, selection } => {
+                match super::search::selected_text(&self.terminal, selection) {
+                    Ok(text) => self.emit(TerminalEvent::ClipboardText { request, text }),
+                    Err(error) => self.error("copy terminal selection", error),
+                }
+            }
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
@@ -1933,6 +2008,19 @@ impl Worker {
             match effect {
                 Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
                 Effect::Bell => self.emit(TerminalEvent::Bell),
+                Effect::WorkingDirectoryChanged => {
+                    let raw = self.terminal.pwd().unwrap_or_default();
+                    let path = url::Url::parse(raw)
+                        .ok()
+                        .and_then(|url| url.to_file_path().ok())
+                        .or_else(|| {
+                            let path = std::path::PathBuf::from(raw);
+                            path.is_absolute().then_some(path)
+                        });
+                    if let Some(path) = path {
+                        self.emit(TerminalEvent::WorkingDirectoryChanged(path));
+                    }
+                }
                 Effect::Title(title) => {
                     let title = if self.agent_provider == Some(crate::agent::Provider::Codex) {
                         crate::agent::codex_title_without_spinner(&title)

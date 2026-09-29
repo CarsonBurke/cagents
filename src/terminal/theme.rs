@@ -40,7 +40,6 @@ mod tests {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalTheme {
-    #[default]
     Dark,
     Light,
     SolarizedDark,
@@ -67,6 +66,9 @@ pub enum TerminalTheme {
     EverforestLight,
     SolarizedLight,
     Custom(TerminalPalette),
+    /// Resolved by the UI before crossing the terminal-host boundary.
+    #[default]
+    Auto,
 }
 
 /// Unknown keys are ignored rather than refused: a newer build may add a
@@ -108,6 +110,7 @@ impl<'de> Deserialize<'de> for ThemeColor {
 
 impl TerminalTheme {
     pub const PRESETS: &'static [(Self, &'static str, &'static str)] = &[
+        (Self::Auto, "Follow app theme", "auto"),
         (Self::Dark, "Dark", "dark"),
         (Self::Light, "Light", "light"),
         (Self::SolarizedDark, "Solarized dark", "solarized_dark"),
@@ -174,6 +177,7 @@ impl TerminalTheme {
     }
     pub fn palette(self) -> TerminalPalette {
         let (foreground, background, ansi, light) = match self {
+            Self::Auto => return Self::Dark.palette(),
             Self::Dark => (
                 0xd8d8d8,
                 0x101010,
