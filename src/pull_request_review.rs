@@ -1705,9 +1705,17 @@ impl State {
         }
         rows.push(
             widget::row::with_children(vec![
-                widget::Space::new().width(Length::Fill).into(),
+                design::caption(self.progress_label())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
                 self.review_control(modal_open),
             ])
+            .spacing(spacing.space_xs)
+            .align_y(Alignment::Center)
             .padding(Padding {
                 top: spacing.space_xxs.into(),
                 ..Padding::ZERO
@@ -1727,6 +1735,15 @@ impl State {
             self.files.iter().filter(|file| file.viewed).count(),
             self.files.len(),
         )
+    }
+
+    /// How far the review has come, or why there is nothing to count yet.
+    fn progress_label(&self) -> String {
+        match self.progress() {
+            (_, 0) if self.load == LoadState::Loading => "Loading files".to_owned(),
+            (_, 0) => "No files".to_owned(),
+            (viewed, total) => format!("{viewed} of {total} viewed"),
+        }
     }
 
     /// The notice slot: a load failure, a refused mark, or nothing.
@@ -3372,6 +3389,7 @@ pub(crate) mod tests {
         assert_eq!(Mark::from_tally(1, 2), Mark::Mixed);
         assert_eq!(state.files_under(&path("src")).len(), 2);
         assert_eq!(state.progress(), (1, 3));
+        assert_eq!(state.progress_label(), "1 of 3 viewed");
     }
 
     #[test]

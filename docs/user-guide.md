@@ -197,7 +197,8 @@ reconciled on refresh. The cache retains up to 32 recent reviews within a
   links.
 
 The header names the pull request and holds its whole-PR controls; the title,
-author, and branches read in full beneath it.
+author, and branches read in full beneath it, with the viewed progress beside
+the review control.
 
 Comment where the feedback belongs:
 
