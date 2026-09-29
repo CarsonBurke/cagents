@@ -2210,6 +2210,13 @@ impl Claude {
     }
 
     fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        // Both initial metadata and autonomous plan-mode transitions report
+        // the effective permission mode, independent of our control replies.
+        if let Some(mode) = frame["permissionMode"].as_str() {
+            step.events.push(Event::PermissionMode(Some(
+                if mode == "default" { "manual" } else { mode }.into(),
+            )));
+        }
         match string(frame, "subtype") {
             "init" | "commands_changed" => self.metadata(frame, step),
             "model_refusal_fallback" => {
@@ -4378,6 +4385,36 @@ mod tests {
                     .contains(&Event::PermissionMode(Some(mode.into())))
             );
         }
+    }
+
+    #[test]
+    fn autonomous_permission_changes_and_initial_metadata_update_the_session() {
+        let mut adapter = Claude::default();
+        for (subtype, wire, expected) in [
+            ("init", "plan", "plan"),
+            ("status", "acceptEdits", "acceptEdits"),
+            ("status", "default", "manual"),
+        ] {
+            let step = adapter
+                .receive(json!({
+                    "type": "system", "subtype": subtype,
+                    "status": null, "permissionMode": wire,
+                }))
+                .unwrap();
+            assert!(
+                step.events
+                    .contains(&Event::PermissionMode(Some(expected.into())))
+            );
+        }
+        let step = adapter
+            .receive(json!({"type":"system", "subtype":"status", "status":"compacting"}))
+            .unwrap();
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PermissionMode(_)))
+        );
     }
 
     #[test]
