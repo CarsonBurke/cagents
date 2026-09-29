@@ -4,8 +4,8 @@ use std::{
     borrow::Cow,
     fs,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -41,7 +41,12 @@ impl TryFrom<(Vec<u8>, String)> for Image {
     }
 }
 
+/// The largest clipboard image kept, whatever the provider accepts; a
+/// provider without its own limit would otherwise keep any size offered.
+const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 pub(super) fn save(image: Image, max_bytes: u64) -> Result<PathBuf, String> {
+    let max_bytes = max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES);
     let (format, extension) = match image.mime.as_str() {
         "image/png" => (image::ImageFormat::Png, ".png"),
         "image/jpeg" => (image::ImageFormat::Jpeg, ".jpg"),
@@ -56,8 +61,8 @@ pub(super) fn save(image: Image, max_bytes: u64) -> Result<PathBuf, String> {
         return Err("Clipboard image data does not match its image type.".into());
     }
     let directory = cache_directory().ok_or("Application cache directory is unavailable.")?;
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
     prune_cache();
     let mut file = tempfile::Builder::new()
@@ -71,8 +76,14 @@ pub(super) fn save(image: Image, max_bytes: u64) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-fn cache_directory() -> Option<PathBuf> {
-    crate::instance::project_dirs().map(|dirs| dirs.cache_dir().join("chat-pasted-images"))
+/// Resolved once: the attachment row asks for every attachment on each redraw.
+fn cache_directory() -> Option<&'static Path> {
+    static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            crate::instance::project_dirs().map(|dirs| dirs.cache_dir().join("chat-pasted-images"))
+        })
+        .as_deref()
 }
 
 pub(super) fn prune_cache() {
@@ -87,12 +98,12 @@ pub(super) fn prune_cache() {
     if last_prune.is_some_and(|last| last.elapsed() < PRUNE_INTERVAL) {
         return;
     }
-    prune_old_images(&directory);
+    prune_old_images(directory);
     *last_prune = Some(Instant::now());
 }
 
 pub(super) fn is_pasted(path: &std::path::Path) -> bool {
-    path.parent() == cache_directory().as_deref()
+    path.parent() == cache_directory()
         && path
             .file_name()
             .and_then(|name| name.to_str())
@@ -139,5 +150,14 @@ mod tests {
         assert!(save(invalid, 100).is_err());
         let image = Image::try_from((b"\x89PNG\r\n\x1a\n".to_vec(), "image/png".into())).unwrap();
         assert!(save(image, 1).is_err());
+    }
+
+    #[test]
+    fn an_unlimited_provider_still_refuses_huge_clipboard_images() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(MAX_CLIPBOARD_IMAGE_BYTES as usize + 1, 0);
+        let image = Image::try_from((bytes, "image/png".into())).unwrap();
+        let error = save(image, u64::MAX).unwrap_err();
+        assert!(error.contains("size limit"), "{error}");
     }
 }
