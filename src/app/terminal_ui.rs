@@ -45,9 +45,9 @@ mod tests {
             "needle".into(),
             vec![crate::terminal::SearchMatch {
                 start_row: 12,
-                start_col: 0,
+                start_column: 0,
                 end_row: 12,
-                end_col: 6,
+                end_column: 6,
             }],
             true,
         );
