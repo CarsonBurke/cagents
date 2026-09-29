@@ -24,6 +24,7 @@
 // COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+use crate::editor_history::{self as history, Excerpt, TextChange};
 use cosmic::iced::advanced::text::{
     editor::Editor as _,
     highlighter::{self, Highlighter},
@@ -354,6 +355,12 @@ where
 /// Ctrl+Delete / Ctrl+Backspace delete the adjacent word, then the usual
 /// iced editor chords (copy/cut/paste/select-all and caret motion).
 pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
+    // Every editor on screen sees every key press. Only the focused one may
+    // act on it, or Ctrl+Backspace typed anywhere else would delete a word
+    // from each unfocused buffer too.
+    if !matches!(press.status, Status::Focused { .. }) {
+        return None;
+    }
     if press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() {
         match press.key.as_ref() {
             keyboard::Key::Named(keyboard::key::Named::Delete) => {
@@ -372,6 +379,33 @@ pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
         }
     }
     Binding::from_key_press(press)
+}
+
+/// A step through the edit history that a chord asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCommand {
+    Undo,
+    Redo,
+}
+
+/// Recognizes Ctrl+Z as undo, and both Ctrl+Shift+Z and Ctrl+Y as redo, in
+/// the focused editor.
+///
+/// Letters are read through the physical key as well, so the chords stay
+/// where they are on a non-Latin keyboard layout.
+pub fn history_command(press: &KeyPress) -> Option<HistoryCommand> {
+    if !matches!(press.status, Status::Focused { .. })
+        || !press.modifiers.command()
+        || press.modifiers.alt()
+    {
+        return None;
+    }
+    match press.key.to_latin(press.physical_key)?.to_ascii_lowercase() {
+        'z' if press.modifiers.shift() => Some(HistoryCommand::Redo),
+        'z' => Some(HistoryCommand::Undo),
+        'y' if !press.modifiers.shift() => Some(HistoryCommand::Redo),
+        _ => None,
+    }
 }
 
 /// A small logical anchor independent of the document's text allocation.
@@ -746,14 +780,7 @@ where
             let Some(line) = internal.editor.line(index) else {
                 break;
             };
-            length += line.text.len();
-            if index + 1 < count {
-                length += if line.ending == LineEnding::None {
-                    LineEnding::default().as_str().len()
-                } else {
-                    line.ending.as_str().len()
-                };
-            }
+            length += line.text.len() + terminator(line.ending, index + 1 == count).len();
         }
         length
     }
@@ -776,13 +803,7 @@ where
                 break;
             };
             contents.push_str(&line.text);
-            if index + 1 < count {
-                contents.push_str(if line.ending == LineEnding::None {
-                    LineEnding::default().as_str()
-                } else {
-                    line.ending.as_str()
-                });
-            }
+            contents.push_str(terminator(line.ending, index + 1 == count));
         }
 
         contents
@@ -801,6 +822,306 @@ where
     /// Returns whether or not the the [`Content`] is empty.
     pub fn is_empty(&self) -> bool {
         self.0.borrow().editor.is_empty()
+    }
+
+    /// Performs one edit and reports exactly what it replaced, or `None`
+    /// when it changed nothing, such as Backspace at the start of the file.
+    ///
+    /// The change is measured rather than predicted: the lines the edit can
+    /// reach — those under the caret and selection, and one either side for
+    /// a delete that joins lines — are read before and after, and compared.
+    /// That costs a copy of those few lines, not of the document.
+    pub fn perform_edit(&mut self, edit: Edit) -> Option<RecordedEdit> {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let count = self.line_count();
+        let first = cursor.position.line.min(anchor.line).saturating_sub(1);
+        let last = (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
+        let before = self.excerpt(first, last);
+        let selection = self.selected_span(&before, cursor);
+        // The edit begins no later than the selection or the caret —
+        // Backspace one character before it — which settles where a change
+        // beside a repeated character is recorded.
+        let offset = |position| before.offset(position).unwrap_or(usize::MAX);
+        let caret_at = offset(selection.position);
+        let changed_from = match selection.selection {
+            Some(anchor) => caret_at.min(offset(anchor)),
+            None if matches!(edit, Edit::Backspace) => before
+                .text()
+                .get(..caret_at)
+                .and_then(|text| text.chars().next_back())
+                .map_or(caret_at, |character| caret_at - character.len_utf8()),
+            None => caret_at,
+        };
+        self.perform(Action::Edit(edit));
+        // Lines past the window only move; how far is how many the edit added
+        // or removed.
+        let after_count = self.line_count();
+        let after_last = (last + after_count)
+            .saturating_sub(count)
+            .max(first)
+            .min(after_count.saturating_sub(1));
+        let after = self.excerpt(first, after_last);
+        history::replacement(&before, &after, changed_from).map(|change| RecordedEdit {
+            change,
+            before: selection,
+        })
+    }
+
+    /// The caret with the exact span it has selected.
+    ///
+    /// A word or line selection reports only the point it was anchored at,
+    /// not the span it covers, so the span is found as the selected text
+    /// around both of its reported ends. A selection of nothing is no
+    /// selection.
+    fn selected_span(&self, excerpt: &Excerpt, cursor: Cursor) -> Cursor {
+        let caret = Cursor {
+            position: cursor.position,
+            selection: None,
+        };
+        let Some(anchor) = cursor.selection else {
+            return caret;
+        };
+        let Some(selected) = self.selection().filter(|selected| !selected.is_empty()) else {
+            return caret;
+        };
+        let (Some(caret_at), Some(anchor_at)) =
+            (excerpt.offset(cursor.position), excerpt.offset(anchor))
+        else {
+            return cursor;
+        };
+        let text = excerpt.text();
+        let (low, high) = (caret_at.min(anchor_at), caret_at.max(anchor_at));
+        let mut search = low.saturating_sub(selected.len());
+        while !text.is_char_boundary(search) {
+            search -= 1;
+        }
+        let mut limit = (high + selected.len()).min(text.len());
+        while !text.is_char_boundary(limit) {
+            limit += 1;
+        }
+        let mut span = None;
+        while let Some(found) = text
+            .get(search..limit)
+            .and_then(|rest| rest.find(&selected))
+        {
+            let start = search + found;
+            if start > low {
+                break;
+            }
+            if start + selected.len() >= high {
+                span = Some(start..start + selected.len());
+                break;
+            }
+            search = start + text[start..].chars().next().map_or(1, char::len_utf8);
+        }
+        let Some(span) = span else {
+            return cursor;
+        };
+        let (start, end) = (excerpt.position(span.start), excerpt.position(span.end));
+        if caret_at < anchor_at {
+            Cursor {
+                position: start,
+                selection: Some(end),
+            }
+        } else {
+            Cursor {
+                position: end,
+                selection: Some(start),
+            }
+        }
+    }
+
+    /// Serializes lines `first..=last` exactly as [`Content::text`] would.
+    fn excerpt(&self, first: usize, last: usize) -> Excerpt {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut excerpt = Excerpt::new(first);
+        for index in first..=last.min(count.saturating_sub(1)) {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
+            excerpt.push_line(&line.text, terminator(line.ending, index + 1 == count));
+        }
+        if count == 0 {
+            excerpt.push_line("", "");
+        }
+        excerpt
+    }
+
+    /// Where `expected` ends if the buffer holds it at `start`, and `None`
+    /// when it does not.
+    ///
+    /// Reads the lines in place, so checking a range costs its own length.
+    pub fn range_end(&self, start: Position, expected: &str) -> Option<Position> {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut position = start;
+        let mut rest = expected;
+        loop {
+            let line = internal.editor.line(position.line)?;
+            let segment = line.text.get(position.column..)?;
+            if segment.starts_with(rest) {
+                return Some(Position {
+                    line: position.line,
+                    column: position.column + rest.len(),
+                });
+            }
+            rest = rest.strip_prefix(segment)?;
+            let ending = terminator(line.ending, position.line + 1 == count);
+            if ending.is_empty() {
+                return None;
+            }
+            rest = rest.strip_prefix(ending)?;
+            position = Position {
+                line: position.line + 1,
+                column: 0,
+            };
+            if rest.is_empty() {
+                return Some(position);
+            }
+        }
+    }
+
+    /// Measures a whole-document replacement against the native line map,
+    /// including boundaries which serializing and reparsing would change.
+    pub fn replacement_to_text(&self, replacement: &str) -> Option<TextChange> {
+        history::replacement(
+            &self.excerpt(0, self.line_count().saturating_sub(1)),
+            &Excerpt::document(replacement),
+            usize::MAX,
+        )
+    }
+
+    pub fn replace_range_recorded(
+        &mut self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) -> Option<TextChange> {
+        self.set_cursor(Cursor {
+            position: end,
+            selection: ((start.line, start.column) != (end.line, end.column)).then_some(start),
+        });
+        self.perform_edit(if replacement.is_empty() {
+            Edit::Delete
+        } else {
+            Edit::Paste(Arc::new(replacement.to_owned()))
+        })
+        .map(|edit| edit.change)
+    }
+
+    /// Replays native line fragments separately. Combining their bytes into
+    /// one paste can join LF and CR into a different pair of line endings.
+    pub fn replace_range_with_breaks(
+        &mut self,
+        start: Position,
+        end: Position,
+        replacement: &str,
+        breaks: &[usize],
+    ) {
+        let empty = (start.line, start.column) == (end.line, end.column);
+        self.perform(Action::ClearSelection);
+        self.move_to(Cursor {
+            position: end,
+            selection: (!empty).then_some(start),
+        });
+        if !replacement.is_empty() {
+            if history::canonical_breaks(replacement, breaks) {
+                self.perform(Action::Edit(Edit::Paste(Arc::new(replacement.to_owned()))));
+                return;
+            }
+            let mut previous = 0;
+            for end in breaks
+                .iter()
+                .copied()
+                .chain(std::iter::once(replacement.len()))
+            {
+                if end > previous {
+                    self.perform(Action::Edit(Edit::Paste(Arc::new(
+                        replacement[previous..end].to_owned(),
+                    ))));
+                }
+                previous = end;
+            }
+        } else if !empty {
+            self.perform(Action::Edit(Edit::Delete));
+        }
+    }
+
+    /// Places the caret and selection, clamped into the buffer, and replaces
+    /// any selection there was.
+    pub fn set_cursor(&mut self, cursor: Cursor) {
+        let clamp = |position: Position| {
+            let internal = self.0.borrow();
+            let line = position
+                .line
+                .min(internal.editor.line_count().saturating_sub(1));
+            let column = internal.editor.line(line).map_or(0, |text| {
+                let mut column = position.column.min(text.text.len());
+                while !text.text.is_char_boundary(column) {
+                    column -= 1;
+                }
+                column
+            });
+            Position { line, column }
+        };
+        let position = clamp(cursor.position);
+        // A selection of nothing would swallow the next Backspace or Delete.
+        let selection = cursor
+            .selection
+            .map(clamp)
+            .filter(|anchor| (anchor.line, anchor.column) != (position.line, position.column));
+        let cursor = Cursor {
+            position,
+            selection,
+        };
+        self.perform(Action::ClearSelection);
+        self.move_to(cursor);
+    }
+}
+
+/// One edit as the history records it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedEdit {
+    /// What the edit replaced.
+    pub change: TextChange,
+    /// The caret and the exact span selected before the edit.
+    pub before: Cursor,
+}
+
+/// What [`Content::text`] writes after a line: nothing after the last one,
+/// and the default newline for an unterminated line in the middle.
+fn terminator(ending: LineEnding, last: bool) -> &'static str {
+    if last {
+        ""
+    } else if ending == LineEnding::None {
+        LineEnding::default().as_str()
+    } else {
+        ending.as_str()
+    }
+}
+
+impl<R> history::EditBuffer for Content<R>
+where
+    R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
+{
+    fn replace(
+        &mut self,
+        start: Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
+        let Some(end) = self.range_end(start, expected) else {
+            return false;
+        };
+        self.replace_range_with_breaks(start, end, replacement, replacement_breaks);
+        true
+    }
+
+    fn set_cursor(&mut self, cursor: Cursor) {
+        Content::set_cursor(self, cursor);
     }
 }
 
@@ -2790,6 +3111,409 @@ mod tests {
             content.scroll_position().horizontal,
             40.0,
             "the dominant axis decides the pan, not a nonzero test on x"
+        );
+    }
+
+    #[test]
+    fn a_selection_search_window_ending_inside_a_character_still_finds_it() {
+        // A word selection reports only the point it was made at; the search
+        // for its span looks the selection's length in bytes past that
+        // point, which here ends inside the three-byte dash.
+        let text = "ab\u{2014}\n";
+        let mut content: Content = Content::with_text(text);
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        });
+        content.perform(Action::SelectWord);
+        assert_eq!(content.selection().as_deref(), Some("ab"));
+        assert_eq!(
+            content.selected_span(&Excerpt::document(text), content.cursor()),
+            Cursor {
+                position: Position { line: 0, column: 2 },
+                selection: Some(Position { line: 0, column: 0 }),
+            }
+        );
+    }
+
+    /// Every kind of edit the native buffer performs, at random places and
+    /// over random selections, is recorded exactly: undoing the whole
+    /// history reproduces the original bytes, including mixed line endings,
+    /// and redoing it reproduces the final ones.
+    #[test]
+    fn recorded_native_edits_undo_and_redo_byte_for_byte() {
+        use history::{EditKind, History, Replay};
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound.max(1) as u64) as usize
+        };
+        let original = "fn main() {\r\n    let é = 1;\n\n\tprintln!(\"漢字\");\r\n}\n";
+        let native_lines = |content: &Content| {
+            (0..content.line_count())
+                .map(|index| {
+                    let line = content.line(index).unwrap();
+                    (line.text.into_owned(), line.ending)
+                })
+                .collect::<Vec<_>>()
+        };
+        let start = Instant::now();
+        for round in 0..60 {
+            let mut content: Content = Content::with_text(original);
+            let original_lines = native_lines(&content);
+            let mut history = History::default();
+            for step in 0..30 {
+                let lines = content.line_count();
+                let pick = |line: usize, column: usize, content: &Content| {
+                    let line = line % lines;
+                    let text = content.line(line).unwrap().text.into_owned();
+                    let mut column = column % (text.len() + 1);
+                    while !text.is_char_boundary(column) {
+                        column -= 1;
+                    }
+                    Position { line, column }
+                };
+                // Half the time the caret moves, which seals the step the way
+                // the editor does; otherwise the edit continues from where the
+                // last one left it and may coalesce into its step.
+                if step == 0 || next(2) == 0 {
+                    let position = pick(next(lines), next(40), &content);
+                    let selection = (next(3) == 0).then(|| pick(next(lines), next(40), &content));
+                    content.set_cursor(Cursor {
+                        position,
+                        selection,
+                    });
+                    history.seal();
+                }
+                let selection = content.cursor().selection;
+                // Unindent is left out: cosmic-text 0.19 underflows its caret
+                // when unindenting with the caret inside the indentation,
+                // and nothing in the application binds it.
+                let edit = match next(7) {
+                    0 | 1 => Edit::Insert(['a', ' ', 'é', '漢', '\t', 'z'][next(6)]),
+                    2 => Edit::Enter,
+                    3 => Edit::Backspace,
+                    4 => Edit::Delete,
+                    5 => Edit::Paste(Arc::new(
+                        ["x", "two\nlines", "crlf\r\nend", "\n", "tab\t"][next(5)].to_owned(),
+                    )),
+                    _ => Edit::Indent,
+                };
+                let kind = match &edit {
+                    Edit::Insert(_) | Edit::Enter => EditKind::Insert,
+                    Edit::Backspace if selection.is_none() => EditKind::DeleteBackward,
+                    Edit::Delete if selection.is_none() => EditKind::DeleteForward,
+                    _ => EditKind::Other,
+                };
+                let now = start + Duration::from_millis((round * 100_000 + step * 200) as u64);
+                if let Some(edit) = content.perform_edit(edit) {
+                    history.record(edit.change, kind, edit.before, content.cursor(), now);
+                }
+            }
+            let last = content.text();
+            let last_lines = native_lines(&content);
+            while history.undo(&mut content) == Replay::Applied {}
+            assert_eq!(content.text(), original, "round {round}");
+            assert_eq!(
+                native_lines(&content),
+                original_lines,
+                "native undo, round {round}"
+            );
+            while history.redo(&mut content) == Replay::Applied {}
+            assert_eq!(content.text(), last, "round {round}");
+            assert_eq!(
+                native_lines(&content),
+                last_lines,
+                "native redo, round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_lf_then_crlf_preserves_native_line_boundaries_on_replay() {
+        use history::{EditKind, History, Replay};
+        let original = "a\r\nb\n";
+        let mut content: Content = Content::with_text(original);
+        let mut history = History::default();
+        let cursor = Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        };
+        content.set_cursor(cursor);
+        let now = Instant::now();
+        let edit = content.perform_edit(Edit::Enter).unwrap();
+        history.record(
+            edit.change,
+            EditKind::Insert,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        content.set_cursor(cursor);
+        history.seal();
+        for _ in 0..2 {
+            let edit = content.perform_edit(Edit::Delete).unwrap();
+            history.record(
+                edit.change,
+                EditKind::DeleteForward,
+                edit.before,
+                content.cursor(),
+                now,
+            );
+        }
+        assert_eq!(content.text(), "ab\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), original);
+        assert_eq!(history.undo(&mut content), Replay::Empty);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "ab\n");
+    }
+
+    #[test]
+    fn replacing_multiple_native_lines_preserves_their_boundaries_on_replay() {
+        use history::{EditKind, History, Replay};
+        let original = "a\r\nb\n";
+        let mut content: Content = Content::with_text(original);
+        let mut history = History::default();
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        });
+        let now = Instant::now();
+        let edit = content.perform_edit(Edit::Enter).unwrap();
+        history.record(
+            edit.change,
+            EditKind::Insert,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        content.set_cursor(Cursor {
+            position: Position { line: 2, column: 1 },
+            selection: Some(Position { line: 0, column: 1 }),
+        });
+        let edit = content.perform_edit(Edit::Delete).unwrap();
+        assert_eq!(edit.change.removed_breaks, [2, 4, 6]);
+        history.record(
+            edit.change,
+            EditKind::Other,
+            edit.before,
+            content.cursor(),
+            now,
+        );
+        assert_eq!(content.text(), "a\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "a\n\r\nb\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), original);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(history.redo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "a\n");
+    }
+
+    #[test]
+    fn a_typed_run_is_one_undo_step_that_restores_the_caret() {
+        use history::{EditKind, History, Replay};
+        let mut content: Content = Content::with_text("let x;\n");
+        let mut history = History::default();
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: None,
+        });
+        let now = Instant::now();
+        for character in "yz".chars() {
+            let edit = content.perform_edit(Edit::Insert(character)).unwrap();
+            history.record(
+                edit.change,
+                EditKind::Insert,
+                edit.before,
+                content.cursor(),
+                now,
+            );
+        }
+        assert_eq!(content.text(), "let xyz;\n");
+        assert_eq!(history.undo(&mut content), Replay::Applied);
+        assert_eq!(content.text(), "let x;\n");
+        assert_eq!(content.cursor().position, Position { line: 0, column: 5 });
+        assert_eq!(history.undo(&mut content), Replay::Empty);
+        // Backspace at the very start changes nothing and records nothing.
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        });
+        assert!(content.perform_edit(Edit::Backspace).is_none());
+    }
+
+    /// Next to a repeated character the before and after texts alone cannot
+    /// say which copy an edit touched; the caret does, and a run that stays
+    /// at the caret stays one undo step.
+    #[test]
+    fn native_runs_beside_a_repeated_character_are_one_undo_step() {
+        use history::{EditKind, History, Replay};
+        for (text, column, edits, kind, edited) in [
+            (
+                "helo\n",
+                2,
+                vec![Edit::Insert('x'), Edit::Insert('l')],
+                EditKind::Insert,
+                "hexllo\n",
+            ),
+            (
+                "abbc\n",
+                1,
+                vec![Edit::Delete, Edit::Delete],
+                EditKind::DeleteForward,
+                "ac\n",
+            ),
+            (
+                "abbc\n",
+                2,
+                vec![Edit::Backspace, Edit::Backspace],
+                EditKind::DeleteBackward,
+                "bc\n",
+            ),
+        ] {
+            let mut content: Content = Content::with_text(text);
+            let mut history = History::default();
+            let caret = Cursor {
+                position: Position { line: 0, column },
+                selection: None,
+            };
+            content.set_cursor(caret);
+            let now = Instant::now();
+            for edit in edits {
+                let edit = content.perform_edit(edit).unwrap();
+                history.record(edit.change, kind, edit.before, content.cursor(), now);
+            }
+            assert_eq!(content.text(), edited);
+            assert_eq!(history.undo(&mut content), Replay::Applied);
+            assert_eq!(content.text(), text);
+            assert_eq!(content.cursor(), caret);
+            assert_eq!(history.undo(&mut content), Replay::Empty, "{edited:?}");
+        }
+    }
+
+    #[test]
+    fn undo_reselects_the_whole_word_or_line_a_keystroke_replaced() {
+        use history::{EditKind, History};
+        for (select, expected) in [
+            (Action::SelectWord, "xylophone"),
+            (Action::SelectLine, "play the xylophone"),
+        ] {
+            let mut content: Content = Content::with_text("play the xylophone\nnext\n");
+            let mut history = History::default();
+            content.set_cursor(Cursor {
+                position: Position {
+                    line: 0,
+                    column: 12,
+                },
+                selection: None,
+            });
+            content.perform(select);
+            let edit = content.perform_edit(Edit::Insert('x')).unwrap();
+            history.record(
+                edit.change,
+                EditKind::Insert,
+                edit.before,
+                content.cursor(),
+                Instant::now(),
+            );
+            history.undo(&mut content);
+            assert_eq!(content.text(), "play the xylophone\nnext\n");
+            assert_eq!(content.selection().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn an_empty_selection_is_never_restored() {
+        let mut content: Content = Content::with_text("abc\n");
+        let at = Position { line: 0, column: 1 };
+        content.set_cursor(Cursor {
+            position: at,
+            selection: Some(at),
+        });
+        assert_eq!(content.cursor().selection, None);
+        content.perform(Action::Edit(Edit::Backspace));
+        assert_eq!(
+            content.text(),
+            "bc\n",
+            "Backspace must delete, not clear a selection"
+        );
+    }
+
+    #[test]
+    fn a_replacement_refuses_text_the_buffer_does_not_hold() {
+        use history::EditBuffer;
+        let mut content: Content = Content::with_text("one\r\ntwo\n");
+        let at = Position { line: 0, column: 2 };
+        assert_eq!(
+            content.range_end(at, "e\r\nt"),
+            Some(Position { line: 1, column: 1 })
+        );
+        assert_eq!(content.range_end(at, "e\nt"), None);
+        assert_eq!(
+            content.range_end(at, "e\r\ntwo\n"),
+            Some(Position { line: 2, column: 0 })
+        );
+        assert!(!content.replace(at, "x", "y", &[]));
+        assert_eq!(content.text(), "one\r\ntwo\n");
+        assert!(content.replace(at, "e\r\ntw", "E", &[]));
+        assert_eq!(content.text(), "onEo\n");
+    }
+
+    #[test]
+    fn history_chords_act_only_in_the_focused_editor() {
+        let press = |character: &str, modifiers, focused: bool| KeyPress {
+            key: keyboard::Key::Character(character.into()),
+            modified_key: keyboard::Key::Character(character.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: if focused {
+                Status::Focused { is_hovered: false }
+            } else {
+                Status::Active
+            },
+        };
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            history_command(&press("z", ctrl, true)),
+            Some(HistoryCommand::Undo)
+        );
+        assert_eq!(
+            history_command(&press("Z", ctrl_shift, true)),
+            Some(HistoryCommand::Redo)
+        );
+        assert_eq!(
+            history_command(&press("y", ctrl, true)),
+            Some(HistoryCommand::Redo)
+        );
+        assert_eq!(history_command(&press("z", ctrl, false)), None);
+        assert_eq!(
+            history_command(&press("z", keyboard::Modifiers::empty(), true)),
+            None
+        );
+        assert_eq!(
+            history_command(&press("z", ctrl | keyboard::Modifiers::ALT, true)),
+            None
+        );
+        let backspace = KeyPress {
+            key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+            ..press("", ctrl, false)
+        };
+        assert!(
+            default_bindings::<()>(backspace).is_none(),
+            "an unfocused editor must not delete a word typed at another widget"
         );
     }
 }

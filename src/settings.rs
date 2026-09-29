@@ -20,8 +20,10 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
-const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
-const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
+pub const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+pub const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
+/// The longest terminal font family name, in bytes.
+pub const MAX_TERMINAL_FONT_FAMILY_BYTES: usize = 128;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SIDEBAR_WIDTH_MIN: f32 = 180.0;
@@ -285,7 +287,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 16] {
+    pub fn actions(&self) -> [&Vec<String>; 16] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -313,7 +315,7 @@ impl KeyboardShortcuts {
     /// The first action this table cannot bind, and why: by index into
     /// `actions()`, and for a conflict, the earlier action whose chord it
     /// repeats.
-    fn fault(&self) -> Option<ShortcutFault> {
+    pub fn fault(&self) -> Option<ShortcutFault> {
         let mut parsed: Vec<(ShortcutBinding, usize)> = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
             let fault = |error, conflicts_with| {
@@ -368,10 +370,10 @@ const SHORTCUT_ACTIONS: [&str; 16] = [
 
 /// An action a shortcut table cannot bind.
 #[derive(Debug)]
-struct ShortcutFault {
-    action: usize,
-    conflicts_with: Option<usize>,
-    error: SettingsError,
+pub struct ShortcutFault {
+    pub action: usize,
+    pub conflicts_with: Option<usize>,
+    pub error: SettingsError,
 }
 
 /// Why a chord must not be bound, or `None` when binding it is safe.
@@ -523,7 +525,7 @@ fn default_managed_worktree_directory() -> String {
 }
 
 const fn default_focus_follows_mouse() -> bool {
-    true
+    false
 }
 
 const fn default_editor_auto_save() -> bool {
@@ -543,6 +545,10 @@ const fn default_show_status_bar() -> bool {
 }
 
 const fn default_relaunch_agents_on_upgrade() -> bool {
+    true
+}
+
+const fn default_check_for_updates() -> bool {
     true
 }
 
@@ -732,6 +738,10 @@ pub struct AppSettings {
     /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,
+    /// Whether windows look for a new release on their own, at startup and
+    /// every few hours. A check the user asks for runs either way.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
     /// The revision of the built-in shortcut defaults `keyboard_shortcuts`
     /// has been brought up to; see [`SHORTCUT_DEFAULTS_REVISION`]. A file
     /// without it is read as revision 1, and loading records the revision it
@@ -793,6 +803,7 @@ impl Default for AppSettings {
             chat_enter_sends: default_chat_enter_sends(),
             show_status_bar: default_show_status_bar(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
+            check_for_updates: default_check_for_updates(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
@@ -1403,7 +1414,7 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
-        if self.terminal_font_family.len() > 128 {
+        if self.terminal_font_family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES {
             return Err(SettingsError::Invalid(
                 "terminal_font_family must not exceed 128 bytes",
             ));
@@ -2765,7 +2776,7 @@ mod tests {
             default_column_fraction: 0.55,
             managed_worktree_directory: "../managed trees/".to_owned(),
             worktree_sort: WorktreeSort::Oldest,
-            focus_follows_mouse: false,
+            focus_follows_mouse: true,
             confirm_terminal_close: false,
             relaunch_agents_on_upgrade: false,
             ..AppSettings::default()
@@ -2790,7 +2801,7 @@ mod tests {
         table.remove("relaunch_agents_on_upgrade");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
-        assert!(decoded.focus_follows_mouse);
+        assert!(!decoded.focus_follows_mouse);
         assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
     }
@@ -2939,7 +2950,7 @@ mod tests {
             assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
             assert_eq!(loaded.sidebar_width, expected_width);
             assert_eq!(loaded.default_column_fraction, 0.72);
-            assert!(loaded.focus_follows_mouse);
+            assert!(!loaded.focus_follows_mouse);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
     }
@@ -2975,7 +2986,7 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.sidebar_width, 376.0);
         assert_eq!(migrated.terminal_font_size, 15.0);
         assert_eq!(migrated.default_column_fraction, 0.72);
-        assert!(migrated.focus_follows_mouse);
+        assert!(!migrated.focus_follows_mouse);
         // Every shortcut the file held was a default then, so each takes
         // today's default.
         assert_eq!(migrated.keyboard_shortcuts, KeyboardShortcuts::default());

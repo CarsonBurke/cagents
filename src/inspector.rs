@@ -798,8 +798,8 @@ pub fn model_for_card(
                 }
                 if source.can_discard {
                     actions.push(Action::new(
-                        "Discard changes",
-                        "edit-undo-symbolic",
+                        "Discard unsaved edits",
+                        "document-revert-symbolic",
                         InspectorAction::DiscardRepositoryEdits(card.id),
                     ));
                 }

@@ -30,6 +30,8 @@ pub mod document_render;
 #[cfg(feature = "ui")]
 pub mod editor;
 #[cfg(feature = "ui")]
+pub(crate) mod editor_history;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;
@@ -42,6 +44,8 @@ pub(crate) mod git_watch;
 pub mod github;
 #[cfg(feature = "host")]
 pub mod host;
+#[cfg(feature = "ui")]
+pub mod input_trace;
 #[cfg(feature = "ui")]
 pub mod inspector;
 mod install_guard;

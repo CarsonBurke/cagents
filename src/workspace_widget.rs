@@ -14,6 +14,7 @@ use cosmic::iced::{
 use cosmic::{Element, Renderer, Task, Theme};
 
 use crate::{
+    input_trace::InputTrace,
     model::CardId,
     settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, format_chords, parse_shortcut},
     workspace::{FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, Workspace},
@@ -30,7 +31,9 @@ pub enum WorkspaceViewportEvent {
     Scrolled(ViewportSample),
     Resized(f32),
     PointerFocused(CardId),
-    PointerEntered(CardId),
+    /// The pointer moved into this pane and rested there for
+    /// [`HOVER_ACTIVATION_DWELL`] without a click or a key press in between.
+    PointerRested(CardId),
     Reordered {
         card: CardId,
         before: Option<CardId>,
@@ -110,6 +113,13 @@ pub struct ShortcutDescriptor {
     pub repeatable: bool,
     pub scope: ShortcutScope,
 }
+
+/// How long the pointer must rest in a pane it moved into before hover
+/// activation gives that pane focus. Long enough that sweeping across the
+/// strip - toward the inspector, say - activates nothing on the way; short
+/// enough to read as a response to stopping there. It matches the tooltip
+/// delay, the app's other reading of a pointer that stopped on purpose.
+pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
@@ -549,11 +559,15 @@ pub struct Events<ViewportMessage> {
 /// function rebuilds because `widget::Id::new` allocates, and every mounted
 /// card would pay that on every redraw; the owner is expected to return a
 /// cached clone.
+///
+/// `input` is the trace the owner's [`crate::input_trace::observe`] keeps for
+/// the whole window, which hover activation reads.
 pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
     focused_pane: FocusedPane,
     focus_follows_mouse: bool,
+    input: &InputTrace,
     viewport_width: f32,
     scroll_id: widget::Id,
     build_card: BuildCard,
@@ -579,9 +593,10 @@ where
                 .iter()
                 .filter_map(|mounted| {
                     let card = workspace.card(mounted.id)?;
+                    let focused = workspace.focused() == Some(card.id);
                     let context = CardViewContext {
                         id: card.id,
-                        focused: workspace.focused() == Some(card.id),
+                        focused,
                     };
                     let content =
                         cosmic::widget::id_container(build_card(context), container_id(card.id));
@@ -590,11 +605,13 @@ where
                         x: mounted.start,
                         width: mounted.width,
                         content: CardSurface::new(content)
+                            .traced_by(input)
                             .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
                                 card.id,
                             )))
-                            .on_pointer_enter(focus_follows_mouse.then(|| {
-                                on_viewport(WorkspaceViewportEvent::PointerEntered(card.id))
+                            // The active pane has nothing to gain from a rest.
+                            .on_pointer_rest((focus_follows_mouse && !focused).then(|| {
+                                on_viewport(WorkspaceViewportEvent::PointerRested(card.id))
                             }))
                             .into(),
                     })
@@ -657,7 +674,8 @@ where
 struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
     on_pointer_focus: Option<Message>,
-    on_pointer_enter: Option<Message>,
+    on_pointer_rest: Option<Message>,
+    input: InputTrace,
 }
 
 impl<'a, Message> CardSurface<'a, Message> {
@@ -665,8 +683,17 @@ impl<'a, Message> CardSurface<'a, Message> {
         Self {
             content: content.into(),
             on_pointer_focus: None,
-            on_pointer_enter: None,
+            on_pointer_rest: None,
+            input: InputTrace::default(),
         }
+    }
+
+    /// The window's record of its input, which hover activation reads for
+    /// where each motion began and for presses the pane never received.
+    /// Without it the pane never counts the pointer as having crossed in.
+    fn traced_by(mut self, input: &InputTrace) -> Self {
+        self.input = input.clone();
+        self
     }
 
     fn on_pointer_focus(mut self, message: Message) -> Self {
@@ -674,8 +701,10 @@ impl<'a, Message> CardSurface<'a, Message> {
         self
     }
 
-    fn on_pointer_enter(mut self, message: Option<Message>) -> Self {
-        self.on_pointer_enter = message;
+    /// Published once the pointer has moved into this pane and rested there;
+    /// see [`CardPointerState`] for what counts.
+    fn on_pointer_rest(mut self, message: Option<Message>) -> Self {
+        self.on_pointer_rest = message;
         self
     }
 
@@ -688,10 +717,42 @@ impl<'a, Message> CardSurface<'a, Message> {
     }
 }
 
+/// Hover activation follows deliberate pointer movement only.
+///
+/// An entry counts when the pointer itself crossed into the pane: where the
+/// motion began, according to the window's [`InputTrace`] and placed against
+/// the pane where the pane is now, lay outside it. The trace, not the pane,
+/// remembers that start, because a pane misses motions: over an overlay that
+/// captured them, or while it was scrolled out of the mounted band. Being
+/// uncovered is not an entry - a menu closing over the pane, the pointer
+/// returning from a popup surface, the strip scrolling under a still pointer,
+/// or a pane mounting beneath it all leave the pointer where it was.
+///
+/// An entry must then rest for [`HOVER_ACTIVATION_DWELL`], so sweeping across
+/// the strip activates nothing on the way. A key or button pressed anywhere
+/// before then cancels it, so a pointer that drifts while the reader types or
+/// runs a shortcut leaves their keystrokes going where they were going. The
+/// pointer must still be over the pane when the dwell ends, which a pane the
+/// strip moved away meanwhile is not.
 #[derive(Default)]
 struct CardPointerState {
-    hovered: bool,
+    /// When a crossing into the pane began the dwell it is still serving.
+    entered_at: Option<Instant>,
     selecting: bool,
+}
+
+/// How late past its dwell a rest may still be reported. A pane scrolled out
+/// of view receives no frames, so its dwell ends at the first frame it gets
+/// back, however long after the pointer stopped there that is.
+const HOVER_ACTIVATION_LATENESS: Duration = Duration::from_secs(1);
+
+/// The cursor's position in the pane's coordinates, including while the
+/// strip's own edge keeps it from counting as over the pane.
+fn cursor_point(cursor: mouse::Cursor) -> Option<Point> {
+    match cursor {
+        mouse::Cursor::Available(point) | mouse::Cursor::Levitating(point) => Some(point),
+        mouse::Cursor::Unavailable => None,
+    }
 }
 
 fn clipped_viewport(bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
@@ -768,28 +829,57 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
     ) {
         let pointer = tree.state.downcast_mut::<CardPointerState>();
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                pointer.selecting = true
+            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+                pointer.selecting |= *button == mouse::Button::Left;
+                pointer.entered_at = None;
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 pointer.selecting = false
             }
-            Event::Mouse(mouse::Event::CursorLeft) => {
-                pointer.hovered = false;
-                pointer.selecting = false;
-            }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+            Event::Mouse(mouse::Event::CursorLeft) => *pointer = CardPointerState::default(),
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let clip = clipped_viewport(layout.bounds(), viewport);
                 let hovered = !pointer.selecting
                     && !shell.is_event_captured()
-                    && clipped_viewport(layout.bounds(), viewport)
-                        .is_some_and(|clip| cursor.is_over(clip));
-                if hovered
-                    && !pointer.hovered
-                    && let Some(message) = &self.on_pointer_enter
-                {
-                    shell.publish(message.clone());
+                    && clip.is_some_and(|clip| cursor.is_over(clip));
+                // Where the motion began is replayed through the current
+                // translation, so content scrolled under a still pointer did
+                // not cross anything.
+                let crossed_in = hovered
+                    && self
+                        .input
+                        .previous_position()
+                        .zip(cursor_point(cursor))
+                        .zip(clip)
+                        .is_some_and(|((previous, local), clip)| {
+                            !clip.contains(previous + (local - *position))
+                        });
+                if !hovered {
+                    pointer.entered_at = None;
+                } else if crossed_in && self.on_pointer_rest.is_some() {
+                    let now = Instant::now();
+                    pointer.entered_at = Some(now);
+                    shell.request_redraw_at(now + HOVER_ACTIVATION_DWELL);
                 }
-                pointer.hovered = hovered;
+            }
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                if let Some(entered) = pointer.entered_at {
+                    let due = entered + HOVER_ACTIVATION_DWELL;
+                    if *now < due {
+                        shell.request_redraw_at(due);
+                    } else {
+                        pointer.entered_at = None;
+                        let rested = now.saturating_duration_since(due)
+                            <= HOVER_ACTIVATION_LATENESS
+                            && !self.input.pressed_since(entered)
+                            && clipped_viewport(layout.bounds(), viewport)
+                                .is_some_and(|clip| cursor.is_over(clip));
+                        // Gone when the pane became active in the meantime.
+                        if rested && let Some(message) = &self.on_pointer_rest {
+                            shell.publish(message.clone());
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1710,7 +1800,7 @@ mod tests {
         let row = cosmic::widget::row::with_children(vec![editor.into(), button.into()])
             .height(Length::Fill);
         let mut surface: Element<'_, &str> =
-            CardSurface::new(row).on_pointer_enter(Some("enter")).into();
+            CardSurface::new(row).on_pointer_rest(Some("rest")).into();
         let mut tree = Tree::new(&surface);
         let node = surface
             .as_widget_mut()
@@ -1766,7 +1856,271 @@ mod tests {
                 );
             }
         }
-        assert_eq!(messages, ["enter"]);
+        // Moving about inside the pane never crossed into it.
+        assert!(messages.is_empty());
+    }
+
+    /// Drives one [`CardSurface`] spanning x 100..300 of the window, beneath
+    /// the window's input trace, in the window's own coordinates unless a
+    /// sample says otherwise.
+    struct RestProbe {
+        renderer: Renderer,
+        surface: Element<'static, &'static str>,
+        tree: Tree,
+        node: layout::Node,
+        messages: Vec<&'static str>,
+        input: InputTrace,
+        /// The cursor as the pane last saw it, which frames report too.
+        cursor: mouse::Cursor,
+    }
+
+    impl RestProbe {
+        const OUTSIDE: Point = Point::new(50.0, 40.0);
+        const INSIDE: Point = Point::new(150.0, 40.0);
+        /// Where the pointer is over the next pane along.
+        const NEIGHBOUR: Point = Point::new(350.0, 40.0);
+
+        fn new() -> Self {
+            use cosmic::iced::advanced::renderer::Headless;
+            let renderer = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(Renderer::new(
+                    cosmic::iced::Font::default(),
+                    cosmic::iced::Pixels(14.0),
+                    Some("tiny-skia"),
+                ))
+                .unwrap();
+            let input = InputTrace::default();
+            let mut surface = crate::input_trace::observe(
+                CardSurface::new(
+                    widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .traced_by(&input)
+                .on_pointer_focus("click")
+                .on_pointer_rest(Some("rest")),
+                &input,
+            );
+            let mut tree = Tree::new(&surface);
+            let node = surface
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::new(200.0, 80.0), Size::new(200.0, 80.0)),
+                )
+                .move_to(Point::new(100.0, 0.0));
+            Self {
+                renderer,
+                surface,
+                tree,
+                node,
+                messages: Vec::new(),
+                input,
+                cursor: mouse::Cursor::Unavailable,
+            }
+        }
+
+        fn send(&mut self, event: Event, cursor: mouse::Cursor) {
+            use cosmic::iced::advanced::clipboard;
+            self.surface.as_widget_mut().update(
+                &mut self.tree,
+                &event,
+                Layout::new(&self.node),
+                cursor,
+                &self.renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut self.messages),
+                &Rectangle::new(Point::new(100.0, 0.0), Size::new(200.0, 80.0)),
+            );
+        }
+
+        /// Input the window delivered somewhere other than the pane: to an
+        /// overlay that captured it, or to a widget that captured it before
+        /// the strip, or while the pane was not mounted.
+        fn elsewhere(&self, event: &Event) {
+            self.input.record(event);
+        }
+
+        /// The pointer at `window` in the window, which the pane sees as
+        /// `local` once the strip's scroll translation is applied.
+        fn move_translated(&mut self, window: Point, local: mouse::Cursor) {
+            self.cursor = local;
+            self.send(
+                Event::Mouse(mouse::Event::CursorMoved { position: window }),
+                local,
+            );
+        }
+
+        fn move_to(&mut self, position: Point) {
+            self.move_translated(position, mouse::Cursor::Available(position));
+        }
+
+        /// Delivers the frame `after` now.
+        fn frame(&mut self, after: Duration) {
+            self.frame_with(after, self.cursor);
+        }
+
+        /// Delivers the frame `after` now, with the pane seeing the cursor at
+        /// `cursor` by then.
+        fn frame_with(&mut self, after: Duration, cursor: mouse::Cursor) {
+            self.send(
+                Event::Window(window::Event::RedrawRequested(Instant::now() + after)),
+                cursor,
+            );
+        }
+
+        /// Frames before and after the dwell elapses, and everything the pane
+        /// published since the last look.
+        fn rest(&mut self) -> Vec<&'static str> {
+            self.frame(Duration::ZERO);
+            self.frame(HOVER_ACTIVATION_DWELL * 2);
+            self.frame(HOVER_ACTIVATION_DWELL * 3);
+            mem::take(&mut self.messages)
+        }
+    }
+
+    fn moved(position: Point) -> Event {
+        Event::Mouse(mouse::Event::CursorMoved { position })
+    }
+
+    #[test]
+    fn a_pane_activates_on_hover_only_after_the_pointer_crosses_in_and_rests() {
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.frame(Duration::ZERO);
+        assert!(probe.messages.is_empty(), "activation waits for the dwell");
+        // Moving about inside the pane keeps the dwell it started, and the
+        // rest is reported once however many frames follow.
+        probe.move_to(Point::new(180.0, 60.0));
+        assert_eq!(probe.rest(), ["rest"]);
+
+        // Sweeping through on the way somewhere else activates nothing.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.move_to(RestProbe::NEIGHBOUR);
+        assert!(probe.rest().is_empty());
+    }
+
+    #[test]
+    fn typing_or_clicking_before_the_dwell_keeps_focus_where_it_is() {
+        let key = Event::Keyboard(key_press(
+            "a",
+            keyboard::key::Code::KeyA,
+            keyboard::Modifiers::empty(),
+            false,
+        ));
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.send(key.clone(), mouse::Cursor::Available(RestProbe::INSIDE));
+        // Further drift inside the pane does not re-arm what typing cancelled.
+        probe.move_to(Point::new(160.0, 40.0));
+        assert!(probe.rest().is_empty());
+
+        // A shortcut the workspace captures, or a key a focused input
+        // elsewhere takes, never reaches the pane, and cancels it all the same.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.elsewhere(&key);
+        assert!(probe.rest().is_empty());
+
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.send(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            mouse::Cursor::Available(RestProbe::INSIDE),
+        );
+        // The click activates the pane itself; the dwell adds nothing.
+        assert_eq!(probe.rest(), ["click"]);
+    }
+
+    /// The pane was entered, but by the time the dwell ends it is no longer
+    /// where the pointer rests.
+    #[test]
+    fn a_pane_that_left_the_pointer_during_the_dwell_is_not_activated() {
+        // Keyboard navigation or a new pane moves the strip, and the pointer,
+        // which never moved, now rests over a neighbour.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.frame_with(
+            HOVER_ACTIVATION_DWELL * 2,
+            mouse::Cursor::Available(RestProbe::NEIGHBOUR),
+        );
+        // Nor does it activate once scrolled back under the pointer.
+        assert!(probe.rest().is_empty());
+
+        // The pane scrolled out of view, where it receives no frames, and its
+        // first one back comes long after the pointer stopped over it.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_to(RestProbe::INSIDE);
+        probe.frame(HOVER_ACTIVATION_DWELL + HOVER_ACTIVATION_LATENESS * 2);
+        assert!(probe.rest().is_empty());
+    }
+
+    /// A pane that comes out from under something the pointer was already
+    /// over was not entered: the reader never moved toward it.
+    #[test]
+    fn uncovering_a_pane_under_a_still_pointer_is_not_an_entry() {
+        // A dropdown drawn over the pane leaves it the motions beneath, but
+        // with no cursor, and then closes under the pointer.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.move_translated(RestProbe::INSIDE, mouse::Cursor::Unavailable);
+        assert!(probe.rest().is_empty(), "an overlay covers the pane");
+        probe.move_to(Point::new(151.0, 40.0));
+        assert!(probe.rest().is_empty());
+
+        // A context menu opened from outside the pane captures every motion
+        // over it, and then an item is chosen over the pane.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.elsewhere(&moved(RestProbe::INSIDE));
+        probe.move_to(Point::new(151.0, 40.0));
+        assert!(probe.rest().is_empty());
+
+        // A popup surface outside the window closes, returning the pointer.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.send(
+            Event::Mouse(mouse::Event::CursorLeft),
+            mouse::Cursor::Unavailable,
+        );
+        probe.move_to(RestProbe::INSIDE);
+        assert!(probe.rest().is_empty());
+
+        // The strip scrolls the pane under a pointer that stays put.
+        let mut probe = RestProbe::new();
+        probe.move_translated(
+            RestProbe::INSIDE,
+            mouse::Cursor::Available(RestProbe::NEIGHBOUR),
+        );
+        probe.move_to(Point::new(151.0, 40.0));
+        assert!(probe.rest().is_empty());
+
+        // A pane mounted beneath the pointer has no sample to cross from.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::INSIDE);
+        assert!(probe.rest().is_empty());
+
+        // A pane remounted after a far jump last saw the pointer where it was
+        // before; the pointer has since moved on beneath other panes and
+        // stopped where the pane now comes to lie.
+        let mut probe = RestProbe::new();
+        probe.move_to(RestProbe::OUTSIDE);
+        probe.elsewhere(&moved(Point::new(149.0, 40.0)));
+        probe.elsewhere(&moved(RestProbe::INSIDE));
+        probe.move_to(Point::new(151.0, 40.0));
+        assert!(probe.rest().is_empty());
     }
 
     #[test]
@@ -2402,6 +2756,7 @@ mod tests {
             &shortcuts,
             FocusedPane::Other,
             true,
+            &InputTrace::default(),
             400.0,
             widget::Id::unique(),
             |_| {
@@ -2505,6 +2860,7 @@ mod tests {
                     &shortcuts,
                     FocusedPane::Other,
                     false,
+                    &InputTrace::default(),
                     workspace.viewport_width(),
                     scroll_id.clone(),
                     |_| {
@@ -2784,6 +3140,7 @@ mod tests {
             &shortcuts,
             FocusedPane::Other,
             true,
+            &InputTrace::default(),
             VIEWPORT_WIDTH,
             widget::Id::unique(),
             |context| {
@@ -3163,6 +3520,7 @@ mod tests {
             &shortcuts,
             FocusedPane::Other,
             false,
+            &InputTrace::default(),
             VIEWPORT,
             scroll_id.clone(),
             |_| Element::new(OverlayProbe),

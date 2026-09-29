@@ -8,8 +8,49 @@ use cosmic::{
 use std::borrow::Cow;
 
 pub struct Setting<'a, Message> {
-    search: String,
-    element: Element<'a, Message>,
+    label: &'static str,
+    detail: Cow<'a, str>,
+    control: Element<'a, Message>,
+    error: Option<&'a str>,
+}
+
+impl<'a, Message: Clone + 'a> Setting<'a, Message> {
+    /// Reports why the value last entered was not saved, directly under the
+    /// control that holds it.
+    pub fn error(mut self, error: Option<&'a str>) -> Self {
+        self.error = error;
+        self
+    }
+
+    fn matches(&self, context: &str, query: &str) -> bool {
+        matches(&format!("{context} {} {}", self.label, self.detail), query)
+    }
+
+    fn view(self) -> Element<'a, Message> {
+        let mut children = vec![
+            widget::text::caption_heading(self.label).into(),
+            self.control,
+        ];
+        if let Some(error) = self.error {
+            children.push(
+                design::caption(error)
+                    .class(cosmic::theme::Text::Custom(design::destructive_text))
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        children.push(
+            design::caption(self.detail)
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+        );
+        widget::column::with_children(children)
+            .spacing(design::GRID_UNIT)
+            .width(Length::Fill)
+            .into()
+    }
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -24,20 +65,11 @@ pub fn field<'a, Message: Clone + 'a>(
     detail: impl Into<Cow<'a, str>>,
     control: Element<'a, Message>,
 ) -> Setting<'a, Message> {
-    let detail = detail.into();
     Setting {
-        search: format!("{label} {detail}"),
-        element: widget::column::with_children(vec![
-            widget::text::caption_heading(label).into(),
-            control,
-            design::caption(detail)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(design::GRID_UNIT)
-        .width(Length::Fill)
-        .into(),
+        label,
+        detail: detail.into(),
+        control,
+        error: None,
     }
 }
 
@@ -61,19 +93,12 @@ pub fn group<'a, Message>(
 
 impl<'a, Message: Clone + 'a> Group<'a, Message> {
     pub fn view(self, category: &str, query: &str) -> Option<Element<'a, Message>> {
+        let context = format!("{category} {} {}", self.title, self.detail);
         let mut settings: Vec<_> = self
             .settings
             .into_iter()
-            .filter(|setting| {
-                matches(
-                    &format!(
-                        "{category} {} {} {}",
-                        self.title, self.detail, setting.search
-                    ),
-                    query,
-                )
-            })
-            .map(|setting| setting.element)
+            .filter(|setting| setting.matches(&context, query))
+            .map(Setting::view)
             .collect();
         if settings.is_empty() {
             return None;

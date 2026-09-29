@@ -38,6 +38,7 @@ use crate::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
         SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
     },
+    editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
         LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
     },
@@ -473,6 +474,14 @@ pub enum RepositoryAction {
     DiscardEdits {
         card: CardId,
     },
+    /// Reverts the newest step of the open buffer's edit history.
+    Undo {
+        card: CardId,
+    },
+    /// Re-applies the newest undone step.
+    Redo {
+        card: CardId,
+    },
     BackToFiles {
         card: CardId,
     },
@@ -587,6 +596,8 @@ impl RepositoryAction {
             | Self::Save { card, .. }
             | Self::Reload { card }
             | Self::DiscardEdits { card }
+            | Self::Undo { card }
+            | Self::Redo { card }
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
@@ -677,6 +688,18 @@ struct EditorDocument {
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
+    /// Undo and redo for this buffer. It lives exactly as long as the buffer:
+    /// a document loaded afresh starts a history of its own.
+    history: History,
+}
+
+/// What one editor action did to the buffer's text.
+#[derive(Debug, Clone, PartialEq)]
+enum Applied {
+    Unchanged,
+    /// The text changed; the protocol edit describing it, or `None` where it
+    /// has no protocol range and the server needs the whole document.
+    Changed(Option<LspTextEdit>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -716,6 +739,7 @@ impl EditorDocument {
             conflict: false,
             error: None,
             durability_warning: None,
+            history: History::default(),
         }
     }
 
@@ -726,7 +750,8 @@ impl EditorDocument {
         Self::new(path.clone(), path, text, disk_hash, markdown)
     }
 
-    /// Applies one editor action and brings the derived state with it.
+    /// Applies one editor action and brings the derived state with it,
+    /// answering whether the text changed and how to tell the server.
     ///
     /// Deliberately does *not* serialize the buffer.
     /// [`text_editor::Content::text`] walks every line into a fresh `String`,
@@ -734,22 +759,128 @@ impl EditorDocument {
     /// way copies megabytes per keystroke on the COSMIC update thread.
     /// Dirtiness is decided from the byte length first and Markdown is
     /// re-parsed at a debounce boundary instead.
-    fn apply(&mut self, action: text_editor::Action) {
-        let is_edit = action.is_edit();
-        self.content.perform(action);
-        if is_edit {
-            self.revision = self.revision.wrapping_add(1).max(1);
-            self.dirty = !content_matches(&self.content, &self.saved_text);
-            self.markdown_stale |= self.markdown;
+    fn apply(&mut self, action: text_editor::Action) -> Applied {
+        match action {
+            text_editor::Action::Edit(edit) => {
+                let kind = edit_kind(&edit, self.content.cursor());
+                let trailing_cr = trailing_carriage_return(&self.content).is_some();
+                let Some(recorded) = self.content.perform_edit(edit) else {
+                    return Applied::Unchanged;
+                };
+                // A final bare `\r` is a byte the protocol does not count, and
+                // `protocol_edit` measures against the edited buffer only; while
+                // either side ends in one, the server gets the whole document.
+                let protocol = if trailing_cr || trailing_carriage_return(&self.content).is_some() {
+                    None
+                } else {
+                    protocol_edit(&self.content, &recorded.change)
+                };
+                self.history.record(
+                    recorded.change,
+                    kind,
+                    recorded.before,
+                    self.content.cursor(),
+                    Instant::now(),
+                );
+                self.text_changed();
+                Applied::Changed(protocol)
+            }
+            // Scrolling is only looking; everything else moves the caret or
+            // the selection, and typing resumed from there is a new step.
+            text_editor::Action::Scroll { .. } => {
+                self.content.perform(action);
+                Applied::Unchanged
+            }
+            action => {
+                self.history.seal();
+                self.content.perform(action);
+                Applied::Unchanged
+            }
         }
     }
 
-    fn discard_edits(&mut self) {
-        // `Content::with_text` starts the viewport at the top of the file.
-        // This card maintains per-file anchors precisely so the user does not
-        // lose their place, and abandoning an edit is no reason to lose it.
+    /// Brings the derived state up to date after the text changed.
+    fn text_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.dirty = !content_matches(&self.content, &self.saved_text);
+        self.markdown_stale |= self.markdown;
+    }
+
+    /// Steps through the edit history, reporting what changed for the
+    /// language server, or `None` when there was nothing to step to.
+    ///
+    /// Each entry describes one replacement in the order it was applied; an
+    /// entry is `None` where the replacement had no protocol range.
+    fn step_history(&mut self, redo: bool) -> Option<Vec<Option<LspTextEdit>>> {
+        let mut buffer = ProtocolTracked {
+            content: &mut self.content,
+            edits: Vec::new(),
+        };
+        let replay = if redo {
+            self.history.redo(&mut buffer)
+        } else {
+            self.history.undo(&mut buffer)
+        };
+        let edits = buffer.edits;
+        match replay {
+            Replay::Empty => return None,
+            Replay::Applied => {}
+            Replay::Diverged => {
+                tracing::warn!("editor history no longer matched its buffer and was cleared");
+            }
+        }
+        if !edits.is_empty() {
+            self.text_changed();
+        }
+        Some(edits)
+    }
+
+    /// Returns the buffer to the text last read from or written to disk, as
+    /// one step the user can undo.
+    ///
+    /// Reported like [`EditorDocument::step_history`]. A buffer whose lines
+    /// cannot be addressed the way the history needs is rebuilt instead,
+    /// which cannot be undone and forgets the history.
+    fn discard_edits(&mut self) -> Vec<Option<LspTextEdit>> {
+        // The reader keeps their place: the caret and the viewport stay where
+        // they were rather than following the replaced text.
         let scroll = self.content.scroll_position();
-        self.content = text_editor::Content::with_text(&self.saved_text);
+        let cursor = self.content.cursor();
+        let change = self.content.replacement_to_text(&self.saved_text);
+        let mut edits = Vec::new();
+        if let Some(change) = change {
+            let mut buffer = ProtocolTracked {
+                content: &mut self.content,
+                edits: Vec::new(),
+            };
+            // Verified afterwards as well as before: the change was measured
+            // on the text re-split into lines, and a buffer whose own lines
+            // disagree with that split is rebuilt rather than trusted.
+            let replaced = buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            );
+            let replayed = buffer.edits;
+            if replaced && content_matches(&self.content, &self.saved_text) {
+                edits = replayed;
+                self.content.set_cursor(cursor);
+                self.history.record_group(
+                    vec![change],
+                    cursor,
+                    self.content.cursor(),
+                    Instant::now(),
+                );
+            } else {
+                tracing::warn!(
+                    "discarded edits by rebuilding the editor buffer; they cannot be undone"
+                );
+                self.content = text_editor::Content::with_text(&self.saved_text);
+                self.history.clear();
+                edits.push(None);
+            }
+        }
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.markdown_stale |= self.markdown;
@@ -757,6 +888,7 @@ impl EditorDocument {
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
         self.error = None;
+        edits
     }
 
     /// Advances the version the language server will be told about, or reports
@@ -781,9 +913,42 @@ impl EditorDocument {
     /// other way to express.
     fn replace_text(&mut self, text: &str) {
         self.content = text_editor::Content::with_text(text);
+        // The positions the history recorded address the buffer that was
+        // just thrown away.
+        self.history.clear();
         self.markdown_stale |= self.markdown;
         self.dirty = text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
+    }
+
+    /// Applies replacements given as byte spans of `text`, the buffer's
+    /// current text, in place and in the order given, returning the changes
+    /// the history needs to undo them.
+    ///
+    /// Each span must still address the buffer when its turn comes, which
+    /// holds for spans applied highest-first. A span the buffer cannot
+    /// address — one splitting a line break — stops the splice and answers
+    /// `None`; the caller then replaces the text wholesale, which is what
+    /// the partly spliced buffer needs anyway.
+    fn splice<'t>(
+        &mut self,
+        text: &str,
+        spans: impl Iterator<Item = (Range<usize>, &'t str)>,
+    ) -> Option<Vec<TextChange>> {
+        let mut changes = Vec::new();
+        for (span, inserted) in spans {
+            let removed = text.get(span.clone())?;
+            if removed == inserted {
+                continue;
+            }
+            let start = caret_for_offset(&self.content, span.start);
+            let end = self.content.range_end(start, removed)?;
+            if let Some(change) = self.content.replace_range_recorded(start, end, inserted) {
+                changes.push(change);
+            }
+        }
+        self.text_changed();
+        Some(changes)
     }
 
     /// Re-parses Markdown when an edit has invalidated the preview's items.
@@ -797,6 +962,71 @@ impl EditorDocument {
             return;
         }
         self.markdown_items = markdown::parse(&self.content.text()).collect();
+    }
+}
+
+/// How an edit may coalesce with the undo step before it, judged from the
+/// caret it was made at.
+fn edit_kind(edit: &text_editor::Edit, before: text_editor::Cursor) -> EditKind {
+    // Any selection counts, even one reported as anchored where the caret
+    // is: a double-clicked word selects its span from a single point.
+    let selected = before.selection.is_some();
+    match edit {
+        text_editor::Edit::Insert(_) | text_editor::Edit::Enter => EditKind::Insert,
+        text_editor::Edit::Backspace if !selected => EditKind::DeleteBackward,
+        text_editor::Edit::Delete if !selected => EditKind::DeleteForward,
+        text_editor::Edit::Backspace
+        | text_editor::Edit::Delete
+        | text_editor::Edit::Paste(_)
+        | text_editor::Edit::Indent
+        | text_editor::Edit::Unindent => EditKind::Other,
+    }
+}
+
+/// The editor buffer as the history replays into it, recording each
+/// replacement as the protocol edit that describes it.
+struct ProtocolTracked<'a> {
+    content: &'a mut text_editor::Content<cosmic::Renderer>,
+    edits: Vec<Option<LspTextEdit>>,
+}
+
+impl EditBuffer for ProtocolTracked<'_> {
+    fn replace(
+        &mut self,
+        start: text_editor::Position,
+        expected: &str,
+        replacement: &str,
+        replacement_breaks: &[usize],
+    ) -> bool {
+        let Some(end) = self.content.range_end(start, expected) else {
+            return false;
+        };
+        // Measured before the replacement lands, like every other edit the
+        // server is told about.
+        let range = caret_position(self.content, start)
+            .zip(caret_position(self.content, end))
+            .map(|(start, end)| LspRange::new(start, end));
+        let trailing_cr = trailing_carriage_return(self.content).is_some();
+        self.content
+            .replace_range_with_breaks(start, end, replacement, replacement_breaks);
+        // A final bare carriage return has no protocol column. Replaying
+        // its removal would otherwise report an empty range and leave the
+        // server holding a byte that the editor has removed.
+        self.edits.push(
+            if trailing_cr || trailing_carriage_return(self.content).is_some() {
+                None
+            } else {
+                range.map(|range| LspTextEdit {
+                    range,
+                    new_text: replacement.to_owned(),
+                })
+            },
+        );
+        true
+    }
+
+    fn set_cursor(&mut self, cursor: text_editor::Cursor) {
+        self.content.set_cursor(cursor);
     }
 }
 
@@ -1146,92 +1376,34 @@ fn caret_for_position(
     found
 }
 
-/// The protocol position one scalar before `at`, or `None` at the start of
-/// the buffer.
-fn position_before(
-    content: &text_editor::Content<cosmic::Renderer>,
-    at: LspPosition,
-) -> Option<LspPosition> {
-    if at.character > 0 {
-        return Some(LspPosition::new(at.line, at.character - 1));
-    }
-    let previous = at.line.checked_sub(1)?;
-    // Clamps to the end of that line, which is where the caret lands when a
-    // backspace joins two lines.
-    let caret = caret_for_position(content, LspPosition::new(previous, u32::MAX))?;
-    caret_position(content, caret)
-}
-
-/// The protocol position one scalar after `at`, or `None` at the end of the
-/// buffer.
-fn position_after(
-    content: &text_editor::Content<cosmic::Renderer>,
-    at: LspPosition,
-) -> Option<LspPosition> {
-    let caret = caret_for_position(content, LspPosition::new(at.line, at.character + 1))?;
-    let resolved = caret_position(content, caret)?;
-    if resolved != at {
-        return Some(resolved);
-    }
-    // `at` is the end of its line, so the next scalar is the line break.
-    let following = LspPosition::new(at.line.checked_add(1)?, 0);
-    caret_for_position(content, following)?;
-    Some(following)
-}
-
-/// The protocol edit an editor action is about to perform, measured against
-/// the buffer as it stands *now*.
+/// The protocol edit that describes a change the buffer has just made.
 ///
-/// `None` where the transition cannot be described as one range — the caller
-/// then falls back to the full document, which [`LspIntent::Change`] carries
-/// regardless, so an undescribed edit costs a resynchronisation rather than
-/// a wrong one.
-fn describe_edit(
+/// Built from the measured change rather than guessed from the keystroke: a
+/// double-clicked word reports its selection as a single point, so a guess
+/// would tell the server one character went where a whole word did. The
+/// start is read off the edited buffer, where nothing before it moved; the
+/// end is the start advanced over the removed text in protocol terms, where
+/// lines break on `\n` alone.
+///
+/// `None` where the start has no protocol position; the caller then falls
+/// back to the full document.
+fn protocol_edit(
     content: &text_editor::Content<cosmic::Renderer>,
-    edit: &text_editor::Edit,
+    change: &TextChange,
 ) -> Option<LspTextEdit> {
-    let cursor = content.cursor();
-    let caret = caret_position(content, cursor.position)?;
-    let anchor = match cursor.selection {
-        Some(anchor) => Some(caret_position(content, anchor)?),
-        None => None,
-    };
-    let (start, end) = match anchor {
-        Some(anchor) if (anchor.line, anchor.character) < (caret.line, caret.character) => {
-            (anchor, caret)
+    let start = caret_position(content, change.start)?;
+    let mut end = start;
+    for character in change.removed.chars() {
+        if character == '\n' {
+            end = LspPosition::new(end.line.checked_add(1)?, 0);
+        } else {
+            end = LspPosition::new(end.line, end.character.checked_add(1)?);
         }
-        Some(anchor) => (caret, anchor),
-        None => (caret, caret),
-    };
-    let selected = start != end;
-    let (range, new_text) = match edit {
-        text_editor::Edit::Insert(character) => (LspRange::new(start, end), character.to_string()),
-        text_editor::Edit::Paste(text) => (LspRange::new(start, end), text.as_ref().clone()),
-        text_editor::Edit::Enter => (
-            LspRange::new(start, end),
-            content
-                .line_ending()
-                .unwrap_or_default()
-                .as_str()
-                .to_owned(),
-        ),
-        text_editor::Edit::Backspace if !selected => (
-            LspRange::new(position_before(content, start)?, end),
-            String::new(),
-        ),
-        text_editor::Edit::Delete if !selected => (
-            LspRange::new(start, position_after(content, end)?),
-            String::new(),
-        ),
-        text_editor::Edit::Backspace | text_editor::Edit::Delete => {
-            (LspRange::new(start, end), String::new())
-        }
-        // Indentation rewrites every line the selection touches, with a
-        // width this runtime does not know. Reporting it as one range would
-        // be a lie; a full resynchronisation is not.
-        text_editor::Edit::Indent | text_editor::Edit::Unindent => return None,
-    };
-    Some(LspTextEdit { range, new_text })
+    }
+    Some(LspTextEdit {
+        range: LspRange::new(start, end),
+        new_text: change.inserted.clone(),
+    })
 }
 
 /// Byte range one completion edit replaces, or `None` when it cannot be
@@ -2481,12 +2653,9 @@ impl RepositoryRuntime {
         let Some(position) = caret_for_position(&document.content, at) else {
             return false;
         };
-        // `move_to` leaves an existing selection installed, which would turn a
-        // jump into a selection stretching from wherever the user last was.
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
-        document.content.move_to(text_editor::Cursor {
+        // Typing after a jump is a new undo step, like typing after a click.
+        document.history.seal();
+        document.content.set_cursor(text_editor::Cursor {
             position,
             selection: None,
         });
@@ -2504,6 +2673,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return None;
         };
+        document.history.seal();
         let query = query.trim();
         if query.is_empty() {
             document
@@ -2763,7 +2933,7 @@ impl RepositoryRuntime {
             return false;
         }
 
-        let mut updated = text;
+        let mut updated = text.clone();
         for (span, new_text, _) in edits.iter().rev() {
             updated.replace_range(span.clone(), new_text);
         }
@@ -2784,17 +2954,34 @@ impl RepositoryRuntime {
         // completion as the single document transition the user performed, not
         // as one transition per edit it happened to decompose into.
         let version = document.bump_lsp_version();
-        document.replace_text(&updated);
-        // Resolved against the rebuilt buffer, so the caret lands where the
+        let before = document.content.cursor();
+        let changes = document.splice(
+            &text,
+            edits
+                .iter()
+                .rev()
+                .map(|(span, new_text, _)| (span.clone(), *new_text)),
+        );
+        if changes.is_none() {
+            document.replace_text(&updated);
+        }
+        debug_assert_eq!(document.content.text(), updated);
+        // Resolved against the edited buffer, so the caret lands where the
         // editor now believes that offset to be.
         let position = caret_for_offset(&document.content, caret);
-        document
-            .content
-            .perform(text_editor::Action::ClearSelection);
-        document.content.move_to(text_editor::Cursor {
+        document.content.set_cursor(text_editor::Cursor {
             position,
             selection: None,
         });
+        if let Some(changes) = changes {
+            // One step, like the one choice the user made.
+            document.history.record_group(
+                changes,
+                before,
+                document.content.cursor(),
+                Instant::now(),
+            );
+        }
         if let Some(version) = version {
             // Recorded highest-range-first, the order they were applied in:
             // each range then still addresses the document the one before it
@@ -3109,6 +3296,33 @@ impl RepositoryRuntime {
                 self.lsp_edits.clear();
                 self.lsp_edits_exact = false;
             }
+        }
+    }
+
+    /// Undoes or redoes one step in the open buffer.
+    fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
+        // The same gates as typing: a history step is an edit, and find
+        // holds the buffer read-only while it is open.
+        if self.search_mode || self.source_surface != SourceSurface::Editor {
+            return Task::none();
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        let Some(edits) = document.step_history(redo) else {
+            return Task::none();
+        };
+        self.push_lsp_edits(edits);
+        // Undo from the context menu leaves the keyboard on the menu; the
+        // restored caret is only visible in a focused buffer.
+        Task::batch([self.markdown_task(card), self.focus_editor(card)])
+    }
+
+    /// Reports a run of replacements, in the order they were applied, and
+    /// nothing at all for an empty run.
+    fn push_lsp_edits(&mut self, edits: Vec<Option<LspTextEdit>>) {
+        for edit in edits {
+            self.push_lsp_change(edit);
         }
     }
 
@@ -3673,10 +3887,10 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             unreachable!("discard eligibility requires an editable document");
         };
-        document.discard_edits();
         // Reached from the application's dirty-close dialog, which throws the
         // buffer away without the editor ever seeing an action for it.
-        self.push_lsp_change(None);
+        let edits = document.discard_edits();
+        self.push_lsp_edits(edits);
         true
     }
 
@@ -4251,26 +4465,21 @@ impl RepositoryRuntime {
                 if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
-                let is_edit = action.is_edit();
-                // Measured before the action lands: an edit names the range
-                // it is about to replace, in the document the server holds.
-                let edit = match (&action, &self.document) {
-                    (text_editor::Action::Edit(edit), DocumentState::Editable(document)) => {
-                        describe_edit(&document.content, edit)
-                    }
-                    _ => None,
+                let applied = match &mut self.document {
+                    DocumentState::Editable(document) => document.apply(action),
+                    _ => Applied::Unchanged,
                 };
-                if let DocumentState::Editable(document) = &mut self.document {
-                    document.apply(action);
+                // A caret movement is not a document change, and neither is
+                // an edit that found nothing to change. Bumping the version
+                // for one would leave every request the user makes next
+                // quoting a version the server has never been sent.
+                match applied {
+                    Applied::Changed(edit) => {
+                        self.push_lsp_change(edit);
+                        self.markdown_task(card)
+                    }
+                    Applied::Unchanged => Task::none(),
                 }
-                // A caret movement is not a document change. Bumping the
-                // version for one would leave every request the user makes
-                // next quoting a version the server has never been sent.
-                if is_edit {
-                    self.push_lsp_change(edit);
-                    return self.markdown_task(card);
-                }
-                Task::none()
             }
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::AutoSaveDue {
@@ -4410,16 +4619,24 @@ impl RepositoryRuntime {
                 if !self.can_discard_edits() {
                     return Task::none();
                 }
-                if let DocumentState::Editable(document) = &mut self.document {
-                    document.discard_edits();
-                    // `discard_edits` rebuilds the buffer without going
-                    // through an editor action, so nothing else here would
-                    // notice that the server's copy just became wrong, and
-                    // no range describes a wholesale replacement.
-                    self.push_lsp_change(None);
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                // `discard_edits` changes the buffer without going through
+                // an editor action, so nothing else here would notice that
+                // the server's copy just became wrong.
+                let edits = document.discard_edits();
+                self.push_lsp_edits(edits);
+                // Find keeps the keyboard while it is open.
+                if self.search_mode {
+                    return self.markdown_task(card);
                 }
-                self.markdown_task(card)
+                // The toolbar button took the keyboard; give it back so the
+                // Ctrl+Z its tooltip promises reaches the buffer.
+                Task::batch([self.markdown_task(card), self.focus_editor(card)])
             }
+            RepositoryAction::Undo { card } => self.step_history(card, false),
+            RepositoryAction::Redo { card } => self.step_history(card, true),
             RepositoryAction::BackToFiles { card } => {
                 if self.descriptor.selected_file.is_some() || self.blocks_navigation() {
                     return Task::none();
@@ -6035,21 +6252,92 @@ fn branch_comparison_icon() -> widget::icon::Handle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalEditorCommand<'a>(CardId, &'a str);
 
+/// An entry in the editor's context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EditorClipboardCommand {
-    card: CardId,
-    op: ClipboardOp,
+enum EditorMenuCommand {
+    Undo(CardId),
+    Redo(CardId),
+    Clipboard(CardId, ClipboardOp),
 }
 
-impl widget::menu::Action for EditorClipboardCommand {
+impl widget::menu::Action for EditorMenuCommand {
     type Message = RepositoryAction;
 
     fn message(&self) -> RepositoryAction {
-        RepositoryAction::Clipboard {
-            card: self.card,
-            op: self.op,
+        match *self {
+            Self::Undo(card) => RepositoryAction::Undo { card },
+            Self::Redo(card) => RepositoryAction::Redo { card },
+            Self::Clipboard(card, op) => RepositoryAction::Clipboard { card, op },
         }
     }
+}
+
+/// The editor's context menu: history, then the clipboard, each entry
+/// showing the chord that does the same thing.
+fn editor_context_menu(
+    card: CardId,
+    document: &EditorDocument,
+) -> Vec<widget::menu::Tree<RepositoryAction>> {
+    use widget::menu::{Item, KeyBind, key_bind::Modifier};
+    let chord = |modifiers: &[Modifier], key: &str| KeyBind {
+        modifiers: modifiers.to_vec(),
+        key: iced::keyboard::Key::Character(key.into()),
+    };
+    let ctrl = [Modifier::Ctrl];
+    let entries = [
+        (
+            "Undo",
+            EditorMenuCommand::Undo(card),
+            chord(&ctrl, "z"),
+            document.history.can_undo(),
+        ),
+        (
+            "Redo",
+            EditorMenuCommand::Redo(card),
+            chord(&[Modifier::Ctrl, Modifier::Shift], "z"),
+            document.history.can_redo(),
+        ),
+        (
+            "Cut",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Cut),
+            chord(&ctrl, "x"),
+            true,
+        ),
+        (
+            "Copy",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Copy),
+            chord(&ctrl, "c"),
+            true,
+        ),
+        (
+            "Paste",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::Paste),
+            chord(&ctrl, "v"),
+            true,
+        ),
+        (
+            "Select all",
+            EditorMenuCommand::Clipboard(card, ClipboardOp::SelectAll),
+            chord(&ctrl, "a"),
+            true,
+        ),
+    ];
+    let key_binds = entries
+        .iter()
+        .map(|(_, command, chord, _)| (chord.clone(), *command))
+        .collect::<HashMap<_, _>>();
+    let mut items = Vec::with_capacity(entries.len() + 1);
+    for (index, (label, command, _, enabled)) in entries.into_iter().enumerate() {
+        if index == 2 {
+            items.push(Item::Divider);
+        }
+        items.push(if enabled {
+            Item::Button(label, None, command)
+        } else {
+            Item::ButtonDisabled(label, None, command)
+        });
+    }
+    widget::menu::items(&key_binds, items)
 }
 
 impl widget::menu::Action for ExternalEditorCommand<'_> {
@@ -6215,8 +6503,8 @@ pub fn selected_file_toolbar_with<'a>(
     if editable {
         document_actions.push(
             icon_control(
-                crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-                "Discard unsaved changes",
+                crate::ui_controls::symbolic_icon("document-revert-symbolic"),
+                "Discard unsaved edits (Ctrl+Z restores them)",
                 false,
                 runtime.can_discard_edits(),
                 Some(RepositoryAction::DiscardEdits { card }),
@@ -6911,24 +7199,22 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(text_editor::default_bindings);
+            .key_binding(move |press| match text_editor::history_command(&press) {
+                Some(text_editor::HistoryCommand::Undo) => {
+                    Some(text_editor::Binding::Custom(RepositoryAction::Undo {
+                        card,
+                    }))
+                }
+                Some(text_editor::HistoryCommand::Redo) => {
+                    Some(text_editor::Binding::Custom(RepositoryAction::Redo {
+                        card,
+                    }))
+                }
+                None => text_editor::default_bindings(press),
+            });
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
-        let entries = [
-            ("Cut", ClipboardOp::Cut),
-            ("Copy", ClipboardOp::Copy),
-            ("Paste", ClipboardOp::Paste),
-            ("Select all", ClipboardOp::SelectAll),
-        ]
-        .into_iter()
-        .map(|(label, op)| {
-            widget::menu::Item::Button(label.to_owned(), None, EditorClipboardCommand { card, op })
-        })
-        .collect();
-        crate::interaction::context_menu(
-            editor,
-            widget::menu::items(&std::collections::HashMap::new(), entries),
-        )
+        crate::interaction::context_menu(editor, editor_context_menu(card, document))
     };
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
@@ -11812,6 +12098,13 @@ mod tests {
             .expect("test expects an editable buffer")
     }
 
+    fn document_revision(runtime: &RepositoryRuntime) -> u64 {
+        match &runtime.document {
+            DocumentState::Editable(document) => document.revision,
+            _ => panic!("test expects an editable buffer"),
+        }
+    }
+
     fn lsp_version(runtime: &RepositoryRuntime) -> i32 {
         match &runtime.document {
             DocumentState::Editable(document) => document.lsp_version,
@@ -13023,6 +13316,151 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn a_completion_is_one_undo_step_that_restores_the_caret() {
+        let card = CardId::new();
+        let original = "use std::fmt;\n\nfn main() {\n    prin\n}\n";
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, original);
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::Down),
+        }));
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(3, 4), LspPosition::new(3, 8)),
+                "println!()",
+            ),
+            vec![completion_edit(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                "use std::io;\n",
+            )],
+        );
+        let caret = runtime.cursor_position();
+        assert!(runtime.apply_completion(&item));
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            original,
+            "both edits come back as one"
+        );
+        assert_eq!(runtime.cursor_position(), caret);
+        assert!(!runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "use std::fmt;\nuse std::io;\n\nfn main() {\n    println!()\n}\n"
+        );
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(4, 14)));
+    }
+
+    #[test]
+    fn undo_and_redo_step_through_typing_and_report_exact_edits() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        for character in ['a', 'b'] {
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+            }));
+        }
+        drop(runtime.take_lsp_intents());
+        drop(runtime.take_lsp_edits());
+        let revision = document_revision(&runtime);
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "fn main() {}\n");
+        assert!(
+            !runtime.is_dirty(),
+            "undoing to the saved text is not a modification"
+        );
+        assert_ne!(
+            document_revision(&runtime),
+            revision,
+            "autosave must see the change"
+        );
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 0)));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 4,
+                text: "fn main() {}\n".into(),
+            }]
+        );
+        assert_eq!(
+            runtime.take_lsp_edits(),
+            vec![LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 2)),
+                new_text: String::new(),
+            }]
+        );
+
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(buffer_text(&runtime), "abfn main() {}\n");
+        assert!(runtime.is_dirty());
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 2)));
+
+        // Nothing left to redo, and undo with nothing to undo, are no-ops the
+        // server never hears about.
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.take_lsp_intents(), Vec::new());
+    }
+
+    #[test]
+    fn discarding_unsaved_edits_can_itself_be_undone() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "one\ntwo\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("zero\n".into()))),
+        }));
+        assert!(runtime.is_dirty());
+
+        drop(runtime.update(RepositoryAction::DiscardEdits { card }));
+        assert_eq!(buffer_text(&runtime), "one\ntwo\n");
+        assert!(!runtime.is_dirty());
+
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "zero\none\ntwo\n",
+            "a discard is a step like any other, so the edits it dropped come back"
+        );
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "one\ntwo\n");
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(
+            buffer_text(&runtime),
+            "one\ntwo\n",
+            "redo replays the discard too"
+        );
+    }
+
+    #[test]
+    fn undo_waits_while_find_holds_the_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        }));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "zalpha\n");
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), "alpha\n");
     }
 
     #[test]
@@ -14574,6 +15012,62 @@ mod tests {
         document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('H')));
         assert_eq!(document.content.text().len(), text.len());
         assert!(document.dirty);
+    }
+
+    #[test]
+    fn an_edit_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        // The protocol does not count a buffer's final bare `\r`, so removing
+        // it has no protocol range measured on the edited buffer alone.
+        let text = "a\r";
+        let mut document = EditorDocument::unlinked(
+            PathBuf::from("mac.txt"),
+            text.into(),
+            blake3::hash(text.as_bytes()),
+            false,
+        );
+        document.apply(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        assert_eq!(
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Backspace)),
+            Applied::Changed(None)
+        );
+        assert_eq!(document.content.text(), "a");
+    }
+
+    #[test]
+    fn replay_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\r");
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Backspace),
+        }));
+        drop(runtime.take_lsp_intents());
+        drop(runtime.take_lsp_edits());
+
+        for (action, version, text) in [
+            (RepositoryAction::Undo { card }, 3, "a\r"),
+            (RepositoryAction::Redo { card }, 4, "a"),
+        ] {
+            drop(runtime.update(action));
+            assert_eq!(buffer_text(&runtime), text);
+            assert!(
+                !runtime.lsp_edits_exact,
+                "a trailing CR cannot be addressed by a protocol range"
+            );
+            assert_eq!(
+                runtime.take_lsp_intents(),
+                vec![LspIntent::Change {
+                    version,
+                    text: text.into(),
+                }]
+            );
+            assert!(runtime.take_lsp_edits().is_empty());
+        }
     }
 
     #[test]

@@ -1379,6 +1379,7 @@ pub struct TerminalWidget<Message> {
     scale_factor: f32,
     model_focused: bool,
     on_focus: Option<Message>,
+    on_read_only_submit: Option<Message>,
     on_command_error: Option<Arc<ErrorMapper<Message>>>,
     on_open_link: Option<Box<LinkMapper<Message>>>,
     _message: PhantomData<fn() -> Message>,
@@ -1414,6 +1415,7 @@ impl<Message> TerminalWidget<Message> {
             scale_factor: 1.0,
             model_focused: false,
             on_focus: None,
+            on_read_only_submit: None,
             on_command_error: None,
             on_open_link: None,
             _message: PhantomData,
@@ -1522,6 +1524,13 @@ impl<Message> TerminalWidget<Message> {
 
     pub fn on_focus(mut self, message: Message) -> Self {
         self.on_focus = Some(message);
+        self
+    }
+
+    /// The message a read-only terminal publishes when Enter is pressed in it,
+    /// such as relaunching the process whose final screen it shows.
+    pub fn on_read_only_submit(mut self, message: Option<Message>) -> Self {
+        self.on_read_only_submit = message;
         self
     }
 
@@ -1944,6 +1953,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     return;
                 }
                 if self.read_only {
+                    if !*repeat
+                        && is_plain_enter(key, *modifiers)
+                        && let Some(message) = self.on_read_only_submit.clone()
+                    {
+                        shell.publish(message);
+                    }
                     shell.capture_event();
                     return;
                 }
@@ -3203,6 +3218,13 @@ fn clipboard_chord(
         'v' => Some(ClipboardChord::Paste),
         _ => None,
     }
+}
+
+fn is_plain_enter(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    matches!(
+        key.as_ref(),
+        keyboard::Key::Named(keyboard::key::Named::Enter)
+    ) && !(modifiers.shift() || modifiers.control() || modifiers.alt() || modifiers.logo())
 }
 
 fn is_escape(key: &keyboard::Key) -> bool {
