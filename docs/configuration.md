@@ -75,7 +75,7 @@ terminal_scroll_speed = 1.0
 terminal_padding = 8.0
 terminal_scroll_size = 2
 terminal_cursor_style = "beam"
-terminal_theme = "dark"
+terminal_theme = "auto"
 terminal_font_size = 14.0
 terminal_font_family = ""
 sidebar_width = 260.0
@@ -145,9 +145,13 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `terminal_padding` | float | `8.0` | `0.0` through `24.0` logical pixels |
 | `terminal_scroll_size` | integer | `2` | `1` through `10` lines per mouse-wheel notch. Trackpad scrolling stays proportional |
 | `terminal_cursor_style` | string | `"beam"` | `"application"` uses the cursor shape the program requests. `"block"`, `"beam"`, and `"underline"` override that request |
-| `terminal_theme` | string or table | `"dark"` | One of the 25 terminal presets (see [Terminal themes](#terminal-themes)), independent of `app_theme`. When **Custom** is selected, the file stores the palette here as a `[terminal_theme.custom]` table |
+| `terminal_theme` | string or table | `"auto"` | `"auto"` follows the application's light/dark theme, or choose one of the 25 terminal presets (see [Terminal themes](#terminal-themes)). When **Custom** is selected, the file stores the palette here as a `[terminal_theme.custom]` table |
 | `terminal_font_size` | float | `14.0` | `8.0` through `40.0` logical pixels |
 | `terminal_font_family` | string | `""` | Empty for the system monospace font, or a family name of up to 128 bytes that is not only whitespace. The terminal grid needs one character width. A family whose glyph widths differ falls back to the system monospace font |
+| `editor_font_family` | optional string | absent | Follows the terminal family when absent; otherwise a font family of up to 128 bytes |
+| `editor_font_size` | optional float | absent | Follows the terminal size when absent; otherwise `8.0` through `40.0` logical pixels |
+| `confirm_multiline_paste` | boolean | `true` | Confirm multiline terminal paste when bracketed paste is unavailable |
+| `browser_search_url` | string | `"https://www.google.com/search?q={query}"` | HTTP(S) search URL containing `{query}` |
 | `sidebar_width` | float | `260.0` | `220.0` through `420.0` |
 | `inspector_width` | float | `380.0` | `320.0` through `480.0` |
 | `default_column_fraction` | float | `0.5` | `0.25` through `1.0`. The share of the workspace a new pane takes |
@@ -191,8 +195,9 @@ modifiers, joined by `+`. Names are case-insensitive.
   be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
   with a letter or arrow, can be bound but then no longer reach a terminal;
   the defaults avoid them.
-- The one exception is `search_projects`: while a terminal has focus, its
-  chords go to the terminal, so the default `Ctrl+F` stays forward-char there.
+- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
+  which opens terminal scrollback find. The same key finds in the focused
+  editor or chat transcript, and otherwise searches projects.
   File and hunk navigation also works in local diff panes. Viewed-file commands
   act only in a pull request pane. The chords reach terminals outside that scope.
 - `new_terminal`, `close_focused_column`, `search_projects`,
