@@ -304,7 +304,7 @@ fn settings_category_controls<'a>(
                 ),
                 setting_field(
                     "Pane activation",
-                    "Activate the pane under the pointer without scrolling the workspace or pane contents.",
+                    "Focus a pane, without scrolling, once the pointer moves into it and rests there. Typing before then keeps focus where it is.",
                     crate::settings_widgets::toggle(
                         "Activate panes on hover",
                         draft.focus_follows_mouse,

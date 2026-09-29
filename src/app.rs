@@ -1191,25 +1191,28 @@ fn apply_durable_viewport_update(
     changed
 }
 
-/// Whether [`apply_durable_viewport_update`] would change anything.
+/// Whether `transitions` change any card's durable exposure, which with a
+/// change of focus is all [`apply_durable_viewport_update`] can change.
 ///
 /// Callers hold the workspace behind an `Arc`, and taking a mutable reference
 /// copies it while the writer thread still holds the last snapshot. Camera-only
 /// updates arrive every frame, so they must not reach that copy.
-fn durable_viewport_update_pending(
-    state: &WorkspaceState,
-    focused: Option<CardId>,
-    transitions: &[VisibilityTransition],
-) -> bool {
-    state.focused != focused
-        || transitions.iter().any(|transition| {
-            let exposure = Exposure::from(transition.to);
-            state
-                .cards
-                .iter()
-                .any(|card| card.id == transition.id && card.exposure != exposure)
-        })
+fn exposure_update_pending(state: &WorkspaceState, transitions: &[VisibilityTransition]) -> bool {
+    transitions.iter().any(|transition| {
+        let exposure = Exposure::from(transition.to);
+        state
+            .cards
+            .iter()
+            .any(|card| card.id == transition.id && card.exposure != exposure)
+    })
 }
+
+/// How long a change of focus alone waits to be saved. Focus moves in bursts -
+/// a held navigation key, a pointer resting on one pane after another - and
+/// each save copies the workspace and every chat draft on the UI thread, so a
+/// burst is saved once, at its first move plus this delay. Any other save in
+/// between carries the focus with it.
+const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 fn deferred_terminal_session(
     state: Option<&CardState>,
@@ -1631,7 +1634,7 @@ fn update_workspace_viewport(
             (workspace.native_scroll(sample.offset, sample.width), false)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
-        WorkspaceViewportEvent::PointerEntered(card) => (
+        WorkspaceViewportEvent::PointerRested(card) => (
             workspace
                 .focus_without_scrolling(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged()),
@@ -2498,7 +2501,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::FocusAdjacent(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
-                    | WorkspaceViewportEvent::PointerEntered(_),
+                    | WorkspaceViewportEvent::PointerRested(_),
                 ..
             }
             | Message::ToggleContextInspector
@@ -3322,6 +3325,8 @@ pub enum Message {
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
     LifecycleSweepElapsed(u64),
+    /// The delay on saving a change of focus alone has passed.
+    FocusSaveDue,
     #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
     #[cfg(feature = "integrated-browser")]
@@ -3877,6 +3882,11 @@ pub struct Cagents {
     // the stale delivery be dropped.
     lifecycle_sweep_deadline: Option<Instant>,
     lifecycle_sweep_generation: u64,
+    /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
+    focus_save_pending: bool,
+    /// The main window's latest input, whichever widget or overlay took it;
+    /// hover activation reads it. See [`crate::input_trace`].
+    input_trace: crate::input_trace::InputTrace,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
     hosted_terminals_rx: async_channel::Receiver<Vec<crate::terminal::ipc::TerminalDescriptor>>,
@@ -5772,6 +5782,7 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
+        self.focus_save_pending = false;
         self.snapshot_workspace_scope();
         let saved = self.persistent_workspace();
         if let Some(session) = &self.session {
@@ -6625,14 +6636,15 @@ impl Cagents {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
         let focus_changed = self.durable.focused != focused;
-        let viewport_durable_changed =
-            durable_viewport_update_pending(&self.durable, focused, &update.transitions)
-                && apply_durable_viewport_update(
-                    Arc::make_mut(&mut self.durable),
-                    focused,
-                    &update.transitions,
-                );
-        let durable_changed = additional_durable_change || viewport_durable_changed;
+        let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
+        if focus_changed || exposure_changed {
+            apply_durable_viewport_update(
+                Arc::make_mut(&mut self.durable),
+                focused,
+                &update.transitions,
+            );
+        }
+        let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
         if focus_changed {
@@ -6699,10 +6711,27 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        if durable_changed {
+        if save_now {
             self.persist();
+        } else if focus_changed {
+            // The durable state stays current; only handing it to the writer
+            // waits, and that is the expensive part.
+            self.snapshot_workspace_scope();
+            tasks.push(self.save_focus_soon());
         }
         Task::batch(tasks)
+    }
+
+    /// Saves a change of focus alone within [`FOCUS_SAVE_DELAY`], together
+    /// with whatever else changes by then.
+    fn save_focus_soon(&mut self) -> Task<Message> {
+        if std::mem::replace(&mut self.focus_save_pending, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            tokio::time::sleep(FOCUS_SAVE_DELAY).await;
+            Message::FocusSaveDue
+        })
     }
 
     /// Arms a timer for `deadline`, superseding any timer already pending.
@@ -10345,6 +10374,8 @@ impl Application for Cagents {
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
+            focus_save_pending: false,
+            input_trace: crate::input_trace::InputTrace::default(),
         };
         // One notice per lost card, not a single joined line: the log dedupes
         // by message, so distinct failures stay distinct and a repeated one
@@ -12078,12 +12109,12 @@ impl Application for Cagents {
                 if matches!(
                     event,
                     WorkspaceViewportEvent::PointerFocused(_)
-                        | WorkspaceViewportEvent::PointerEntered(_)
+                        | WorkspaceViewportEvent::PointerRested(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
                 }
-                if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
+                if matches!(event, WorkspaceViewportEvent::PointerRested(_))
                     && !self.settings.focus_follows_mouse
                 {
                     return Task::none();
@@ -12111,6 +12142,12 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::FocusSaveDue => {
+                if self.focus_save_pending {
+                    self.persist();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -13685,6 +13722,7 @@ impl Application for Cagents {
                 &self.settings.keyboard_shortcuts,
                 self.focused_pane(),
                 self.settings.focus_follows_mouse,
+                &self.input_trace,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 move |context| {
@@ -13843,6 +13881,7 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
+        let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
@@ -19474,6 +19513,8 @@ mod tests {
             next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
+            focus_save_pending: false,
+            input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
             terminal_wake_rx,
             hosted_terminals_rx: async_channel::unbounded().1,
@@ -19595,10 +19636,11 @@ mod tests {
     }
 
     #[test]
-    fn pane_attention_tracks_semantic_events_and_hover_acknowledges_only_its_pane() {
+    fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
         app.context_inspector_open = false;
+        app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
         let second = terminal_card_state();
         let third = terminal_card_state();
@@ -19626,10 +19668,12 @@ mod tests {
         let offset = app.workspace.camera().offset();
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerEntered(second_id),
+            event: WorkspaceViewportEvent::PointerRested(second_id),
         });
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert_eq!(app.workspace.camera().offset(), offset);
+        // Only the pane the pointer rested on is read; the ones it crossed to
+        // get there are the widget's to filter out, and never arrive here.
         assert!(!app.sidebar_state.has_card_update(second_id));
         assert!(app.sidebar_state.has_card_update(third_id));
         app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
@@ -19637,11 +19681,52 @@ mod tests {
         app.settings.focus_follows_mouse = false;
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
-            event: WorkspaceViewportEvent::PointerEntered(third_id),
+            event: WorkspaceViewportEvent::PointerRested(third_id),
         });
         assert_eq!(app.workspace.focused(), Some(second_id));
         assert!(app.sidebar_state.has_card_update(third_id));
     }
+
+    /// Moving focus alone is saved once per burst rather than once per move,
+    /// but the durable state carries it at once, so any save that happens
+    /// sooner - or the one on exit - records it.
+    #[test]
+    fn focus_only_changes_are_saved_once_per_burst() {
+        let mut app = context_inspector_test_app(true);
+        app.settings.focus_follows_mouse = true;
+        let second = terminal_card_state();
+        let third = terminal_card_state();
+        let (second_id, third_id) = (second.id, third.id);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([second, third]);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        // Every pane fits, so moving focus exposes nothing new.
+        let update = app.workspace.resize_viewport(3_000.0);
+        let _ = app.apply_viewport(update, false, true);
+        assert!(!app.focus_save_pending);
+
+        for card in [second_id, third_id] {
+            let _ = app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::PointerRested(card),
+            });
+            assert_eq!(app.durable.focused, Some(card));
+            assert!(app.focus_save_pending, "the save waits for the burst");
+        }
+        let _ = app.update(Message::FocusSaveDue);
+        assert!(!app.focus_save_pending);
+
+        // A change that must be saved now takes the pending focus with it.
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second_id),
+        });
+        assert!(app.focus_save_pending);
+        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
+        assert!(!app.focus_save_pending);
+    }
+
     #[test]
     fn an_agent_finishing_its_turn_marks_its_project_for_a_read() {
         use crate::agent::{Activity, ActivityState, Provider};

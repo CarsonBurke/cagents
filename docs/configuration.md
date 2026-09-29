@@ -67,7 +67,7 @@ list applies (see [Language servers](#language-servers)).
 schema_version = 3
 max_hot_cards = 6
 hibernation_delay_ms = 30000
-focus_follows_mouse = true
+focus_follows_mouse = false
 app_theme = "system"
 ui_scale = 1.0
 terminal_line_height = 1.286
@@ -128,7 +128,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of columns kept live; extra background columns can hibernate. Required |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background column hibernates. Required |
-| `focus_follows_mouse` | boolean | `true` | Activates the pane under the pointer without scrolling |
+| `focus_follows_mouse` | boolean | `false` | Activates a pane, without scrolling, once the pointer moves into it and rests there for 300 ms. A key press before then cancels it; a pane uncovered under a still pointer, such as by a closing dropdown, is not activated |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
