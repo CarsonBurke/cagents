@@ -1003,11 +1003,21 @@ impl EditBuffer for ProtocolTracked<'_> {
         let range = caret_position(self.content, start)
             .zip(caret_position(self.content, end))
             .map(|(start, end)| LspRange::new(start, end));
-        self.edits.push(range.map(|range| LspTextEdit {
-            range,
-            new_text: replacement.to_owned(),
-        }));
+        let trailing_cr = trailing_carriage_return(self.content).is_some();
         self.content.replace_range(start, end, replacement);
+        // A final bare carriage return has no protocol column. Replaying
+        // its removal would otherwise report an empty range and leave the
+        // server holding a byte that the editor has removed.
+        self.edits.push(
+            if trailing_cr || trailing_carriage_return(self.content).is_some() {
+                None
+            } else {
+                range.map(|range| LspTextEdit {
+                    range,
+                    new_text: replacement.to_owned(),
+                })
+            },
+        );
         true
     }
 
@@ -14906,6 +14916,43 @@ mod tests {
             Applied::Changed(None)
         );
         assert_eq!(document.content.text(), "a");
+    }
+
+    #[test]
+    fn replay_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\r");
+        drop(runtime.take_lsp_intents());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Backspace),
+        }));
+        drop(runtime.take_lsp_intents());
+        drop(runtime.take_lsp_edits());
+
+        for (action, version, text) in [
+            (RepositoryAction::Undo { card }, 3, "a\r"),
+            (RepositoryAction::Redo { card }, 4, "a"),
+        ] {
+            drop(runtime.update(action));
+            assert_eq!(buffer_text(&runtime), text);
+            assert!(
+                !runtime.lsp_edits_exact,
+                "a trailing CR cannot be addressed by a protocol range"
+            );
+            assert_eq!(
+                runtime.take_lsp_intents(),
+                vec![LspIntent::Change {
+                    version,
+                    text: text.into(),
+                }]
+            );
+            assert!(runtime.take_lsp_edits().is_empty());
+        }
     }
 
     #[test]
