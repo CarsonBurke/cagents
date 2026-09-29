@@ -9199,8 +9199,23 @@ fn search_highlight_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usiz
         );
     } else {
         let mut offset = 0;
-        for expected in query {
-            let Some(position) = folded[offset..].iter().position(|(ch, _)| *ch == expected) else {
+        for (query_index, expected) in query.iter().enumerate() {
+            // Prefer an intact suffix to scattering it through an earlier
+            // word: `fauth` reads as F + auth in "Feature authentication".
+            let suffix = &query[query_index..];
+            if let Some(position) = folded[offset..]
+                .windows(suffix.len())
+                .position(|window| window.iter().map(|(ch, _)| ch).eq(suffix.iter()))
+            {
+                let start = offset + position;
+                ranges.extend(
+                    folded[start..start + suffix.len()]
+                        .iter()
+                        .map(|(_, range)| range.clone()),
+                );
+                break;
+            }
+            let Some(position) = folded[offset..].iter().position(|(ch, _)| ch == expected) else {
                 return Vec::new();
             };
             offset += position;
@@ -13411,23 +13426,19 @@ pub(crate) mod tests {
     #[test]
     fn the_search_input_carries_the_focus_target_the_application_reveals() {
         let mut state = SidebarState::default();
-        assert_eq!(
-            search(&state, false)
-                .as_widget()
-                .id()
-                .map(|id| id.to_string()),
-            Some(search_focus_id().to_string())
+        assert!(
+            Tree::new(&search(&state, false))
+                .find(&search_focus_id())
+                .is_some()
         );
 
         // A query adds the clear action, which must not cost the input the id
         // the application focuses.
         state.apply(&SidebarAction::SearchChanged("cagents".into()));
-        assert_eq!(
-            search(&state, false)
-                .as_widget()
-                .id()
-                .map(|id| id.to_string()),
-            Some(search_focus_id().to_string())
+        assert!(
+            Tree::new(&search(&state, false))
+                .find(&search_focus_id())
+                .is_some()
         );
     }
 

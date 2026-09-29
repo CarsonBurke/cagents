@@ -43,7 +43,11 @@ struct Overlay {
 // A cached/lazy widget can skip child diffing even though the runtime extracted
 // all its named descendants. Reclaim only surviving State::None placeholders;
 // ordinary reconciliation already consumed the states for rebuilt widgets.
-fn restore_cached_named_states(tree: &mut widget::Tree) {
+/// Restores extracted named states in retained cached widget subtrees.
+///
+/// Custom event loops that use `Tree::take_all_named` must call this after
+/// reconciliation and before layout, just as [`UserInterface::build`] does.
+pub fn restore_cached_named_states(tree: &mut widget::Tree) {
     if matches!(tree.state, widget::tree::State::None)
         && let Some(crate::core::id::Id(crate::core::id::Internal::Custom(_, name))) = &tree.id
         && let Some((state, children)) = NAMED.with(|named| named.borrow_mut().remove(name))
