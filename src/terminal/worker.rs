@@ -62,6 +62,13 @@ const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
 /// immediately in every case we can construct; this only bounds the ones we
 /// cannot, because a hung join here wedges the daemon's dispatch thread.
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+/// How long a synchronized update (DEC mode 2026) may withhold output from the
+/// published grid. A program brackets a frame it has to emit in several writes
+/// - clearing the screen, then repainting it - so that no half-drawn frame is
+/// shown; reads split that frame arbitrarily, and publishing between them
+/// flashes an empty screen. Ghostty bounds the hold the same way, so a program
+/// that dies or never ends the update cannot freeze its card.
+const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum Command {
@@ -155,7 +162,8 @@ enum WorkerEvent {
     Pty(Option<PtyMessage>),
     ChildExit(Option<ChildExit>),
     Capture,
-    ObserveForeground,
+    /// Foreground observation or a synchronized update's hold came due.
+    Timer,
 }
 
 #[derive(Debug)]
@@ -828,6 +836,9 @@ struct Worker {
     generation: u64,
     capture_dirty: bool,
     force_capture: bool,
+    /// When a capture was first withheld for the synchronized update still in
+    /// progress. `None` while no update is holding the grid back.
+    synchronized_since: Option<std::time::Instant>,
     /// Size the widget last asked for; the size a resumed or upgraded terminal
     /// is rebuilt with.
     current_size: TerminalSize,
@@ -1156,6 +1167,7 @@ impl Worker {
             generation: 0,
             capture_dirty: false,
             force_capture: false,
+            synchronized_since: None,
             current_size,
             applied_pty_size: current_size,
             applied_parser_size: current_size,
@@ -1209,6 +1221,7 @@ impl Worker {
                         !exited,
                         self.foreground_poll
                             .saturating_sub(self.last_foreground_observation.elapsed()),
+                        self.synchronized_release_after(),
                     )
                 });
             match event {
@@ -1221,7 +1234,9 @@ impl Worker {
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
                 WorkerEvent::Capture => self.capture_if_ready(),
-                WorkerEvent::ObserveForeground => self.observe_foreground(),
+                // Foreground observation runs at the top of the loop once it
+                // is due. An expired synchronized update is released here.
+                WorkerEvent::Timer => self.capture_if_ready(),
                 WorkerEvent::Pty(message) => {
                     pty_open = self.handle_pty_message(message);
                 }
@@ -1249,7 +1264,8 @@ impl Worker {
             self.published
                 .acknowledged_generation
                 .store(self.generation, Ordering::Release);
-            self.capture_if_ready();
+            // Nothing will end a synchronized update the child left open.
+            self.capture_when_ready(false);
         }
         if shutting_down && !exited && !self.carried {
             match self.child_exit_rx.try_recv() {
@@ -1419,6 +1435,7 @@ impl Worker {
                 terminal_id = %self.terminal_id, bytes = bytes.len(),
                 elapsed_ns = started.elapsed().as_nanos() as u64);
         }
+        self.observe_synchronized_output(&bytes);
 
         // Hand the batch over instead of copying up to PTY_BATCH_LIMIT bytes
         // into a channel that drops them under exactly the flood that makes
@@ -1694,7 +1711,12 @@ impl Worker {
                 size.cell_width_px,
                 size.cell_height_px,
             ) {
-                Ok(()) => self.applied_parser_size = size,
+                Ok(()) => {
+                    self.applied_parser_size = size;
+                    // The parser ends an update when it resizes; the next one
+                    // gets its own full hold.
+                    self.synchronized_since = None;
+                }
                 Err(error) => self.error("resize terminal", error.to_string()),
             }
         }
@@ -1707,6 +1729,8 @@ impl Worker {
     fn set_hidden(&mut self) {
         self.visibility = Visibility::Hidden;
         self.published.suppress_wakes();
+        // Nothing is published while away, so there is no update to time.
+        self.synchronized_since = None;
     }
 
     fn reveal(&mut self) {
@@ -1723,6 +1747,9 @@ impl Worker {
             }
         }
         self.visibility = Visibility::Visible;
+        // An update seen before the card went away must not count against one
+        // in progress now: that one gets its own full hold.
+        self.synchronized_since = None;
         // Observe promptly again: whatever ran in the background while this
         // card was away is what the user is now looking at.
         self.foreground_poll = FOREGROUND_POLL_MIN;
@@ -1733,6 +1760,7 @@ impl Worker {
     fn hibernate_visuals(&mut self) {
         self.visibility = Visibility::Hibernated;
         self.published.suppress_wakes();
+        self.synchronized_since = None;
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
         self.published.detach(self.generation);
@@ -1778,6 +1806,15 @@ impl Worker {
     }
 
     fn capture_if_ready(&mut self) {
+        self.capture_when_ready(true);
+    }
+
+    /// Publishes the grid if it changed and the consumer has returned credit.
+    /// With `honor_synchronized_output`, an update in progress keeps the grid
+    /// back whatever asked for it: a reveal or theme change mid-update would
+    /// otherwise show the frame half drawn. A resize is never held, because
+    /// the parser ends the update when it resizes.
+    fn capture_when_ready(&mut self, honor_synchronized_output: bool) {
         if !self.capture_dirty
             || self
                 .published
@@ -1788,6 +1825,9 @@ impl Worker {
             return;
         }
         if self.visibility != Visibility::Visible {
+            return;
+        }
+        if honor_synchronized_output && self.synchronized_output_holds() {
             return;
         }
         let Some(visual) = self.visual.as_mut() else {
@@ -1828,6 +1868,55 @@ impl Worker {
             }
             Err(error) => self.error("build terminal snapshot", error.to_string()),
         }
+    }
+
+    /// Whether the child is inside a synchronized update that may still
+    /// withhold its output, starting the update's hold on first sight.
+    fn synchronized_output_holds(&mut self) -> bool {
+        let active = match self.terminal.mode(Mode::SYNC_OUTPUT) {
+            Ok(active) => active,
+            Err(error) => {
+                self.error("read synchronized output mode", error.to_string());
+                false
+            }
+        };
+        if !active {
+            self.synchronized_since = None;
+            return false;
+        }
+        let since = *self
+            .synchronized_since
+            .get_or_insert_with(std::time::Instant::now);
+        since.elapsed() < SYNCHRONIZED_OUTPUT_TIMEOUT
+    }
+
+    /// Times synchronized updates per read batch, whether or not the batch
+    /// can publish. A capture samples the mode only when credit allows, so an
+    /// update that ends and restarts inside one batch, or across batches while
+    /// the consumer owes credit, would otherwise read as one long update and
+    /// lose its hold to the timeout under sustained output.
+    fn observe_synchronized_output(&mut self, bytes: &[u8]) {
+        const END: &[u8] = b"\x1b[?2026l";
+        let ended = bytes.windows(END.len()).any(|window| window == END);
+        // A read error is reported by the capture that consults the mode.
+        let active = self.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false);
+        if ended || !active {
+            self.synchronized_since = None;
+        }
+        // Nothing is published while away, so only a visible card times one.
+        if active && self.visibility == Visibility::Visible {
+            self.synchronized_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// How long until the update holding back a dirty grid loses its hold.
+    /// `None` once the hold has lapsed: from then on output and returned
+    /// credit publish as usual, and a timer would only spin while the
+    /// consumer still owes credit.
+    fn synchronized_release_after(&self) -> Option<Duration> {
+        let since = self.synchronized_since.filter(|_| self.capture_dirty)?;
+        SYNCHRONIZED_OUTPUT_TIMEOUT.checked_sub(since.elapsed())
     }
 
     fn drain_effects(&mut self) {
@@ -2204,25 +2293,37 @@ fn wait_for_worker_event(
     pty_open: bool,
     child_running: bool,
     observe_after: Duration,
+    release_after: Option<Duration>,
 ) -> WorkerEvent {
+    // Foreground observation only applies while the child runs; a withheld
+    // synchronized update must be released either way. An unbounded wait is
+    // `Duration::MAX`, which the channel treats as no deadline.
+    let timer = |observe: Option<Duration>| {
+        observe
+            .into_iter()
+            .chain(release_after)
+            .min()
+            .unwrap_or(Duration::MAX)
+    };
     match (pty_open, child_running) {
         (true, true) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
-            default(observe_after) => WorkerEvent::ObserveForeground,
+            default(timer(Some(observe_after))) => WorkerEvent::Timer,
         },
         (true, false) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
+            default(timer(None)) => WorkerEvent::Timer,
         },
         (false, true) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
-            default(observe_after) => WorkerEvent::ObserveForeground,
+            default(timer(Some(observe_after))) => WorkerEvent::Timer,
         },
         (false, false) => WorkerEvent::Command(commands.recv().ok()),
     }
@@ -3592,6 +3693,194 @@ mod tests {
         worker.run();
     }
 
+    fn published_row(worker: &Worker, row: usize) -> String {
+        worker.published.snapshot.load().lines[row]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    /// Returns the consumer's credit for whatever is published, as a presented
+    /// frame would.
+    fn present(worker: &Worker) {
+        worker.published.acknowledge(worker.generation);
+    }
+
+    #[test]
+    fn synchronized_update_publishes_only_its_finished_frame() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"old frame".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        let before = worker.generation;
+
+        // A TUI repainting after SIGWINCH clears the screen inside the update.
+        // Reads split the repaint anywhere, so the clear can arrive alone.
+        worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2J".to_vec());
+        assert_eq!(
+            worker.generation, before,
+            "the cleared screen was published"
+        );
+        assert_eq!(published_row(&worker, 0), "old frame");
+        assert!(worker.synchronized_release_after().is_some());
+        worker.process_output(b"new ".to_vec());
+        // Credit returning mid-update cannot publish the half-drawn frame either.
+        worker.capture_if_ready();
+        assert_eq!(worker.generation, before);
+
+        worker.process_output(b"frame\x1b[?2026l".to_vec());
+        assert_eq!(worker.generation, before + 1);
+        assert_eq!(published_row(&worker, 0), "new frame");
+        assert_eq!(worker.synchronized_release_after(), None);
+        worker.run();
+    }
+
+    #[test]
+    fn synchronized_update_left_open_is_released_after_its_timeout() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        let before = worker.generation;
+
+        worker.process_output(b"\x1b[?2026hstuck".to_vec());
+        assert_eq!(worker.generation, before);
+        let release = worker.synchronized_release_after().unwrap();
+        assert!(release <= SYNCHRONIZED_OUTPUT_TIMEOUT);
+
+        worker.synchronized_since = Some(std::time::Instant::now() - SYNCHRONIZED_OUTPUT_TIMEOUT);
+        // A lapsed hold needs no timer, even while the grid is still dirty.
+        assert_eq!(worker.synchronized_release_after(), None);
+        worker.capture_if_ready();
+        assert_eq!(worker.generation, before + 1);
+        assert_eq!(published_row(&worker, 0), "stuck");
+        assert_eq!(worker.synchronized_release_after(), None);
+        worker.run();
+    }
+
+    #[test]
+    fn an_update_restarted_while_credit_is_owed_gets_its_own_hold() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"old".to_vec());
+        let published = worker.generation;
+        assert_eq!(published_row(&worker, 0), "old");
+
+        // The consumer still owes credit for that frame while an update runs
+        // long enough that its own hold would have lapsed.
+        worker.process_output(b"\x1b[?2026hhalf".to_vec());
+        worker.synchronized_since = Some(std::time::Instant::now() - SYNCHRONIZED_OUTPUT_TIMEOUT);
+        // One read ends it and begins the next; no capture sees the gap.
+        worker.process_output(b" done\x1b[?2026l\x1b[?2026hnext".to_vec());
+        present(&worker);
+        worker.capture_if_ready();
+        assert_eq!(
+            worker.generation, published,
+            "the next update's half-drawn frame was published"
+        );
+        assert_eq!(published_row(&worker, 0), "old");
+
+        worker.process_output(b" frame\x1b[?2026l".to_vec());
+        assert_eq!(worker.generation, published + 1);
+        assert_eq!(published_row(&worker, 0), "oldhalf donenext frame");
+        worker.run();
+    }
+
+    #[test]
+    fn a_revealed_card_gives_the_update_in_progress_a_full_hold() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"\x1b[?2026hhalf".to_vec());
+        // An update seen long ago, before the card went away.
+        worker.synchronized_since = Some(std::time::Instant::now() - SYNCHRONIZED_OUTPUT_TIMEOUT);
+        worker.handle_command(Command::Hide);
+        let before = worker.generation;
+
+        worker.handle_command(Command::Reveal);
+        assert_eq!(worker.generation, before, "a half-drawn frame was revealed");
+        worker.process_output(b" done\x1b[?2026l".to_vec());
+        assert_eq!(published_row(&worker, 0), "half done");
+        worker.run();
+    }
+
+    #[test]
+    fn a_resize_shows_its_reflow_at_once_and_holds_the_repaint_it_prompts() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        let before = worker.generation;
+        worker.process_output(b"\x1b[?2026hpending".to_vec());
+        assert_eq!(worker.generation, before);
+
+        // The parser ends an update on resize, as Ghostty does, so the new
+        // size is never held back behind the old one's frame.
+        worker.resize(TerminalSize {
+            columns: 40,
+            rows: 10,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        });
+        assert_eq!(worker.generation, before + 1);
+        assert_eq!(worker.published.snapshot.load().columns, 40);
+        present(&worker);
+
+        // The child answers SIGWINCH by clearing and repainting inside a new
+        // update; only the repainted frame is published.
+        worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2J".to_vec());
+        assert_eq!(worker.generation, before + 1);
+        worker.process_output(b"repainted\x1b[?2026l".to_vec());
+        assert_eq!(worker.generation, before + 2);
+        assert_eq!(published_row(&worker, 0), "repainted");
+        worker.run();
+    }
+
+    #[test]
+    fn exit_publishes_a_final_grid_left_inside_an_update() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.process_output(b"\x1b[?2026hlast words".to_vec());
+        let published = Arc::clone(&worker.published);
+        // Keep the command channel connected so child EOF, not client
+        // teardown, ends the worker loop.
+        let (_commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        worker.run();
+        assert_eq!(
+            published.snapshot.load().lines[0]
+                .cells
+                .iter()
+                .take(10)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "last words"
+        );
+    }
+
+    #[test]
+    fn a_withheld_update_wakes_the_worker_after_the_child_exits() {
+        let (_command_tx, command_rx) = command_channel(1);
+        let (_pty_tx, pty_rx) = crossbeam_channel::bounded::<PtyMessage>(1);
+        let (_child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
+        assert!(matches!(
+            wait_for_worker_event(
+                &command_rx,
+                &pty_rx,
+                &child_exit_rx,
+                &crossbeam_channel::never(),
+                true,
+                false,
+                FOREGROUND_POLL_MAX,
+                Some(Duration::from_millis(1)),
+            ),
+            WorkerEvent::Timer
+        ));
+    }
+
     #[test]
     fn eof_preserves_final_grid_without_outstanding_consumer_credit() {
         let (mut worker, _) = capture_worker();
@@ -4438,6 +4727,7 @@ mod tests {
                 false,
                 true,
                 FOREGROUND_POLL_MIN,
+                None,
             ),
             WorkerEvent::Command(Some(Command::Hide))
         ));
@@ -4454,6 +4744,7 @@ mod tests {
                 false,
                 true,
                 FOREGROUND_POLL_MIN,
+                None,
             ),
             WorkerEvent::ChildExit(Some(Ok(status))) if status.exit_code() == 7
         ));
