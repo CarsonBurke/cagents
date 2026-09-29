@@ -345,6 +345,23 @@ async fn send(proxy: &NotificationProxy<'_>, notice: &Notice) -> Result<(), Stri
     .map_err(|error| format!("Desktop notifications unavailable: {error}"))
 }
 
+async fn send_test(backend: &Portal) -> TestOutcome {
+    let test = Notification::new("cagents notifications work")
+        .body("Agent completion and attention alerts appear here.");
+    match tokio::time::timeout(
+        PORTAL_TIMEOUT,
+        backend
+            .proxy
+            .add_notification("cagents-notification-test", test),
+    )
+    .await
+    {
+        Ok(Ok(())) => TestOutcome::Sent,
+        Ok(Err(error)) => TestOutcome::Unavailable(error.to_string()),
+        Err(_) => TestOutcome::TimedOut,
+    }
+}
+
 async fn remove(proxy: &Portal, id: Uuid) -> Result<(), String> {
     tokio::time::timeout(
         PORTAL_TIMEOUT,
@@ -543,6 +560,26 @@ async fn run(
             break;
         }
         let Ok(journal) = &mut journal else {
+            // Without a journal there is no backlog to deliver, but the
+            // portal may be fine, so a test is still answered by the portal
+            // itself rather than dropped as if the broker had stopped.
+            if !pending.tests.is_empty() {
+                if proxy.is_none() {
+                    match connect(shared.clone(), application).await {
+                        Ok(connected) => proxy = Some(connected),
+                        Err(error) => {
+                            answer_tests(&pending.tests, &TestOutcome::Unavailable(error))
+                        }
+                    }
+                }
+                if let Some(backend) = &proxy {
+                    let outcome = send_test(backend).await;
+                    if outcome != TestOutcome::Sent {
+                        proxy = None;
+                    }
+                    answer_tests(&pending.tests, &outcome);
+                }
+            }
             continue;
         };
         if let Some(current) = current_presence {
@@ -658,14 +695,13 @@ async fn run(
             });
             policy.allows(notice.event.evidence.kind, focused)
         });
-        let backlog = !delivery.is_empty() || !withdrawals.is_empty();
+        let backlog_due =
+            (!delivery.is_empty() || !withdrawals.is_empty()) && Instant::now() >= next_attempt;
         // A test is a person asking right now, so it retries a portal that
         // the backlog is still backing off from. Its failure is answered to
         // that person rather than raised as every window's diagnostic, and
         // leaves the backlog's schedule alone.
-        if proxy.is_none()
-            && ((backlog && Instant::now() >= next_attempt) || !pending.tests.is_empty())
-        {
+        if proxy.is_none() && (backlog_due || !pending.tests.is_empty()) {
             match connect(shared.clone(), application).await {
                 Ok(connected) => {
                     proxy = Some(connected);
@@ -674,7 +710,7 @@ async fn run(
                 }
                 Err(error) => {
                     answer_tests(&pending.tests, &TestOutcome::Unavailable(error.clone()));
-                    if backlog {
+                    if backlog_due {
                         snapshot.diagnostic = Some(error);
                         next_attempt = Instant::now() + retry_delay;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
@@ -686,20 +722,7 @@ async fn run(
             let mut failed = false;
             // Ahead of the backlog, so the answer is not held behind it.
             if !pending.tests.is_empty() {
-                let test = Notification::new("cagents notifications work")
-                    .body("Agent completion and attention alerts appear here.");
-                let outcome = match tokio::time::timeout(
-                    PORTAL_TIMEOUT,
-                    backend
-                        .proxy
-                        .add_notification("cagents-notification-test", test),
-                )
-                .await
-                {
-                    Ok(Ok(())) => TestOutcome::Sent,
-                    Ok(Err(error)) => TestOutcome::Unavailable(error.to_string()),
-                    Err(_) => TestOutcome::TimedOut,
-                };
+                let outcome = send_test(backend).await;
                 failed = outcome != TestOutcome::Sent;
                 answer_tests(&pending.tests, &outcome);
             }
