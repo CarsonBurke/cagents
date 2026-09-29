@@ -12685,6 +12685,11 @@ impl Application for Cagents {
                 if let Some(task) = self.account_key_event(&event) {
                     return task;
                 }
+                if !self.workspace_inputs_blocked()
+                    && let Some(task) = self.chat_find_key(&event)
+                {
+                    return task;
+                }
                 // A widget that consumed Escape has already answered it - a
                 // focused terminal clearing its selection, for one. Running the
                 // chain anyway would close the inspector behind it in the same
@@ -12894,6 +12899,9 @@ impl Application for Cagents {
                 }
             }
             Message::FocusProjectSearch => {
+                if let Some(task) = self.open_chat_find() {
+                    return task;
+                }
                 // `focus` unfocuses every widget whose id does not match, so
                 // aiming it at an id the pane is not rendering would blur
                 // whatever the user was typing into and focus nothing. Only

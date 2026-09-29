@@ -63,6 +63,17 @@ impl Preview {
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
         let (source, language) = match content {
+            ItemContent::Command { output, .. } | ItemContent::Tool { output, .. }
+                if !output.trim().is_empty() =>
+            {
+                (
+                    output
+                        .rsplit('\n')
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or(output),
+                    Language::Plain,
+                )
+            }
             ItemContent::Command { command, label, .. } if label.is_empty() || label == command => {
                 (command.as_str(), Language::Shell)
             }
@@ -203,13 +214,15 @@ impl ToolText {
             });
         let body = crate::interaction::parent_wheel(editor);
         match limit {
-            Some(height) => widget::container(
+            Some(height) => widget::container(scroll::transcript(
                 widget::scrollable(body)
                     .direction(iced::widget::scrollable::Direction::Vertical(
                         design::scrollbar(),
                     ))
+                    .anchor_bottom()
                     .height(Length::Shrink),
-            )
+                None,
+            ))
             .max_height(height)
             .into(),
             None => body,

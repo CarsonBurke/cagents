@@ -3,7 +3,7 @@ use crate::account::{Account, AccountId};
 use crate::agent::{Activity, Provider};
 use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
-use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot, clock_label};
+use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
@@ -17,6 +17,7 @@ mod completion;
 mod prose;
 mod retained;
 mod scroll;
+mod selectable_prose;
 mod step;
 mod tool_text;
 mod turn;
@@ -90,7 +91,6 @@ pub enum CopyPart {
     Text,
     Input,
     Output,
-    Code(usize),
     Change(usize),
 }
 
@@ -167,6 +167,18 @@ pub enum Action {
     SelectSubagent(Target, Option<String>),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
+    OpenDocument(Target, String),
+    CopyLiteral(String),
+    Latest(Target),
+    CancelFollowup(Target),
+    Files(Target, PathBuf, Arc<Vec<String>>),
+    Find(Target, String),
+    FindNext(Target, bool),
+    CloseFind(Target),
+    FindFocused(Target, bool),
+    Tick,
+    ClearCopied(Target, Instant),
+    DropHover(Target, bool),
     Attach(Target),
     Attached(Target, Result<Option<Vec<PathBuf>>, String>),
     /// Files or text dropped on the conversation.
@@ -198,6 +210,7 @@ pub enum Action {
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
+    PermissionPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -232,6 +245,9 @@ impl Action {
                 | Self::RetainedCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
+                | Self::ClearCopied(..)
+                | Self::Files(..)
+                | Self::Tick
                 | Self::AccountPicker(_, false)
         )
     }
@@ -325,6 +341,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
@@ -364,6 +381,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            files: HashMap::new(),
             sender,
             receiver,
             generation: 0,
@@ -592,73 +610,6 @@ impl ChangeToken {
     }
 }
 
-/// Fenced code blocks found in an item's body, scanned one line at a time so a
-/// streamed body is never re-scanned from the top.
-#[derive(Default)]
-struct CodeScan {
-    /// Bytes of the body already scanned; always just past a line ending.
-    scanned: usize,
-    /// The open fence's marker character and run length.
-    fence: Option<(char, usize)>,
-    /// Whether `codes` ends with the block the open fence is still filling.
-    open: bool,
-    /// Each fenced block's body, in the order the blocks appear.
-    codes: Vec<String>,
-}
-
-impl CodeScan {
-    /// Scans the complete lines of `body` that the cursor has not reached.
-    ///
-    /// A partial trailing line is left for the refresh that completes it: a
-    /// fence is only a fence once its line ends, and a provisional scan would
-    /// have to be undone.
-    fn feed(&mut self, body: &str) {
-        while let Some(index) = body[self.scanned..].find('\n') {
-            let line = &body[self.scanned..self.scanned + index];
-            self.scanned += index + 1;
-            self.line(line.strip_suffix('\r').unwrap_or(line));
-        }
-    }
-    fn line(&mut self, line: &str) {
-        let trimmed = line.trim_start();
-        let marker = trimmed.chars().next().unwrap_or(' ');
-        if matches!(marker, '`' | '~') {
-            let length = trimmed
-                .chars()
-                .take_while(|character| *character == marker)
-                .count();
-            if length >= 3 {
-                match self.fence {
-                    None => {
-                        self.fence = Some((marker, length));
-                        return;
-                    }
-                    Some((opening, count)) if opening == marker && length >= count => {
-                        if !self.open {
-                            // An empty block still earns its copy control.
-                            self.codes.push(String::new());
-                        }
-                        self.fence = None;
-                        self.open = false;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if self.fence.is_some() {
-            if !self.open {
-                self.codes.push(String::new());
-                self.open = true;
-            }
-            if let Some(code) = self.codes.last_mut() {
-                code.push_str(line);
-                code.push('\n');
-            }
-        }
-    }
-}
-
 /// An elapsed time at the precision a reader can act on.
 ///
 /// Sub-second work is reported in milliseconds because the difference between
@@ -759,8 +710,31 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         (CopyPart::Change(index), ItemContent::Changes { changes, .. }) => {
             changes.get(index).map(|change| change.diff.clone())
         }
-        (CopyPart::Code(_) | CopyPart::Change(_), _) | (CopyPart::Input | CopyPart::Output, _) => {
-            None
+        (CopyPart::Change(_), _) | (CopyPart::Input | CopyPart::Output, _) => None,
+    }
+}
+
+fn contains_text(content: &ItemContent, query: &str) -> bool {
+    match content {
+        ItemContent::Text { text, .. } => text.contains(query),
+        ItemContent::Command {
+            command, output, ..
+        } => command.contains(query) || output.contains(query),
+        ItemContent::Changes { changes, .. } => {
+            changes.iter().any(|change| change.diff.contains(query))
+        }
+        ItemContent::Tool { input, output, .. } => input.contains(query) || output.contains(query),
+        ItemContent::WebSearch {
+            query: search,
+            results,
+        } => {
+            search.contains(query)
+                || results
+                    .iter()
+                    .any(|result| result.title.contains(query) || result.url.contains(query))
+        }
+        ItemContent::Image { path, description } => {
+            path.contains(query) || description.contains(query)
         }
     }
 }
@@ -771,13 +745,13 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
 /// recorded as a `ChangeToken`, and the authoritative text stays in the
 /// snapshot the runtime already holds.
 struct CachedItem {
+    stamp: Option<(u64, String, String)>,
     preview: tool_text::Preview,
     tool_input: Option<tool_text::ToolText>,
     tool_output: Option<tool_text::ToolText>,
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
     markdown: markdown::Content,
-    code: CodeScan,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
     /// block's language and text: what a frame looks a block up by. The
     /// palette is the runtime's, applied when the block is highlighted, so a
@@ -852,9 +826,9 @@ impl CachedItem {
             patches,
             token: ChangeToken::of(content),
             markdown: markdown::Content::new(),
-            code: CodeScan::default(),
             blocks: HashMap::new(),
             detail: None,
+            stamp: None,
             image: None,
         };
         match content {
@@ -927,7 +901,6 @@ impl CachedItem {
     /// bytes per frame instead of its whole length.
     fn extend(&mut self, body: &str, parsed: usize, theme: crate::settings::EditorSyntaxTheme) {
         self.markdown.push_str(&body[parsed..]);
-        self.code.feed(body);
         self.highlight(theme);
     }
 
@@ -1023,6 +996,7 @@ fn snapshot_channel_name(snapshot: &Snapshot) -> Option<&str> {
 }
 
 struct PendingCommand {
+    followup: bool,
     id: u64,
     draft_revision: Option<u64>,
     request: Option<String>,
@@ -1109,11 +1083,19 @@ enum QueuedStep {
 }
 
 pub(super) struct Runtime {
+    find: Option<String>,
+    find_focused: bool,
+    find_matches: Vec<String>,
+    find_index: usize,
+    copied: Option<(String, Instant)>,
+    drop_hover: bool,
+    files: Option<Arc<Vec<String>>>,
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
+    followup: Option<(String, Vec<Attachment>)>,
     snapshot: Arc<Snapshot>,
     cache: HashMap<String, CachedItem>,
     /// The palette the cache's code blocks are highlighted in.
@@ -1168,6 +1150,7 @@ pub(super) struct Runtime {
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
+    permission_picker: bool,
     /// Whether the account choice is open.
     account_picker: bool,
     /// Messages the provider accepted, oldest first, for Up and Down in the
@@ -1297,7 +1280,14 @@ impl Runtime {
         if self.completion.dismissed == Some((token.line, token.start)) {
             return None;
         }
-        let rows = completion::candidates(&self.snapshot, &token);
+        let rows = if token.sigil == '@' {
+            completion::files(
+                self.files.as_deref().map_or(&[][..], Vec::as_slice),
+                &token.query,
+            )
+        } else {
+            completion::candidates(&self.snapshot, &token)
+        };
         token.fit(&rows);
         (!rows.is_empty()).then_some((token, rows))
     }
@@ -1398,12 +1388,25 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
+        let permission_mode =
+            draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
             target,
             session,
-            snapshot: Arc::new(Snapshot::default()),
+            snapshot: Arc::new(Snapshot {
+                permission_mode,
+                ..Snapshot::default()
+            }),
             connection,
             queued: None,
+            followup: None,
+            files: None,
+            find: None,
+            find_focused: false,
+            find_matches: Vec::new(),
+            find_index: 0,
+            copied: None,
+            drop_hover: false,
             cache: HashMap::new(),
             syntax_theme,
             turns: Vec::new(),
@@ -1428,6 +1431,7 @@ impl Runtime {
             error: None,
             failures: Vec::new(),
             reasoning_picker: false,
+            permission_picker: false,
             account_picker: false,
             history: Vec::new(),
             history_cursor: None,
@@ -1530,10 +1534,32 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let snapshot = handle.snapshot();
+        let mut snapshot = handle.snapshot();
         if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
         {
             return;
+        }
+        if snapshot.permission_mode.is_none() {
+            Arc::make_mut(&mut snapshot).permission_mode =
+                self.snapshot.permission_mode.clone().or_else(|| {
+                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                });
+        }
+        // Restored and paged conversations carry their own prompt history.
+        // Preserve a recalled index while the reader is walking it.
+        if self.history_cursor.is_none() {
+            self.history = snapshot
+                .items
+                .iter()
+                .filter_map(|item| match (&item.role, &item.content) {
+                    (chat::Role::User, ItemContent::Text { text, .. })
+                        if !text.trim().is_empty() =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
         }
         let live_ids: HashSet<&str> = snapshot
             .items
@@ -1591,6 +1617,35 @@ impl Runtime {
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
+        for item in snapshot.items.iter() {
+            if let Some(cached) = self.cache.get_mut(&item.id)
+                && let Some(at) = item.at
+                && cached
+                    .stamp
+                    .as_ref()
+                    .is_none_or(|(cached_at, _, _)| *cached_at != at)
+            {
+                if let Some(time) = chat::local_time(i64::try_from(at / 1000).unwrap_or(i64::MAX)) {
+                    let full = format!(
+                        "{:04}-{:02}-{:02} {}",
+                        time.year + 1900,
+                        time.month + 1,
+                        time.day,
+                        time.clock()
+                    );
+                    let today =
+                        chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
+                    let label = if today.is_some_and(|today| {
+                        today.year == time.year && today.day_of_year == time.day_of_year
+                    }) {
+                        time.clock()
+                    } else {
+                        full.clone()
+                    };
+                    cached.stamp = Some((at, label, full));
+                }
+            }
+        }
         for request in &snapshot.requests {
             for field in &request.fields {
                 self.answers
@@ -1630,6 +1685,42 @@ impl Runtime {
         self.turns = turn::group(&snapshot.items, &self.asked_after);
         reconcile_disclosure(&mut self.opened, &self.turns);
         self.snapshot = snapshot;
+        self.refresh_find();
+    }
+
+    fn refresh_find(&mut self) {
+        let previous = self.find_matches.get(self.find_index).cloned();
+        let query = self.find.as_deref().unwrap_or_default();
+        self.find_matches = self
+            .turns
+            .iter()
+            .filter(|turn| {
+                !query.is_empty()
+                    && turn
+                        .prompt
+                        .iter()
+                        .copied()
+                        .chain(
+                            turn.steps
+                                .iter()
+                                .chain(&turn.prose)
+                                .map(|placed| placed.index),
+                        )
+                        .filter_map(|index| self.snapshot.items.get(index))
+                        .any(|item| contains_text(&item.content, query))
+            })
+            .map(|turn| turn.key.clone())
+            .collect();
+        self.find_index = previous
+            .and_then(|key| {
+                self.find_matches
+                    .iter()
+                    .position(|candidate| candidate == &key)
+            })
+            .unwrap_or_else(|| {
+                self.find_index
+                    .min(self.find_matches.len().saturating_sub(1))
+            });
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
@@ -1641,7 +1732,9 @@ impl Runtime {
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     fn present(&self) -> Result<(), String> {
-        let visible = self.visible.load(Ordering::Relaxed) || self.queued.is_some();
+        let visible = self.visible.load(Ordering::Relaxed)
+            || self.queued.is_some()
+            || self.followup.is_some();
         self.handle()
             .map_or(Ok(()), |handle| handle.set_visible(visible))
     }
@@ -2144,6 +2237,104 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    pub(super) fn chat_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let card = self.workspace.focused()?;
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        if !runtime.find_focused {
+            return None;
+        }
+        let target = runtime.target;
+        let keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modifiers,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        match key {
+            keyboard::key::Named::Enter => Some(self.chat_find_next(target, !modifiers.shift())),
+            keyboard::key::Named::Escape => Some(self.handle_chat_ui(Action::CloseFind(target))),
+            _ => None,
+        }
+    }
+    pub(super) fn open_chat_find(&mut self) -> Option<Task<Message>> {
+        let card = self.workspace.focused()?;
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return None;
+        };
+        runtime.find.get_or_insert_with(String::new);
+        Some(
+            iced::widget::operation::focus(card_control_id(card, "chat-find"))
+                .map(cosmic::Action::App),
+        )
+    }
+
+    fn chat_find_next(&mut self, target: Target, forward: bool) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.find_matches.is_empty() {
+            return Task::none();
+        }
+        runtime.find_index = if forward {
+            (runtime.find_index + 1) % runtime.find_matches.len()
+        } else {
+            (runtime.find_index + runtime.find_matches.len() - 1) % runtime.find_matches.len()
+        };
+        let key = runtime.find_matches[runtime.find_index].clone();
+        if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
+            runtime.opened.insert(key.clone(), true);
+            let query = runtime.find.as_deref().unwrap_or_default();
+            for placed in &turn.steps {
+                if let Some(item) = runtime.snapshot.items.get(placed.index)
+                    && contains_text(&item.content, query)
+                    && runtime.expanded.insert(item.id.clone())
+                {
+                    let previous = runtime.cache.remove(&item.id);
+                    runtime.cache.insert(
+                        item.id.clone(),
+                        CachedItem::updated(&item.content, runtime.syntax_theme, previous, true),
+                    );
+                }
+            }
+        }
+        crate::document_link::scroll_to_heading_anchored(
+            card_control_id(target.card, "chat-transcript"),
+            iced::advanced::widget::Id::new(format!("chat-turn-{}-{key}", target.card)),
+            true,
+        )
+    }
+    fn load_chat_files(&mut self, target: Target, directory: PathBuf) -> Task<Message> {
+        if let Some(files) = self.chat_ui.files.get(&directory).cloned() {
+            return self.handle_chat_ui(Action::Files(target, directory, files));
+        }
+        cosmic::task::future(async move {
+            let working = directory.clone();
+            let files = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("git")
+                    .args(["ls-files", "-z", "--cached"])
+                    .current_dir(working)
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| {
+                        output
+                            .stdout
+                            .split(|byte| *byte == 0)
+                            .filter(|path| !path.is_empty())
+                            .filter_map(|path| String::from_utf8(path.to_vec()).ok())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            Message::ChatUi(Action::Files(target, directory, Arc::new(files)))
+        })
+    }
     /// Points a draft at `model` of `provider`, or at that provider's
     /// default where `model` is `None`.
     ///
@@ -2731,8 +2922,10 @@ impl Cagents {
         };
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
+            || runtime.permission_picker
             || runtime.account_picker;
         runtime.reasoning_picker = false;
+        runtime.permission_picker = false;
         runtime.account_picker = false;
         open
     }
@@ -2937,8 +3130,19 @@ impl Cagents {
     }
 
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
-        Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
-            .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)))
+        let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
+            .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
+        if self.cards.values().any(|card| {
+            matches!(card, CardRuntime::Chat(runtime)
+            if runtime.snapshot.busy && runtime.visible.load(Ordering::Relaxed))
+        }) {
+            Subscription::batch([
+                wakes,
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::ChatUi(Action::Tick)),
+            ])
+        } else {
+            wakes
+        }
     }
     pub(super) fn chat_forget(&mut self, card: CardId) {
         // The runtime is about to be dropped, so its unsent text is captured
@@ -3563,6 +3767,24 @@ impl Cagents {
         if runtime.pending.is_some() || runtime.disconnected {
             return Task::none();
         }
+        let latest = handle.snapshot();
+        if latest.ready && !latest.busy && !latest.exited && runtime.followup.is_some() {
+            let (text, attachments) = runtime.followup.as_ref().unwrap();
+            let command = match submission(text, &latest, attachments, PromptMode::Send) {
+                Ok(command) => command,
+                Err(error) => {
+                    runtime.error = Some(error.into());
+                    return Task::none();
+                }
+            };
+            let task = self.chat_send(target, command, false);
+            if let Some(runtime) = self.chat_runtime_mut(target)
+                && let Some(pending) = &mut runtime.pending
+            {
+                pending.followup = true;
+            }
+            return task;
+        }
         let provider = runtime.session.launch.provider;
         let Some(queued) = runtime.queued.as_mut() else {
             return Task::none();
@@ -3837,6 +4059,7 @@ impl Cagents {
             _ => None,
         };
         runtime.pending = Some(PendingCommand {
+            followup: false,
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
@@ -3916,6 +4139,7 @@ impl Cagents {
                     runtime.account_picker = open && runtime.choosing();
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
+                    runtime.permission_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -4721,6 +4945,7 @@ impl Cagents {
                 return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
             Action::Composer(target, action) => {
+                let mut files = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
                         runtime.revision = runtime.revision.wrapping_add(1);
@@ -4733,9 +4958,21 @@ impl Cagents {
                     let rescroll = !matches!(action, text_editor::Action::Scroll { .. })
                         && runtime.completion.restart(action.is_edit());
                     runtime.composer.perform(action);
-                    if rescroll {
-                        return view::completion_scroll(target, 0.0);
+                    if runtime.files.is_none() && runtime.composer.text().contains('@') {
+                        runtime.files = Some(Arc::new(Vec::new()));
+                        files = Some(runtime.session.launch.recipe.working_directory.clone());
                     }
+                    if rescroll {
+                        return Task::batch([
+                            view::completion_scroll(target, 0.0),
+                            files.map_or_else(Task::none, |directory| {
+                                self.load_chat_files(target, directory)
+                            }),
+                        ]);
+                    }
+                }
+                if let Some(directory) = files {
+                    return self.load_chat_files(target, directory);
                 }
             }
             Action::Paste(target) => {
@@ -4895,6 +5132,24 @@ impl Cagents {
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
                 }
+                if runtime.followup.is_some() {
+                    return Task::none();
+                }
+                if mode == PromptMode::Queue
+                    && !runtime.snapshot.capabilities.queue
+                    && runtime.snapshot.busy
+                    && runtime.followup.is_none()
+                    && runtime.pending.is_none()
+                    && !runtime.disconnected
+                {
+                    runtime.followup = Some((
+                        runtime.composer.text(),
+                        std::mem::take(&mut runtime.attachments),
+                    ));
+                    runtime.replace_draft(text_editor::Content::new());
+                    let _ = runtime.present();
+                    return Task::none();
+                }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
                     || (mode == PromptMode::Send && runtime.snapshot.busy)
@@ -4915,6 +5170,50 @@ impl Cagents {
             Action::HistoryOlder(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.recall(true);
+                }
+            }
+            Action::PermissionPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.permission_picker = open;
+                    if open {
+                        runtime.model_picker = None;
+                        runtime.reasoning_picker = false;
+                        runtime.account_picker = false;
+                    }
+                }
+            }
+            Action::Files(target, directory, files) => {
+                self.chat_ui.files.insert(directory.clone(), files.clone());
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.session.launch.recipe.working_directory == directory
+                {
+                    runtime.files = Some(files);
+                }
+            }
+            Action::Find(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find = Some(query);
+                    runtime.refresh_find();
+                    runtime.find_index = runtime.find_matches.len().saturating_sub(1);
+                }
+                return self.chat_find_next(target, true);
+            }
+            Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            Action::CloseFind(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find = None;
+                    runtime.find_focused = false;
+                    runtime.find_matches.clear();
+                }
+                return iced::widget::operation::focus(card_control_id(
+                    target.card,
+                    "chat-composer",
+                ))
+                .map(cosmic::Action::App);
+            }
+            Action::FindFocused(target, focused) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.find_focused = focused;
                 }
             }
             Action::HistoryNewer(target) => {
@@ -4949,6 +5248,9 @@ impl Cagents {
                 };
                 let first_prompt = match result {
                     Ok(()) => {
+                        if pending.followup {
+                            runtime.followup = None;
+                        }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
                             runtime.attachments.clear();
@@ -4963,6 +5265,16 @@ impl Cagents {
                         pending.first_prompt
                     }
                     Err(error) => {
+                        if pending.followup
+                            && let Some((text, attachments)) = runtime.followup.take()
+                        {
+                            let draft = runtime.composer.text();
+                            runtime.replace_draft(text_editor::Content::with_text(&format!(
+                                "{text}\n{draft}"
+                            )));
+                            runtime
+                                .attach(attachments.into_iter().map(|attachment| attachment.path));
+                        }
                         runtime.note(error.clone());
                         runtime.error = Some(error);
                         None
@@ -5041,11 +5353,6 @@ impl Cagents {
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = match part {
-                    CopyPart::Code(index) => runtime
-                        .cache
-                        .get(&id)
-                        .and_then(|cached| cached.code.codes.get(index))
-                        .cloned(),
                     part => runtime
                         .snapshot
                         .items
@@ -5061,7 +5368,15 @@ impl Cagents {
                         .and_then(|item| copy_text(part, &item.content)),
                 };
                 if let Some(text) = text {
-                    return iced::clipboard::write(text).map(cosmic::Action::App);
+                    let at = Instant::now();
+                    runtime.copied = Some((id, at));
+                    return Task::batch([
+                        iced::clipboard::write(text).map(cosmic::Action::App),
+                        cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            Message::ChatUi(Action::ClearCopied(target, at))
+                        }),
+                    ]);
                 }
             }
             Action::OpenUrl(raw) => match Url::parse(&raw) {
@@ -5074,6 +5389,56 @@ impl Cagents {
                     ))
                 }
             },
+            Action::OpenDocument(target, raw) => {
+                if self.chat_runtime_mut(target).is_some() {
+                    return self.open_document_link(Some(target.card), &raw);
+                }
+            }
+            Action::CopyLiteral(text) => {
+                self.status = Some(TransientNotice::success("Copied code block"));
+                return iced::clipboard::write(text).map(cosmic::Action::App);
+            }
+            Action::Tick => {}
+            Action::DropHover(target, hovering) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.drop_hover = hovering;
+                }
+            }
+            Action::ClearCopied(target, at) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime
+                        .copied
+                        .as_ref()
+                        .is_some_and(|(_, copied)| *copied == at)
+                {
+                    runtime.copied = None;
+                }
+            }
+            Action::Latest(target) => {
+                return iced::widget::scrollable::snap_to(
+                    card_control_id(target.card, "chat-transcript"),
+                    iced::widget::scrollable::RelativeOffset {
+                        x: None,
+                        y: Some(0.0),
+                    },
+                )
+                .map(cosmic::Action::App);
+            }
+            Action::CancelFollowup(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && !runtime
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.followup)
+                    && let Some((text, attachments)) = runtime.followup.take()
+                {
+                    let draft = runtime.composer.text();
+                    runtime.replace_draft(text_editor::Content::with_text(&format!(
+                        "{text}\n{draft}"
+                    )));
+                    runtime.attach(attachments.into_iter().map(|attachment| attachment.path));
+                }
+            }
             Action::Attach(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -5117,6 +5482,9 @@ impl Cagents {
                 }
             }
             Action::Dropped(target, payload) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.drop_hover = false;
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -5239,6 +5607,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                runtime.permission_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -5594,6 +5963,7 @@ impl Cagents {
                 runtime.model_picker = open.then(String::new);
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
+                runtime.permission_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -5616,6 +5986,7 @@ impl Cagents {
                     runtime.reasoning_picker = open;
                     runtime.model_picker = None;
                     runtime.account_picker = false;
+                    runtime.permission_picker = false;
                 }
             }
         }
@@ -5680,6 +6051,59 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_busy_provider_without_native_queue_keeps_a_followup_editable() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+        runtime.replace_draft(text_editor::Content::with_text("next task"));
+        let target = runtime.target;
+        let _ = app.handle_chat_ui(Action::Submit(target, PromptMode::Queue));
+        assert_eq!(
+            chat_runtime(&app, card).followup.as_ref().unwrap().0.trim(),
+            "next task"
+        );
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("later draft"));
+        let _ = app.handle_chat_ui(Action::CancelFollowup(target));
+        assert!(chat_runtime(&app, card).followup.is_none());
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "next task\nlater draft"
+        );
+    }
+
+    #[test]
+    fn sending_a_local_followup_preserves_the_later_composer_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.followup = Some(("queued task".into(), Vec::new()));
+        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        let _ = app.dispatch_queued(target);
+        assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).followup.is_none());
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "later draft"
+        );
+    }
+    fn parsed_codes(cached: &super::CachedItem) -> Vec<String> {
+        let mut codes = Vec::new();
+        super::for_each_fence(cached.markdown.items(), &mut |_, code| {
+            codes.push(code.to_owned())
+        });
+        codes
+    }
     use super::*;
 
     #[test]
@@ -9083,7 +9507,7 @@ mod tests {
             "Intro\n\n```rust\nfn main() {}\nlet total = 1;\n```\n\nAfter\n\n~~~\nplain\n~~~\n";
         let whole = CachedItem::new(&text(BODY), THEME);
         assert_eq!(
-            whole.code.codes,
+            parsed_codes(&whole),
             vec![
                 "fn main() {}\nlet total = 1;\n".to_owned(),
                 "plain\n".to_owned()
@@ -9103,7 +9527,7 @@ mod tests {
             streamed.extend(body, parsed, THEME);
             streamed.token = ChangeToken::of(&content);
         }
-        assert_eq!(streamed.code.codes, whole.code.codes);
+        assert_eq!(parsed_codes(&streamed), parsed_codes(&whole));
         assert_eq!(streamed.token, whole.token);
         assert_eq!(
             streamed.blocks.keys().collect::<HashSet<_>>(),
@@ -9124,7 +9548,7 @@ mod tests {
             &text("```rust\nfn main() {}\nlet x = 1;\n```\n\n```\nplain\n```\n"),
             THEME,
         );
-        let text_of = |spans: &[iced::widget::text::Span<'static>]| {
+        let text_of = |spans: &[iced::widget::text::Span<'static, String>]| {
             spans
                 .iter()
                 .map(|span| span.text.as_ref())
