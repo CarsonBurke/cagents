@@ -629,6 +629,10 @@ const fn default_editor_auto_save() -> bool {
     true
 }
 
+const fn default_diff_hide_unchanged() -> bool {
+    true
+}
+
 const fn default_confirm_terminal_close() -> bool {
     true
 }
@@ -821,7 +825,7 @@ pub struct AppSettings {
     pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
-    #[serde(default = "default_editor_auto_save")]
+    #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
@@ -912,7 +916,7 @@ impl Default for AppSettings {
             confirm_multiline_paste: true,
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
-            diff_hide_unchanged: true,
+            diff_hide_unchanged: default_diff_hide_unchanged(),
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),

@@ -571,6 +571,23 @@ impl ShortcutDraft {
 mod tests {
     use super::*;
     #[test]
+    fn closing_shortcut_recording_dismisses_the_modal_and_preserves_the_binding() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let before = app
+            .settings_draft
+            .keyboard_shortcuts
+            .command_palette
+            .clone();
+        let _ = app.update_palette(Action::Record(SettingsField::ShortcutCommandPalette));
+        assert!(app.palette.is_open());
+        let _ = app.update_palette(Action::Close);
+        assert!(!app.palette.is_open());
+        assert_eq!(
+            app.settings_draft.keyboard_shortcuts.command_palette,
+            before
+        );
+    }
+    #[test]
     fn palette_filters_commands_without_changing_workspace() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
