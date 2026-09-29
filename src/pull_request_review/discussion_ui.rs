@@ -319,7 +319,9 @@ impl State {
                     self.discussion.expanded.insert(id);
                 }
             }
-            Action::CancelSubmit => self.discussion.confirmation = None,
+            Action::CancelSubmit if !self.discussion.submitting || !self.discussion.busy => {
+                self.discussion.confirmation = None;
+            }
             Action::ToggleReview if !self.discussion.submitting || !self.discussion.busy => {
                 self.discussion.review_open = !self.discussion.review_open;
                 self.discussion.confirmation = None;
@@ -531,7 +533,10 @@ impl State {
                     return self.send_discussion(authority, Mutation::Submit { request, comments });
                 }
             }
-            Action::AcknowledgeUnknown | Action::ToggleReview | Action::CloseReview => {}
+            Action::AcknowledgeUnknown
+            | Action::ToggleReview
+            | Action::CloseReview
+            | Action::CancelSubmit => {}
         }
         ActionTask::none()
     }
@@ -643,7 +648,8 @@ impl State {
                 );
             }
             rows.push(popup_actions(
-                button::text("Back").on_press(Action::CancelSubmit),
+                button::text("Back")
+                    .on_press_maybe((!self.discussion.busy).then_some(Action::CancelSubmit)),
                 button::suggested(if self.discussion.busy {
                     "Submitting…"
                 } else {
@@ -1524,9 +1530,18 @@ mod tests {
         let mut state = ready();
         drop(state.update_discussion(Action::ToggleReview));
         drop(state.update_discussion(Action::PrepareSubmit));
+        drop(state.update_discussion(Action::CancelSubmit));
+        assert!(state.discussion.confirmation.is_none());
+        assert!(state.discussion.review_open);
+        drop(state.update_discussion(Action::PrepareSubmit));
         drop(state.update_discussion(Action::ConfirmSubmit));
         assert!(state.discussion.busy && state.discussion.submitting);
         assert!(state.discussion.confirmation.is_some());
+        drop(state.update_discussion(Action::CancelSubmit));
+        assert!(
+            state.discussion.confirmation.is_some(),
+            "Back cannot dismiss the confirmation while GitHub is receiving it"
+        );
         drop(state.update_discussion(Action::CloseReview));
         assert!(
             state.discussion.review_open,

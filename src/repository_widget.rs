@@ -3383,17 +3383,18 @@ impl RepositoryRuntime {
     /// Whether the diff surface can hold a discussion of the whole file: it
     /// renders one only above a text or no-text comparison, so a failed,
     /// empty, or unresolved comparison would hide a draft begun there. A
-    /// comparison still loading counts, since it resolves into one of those.
+    /// comparison still loading does not count: a failure would leave its
+    /// draft without a visible Save or Cancel control.
     pub fn can_show_file_discussion(&self) -> bool {
         self.can_show_diff()
             && self.basis_resolution.is_none()
             && self.working_diff_failure().is_none()
             && matches!(
                 self.diff_state(&self.diff_basis),
-                Some(
-                    DiffState::Loading { .. }
-                        | DiffState::Ready(RenderedDiff::Text { .. } | RenderedDiff::NoText(_), _)
-                )
+                Some(DiffState::Ready(
+                    RenderedDiff::Text { .. } | RenderedDiff::NoText(_),
+                    _
+                ))
             )
     }
 
@@ -11506,6 +11507,23 @@ mod tests {
     fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Loading {
+                request: 1,
+                cancellation: CancellationToken::new(),
+            },
+        );
+        assert!(
+            !runtime.can_show_file_discussion(),
+            "a pending comparison may fail and strand a new file draft"
+        );
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(RenderedDiff::Error("unreadable".into())),
+        );
+        assert!(!runtime.can_show_file_discussion());
+        // Once a retry provides a renderable diff, a draft can be offered.
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(crate::diff_view::build_diff("", "line\n"))),
