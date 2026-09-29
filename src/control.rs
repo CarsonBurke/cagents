@@ -13,7 +13,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, error::ErrorKind as ClapErrorKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -2261,6 +2261,50 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
             "Shutdown already requested; termination is not yet confirmed complete".into()
         }
     }
+}
+
+/// One plain line about a shutdown outcome, for the tray menu and the stop
+/// confirmation, which have room for a sentence rather than the CLI's full
+/// account of what was and was not requested.
+pub fn shutdown_outcome_summary(outcome: &ShutdownOutcome) -> String {
+    let terminals = |count: u64| match count {
+        1 => "1 terminal".to_owned(),
+        count => format!("{count} terminals"),
+    };
+    match *outcome {
+        ShutdownOutcome::Accepted {
+            live_terminals_before: 0,
+            ..
+        } => "Stopping the daemon…".into(),
+        ShutdownOutcome::Accepted {
+            live_terminals_before,
+            ..
+        } => format!("Stopping… {} will close", terminals(live_terminals_before)),
+        ShutdownOutcome::EmptyRequired { current_count }
+        | ShutdownOutcome::ConfirmationRequired { current_count } => {
+            format!("Stop needs confirmation: {} open", terminals(current_count))
+        }
+        ShutdownOutcome::InventoryChanged { current_count } => format!(
+            "Not stopped: the open terminals changed ({} now). Try again.",
+            current_count
+        ),
+        ShutdownOutcome::Expired => "Not stopped: the confirmation expired. Try again.".into(),
+        ShutdownOutcome::DaemonRestarted => "Not stopped: the daemon restarted. Try again.".into(),
+        ShutdownOutcome::InvalidCapability => {
+            "Not stopped: the confirmation was not accepted. Try again.".into()
+        }
+        ShutdownOutcome::AlreadyShuttingDown => "The daemon is already stopping…".into(),
+    }
+}
+
+/// What the stop confirmation reports to the tray that opened it, as one JSON
+/// line on its stdout; the tray words it, rather than showing that text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum StopReport {
+    Cancelled,
+    Finished { outcome: ShutdownOutcome },
+    Failed { error: String },
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {

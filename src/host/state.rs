@@ -380,6 +380,29 @@ impl HostState {
         self.model = Some(registry);
     }
 
+    /// How many hosted agents are working, and how many are waiting on the
+    /// user, across running terminals and native conversations.
+    pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
+        use crate::agent::ActivityState;
+        let terminals = self
+            .terminals
+            .values()
+            .filter(|record| record.running)
+            .filter_map(|record| record.handle.agent_activity())
+            .map(|activity| activity.state);
+        let chats = self.chats.values().map(|record| record.handle.activity());
+        terminals
+            .chain(chats)
+            .fold(crate::tray::AgentTally::default(), |mut tally, state| {
+                match state {
+                    ActivityState::Working => tally.working += 1,
+                    ActivityState::Waiting => tally.waiting += 1,
+                    ActivityState::Idle | ActivityState::Unknown => {}
+                }
+                tally
+            })
+    }
+
     pub(super) fn notification_snapshot(&self) -> crate::notifications::Snapshot {
         self.notifications.as_ref().map_or_else(
             || crate::notifications::Snapshot {
