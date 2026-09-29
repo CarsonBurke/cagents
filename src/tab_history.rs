@@ -17,6 +17,9 @@ impl<T> Default for TabHistory<T> {
 }
 
 impl<T: Copy + Eq> TabHistory<T> {
+    pub fn cycle_order(&self) -> Option<&[T]> {
+        self.cycle.as_ref().map(|(order, _)| order.as_slice())
+    }
     pub fn observe(&mut self, active: Option<T>) {
         let Some(active) = active else { return };
         if let Some((order, index)) = &self.cycle {

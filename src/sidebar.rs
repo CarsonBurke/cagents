@@ -624,8 +624,8 @@ impl SidebarProject {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        self.chrome.folded_name.contains(folded_query)
-            || self.chrome.folded_repository.contains(folded_query)
+        search_score(&self.chrome.folded_name, folded_query).is_some()
+            || (folded_query.contains('/') && self.chrome.folded_repository.contains(folded_query))
     }
 }
 
@@ -727,7 +727,7 @@ impl SidebarWorktree {
             paneless_accessible_name: paneless_name(&accessible_name),
             accessible_name: accessible_name.into_boxed_str(),
             tooltip: format!(
-                "{label} — {} — {path_label} — {status}",
+                "{label}\nBranch: {}\n{path_label}\n{status}",
                 branch.as_deref().unwrap_or("Detached HEAD")
             )
             .into_boxed_str(),
@@ -839,14 +839,14 @@ impl SidebarWorktree {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        if self.chrome.folded_label.contains(folded_query) {
+        if search_score(&self.chrome.folded_label, folded_query).is_some() {
             return true;
         }
         self.chrome
             .folded_branch
             .as_deref()
-            .is_some_and(|branch| branch.contains(folded_query))
-            || self.chrome.folded_path.contains(folded_query)
+            .is_some_and(|branch| search_score(branch, folded_query).is_some())
+            || (folded_query.contains('/') && self.chrome.folded_path.contains(folded_query))
     }
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
@@ -934,7 +934,7 @@ impl SidebarWorktree {
         self.chrome.paneless_accessible_name = paneless_name(&accessible_name);
         self.chrome.accessible_name = accessible_name.into_boxed_str();
         self.chrome.tooltip = format!(
-            "{} — {branch} — {} — {status}",
+            "{}\nBranch: {branch}\n{}\n{status}",
             self.chrome.label,
             self.path.display()
         )
@@ -1185,9 +1185,7 @@ enum PullRequestTone {
     Review,
     Merged,
     Danger,
-    Pending,
     Draft,
-    Passing,
     Neutral,
 }
 
@@ -1195,11 +1193,8 @@ fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
     match pr.state {
         Some(WorktreePullRequestState::Merged) => PullRequestTone::Merged,
         Some(WorktreePullRequestState::Closed) => PullRequestTone::Danger,
-        _ if pr.checks == CheckStatus::Failing => PullRequestTone::Danger,
         _ if pr.needs_review => PullRequestTone::Review,
-        _ if pr.checks == CheckStatus::Pending => PullRequestTone::Pending,
         _ if pr.draft => PullRequestTone::Draft,
-        _ if pr.checks == CheckStatus::Passing => PullRequestTone::Passing,
         _ => PullRequestTone::Neutral,
     }
 }
@@ -1212,9 +1207,7 @@ impl PullRequestTone {
             Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
             Self::Review => design::accent_color(theme),
             Self::Danger => cosmic.destructive.base.into(),
-            Self::Pending => cosmic.warning.base.into(),
             Self::Draft => theme.current_container().component.on_disabled.into(),
-            Self::Passing => cosmic.success.base.into(),
             Self::Neutral => theme.current_container().component.on.into(),
         }
     }
@@ -3028,6 +3021,10 @@ impl SidebarState {
         self.toggled_sections.contains(&section) != section.expanded_by_default()
     }
 
+    pub fn project_expanded(&self, project: ProjectId) -> bool {
+        !self.collapsed_projects.contains(&project)
+    }
+
     /// Applies only local, pure presentation transitions. Commands such as
     /// opening a worktree, staging, or pushing remain for the application.
     pub fn apply(&mut self, action: &SidebarAction) {
@@ -3190,6 +3187,11 @@ impl SidebarState {
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished
             | SidebarAction::SelectRows { .. }
+            | SidebarAction::NavigateRow { .. }
+            | SidebarAction::OpenFirstSearchResult
+            | SidebarAction::ScrollProjects(_)
+            | SidebarAction::RenameChannel(_)
+            | SidebarAction::MarkChannelRead(_)
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::ClearRowSelection => {}
@@ -3231,6 +3233,14 @@ pub enum SidebarAction {
         scope: ChangeTreeScope,
         page: usize,
     },
+    NavigateRow {
+        row: SelectionRow,
+        key: cosmic::iced::keyboard::key::Named,
+    },
+    OpenFirstSearchResult,
+    ScrollProjects(f32),
+    RenameChannel(ChannelId),
+    MarkChannelRead(ChannelId),
     SelectRows {
         row: SelectionRow,
         intent: SelectionIntent,
@@ -3545,6 +3555,42 @@ pub fn view<'a>(
     persisted_width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    view_inner(model, state, mode, persisted_width, modal_open, None)
+}
+
+#[derive(Default)]
+pub struct NavigationCache(std::cell::RefCell<(SidebarModel, SidebarState, u64)>);
+impl NavigationCache {
+    fn generation(&self, model: &SidebarModel, state: &SidebarState) -> u64 {
+        let mut snapshot = self.0.borrow_mut();
+        if &snapshot.0 != model || &snapshot.1 != state {
+            snapshot.0 = model.clone();
+            snapshot.1 = state.clone();
+            snapshot.2 = snapshot.2.wrapping_add(1);
+        }
+        snapshot.2
+    }
+}
+
+pub fn view_cached<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    mode: SidebarMode,
+    persisted_width: f32,
+    modal_open: bool,
+    cache: &'a NavigationCache,
+) -> Element<'a, SidebarAction> {
+    view_inner(model, state, mode, persisted_width, modal_open, Some(cache))
+}
+
+fn view_inner<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    mode: SidebarMode,
+    persisted_width: f32,
+    modal_open: bool,
+    cache: Option<&'a NavigationCache>,
+) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -3566,9 +3612,22 @@ pub fn view<'a>(
     }
 
     content = content.push(
-        widget::container(body(model, state, compact, modal_open))
-            .width(Length::Fill)
-            .height(Length::Fill),
+        widget::container(
+            if let Some(cache) = cache
+                && !model.projects.is_empty()
+                && !matches!(model.data_state, SidebarDataState::Error(_))
+            {
+                cosmic::iced::widget::lazy(
+                    (cache.generation(model, state), compact, modal_open),
+                    move |_| project_list(model, state, compact, modal_open),
+                )
+                .into()
+            } else {
+                body(model, state, compact, modal_open)
+            },
+        )
+        .width(Length::Fill)
+        .height(Length::Fill),
     );
     if !state.rows.is_empty() {
         content = content.push(selection_controls(state, compact, modal_open));
@@ -3882,9 +3941,13 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
 /// this box.
 fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
     let width = Length::Fill;
-    let mut input = widget::text_input::search_input("Search projects", &state.query).width(width);
+    let mut input =
+        widget::text_input::search_input("Search projects, branches, channels", &state.query)
+            .width(width);
     if !modal_open {
-        input = input.on_input(SidebarAction::SearchChanged);
+        input = input
+            .on_input(SidebarAction::SearchChanged)
+            .on_submit(|_| SidebarAction::OpenFirstSearchResult);
         if !state.query.is_empty() {
             input = input.on_clear(SidebarAction::SearchChanged(String::new()));
         }
@@ -3945,7 +4008,7 @@ fn project_list<'a>(
     state: &'a SidebarState,
     compact: bool,
     modal_open: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
         return project_scroll(empty(state, compact, modal_open), state.filter);
@@ -4338,7 +4401,7 @@ fn project_identity_row<'a>(
     modal_open: bool,
     compact: bool,
     review_mode: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let label = (!compact).then(|| project_name_label(project));
@@ -4351,27 +4414,29 @@ fn project_identity_row<'a>(
         .name(if review_mode && project.github_ready {
             Cow::Owned(format!("Browse pull requests in {}", project.name))
         } else if compact {
-            Cow::Borrowed(&*chrome.compact_open_name)
+            Cow::Owned(chrome.compact_open_name.to_string())
         } else {
-            Cow::Borrowed(&*chrome.open_name)
+            Cow::Owned(chrome.open_name.to_string())
         })
         .on_press_maybe(gated(
             if review_mode && project.github_ready {
                 SidebarAction::BrowsePullRequests {
                     project_id: project.id,
                 }
-            } else {
+            } else if project.kind == ProjectKind::Folder {
                 SidebarAction::OpenRepository {
                     project_id: project.id,
                     repository: project.repository.clone(),
                 }
+            } else {
+                SidebarAction::ToggleProject(project.id)
             },
             modal_open,
         ));
-    let tip: Cow<'a, str> = if review_mode && project.github_ready {
+    let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
     } else if compact {
-        Cow::Borrowed(&*chrome.compact_open_name)
+        Cow::Owned(chrome.compact_open_name.to_string())
     } else {
         Cow::Owned(project.repository.display().to_string())
     };
@@ -4380,8 +4445,8 @@ fn project_identity_row<'a>(
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
 /// name cannot change a header's height.
-fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
-    design::heading(project.name.as_str())
+fn project_name_label(project: &SidebarProject) -> Element<'static, SidebarAction> {
+    design::heading(project.name.clone())
         .class(theme::Text::Default)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
         .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -4401,10 +4466,10 @@ fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
 fn operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
-) -> impl Iterator<Item = Element<'a, SidebarAction>> {
+) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
     project.operations.iter().map(move |operation| {
-        let label = design::body(&*operation.label)
+        let label = design::body(operation.label.to_string())
             .class(theme::Text::Custom(design::muted_text))
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
@@ -4430,7 +4495,7 @@ fn operation_rows<'a>(
                 .filter(|_| operation.reopenable),
             )
             .width(Length::Fill);
-        let control = crate::interaction::tooltip(control, &*operation.detail);
+        let control = crate::interaction::tooltip(control, operation.detail.to_string());
         let retry = operation.reopenable.then(|| {
             icon_action(
                 "view-refresh-symbolic",
@@ -4458,7 +4523,7 @@ fn operation_rows<'a>(
 fn compact_operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
-) -> impl Iterator<Item = Element<'a, SidebarAction>> {
+) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(true);
     project.operations.iter().map(move |operation| {
         let control = grid
@@ -4468,14 +4533,20 @@ fn compact_operation_rows<'a>(
             )
             .name(operation_accessible_name(operation))
             .on_press_maybe(gated_operation_action(operation, modal_open));
-        grid.mount(crate::interaction::tooltip(control, &*operation.detail))
+        grid.mount(crate::interaction::tooltip(
+            control,
+            operation.detail.to_string(),
+        ))
     })
 }
 
 /// The leading glyph: the worktree icon the row will keep, muted, while the
 /// creation runs; a warning once it has failed. The rail has no status slot,
 /// so there the spinner takes the glyph's place.
-fn operation_icon<'a>(phase: WorktreeOperationPhase, compact: bool) -> Element<'a, SidebarAction> {
+fn operation_icon<'a>(
+    phase: WorktreeOperationPhase,
+    compact: bool,
+) -> Element<'static, SidebarAction> {
     match phase {
         WorktreeOperationPhase::Working if compact => crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -4495,7 +4566,7 @@ fn operation_icon<'a>(phase: WorktreeOperationPhase, compact: bool) -> Element<'
     }
 }
 
-fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'a, SidebarAction>> {
+fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'static, SidebarAction>> {
     match phase {
         WorktreeOperationPhase::Working => Some(crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -4528,7 +4599,7 @@ fn gated_operation_action(
 fn operation_control<'a>(
     operation: &'a WorktreeOperationRow,
     modal_open: bool,
-) -> Option<Element<'a, SidebarAction>> {
+) -> Option<Element<'static, SidebarAction>> {
     let action = gated_operation_action(operation, modal_open)?;
     let (icon_name, label) = if operation.cancellable {
         (
@@ -4589,7 +4660,7 @@ fn unreachable_project<'a>(
     compact: bool,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let reload = (!project.reloading)
@@ -4685,7 +4756,7 @@ fn project_view<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
@@ -4705,7 +4776,7 @@ fn project_view<'a>(
         selection
     };
     if compact {
-        return compact_project(project, selection, modal_open, sticky_viewport);
+        return compact_project(project, expanded, selection, modal_open, sticky_viewport);
     }
 
     let worktree_count = project.worktrees.len();
@@ -4718,7 +4789,7 @@ fn project_view<'a>(
         project.state.filter == SidebarFilter::PullRequests,
     );
 
-    let disclosure: Element<'a, SidebarAction> = if has_children {
+    let disclosure: Element<'static, SidebarAction> = if has_children {
         icon_action(
             if expanded {
                 "go-down-symbolic"
@@ -4726,9 +4797,9 @@ fn project_view<'a>(
                 "go-next-symbolic"
             },
             if expanded {
-                &*chrome.collapse_name
+                chrome.collapse_name.to_string()
             } else {
-                &*chrome.expand_name
+                chrome.expand_name.to_string()
             },
             gated(SidebarAction::ToggleProject(project_id), modal_open),
             chrome.toggle_id.clone(),
@@ -4741,7 +4812,7 @@ fn project_view<'a>(
     };
     let add_worktree = icon_action(
         "worktree-add-symbolic",
-        &*chrome.new_worktree_name,
+        chrome.new_worktree_name.to_string(),
         gated(
             SidebarAction::NewWorktree {
                 project_id,
@@ -4753,16 +4824,46 @@ fn project_view<'a>(
     );
     let add_channel = icon_action(
         "channel-add-symbolic",
-        &*chrome.new_channel_name,
+        chrome.new_channel_name.to_string(),
         gated(SidebarAction::NewChannel { project_id }, modal_open),
         chrome.new_channel_id.clone(),
     );
+    let mut identity =
+        widget::row::with_children(vec![disclosure, project_identity]).align_y(Alignment::Center);
+    if !expanded {
+        let activity = entity
+            .channels
+            .iter()
+            .filter_map(|channel| channel.activity)
+            .chain(
+                entity
+                    .worktrees
+                    .iter()
+                    .filter_map(|worktree| project.state.agent_activity(project_id, worktree.id)),
+            )
+            .max_by_key(|activity| match activity {
+                crate::agent::ActivityState::Waiting => 2,
+                crate::agent::ActivityState::Working => 1,
+                _ => 0,
+            });
+        let unread = entity.channels.iter().any(|channel| channel.unread)
+            || entity
+                .worktrees
+                .iter()
+                .any(|worktree| project.state.has_agent_update(project_id, worktree.id));
+        if let Some(indicator) = agent_indicator(activity, unread) {
+            identity = identity.push(indicator);
+        }
+        identity = identity.push(design::caption(
+            (entity.channels.len() + entity.worktrees.len()).to_string(),
+        ));
+    }
     let header = project_header_row(
-        project_identity,
+        identity.into(),
         if entity.kind == ProjectKind::Git {
-            vec![disclosure, add_channel, add_worktree]
+            vec![add_channel, add_worktree]
         } else {
-            vec![disclosure, add_channel]
+            vec![add_channel]
         },
     );
     let header = context_controls(
@@ -4844,12 +4945,12 @@ pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
 
 fn compact_project<'a>(
     project: &FilteredProject<'a>,
+    expanded: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     sticky_viewport: row_interaction::StickyViewport,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let entity = project.project;
-    let chrome = &entity.chrome;
     let selected = matches!(
         selection,
         Some(SidebarSelection::Project(project_id))
@@ -4894,7 +4995,13 @@ fn compact_project<'a>(
     for row in compact_operation_rows(entity, modal_open) {
         column = column.push(row);
     }
-    for channel in &project.channels {
+    for channel in project.channels.iter().filter(|channel| {
+        expanded
+            && (channel.selected
+                || channel.unread
+                || channel.activity.is_some()
+                || channel.deletion.is_some())
+    }) {
         column = column.push(RowInteraction::selectable(
             channel_view(
                 channel,
@@ -4910,7 +5017,21 @@ fn compact_project<'a>(
             !modal_open && channel.deletion != Some(RowDeletion::Deleting),
         ));
     }
-    for &worktree in &project.worktrees {
+    for &worktree in project.worktrees.iter().filter(|worktree| {
+        expanded
+            && (selection
+                == Some(SidebarSelection::Worktree {
+                    project_id: entity.id,
+                    worktree_id: worktree.id,
+                })
+                || project.state.has_agent_update(entity.id, worktree.id)
+                || project.state.worktree_has_panes(entity.id, worktree.id)
+                || worktree.deletion.is_some()
+                || project
+                    .state
+                    .agent_activity(entity.id, worktree.id)
+                    .is_some())
+    }) {
         column = column.push(RowInteraction::selectable(
             worktree_view(
                 entity.id,
@@ -4933,31 +5054,6 @@ fn compact_project<'a>(
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
             !modal_open && worktree.deletion != Some(RowDeletion::Deleting),
-        ));
-    }
-    column = column.push(new_row_action(
-        "channel-add-symbolic",
-        &*chrome.new_channel_name,
-        gated(
-            SidebarAction::NewChannel {
-                project_id: entity.id,
-            },
-            modal_open,
-        ),
-        chrome.new_channel_id.clone(),
-    ));
-    if entity.kind == ProjectKind::Git {
-        column = column.push(new_row_action(
-            "worktree-add-symbolic",
-            &*chrome.new_worktree_name,
-            gated(
-                SidebarAction::NewWorktree {
-                    project_id: entity.id,
-                    repository: entity.repository.clone(),
-                },
-                modal_open,
-            ),
-            chrome.new_worktree_id.clone(),
         ));
     }
     widget::container(RowInteraction::group(
@@ -5066,8 +5162,25 @@ fn worktree_glyph_tone(
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarAction>> {
-    if channel.activity == Some(crate::agent::ActivityState::Working) {
+fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'static, SidebarAction>> {
+    agent_indicator(channel.activity, channel.unread)
+        .or_else(|| (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into()))
+}
+
+/// Waiting is a live state, independent of whether its notification was read.
+/// Channels and worktrees share the same vocabulary and priority.
+fn agent_indicator<'a>(
+    activity: Option<crate::agent::ActivityState>,
+    unread: bool,
+) -> Option<Element<'static, SidebarAction>> {
+    if activity == Some(crate::agent::ActivityState::Waiting) {
+        return Some(status_icon(
+            "agent-waiting-symbolic",
+            "An agent is waiting for input",
+            BadgeTone::Warning,
+        ));
+    }
+    if activity == Some(crate::agent::ActivityState::Working) {
         return Some(crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
@@ -5076,21 +5189,19 @@ fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarActi
             "An agent is actively working",
         ));
     }
-    if channel.unread {
+    if unread {
         return Some(status_icon(
             "agent-waiting-symbolic",
-            "Channel needs attention",
+            "Unread agent update",
             BadgeTone::Neutral,
         ));
     }
-    // A channel holds conversations rather than being one, and the count is
-    // the only thing on the row that says so.
-    (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into())
+    None
 }
 
 /// A deletion under way takes the reserved slot: it is the one live thing
 /// about the row, and outranks whatever the row was doing before.
-fn deleting_indicator<'a>() -> Element<'a, SidebarAction> {
+fn deleting_indicator<'a>() -> Element<'static, SidebarAction> {
     crate::interaction::tooltip(
         crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
@@ -5103,8 +5214,12 @@ fn deleting_indicator<'a>() -> Element<'a, SidebarAction> {
 /// A failed deletion is a fact about the row until it is retried, so it is a
 /// badge after the reserved slot and leaves live activity where it was. The
 /// rail has room for nothing after the slot, so there it takes the slot.
-fn deletion_failed_badge(reason: &str) -> Element<'_, SidebarAction> {
-    status_icon("dialog-warning-symbolic", reason, BadgeTone::Warning)
+fn deletion_failed_badge(reason: &str) -> Element<'static, SidebarAction> {
+    status_icon(
+        "dialog-warning-symbolic",
+        reason.to_owned(),
+        BadgeTone::Warning,
+    )
 }
 
 /// A row being deleted reads as muted as a creation's row does, glyph and
@@ -5119,13 +5234,13 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
 
 /// Mounts a row with the trailing retry a failed deletion offers.
 fn with_deletion_retry<'a>(
-    row: Element<'a, SidebarAction>,
+    row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
     label: &str,
     retry: Option<SidebarAction>,
     id: Id,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     if compact || !matches!(deletion, Some(RowDeletion::Failed(_))) {
         return row;
     }
@@ -5143,11 +5258,11 @@ fn with_deletion_retry<'a>(
 
 /// A row's accessible name with the deletion it is part of.
 fn with_deletion_name<'a>(
-    name: Cow<'a, str>,
+    name: Cow<'static, str>,
     kind: &str,
     label: &str,
     deletion: Option<&RowDeletion>,
-) -> Cow<'a, str> {
+) -> Cow<'static, str> {
     match deletion {
         None => name,
         Some(RowDeletion::Deleting) => Cow::Owned(format!("Deleting {kind} {label}")),
@@ -5162,7 +5277,7 @@ fn channel_view(
     modal_open: bool,
     compact: bool,
     selection_count: Option<usize>,
-) -> Element<'_, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
@@ -5178,7 +5293,7 @@ fn channel_view(
         }
     }));
     let label = (!compact).then(|| {
-        design::body(&channel.title)
+        design::body(channel.title.clone())
             .size(CHILD_ROW_TEXT_SIZE)
             .class(channel_ink(channel).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -5210,7 +5325,7 @@ fn channel_view(
         .control(content, channel.selected)
         .id(channel.open_id.clone())
         .name(with_deletion_name(
-            Cow::Borrowed(&*channel.accessible_name),
+            Cow::Owned(channel.accessible_name.to_string()),
             "channel",
             &channel.title,
             deletion,
@@ -5222,7 +5337,7 @@ fn channel_view(
             inert,
         ));
     let action = row_quick_delete(
-        crate::interaction::tooltip(action, &*channel.tooltip),
+        crate::interaction::tooltip(action, channel.tooltip.to_string()),
         &channel.delete_name,
         gated(
             SidebarAction::DeleteChannel {
@@ -5252,12 +5367,12 @@ fn channel_view(
 /// The compact rail reuses its indicator slot while hovered; an expanded row
 /// reserves the button width so the label continues to ellipsize correctly.
 fn row_quick_delete<'a>(
-    content: Element<'a, SidebarAction>,
-    label: &'a str,
+    content: Element<'static, SidebarAction>,
+    label: &str,
     action: Option<SidebarAction>,
     id: Id,
     compact: bool,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let width = if compact {
         ROW_STATUS_WIDTH
     } else {
@@ -5266,13 +5381,13 @@ fn row_quick_delete<'a>(
     let control = button::icon(crate::ui_controls::symbolic_icon("edit-delete-symbolic"))
         .class(sidebar_button_style(false))
         .id(id)
-        .name(label)
+        .name(label.to_owned())
         .width(width)
         .height(WORKTREE_ROW_HEIGHT)
         .padding(0)
         .on_press_maybe(action);
     let controls = widget::container(
-        widget::container(crate::interaction::tooltip(control, label))
+        widget::container(crate::interaction::tooltip(control, label.to_owned()))
             .class(theme::Container::Primary)
             .width(width)
             .height(WORKTREE_ROW_HEIGHT),
@@ -5288,27 +5403,47 @@ fn row_quick_delete<'a>(
 /// deleting one is destructive and the entry says so with an ellipsis: the
 /// application answers it with a confirmation rather than a removal.
 fn channel_context_controls<'a>(
-    content: impl Into<Element<'a, SidebarAction>>,
+    content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
     selection_count: Option<usize>,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
     let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
-        items(
-            &std::collections::HashMap::new(),
-            vec![Item::Button(
-                match selection_count {
-                    Some(count) if count > 1 => format!(
-                        "{}…",
-                        SelectionRow::Channel(channel_id).deletion_label(count)
-                    ),
-                    _ => "Delete channel…".to_owned(),
-                },
-                None,
-                ChannelContextCommand(channel_id, selection_count.unwrap_or(1) > 1),
-            )],
-        )
+        let mut entries = vec![Item::Button(
+            match selection_count {
+                Some(count) if count > 1 => format!(
+                    "{}…",
+                    SelectionRow::Channel(channel_id).deletion_label(count)
+                ),
+                _ => "Delete channel…".to_owned(),
+            },
+            None,
+            ChannelContextCommand(
+                channel_id,
+                selection_count.unwrap_or(1) > 1,
+                ChannelMenuCommand::Delete,
+            ),
+        )];
+        if selection_count == Some(1) {
+            entries.insert(
+                0,
+                Item::Button(
+                    "Rename channel…".into(),
+                    None,
+                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
+                ),
+            );
+            entries.insert(
+                1,
+                Item::Button(
+                    "Mark as read".into(),
+                    None,
+                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::MarkRead),
+                ),
+            );
+        }
+        items(&std::collections::HashMap::new(), entries)
     }) else {
         return content.into();
     };
@@ -5316,12 +5451,24 @@ fn channel_context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChannelContextCommand(ChannelId, bool);
+struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelMenuCommand {
+    Delete,
+    Rename,
+    MarkRead,
+}
 
 impl widget::menu::Action for ChannelContextCommand {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
+        match self.2 {
+            ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
+            ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
+            ChannelMenuCommand::Delete => {}
+        }
         if self.1 {
             SidebarAction::DeleteSelectedRows
         } else {
@@ -5335,11 +5482,11 @@ fn worktree_accessible_name(
     unread: bool,
     activity: Option<crate::agent::ActivityState>,
     has_panes: bool,
-) -> Cow<'_, str> {
-    let mut name = Cow::Borrowed(if has_panes {
-        &*worktree.chrome.accessible_name
+) -> Cow<'static, str> {
+    let mut name: Cow<'static, str> = Cow::Owned(if has_panes {
+        worktree.chrome.accessible_name.to_string()
     } else {
-        &*worktree.chrome.paneless_accessible_name
+        worktree.chrome.paneless_accessible_name.to_string()
     });
     if unread {
         name.to_mut().push_str(", unread agent update");
@@ -5386,35 +5533,29 @@ fn worktree_indicator(
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
     compact: bool,
-) -> Option<Element<'_, SidebarAction>> {
+) -> Option<Element<'static, SidebarAction>> {
     let indicators = worktree_indicators(worktree);
-    let working = activity == Some(crate::agent::ActivityState::Working);
-    let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting) && agent_update;
+    if let Some(indicator) = agent_indicator(activity, agent_update) {
+        return Some(indicator);
+    }
     let checks = indicators.pending_checks;
-    if working || (compact && !waiting_unread && checks) {
+    if compact && checks {
         return Some(crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
                 design::warning_color,
             ),
-            if working {
-                "An agent is actively working"
-            } else {
-                "CI checks pending or running"
-            },
-        ));
-    }
-    if waiting_unread {
-        return Some(status_icon(
-            "agent-waiting-symbolic",
-            "An agent needs input",
-            BadgeTone::Danger,
+            "CI checks pending or running",
         ));
     }
     if compact {
-        return indicators
-            .dirty
-            .map(|label| status_icon("document-edit-symbolic", label, BadgeTone::Warning));
+        return indicators.dirty.map(|label| {
+            status_icon(
+                "document-edit-symbolic",
+                label.to_owned(),
+                BadgeTone::Warning,
+            )
+        });
     }
     None
 }
@@ -5433,13 +5574,13 @@ fn worktree_view<'a>(
     has_panes: bool,
     compact: bool,
     selection_count: Option<usize>,
-) -> Element<'a, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let label = (!compact).then(|| {
-        design::body(&*chrome.label)
+        design::body(chrome.label.to_string())
             .size(CHILD_ROW_TEXT_SIZE)
             .class(deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -5464,7 +5605,7 @@ fn worktree_view<'a>(
             }))
             .into()
     } else {
-        worktree_status_icon(worktree, agent_update, has_panes)
+        worktree_status_icon(worktree, false, has_panes || agent_update)
     };
     let mut content = grid.content(glyph, label, indicator);
     if !compact {
@@ -5485,7 +5626,7 @@ fn worktree_view<'a>(
         if let Some(label) = indicators.dirty {
             content = content.push(status_icon(
                 "document-edit-symbolic",
-                label,
+                label.to_owned(),
                 BadgeTone::Warning,
             ));
         }
@@ -5505,8 +5646,13 @@ fn worktree_view<'a>(
                 )
             })
         })));
-        if indicators.pending_checks && activity != Some(crate::agent::ActivityState::Working) {
-            content = content.push(check_indicator(CheckStatus::Pending));
+        if let Some(pr) = indicators.pull_request
+            && matches!(
+                pr.checks,
+                CheckStatus::Failing | CheckStatus::Pending | CheckStatus::Passing
+            )
+        {
+            content = content.push(check_indicator(pr.checks));
         }
         if primary {
             content = content.push(status_icon(
@@ -5560,12 +5706,12 @@ fn worktree_view<'a>(
             worktree_primary_action(project_id, worktree, review_mode),
             inert,
         ));
-    let action: Element<'a, SidebarAction> = if compact {
+    let action: Element<'static, SidebarAction> = if compact {
         action.into()
     } else {
         crate::interaction::hover(action)
     };
-    let action = crate::interaction::tooltip(action, &*chrome.tooltip);
+    let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
     let action = if !primary
         && worktree
             .pull_request()
@@ -5633,7 +5779,7 @@ fn worktree_primary_action(
     }
 }
 
-fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarAction> {
+fn project_icon(project: &SidebarProject, size: u16) -> Element<'static, SidebarAction> {
     match &project.avatar {
         Some(handle) => cosmic::iced::widget::image(handle.clone())
             .width(size)
@@ -5656,8 +5802,15 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectCommand {
+    CopyPath,
+    CopyBranch,
+    PullRequest,
+    NewWorktreeFromBranch,
+    MoveUp,
+    MoveDown,
     Reveal,
     NewTerminal,
+    NewChannel,
     NewWorktree,
     RepositoryUrl,
     OpenEditor(String),
@@ -5690,17 +5843,43 @@ fn context_controls<'a>(
     modal_open: bool,
     git: bool,
     github_ready: bool,
-    editors: &'a [SidebarEditor],
+    editors: &[SidebarEditor],
     selection_count: Option<usize>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
-    let menu = (!modal_open && selection_count.is_some()).then(|| {
+    let editors = editors.to_vec();
+    if modal_open || selection_count.is_none() {
+        return content.into();
+    }
+    crate::interaction::context_menu_lazy(content, move || {
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
+            ("New thread".to_owned(), None, ProjectCommand::NewChannel),
         ];
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
+        }
+        if worktree_id.is_some() {
+            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
+            if git {
+                commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
+                commands.push((
+                    "New worktree from this branch…".into(),
+                    None,
+                    ProjectCommand::NewWorktreeFromBranch,
+                ));
+                if github_ready {
+                    commands.push((
+                        "Open or create pull request…".into(),
+                        None,
+                        ProjectCommand::PullRequest,
+                    ));
+                }
+            }
+        } else {
+            commands.push(("Move project up".into(), None, ProjectCommand::MoveUp));
+            commands.push(("Move project down".into(), None, ProjectCommand::MoveDown));
         }
         commands.extend(editors.iter().map(|editor| {
             (
@@ -5752,11 +5931,7 @@ fn context_controls<'a>(
             })
             .collect();
         items(&std::collections::HashMap::new(), entries)
-    });
-    match menu {
-        Some(menu) => crate::interaction::context_menu(content, menu),
-        None => content.into(),
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5885,7 +6060,7 @@ fn worktree_status_icon(
     worktree: &SidebarWorktree,
     update: bool,
     has_panes: bool,
-) -> Element<'_, SidebarAction> {
+) -> Element<'static, SidebarAction> {
     let (handle, pull_request) = worktree
         .chrome
         .pull_request
@@ -8499,34 +8674,6 @@ fn icon_action<'a>(
 /// A "new …" command that is a row of its own, on the grid of the rows it
 /// creates.
 ///
-/// The rail lists these under a project's channels and worktrees, so they are
-/// child rows: the same leading slot, the same reserved indicator slot, and
-/// therefore the same content start as the `main` worktree above them.
-/// [`icon_action`] remains the form for a command that lives inside another
-/// row, such as the expanded header's hover-revealed commands.
-fn new_row_action<'a>(
-    icon_name: &'static str,
-    label: impl Into<Cow<'a, str>>,
-    action: Option<SidebarAction>,
-    id: Id,
-) -> Element<'a, SidebarAction> {
-    let grid = RowGrid::child(true);
-    let label = label.into();
-    let control = grid
-        .control(
-            grid.content(
-                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
-                None,
-                None,
-            ),
-            false,
-        )
-        .id(id)
-        .name(label.clone())
-        .on_press_maybe(action);
-    grid.mount(crate::interaction::tooltip(control, label))
-}
-
 /// The rule between the pane and the workspace, doubling as the pane's resize
 /// handle.
 ///
@@ -8647,7 +8794,7 @@ fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Elem
 /// differently is the defect this shares its way out of.
 pub fn status_icon<'a, Message: Clone + 'a>(
     icon_name: &'static str,
-    label: &'a str,
+    label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, Message> {
     crate::interaction::tooltip(toned_icon(icon_name, tone), label)
@@ -8693,12 +8840,20 @@ pub fn visible_selection_rows(
     let mut rows = Vec::new();
     for project in filtered_projects(model, state, compact) {
         rows.push(SelectionRow::Project(project.project.id));
-        if compact || searching || !state.collapsed_projects.contains(&project.project.id) {
+        if searching || !state.collapsed_projects.contains(&project.project.id) {
             rows.extend(
                 project
                     .channels
                     .iter()
                     .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
+                    .filter(|channel| {
+                        !compact
+                            || searching
+                            || channel.selected
+                            || channel.unread
+                            || channel.activity.is_some()
+                            || channel.deletion.is_some()
+                    })
                     .map(|channel| SelectionRow::Channel(channel.id)),
             );
             rows.extend(
@@ -8706,6 +8861,21 @@ pub fn visible_selection_rows(
                     .worktrees
                     .iter()
                     .filter(|worktree| worktree.deletion != Some(RowDeletion::Deleting))
+                    .filter(|worktree| {
+                        !compact
+                            || searching
+                            || state.selection
+                                == Some(SidebarSelection::Worktree {
+                                    project_id: project.project.id,
+                                    worktree_id: worktree.id,
+                                })
+                            || state.has_agent_update(project.project.id, worktree.id)
+                            || state.worktree_has_panes(project.project.id, worktree.id)
+                            || state
+                                .agent_activity(project.project.id, worktree.id)
+                                .is_some()
+                            || worktree.deletion.is_some()
+                    })
                     .map(|worktree| SelectionRow::Worktree(project.project.id, worktree.id)),
             );
         }
@@ -8748,10 +8918,13 @@ fn filtered_projects<'a>(
                 });
             }
             let channels = channels_in_display_order(project.channels.iter().filter(|channel| {
-                (project_matches || channel.folded_title.contains(query.as_ref()))
+                (project_matches || search_score(&channel.folded_title, query.as_ref()).is_some())
                     && match state.filter {
                         SidebarFilter::All => true,
-                        SidebarFilter::Attention => channel.unread,
+                        SidebarFilter::Attention => {
+                            channel.unread
+                                || channel.activity == Some(crate::agent::ActivityState::Waiting)
+                        }
                         SidebarFilter::PullRequests => false,
                     }
             }));
@@ -8764,7 +8937,11 @@ fn filtered_projects<'a>(
                     .filter(|worktree| match state.filter {
                         SidebarFilter::All => true,
                         SidebarFilter::PullRequests => worktree.pull_request().is_some(),
-                        SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
+                        SidebarFilter::Attention => {
+                            state.has_agent_update(project.id, worktree.id)
+                                || state.agent_activity(project.id, worktree.id)
+                                    == Some(crate::agent::ActivityState::Waiting)
+                        }
                     })
                     .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
             );
@@ -8880,6 +9057,14 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
             });
         }
         destinations.extend(
+            channels_in_display_order(&project.channels)
+                .into_iter()
+                .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
+                .map(|channel| SidebarAction::OpenChannel {
+                    channel_id: channel.id,
+                }),
+        );
+        destinations.extend(
             worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
@@ -8893,14 +9078,6 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
                 path: worktree.path.clone(),
             }),
         );
-        destinations.extend(
-            channels_in_display_order(&project.channels)
-                .into_iter()
-                .filter(|channel| channel.deletion != Some(RowDeletion::Deleting))
-                .map(|channel| SidebarAction::OpenChannel {
-                    channel_id: channel.id,
-                }),
-        );
     }
     destinations
 }
@@ -8909,6 +9086,26 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
 /// never folds a candidate while rendering.
 fn fold(value: &str) -> Box<str> {
     value.case_fold().collect::<String>().into_boxed_str()
+}
+
+/// Match names first; ordered abbreviations allow narrow searches without
+/// allocating another folded candidate on each frame.
+fn search_score(candidate: &str, query: &str) -> Option<usize> {
+    if let Some(position) = candidate.find(query) {
+        return Some(position);
+    }
+    let mut remaining = candidate.chars();
+    let mut skipped = candidate.len();
+    for expected in query.chars() {
+        loop {
+            let actual = remaining.next()?;
+            skipped += 1;
+            if actual == expected {
+                break;
+            }
+        }
+    }
+    Some(skipped)
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -9446,6 +9643,16 @@ mod row_interaction {
                         modifiers,
                         ..
                     }) if state.focused && modifiers.is_empty() => match key {
+                        keyboard::key::Named::ArrowUp
+                        | keyboard::key::Named::ArrowDown
+                        | keyboard::key::Named::ArrowLeft
+                        | keyboard::key::Named::ArrowRight
+                        | keyboard::key::Named::Home
+                        | keyboard::key::Named::End => {
+                            shell.publish(SidebarAction::NavigateRow { row, key: *key });
+                            shell.capture_event();
+                            return;
+                        }
                         keyboard::key::Named::Delete | keyboard::key::Named::Backspace => {
                             // The focused row is the target unless it belongs
                             // to the explicit selection, as in VS Code: focus
@@ -9565,6 +9772,26 @@ mod row_interaction {
                     _ => {}
                 }
                 if state.dragging {
+                    if let Some(position) = cursor.position() {
+                        state.drop = hovered.then(|| self.drop_at(layout, position));
+                        let margin = 32.0;
+                        let direction = if position.y < viewport.y + margin {
+                            -1.0
+                        } else if position.y > viewport.y + viewport.height - margin {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        if direction != 0.0 && hovered {
+                            if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
+                                shell.publish(SidebarAction::ScrollProjects(direction * 8.0));
+                            }
+                            shell.request_redraw();
+                        }
+                    }
+                    if matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. })) {
+                        return;
+                    }
                     shell.capture_event();
                     return;
                 }
@@ -9985,6 +10212,60 @@ pub(crate) mod tests {
         ProjectId::from_uuid(Uuid::from_u128(value))
     }
 
+    #[test]
+    fn navigation_cache_invalidates_attention_query_and_disclosure_but_reuses_identical_views() {
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        let cache = NavigationCache::default();
+        let initial = cache.generation(&model, &state);
+        assert_eq!(initial, cache.generation(&model.clone(), &state.clone()));
+        state.apply(&SidebarAction::ToggleProject(project_id(1)));
+        let collapsed = cache.generation(&model, &state);
+        assert_ne!(initial, collapsed);
+        state.query = "fix".into();
+        let searched = cache.generation(&model, &state);
+        assert_ne!(collapsed, searched);
+        state.observe_agent_update(
+            CardId::new(),
+            project_id(1),
+            WorktreeId::from_uuid(Uuid::from_u128(2)),
+        );
+        let attention = cache.generation(&model, &state);
+        assert_ne!(searched, attention);
+        assert_eq!(attention, cache.generation(&model, &state));
+    }
+
+    #[test]
+    fn search_ignores_common_ancestor_paths_and_accepts_name_abbreviations() {
+        let entry = project();
+        assert!(!entry.matches("repo"));
+        assert!(!entry.worktrees[0].matches("repo"));
+        assert!(entry.worktrees[0].matches("/repo/"));
+        assert!(search_score("feature/authentication", "fauth").is_some());
+        assert!(search_score("feature/authentication", "fhz").is_none());
+    }
+
+    #[test]
+    fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
+        assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
+        assert!(agent_indicator(None, true).is_some());
+        assert!(agent_indicator(None, false).is_none());
+        let mut pr = project().pull_requests[0].clone();
+        pr.needs_review = false;
+        pr.draft = false;
+        pr.state = Some(WorktreePullRequestState::Open);
+        for checks in [
+            CheckStatus::Failing,
+            CheckStatus::Pending,
+            CheckStatus::Passing,
+        ] {
+            pr.checks = checks;
+            assert_eq!(pull_request_tone(&pr), PullRequestTone::Neutral);
+        }
+        pr.state = Some(WorktreePullRequestState::Closed);
+        assert_eq!(pull_request_tone(&pr), PullRequestTone::Danger);
+    }
+
     fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {
         let mut row = SidebarWorktree::from_repository(
             &WorktreeRecord {
@@ -10083,8 +10364,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             visible_selection_rows(&model, &state, true),
-            rows,
-            "compact rail ignores disclosure"
+            vec![SelectionRow::Project(id)],
+            "compact rail respects disclosure"
         );
         state.apply(&SidebarAction::SearchChanged("not-present".into()));
         assert!(visible_selection_rows(&model, &state, false).is_empty());
@@ -10410,9 +10691,9 @@ pub(crate) mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(channels, vec![second, first]);
-        // Channels follow every worktree of their project.
+        // Channel rows precede worktrees in the sidebar.
         assert!(matches!(
-            cycle.last(),
+            cycle.first(),
             Some(SidebarAction::OpenChannel { .. })
         ));
     }
@@ -10580,7 +10861,7 @@ pub(crate) mod tests {
         assert!(projects[0].worktrees.is_empty());
         assert_eq!(projects[0].channels[0].id, channel_id);
         model.projects[0].channels[0].unread = false;
-        assert!(filtered_projects(&model, &state, false).is_empty());
+        assert_eq!(filtered_projects(&model, &state, false).len(), 1);
         assert_eq!(
             model.projects[0].channels[0].activity,
             Some(crate::agent::ActivityState::Waiting),
@@ -10698,18 +10979,8 @@ pub(crate) mod tests {
 
         let compact_header = header(true, COMPACT_ROW_WIDTH);
         let compact = members(true, COMPACT_ROW_WIDTH);
-        // The channel, both worktrees, "New channel" and "New worktree".
-        assert_eq!((compact_header.len(), compact.len()), (1, 5));
-        let (new_channel, primary) = (&compact[3].1, &compact[1].1);
-        assert_eq!(
-            (
-                new_channel[0].x,
-                new_channel[0].width,
-                new_channel[0].height
-            ),
-            (primary[0].x, primary[0].width, primary[0].height),
-            "\"New channel\" and the primary worktree share the rail's grid",
-        );
+        // Quiet children and creation controls do not fill the compact rail.
+        assert_eq!((compact_header.len(), compact.len()), (1, 0));
         for (row, slots) in compact_header.iter().chain(&compact) {
             assert_eq!(slots[0].x, compact_header[0].1[0].x, "one rail column");
             assert_eq!(row.height, design::ROW_HEIGHT);
@@ -10884,12 +11155,7 @@ pub(crate) mod tests {
             worktree_glyph_tone(Some(PullRequestTone::Draft), false, false),
             GlyphTone::Draft(RowInk::Muted)
         );
-        for tone in [
-            PullRequestTone::Merged,
-            PullRequestTone::Danger,
-            PullRequestTone::Pending,
-            PullRequestTone::Passing,
-        ] {
+        for tone in [PullRequestTone::Merged, PullRequestTone::Danger] {
             assert_eq!(
                 worktree_glyph_tone(Some(tone), false, false),
                 GlyphTone::PullRequest(tone)
@@ -11424,18 +11690,20 @@ pub(crate) mod tests {
     fn interface<'a>(
         model: &'a SidebarModel,
         state: &'a SidebarState,
+        navigation: &'a NavigationCache,
         bounds: Size,
         cache: cosmic::iced::runtime::user_interface::Cache,
         renderer: &mut cosmic::Renderer,
     ) -> cosmic::iced::runtime::UserInterface<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>
     {
         cosmic::iced::runtime::UserInterface::build(
-            view(
+            view_cached(
                 model,
                 state,
                 SidebarMode::Expanded,
                 design::NAVIGATION_DEFAULT_WIDTH,
                 false,
+                navigation,
             ),
             bounds,
             cache,
@@ -11448,6 +11716,7 @@ pub(crate) mod tests {
     /// window shorter than the project list is what makes a scroll offset, and
     /// the menu geometry that depends on it, observable at all.
     struct Sidebar {
+        navigation: NavigationCache,
         model: SidebarModel,
         state: SidebarState,
         renderer: cosmic::Renderer,
@@ -11502,6 +11771,7 @@ pub(crate) mod tests {
                 })
                 .collect();
             Self {
+                navigation: NavigationCache::default(),
                 model,
                 state: SidebarState::default(),
                 renderer: headless_renderer(),
@@ -11520,6 +11790,7 @@ pub(crate) mod tests {
             let mut interface = interface(
                 &self.model,
                 &self.state,
+                &self.navigation,
                 self.bounds,
                 std::mem::take(&mut self.cache),
                 &mut self.renderer,
@@ -11592,6 +11863,7 @@ pub(crate) mod tests {
                 let mut interface = interface(
                     &sidebar.model,
                     &sidebar.state,
+                    &sidebar.navigation,
                     sidebar.bounds,
                     std::mem::take(&mut sidebar.cache),
                     &mut sidebar.renderer,
@@ -11715,12 +11987,12 @@ pub(crate) mod tests {
             .expect("the rail draws the project's channel row");
 
         sidebar.click(mouse::Button::Right, row);
-        let entry = Point::new(row.x + 30.0, row.y + 8.0);
+        let entry = Point::new(row.x + 30.0, row.y + 56.0);
         sidebar.move_to(entry);
         assert_eq!(
             sidebar.click(mouse::Button::Left, entry).first(),
             Some(&SidebarAction::DeleteChannel { channel_id }),
-            "the channel row's only menu entry deletes the channel it was opened over",
+            "the channel row's Delete entry deletes the channel it was opened over",
         );
     }
 
@@ -12622,7 +12894,8 @@ pub(crate) mod tests {
         entry.worktrees[1].deletion = Some(RowDeletion::Deleting);
         entry.channels[0].deletion = Some(RowDeletion::Deleting);
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry.clone()]);
-        let state = SidebarState::default();
+        let mut state = SidebarState::default();
+        state.set_worktrees_with_panes(BTreeSet::from([(project_id, kept)]));
         for compact in [false, true] {
             let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
             assert!(opens(&actions, kept), "compact {compact}: {actions:?}");
@@ -14549,4 +14822,72 @@ pub(crate) mod tests {
         );
         assert!(previous.can_load_history());
     }
+}
+
+/// Focus a navigation row and reveal it within the Projects scroll viewport.
+pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
+    use cosmic::iced::advanced::widget::{Operation, operation};
+    struct FocusRow {
+        id: Id,
+        bounds: Option<cosmic::iced::Rectangle>,
+    }
+    impl<T: 'static> Operation<T> for FocusRow {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: cosmic::iced::Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            if id == Some(&self.id) {
+                state.focus();
+                self.bounds = Some(bounds);
+            } else {
+                state.unfocus();
+            }
+        }
+        fn finish(&self) -> operation::Outcome<T> {
+            self.bounds.map_or(operation::Outcome::None, |bounds| {
+                operation::Outcome::Chain(Box::new(RevealRow { bounds }))
+            })
+        }
+    }
+    struct RevealRow {
+        bounds: cosmic::iced::Rectangle,
+    }
+    impl<T> Operation<T> for RevealRow {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: cosmic::iced::Rectangle,
+            content: cosmic::iced::Rectangle,
+            translation: cosmic::iced::Vector,
+            state: &mut dyn operation::Scrollable,
+        ) {
+            if id != Some(&stable_id("sidebar.projects.scroll")) {
+                return;
+            }
+            let row = self.bounds - translation;
+            let delta = if row.y < bounds.y {
+                row.y - bounds.y
+            } else if row.y + row.height > bounds.y + bounds.height {
+                row.y + row.height - bounds.y - bounds.height
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                state.scroll_by(
+                    operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                    bounds,
+                    content,
+                );
+            }
+        }
+    }
+    cosmic::iced::advanced::widget::operate(FocusRow { id, bounds: None })
 }

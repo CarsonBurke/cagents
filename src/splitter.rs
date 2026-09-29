@@ -36,6 +36,7 @@ pub enum Edge {
 pub struct Splitter<'a, Message> {
     content: Element<'a, Message>,
     width: f32,
+    default_width: f32,
     min: f32,
     max: f32,
     edge: Edge,
@@ -66,6 +67,7 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
                 .height(Length::Fill)
                 .into(),
             width: clamp(width, min, max),
+            default_width: clamp(width, min, max),
             min,
             max,
             edge,
@@ -75,6 +77,11 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
             on_resize: Box::new(on_resize),
             on_finish: Box::new(on_finish),
         }
+    }
+
+    pub fn default_width(mut self, width: f32) -> Self {
+        self.default_width = clamp(width, self.min, self.max);
+        self
     }
 
     fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
@@ -128,6 +135,7 @@ struct SplitterState {
     drag: Option<ResizeOrigin>,
     is_focused: bool,
     keyboard_gesture: bool,
+    last_click: Option<std::time::Instant>,
 }
 
 impl SplitterState {
@@ -258,13 +266,26 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.modal_open => {
                 state.is_focused = cursor.is_over(bounds);
                 if let Some(position) = cursor.position().filter(|_| state.is_focused) {
+                    let now = std::time::Instant::now();
+                    if state.last_click.take().is_some_and(|previous| {
+                        now.duration_since(previous) <= std::time::Duration::from_millis(400)
+                    }) {
+                        state.drag = None;
+                        shell.publish(self.resize(self.default_width));
+                        shell.publish((self.on_finish)());
+                        shell.capture_event();
+                        return;
+                    }
+                    state.last_click = Some(now);
                     state.begin_drag(position.x, self.width);
                     shell.capture_event();
                     return;
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                shell.request_redraw();
                 if let Some(width) = state.dragged_width(self.edge, position.x) {
+                    state.last_click = None;
                     shell.publish(self.resize(width));
                     shell.capture_event();
                     return;
@@ -283,6 +304,16 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
                 if dragging || keyboard_gesture {
                     shell.publish((self.on_finish)());
                 }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) if state.drag.is_some() => {
+                let origin = state.drag.take().expect("active resize gesture");
+                shell.publish(self.resize(origin.width));
+                shell.publish((self.on_finish)());
+                shell.capture_event();
+                return;
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -359,14 +390,14 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
         if !layout.bounds().intersects(viewport) {
             return;
         }
         let scale = style.scale_factor as f32;
-        let bounds = crate::separator::physical_bounds(
+        let mut bounds = crate::separator::physical_bounds(
             layout.bounds(),
             layout.virtual_offset(),
             scale,
@@ -377,11 +408,18 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         // component-level divider and pre-compositing against the window
         // background both rendered a brighter, stronger line than every
         // sibling border.
-        let color: Color = if tree.state.downcast_ref::<SplitterState>().is_focused {
-            theme.current_container().component.on.into()
+        let state = tree.state.downcast_ref::<SplitterState>();
+        let active = !self.modal_open
+            && (state.drag.is_some() || cursor.is_over(Self::hit_bounds(layout.bounds())));
+        let color: Color = if active || state.is_focused {
+            crate::design::accent_color(theme)
         } else {
             crate::design::rule(theme)
         };
+        if active {
+            bounds.x -= 1.0;
+            bounds.width = 3.0;
+        }
         renderer.fill_quad(
             renderer::Quad {
                 bounds,

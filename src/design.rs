@@ -30,6 +30,15 @@ pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 /// this role - navigation rows, panel rows, header status - uses this token, so
 /// the same role cannot be 16px in one pane and 14px in the next.
 pub const ROW_ICON_SIZE: u16 = 16;
+pub const TAB_STATUS_ICON_SIZE: u16 = 14;
+pub const WINDOW_CONTROL_SIZE: f32 = 32.0;
+pub const COMMAND_POPOVER_WIDTH: f32 = 292.0;
+pub const NOTICE_POPOVER_WIDTH: f32 = 408.0;
+pub const PANE_NAVIGATOR_MIN_WIDTH: f32 = 42.0;
+pub const PANE_NAVIGATOR_RESERVED_WIDTH: f32 = 110.0;
+pub const TAB_MIN_WIDTH: f32 = 160.0;
+pub const TAB_MAX_WIDTH: f32 = 280.0;
+pub const PULL_REQUEST_BROWSER_ROW_HEIGHT: f32 = 48.0;
 /// Icons that stand alone as the illustration of a whole pane state.
 pub const STATUS_ICON_SIZE: u16 = 20;
 /// A control that sits inside prose rather than in a toolbar, and its icon.
