@@ -262,6 +262,9 @@ pub(crate) struct HostState {
     pub(super) control_gate: Arc<RwLock<()>>,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
+    /// Where this daemon's upgrade handoff keeps durable evidence, including
+    /// retained conversations a restore could not reattach.
+    upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
 }
 
 /// A checkpoint saved and awaiting this daemon's exit.
@@ -318,6 +321,7 @@ impl HostState {
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
+            upgrade_evidence: None,
         }
     }
 
@@ -2217,7 +2221,9 @@ fn apply_size(
 }
 
 /// Runs while HostLease is held, before binding the public listener.
-pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
+/// Returns the retained native conversations this restore left unattached:
+/// their reattachment was just refused, so startup must not retry it at once.
+pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, String> {
     restore_upgrade_from(
         host,
         crate::upgrade::handoff::Store::discover()?,
@@ -2359,10 +2365,27 @@ fn restore_upgrade_from(
     store: crate::upgrade::handoff::Store,
     proc_root: &std::path::Path,
     holders: Option<&std::path::Path>,
-) -> Result<(), String> {
-    use crate::upgrade::{ensure_no_surviving_process, handoff::Phase};
+) -> Result<Vec<TerminalId>, String> {
+    use crate::upgrade::{
+        ensure_no_surviving_process,
+        handoff::{Phase, UnattachedChat},
+    };
+    let store = Arc::new(store);
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence = None;
+    forget_departed_unattached(&store);
+    // Reattachment and close retire unattached evidence only once published
+    // here. A chat reattached mid-restore is retired with the restore's own
+    // record instead, so a failed restore never loses an earlier entry.
+    let publish = || {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upgrade_evidence = Some(store.clone());
+    };
     let Some(mut checkpoint) = store.load()? else {
-        return Ok(());
+        publish();
+        return Ok(Vec::new());
     };
     checkpoint.validate()?;
     if checkpoint.chats.iter().any(|chat| {
@@ -2411,11 +2434,13 @@ fn restore_upgrade_from(
             checkpoint = %store.path.display(),
             "skipped upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
         );
-        return Ok(());
+        return Ok(Vec::new());
     }
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     let mut adopted = Vec::new();
+    let mut unattached = Vec::new();
+    let mut reattached = Vec::new();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
@@ -2462,17 +2487,50 @@ fn restore_upgrade_from(
         }) {
             restore_orphaned_holders(host)?;
         }
+        // Each retained conversation has its own provider holder, which a
+        // refused reattachment leaves untouched: nothing was started, relaunched
+        // or resent for it. So one refusal, such as Codex no longer finding the
+        // thread's rollout, is that conversation's problem to report, not a
+        // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if matches!(
+            if !matches!(
                 chat.source.native_continuity,
                 crate::chat::NativeContinuity::Durable { .. }
             ) {
-                super::chat::restore_upgrade(host, chat)?;
+                continue;
+            }
+            if crate::daemon::termination_requested() {
+                return Err(RESTORE_TERMINATED.to_owned());
+            }
+            if let Err(reason) = super::chat::restore_upgrade(host, chat) {
+                if crate::daemon::termination_requested() {
+                    return Err(RESTORE_TERMINATED.to_owned());
+                }
+                tracing::warn!(session = %chat.source.id, %reason,
+                    "retained native conversation could not be reattached after the upgrade; its holder and checkpoint evidence were kept and nothing was restarted or resent");
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .native_adoption_failures
+                    .remember_upgrade(chat, &reason);
+                unattached.push(UnattachedChat::new(chat.clone(), reason));
+            } else {
+                reattached.push(chat.source.id);
             }
         }
         for terminal in &checkpoint.terminals {
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
+            }
+            // An unattached conversation's paired view would reconnect to its
+            // retained server as a new, unowned client. Keep it as evidence.
+            if let Some(chat) = unattached
+                .iter_mut()
+                .find(|chat| chat.summary.id == terminal.source.id)
+            {
+                tracing::warn!(terminal = %terminal.source.id,
+                    "not relaunching the paired view of an unattached native conversation; its checkpoint entry was kept as evidence");
+                chat.terminal = Some(terminal.clone());
+                continue;
             }
             let mut session = terminal.source.clone();
             session.launch = terminal.recipe.clone();
@@ -2515,6 +2573,9 @@ fn restore_upgrade_from(
             }
             super::chat::restore_upgrade(host, chat)?;
         }
+        // Until this is durable, the checkpoint is the only record of what
+        // was left unattached, so it must be written before that is consumed.
+        store.record_unattached(&unattached, &reattached)?;
         Ok::<_, String>(())
     })();
     if let Err(error) = restored {
@@ -2534,14 +2595,93 @@ fn restore_upgrade_from(
                 %error,
                 "abandoned upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
         return Err(format!(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
             store.path.display()
         ));
     }
-    store.remove()
+    store.remove()?;
+    publish();
+    if !unattached.is_empty() {
+        tracing::warn!(
+            conversations = unattached.len(),
+            evidence = %store.unattached_path().display(),
+            "the daemon upgrade finished, but retained native conversations need attention"
+        );
+    }
+    Ok(unattached.iter().map(|chat| chat.summary.id).collect())
+}
+
+/// Forgets unattached conversations whose native holder no longer exists,
+/// as after a reboot or once the holder itself exited: nothing in cagents can
+/// reattach or close them any more, so they would otherwise warn forever.
+/// Their identity stays in the log for manual recovery from provider storage.
+fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let conversations = match store.unattached() {
+        Ok(conversations) if conversations.is_empty() => return,
+        Ok(conversations) => conversations,
+        Err(error) => {
+            tracing::warn!(%error, "cannot read unattached-conversation evidence");
+            return;
+        }
+    };
+    let directory = match registry::directory(Kind::Native) {
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::warn!(%error, "cannot inspect native holders for unattached conversations");
+            return;
+        }
+    };
+    let departed = conversations
+        .iter()
+        .filter(|conversation| {
+            let gone = match registry::evidence(
+                &registry::socket(&directory, conversation.id),
+                Kind::Native,
+            ) {
+                Ok(None) => true,
+                // A record outliving its holder process, as after that holder
+                // was killed, leaves nothing to reattach or close either.
+                Ok(Some(record)) => !record.holder.is_current(),
+                Err(error) => {
+                    tracing::warn!(session = %conversation.id, %error,
+                        "kept unattached conversation whose holder evidence cannot be read");
+                    false
+                }
+            };
+            if gone {
+                tracing::warn!(session = %conversation.id,
+                    conversation = ?conversation.conversation,
+                    working_directory = %conversation.working_directory.display(),
+                    "the native holder of an unattached conversation is gone; reopen it from its provider's session storage if it is still wanted");
+            }
+            gone
+        })
+        .map(|conversation| conversation.id)
+        .collect::<Vec<_>>();
+    if let Err(error) = store.record_unattached(&[], &departed) {
+        tracing::warn!(%error, "could not forget unattached conversations whose holders are gone");
+    }
+}
+
+/// Forgets that a retained native conversation was left unattached by an
+/// upgrade, once it has been reattached or explicitly closed.
+pub(super) fn retire_unattached_upgrade_chat(host: &SharedHost, id: TerminalId) {
+    let Some(store) = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_evidence
+        .clone()
+    else {
+        return;
+    };
+    if let Err(error) = store.retire_unattached(id) {
+        tracing::warn!(session = %id, %error,
+            "could not retire resolved unattached-conversation evidence");
+    }
 }
 
 /// How many times a carried terminal's holder is asked for it before the

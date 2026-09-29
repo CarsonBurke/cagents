@@ -43,6 +43,28 @@ impl AdoptionFailures {
             .map(|failure| failure.reason.as_str())
     }
 
+    /// Explains a refusal to every descriptor a trusted upgrade checkpoint
+    /// issued for this conversation, unless its authenticated holder already
+    /// did. A refusal can precede holder authentication, as when the holder
+    /// is gone, and the checkpoint is then the only authority on its aliases.
+    pub(in crate::host) fn remember_upgrade(
+        &mut self,
+        saved: &crate::upgrade::handoff::Chat,
+        reason: &str,
+    ) {
+        if self.get(&saved.source).is_some() {
+            return;
+        }
+        let sources = saved
+            .previous_sources
+            .iter()
+            .map(|previous| &previous.source)
+            .chain(std::iter::once(&saved.source))
+            .filter_map(Self::source_key)
+            .collect();
+        self.remember(saved.source.id, sources, reason);
+    }
+
     pub(super) fn clear(&mut self, id: TerminalId) {
         self.0.retain(|failure| failure.id != id);
     }
@@ -126,6 +148,10 @@ fn restore_reserved(
         Err(reason) => state
             .native_adoption_failures
             .remember(source.id, sources, reason),
+    }
+    drop(state);
+    if result.is_ok() {
+        super::super::state::retire_unattached_upgrade_chat(host, source.id);
     }
     result
 }
@@ -364,7 +390,14 @@ fn retained_upgrade_sources(
         .collect()
 }
 
-pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), String> {
+/// `refused` names conversations whose reattachment this startup already
+/// attempted and refused, as an upgrade restore's unattached ones: retrying
+/// them at once would only repeat that refusal after another confirmation
+/// wait. A later discovery still considers them.
+pub(in crate::host) fn restore_orphaned_native(
+    host: &SharedHost,
+    refused: &[TerminalId],
+) -> Result<(), String> {
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -372,6 +405,9 @@ pub(in crate::host) fn restore_orphaned_native(host: &SharedHost) -> Result<(), 
         .clone();
     let directory = registry::directory(Kind::Native)?;
     for record in registry::discover(&directory, &proof.boot_id, Kind::Native)? {
+        if refused.contains(&record.terminal) {
+            continue;
+        }
         if host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
