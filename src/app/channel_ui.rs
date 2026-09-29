@@ -176,6 +176,9 @@ pub enum Action {
     Open(ChannelId),
     /// Deletes an empty channel immediately; live sessions require confirmation.
     Delete(ChannelId),
+    /// Always asks first, even for an empty channel: a stray keystroke on a
+    /// focused row must never delete it outright.
+    RequestDelete(ChannelId),
     ConfirmDelete,
     Dismiss,
     SessionsClosed(ChannelId, Result<(), String>),
@@ -390,41 +393,8 @@ impl Cagents {
             // nothing, and this refuses anything that raced it.
             Action::Open(id) if self.channel_ui.is_deleting(id) => Task::none(),
             Action::Open(id) => self.open_channel_with_default(id),
-            Action::Delete(id) => {
-                if self.channel_ui.is_deleting(id) {
-                    return Task::none();
-                }
-                let Some(channel) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == id)
-                else {
-                    return Task::none();
-                };
-                let title = channel_display_title(channel).to_owned();
-                let chats = channel
-                    .cards
-                    .iter()
-                    .filter(|card| {
-                        self.durable.cards.iter().any(|state| {
-                            state.id == **card
-                                && state.existence.is_open()
-                                && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                        })
-                    })
-                    .count();
-                if chats == 0 {
-                    return self.delete_channel(id);
-                }
-                self.channel_ui.dialog = Some(Deletion {
-                    channel: id,
-                    title,
-                    chats,
-                    failure: self.channel_ui.failed.get(&id).cloned(),
-                });
-                iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
-            }
+            Action::Delete(id) => self.begin_channel_deletion(id, false),
+            Action::RequestDelete(id) => self.begin_channel_deletion(id, true),
             Action::ConfirmDelete => {
                 let Some(deletion) = self.channel_ui.dialog.take() else {
                     return Task::none();
@@ -514,6 +484,50 @@ impl Cagents {
     fn is_channel_content(&self, card: CardId) -> bool {
         self.card_state(card)
             .is_none_or(|state| !state.kind.is_utility())
+    }
+
+    /// Opens a channel's delete confirmation, or deletes an empty channel at
+    /// once unless `always_confirm`.
+    fn begin_channel_deletion(&mut self, id: ChannelId, always_confirm: bool) -> Task<Message> {
+        if self.channel_ui.is_deleting(id) {
+            return Task::none();
+        }
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return Task::none();
+        };
+        let title = channel_display_title(channel).to_owned();
+        let chats = self.channel_conversation_count(channel);
+        if chats == 0 && !always_confirm {
+            return self.delete_channel(id);
+        }
+        self.channel_ui.dialog = Some(Deletion {
+            channel: id,
+            title,
+            chats,
+            failure: self.channel_ui.failed.get(&id).cloned(),
+        });
+        iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+    }
+
+    /// The open conversations - chats and terminals - that deleting
+    /// `channel` closes with it.
+    pub(super) fn channel_conversation_count(&self, channel: &ProjectChannel) -> usize {
+        channel
+            .cards
+            .iter()
+            .filter(|card| {
+                self.durable.cards.iter().any(|state| {
+                    state.id == **card
+                        && state.existence.is_open()
+                        && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
+                })
+            })
+            .count()
     }
 
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
@@ -735,25 +749,18 @@ impl Cagents {
                 "The last attempt failed: {failure}"
             )));
         }
-        rows.push(
-            widget::row::with_children(vec![
-                iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
-                    .id(widget::Id::new("dialog.channel.close"))
-                    .on_press(Message::ChannelUi(Action::Dismiss))
-                    .into(),
-                widget::button::destructive(if dialog.failure.is_some() {
-                    "Retry delete"
-                } else {
-                    "Delete channel"
-                })
-                .id(State::focus_target())
-                .on_press(Message::ChannelUi(Action::ConfirmDelete))
-                .into(),
-            ])
-            .spacing(cosmic::theme::spacing().space_xxs)
-            .into(),
-        );
+        rows.push(super::dialog_ui::confirmation_actions(
+            widget::button::standard("Cancel")
+                .id(widget::Id::new("dialog.channel.close"))
+                .on_press(Message::ChannelUi(Action::Dismiss)),
+            widget::button::destructive(if dialog.failure.is_some() {
+                "Retry delete"
+            } else {
+                "Delete channel"
+            })
+            .id(State::focus_target())
+            .on_press(Message::ChannelUi(Action::ConfirmDelete)),
+        ));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
             480.0,

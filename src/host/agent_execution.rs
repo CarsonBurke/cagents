@@ -181,6 +181,39 @@ fn dispatch_accepted_with_directory(
     Ok(())
 }
 
+/// The provider's own launch arguments for a new agent's settings, in the
+/// spelling its native chat adapter translates. Each is applied before the
+/// provider can receive a prompt, so the first turn already runs with it.
+fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
+    use crate::agent::Provider;
+    let mut arguments = Vec::new();
+    if let Some(model) = &spec.model {
+        arguments.extend(["--model".into(), model.clone()]);
+    }
+    if let Some(mode) = &spec.permission_mode {
+        let flag = match spec.provider {
+            Provider::Claude => "--permission-mode",
+            Provider::Omp => "--approval-mode",
+            Provider::Codex => "--ask-for-approval",
+        };
+        arguments.extend([flag.into(), mode.clone()]);
+    }
+    if let Some(effort) = &spec.reasoning_effort {
+        arguments.extend(match spec.provider {
+            Provider::Claude => ["--effort".into(), effort.clone()],
+            Provider::Omp => ["--thinking".into(), effort.clone()],
+            Provider::Codex => [
+                "--config".into(),
+                format!(
+                    "{}={effort}",
+                    crate::chat::protocol::codex::REASONING_EFFORT_KEY
+                ),
+            ],
+        });
+    }
+    arguments
+}
+
 fn dispatch(
     host: &SharedHost,
     accepted: &Accepted,
@@ -282,25 +315,11 @@ fn dispatch(
         // Use each provider's existing launch policy before it can receive a
         // prompt. Post-start settings controls are unsupported by some adapters
         // and an asynchronous acknowledgement must not race the first turn.
-        if let Some(model) = &accepted.agent.spec.model {
-            session
-                .launch
-                .recipe
-                .arguments
-                .extend(["--model".into(), model.clone()]);
-        }
-        if let Some(mode) = &accepted.agent.spec.permission_mode {
-            let flag = match accepted.agent.spec.provider {
-                crate::agent::Provider::Claude => "--permission-mode",
-                crate::agent::Provider::Omp => "--approval-mode",
-                crate::agent::Provider::Codex => "--ask-for-approval",
-            };
-            session
-                .launch
-                .recipe
-                .arguments
-                .extend([flag.into(), mode.clone()]);
-        }
+        session
+            .launch
+            .recipe
+            .arguments
+            .extend(launch_options(&accepted.agent.spec));
         let proof = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())

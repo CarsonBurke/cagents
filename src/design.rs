@@ -86,8 +86,10 @@ pub const BUDGET_CRITICAL: f32 = 0.9;
 
 /// The tone a budget that is `used` full is drawn in.
 ///
-/// Detailed usage bars carry this urgency; compact radial gauges stay neutral
-/// so a row of accounts does not become a row of competing warning colors.
+/// Detailed usage bars carry this urgency at every level. Compact radial
+/// gauges stay neutral while healthy, so a row of accounts does not become a
+/// row of competing colors, and take the warning or destructive tone only
+/// once their budget is in trouble.
 pub fn budget_tone(used: f32) -> fn(&cosmic::Theme) -> cosmic::iced::Color {
     if used > BUDGET_CRITICAL {
         destructive_color

@@ -177,6 +177,7 @@ pub(super) struct SettingsContext<'a> {
     pub invalid: &'a HashMap<SettingsField, String>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
+    pub testing_notification: bool,
 }
 
 fn settings_category_controls<'a>(
@@ -185,6 +186,7 @@ fn settings_category_controls<'a>(
     context: &SettingsContext<'a>,
 ) -> Vec<Group<'a, Message>> {
     let invalid = context.invalid;
+    let testing_notification = context.testing_notification;
     match category {
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
@@ -237,7 +239,21 @@ fn settings_category_controls<'a>(
                     )
                 })
                 .collect();
-            controls.push(setting_field("Test notification", "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; test results appear in notices.", widget::button::standard("Send test notification").on_press(Message::NotificationUi(notification_ui::Action::Test)).into()));
+            controls.push(setting_field(
+                "Test notification",
+                "Your desktop controls presentation and sound. Unavailable delivery keeps attention inside cagents; the result appears in notices.",
+                widget::button::standard(if testing_notification {
+                    "Sending test notification…"
+                } else {
+                    "Send test notification"
+                })
+                .id(widget::Id::new("settings.notifications.test"))
+                .on_press_maybe(
+                    (!testing_notification)
+                        .then_some(Message::NotificationUi(notification_ui::Action::Test)),
+                )
+                .into(),
+            ));
             vec![settings_group(
                 "Agent notifications",
                 "Alerts contain the provider and folder name, never prompts or output.",

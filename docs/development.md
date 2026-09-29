@@ -230,6 +230,15 @@ The development runner uses an isolated application and settings identity.
 The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
 built executable.
 
+Desktop alerts are sent through the notification portal under the daemon's
+application ID. When the portal accepts that ID, the daemon owns it on the session
+bus and receives clicks as `org.freedesktop.Application.ActivateAction` calls
+carrying the notification server's activation token, so the compositor raises
+the window. The portal only accepts IDs with an installed desktop entry; without
+`dev.cagents.Cagents.Development.desktop`, development alerts fall back to the
+portal's `ActionInvoked` signal, which still selects the pane but may carry no
+token, and Wayland compositors such as niri then leave the window unraised.
+
 Standalone Ceditor review alerts use the shared daemon notification broker. The
 `--review-alerts` runner builds the CLI, daemon, and editor in separate feature
 lanes; the daemon starts lazily when GitHub review requests are scanned. Ordinary

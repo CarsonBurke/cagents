@@ -398,13 +398,44 @@ pub(super) fn process_request(
                 false,
             ))
         }
-        ClientRequest::NotificationPreferencesChanged { preferences, test } => {
+        ClientRequest::NotificationPreferencesChanged { preferences } => {
             if let Some(notifications) =
                 &host.lock().unwrap_or_else(|p| p.into_inner()).notifications
             {
-                notifications.reload(preferences, test);
+                notifications.reload(preferences);
             }
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::SendTestNotification => {
+            let answer = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notifications
+                .as_ref()
+                .map(|notifications| notifications.test());
+            // Waited for here, on this connection's own thread and without the
+            // host lock, so only the person who asked waits on the desktop.
+            let outcome = match answer {
+                None => crate::notifications::TestOutcome::Unavailable(
+                    "this daemon has no notification service".into(),
+                ),
+                Some(answer) => match answer.recv_timeout(crate::notifications::TEST_TIMEOUT) {
+                    Ok(outcome) => outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::notifications::TestOutcome::TimedOut
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::notifications::TestOutcome::Unavailable(
+                            "the notification service stopped".into(),
+                        )
+                    }
+                },
+            };
+            Ok((
+                ServerResponse::NotificationTest { outcome },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::AcknowledgeNotification { id } => {
             if let Some(notifications) =
