@@ -2688,9 +2688,31 @@ impl SidebarState {
     pub fn has_row_selection(&self) -> bool {
         !self.rows.is_empty()
     }
+    /// Whether the search controls narrow the list: a query, or the pull
+    /// request filter that lives beside it. Attention is not counted; its
+    /// toggle stays in the header whether or not the controls show.
+    pub fn search_filters_active(&self) -> bool {
+        !self.query.trim().is_empty() || self.filter == SidebarFilter::PullRequests
+    }
+
+    /// Hiding the search controls ends the search. A query or filter nobody
+    /// can see would keep hiding rows, and the pull request filter would keep
+    /// changing what a click on a row does, with nothing on screen to say so.
+    fn clear_search_filters(&mut self) {
+        self.query.clear();
+        if self.filter == SidebarFilter::PullRequests {
+            self.filter = SidebarFilter::All;
+        }
+    }
+
     pub fn saved_view(&self) -> SidebarView {
         SidebarView {
-            query: self.query.clone(),
+            // A hidden query is not applied, so there is nothing to restore.
+            query: if self.controls_expanded {
+                self.query.clone()
+            } else {
+                String::new()
+            },
             controls_expanded: self.controls_expanded,
             collapsed_projects: self.collapsed_projects.clone(),
             selection: self.selection,
@@ -2704,7 +2726,12 @@ impl SidebarState {
     }
 
     pub fn restore_view(&mut self, view: SidebarView) {
-        self.query = view.query;
+        // Views saved before hidden queries were dropped may still hold one.
+        self.query = if view.controls_expanded {
+            view.query
+        } else {
+            String::new()
+        };
         self.controls_expanded = view.controls_expanded;
         self.collapsed_projects = view.collapsed_projects;
         self.selection = view.selection;
@@ -2981,7 +3008,12 @@ impl SidebarState {
         match action {
             SidebarAction::SearchChanged(query) => self.query.clone_from(query),
             SidebarAction::SetFilter(filter) => self.filter = *filter,
-            SidebarAction::ToggleControls => self.controls_expanded = !self.controls_expanded,
+            SidebarAction::ToggleControls => {
+                self.controls_expanded = !self.controls_expanded;
+                if !self.controls_expanded {
+                    self.clear_search_filters();
+                }
+            }
             SidebarAction::ToggleProject(project_id) => {
                 toggle_membership(&mut self.collapsed_projects, *project_id);
             }
@@ -3576,7 +3608,7 @@ fn header<'a>(
                 "Show projects needing attention"
             },
         ));
-        let selected = state.controls_expanded || (!compact && !state.query.is_empty());
+        let selected = search_toggle_lit(state);
         let search_button = crate::interaction::tooltip(
             button::icon(crate::ui_controls::symbolic_icon("edit-find-symbolic"))
                 .class(sidebar_button_style(selected))
@@ -3586,7 +3618,12 @@ fn header<'a>(
                 .width(ICON_CONTROL_SIZE)
                 .height(ICON_CONTROL_SIZE)
                 .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
-            "Search projects",
+            // Closing the controls also ends the search, so say so.
+            if state.controls_expanded && state.search_filters_active() {
+                "Close and clear search"
+            } else {
+                "Search projects"
+            },
         );
         if compact {
             actions.push(crate::ui_controls::popover(
@@ -3641,6 +3678,12 @@ fn header<'a>(
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
     window_gestures(header)
+}
+
+/// The search toggle is lit whenever the controls narrow the list, not only
+/// while they show, so an active search can never pass for the full list.
+fn search_toggle_lit(state: &SidebarState) -> bool {
+    state.controls_expanded || state.search_filters_active()
 }
 
 /// The pane's top strip is part of the titlebar.
@@ -8404,8 +8447,9 @@ pub fn visible_selection_rows(
     rows
 }
 
-/// A compact query applies only while its search popover is available, so
-/// hiding the popover cannot leave an invisible query filtering the rail.
+/// A compact query applies only while its search popover is available.
+/// Closing the controls clears the query anyway; this keeps a query restored
+/// from an older saved view from filtering the rail invisibly.
 fn filtered_projects<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -11831,6 +11875,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hiding_the_search_controls_ends_the_search_they_held() {
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("sidebar".into()));
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
+        assert!(state.search_filters_active());
+        assert_eq!(state.saved_view().query, "sidebar");
+
+        state.apply(&SidebarAction::ToggleControls);
+        assert!(!state.controls_expanded());
+        assert_eq!(state.query(), "");
+        assert_eq!(
+            state.filter(),
+            SidebarFilter::All,
+            "a hidden pull request filter would silently change row clicks"
+        );
+        assert!(!state.search_filters_active());
+
+        // Attention keeps its own always-visible header toggle.
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::ToggleControls);
+        assert_eq!(state.filter(), SidebarFilter::Attention);
+        assert!(!state.search_filters_active());
+    }
+
+    #[test]
+    fn a_hidden_query_is_neither_saved_nor_restored() {
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("kept".into()));
+        let mut restored = SidebarState::default();
+        restored.restore_view(state.saved_view());
+        assert_eq!(restored.query(), "kept", "a visible search survives");
+
+        // A view saved before hiding cleared the query.
+        let legacy: SidebarView = serde_json::from_value(serde_json::json!({
+            "query": "stale",
+            "controls_expanded": false,
+            "collapsed_projects": [],
+            "selection": null,
+        }))
+        .unwrap();
+        let mut restored = SidebarState::default();
+        restored.restore_view(legacy);
+        assert_eq!(restored.query(), "");
+        assert_eq!(restored.saved_view().query, "");
+    }
+
+    #[test]
+    fn the_search_toggle_is_lit_while_any_search_filter_applies() {
+        for (controls_expanded, query, filter, lit) in [
+            (false, "", SidebarFilter::All, false),
+            (false, "", SidebarFilter::Attention, false),
+            (false, "  ", SidebarFilter::All, false),
+            (true, "", SidebarFilter::All, true),
+            // Neither can arise through the pane any more, but a state that
+            // holds one must still show it.
+            (false, "q", SidebarFilter::All, true),
+            (false, "", SidebarFilter::PullRequests, true),
+        ] {
+            let state = SidebarState {
+                controls_expanded,
+                query: query.into(),
+                filter,
+                ..SidebarState::default()
+            };
+            assert_eq!(
+                search_toggle_lit(&state),
+                lit,
+                "controls={controls_expanded} query={query:?} filter={filter:?}"
+            );
+        }
+    }
+
+    #[test]
     fn filtering_matches_descendants_and_attention_state() {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
@@ -12287,20 +12407,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compact_search_applies_only_while_reachable_and_pr_filter_remains_available() {
+    fn compact_search_and_pr_filter_apply_while_the_popover_is_open() {
         let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
         let mut state = SidebarState::default();
-        state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
         state.apply(&SidebarAction::ToggleControls);
+        state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
         assert_eq!(
             filtered_projects(&model, &state, true)[0].worktrees.len(),
             1
         );
-        state.apply(&SidebarAction::ToggleControls);
-        assert_eq!(
-            filtered_projects(&model, &state, true)[0].worktrees.len(),
-            2
-        );
+        state.apply(&SidebarAction::SearchChanged(String::new()));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
         let filtered = filtered_projects(&model, &state, true);
         assert_eq!(
@@ -12308,6 +12424,12 @@ pub(crate) mod tests {
             Some("fix-sidebar")
         );
         assert_eq!(filtered[0].worktrees.len(), 1);
+        // Dismissing the popover ends both.
+        state.apply(&SidebarAction::ToggleControls);
+        assert_eq!(
+            filtered_projects(&model, &state, true)[0].worktrees.len(),
+            2
+        );
     }
 
     #[test]
