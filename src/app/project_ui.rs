@@ -827,6 +827,71 @@ impl Cagents {
                     return Task::none();
                 }
                 match command {
+                    ProjectCommand::CopyPath => {
+                        return iced::clipboard::write(target.path.display().to_string());
+                    }
+                    ProjectCommand::CopyBranch
+                    | ProjectCommand::NewWorktreeFromBranch
+                    | ProjectCommand::PullRequest => {
+                        let row = self.sidebar_model.project(project_id).and_then(|project| {
+                            project
+                                .worktrees
+                                .iter()
+                                .find(|worktree| Some(worktree.id) == worktree_id)
+                        });
+                        if matches!(command, ProjectCommand::PullRequest) {
+                            if let Some(pr) = row.and_then(|row| row.pull_request()) {
+                                return self.open_clicked_link(pr.url.clone());
+                            }
+                            return self.update(Message::Sidebar(
+                                SidebarAction::CreatePullRequest {
+                                    project_id,
+                                    worktree: Some(target.path),
+                                },
+                            ));
+                        }
+                        let Some(branch) = row.and_then(|row| row.branch.clone()) else {
+                            return Task::none();
+                        };
+                        if matches!(command, ProjectCommand::CopyBranch) {
+                            return iced::clipboard::write(branch);
+                        }
+                        return self.open_worktree_dialog(
+                            project_id,
+                            target.repository,
+                            WorktreeDraft {
+                                base: branch.trim_start_matches("refs/heads/").to_owned(),
+                                ..Default::default()
+                            },
+                            None,
+                        );
+                    }
+                    ProjectCommand::MoveUp | ProjectCommand::MoveDown => {
+                        let order: Vec<_> = self
+                            .sidebar_model
+                            .projects
+                            .iter()
+                            .map(|project| project.id)
+                            .collect();
+                        let Some(index) = order.iter().position(|id| *id == project_id) else {
+                            return Task::none();
+                        };
+                        let before = if matches!(command, ProjectCommand::MoveUp) {
+                            if index == 0 {
+                                return Task::none();
+                            }
+                            Some(order[index - 1])
+                        } else {
+                            if index + 1 >= order.len() {
+                                return Task::none();
+                            }
+                            order.get(index + 2).copied()
+                        };
+                        return self.update(Message::Sidebar(SidebarAction::ReorderProject {
+                            project: project_id,
+                            before,
+                        }));
+                    }
                     ProjectCommand::OpenEditor(editor_id) => {
                         return self.launch_editor(target.path, &editor_id);
                     }
@@ -881,6 +946,12 @@ impl Cagents {
                         let select = self.select_worktree(target.path.clone(), false);
                         let terminal = self.add_terminal(target.path);
                         return Task::batch([select, terminal]);
+                    }
+                    ProjectCommand::NewChannel => {
+                        self.project_ui.dialog = None;
+                        return cosmic::task::message(Message::Sidebar(
+                            SidebarAction::NewChannel { project_id },
+                        ));
                     }
                     ProjectCommand::NewWorktree => {
                         self.project_ui.dialog = None;

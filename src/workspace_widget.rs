@@ -40,6 +40,24 @@ pub enum WorkspaceViewportEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalShortcut {
+    ToggleProjects,
+    RenamePane,
+    CommandPalette,
+    NewThread,
+    ToggleInspector,
+    OpenSettings,
+    MovePaneLeft,
+    MovePaneRight,
+    ReopenPane,
+    FocusPane1,
+    FocusPane2,
+    FocusPane3,
+    FocusPane4,
+    FocusPane5,
+    FocusPane6,
+    FocusPane7,
+    FocusPane8,
+    FocusPane9,
     NewTerminal,
     NewChannel,
     ClonePane,
@@ -113,6 +131,114 @@ pub struct ShortcutDescriptor {
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
+        action: GlobalShortcut::ToggleProjects,
+        label: "Toggle Projects sidebar",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RenamePane,
+        label: "Rename focused pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CommandPalette,
+        label: "Open command palette",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewThread,
+        label: "New thread",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ToggleInspector,
+        label: "Toggle inspector",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenSettings,
+        label: "Open settings",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MovePaneLeft,
+        label: "Move pane left",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MovePaneRight,
+        label: "Move pane right",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReopenPane,
+        label: "Reopen closed pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane1,
+        label: "Focus pane 1",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane2,
+        label: "Focus pane 2",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane3,
+        label: "Focus pane 3",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane4,
+        label: "Focus pane 4",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane5,
+        label: "Focus pane 5",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane6,
+        label: "Focus pane 6",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane7,
+        label: "Focus pane 7",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane8,
+        label: "Focus pane 8",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusPane9,
+        label: "Focus pane 9",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
         repeatable: false,
@@ -132,7 +258,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CloseFocusedCard,
-        label: "Close focused column",
+        label: "Close focused pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -144,13 +270,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
-        label: "Previous column",
+        label: "Previous pane",
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Right),
-        label: "Next column",
+        label: "Next pane",
         repeatable: true,
         scope: ShortcutScope::Workspace,
     },
@@ -220,6 +346,24 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
 /// Every configured chord; newer actions may be explicitly unbound.
 pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
+        GlobalShortcut::ToggleProjects => &shortcuts.toggle_projects,
+        GlobalShortcut::RenamePane => &shortcuts.rename_pane,
+        GlobalShortcut::CommandPalette => &shortcuts.command_palette,
+        GlobalShortcut::NewThread => &shortcuts.new_native_thread,
+        GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
+        GlobalShortcut::OpenSettings => &shortcuts.open_settings,
+        GlobalShortcut::MovePaneLeft => &shortcuts.move_pane_left,
+        GlobalShortcut::MovePaneRight => &shortcuts.move_pane_right,
+        GlobalShortcut::ReopenPane => &shortcuts.reopen_pane,
+        GlobalShortcut::FocusPane1 => &shortcuts.focus_pane_1,
+        GlobalShortcut::FocusPane2 => &shortcuts.focus_pane_2,
+        GlobalShortcut::FocusPane3 => &shortcuts.focus_pane_3,
+        GlobalShortcut::FocusPane4 => &shortcuts.focus_pane_4,
+        GlobalShortcut::FocusPane5 => &shortcuts.focus_pane_5,
+        GlobalShortcut::FocusPane6 => &shortcuts.focus_pane_6,
+        GlobalShortcut::FocusPane7 => &shortcuts.focus_pane_7,
+        GlobalShortcut::FocusPane8 => &shortcuts.focus_pane_8,
+        GlobalShortcut::FocusPane9 => &shortcuts.focus_pane_9,
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::NewChannel => &shortcuts.new_channel,
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,
@@ -2146,6 +2290,7 @@ mod tests {
 
         let mut customized = shortcuts;
         customized.new_terminal = vec!["Ctrl+Shift+N".to_owned()];
+        customized.new_native_thread.clear();
         assert_eq!(
             global_shortcut(
                 &key_press("n", Code::KeyN, ctrl_shift, false),
@@ -2293,6 +2438,7 @@ mod tests {
         let mut shortcuts = KeyboardShortcuts {
             clone_pane: vec!["Alt+Shift+E".into()],
             new_channel: vec!["Ctrl+Shift+N".into()],
+            new_native_thread: vec![],
             ..KeyboardShortcuts::default()
         };
         for (character, code, default_character, default_code, action) in [

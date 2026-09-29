@@ -213,6 +213,19 @@ pub fn context_menu<'a, Message: Clone + 'static>(
 }
 
 /// Blocks click-through without hiding the child's accessibility tree.
+pub fn context_menu_lazy<'a, Message: Clone + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::lazy_surface(builder)),
+        kind: Kind::ContextMenu,
+        tip: None,
+    }
+    .into()
+}
+
+/// Blocks click-through without hiding the child's accessibility tree.
 pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     Effect {
         content: content.into(),

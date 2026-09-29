@@ -24,7 +24,7 @@ pub(super) fn worktree_directory_available(path: &Path) -> bool {
     }
 }
 
-fn card_directory(card: &CardState) -> Option<&Path> {
+pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
     match &card.kind {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),

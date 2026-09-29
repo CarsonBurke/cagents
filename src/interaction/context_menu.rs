@@ -24,6 +24,22 @@ pub(super) fn surface<'a, Message: Clone + 'static>(
             Some(menu),
         ),
         items,
+        builder: None,
+    })
+}
+
+pub(super) fn lazy_surface<'a, Message: Clone + 'static>(
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Element::new(MenuSurface {
+        native: widget::context_menu(
+            cosmic::iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+            Some(Vec::new()),
+        ),
+        items: 0,
+        builder: Some(Box::new(builder)),
     })
 }
 
@@ -38,9 +54,22 @@ struct MenuItems(usize);
 struct MenuSurface<'a, Message> {
     native: widget::ContextMenu<'a, Message>,
     items: usize,
+    builder: Option<Box<dyn Fn() -> Vec<widget::menu::Tree<Message>> + 'a>>,
 }
 
 impl<Message: Clone + 'static> MenuSurface<'_, Message> {
+    fn build_menu(&mut self) {
+        if let Some(builder) = &self.builder {
+            let menu = builder();
+            self.items = menu.len();
+            self.native = widget::context_menu(
+                cosmic::iced::widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+                Some(menu),
+            );
+        }
+    }
     /// The native widget's own tree, as `ContextMenu::diff` leaves it.
     ///
     /// `ContextMenu::children` also declares the legacy menu subtree, which the
@@ -71,6 +100,9 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
     }
 
     fn diff(&mut self, tree: &mut Tree) {
+        if tree.state.downcast_ref::<MenuItems>().0 > 0 {
+            self.build_menu();
+        }
         // An open menu measures its items once, at the click that opens it, and
         // then keeps that geometry in the state its overlay reads every frame.
         // The roots the overlay walks are this frame's, though: `ContextMenu::
@@ -134,6 +166,11 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             .intersection(viewport)
             .is_some_and(|bounds| cursor.is_over(bounds));
         if opening {
+            if self.builder.is_some() && self.items == 0 {
+                self.build_menu();
+                tree.state.downcast_mut::<MenuItems>().0 = self.items;
+                tree.children = vec![self.native_tree()];
+            }
             self.native.diff(&mut tree.children[0]);
         }
         // The native widget records the anchor it opens at from this cursor,
@@ -205,19 +242,25 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         viewport: &Rectangle,
         _translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        if self.builder.is_some() && self.items == 0 {
+            return None;
+        }
         // The anchor is already a window-space point, which is the space the
         // runtime drives overlays in, so the native menu needs no translation:
         // it derives one offset for its layout and the opposite one for its
         // hit tests, and the two only agree at none at all.
-        self.native
-            .overlay(
-                &mut tree.children[0],
-                layout,
-                renderer,
-                viewport,
-                Vector::ZERO,
-            )
-            .map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner })))
+        let native = self.native.overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            Vector::ZERO,
+        );
+        if native.is_none() && self.builder.is_some() {
+            tree.state.downcast_mut::<MenuItems>().0 = 0;
+            self.items = 0;
+        }
+        native.map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner })))
     }
 }
 

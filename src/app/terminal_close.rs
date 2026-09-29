@@ -328,6 +328,7 @@ impl Cagents {
     ) -> Option<Task<Message>> {
         let handoff = self.workspace.pending_close();
         let replacing = replacement.is_some();
+        let closed_descriptor = (!replacing).then(|| self.card_state(id).cloned()).flatten();
         let update = match self.workspace.commit_close(id) {
             Ok(update) => update,
             Err(error) => {
@@ -338,6 +339,13 @@ impl Cagents {
         // Read before anything persists the scope, which prunes the
         // closed card from its channel's membership.
         let emptied = self.channels_emptied_by(&[id]);
+        if let Some(card) = closed_descriptor {
+            self.recently_closed
+                .push((card, self.active_workspace_destination()));
+            if self.recently_closed.len() > 32 {
+                self.recently_closed.remove(0);
+            }
+        }
         self.retire_lsp_card(id);
         self.sidebar_state.clear_agent_activity(id);
         self.sidebar_state.acknowledge_agent_update(id);

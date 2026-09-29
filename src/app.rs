@@ -16,6 +16,7 @@ mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
@@ -2030,6 +2031,8 @@ pub enum ContextTab {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowView {
     #[serde(default)]
+    user_titles: HashMap<CardId, String>,
+    #[serde(default)]
     projects_sidebar_collapsed: bool,
     sidebar_width: f32,
     inspector_width: f32,
@@ -2618,6 +2621,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    DiffHideUnchanged,
     ChatEnterSends,
     ShowStatusBar,
     RelaunchAgentsOnUpgrade,
@@ -2642,6 +2646,24 @@ pub enum SettingsField {
     ShortcutReviewNextUnviewed,
     ShortcutReviewNextChange,
     ShortcutReviewPreviousChange,
+    ShortcutCommandPalette,
+    ShortcutNewThread,
+    ShortcutToggleInspector,
+    ShortcutOpenSettings,
+    ShortcutMovePaneLeft,
+    ShortcutMovePaneRight,
+    ShortcutReopenPane,
+    ShortcutFocusPane1,
+    ShortcutFocusPane2,
+    ShortcutFocusPane3,
+    ShortcutFocusPane4,
+    ShortcutFocusPane5,
+    ShortcutFocusPane6,
+    ShortcutFocusPane7,
+    ShortcutFocusPane8,
+    ShortcutFocusPane9,
+    ShortcutToggleProjects,
+    ShortcutRenamePane,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2659,6 +2681,24 @@ enum SettingsFeedback {
 /// typed it. The parsed form lives in `AppSettings`; this is only the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
+    toggle_projects: String,
+    rename_pane: String,
+    command_palette: String,
+    new_native_thread: String,
+    toggle_inspector: String,
+    open_settings: String,
+    move_pane_left: String,
+    move_pane_right: String,
+    reopen_pane: String,
+    focus_pane_1: String,
+    focus_pane_2: String,
+    focus_pane_3: String,
+    focus_pane_4: String,
+    focus_pane_5: String,
+    focus_pane_6: String,
+    focus_pane_7: String,
+    focus_pane_8: String,
+    focus_pane_9: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -2680,6 +2720,24 @@ struct ShortcutDraft {
 impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
+            toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
+            rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            command_palette: settings::format_chords(&shortcuts.command_palette),
+            new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
+            toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
+            open_settings: settings::format_chords(&shortcuts.open_settings),
+            move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
+            move_pane_right: settings::format_chords(&shortcuts.move_pane_right),
+            reopen_pane: settings::format_chords(&shortcuts.reopen_pane),
+            focus_pane_1: settings::format_chords(&shortcuts.focus_pane_1),
+            focus_pane_2: settings::format_chords(&shortcuts.focus_pane_2),
+            focus_pane_3: settings::format_chords(&shortcuts.focus_pane_3),
+            focus_pane_4: settings::format_chords(&shortcuts.focus_pane_4),
+            focus_pane_5: settings::format_chords(&shortcuts.focus_pane_5),
+            focus_pane_6: settings::format_chords(&shortcuts.focus_pane_6),
+            focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
+            focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
+            focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -2724,6 +2782,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
     chat_enter_sends: bool,
@@ -2772,6 +2831,7 @@ impl SettingsDraft {
             default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
+            diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
             chat_enter_sends: settings.chat_enter_sends,
             show_status_bar: settings.show_status_bar,
@@ -2816,6 +2876,7 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
+            SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
@@ -2844,6 +2905,30 @@ impl SettingsDraft {
                 };
             }
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
+            SettingsField::ShortcutToggleProjects => {
+                self.keyboard_shortcuts.toggle_projects = value
+            }
+            SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutCommandPalette => {
+                self.keyboard_shortcuts.command_palette = value
+            }
+            SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_native_thread = value,
+            SettingsField::ShortcutToggleInspector => {
+                self.keyboard_shortcuts.toggle_inspector = value
+            }
+            SettingsField::ShortcutOpenSettings => self.keyboard_shortcuts.open_settings = value,
+            SettingsField::ShortcutMovePaneLeft => self.keyboard_shortcuts.move_pane_left = value,
+            SettingsField::ShortcutMovePaneRight => self.keyboard_shortcuts.move_pane_right = value,
+            SettingsField::ShortcutReopenPane => self.keyboard_shortcuts.reopen_pane = value,
+            SettingsField::ShortcutFocusPane1 => self.keyboard_shortcuts.focus_pane_1 = value,
+            SettingsField::ShortcutFocusPane2 => self.keyboard_shortcuts.focus_pane_2 = value,
+            SettingsField::ShortcutFocusPane3 => self.keyboard_shortcuts.focus_pane_3 = value,
+            SettingsField::ShortcutFocusPane4 => self.keyboard_shortcuts.focus_pane_4 = value,
+            SettingsField::ShortcutFocusPane5 => self.keyboard_shortcuts.focus_pane_5 = value,
+            SettingsField::ShortcutFocusPane6 => self.keyboard_shortcuts.focus_pane_6 = value,
+            SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
+            SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
+            SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -2909,6 +2994,78 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::ShortcutToggleProjects => {
+            next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRenamePane => {
+            next.keyboard_shortcuts.rename_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCommandPalette => {
+            next.keyboard_shortcuts.command_palette = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNewThread => {
+            next.keyboard_shortcuts.new_native_thread = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutToggleInspector => {
+            next.keyboard_shortcuts.toggle_inspector = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenSettings => {
+            next.keyboard_shortcuts.open_settings = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMovePaneLeft => {
+            next.keyboard_shortcuts.move_pane_left = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMovePaneRight => {
+            next.keyboard_shortcuts.move_pane_right = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReopenPane => {
+            next.keyboard_shortcuts.reopen_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane1 => {
+            next.keyboard_shortcuts.focus_pane_1 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane2 => {
+            next.keyboard_shortcuts.focus_pane_2 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane3 => {
+            next.keyboard_shortcuts.focus_pane_3 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane4 => {
+            next.keyboard_shortcuts.focus_pane_4 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane5 => {
+            next.keyboard_shortcuts.focus_pane_5 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane6 => {
+            next.keyboard_shortcuts.focus_pane_6 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane7 => {
+            next.keyboard_shortcuts.focus_pane_7 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane8 => {
+            next.keyboard_shortcuts.focus_pane_8 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusPane9 => {
+            next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::Notifications(field) => value
             .parse::<bool>()
             .map(|enabled| next.notifications.set(field, enabled))
@@ -2965,6 +3122,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
             .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
+        SettingsField::DiffHideUnchanged => value
+            .parse::<bool>()
+            .map(|enabled| next.diff_hide_unchanged = enabled)
+            .map_err(|_| "Choose whether unchanged diff lines are folded.".to_owned()),
         SettingsField::AppTheme => AppTheme::from_key(value)
             .map(|theme| next.app_theme = theme)
             .ok_or_else(|| "Choose one of the listed app themes.".to_owned()),
@@ -3078,6 +3239,12 @@ fn settings_update(
             _ => Err("Choose a link-opening gesture.".to_owned()),
         },
         SettingsField::ShortcutNewTerminal => {
+            next.keyboard_shortcuts.command_palette =
+                next.keyboard_shortcuts.command_palette.clone();
+            next.keyboard_shortcuts.toggle_inspector =
+                next.keyboard_shortcuts.toggle_inspector.clone();
+            next.keyboard_shortcuts.move_pane_right =
+                next.keyboard_shortcuts.move_pane_right.clone();
             next.keyboard_shortcuts.new_terminal = settings::parse_chords(value);
             Ok(())
         }
@@ -3169,6 +3336,8 @@ fn settings_update(
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Palette(palette_ui::Action),
+    RunCommand(workspace_widget::GlobalShortcut),
     /// A worktree snapshot for the source-control panel.
     ///
     /// `key` is the binding the request was made against. The panel rebinds
@@ -3509,6 +3678,7 @@ impl ApplicationExit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirtyCloseIntent {
+    PaneGroup,
     Card(CardId),
     Application(window::Id),
 }
@@ -3704,6 +3874,7 @@ struct CardLabels {
 /// is renamed instead of once per rendered frame. Reusing an id also keeps the
 /// card's accessibility node stable across frames.
 struct CardChrome {
+    tooltip: String,
     focus_id: widget::Id,
     title_id: widget::Id,
     container_id: widget::Id,
@@ -3734,6 +3905,11 @@ impl CardChrome {
         shortcuts: &KeyboardShortcuts,
     ) -> Self {
         Self {
+            tooltip: if caption.is_empty() {
+                title.to_owned()
+            } else {
+                format!("{title}\n{caption}")
+            },
             focus_id: workspace_widget::card_focus_id(id),
             title_id: card_control_id(id, "title"),
             container_id: workspace_widget::card_widget_id(id),
@@ -3880,6 +4056,10 @@ pub struct Cagents {
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
     card_chrome: HashMap<CardId, CardChrome>,
+    card_indices: HashMap<CardId, usize>,
+    navigation_cache: sidebar::NavigationCache,
+    palette: palette_ui::State,
+    recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     lifecycle: LifecycleManager,
     /// The shared language-server client. One manager serves every card; a
     /// session is per project root, not per card, so two cards in one worktree
@@ -4908,10 +5088,15 @@ impl Cagents {
         if self.workspace_inputs_blocked() || self.focused_repository_is_saving() {
             return Task::none();
         }
-        let Some(source) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
+        let Some(source) = self
+            .workspace
+            .focused()
+            .and_then(|id| self.card_state(id))
+            .cloned()
+        else {
             return Task::none();
         };
-        if self.project_ui.deleting_card(source) {
+        if self.project_ui.deleting_card(&source) {
             return Task::none();
         }
         // A window holds one of each utility pane; a copy would show the
@@ -4919,12 +5104,17 @@ impl Cagents {
         if !source.existence.is_open() || source.kind.is_utility() {
             return Task::none();
         }
+        self.duplicate_pane(source)
+    }
+
+    fn duplicate_pane(&mut self, source: CardState) -> Task<Message> {
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
         }
-        let mut card = source.clone();
+        let mut card = source;
         card.id = CardId::new();
+        card.existence = Existence::Open;
         card.generation = self.durable.generation;
         card.exposure = Exposure::Visible;
         card.residency = Residency::Hydrating { epoch: 1 };
@@ -6087,16 +6277,28 @@ impl Cagents {
     }
 
     fn card_state(&self, id: CardId) -> Option<&CardState> {
-        self.durable.cards.iter().find(|card| card.id == id)
+        self.card_index(id)
+            .and_then(|index| self.durable.cards.get(index))
+    }
+
+    fn card_index(&self, id: CardId) -> Option<usize> {
+        self.card_indices
+            .get(&id)
+            .copied()
+            .filter(|index| {
+                self.durable
+                    .cards
+                    .get(*index)
+                    .is_some_and(|card| card.id == id)
+            })
+            .or_else(|| self.durable.cards.iter().position(|card| card.id == id))
     }
 
     /// Copy-on-write access; callers must confirm a change is needed first, as
     /// this clones the workspace while the writer thread holds the last snapshot.
     fn card_state_mut(&mut self, id: CardId) -> Option<&mut CardState> {
-        Arc::make_mut(&mut self.durable)
-            .cards
-            .iter_mut()
-            .find(|card| card.id == id)
+        let index = self.card_index(id)?;
+        Arc::make_mut(&mut self.durable).cards.get_mut(index)
     }
 
     /// Renames a card to the title its own runtime reported, and answers whether
@@ -6107,6 +6309,31 @@ impl Cagents {
     /// Storing it would blank the card header, the card's accessible name and
     /// the window title all at once, so the card keeps the name it already had.
     fn apply_reported_title(&mut self, id: CardId, title: String) -> bool {
+        if self.chrome_ui.user_titles.contains_key(&id) {
+            return false;
+        }
+        let title = if title.starts_with('/') || title.starts_with("~/") {
+            self.card_state(id)
+                .and_then(|state| match &state.kind {
+                    CardKind::Terminal(session) => {
+                        let process = Path::new(&session.launch.program)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        let directory = session
+                            .launch
+                            .working_directory
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        Some(format!("{process} · {directory}"))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(title)
+        } else {
+            title
+        };
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
@@ -6125,6 +6352,14 @@ impl Cagents {
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
+        self.card_indices.clear();
+        self.card_indices.extend(
+            self.durable
+                .cards
+                .iter()
+                .enumerate()
+                .map(|(index, card)| (card.id, index)),
+        );
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
             let (title, file_caption) = self.repository_chrome(card);
@@ -6170,13 +6405,24 @@ impl Cagents {
             && let Some(name) = path.file_name()
         {
             return (
-                name.to_string_lossy(),
+                self.chrome_ui.user_titles.get(&card.id).map_or_else(
+                    || name.to_string_lossy(),
+                    |title| Cow::Borrowed(title.as_str()),
+                ),
                 Some(Cow::Owned(
                     display_path(&runtime.descriptor.worktree.join(path)).into_owned(),
                 )),
             );
         }
-        (Cow::Borrowed(&card.title), None)
+        (
+            Cow::Borrowed(
+                self.chrome_ui
+                    .user_titles
+                    .get(&card.id)
+                    .unwrap_or(&card.title),
+            ),
+            None,
+        )
     }
 
     /// Names the window and its header bar after whatever the window is showing.
@@ -7959,35 +8205,141 @@ impl Cagents {
             self.workspace_history = previous_history;
             return Task::none();
         }
-        let destination = WorkspaceDestination::from_action(&action);
-        let previous_pane = self.workspace.focused();
-        self.sidebar_state.apply(&action);
-        // Select synchronously: the next key event must see this preview,
-        // rather than queue another selection against an unchanged workspace.
-        let task = match action {
-            SidebarAction::OpenRepository { repository, .. } => {
-                self.select_worktree(repository, true)
-            }
-            SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
-            SidebarAction::OpenChannel { channel_id } => {
-                self.handle_channel_ui(channel_ui::Action::Open(channel_id))
-            }
-            _ => {
-                unreachable!("workspace destinations only contain folders, worktrees and channels")
-            }
-        };
-        if self.active_workspace_destination() != destination {
-            self.workspace_history = previous_history;
-            return task;
-        }
-        self.tab_history.finish(previous_pane);
+        self.chrome_ui.workspace_preview = Some(action);
         self.workspace_cycle_modifiers = modifiers
             & (keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::LOGO);
         if self.workspace_cycle_modifiers.is_empty() {
-            self.workspace_history
-                .finish(self.active_workspace_destination());
+            return self.commit_workspace_preview();
         }
+        Task::none()
+    }
+
+    fn commit_workspace_preview(&mut self) -> Task<Message> {
+        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+        let action = self.chrome_ui.workspace_preview.take();
+        let task = action.map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+        self.workspace_history
+            .finish(self.active_workspace_destination());
         task
+    }
+
+    fn workspace_switcher(&self) -> Option<Element<'_, Message>> {
+        let selected =
+            WorkspaceDestination::from_action(self.chrome_ui.workspace_preview.as_ref()?);
+        let destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
+        let mut rows: Vec<Element<'_, Message>> = vec![design::heading("Switch workspace").into()];
+        for destination in self.workspace_history.cycle_order()? {
+            let Some(action) = destinations
+                .iter()
+                .find(|action| WorkspaceDestination::from_action(action) == Some(*destination))
+            else {
+                continue;
+            };
+            let (title, detail) = match action {
+                SidebarAction::OpenRepository {
+                    project_id,
+                    repository,
+                } => (
+                    self.sidebar_model.project(*project_id).map_or_else(
+                        || repository.display().to_string(),
+                        |project| project.name.clone(),
+                    ),
+                    display_path(repository).into_owned(),
+                ),
+                SidebarAction::OpenWorktree {
+                    project_id,
+                    worktree_id,
+                    path,
+                } => {
+                    let Some(project) = self.sidebar_model.project(*project_id) else {
+                        continue;
+                    };
+                    let Some(worktree) = project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == *worktree_id)
+                    else {
+                        continue;
+                    };
+                    let activity = self.sidebar_state.agent_activity(*project_id, *worktree_id);
+                    let status = match activity {
+                        Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
+                        Some(crate::agent::ActivityState::Working) => "Working",
+                        _ if self
+                            .sidebar_state
+                            .has_agent_update(*project_id, *worktree_id) =>
+                        {
+                            "Unread update"
+                        }
+                        _ => "",
+                    };
+                    (
+                        format!("{} · {}", project.name, worktree.label()),
+                        format!("{} {status}", display_path(path)),
+                    )
+                }
+                SidebarAction::OpenChannel { channel_id } => {
+                    let Some(channel) = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .flat_map(|project| &project.channels)
+                        .find(|channel| channel.id == *channel_id)
+                    else {
+                        continue;
+                    };
+                    (
+                        channel.title.clone(),
+                        if channel.unread {
+                            "Channel · Unread update"
+                        } else {
+                            "Channel"
+                        }
+                        .to_owned(),
+                    )
+                }
+                _ => continue,
+            };
+            let active = Some(*destination) == selected;
+            rows.push(
+                widget::container(
+                    widget::column::with_children(vec![
+                        design::body(title).into(),
+                        design::caption(detail).into(),
+                    ])
+                    .spacing(design::GRID_UNIT),
+                )
+                .padding(2.0 * design::GRID_UNIT)
+                .width(Length::Fill)
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: active.then(|| {
+                            iced::Background::Color(
+                                theme
+                                    .current_container()
+                                    .component
+                                    .selected_state_color()
+                                    .into(),
+                            )
+                        }),
+                        ..Default::default()
+                    }
+                }))
+                .into(),
+            );
+        }
+        rows.push(design::caption("Release the modifier to open · Escape to cancel").into());
+        Some(
+            widget::container(
+                widget::scrollable(widget::column::with_children(rows).spacing(design::GRID_UNIT))
+                    .height(Length::Shrink),
+            )
+            .class(cosmic::theme::Container::Card)
+            .padding(3.0 * design::GRID_UNIT)
+            .width(440)
+            .max_height(400)
+            .into(),
+        )
     }
 
     fn next_workspace(
@@ -9082,7 +9434,10 @@ impl Cagents {
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
-        self.modal_is_open() || self.context_inspector_is_overlay() || self.chrome_ui.is_open()
+        self.modal_is_open()
+            || self.context_inspector_is_overlay()
+            || self.chrome_ui.is_open()
+            || self.palette.is_open()
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
@@ -9535,6 +9890,7 @@ impl Cagents {
     ) -> Task<Message> {
         let Some(card) = cards.pop_front() else {
             return match intent {
+                DirtyCloseIntent::PaneGroup => self.close_pane_group(),
                 DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
@@ -9554,6 +9910,15 @@ impl Cagents {
         });
         iced::widget::operation::focus(dirty_close_control_id(card, focused))
             .map(cosmic::Action::App)
+    }
+
+    fn close_pane_group(&mut self) -> Task<Message> {
+        let cards = std::mem::take(&mut self.chrome_ui.closing_group);
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| self.begin_card_close(card))
+            .collect();
+        Task::batch(tasks)
     }
 
     fn advance_dirty_close(&mut self) -> Task<Message> {
@@ -9586,6 +9951,7 @@ impl Cagents {
             .map(cosmic::Action::App);
         }
         match close.intent {
+            DirtyCloseIntent::PaneGroup => self.close_pane_group(),
             DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
@@ -9600,6 +9966,9 @@ impl Cagents {
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
+        if matches!(close.intent, DirtyCloseIntent::PaneGroup) {
+            self.chrome_ui.closing_group.clear();
+        }
         let restore_focus = self.nested_modal_focus_target().unwrap_or_else(|| {
             resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
                 self.workspace.order().any(|candidate| candidate == card)
@@ -9824,6 +10193,7 @@ impl Cagents {
             None => settings::default_path().map_err(|error| error.to_string())?,
         };
         let mut view = WindowView {
+            user_titles: self.chrome_ui.user_titles.clone(),
             projects_sidebar_collapsed: self.chrome_ui.projects_collapsed,
             sidebar_width: self.settings.sidebar_width,
             inspector_width: self.settings.inspector_width,
@@ -10384,6 +10754,10 @@ impl Application for Cagents {
             durable: Arc::new(durable),
             cards: HashMap::new(),
             card_chrome: HashMap::new(),
+            card_indices: HashMap::new(),
+            navigation_cache: sidebar::NavigationCache::default(),
+            palette: palette_ui::State::default(),
+            recently_closed: Vec::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -10448,11 +10822,18 @@ impl Application for Cagents {
             refresh_ui: refresh_ui::State::default(),
             account_ui: account_ui::State::installation(),
             automation_ui: crate::automation_ui::State::default(),
-            chrome_ui: chrome_ui::State::default().with_projects_collapsed(
-                window_view
-                    .as_ref()
-                    .is_some_and(|view| view.projects_sidebar_collapsed),
-            ),
+            chrome_ui: chrome_ui::State::default()
+                .with_user_titles(
+                    window_view
+                        .as_ref()
+                        .map(|view| view.user_titles.clone())
+                        .unwrap_or_default(),
+                )
+                .with_projects_collapsed(
+                    window_view
+                        .as_ref()
+                        .is_some_and(|view| view.projects_sidebar_collapsed),
+                ),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -10647,8 +11028,10 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.tab_history.observe(self.workspace.focused());
-        self.workspace_history
-            .observe(self.active_workspace_destination());
+        if self.chrome_ui.workspace_preview.is_none() {
+            self.workspace_history
+                .observe(self.active_workspace_destination());
+        }
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
@@ -10691,7 +11074,10 @@ impl Application for Cagents {
                     ..
                 }
         );
-        let reconcile_row_selection = matches!(
+        let reconcile_row_selection = !matches!(
+            &message,
+            Message::Sidebar(SidebarAction::ScrollProjects(_) | SidebarAction::NavigateRow { .. })
+        ) && matches!(
             &message,
             Message::RepositoryLoaded { .. }
                 | Message::AttachedWorktreePrsResolved { .. }
@@ -10705,6 +11091,10 @@ impl Application for Cagents {
                 | Message::WindowResized(..)
         );
         let task = match message {
+            Message::Palette(action) => self.update_palette(action),
+            Message::RunCommand(command) => {
+                self.run_workspace_command(command, keyboard::Modifiers::empty())
+            }
             Message::NewTerminal => self.add_terminal(
                 self.terminal_directory()
                     .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
@@ -11464,8 +11854,22 @@ impl Application for Cagents {
                 if let Some(row) = opened {
                     self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
-                self.prune_sidebar_row_selection();
                 match action {
+                    SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
+                    SidebarAction::MarkChannelRead(id) => {
+                        let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
+                        let tasks: Vec<_> = cards.into_iter().map(|card| {
+                            self.sidebar_state.acknowledge_agent_update(card);
+                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                                && let Err(error) = handle.acknowledge_updates()
+                            {
+                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
+                            }
+                            self.acknowledge_chat_updates(card)
+                        }).collect();
+                        self.refresh_sidebar_channels();
+                        Task::batch(tasks)
+                    }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
                         iced::widget::operation::AbsoluteOffset { x: 0.0, y },
@@ -11498,12 +11902,12 @@ impl Application for Cagents {
                             Named::ArrowUp => index.saturating_sub(1),
                             _ => (index + 1).min(rows.len().saturating_sub(1)),
                         };
-                        rows.get(target).map_or_else(Task::none, |row| iced::widget::operation::focus(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
+                        rows.get(target).map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(*row)).map(cosmic::Action::App))
                     }
                     SidebarAction::SelectRows { row, intent } => {
                         self.select_sidebar_rows(row, intent);
                         if matches!(intent, sidebar::SelectionIntent::Toggle | sidebar::SelectionIntent::Range { .. }) {
-                            iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
+                            sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
@@ -12759,9 +13163,15 @@ impl Application for Cagents {
                     self.tab_history.finish(self.workspace.focused());
                 }
                 if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers) {
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        return self.commit_workspace_preview();
+                    }
+                }
+                if is_escape_press(&event) && self.chrome_ui.workspace_preview.take().is_some() {
                     self.workspace_history
                         .finish(self.active_workspace_destination());
                     self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                    return Task::none();
                 }
                 if !self.workspace_inputs_blocked()
                     && !self.focused_repository_is_saving()
@@ -12785,6 +13195,9 @@ impl Application for Cagents {
                 }
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
+                }
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
@@ -12891,83 +13304,12 @@ impl Application for Cagents {
                     &self.settings.keyboard_shortcuts,
                     self.focused_pane(),
                 ) {
-                    Some(workspace_widget::GlobalShortcut::NewTerminal) => {
-                        cosmic::task::message(Message::NewTerminal)
-                    }
-                    Some(workspace_widget::GlobalShortcut::NewChannel) => {
-                        self.new_project_channel()
-                    }
-                    Some(workspace_widget::GlobalShortcut::ClonePane) => self.clone_focused_pane(),
-                    Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
-                        match close_focused_message(&self.workspace) {
-                            Some(message) => cosmic::task::message(message),
-                            None => Task::none(),
-                        }
-                    }
-                    // A focused editor claims the search chord for its own
-                    // buffer, which is what it means in every editor the user
-                    // has, and the settings pane for its own search field.
-                    // A focused terminal never gets here: its scope leaves
-                    // the chord to the shell. Anywhere else it searches
-                    // projects.
-                    Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
-                        if self.settings_card_focused() {
-                            return iced::widget::operation::focus(
-                                crate::settings_widgets::search_id(),
-                            )
-                            .map(cosmic::Action::App);
-                        }
-                        match self.focused_editable_repository_card() {
-                            Some(card) => cosmic::task::message(Message::Repository(
-                                RepositoryAction::OpenFind { card },
-                            )),
-                            None => cosmic::task::message(Message::FocusProjectSearch),
-                        }
-                    }
-                    Some(workspace_widget::GlobalShortcut::FocusAdjacent(direction)) => {
-                        cosmic::task::message(Message::FocusAdjacent(direction))
-                    }
-                    Some(workspace_widget::GlobalShortcut::CyclePaneWidth) => {
-                        cosmic::task::message(Message::CyclePaneWidth)
-                    }
-                    Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
-                        let keyboard::Event::KeyPressed { modifiers, .. } = event else {
-                            unreachable!("shortcuts come from key presses")
+                    Some(command) => {
+                        let modifiers = match event {
+                            keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
+                            _ => keyboard::Modifiers::empty(),
                         };
-                        self.cycle_workspace(direction, modifiers)
-                    }
-                    Some(
-                        shortcut @ (workspace_widget::GlobalShortcut::ReviewToggleViewed
-                        | workspace_widget::GlobalShortcut::ReviewNextFile
-                        | workspace_widget::GlobalShortcut::ReviewPreviousFile
-                        | workspace_widget::GlobalShortcut::ReviewNextUnviewed
-                        | workspace_widget::GlobalShortcut::ReviewNextChange
-                        | workspace_widget::GlobalShortcut::ReviewPreviousChange),
-                    ) => {
-                        let Some(card) = self.workspace.focused().filter(|card| {
-                            matches!(self.cards.get(card), Some(CardRuntime::PullRequests(_)))
-                        }) else {
-                            return Task::none();
-                        };
-                        let action = match shortcut {
-                            workspace_widget::GlobalShortcut::ReviewToggleViewed => {
-                                pull_request_review::Action::ToggleViewedAndAdvance
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextFile => {
-                                pull_request_review::Action::NextFile
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextUnviewed => {
-                                pull_request_review::Action::NextUnviewed
-                            }
-                            workspace_widget::GlobalShortcut::ReviewNextChange => {
-                                pull_request_review::Action::NextChange
-                            }
-                            workspace_widget::GlobalShortcut::ReviewPreviousChange => {
-                                pull_request_review::Action::PreviousChange
-                            }
-                            _ => pull_request_review::Action::PreviousFile,
-                        };
-                        self.handle_pull_request_review(card, action)
+                        self.run_workspace_command(command, modifiers)
                     }
                     None => Task::none(),
                 }
@@ -13070,12 +13412,13 @@ impl Application for Cagents {
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
             Message::RefreshUi(action) => {
+                let mut preview_task = Task::none();
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
                     self.tab_history.finish(self.workspace.focused());
-                    self.workspace_history
-                        .finish(self.active_workspace_destination());
-                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        preview_task = self.commit_workspace_preview();
+                    }
                 }
                 let account_focus = match action {
                     refresh_ui::Action::Focused(id, focused)
@@ -13091,7 +13434,7 @@ impl Application for Cagents {
                 let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
                     self.accounts_focus_changed(focused, regained)
                 });
-                Task::batch([refresh, self.flush_document_tone(), accounts])
+                Task::batch([preview_task, refresh, self.flush_document_tone(), accounts])
             }
             Message::DocumentToneStale => {
                 self.document_tone_stale = self.settings.app_theme == AppTheme::System;
@@ -13743,12 +14086,13 @@ impl Application for Cagents {
         let spacing = cosmic::theme::spacing();
         let window_width = self.window_width;
         let sidebar_mode = self.projects_sidebar_mode();
-        let sidebar = sidebar::view(
+        let sidebar = sidebar::view_cached(
             &self.sidebar_model,
             &self.sidebar_state,
             sidebar_mode,
             self.settings.sidebar_width,
             self.modal_is_open(),
+            &self.navigation_cache,
         )
         .map(Message::Sidebar);
 
@@ -13775,21 +14119,50 @@ impl Application for Cagents {
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());
             let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
+            let scope_name = self
+                .durable
+                .active_channel
+                .and_then(|id| {
+                    self.durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == id)
+                        .map(|channel| channel.title.clone())
+                })
+                .or_else(|| {
+                    directory
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "Workspace".into());
             let action_buttons = || {
-                let mut buttons: Vec<Element<'_, Message>> = vec![
-                    widget::button::suggested("New thread")
-                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                            chrome_ui::NewTab::Thread,
-                        )))
-                        .into(),
-                    widget::button::standard("New terminal")
-                        .id(widget::Id::new("empty.new-terminal"))
-                        .name("New terminal")
-                        .leading_icon(crate::ui_controls::symbolic_icon(
-                            "utilities-terminal-symbolic",
-                        ))
-                        .on_press(Message::NewTerminal)
-                        .into(),
+                let buttons: Vec<Element<'_, Message>> = vec![
+                    widget::button::suggested(format!(
+                        "New thread · {}",
+                        workspace_widget::shortcut_chords(
+                            workspace_widget::GlobalShortcut::NewThread,
+                            &self.settings.keyboard_shortcuts
+                        )
+                    ))
+                    .name("New thread")
+                    .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
+                        chrome_ui::NewTab::Thread,
+                    )))
+                    .into(),
+                    widget::button::standard(format!(
+                        "New terminal · {}",
+                        workspace_widget::shortcut_chords(
+                            workspace_widget::GlobalShortcut::NewTerminal,
+                            &self.settings.keyboard_shortcuts
+                        )
+                    ))
+                    .id(widget::Id::new("empty.new-terminal"))
+                    .name("New terminal")
+                    .leading_icon(crate::ui_controls::symbolic_icon(
+                        "utilities-terminal-symbolic",
+                    ))
+                    .on_press(Message::NewTerminal)
+                    .into(),
                     widget::button::standard(if cfg!(feature = "integrated-browser") {
                         "New browser"
                     } else {
@@ -13803,17 +14176,6 @@ impl Application for Cagents {
                     .on_press(Message::NewBrowser)
                     .into(),
                 ];
-                if self.sidebar_model.projects.is_empty() {
-                    buttons.insert(
-                        0,
-                        widget::button::standard("Open folder")
-                            .id(widget::Id::new("empty.open-repository"))
-                            .name("Open folder")
-                            .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
-                            .on_press(Message::OpenRepository)
-                            .into(),
-                    );
-                }
                 buttons
             };
             let actions: Element<'_, Message> = if matches!(
@@ -13836,9 +14198,9 @@ impl Application for Cagents {
                         .size(32)
                         .into(),
                     widget::text::title2(if scoped {
-                        "This workspace has no panes"
+                        format!("{scope_name} has no panes")
                     } else {
-                        "Start a workspace"
+                        "Start a workspace".into()
                     })
                     .into(),
                     widget::text::body(if scoped {
@@ -14026,6 +14388,21 @@ impl Application for Cagents {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
+        let switcher = self
+            .palette_surface()
+            .or_else(|| self.pane_rename_surface())
+            .or_else(|| self.workspace_switcher())
+            .map_or_else(
+                || iced::widget::Space::new().into(),
+                |switcher| {
+                    widget::container(switcher)
+                        .align_x(Alignment::Center)
+                        .padding(2.0 * design::HEADER_HEIGHT)
+                        .width(Length::Fill)
+                        .into()
+                },
+            );
+        let surface = crate::interaction::layer(surface, switcher);
         let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
@@ -15555,6 +15932,7 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(1600.0);
         app.cards.insert(second_id, CardRuntime::Loading);
+        drop(app.update_chrome(chrome_ui::Action::HoverTab(Some(second_id))));
         assert!(!app.workspace_inputs_blocked());
         let renderer = headless_renderer();
         let mut tree = Tree::empty();
@@ -17727,7 +18105,7 @@ mod tests {
         );
 
         app.pull_request_dialog = None;
-        app.window_width = design::WIDE_BREAKPOINT - 1.0;
+        app.window_width = 900.0;
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
@@ -17756,7 +18134,7 @@ mod tests {
 
         // The compositor's first narrow size is the real startup transition.
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
+        let _focus_close = app.update(Message::WindowResized(900.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert!(app.context_inspector_overlay_active);
         assert!(app.workspace_inputs_blocked());
@@ -17816,7 +18194,7 @@ mod tests {
         let _open_docked = app.update(Message::ToggleContextInspector);
         assert!(!app.context_inspector_is_overlay());
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
+        let _focus_close = app.update(Message::WindowResized(900.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
             app.context_inspector_restore_focus
@@ -17825,12 +18203,11 @@ mod tests {
             Some(context_inspector_toggle_id().to_string())
         );
 
-        // An open inspector remains mounted even before a first card arrives,
-        // so its window controls remain reachable on a narrow empty workspace.
+        // A first-run workspace gives the full canvas to onboarding.
         let mut startup = context_inspector_test_app(false);
-        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
-        assert!(startup.context_inspector_is_overlay());
-        assert!(startup.context_inspector_overlay_active);
+        let _narrow = startup.update(Message::WindowResized(900.0, 900.0));
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
         assert_eq!(
             startup
                 .context_inspector_restore_focus
@@ -18616,11 +18993,11 @@ mod tests {
         app.refresh_sidebar_channels();
 
         let destinations = sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state);
-        let root = WorkspaceDestination::from_action(&destinations[0]).unwrap();
-        let feature = WorkspaceDestination::from_action(&destinations[1]).unwrap();
+        let root = WorkspaceDestination::from_action(&destinations[1]).unwrap();
+        let feature = WorkspaceDestination::from_action(&destinations[2]).unwrap();
         let channel = WorkspaceDestination::Channel(channel);
-        // Sidebar order is root, feature, channel; visit order deliberately differs.
-        for index in [0, 1, 2, 0] {
+        // Sidebar order is channel, root, feature; visit order deliberately differs.
+        for index in [1, 2, 0, 1] {
             drop(app.update(Message::Sidebar(destinations[index].clone())));
         }
         let next = |modifiers| Message::KeyEvent {
@@ -18637,34 +19014,64 @@ mod tests {
         };
         let alt = keyboard::Modifiers::ALT;
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(channel)
+        );
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(feature)
+        );
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::ModifiersChanged(alt | keyboard::Modifiers::SHIFT),
             captured: false,
         }));
         drop(app.update(next(alt | keyboard::Modifiers::SHIFT)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(root));
         drop(app.update(Message::KeyEvent {
             event: keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
             captured: false,
         }));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
         // Intermediate feature preview did not become more recent than root.
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(root));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(root)
+        );
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(app.active_workspace_destination(), Some(channel));
         app.core.set_main_window_id(Some(window::Id::RESERVED));
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
             window::Id::RESERVED,
             false,
         ))));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
+        assert_eq!(
+            app.chrome_ui
+                .workspace_preview
+                .as_ref()
+                .and_then(WorkspaceDestination::from_action),
+            Some(channel)
+        );
         app.settings_reset_confirm = true;
         drop(app.update(next(alt)));
-        assert_eq!(app.active_workspace_destination(), Some(channel));
+        assert_eq!(app.active_workspace_destination(), Some(feature));
     }
 
     #[test]
@@ -19794,6 +20201,10 @@ mod tests {
                 .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
+            card_indices: HashMap::new(),
+            navigation_cache: sidebar::NavigationCache::default(),
+            palette: palette_ui::State::default(),
+            recently_closed: Vec::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -21096,7 +21507,7 @@ mod tests {
         // Deliberately do not execute the returned COSMIC actions: input can
         // arrive before the runtime has applied the previous scale action.
         let _ = app.apply_setting_input(SettingsField::UiScale, "1.25".into());
-        assert!(app.context_inspector_is_overlay());
+        assert!(!app.context_inspector_is_overlay());
         let _ = app.apply_setting_input(SettingsField::UiScale, "1.5".into());
         assert!((app.window_width - original_width / 1.5).abs() < 0.01);
         let _ = app.apply_setting_input(SettingsField::UiScale, "NaN".into());

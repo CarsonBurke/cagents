@@ -434,7 +434,7 @@ pub fn popover<'a, Message: Clone + 'static>(
 pub fn popover_item<'a, Message: Clone + 'a>(
     icon: widget::icon::Handle,
     title: &'a str,
-    description: &'a str,
+    description: impl Into<Cow<'a, str>> + 'a,
     on_press: Message,
 ) -> widget::button::Button<'a, Message> {
     widget::button::custom(

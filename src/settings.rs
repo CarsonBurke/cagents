@@ -253,6 +253,24 @@ pub struct KeyboardShortcuts {
     pub review_next_unviewed: Vec<String>,
     pub review_next_change: Vec<String>,
     pub review_previous_change: Vec<String>,
+    pub command_palette: Vec<String>,
+    pub new_native_thread: Vec<String>,
+    pub toggle_inspector: Vec<String>,
+    pub open_settings: Vec<String>,
+    pub move_pane_left: Vec<String>,
+    pub move_pane_right: Vec<String>,
+    pub reopen_pane: Vec<String>,
+    pub focus_pane_1: Vec<String>,
+    pub focus_pane_2: Vec<String>,
+    pub focus_pane_3: Vec<String>,
+    pub focus_pane_4: Vec<String>,
+    pub focus_pane_5: Vec<String>,
+    pub focus_pane_6: Vec<String>,
+    pub focus_pane_7: Vec<String>,
+    pub focus_pane_8: Vec<String>,
+    pub focus_pane_9: Vec<String>,
+    pub toggle_projects: Vec<String>,
+    pub rename_pane: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -276,6 +294,24 @@ impl Default for KeyboardShortcuts {
             review_next_unviewed: vec!["Alt+Shift+Down".to_owned()],
             review_next_change: vec!["Alt+J".to_owned()],
             review_previous_change: vec!["Alt+K".to_owned()],
+            command_palette: vec!["Ctrl+Shift+P".to_owned()],
+            new_native_thread: vec!["Ctrl+Shift+N".to_owned()],
+            toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
+            open_settings: vec!["Ctrl+Comma".to_owned()],
+            move_pane_left: vec!["Alt+Shift+Left".to_owned()],
+            move_pane_right: vec!["Alt+Shift+Right".to_owned()],
+            reopen_pane: vec!["Ctrl+Shift+Z".to_owned()],
+            focus_pane_1: vec!["Alt+1".to_owned()],
+            focus_pane_2: vec!["Alt+2".to_owned()],
+            focus_pane_3: vec!["Alt+3".to_owned()],
+            focus_pane_4: vec!["Alt+4".to_owned()],
+            focus_pane_5: vec!["Alt+5".to_owned()],
+            focus_pane_6: vec!["Alt+6".to_owned()],
+            focus_pane_7: vec!["Alt+7".to_owned()],
+            focus_pane_8: vec!["Alt+8".to_owned()],
+            focus_pane_9: vec!["Alt+9".to_owned()],
+            toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
+            rename_pane: vec!["F2".to_owned()],
         }
     }
 }
@@ -285,7 +321,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 16] {
+    fn actions(&self) -> [&Vec<String>; 34] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -303,6 +339,24 @@ impl KeyboardShortcuts {
             &self.review_next_unviewed,
             &self.review_next_change,
             &self.review_previous_change,
+            &self.command_palette,
+            &self.new_native_thread,
+            &self.toggle_inspector,
+            &self.open_settings,
+            &self.move_pane_left,
+            &self.move_pane_right,
+            &self.reopen_pane,
+            &self.focus_pane_1,
+            &self.focus_pane_2,
+            &self.focus_pane_3,
+            &self.focus_pane_4,
+            &self.focus_pane_5,
+            &self.focus_pane_6,
+            &self.focus_pane_7,
+            &self.focus_pane_8,
+            &self.focus_pane_9,
+            &self.toggle_projects,
+            &self.rename_pane,
         ]
     }
 
@@ -323,7 +377,7 @@ impl KeyboardShortcuts {
                     error: SettingsError::InvalidShortcut(error),
                 })
             };
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=15) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=33) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return fault("every keyboard shortcut needs at least one chord", None);
@@ -347,7 +401,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 16] = [
+const SHORTCUT_ACTIONS: [&str; 34] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -364,6 +418,24 @@ const SHORTCUT_ACTIONS: [&str; 16] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "command_palette",
+    "new_native_thread",
+    "toggle_inspector",
+    "open_settings",
+    "move_pane_left",
+    "move_pane_right",
+    "reopen_pane",
+    "focus_pane_1",
+    "focus_pane_2",
+    "focus_pane_3",
+    "focus_pane_4",
+    "focus_pane_5",
+    "focus_pane_6",
+    "focus_pane_7",
+    "focus_pane_8",
+    "focus_pane_9",
+    "toggle_projects",
+    "rename_pane",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -410,11 +482,22 @@ pub fn format_chords(chords: &[String]) -> String {
 /// separator left mid-edit does not read as an unparsable chord; a line with no
 /// chord at all is rejected by [`KeyboardShortcuts::validate`].
 pub fn parse_chords(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|chord| !chord.is_empty())
-        .map(str::to_owned)
-        .collect()
+    let mut chords = Vec::new();
+    let mut start = 0;
+    for (index, ch) in raw.char_indices() {
+        if ch == ',' && !raw[..index].ends_with('+') {
+            let chord = raw[start..index].trim();
+            if !chord.is_empty() {
+                chords.push(chord.to_owned());
+            }
+            start = index + 1;
+        }
+    }
+    let chord = raw[start..].trim();
+    if !chord.is_empty() {
+        chords.push(chord.to_owned());
+    }
+    chords
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,7 +591,7 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
             };
         }
     }
-    if !(control || alt || logo) {
+    if !(control || alt || logo) && !matches!(key, Some(ShortcutKey::Function(_))) {
         return Err("keyboard shortcut must include Ctrl, Alt, or Super");
     }
     Ok(ShortcutBinding {
@@ -721,6 +804,8 @@ pub struct AppSettings {
     pub editor_auto_save: bool,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default = "default_editor_auto_save")]
+    pub diff_hide_unchanged: bool,
     #[serde(default)]
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
@@ -802,6 +887,7 @@ impl Default for AppSettings {
             default_channel_pane: DefaultPane::default(),
             editor_auto_save: default_editor_auto_save(),
             editor_wrap_lines: false,
+            diff_hide_unchanged: true,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
@@ -1180,7 +1266,25 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 11] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 29] = [
+    "toggle_projects",
+    "rename_pane",
+    "command_palette",
+    "new_native_thread",
+    "toggle_inspector",
+    "open_settings",
+    "move_pane_left",
+    "move_pane_right",
+    "reopen_pane",
+    "focus_pane_1",
+    "focus_pane_2",
+    "focus_pane_3",
+    "focus_pane_4",
+    "focus_pane_5",
+    "focus_pane_6",
+    "focus_pane_7",
+    "focus_pane_8",
+    "focus_pane_9",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",
@@ -2846,12 +2950,16 @@ mod tests {
         save(&path, &defaults).unwrap();
         let mut old = toml::Value::try_from(&defaults).unwrap();
         old.as_table_mut().unwrap().remove("editor_wrap_lines");
+        old.as_table_mut().unwrap().remove("diff_hide_unchanged");
         fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
         let mut settings = load(&path).unwrap();
         assert!(!settings.editor_wrap_lines);
+        assert!(settings.diff_hide_unchanged);
         settings.editor_wrap_lines = true;
+        settings.diff_hide_unchanged = false;
         save(&path, &settings).unwrap();
         assert!(load(&path).unwrap().editor_wrap_lines);
+        assert!(!load(&path).unwrap().diff_hide_unchanged);
     }
 
     #[test]
@@ -3335,6 +3443,7 @@ new_thread = "Alt+Shift+G"
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.clone_pane = clone_pane;
             settings.keyboard_shortcuts.new_channel = new_channel;
+            settings.keyboard_shortcuts.new_native_thread.clear();
             save(&path, &settings).unwrap();
             assert_eq!(load(&path).unwrap(), settings);
         }

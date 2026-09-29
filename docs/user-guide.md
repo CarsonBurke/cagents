@@ -421,6 +421,8 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   to save manually.
 - **Wrap long lines** is off by default. Editor and terminal text default to 14
   logical pixels; a terminal font size you already saved is kept.
+- **Hide unchanged diff lines** is on by default. Turn it off in Settings →
+  Editor to show the complete file between changed hunks.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
 - Working-tree diffs edit the real file buffer with the same selection, IME,
