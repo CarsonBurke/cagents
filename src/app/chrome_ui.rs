@@ -637,9 +637,42 @@ impl Cagents {
             }),
             Action::Reveal(id) => {
                 let focus = self.update(Message::FocusCard(id));
+                if self.workspace.focused() != Some(id) {
+                    return focus;
+                }
                 self.chrome_ui.projects_collapsed = false;
                 self.synchronize_sidebar_selection();
-                Task::batch([focus, cosmic::task::message(Message::FocusProjectSearch)])
+                let destination = self.active_workspace_destination();
+                let target = self.sidebar_model.projects.iter().find_map(|project| {
+                    let row = match destination {
+                        Some(WorkspaceDestination::Channel(id))
+                            if project.channels.iter().any(|channel| channel.id == id) =>
+                        {
+                            sidebar::SelectionRow::Channel(id)
+                        }
+                        Some(WorkspaceDestination::Worktree(id))
+                            if project.worktrees.iter().any(|worktree| worktree.id == id) =>
+                        {
+                            sidebar::SelectionRow::Worktree(project.id, id)
+                        }
+                        Some(WorkspaceDestination::Folder(id)) if project.id == id => {
+                            sidebar::SelectionRow::Project(id)
+                        }
+                        _ => return None,
+                    };
+                    Some((project.id, row))
+                });
+                if let Some((project, row)) = target {
+                    self.sidebar_state.reveal_project(project);
+                    self.persist();
+                    Task::batch([
+                        focus,
+                        sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                            .map(cosmic::Action::App),
+                    ])
+                } else {
+                    focus
+                }
             }
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
