@@ -12162,6 +12162,14 @@ pub(crate) mod tests {
         /// so that neither the list's scroll position nor hover feedback can
         /// be mistaken for the menu.
         fn menu_rows(scroll: f32) -> Vec<(usize, usize)> {
+            Self::menu_rows_for(Self::roomy, MENU_ROW, scroll)
+        }
+
+        fn menu_rows_for(
+            make: impl Fn() -> Self,
+            anchor: cosmic::iced::Point,
+            scroll: f32,
+        ) -> Vec<(usize, usize)> {
             use cosmic::iced::{
                 Color,
                 advanced::{
@@ -12170,12 +12178,12 @@ pub(crate) mod tests {
                 },
             };
             let frame = |open: bool| {
-                let mut sidebar = Self::roomy();
-                sidebar.scroll(scroll, MENU_ROW);
+                let mut sidebar = make();
+                sidebar.scroll(scroll, anchor);
                 if open {
-                    sidebar.click(mouse::Button::Right, MENU_ROW);
+                    sidebar.click(mouse::Button::Right, anchor);
                 }
-                sidebar.move_to(MENU_ROW);
+                sidebar.move_to(anchor);
                 // The frame that draws has to be the frame that updated: the
                 // runtime keeps an overlay's layout from its own update pass.
                 let mut interface = interface(
@@ -12304,13 +12312,44 @@ pub(crate) mod tests {
             })
             .expect("the rail draws the project's channel row");
 
-        sidebar.click(mouse::Button::Right, row);
-        let entry = Point::new(row.x + 30.0, row.y + 56.0);
-        sidebar.move_to(entry);
+        // The third entry's position follows the native menu's measured
+        // height, including fonts and theme padding. Use its painted bounds
+        // rather than a fixed distance from the right-click anchor.
+        let painted = Sidebar::menu_rows_for(|| Sidebar::with_channel(channel_id), row, 0.0);
+        let (top, bottom) = painted
+            .iter()
+            .find(|(from, to)| *from <= row.y as usize && *to > row.y as usize)
+            .expect("the channel menu paints over its anchor");
+        // Menus include a shadow and theme padding. Probe only the measured
+        // band, remounting each time so another command cannot close the menu
+        // before the Delete entry is reached. Assert the entire event result
+        // so a menu command cannot hide click-through to the row underneath.
+        let attempted: Vec<_> = (*top..=*bottom)
+            .step_by(4)
+            .map(|y| {
+                let mut candidate = Sidebar::with_channel(channel_id);
+                candidate.click(mouse::Button::Right, row);
+                // The redraw requested by opening a native menu initializes
+                // its geometry at the anchor before the pointer leaves it.
+                // Feed that frame just as the application event loop does.
+                candidate.feed(
+                    &[cosmic::iced::Event::Window(
+                        cosmic::iced::window::Event::RedrawRequested(std::time::Instant::now()),
+                    )],
+                    row,
+                );
+                let entry = Point::new(row.x + 30.0, y as f32);
+                candidate.move_to(entry);
+                candidate.click(mouse::Button::Left, entry)
+            })
+            .collect();
+        let selected = attempted
+            .iter()
+            .find(|actions| actions.contains(&SidebarAction::DeleteChannel { channel_id }));
         assert_eq!(
-            sidebar.click(mouse::Button::Left, entry).first(),
-            Some(&SidebarAction::DeleteChannel { channel_id }),
-            "the channel row's Delete entry deletes the channel it was opened over",
+            selected,
+            Some(&vec![SidebarAction::DeleteChannel { channel_id }]),
+            "Delete must target the channel without opening a row underneath: {attempted:?}",
         );
     }
 
