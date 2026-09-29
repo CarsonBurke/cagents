@@ -22892,7 +22892,7 @@ mod tests {
         assert!(matches!(
             settings_update(&settings, SettingsField::MaxHotCards, "0"),
             SettingsDecision::Invalid(message)
-                if message == "Maximum hot columns must be a whole number, at least 1."
+                if message == "Maximum hot panes must be a whole number, at least 1."
         ));
         assert!(matches!(
             settings_update(&settings, SettingsField::ManagedWorktreeDirectory, " "),
