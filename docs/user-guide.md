@@ -32,15 +32,15 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   selected worktree or channel. Some settings and shortcut labels call a pane
   in the strip a **column**, and a few messages call it a **card**; all three
   mean the same thing.
-- **New terminal** (`Ctrl+T`) starts in the selected worktree and opens directly
+- **New terminal** (`Ctrl+Shift+T`) starts in the selected worktree and opens directly
   to the right of the focused pane. The **New tab** menu offers **New
   thread**, **Terminal**, and **Browser** with keyboard navigation; New thread
   opens the model selector.
-- **Clone focused pane** (`Alt+E`) opens another pane of the same kind:
+- **Clone focused pane** (`Ctrl+Shift+D`) opens another pane of the same kind:
   terminals launch a separate process, native chats start a separate
   conversation, and browser and repository panes open at the same location.
   Clones never share the original process or conversation.
-- **New channel** (`Alt+G`, or the channel-plus button on a project header)
+- **New channel** (`Ctrl+Shift+G`, or the channel-plus button on a project header)
   starts an independent native conversation in the project's main worktree.
   Channels have their own sidebar rows and panes. A channel holds the chats
   opened while it was selected, and its row shows how many when there is more
@@ -69,13 +69,13 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 
 | Action | Default |
 | --- | --- |
-| New terminal | `Ctrl+T` |
-| New channel | `Alt+G` |
-| Clone focused pane | `Alt+E` |
-| Close focused column | `Ctrl+W` |
-| Search projects | `Ctrl+F` |
-| Previous / next column | `Alt+Q` / `Alt+W`, or `Alt+Left` / `Alt+Right` |
-| Cycle pane width | `Alt+R` |
+| New terminal | `Ctrl+Shift+T` |
+| New channel | `Ctrl+Shift+G` |
+| Clone focused pane | `Ctrl+Shift+D` |
+| Close focused column | `Ctrl+Shift+W` |
+| Search projects | `Ctrl+F` (outside terminals) |
+| Previous / next column | `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Cycle pane width | `Ctrl+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
@@ -85,9 +85,22 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 Every shortcut is configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
 
+- The defaults leave the keys shells, editors, and agent CLIs use to the
+  focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
+  deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
+  bind is withheld from the terminal, except **Search projects**, which a
+  focused terminal receives as input (in an editor it finds in the file), and
+  the review chords, which act only in a pull request pane. As in those
+  terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
+  longer reach terminal programs such as Vim.
+- Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
+  `Alt+Left`/`Alt+Right`, `Alt+E`, `Alt+G`, and `Alt+R`. Shortcuts still on
+  those defaults move to the new ones; any shortcut you changed is kept. See
+  [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
+
 - Hold the column shortcuts to move repeatedly. Navigation scrolls only far
   enough to reveal the target pane.
-- **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
+- **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
@@ -535,8 +548,8 @@ the source for resumed history.
   browserless builds. The selected file is restored with the workspace.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
-  focused; Cancel or Escape keeps the pane. The close button and `Ctrl+W`
-  follow the same rule. The decision uses the process tree, not prompt
+  focused; Cancel or Escape keeps the pane. The close button and
+  `Ctrl+Shift+W` follow the same rule. The decision uses the process tree, not prompt
   instrumentation, so a shell builtin with no child process closes without
   asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.

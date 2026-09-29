@@ -710,10 +710,9 @@ impl Cagents {
             worktree,
             repository: row.repository.clone(),
             path: selected.map_or_else(|| row.repository.clone(), |worktree| worktree.path.clone()),
-            label: selected.filter(|_| worktree.is_some()).map_or_else(
-                || row.name.clone(),
-                |worktree| worktree.path.display().to_string(),
-            ),
+            label: selected
+                .filter(|_| worktree.is_some())
+                .map_or_else(|| row.name.clone(), |worktree| worktree.label().to_owned()),
         })
     }
 
@@ -1387,9 +1386,22 @@ impl Cagents {
     /// What the deletion takes with it: the open terminal and chat cards
     /// inside the worktree, counted so the user knows before confirming.
     fn worktree_cascade_summary(&self, target: &Target) -> Option<String> {
+        self.worktree_session_cascade(&[target.path.as_path()], "the worktree")
+    }
+
+    /// The open terminal and chat cards inside any of `worktrees`, as the
+    /// sentence a deletion confirmation shows; `None` when nothing is open.
+    /// `place` names the worktrees in that sentence.
+    pub(super) fn worktree_session_cascade(
+        &self,
+        worktrees: &[&Path],
+        place: &str,
+    ) -> Option<String> {
         let (mut terminals, mut chats) = (0, 0);
         for card in &self.durable.cards {
-            if !card.existence.is_open() || !card_belongs_to(card, &target.path) {
+            if !card.existence.is_open()
+                || !worktrees.iter().any(|path| card_belongs_to(card, path))
+            {
                 continue;
             }
             match &card.kind {
@@ -1411,7 +1423,7 @@ impl Cagents {
             ),
         };
         Some(format!(
-            "This closes {parts} in the worktree and ends their sessions."
+            "This closes {parts} in {place} and ends their sessions."
         ))
     }
 
@@ -1436,18 +1448,13 @@ impl Cagents {
                         ProjectKind::Folder => "Terminals and chats in this folder, including detached sessions, will close. The folder and its files stay on disk.",
                         ProjectKind::Git => "Terminals and chats in its worktrees, including detached sessions, will close. The repository, worktrees, and branches stay on disk.",
                     }),
-                    widget::row::with_children(vec![
-                        iced::widget::Space::new().width(Length::Fill).into(),
+                    super::dialog_ui::confirmation_actions(
                         widget::button::standard("Cancel")
-                            .on_press(Message::ProjectUi(Action::Dismiss))
-                            .into(),
+                            .on_press(Message::ProjectUi(Action::Dismiss)),
                         widget::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
-                            .on_press(Message::ProjectUi(Action::ConfirmRemove))
-                            .into(),
-                    ])
-                    .spacing(cosmic::theme::spacing().space_xxs)
-                    .into(),
+                            .on_press(Message::ProjectUi(Action::ConfirmRemove)),
+                    ),
                 ])
                 .spacing(3.0 * design::GRID_UNIT),
                 500.0,
@@ -1478,25 +1485,18 @@ impl Cagents {
             .blocker
             .is_none()
             .then_some(Message::ProjectUi(Action::ConfirmDelete));
-        rows.push(
-            widget::row::with_children(vec![
-                iced::widget::Space::new().width(Length::Fill).into(),
-                widget::button::standard("Cancel")
-                    .id(widget::Id::new("dialog.project.close"))
-                    .on_press(Message::ProjectUi(Action::Dismiss))
-                    .into(),
-                widget::button::destructive(if dialog.failure.is_some() {
-                    "Retry delete"
-                } else {
-                    "Delete worktree"
-                })
-                .id(widget::Id::new("dialog.project.confirm"))
-                .on_press_maybe(confirm)
-                .into(),
-            ])
-            .spacing(cosmic::theme::spacing().space_xxs)
-            .into(),
-        );
+        rows.push(super::dialog_ui::confirmation_actions(
+            widget::button::standard("Cancel")
+                .id(widget::Id::new("dialog.project.close"))
+                .on_press(Message::ProjectUi(Action::Dismiss)),
+            widget::button::destructive(if dialog.failure.is_some() {
+                "Retry delete"
+            } else {
+                "Delete worktree"
+            })
+            .id(widget::Id::new("dialog.project.confirm"))
+            .on_press_maybe(confirm),
+        ));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
             480.0,

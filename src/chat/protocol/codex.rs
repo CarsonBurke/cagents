@@ -391,6 +391,15 @@ enum Pending {
     Compact,
     Other,
 }
+
+fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
+    match (approval.as_str(), sandbox["type"].as_str()) {
+        (Some("never"), Some("dangerFullAccess")) => Some("yolo"),
+        (Some("on-request"), Some("workspaceWrite")) => Some("workspaceWrite"),
+        (Some("on-request"), Some("readOnly")) => Some("readOnly"),
+        _ => None,
+    }
+}
 struct PendingRequest {
     frame: Value,
     actions: BTreeMap<String, Value>,
@@ -572,7 +581,11 @@ impl Codex {
             model_selection: self.direct_input && !self.models.is_empty(),
             reasoning_selection: self.direct_input
                 && model.is_some_and(|m| !m.reasoning.is_empty()),
-            permission_modes: Vec::new(),
+            permission_modes: if self.direct_input {
+                vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()]
+            } else {
+                Vec::new()
+            },
             skill_reach: SkillReach::Anywhere,
         }
     }
@@ -1069,7 +1082,22 @@ impl Adapter for Codex {
                 self.model_events(&mut step);
                 step.events.push(Event::Status { busy: self.busy, detail: "Model/reasoning selection will apply to your next new turn, not the running turn".into() });
             }
-            Command::SetPermissionMode { .. } => return Err("Codex permission profiles cannot safely be represented by this control; existing permissions are preserved and individual approvals remain explicit".into()),
+            Command::SetPermissionMode { mode } => {
+                if !self.direct_input || self.busy {
+                    return Err("Codex permissions can be changed only on an idle, writable thread".into());
+                }
+                let (approval, sandbox) = match mode.as_str() {
+                    "yolo" => ("never", "dangerFullAccess"),
+                    "workspaceWrite" => ("on-request", "workspaceWrite"),
+                    "readOnly" => ("on-request", "readOnly"),
+                    _ => return Err("Unsupported Codex permission mode".into()),
+                };
+                self.call(&mut step, "thread/settings/update", json!({
+                    "threadId": self.thread,
+                    "approvalPolicy": approval,
+                    "sandboxPolicy": {"type": sandbox},
+                }), Pending::Other)?;
+            }
             Command::Compact => {
                 if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
@@ -1205,6 +1233,10 @@ impl Adapter for Codex {
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
+                    step.events.push(Event::PermissionMode(
+                        permission_mode(&result["approvalPolicy"], &result["sandbox"])
+                            .map(str::to_owned),
+                    ));
                     step.events
                         .push(Event::Waiting(waiting_on_user(&thread["status"])));
                     step.events.push(Event::Session {
@@ -1481,6 +1513,12 @@ impl Adapter for Codex {
                 title: params["threadName"].as_str().map(str::to_owned),
             }),
             "thread/settings/updated" => {
+                let mode = permission_mode(
+                    &params["threadSettings"]["approvalPolicy"],
+                    &params["threadSettings"]["sandboxPolicy"],
+                );
+                step.events
+                    .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
                     self.selected = params["threadSettings"]["model"]
                         .as_str()
@@ -2560,6 +2598,60 @@ mod tests {
             materialized: true,
             execution: None,
         }
+    }
+
+    #[test]
+    fn permission_picker_updates_both_codex_policies() {
+        let mut adapter = adapter();
+        assert_eq!(
+            adapter.capabilities().permission_modes,
+            ["readOnly", "workspaceWrite", "yolo"]
+        );
+        for (mode, approval, sandbox) in [
+            ("yolo", "never", "dangerFullAccess"),
+            ("workspaceWrite", "on-request", "workspaceWrite"),
+            ("readOnly", "on-request", "readOnly"),
+        ] {
+            let step = adapter
+                .command(Command::SetPermissionMode { mode: mode.into() })
+                .unwrap();
+            assert_eq!(step.writes[0]["method"], "thread/settings/update");
+            assert_eq!(step.writes[0]["params"]["approvalPolicy"], approval);
+            assert_eq!(step.writes[0]["params"]["sandboxPolicy"]["type"], sandbox);
+            let acknowledged = adapter
+                .receive(json!({"id":step.writes[0]["id"], "result":{}}))
+                .unwrap();
+            assert!(
+                !acknowledged
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::PermissionMode(_)))
+            );
+            let confirmed = adapter
+                .receive(json!({"method":"thread/settings/updated","params":{
+                    "threadId":"thread-exact",
+                    "threadSettings": {"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
+                }}))
+                .unwrap();
+            assert!(
+                confirmed
+                    .events
+                    .contains(&Event::PermissionMode(Some(mode.into())))
+            );
+        }
+        let custom = adapter.receive(json!({"method":"thread/settings/updated","params":{
+            "threadId":"thread-exact",
+            "threadSettings": {"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
+        }})).unwrap();
+        assert!(custom.events.contains(&Event::PermissionMode(None)));
+        adapter.busy = true;
+        assert!(
+            adapter
+                .command(Command::SetPermissionMode {
+                    mode: "yolo".into()
+                })
+                .is_err()
+        );
     }
 
     #[test]

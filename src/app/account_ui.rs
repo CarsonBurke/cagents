@@ -823,11 +823,50 @@ fn reset_countdown(window: &UsageWindow, now: Millis) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChipTone {
     Current,
+    /// Current figures running low: worth a glance before starting work.
+    Low,
+    /// Current figures at or next to the limit: new work will fail or stall.
+    Exhausted,
     /// Figures the reader should not plan around: old, or from before a
     /// reset.
     Stale,
     /// Something the reader has to do.
     Attention,
+}
+
+impl ChipTone {
+    /// How current figures read, from the provider's own verdict and from
+    /// how full the window the chip leads with is. Healthy accounts stay
+    /// neutral, so only an account in trouble draws the eye along the bar.
+    fn of_usage(status: UsageStatus, used: f32) -> Self {
+        if status == UsageStatus::Limited || used > design::BUDGET_CRITICAL {
+            Self::Exhausted
+        } else if status == UsageStatus::Warning || used > design::BUDGET_WARNING {
+            Self::Low
+        } else {
+            Self::Current
+        }
+    }
+
+    /// The color the chip's gauge takes, or `None` for the neutral stroke.
+    fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
+        match self {
+            Self::Low | Self::Attention => Some(design::warning_color),
+            Self::Exhausted => Some(design::destructive_color),
+            Self::Current | Self::Stale => None,
+        }
+    }
+
+    /// The chip's text in the same tone as its gauge.
+    fn text_class(self) -> cosmic::theme::Text {
+        match self {
+            Self::Current => cosmic::theme::Text::Default,
+            Self::Low | Self::Attention => cosmic::theme::Text::Custom(design::warning_text),
+            Self::Exhausted => cosmic::theme::Text::Custom(design::destructive_text),
+            // A caption's own muted ink.
+            Self::Stale => cosmic::theme::Text::Custom(design::muted_text),
+        }
+    }
 }
 
 /// What an account's chip says.
@@ -948,15 +987,18 @@ fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
                     percent_left(scoped.used)
                 ));
             }
+            let tone = if stale {
+                ChipTone::Stale
+            } else {
+                ChipTone::of_usage(snapshot.status, window.used)
+            };
             Chip {
                 text,
                 gauge: Some(window.used),
-                tone: if stale {
-                    ChipTone::Stale
-                } else {
-                    ChipTone::Current
-                },
-                essential: false,
+                tone,
+                // An account that cannot take new work keeps its figure even
+                // in a bar too narrow for the others'.
+                essential: tone == ChipTone::Exhausted,
                 tooltip,
             }
         }
@@ -3201,22 +3243,17 @@ impl Cagents {
                 .size(CHIP_ICON_SIZE)
                 .into(),
         ];
+        let tone = summary.tone.color();
         if let Some(used) = summary.gauge {
-            items.push(crate::ui_controls::budget_radial(used));
+            items.push(crate::ui_controls::budget_radial_toned(
+                used,
+                tone.map(design::Tone::Themed),
+            ));
         }
         if !compact || summary.essential {
             let text =
                 design::caption(summary.text).wrapping(cosmic::iced::widget::text::Wrapping::None);
-            items.push(
-                match summary.tone {
-                    ChipTone::Current => text.class(cosmic::theme::Text::Default),
-                    ChipTone::Stale => text,
-                    ChipTone::Attention => {
-                        text.class(cosmic::theme::Text::Custom(design::warning_text))
-                    }
-                }
-                .into(),
-            );
+            items.push(text.class(summary.tone.text_class()).into());
         }
         if others > 0 && !compact {
             items.push(
@@ -3861,6 +3898,36 @@ mod tests {
             chip.tooltip.contains("Weekly · Fable: 0% left"),
             "{}",
             chip.tooltip
+        );
+    }
+
+    #[test]
+    fn a_chip_takes_the_warning_or_error_tone_as_its_account_runs_out() {
+        let tone = |used: f32, status: UsageStatus| {
+            let mut snapshot = snapshot(vec![window(used, None)], NOW);
+            snapshot.status = status;
+            chip(&state_with(Some(snapshot)), "Claude", NOW)
+        };
+        assert_eq!(tone(0.05, UsageStatus::Ok).tone, ChipTone::Current);
+        assert_eq!(tone(0.8, UsageStatus::Ok).tone, ChipTone::Low);
+        // The provider's own verdict counts even below the local thresholds.
+        assert_eq!(tone(0.5, UsageStatus::Warning).tone, ChipTone::Low);
+        let exhausted = tone(1.0, UsageStatus::Limited);
+        assert_eq!(exhausted.tone, ChipTone::Exhausted);
+        assert!(exhausted.essential, "a narrow bar still says 0% left");
+        assert_eq!(tone(0.95, UsageStatus::Ok).tone, ChipTone::Exhausted);
+        assert_eq!(ChipTone::Current.color(), None);
+        assert!(ChipTone::Exhausted.color().is_some());
+
+        // Old figures stay muted however low they were.
+        let mut old = snapshot(
+            vec![window(1.0, None)],
+            NOW - schedule::DISPLAY_STALE_AFTER - 1,
+        );
+        old.status = UsageStatus::Limited;
+        assert_eq!(
+            chip(&state_with(Some(old)), "Claude", NOW).tone,
+            ChipTone::Stale
         );
     }
 

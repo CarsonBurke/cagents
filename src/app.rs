@@ -486,7 +486,10 @@ fn notice_surface<'a>(
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
     let mut children = vec![
-        widget::icon::from_name(severity.icon()).size(16).into(),
+        crate::ui_controls::symbolic_icon(severity.icon())
+            .icon()
+            .size(16)
+            .into(),
         body,
     ];
     if let Some(action) = action {
@@ -1359,7 +1362,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
         },
         Some(CardKind::Chat(_)) => CardLabels {
             type_label: "Chat",
-            icon: "chat-bubbles-symbolic",
+            icon: "chat-bubble-text-symbolic",
             starting: "Connecting to agent…",
             unavailable: "Agent connection unavailable",
         },
@@ -5319,12 +5322,27 @@ impl Cagents {
         self.apply_pull_request_review(card, action)
     }
 
-    /// Whether the focused card is a pull request pane, which is when the
-    /// review chords are withheld from other cards' processes.
-    fn review_pane_focused(&self) -> bool {
-        self.workspace
-            .focused()
-            .is_some_and(|card| matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_))))
+    /// The kind of the focused pane, which decides which shortcut scopes
+    /// apply. A terminal counts as focused exactly when it is the one its own
+    /// widget forwards keys from, so a chord its scope leaves to the terminal
+    /// always reaches one.
+    ///
+    /// A terminal that has ended, or is closing, is read-only and forwards
+    /// nothing, so it counts as any other pane.
+    fn focused_pane(&self) -> workspace_widget::FocusedPane {
+        let Some(card) = self.workspace.focused() else {
+            return workspace_widget::FocusedPane::Other;
+        };
+        match self.cards.get(&card) {
+            Some(CardRuntime::Terminal(_))
+                if ended_terminal(self.card_state(card)).is_none()
+                    && !self.terminal_close_pending(card) =>
+            {
+                workspace_widget::FocusedPane::Terminal
+            }
+            Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            _ => workspace_widget::FocusedPane::Other,
+        }
     }
 
     /// [`Self::handle_pull_request_review`] without the modal gate, for
@@ -7366,19 +7384,21 @@ impl Cagents {
             let toolbar = widget::container(
                 widget::row::with_children(vec![
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.back"),
-                                |chrome| chrome.browser_back_id.clone(),
-                            ))
-                            .name("Back")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "go-previous-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.back"),
+                            |chrome| chrome.browser_back_id.clone(),
+                        ))
+                        .name("Back")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("go-next-symbolic"))
+                        widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
                                 |chrome| chrome.browser_forward_id.clone(),
@@ -7390,15 +7410,17 @@ impl Cagents {
                         "Forward",
                     ),
                     crate::interaction::tooltip(
-                        widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
-                            .id(chrome.map_or_else(
-                                || card_control_id(id, "browser.reload"),
-                                |chrome| chrome.browser_reload_id.clone(),
-                            ))
-                            .name("Reload")
-                            .width(ICON_CONTROL_SIZE)
-                            .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(active.then_some(Message::BrowserReload(id))),
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "view-refresh-symbolic",
+                        ))
+                        .id(chrome.map_or_else(
+                            || card_control_id(id, "browser.reload"),
+                            |chrome| chrome.browser_reload_id.clone(),
+                        ))
+                        .name("Reload")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press_maybe(active.then_some(Message::BrowserReload(id))),
                         "Reload",
                     ),
                     address_input.into(),
@@ -7567,7 +7589,8 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         widget::row::with_children(vec![
-                            widget::icon::from_name("dialog-warning-symbolic")
+                            crate::ui_controls::symbolic_icon("dialog-warning-symbolic")
+                                .icon()
                                 .size(24)
                                 .into(),
                             widget::text::title3(labels.unavailable).into(),
@@ -9359,8 +9382,8 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.sidebar_selection_ui.dialog.is_some() {
-            Some(sidebar_selection_ui::focus_id())
+        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
+            Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
@@ -11250,7 +11273,10 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.sidebar_state.apply(&action);
-                let activated = match &action {
+                // Opening a row, by pointer or keyboard, is navigation: it
+                // ends any explicit selection and anchors a later range, but
+                // selects nothing.
+                let opened = match &action {
                     SidebarAction::OpenRepository { project_id, .. } => {
                         Some(sidebar::SelectionRow::Project(*project_id))
                     }
@@ -11264,8 +11290,8 @@ impl Application for Cagents {
                     }
                     _ => None,
                 };
-                if let Some(row) = activated {
-                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Replace);
+                if let Some(row) = opened {
+                    self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
                 self.prune_sidebar_row_selection();
                 match action {
@@ -11275,6 +11301,7 @@ impl Application for Cagents {
                             iced::widget::operation::focus(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App)
                         } else { Task::none() }
                     }
+                    SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
@@ -12642,9 +12669,10 @@ impl Application for Cagents {
                     return self.cycle_dirty_close_focus(backwards);
                 }
                 // A chord typed at a dialog is not the workspace's to act on:
-                // Ctrl+W must not close the card behind the dialog. The dialog
-                // is an overlay, so it has already seen the keystroke by the
-                // time this runs, and what it does with one is its own affair.
+                // the close chord must not close the card behind the dialog.
+                // The dialog is an overlay, so it has already seen the
+                // keystroke by the time this runs, and what it does with one
+                // is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -12660,7 +12688,11 @@ impl Application for Cagents {
                         overwrite: false,
                     }));
                 }
-                match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts) {
+                match workspace_widget::global_shortcut(
+                    &event,
+                    &self.settings.keyboard_shortcuts,
+                    self.focused_pane(),
+                ) {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
                         cosmic::task::message(Message::NewTerminal)
                     }
@@ -12677,7 +12709,9 @@ impl Application for Cagents {
                     // A focused editor claims the search chord for its own
                     // buffer, which is what it means in every editor the user
                     // has, and the settings pane for its own search field.
-                    // Anywhere else it keeps its existing meaning.
+                    // A focused terminal never gets here: its scope leaves
+                    // the chord to the shell. Anywhere else it searches
+                    // projects.
                     Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
                         if self.settings_card_focused() {
                             return iced::widget::operation::focus(
@@ -13596,9 +13630,9 @@ impl Application for Cagents {
                     widget::button::suggested("New terminal")
                         .id(widget::Id::new("empty.new-terminal"))
                         .name("New terminal")
-                        .leading_icon(
-                            widget::icon::from_name("utilities-terminal-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "utilities-terminal-symbolic",
+                        ))
                         .on_press(Message::NewTerminal)
                         .into(),
                     widget::button::standard("Open folder")
@@ -13610,9 +13644,9 @@ impl Application for Cagents {
                     widget::button::standard("New browser")
                         .id(widget::Id::new("empty.new-browser"))
                         .name("New browser")
-                        .leading_icon(
-                            widget::icon::from_name("internet-web-browser-symbolic").size(16),
-                        )
+                        .leading_icon(crate::ui_controls::symbolic_icon(
+                            "internet-web-browser-symbolic",
+                        ))
                         .on_press(Message::NewBrowser)
                         .into(),
                 ]
@@ -13632,7 +13666,8 @@ impl Application for Cagents {
             };
             let surface = widget::container(
                 widget::column::with_children(vec![
-                    widget::icon::from_name("utilities-terminal-symbolic")
+                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
+                        .icon()
                         .size(32)
                         .into(),
                     widget::text::title2("Start a workspace").into(),
@@ -13661,7 +13696,7 @@ impl Application for Cagents {
             workspace_widget::view(
                 &self.workspace,
                 &self.settings.keyboard_shortcuts,
-                self.review_pane_focused(),
+                self.focused_pane(),
                 self.settings.focus_follows_mouse,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
