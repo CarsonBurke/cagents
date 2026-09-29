@@ -1213,7 +1213,9 @@ where
                     shell.capture_event();
                     return;
                 }
-                Event::Keyboard(keyboard::Event::KeyPressed { .. }) => {
+                Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                | Event::Mouse(mouse::Event::CursorLeft)
+                | Event::Window(window::Event::Unfocused) => {
                     if state.hover.take().is_some()
                         && let Some(on_hover) = &self.on_hover
                     {
