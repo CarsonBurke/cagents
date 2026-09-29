@@ -625,8 +625,17 @@ impl SidebarProject {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        search_score(&self.chrome.folded_name, folded_query).is_some()
-            || (folded_query.contains('/') && self.chrome.folded_repository.contains(folded_query))
+        self.search_rank(folded_query).is_some()
+    }
+
+    fn search_rank(&self, query: &str) -> Option<usize> {
+        search_score(&self.chrome.folded_name, query).or_else(|| {
+            query
+                .contains('/')
+                .then(|| self.chrome.folded_repository.find(query))
+                .flatten()
+                .map(|position| 10_000 + position)
+        })
     }
 }
 
@@ -840,14 +849,26 @@ impl SidebarWorktree {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
-        if search_score(&self.chrome.folded_label, folded_query).is_some() {
-            return true;
-        }
-        self.chrome
-            .folded_branch
-            .as_deref()
-            .is_some_and(|branch| search_score(branch, folded_query).is_some())
-            || (folded_query.contains('/') && self.chrome.folded_path.contains(folded_query))
+        self.search_rank(folded_query).is_some()
+    }
+
+    fn search_rank(&self, query: &str) -> Option<usize> {
+        search_score(&self.chrome.folded_label, query)
+            .into_iter()
+            .chain(
+                self.chrome
+                    .folded_branch
+                    .as_deref()
+                    .and_then(|branch| search_score(branch, query)),
+            )
+            .min()
+            .or_else(|| {
+                query
+                    .contains('/')
+                    .then(|| self.chrome.folded_path.find(query))
+                    .flatten()
+                    .map(|position| 10_000 + position)
+            })
     }
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
@@ -3151,6 +3172,7 @@ impl SidebarState {
             | SidebarAction::SelectRows { .. }
             | SidebarAction::NavigateRow { .. }
             | SidebarAction::OpenFirstSearchResult
+            | SidebarAction::FocusFirstSearchResult
             | SidebarAction::ScrollProjects(_)
             | SidebarAction::RenameChannel(_)
             | SidebarAction::MarkChannelRead(_)
@@ -3183,6 +3205,7 @@ pub enum SidebarAction {
         key: cosmic::iced::keyboard::key::Named,
     },
     OpenFirstSearchResult,
+    FocusFirstSearchResult,
     ScrollProjects(f32),
     RenameChannel(ChannelId),
     MarkChannelRead(ChannelId),
@@ -3888,7 +3911,7 @@ fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarA
             input = input.on_clear(SidebarAction::SearchChanged(String::new()));
         }
     }
-    input.id(search_focus_id()).into()
+    RowInteraction::search(input.id(search_focus_id()).into(), !modal_open)
 }
 
 /// Secondary filters live beside the search input. Attention has its own
@@ -4337,10 +4360,11 @@ fn project_identity_row<'a>(
     modal_open: bool,
     compact: bool,
     review_mode: bool,
+    query: &str,
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let label = (!compact).then(|| project_name_label(project));
+    let label = (!compact).then(|| project_name_label(project, query));
     let control = grid
         .control(
             grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
@@ -4381,15 +4405,14 @@ fn project_identity_row<'a>(
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
 /// name cannot change a header's height.
-fn project_name_label(project: &SidebarProject) -> Element<'static, SidebarAction> {
-    design::heading(project.name.clone())
-        .class(theme::Text::Default)
-        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-            EllipsizeHeightLimit::Lines(1),
-        ))
-        .width(Length::Fill)
-        .into()
+fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static, SidebarAction> {
+    search_label(
+        &project.name,
+        query,
+        design::TEXT_HEADING,
+        theme::Text::Default,
+        true,
+    )
 }
 
 /// The rows for a project's worktree creations that have no worktree row yet.
@@ -4627,7 +4650,7 @@ fn unreachable_project<'a>(
         .control(
             grid.content(
                 toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
-                (!compact).then(|| project_name_label(project)),
+                (!compact).then(|| project_name_label(project, &state.query)),
                 None,
             ),
             false,
@@ -4723,6 +4746,7 @@ fn project_view<'a>(
         modal_open,
         false,
         project.state.filter == SidebarFilter::PullRequests,
+        &project.state.query,
     );
 
     let disclosure: Element<'static, SidebarAction> = if has_children {
@@ -4837,6 +4861,7 @@ fn project_view<'a>(
                         .state
                         .rows
                         .group_size(SelectionRow::Channel(channel.id)),
+                    &project.state.query,
                 ),
                 SelectionRow::Channel(channel.id),
                 project.state,
@@ -4862,6 +4887,7 @@ fn project_view<'a>(
                         .state
                         .rows
                         .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                    &project.state.query,
                 ),
                 SelectionRow::Worktree(project_id, worktree.id),
                 project.state,
@@ -4901,6 +4927,7 @@ fn compact_project<'a>(
             modal_open,
             true,
             project.state.filter == SidebarFilter::PullRequests,
+            &project.state.query,
         ),
         entity.id,
         None,
@@ -4947,6 +4974,7 @@ fn compact_project<'a>(
                     .state
                     .rows
                     .group_size(SelectionRow::Channel(channel.id)),
+                &project.state.query,
             ),
             SelectionRow::Channel(channel.id),
             project.state,
@@ -4986,6 +5014,7 @@ fn compact_project<'a>(
                     .state
                     .rows
                     .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                &project.state.query,
             ),
             SelectionRow::Worktree(entity.id, worktree.id),
             project.state,
@@ -5213,6 +5242,7 @@ fn channel_view(
     modal_open: bool,
     compact: bool,
     selection_count: Option<usize>,
+    query: &str,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
     let deletion = channel.deletion.as_ref();
@@ -5229,15 +5259,13 @@ fn channel_view(
         }
     }));
     let label = (!compact).then(|| {
-        design::body(channel.title.clone())
-            .size(CHILD_ROW_TEXT_SIZE)
-            .class(channel_ink(channel).text_class())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into()
+        search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            channel_ink(channel).text_class(),
+            false,
+        )
     });
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
@@ -5510,21 +5538,20 @@ fn worktree_view<'a>(
     has_panes: bool,
     compact: bool,
     selection_count: Option<usize>,
+    query: &str,
 ) -> Element<'static, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let label = (!compact).then(|| {
-        design::body(chrome.label.to_string())
-            .size(CHILD_ROW_TEXT_SIZE)
-            .class(deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into()
+        search_label(
+            &chrome.label,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            deletion_ink(RowInk::of(has_panes, agent_update), deletion).text_class(),
+            false,
+        )
     });
     let indicator = match deletion {
         Some(RowDeletion::Deleting) => Some(deleting_indicator()),
@@ -8691,7 +8718,7 @@ fn filtered_projects<'a>(
     } else {
         fold(state.query.trim())
     };
-    model
+    let mut filtered: Vec<_> = model
         .projects
         .iter()
         .filter_map(|project| {
@@ -8712,18 +8739,21 @@ fn filtered_projects<'a>(
                     state,
                 });
             }
-            let channels = channels_in_display_order(project.channels.iter().filter(|channel| {
-                (project_matches || search_score(&channel.folded_title, query.as_ref()).is_some())
-                    && match state.filter {
-                        SidebarFilter::All => true,
-                        SidebarFilter::Attention => {
-                            channel.unread
-                                || channel.activity == Some(crate::agent::ActivityState::Waiting)
+            let mut channels =
+                channels_in_display_order(project.channels.iter().filter(|channel| {
+                    (project_matches
+                        || search_score(&channel.folded_title, query.as_ref()).is_some())
+                        && match state.filter {
+                            SidebarFilter::All => true,
+                            SidebarFilter::Attention => {
+                                channel.unread
+                                    || channel.activity
+                                        == Some(crate::agent::ActivityState::Waiting)
+                            }
+                            SidebarFilter::PullRequests => false,
                         }
-                        SidebarFilter::PullRequests => false,
-                    }
-            }));
-            let worktrees = worktrees_in_display_order(
+                }));
+            let mut worktrees = worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
                 project
@@ -8740,6 +8770,13 @@ fn filtered_projects<'a>(
                     })
                     .filter(|worktree| project_matches || worktree.matches(query.as_ref())),
             );
+            if !query.is_empty() {
+                channels.sort_by_key(|channel| {
+                    search_score(&channel.folded_title, &query).unwrap_or(usize::MAX)
+                });
+                worktrees
+                    .sort_by_key(|worktree| worktree.search_rank(&query).unwrap_or(usize::MAX));
+            }
             let visible = match state.filter {
                 SidebarFilter::All => {
                     project_matches || !worktrees.is_empty() || !channels.is_empty()
@@ -8757,7 +8794,30 @@ fn filtered_projects<'a>(
                 state,
             })
         })
-        .collect()
+        .collect();
+    if !query.is_empty() {
+        filtered.sort_by_key(|project| {
+            project
+                .project
+                .search_rank(&query)
+                .into_iter()
+                .chain(
+                    project
+                        .channels
+                        .iter()
+                        .filter_map(|channel| search_score(&channel.folded_title, &query)),
+                )
+                .chain(
+                    project
+                        .worktrees
+                        .iter()
+                        .filter_map(|worktree| worktree.search_rank(&query)),
+                )
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+    }
+    filtered
 }
 
 /// The one place a project's worktree rows are ordered for display.
@@ -8887,7 +8947,7 @@ fn fold(value: &str) -> Box<str> {
 /// allocating another folded candidate on each frame.
 fn search_score(candidate: &str, query: &str) -> Option<usize> {
     if let Some(position) = candidate.find(query) {
-        return Some(position);
+        return Some(if position == 0 { 0 } else { 100 + position });
     }
     let mut remaining = candidate.chars();
     let mut skipped = candidate.len();
@@ -8900,7 +8960,106 @@ fn search_score(candidate: &str, query: &str) -> Option<usize> {
             }
         }
     }
-    Some(skipped)
+    Some(1_000 + skipped)
+}
+
+/// Ranges in the displayed spelling, including full Unicode case-fold
+/// expansions. For example, `ss` highlights the single character `ß`.
+fn search_highlight_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let query: Vec<_> = query.trim().case_fold().collect();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let folded: Vec<_> = label
+        .char_indices()
+        .flat_map(|(start, ch)| {
+            let range = start..start + ch.len_utf8();
+            ch.to_string()
+                .case_fold()
+                .map(move |folded| (folded, range.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let contiguous = folded
+        .windows(query.len())
+        .position(|window| window.iter().map(|(ch, _)| ch).eq(query.iter()));
+    let mut ranges = Vec::new();
+    if let Some(start) = contiguous {
+        ranges.extend(
+            folded[start..start + query.len()]
+                .iter()
+                .map(|(_, range)| range.clone()),
+        );
+    } else {
+        let mut offset = 0;
+        for expected in query {
+            let Some(position) = folded[offset..].iter().position(|(ch, _)| *ch == expected) else {
+                return Vec::new();
+            };
+            offset += position;
+            ranges.push(folded[offset].1.clone());
+            offset += 1;
+        }
+    }
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && previous.end >= range.start
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn search_label(
+    label: &str,
+    query: &str,
+    size: f32,
+    class: theme::Text,
+    heading: bool,
+) -> Element<'static, SidebarAction> {
+    use cosmic::iced::widget::text::Span;
+    let font = cosmic::font::Font {
+        weight: if heading {
+            cosmic::iced::font::Weight::Medium
+        } else {
+            cosmic::iced::font::Weight::Normal
+        },
+        ..cosmic::font::default()
+    };
+    let emphasis = cosmic::font::Font {
+        weight: cosmic::iced::font::Weight::Bold,
+        ..font
+    };
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for range in search_highlight_ranges(label, query) {
+        if cursor < range.start {
+            spans.push(Span::new(label[cursor..range.start].to_owned()));
+        }
+        spans.push(
+            Span::new(label[range.clone()].to_owned())
+                .font(emphasis)
+                .color(design::accent_color(&cosmic::theme::active())),
+        );
+        cursor = range.end;
+    }
+    if cursor < label.len() {
+        spans.push(Span::new(label[cursor..].to_owned()));
+    }
+    cosmic::iced::widget::rich_text(spans)
+        .size(size)
+        .font(font)
+        .class(class)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            EllipsizeHeightLimit::Lines(1),
+        ))
+        .width(Length::Fill)
+        .into()
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -8997,6 +9156,9 @@ mod row_interaction {
             enabled: bool,
         },
         FilteredScroll(SidebarFilter),
+        Search {
+            enabled: bool,
+        },
         Projects {
             ids: Vec<ProjectId>,
             enabled: bool,
@@ -9095,6 +9257,16 @@ mod row_interaction {
             })
         }
 
+        pub(super) fn search(
+            content: Element<'a, SidebarAction>,
+            enabled: bool,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::Search { enabled },
+            })
+        }
+
         pub(super) fn projects(
             content: Element<'a, SidebarAction>,
             ids: Vec<ProjectId>,
@@ -9141,6 +9313,7 @@ mod row_interaction {
             match self.kind {
                 Kind::Selectable { row, .. } => focus.1 = Some(super::selection_row_focus_id(row)),
                 Kind::Actions { .. } => {}
+                Kind::Search { .. } => focus.1 = Some(super::search_focus_id()),
                 _ => return,
             }
             for ((child, tree), layout) in self
@@ -9403,6 +9576,16 @@ mod row_interaction {
                 _ => {}
             }
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
+            if matches!(self.kind, Kind::Search { enabled: true })
+                && state.focused
+                && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown), modifiers, ..
+                }) if modifiers.is_empty())
+            {
+                shell.publish(SidebarAction::FocusFirstSearchResult);
+                shell.capture_event();
+                return;
+            }
             if let Kind::Selectable {
                 row,
                 selected,
@@ -10041,6 +10224,104 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ranked_search_prefers_prefixes_then_substrings_then_abbreviations_and_paths() {
+        let mut entry = project();
+        entry.worktrees = vec![
+            worktree(20, "x-fix-y", false),
+            worktree(21, "fancy-index", false),
+            worktree(22, "fix", false),
+        ];
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        state.query = "fix".into();
+        let filtered = filtered_projects(&model, &state, false);
+        assert_eq!(
+            filtered[0]
+                .worktrees
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [22, 20, 21].map(|id| WorktreeId::from_uuid(Uuid::from_u128(id)))
+        );
+        assert!(search_score("fix", "fix") < search_score("prefix-fix", "fix"));
+        assert!(search_score("prefix-fix", "fix") < search_score("fancy-index", "fix"));
+        assert!(
+            model.projects[0].worktrees[0]
+                .search_rank("/repo/")
+                .unwrap()
+                >= 10_000
+        );
+    }
+
+    #[test]
+    fn fuzzy_highlights_preserve_utf8_boundaries_and_casefold_expansions() {
+        assert_eq!(
+            search_highlight_ranges("Feature authentication", "fauth"),
+            vec![0..1, 8..12]
+        );
+        assert_eq!(search_highlight_ranges("Straße", "ss"), vec![4..6]);
+        assert_eq!(search_highlight_ranges("Éclair", "écl"), vec![0..4]);
+        assert!(search_highlight_ranges("Feature", "missing").is_empty());
+        assert!(search_highlight_ranges("Feature", "").is_empty());
+    }
+
+    #[test]
+    fn search_down_enters_results_only_when_the_enabled_search_input_has_focus() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{Shell, clipboard, widget::operation},
+            keyboard, mouse,
+        };
+        for (focused, modal) in [(false, false), (true, false), (true, true)] {
+            let state = SidebarState::default();
+            let renderer = headless_renderer();
+            let mut element = search(&state, modal);
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            if focused {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                );
+            }
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert_eq!(
+                messages,
+                if focused && !modal {
+                    vec![SidebarAction::FocusFirstSearchResult]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test]
     fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
         assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
         assert!(agent_indicator(None, true).is_some());
@@ -10185,7 +10466,7 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, modal, compact, Some(1));
+            let mut element = channel_view(&channel, modal, compact, Some(1), "");
             let mut tree = Tree::new(&element);
             let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -10266,6 +10547,7 @@ pub(crate) mod tests {
                 false,
                 false,
                 Some(1),
+                "",
             );
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
@@ -10728,7 +11010,7 @@ pub(crate) mod tests {
         // the group hands it.
         let header = |compact: bool, width: f32| {
             laid_out(
-                &mut project_identity_row(&model.projects[0], false, false, compact, false),
+                &mut project_identity_row(&model.projects[0], false, false, compact, false, ""),
                 width,
             )
         };
@@ -10804,7 +11086,7 @@ pub(crate) mod tests {
         let width = design::NAVIGATION_DEFAULT_WIDTH;
         let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
         let mut element = project_header_row(
-            project_identity_row(&model.projects[0], false, false, false, false),
+            project_identity_row(&model.projects[0], false, false, false, false, ""),
             vec![
                 icon_action(
                     "go-down-symbolic",
@@ -10999,7 +11281,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false, Some(1));
+            let mut element = channel_view(channel, false, false, Some(1), "");
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,

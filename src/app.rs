@@ -11880,6 +11880,12 @@ impl Application for Cagents {
                             .or_else(|| rows.first()).copied();
                         row.map_or_else(Task::none, |row| self.open_sidebar_navigation_row(row))
                     }
+                    SidebarAction::FocusFirstSearchResult => {
+                        let rows = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, false);
+                        let row = rows.iter().find(|row| !matches!(row, sidebar::SelectionRow::Project(_)))
+                            .or_else(|| rows.first()).copied();
+                        row.map_or_else(Task::none, |row| sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row)).map(cosmic::Action::App))
+                    }
                     SidebarAction::NavigateRow { row, key } => {
                         use keyboard::key::Named;
                         if key == Named::Enter {
