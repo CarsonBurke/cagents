@@ -758,10 +758,18 @@ impl EditorDocument {
         match action {
             text_editor::Action::Edit(edit) => {
                 let kind = edit_kind(&edit, self.content.cursor());
+                let trailing_cr = trailing_carriage_return(&self.content).is_some();
                 let Some(recorded) = self.content.perform_edit(edit) else {
                     return Applied::Unchanged;
                 };
-                let protocol = protocol_edit(&self.content, &recorded.change);
+                // A final bare `\r` is a byte the protocol does not count, and
+                // `protocol_edit` measures against the edited buffer only; while
+                // either side ends in one, the server gets the whole document.
+                let protocol = if trailing_cr || trailing_carriage_return(&self.content).is_some() {
+                    None
+                } else {
+                    protocol_edit(&self.content, &recorded.change)
+                };
                 self.history.record(
                     recorded.change,
                     kind,
@@ -855,6 +863,9 @@ impl EditorDocument {
                     Instant::now(),
                 );
             } else {
+                tracing::warn!(
+                    "discarded edits by rebuilding the editor buffer; they cannot be undone"
+                );
                 self.content = text_editor::Content::with_text(&self.saved_text);
                 self.history.clear();
                 edits.push(None);
@@ -968,7 +979,11 @@ fn edit_kind(edit: &text_editor::Edit, before: text_editor::Cursor) -> EditKind 
 /// The single replacement that turns the whole document `before` into
 /// `after`, or `None` when they are equal.
 fn replacement_between(before: &str, after: &str) -> Option<TextChange> {
-    crate::editor_history::replacement(&Excerpt::document(before), &Excerpt::document(after))
+    crate::editor_history::replacement(
+        &Excerpt::document(before),
+        &Excerpt::document(after),
+        usize::MAX,
+    )
 }
 
 /// The editor buffer as the history replays into it, recording each
@@ -4580,6 +4595,10 @@ impl RepositoryRuntime {
                 // the server's copy just became wrong.
                 let edits = document.discard_edits();
                 self.push_lsp_edits(edits);
+                // Find keeps the keyboard while it is open.
+                if self.search_mode {
+                    return self.markdown_task(card);
+                }
                 // The toolbar button took the keyboard; give it back so the
                 // Ctrl+Z its tooltip promises reaches the buffer.
                 Task::batch([self.markdown_task(card), self.focus_editor(card)])
@@ -14868,6 +14887,25 @@ mod tests {
         document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('H')));
         assert_eq!(document.content.text().len(), text.len());
         assert!(document.dirty);
+    }
+
+    #[test]
+    fn an_edit_at_a_final_bare_carriage_return_resends_the_whole_document() {
+        // The protocol does not count a buffer's final bare `\r`, so removing
+        // it has no protocol range measured on the edited buffer alone.
+        let text = "a\r";
+        let mut document = EditorDocument::unlinked(
+            PathBuf::from("mac.txt"),
+            text.into(),
+            blake3::hash(text.as_bytes()),
+            false,
+        );
+        document.apply(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        assert_eq!(
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Backspace)),
+            Applied::Changed(None)
+        );
+        assert_eq!(document.content.text(), "a");
     }
 
     #[test]

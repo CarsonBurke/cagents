@@ -839,6 +839,20 @@ where
         let last = (cursor.position.line.max(anchor.line) + 1).min(count.saturating_sub(1));
         let before = self.excerpt(first, last);
         let selection = self.selected_span(&before, cursor);
+        // The edit begins no later than the selection or the caret —
+        // Backspace one character before it — which settles where a change
+        // beside a repeated character is recorded.
+        let offset = |position| before.offset(position).unwrap_or(usize::MAX);
+        let caret_at = offset(selection.position);
+        let changed_from = match selection.selection {
+            Some(anchor) => caret_at.min(offset(anchor)),
+            None if matches!(edit, Edit::Backspace) => before
+                .text()
+                .get(..caret_at)
+                .and_then(|text| text.chars().next_back())
+                .map_or(caret_at, |character| caret_at - character.len_utf8()),
+            None => caret_at,
+        };
         self.perform(Action::Edit(edit));
         // Lines past the window only move; how far is how many the edit added
         // or removed.
@@ -848,7 +862,7 @@ where
             .max(first)
             .min(after_count.saturating_sub(1));
         let after = self.excerpt(first, after_last);
-        history::replacement(&before, &after).map(|change| RecordedEdit {
+        history::replacement(&before, &after, changed_from).map(|change| RecordedEdit {
             change,
             before: selection,
         })
@@ -882,7 +896,10 @@ where
         while !text.is_char_boundary(search) {
             search -= 1;
         }
-        let limit = (high + selected.len()).min(text.len());
+        let mut limit = (high + selected.len()).min(text.len());
+        while !text.is_char_boundary(limit) {
+            limit += 1;
+        }
         let mut span = None;
         while let Some(found) = text
             .get(search..limit)
@@ -3041,6 +3058,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_selection_search_window_ending_inside_a_character_still_finds_it() {
+        // A word selection reports only the point it was made at; the search
+        // for its span looks the selection's length in bytes past that
+        // point, which here ends inside the three-byte dash.
+        let text = "ab\u{2014}\n";
+        let mut content: Content = Content::with_text(text);
+        content.set_cursor(Cursor {
+            position: Position { line: 0, column: 1 },
+            selection: None,
+        });
+        content.perform(Action::SelectWord);
+        assert_eq!(content.selection().as_deref(), Some("ab"));
+        assert_eq!(
+            content.selected_span(&Excerpt::document(text), content.cursor()),
+            Cursor {
+                position: Position { line: 0, column: 2 },
+                selection: Some(Position { line: 0, column: 0 }),
+            }
+        );
+    }
+
     /// Every kind of edit the native buffer performs, at random places and
     /// over random selections, is recorded exactly: undoing the whole
     /// history reproduces the original bytes, including mixed line endings,
@@ -3071,13 +3110,19 @@ mod tests {
                     }
                     Position { line, column }
                 };
-                let position = pick(next(lines), next(40), &content);
-                let selection = (next(3) == 0).then(|| pick(next(lines), next(40), &content));
-                content.set_cursor(Cursor {
-                    position,
-                    selection,
-                });
-                history.seal();
+                // Half the time the caret moves, which seals the step the way
+                // the editor does; otherwise the edit continues from where the
+                // last one left it and may coalesce into its step.
+                if step == 0 || next(2) == 0 {
+                    let position = pick(next(lines), next(40), &content);
+                    let selection = (next(3) == 0).then(|| pick(next(lines), next(40), &content));
+                    content.set_cursor(Cursor {
+                        position,
+                        selection,
+                    });
+                    history.seal();
+                }
+                let selection = content.cursor().selection;
                 // Unindent is left out: cosmic-text 0.19 underflows its caret
                 // when unindenting with the caret inside the indentation,
                 // and nothing in the application binds it.
@@ -3141,6 +3186,55 @@ mod tests {
             selection: None,
         });
         assert!(content.perform_edit(Edit::Backspace).is_none());
+    }
+
+    /// Next to a repeated character the before and after texts alone cannot
+    /// say which copy an edit touched; the caret does, and a run that stays
+    /// at the caret stays one undo step.
+    #[test]
+    fn native_runs_beside_a_repeated_character_are_one_undo_step() {
+        use history::{EditKind, History, Replay};
+        for (text, column, edits, kind, edited) in [
+            (
+                "helo\n",
+                2,
+                vec![Edit::Insert('x'), Edit::Insert('l')],
+                EditKind::Insert,
+                "hexllo\n",
+            ),
+            (
+                "abbc\n",
+                1,
+                vec![Edit::Delete, Edit::Delete],
+                EditKind::DeleteForward,
+                "ac\n",
+            ),
+            (
+                "abbc\n",
+                2,
+                vec![Edit::Backspace, Edit::Backspace],
+                EditKind::DeleteBackward,
+                "bc\n",
+            ),
+        ] {
+            let mut content: Content = Content::with_text(text);
+            let mut history = History::default();
+            let caret = Cursor {
+                position: Position { line: 0, column },
+                selection: None,
+            };
+            content.set_cursor(caret);
+            let now = Instant::now();
+            for edit in edits {
+                let edit = content.perform_edit(edit).unwrap();
+                history.record(edit.change, kind, edit.before, content.cursor(), now);
+            }
+            assert_eq!(content.text(), edited);
+            assert_eq!(history.undo(&mut content), Replay::Applied);
+            assert_eq!(content.text(), text);
+            assert_eq!(content.cursor(), caret);
+            assert_eq!(history.undo(&mut content), Replay::Empty, "{edited:?}");
+        }
     }
 
     #[test]

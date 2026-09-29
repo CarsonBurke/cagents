@@ -523,14 +523,23 @@ impl Excerpt {
 /// edit could touch, taken before and after it. The replacement is the
 /// smallest one that does not split a line break, since a caret cannot sit
 /// between the two halves of `\r\n`.
-pub fn replacement(before: &Excerpt, after: &Excerpt) -> Option<TextChange> {
+///
+/// `max_prefix` is the offset into `before` where the edit is known to
+/// begin at the latest, such as the caret a character was typed at. Next to
+/// a repeated character the difference alone is ambiguous — typing `l` in
+/// `he|lo` reads as well at either `l` — and the rightmost reading would
+/// put the change after the caret, splitting a run of typing or deleting
+/// into separate undo steps. Pass `usize::MAX` when nothing is known.
+pub fn replacement(before: &Excerpt, after: &Excerpt, max_prefix: usize) -> Option<TextChange> {
     debug_assert_eq!(before.first_line, after.first_line);
     let (old, new) = (before.text.as_str(), after.text.as_str());
+    // Capping only widens the change, so any cap still describes the edit.
     let mut prefix = old
         .bytes()
         .zip(new.bytes())
         .take_while(|(left, right)| left == right)
-        .count();
+        .count()
+        .min(max_prefix);
     while !old.is_char_boundary(prefix) {
         prefix -= 1;
     }
@@ -635,7 +644,7 @@ mod tests {
                 position: self.position(offset + text.len()),
                 selection: None,
             };
-            let change = replacement(&before, &after).expect("the edit changed something");
+            let change = replacement(&before, &after, offset).expect("the edit changed something");
             history.record(change, kind, before_cursor, self.cursor, now);
         }
 
@@ -776,6 +785,41 @@ mod tests {
     }
 
     #[test]
+    fn runs_beside_a_repeated_character_stay_one_step() {
+        let now = Instant::now();
+        // Typing `l` after `hex|lo` reads just as well as an insertion after
+        // the existing `l`; it must be recorded at the caret it was typed at.
+        let mut history = History::default();
+        let mut model = Model::new("helo");
+        model.cursor = caret(0, 2);
+        model.type_text(&mut history, "xl", now);
+        assert_eq!(model.text, "hexllo");
+        assert_eq!(undo_all(&mut history, &mut model), 1);
+        assert_eq!(model.text, "helo");
+
+        let mut history = History::default();
+        let mut model = Model::new("abbc");
+        model.cursor = caret(0, 1);
+        for _ in 0..2 {
+            model.edit(&mut history, 1, 1, "", EditKind::DeleteForward, now);
+        }
+        assert_eq!(model.text, "ac");
+        assert_eq!(undo_all(&mut history, &mut model), 1);
+        assert_eq!(model.text, "abbc");
+
+        let mut history = History::default();
+        let mut model = Model::new("abbc");
+        model.cursor = caret(0, 2);
+        for _ in 0..2 {
+            model.backspace(&mut history, now);
+        }
+        assert_eq!(model.text, "bc");
+        assert_eq!(undo_all(&mut history, &mut model), 1);
+        assert_eq!(model.text, "abbc");
+        assert_eq!(model.cursor, caret(0, 2));
+    }
+
+    #[test]
     fn a_replaced_selection_is_reselected_on_undo() {
         let now = Instant::now();
         let mut history = History::default();
@@ -884,23 +928,50 @@ mod tests {
     #[test]
     fn replacements_never_split_a_line_break() {
         // Turning CRLF into LF must not be recorded as deleting half of it.
-        let change = replacement(&Excerpt::document("a\r\nb"), &Excerpt::document("a\nb")).unwrap();
+        let change = replacement(
+            &Excerpt::document("a\r\nb"),
+            &Excerpt::document("a\nb"),
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(change.start, at(0, 1));
         assert_eq!(change.removed, "\r\n");
         assert_eq!(change.inserted, "\n");
         // Joining lines across a CRLF removes the whole break.
-        let change = replacement(&Excerpt::document("a\r\nb"), &Excerpt::document("ab")).unwrap();
+        let change = replacement(
+            &Excerpt::document("a\r\nb"),
+            &Excerpt::document("ab"),
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!((change.start, change.removed.as_str()), (at(0, 1), "\r\n"));
         // An insertion right before an existing break stays an insertion.
-        let change = replacement(&Excerpt::document("a\nb"), &Excerpt::document("a\n\nb")).unwrap();
+        let change = replacement(
+            &Excerpt::document("a\nb"),
+            &Excerpt::document("a\n\nb"),
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(change.removed, "");
         assert_eq!(change.inserted, "\n");
-        assert!(replacement(&Excerpt::document("same"), &Excerpt::document("same")).is_none());
+        assert!(
+            replacement(
+                &Excerpt::document("same"),
+                &Excerpt::document("same"),
+                usize::MAX
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn replacements_keep_multibyte_characters_whole() {
-        let change = replacement(&Excerpt::document("aé"), &Excerpt::document("aè")).unwrap();
+        let change = replacement(
+            &Excerpt::document("aé"),
+            &Excerpt::document("aè"),
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(change.removed, "é");
         assert_eq!(change.inserted, "è");
         assert_eq!(change.start, at(0, 1));
@@ -949,9 +1020,11 @@ mod tests {
                 ][next(4)];
                 let mut after = model.text.clone();
                 after.replace_range(from..to, text);
-                let Some(change) =
-                    replacement(&Excerpt::document(&model.text), &Excerpt::document(&after))
-                else {
+                let Some(change) = replacement(
+                    &Excerpt::document(&model.text),
+                    &Excerpt::document(&after),
+                    from,
+                ) else {
                     continue;
                 };
                 let before = Cursor {
