@@ -36,6 +36,16 @@ impl ActiveWorktreeOperation {
         self.project
     }
 
+    /// The repository root its request was resolved against. A creation
+    /// started from a pull request checkout resolves against that checkout,
+    /// not the project's root, so its relative destination means something
+    /// only there.
+    pub(super) fn repository(&self) -> Option<&Path> {
+        self.request
+            .as_ref()
+            .map(|request| request.repository.as_path())
+    }
+
     /// Why it stopped, unless the user stopped it: a cancellation needs no
     /// explaining back to the person who asked for it.
     pub(super) fn failure(&self) -> Option<&str> {

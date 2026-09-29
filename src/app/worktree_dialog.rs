@@ -404,11 +404,12 @@ impl Cagents {
         if self.worktree_dialog.is_some() {
             return Task::none();
         }
-        let Some((project_id, draft, failure)) =
+        let Some((project_id, repository, draft, failure)) =
             self.worktree_operations.get(&id).and_then(|operation| {
                 operation.reopenable_draft().map(|draft| {
                     (
                         operation.project(),
+                        operation.repository().map(Path::to_path_buf),
                         draft.clone(),
                         operation.failure().map(WorktreeInputError::recorded),
                     )
@@ -417,11 +418,13 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let Some(repository) = self
-            .sidebar_model
-            .project(project_id)
-            .map(|project| project.repository.clone())
-        else {
+        // The input resolves again against the root it was first resolved
+        // against, which for a pull request checkout is not the project's.
+        let Some(repository) = repository.or_else(|| {
+            self.sidebar_model
+                .project(project_id)
+                .map(|project| project.repository.clone())
+        }) else {
             return Task::none();
         };
         let error = failure.filter(|_| !submit);
@@ -948,6 +951,30 @@ mod tests {
         assert!(shown.error.is_none());
         assert!(shown.resolving.is_some(), "retry submits straight away");
         assert!(app.worktree_operations.contains_key(&id));
+    }
+
+    /// A creation started from a pull request checkout reopens against that
+    /// checkout, so a relative destination resolves where it first did.
+    #[test]
+    fn a_reopened_creation_keeps_the_repository_it_was_resolved_against() {
+        let Fixture {
+            mut app, project, ..
+        } = fixture();
+        let _ = app.update(Message::CancelDialog);
+        let id = OperationId::new();
+        let checkout = PathBuf::from("/repo/checkouts/pr-7");
+        let _ = app.start_worktree_operation(
+            project,
+            CreateWorktreeRequest {
+                repository: checkout.clone(),
+                ..request(id)
+            },
+            Some(WorktreeDraft::branch("feature/one")),
+        );
+        not_created(&mut app, id, "network");
+
+        let _ = app.update(Message::Sidebar(SidebarAction::EditWorktreeOperation(id)));
+        assert_eq!(dialog(&app).repository, checkout);
     }
 
     #[test]
