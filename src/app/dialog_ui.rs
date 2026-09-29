@@ -16,6 +16,21 @@ pub(crate) fn surface<'a, M: 'a>(
     .into()
 }
 
+/// The closing row every confirmation shares: right-aligned, the dismissal
+/// before the committing action, on the theme's spacing token.
+pub(super) fn confirmation_actions<'a>(
+    dismiss: impl Into<Element<'a, Message>>,
+    confirm: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    widget::row::with_children(vec![
+        iced::widget::Space::new().width(Length::Fill).into(),
+        dismiss.into(),
+        confirm.into(),
+    ])
+    .spacing(cosmic::theme::spacing().space_xxs)
+    .into()
+}
+
 pub(super) fn overlay<'a>(
     surface: Element<'a, Message>,
     dismiss: Option<Message>,

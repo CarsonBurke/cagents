@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    control::{ControlClient, shutdown_outcome_message},
+    control::{ControlClient, StopReport, shutdown_outcome_summary},
     terminal::ipc::{ShutdownCapability, ShutdownOutcome},
 };
 use std::io::Write;
@@ -22,6 +22,8 @@ pub struct DaemonStop {
     pending: bool,
     settled: bool,
     detail: String,
+    /// What the tray that opened this dialog is told once it closes.
+    report: Option<StopReport>,
     failed: Arc<AtomicBool>,
 }
 
@@ -31,7 +33,7 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming this request terminates the counted hosted terminals. Cancel makes no shutdown request.".into(), failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
+        (Self { core, capability, pending: false, settled: false, detail: "Confirming this request terminates the counted hosted terminals. Cancel makes no shutdown request.".into(), report: None, failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
     }
     fn core(&self) -> &Core {
         &self.core
@@ -46,11 +48,9 @@ impl Application for DaemonStop {
         match message {
             StopMessage::Key(event) if is_escape_press(&event) => self.update(StopMessage::Cancel),
             StopMessage::Cancel if !self.pending => {
-                if !self.settled {
-                    let _ = writeln!(
-                        std::io::stdout(),
-                        "Daemon shutdown cancelled; no shutdown was requested."
-                    );
+                let report = self.report.take().unwrap_or(StopReport::Cancelled);
+                if let Ok(line) = serde_json::to_string(&report) {
+                    let _ = writeln!(std::io::stdout(), "{line}");
                 }
                 iced::exit().map(cosmic::Action::App)
             }
@@ -91,20 +91,22 @@ impl Application for DaemonStop {
             StopMessage::Finished(result) if self.pending => {
                 self.pending = false;
                 self.settled = true;
-                self.detail = match result {
+                let report = match result {
                     Ok(outcome) => {
                         self.failed.store(
                             !matches!(outcome, ShutdownOutcome::Accepted { .. }),
                             Ordering::Release,
                         );
-                        shutdown_outcome_message(&outcome)
+                        self.detail = shutdown_outcome_summary(&outcome);
+                        StopReport::Finished { outcome }
                     }
                     Err(error) => {
                         self.failed.store(true, Ordering::Release);
-                        format!("Failed: daemon shutdown was not confirmed: {error}")
+                        self.detail = format!("Could not stop the daemon: {error}");
+                        StopReport::Failed { error }
                     }
                 };
-                let _ = writeln!(std::io::stdout(), "{}", self.detail);
+                self.report = Some(report);
                 iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
                     .map(cosmic::Action::App)
             }
@@ -114,12 +116,14 @@ impl Application for DaemonStop {
                     Ok(capability) => {
                         self.capability = capability;
                         self.settled = false;
+                        self.report = None;
                         self.detail = "Fresh inventory loaded. Confirm the count below; no shutdown has been requested by this refresh.".into();
                     }
                     Err(error) => {
                         self.settled = true;
                         self.failed.store(true, Ordering::Release);
-                        self.detail = format!("Failed to refresh the daemon: {error}");
+                        self.detail = format!("Could not refresh the daemon: {error}");
+                        self.report = Some(StopReport::Failed { error });
                     }
                 }
                 iced::widget::operation::focus(widget::Id::new(if self.settled {
@@ -292,5 +296,24 @@ mod tests {
             assert!(app.failed.load(Ordering::Acquire));
             assert!(app.settled);
         }
+    }
+
+    #[test]
+    fn the_tray_is_told_the_typed_outcome_and_the_dialog_shows_plain_copy() {
+        let mut app = confirmation(3);
+        assert_eq!(app.report, None, "closing untouched reports a cancellation");
+        let _unpolled = app.update(StopMessage::Confirm);
+        let accepted = ShutdownOutcome::Accepted {
+            live_terminals_before: 3,
+            termination_requested: true,
+        };
+        let _ = app.update(StopMessage::Finished(Ok(accepted.clone())));
+        assert_eq!(app.detail, "Stopping… 3 terminals will close");
+        assert_eq!(app.report, Some(StopReport::Finished { outcome: accepted }));
+        let line = serde_json::to_string(app.report.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StopReport>(&line).unwrap(),
+            app.report.unwrap()
+        );
     }
 }

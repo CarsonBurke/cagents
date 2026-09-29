@@ -385,6 +385,17 @@ impl ClientHandle {
         handle
     }
 
+    /// Publishes `snapshot` as the reader thread would on a presentation
+    /// frame, so a test can stream a transcript into a surface.
+    #[cfg(test)]
+    pub(crate) fn publish_snapshot_for_test(&self, snapshot: Snapshot) {
+        *self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Arc::new(snapshot);
+    }
+
     /// Queues a report as the reader thread would on its arrival, and says
     /// whether it would have woken the surface.
     #[cfg(test)]

@@ -13,7 +13,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, error::ErrorKind as ClapErrorKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -53,6 +53,12 @@ const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `cagents ui` waits for a window that has closed, and so refuses
+/// activations, to finish exiting and release its lease. An exiting UI waits
+/// for its language servers (bounded at 5s) and its window's removal (2s),
+/// then flushes its session.
+const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const UI_PREDECESSOR_EXIT_POLL: Duration = Duration::from_millis(200);
 const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
@@ -534,9 +540,25 @@ impl ControlClient {
     pub fn notification_preferences(
         &mut self,
         preferences: Option<crate::notifications::Preferences>,
-        test: bool,
     ) -> Result<(), ControlError> {
-        self.accepted(ClientRequest::NotificationPreferencesChanged { preferences, test })
+        self.accepted(ClientRequest::NotificationPreferencesChanged { preferences })
+    }
+
+    /// Asks the daemon to show a test notification and waits for the
+    /// desktop's answer.
+    pub fn send_test_notification(
+        &mut self,
+    ) -> Result<crate::notifications::TestOutcome, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::SendTestNotification,
+            Instant::now() + crate::notifications::TEST_TIMEOUT + IO_TIMEOUT,
+        )? {
+            ServerResponse::NotificationTest { outcome } => Ok(outcome),
+            response => Err(unexpected_response(
+                "a test notification outcome",
+                &response,
+            )),
+        }
     }
 
     pub fn acknowledge_notification(&mut self, id: uuid::Uuid) -> Result<(), ControlError> {
@@ -1478,6 +1500,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
+        ServerResponse::NotificationTest { .. } => "notification_test",
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
@@ -1691,21 +1714,32 @@ fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppE
     }
     let executable =
         sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
-    let mut command = Command::new(&executable);
-    if new_window {
-        command.arg("--new-window");
-    }
-    if let Some(slot) = slot {
-        command.args(["--window", slot]);
-    }
-    if let Err(error) = spawn_ui_process(&mut command) {
-        if !new_window
-            && handshake_reports_already_running(&error)
-            && activate().map_err(|error| AppError::new("launch", error))?
-        {
+    let predecessor_deadline = Instant::now() + UI_PREDECESSOR_EXIT_TIMEOUT;
+    loop {
+        let mut command = Command::new(&executable);
+        if new_window {
+            command.arg("--new-window");
+        }
+        if let Some(slot) = slot {
+            command.args(["--window", slot]);
+        }
+        let Err(error) = spawn_ui_process(&mut command) else {
+            break;
+        };
+        if new_window || !handshake_reports_already_running(&error) {
+            return Err(AppError::new("launch", error));
+        }
+        if activate().map_err(|error| AppError::new("launch", error))? {
             return Ok(already_running_ui_output());
         }
-        return Err(AppError::new("launch", error));
+        // The window's lease is held, yet nothing takes an activation: its
+        // window has closed and the process is finishing its exit. Wait for
+        // it to release the lease rather than report a window nobody sees.
+        let now = Instant::now();
+        if now >= predecessor_deadline {
+            return Err(AppError::new("launch", error));
+        }
+        thread::sleep(UI_PREDECESSOR_EXIT_POLL.min(predecessor_deadline - now));
     }
     Ok(CommandOutput {
         command: "ui",
@@ -1825,6 +1859,87 @@ fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
     ))
 }
 
+/// Retained native conversations that the last daemon upgrade could not
+/// reattach and that have not since been reattached or closed, as structured
+/// data and a human warning. `None` when nothing needs attention.
+fn upgrade_attention() -> Option<(Value, String)> {
+    let (evidence, conversations) = match crate::upgrade::handoff::Store::existing() {
+        Ok(None) => return None,
+        Ok(Some(store)) => (Some(store.unattached_path()), store.unattached()),
+        Err(error) => (None, Err(error)),
+    };
+    let conversations = match conversations {
+        Ok(conversations) if conversations.is_empty() => return None,
+        Ok(conversations) => conversations,
+        Err(error) => {
+            return Some((
+                json!({ "evidence": evidence, "error": error }),
+                format!(
+                    "cannot read retained-conversation upgrade evidence: {}",
+                    printable(&error)
+                ),
+            ));
+        }
+    };
+    Some((
+        json!({ "evidence": evidence, "unattached_conversations": conversations }),
+        describe_unattached(&conversations, evidence.as_deref()),
+    ))
+}
+
+fn describe_unattached(
+    conversations: &[crate::upgrade::handoff::UnattachedSummary],
+    evidence: Option<&Path>,
+) -> String {
+    let mut text = format!(
+        "{} retained native conversation{} could not be reattached after the daemon update. Nothing was restarted or resent for them and their providers were left as they were; open each in cagents to see why, then recover or close it.",
+        conversations.len(),
+        if conversations.len() == 1 { "" } else { "s" },
+    );
+    for conversation in conversations {
+        text.push_str(&format!(
+            "\n  {} {} in {}: {}",
+            conversation.provider.label(),
+            printable(
+                conversation
+                    .conversation
+                    .as_deref()
+                    .unwrap_or("(unconfirmed conversation)")
+            ),
+            printable(&conversation.working_directory.to_string_lossy()),
+            printable(&conversation.reason),
+        ));
+    }
+    if let Some(evidence) = evidence {
+        text.push_str(&format!(
+            "\n  evidence: {}",
+            printable(&evidence.to_string_lossy())
+        ));
+    }
+    text
+}
+
+/// Escapes control characters, such as terminal escape sequences in a
+/// provider's error, and bidirectional formatting characters, which can
+/// visually reorder what follows them, before text recorded by the daemon
+/// reaches a terminal.
+fn printable(text: &str) -> String {
+    let mut printable = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        {
+            printable.extend(character.escape_default());
+        } else {
+            printable.push(character);
+        }
+    }
+    printable
+}
+
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     match command {
         DaemonCommand::Upgrade { yes, interrupt } => {
@@ -1840,9 +1955,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
         DaemonCommand::Start => {
             let socket = terminal::ensure_daemon_ready()
                 .map_err(|error| AppError::new("daemon_start", error))?;
+            let mut data = json!({ "instance": instance::NAME, "running": true, "socket": socket });
+            // Installers discard a successful start's output, but a daemon that
+            // came up without some retained conversations must still say so.
+            if let Some((attention, warning)) = upgrade_attention() {
+                eprintln!("cagents: {warning}");
+                data["upgrade_attention"] = attention;
+            }
             Ok(CommandOutput {
                 command: "daemon.start",
-                data: json!({ "instance": instance::NAME, "running": true, "socket": socket }),
+                data,
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
@@ -1867,26 +1989,33 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
+            let mut data = json!({
+                "instance": instance::NAME,
+                "running": running,
+                "socket": socket,
+                "daemon_version": daemon_version,
+                "cli_version": crate::VERSION
+            });
+            let mut human = if running {
+                format!(
+                    "{} daemon {} running ({}); cli {}",
+                    instance::NAME,
+                    daemon_version.as_deref().unwrap_or("starting"),
+                    socket.display(),
+                    crate::VERSION
+                )
+            } else {
+                format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
+            };
+            if let Some((attention, warning)) = upgrade_attention() {
+                data["upgrade_attention"] = attention;
+                human.push_str("\nwarning: ");
+                human.push_str(&warning);
+            }
             Ok(CommandOutput {
                 command: "daemon.status",
-                data: json!({
-                    "instance": instance::NAME,
-                    "running": running,
-                    "socket": socket,
-                    "daemon_version": daemon_version,
-                    "cli_version": crate::VERSION
-                }),
-                human: if running {
-                    format!(
-                        "{} daemon {} running ({}); cli {}",
-                        instance::NAME,
-                        daemon_version.as_deref().unwrap_or("starting"),
-                        socket.display(),
-                        crate::VERSION
-                    )
-                } else {
-                    format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
-                },
+                data,
+                human,
             })
         }
         DaemonCommand::ProtocolVersion => Ok(CommandOutput {
@@ -2132,6 +2261,50 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
             "Shutdown already requested; termination is not yet confirmed complete".into()
         }
     }
+}
+
+/// One plain line about a shutdown outcome, for the tray menu and the stop
+/// confirmation, which have room for a sentence rather than the CLI's full
+/// account of what was and was not requested.
+pub fn shutdown_outcome_summary(outcome: &ShutdownOutcome) -> String {
+    let terminals = |count: u64| match count {
+        1 => "1 terminal".to_owned(),
+        count => format!("{count} terminals"),
+    };
+    match *outcome {
+        ShutdownOutcome::Accepted {
+            live_terminals_before: 0,
+            ..
+        } => "Stopping the daemon…".into(),
+        ShutdownOutcome::Accepted {
+            live_terminals_before,
+            ..
+        } => format!("Stopping… {} will close", terminals(live_terminals_before)),
+        ShutdownOutcome::EmptyRequired { current_count }
+        | ShutdownOutcome::ConfirmationRequired { current_count } => {
+            format!("Stop needs confirmation: {} open", terminals(current_count))
+        }
+        ShutdownOutcome::InventoryChanged { current_count } => format!(
+            "Not stopped: the open terminals changed ({} now). Try again.",
+            current_count
+        ),
+        ShutdownOutcome::Expired => "Not stopped: the confirmation expired. Try again.".into(),
+        ShutdownOutcome::DaemonRestarted => "Not stopped: the daemon restarted. Try again.".into(),
+        ShutdownOutcome::InvalidCapability => {
+            "Not stopped: the confirmation was not accepted. Try again.".into()
+        }
+        ShutdownOutcome::AlreadyShuttingDown => "The daemon is already stopping…".into(),
+    }
+}
+
+/// What the stop confirmation reports to the tray that opened it, as one JSON
+/// line on its stdout; the tray words it, rather than showing that text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum StopReport {
+    Cancelled,
+    Finished { outcome: ShutdownOutcome },
+    Failed { error: String },
 }
 
 fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError> {
@@ -2801,6 +2974,63 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn printable_escapes_terminal_and_bidirectional_controls() {
+        assert_eq!(
+            printable("a\u{1b}[2Jb\u{202E}c\u{2066}d\u{061C}e\u{200F}f"),
+            "a\\u{1b}[2Jb\\u{202e}c\\u{2066}d\\u{61c}e\\u{200f}f"
+        );
+        assert_eq!(printable("plain é 日本"), "plain é 日本");
+    }
+
+    #[test]
+    fn unattached_upgrade_conversations_are_named_with_their_reasons() {
+        let conversation = |reason: &str| crate::upgrade::handoff::UnattachedSummary {
+            id: TerminalId::new(),
+            provider: crate::agent::Provider::Codex,
+            conversation: Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+            working_directory: "/work/project".into(),
+            reason: reason.into(),
+        };
+        let one = describe_unattached(
+            &[conversation("no rollout found for thread id")],
+            Some(Path::new("/data/daemon-upgrade.unattached.json")),
+        );
+        assert!(
+            one.starts_with("1 retained native conversation could not be reattached"),
+            "{one}"
+        );
+        assert!(one.contains("Nothing was restarted or resent"), "{one}");
+        assert!(
+            one.contains(
+                "\n  Codex aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa in /work/project: no rollout found for thread id"
+            ),
+            "{one}"
+        );
+        assert!(
+            one.ends_with("\n  evidence: /data/daemon-upgrade.unattached.json"),
+            "{one}"
+        );
+        let mut unconfirmed = conversation("The durable native holder is unavailable");
+        unconfirmed.conversation = None;
+        let two = describe_unattached(&[conversation("unavailable"), unconfirmed], None);
+        assert!(two.starts_with("2 retained native conversations"), "{two}");
+        assert!(two.contains("(unconfirmed conversation)"), "{two}");
+        assert!(!two.contains("evidence:"), "{two}");
+        let hostile =
+            describe_unattached(&[conversation("refused\u{1b}]52;c;x\u{7}\nforged")], None);
+        assert!(
+            hostile.contains("refused\\u{1b}]52;c;x\\u{7}\\nforged"),
+            "{hostile}"
+        );
+        assert!(
+            !hostile.chars().any(|c| c.is_control() && c != '\n'),
+            "{hostile}"
+        );
+        assert_eq!(hostile.lines().count(), 2, "{hostile}");
+    }
+
     #[test]
     fn require_empty_is_one_guarded_request_and_never_a_list_then_force() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();

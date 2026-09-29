@@ -12,12 +12,19 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod clipboard_image;
 mod completion;
+mod prose;
+mod retained;
 mod scroll;
 mod step;
 mod tool_text;
 mod turn;
 mod view;
+
+pub(super) fn prune_pasted_images() {
+    clipboard_image::prune_cache();
+}
 
 fn action(action: Action) -> Message {
     Message::ChatUi(action)
@@ -137,6 +144,13 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    Paste(Target),
+    PastedImage(Target, Option<clipboard_image::Image>),
+    PastedText(Target, Option<String>),
+    /// A clipboard image the chat cannot take, offered without any text to
+    /// paste in its place.
+    PasteRefused(Target, &'static str),
+    ImageSaved(Target, Result<PathBuf, String>),
     Submit(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
@@ -208,6 +222,10 @@ impl Action {
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::Attached(..)
+                | Self::PastedImage(..)
+                | Self::PastedText(..)
+                | Self::PasteRefused(..)
+                | Self::ImageSaved(..)
                 | Self::HandoffFinished(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
@@ -240,6 +258,7 @@ impl Action {
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Attach(target)
+            | Self::Paste(target)
             | Self::Dropped(target, _)
             | Self::RemoveAttachment(target, _)
             | Self::Model(target, _)
@@ -427,7 +446,7 @@ fn tail_digest(seed: u64, text: &str) -> u64 {
 /// changed must therefore not touch its body: the window holds up to 128 items
 /// and a long answer is megabytes. The content's shape, its field lengths, and
 /// a bounded tail digest answer that question in constant time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ChangeToken {
     /// The content variant plus the flags that sit beside its text.
     shape: u8,
@@ -759,11 +778,11 @@ struct CachedItem {
     token: ChangeToken,
     markdown: markdown::Content,
     code: CodeScan,
-    /// The highlighted spans of each fenced block the Markdown parsed, keyed
-    /// by the block's language and text: what a frame looks a block up by.
-    /// The palette is the runtime's, applied when the block is highlighted,
-    /// so a change of syntax theme rehighlights rather than restyles.
-    blocks: HashMap<u64, crate::diff_view::SyntaxLines>,
+    /// Each fenced block the Markdown parsed, ready to draw, keyed by the
+    /// block's language and text: what a frame looks a block up by. The
+    /// palette is the runtime's, applied when the block is highlighted, so a
+    /// change of syntax theme rehighlights rather than restyles.
+    blocks: HashMap<u64, prose::CodeBlock>,
     /// A step's trailing metadata — exit status and duration — formed once per
     /// change rather than once per frame.
     detail: Option<String>,
@@ -917,22 +936,19 @@ impl CachedItem {
     /// agent pasted rather than a snippet it is showing.
     const HIGHLIGHT_LIMIT: usize = 64 * 1024;
 
-    /// Highlights every fenced block the Markdown now holds, keeping the
-    /// spans of blocks that are unchanged since the last pass. A streamed
-    /// block changes on every refresh until its fence closes, so it is the
-    /// one block a refresh usually rehighlights.
+    /// Prepares every fenced block the Markdown now holds, keeping the blocks
+    /// that are unchanged since the last pass. A streamed block changes on
+    /// every refresh until its fence closes, so it is the one block a
+    /// refresh usually prepares again.
     fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
         let mut previous = std::mem::take(&mut self.blocks);
         let mut blocks = HashMap::new();
         for_each_fence(self.markdown.items(), &mut |language, code| {
-            if code.len() > Self::HIGHLIGHT_LIMIT {
-                return;
-            }
-            let key = fence_key(language, code);
-            let spans = previous
+            let key = fence_key(language.unwrap_or_default(), code);
+            let block = previous
                 .remove(&key)
-                .unwrap_or_else(|| crate::diff_view::highlight_snippet(code, language, theme));
-            blocks.insert(key, spans);
+                .unwrap_or_else(|| prose::CodeBlock::new(language, code, theme));
+            blocks.insert(key, block);
         });
         self.blocks = blocks;
     }
@@ -944,27 +960,23 @@ impl CachedItem {
         self.highlight(theme);
     }
 
-    /// The highlighted lines of the fence whose info string is `language`
-    /// and whose text is `code`, where the cache holds them.
-    fn block(&self, language: Option<&str>, code: &str) -> Option<&crate::diff_view::SyntaxLines> {
-        self.blocks.get(&fence_key(language?, code))
+    /// The fence whose info string is `language` and whose text is `code`,
+    /// where the cache holds it.
+    fn block(&self, language: Option<&str>, code: &str) -> Option<&prose::CodeBlock> {
+        self.blocks
+            .get(&fence_key(language.unwrap_or_default(), code))
     }
 }
 
-/// Visits every fenced block among `items` that names a language, in the
-/// order the Markdown draws them, descending into lists and quotes the way
-/// the drawing does.
+/// Visits every fenced block among `items`, in the order the Markdown draws
+/// them, descending into lists and quotes the way the drawing does.
 fn for_each_fence<'a>(
     items: impl IntoIterator<Item = &'a markdown::Item>,
-    visit: &mut impl FnMut(&'a str, &'a str),
+    visit: &mut impl FnMut(Option<&'a str>, &'a str),
 ) {
     for item in items {
         match item {
-            markdown::Item::CodeBlock {
-                language: Some(language),
-                code,
-                ..
-            } => visit(language, code),
+            markdown::Item::CodeBlock { language, code, .. } => visit(language.as_deref(), code),
             markdown::Item::List { bullets, .. } => {
                 for bullet in bullets {
                     let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
@@ -986,72 +998,6 @@ fn fence_key(language: &str, code: &str) -> u64 {
     language.hash(&mut hasher);
     code.hash(&mut hasher);
     hasher.finish()
-}
-
-/// The transcript's Markdown, drawn with the shell's own code blocks.
-///
-/// Everything but a fenced block is iced's rendering; a fence is drawn from
-/// its cached highlighting on the sunken surface commands and outputs use, in
-/// the palette the editor's syntax theme chose for the current appearance.
-struct Prose<'a> {
-    cached: &'a CachedItem,
-}
-
-impl<'a> Prose<'a> {
-    fn view(cached: &'a CachedItem, settings: markdown::Settings) -> Element<'a, Message> {
-        markdown::view_with(cached.markdown.items(), settings, &Self { cached })
-    }
-}
-
-impl<'a> markdown::Viewer<'a, Message, cosmic::Theme, cosmic::Renderer> for Prose<'a> {
-    fn on_link_click(uri: markdown::Uri) -> Message {
-        action(Action::OpenUrl(uri.to_string()))
-    }
-
-    fn code_block(
-        &self,
-        settings: markdown::Settings,
-        language: Option<&'a str>,
-        code: &'a str,
-        _lines: &'a [markdown::Text],
-    ) -> Element<'a, Message> {
-        let palette = self
-            .cached
-            .block(language, code)
-            .map(|lines| &lines[usize::from(cosmic::theme::is_dark())]);
-        let rows: Vec<Element<'a, Message>> = code
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                let spans = palette
-                    .and_then(|lines| lines.get(index))
-                    .map_or(&[][..], Vec::as_slice);
-                let line: Element<'a, Message> =
-                    iced::widget::rich_text(crate::diff_view::syntax_spans(line, spans))
-                        .font(settings.style.code_block_font)
-                        .size(settings.code_size)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into();
-                line
-            })
-            .collect();
-        widget::container(
-            widget::scrollable(
-                widget::container(widget::column::with_children(rows))
-                    .padding([step::GAP_S as u16, step::GAP_M as u16]),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            )),
-        )
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_S; 4],
-            true,
-        ))
-        .width(Length::Fill)
-        .into()
-    }
 }
 
 /// Provider snapshots also cover restored chats and prompts sent through the
@@ -1080,7 +1026,6 @@ struct PendingCommand {
     id: u64,
     draft_revision: Option<u64>,
     request: Option<String>,
-    permission_mode: Option<String>,
     /// The first user prompt, used to name a new channel once locally queued.
     first_prompt: Option<String>,
     /// The model this command chooses, remembered for new drafts of the
@@ -1205,6 +1150,10 @@ pub(super) struct Runtime {
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
+    /// Clipboard reads and image writes still destined for this draft.
+    pastes_pending: usize,
+    image_pastes_saving: usize,
+    submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
     answers: view::Answers,
@@ -1221,7 +1170,6 @@ pub(super) struct Runtime {
     reasoning_picker: bool,
     /// Whether the account choice is open.
     account_picker: bool,
-    permission_mode: Option<String>,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
@@ -1466,6 +1414,9 @@ impl Runtime {
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
+            pastes_pending: 0,
+            image_pastes_saving: 0,
+            submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
             answers: HashMap::new(),
@@ -1478,7 +1429,6 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             account_picker: false,
-            permission_mode: None,
             history: Vec::new(),
             history_cursor: None,
             history_stash: String::new(),
@@ -2046,11 +1996,24 @@ fn draft_snapshot(
 ) -> Snapshot {
     Snapshot {
         capabilities: chat::Capabilities {
-            // Codex takes an image only on a model that reads one, which it
-            // says once the conversation has started.
-            attachments: provider != Provider::Codex,
+            // Codex reports model image support only after its conversation
+            // starts. Let a draft stage an image; the first send checks the
+            // provider's actual capability and restores the draft on refusal.
+            attachments: true,
             model_selection: true,
             reasoning_selection: true,
+            permission_modes: match provider {
+                Provider::Claude => vec![
+                    "manual".into(),
+                    "acceptEdits".into(),
+                    "auto".into(),
+                    "plan".into(),
+                    "dontAsk".into(),
+                    "bypassPermissions".into(),
+                ],
+                Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
+                Provider::Omp => Vec::new(),
+            },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
                 Provider::Claude => chat::SkillReach::Leading,
@@ -2063,6 +2026,112 @@ fn draft_snapshot(
         reasoning,
         ..Snapshot::default()
     }
+}
+
+fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    let arguments = &recipe.arguments;
+    match provider {
+        Provider::Claude => {
+            if arguments
+                .iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+            {
+                return Some("bypassPermissions".into());
+            }
+            arguments
+                .iter()
+                .enumerate()
+                .find_map(|(index, argument)| {
+                    argument
+                        .strip_prefix("--permission-mode=")
+                        .or_else(|| {
+                            (argument == "--permission-mode")
+                                .then(|| arguments.get(index + 1).map(String::as_str))
+                                .flatten()
+                        })
+                        .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
+                })
+                .or_else(|| {
+                    recipe
+                        .environment
+                        .get("CLAUDE_CODE_PERMISSION_MODE")
+                        .cloned()
+                })
+                .or_else(|| chat::claude_configured_default_mode(recipe))
+                .or_else(|| Some("manual".into()))
+        }
+        Provider::Codex => {
+            if arguments.iter().any(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+                )
+            }) {
+                Some("yolo".into())
+            } else if arguments
+                .windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "on-request"])
+                && arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--sandbox", "workspace-write"])
+            {
+                Some("workspaceWrite".into())
+            } else if arguments
+                .windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "on-request"])
+                && arguments
+                    .windows(2)
+                    .any(|pair| pair == ["--sandbox", "read-only"])
+            {
+                Some("readOnly".into())
+            } else {
+                None
+            }
+        }
+        Provider::Omp => None,
+    }
+}
+
+fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
+    if provider == Provider::Claude {
+        recipe.environment.remove("CLAUDE_CODE_PERMISSION_MODE");
+    }
+    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+    let mut original = recipe.arguments.iter();
+    while let Some(argument) = original.next() {
+        match (provider, argument.as_str()) {
+            (Provider::Claude, "--permission-mode")
+            | (Provider::Codex, "-a" | "--ask-for-approval" | "-s" | "--sandbox") => {
+                original.next();
+            }
+            (
+                Provider::Claude,
+                "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions",
+            )
+            | (Provider::Codex, "--yolo" | "--dangerously-bypass-approvals-and-sandbox") => {}
+            (Provider::Claude, value) if value.starts_with("--permission-mode=") => {}
+            _ => arguments.push(argument.clone()),
+        }
+    }
+    match provider {
+        Provider::Claude => {
+            arguments.extend(["--permission-mode".into(), mode.into()]);
+        }
+        Provider::Codex if mode == "yolo" => arguments.push("--yolo".into()),
+        Provider::Codex if matches!(mode, "readOnly" | "workspaceWrite") => arguments.extend([
+            "--ask-for-approval".into(),
+            "on-request".into(),
+            "--sandbox".into(),
+            if mode == "readOnly" {
+                "read-only"
+            } else {
+                "workspace-write"
+            }
+            .into(),
+        ]),
+        _ => {}
+    }
+    recipe.arguments = arguments;
 }
 
 /// The words a chat whose first message is still waiting to be sent refuses
@@ -2130,6 +2199,12 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
+        let recipe = moved
+            .as_ref()
+            .map_or(&runtime.session.launch.recipe, |session| {
+                &session.launch.recipe
+            });
+        snapshot.permission_mode = draft_permission_mode(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -2232,6 +2307,8 @@ impl Cagents {
         }
         runtime.session = session.clone();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
+        Arc::make_mut(&mut runtime.snapshot).permission_mode =
+            draft_permission_mode(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -2830,7 +2907,9 @@ impl Cagents {
     /// Puts a draft of `session` in card `card`, on the model last chosen for
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
-        let snapshot = self.chat_draft_snapshot(session.launch.provider);
+        let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
+        snapshot.permission_mode =
+            draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -3637,13 +3716,14 @@ impl Cagents {
         else {
             return Task::none();
         };
-        let snapshot = self.chat_draft_snapshot(provider);
+        let mut snapshot = self.chat_draft_snapshot(provider);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
+        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft => None,
@@ -3738,11 +3818,6 @@ impl Cagents {
         };
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
-        let permission_mode = if let Command::SetPermissionMode { mode } = &command {
-            Some(mode.clone())
-        } else {
-            None
-        };
         let page = match &command {
             Command::LoadEarlier => Some(view::Page::Earlier),
             Command::Refresh => Some(view::Page::Newer),
@@ -3765,7 +3840,6 @@ impl Cagents {
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
-            permission_mode,
             first_prompt,
             model,
             page,
@@ -4664,6 +4738,137 @@ impl Cagents {
                     }
                 }
             }
+            Action::Paste(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                runtime.pastes_pending += 1;
+                return iced::clipboard::read_data::<clipboard_image::Image>().map(move |image| {
+                    cosmic::Action::App(Message::ChatUi(Action::PastedImage(target, image)))
+                });
+            }
+            Action::PastedImage(target, Some(image)) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Many apps offer text alongside an image; where the chat
+                // cannot take the image, the text is pasted instead, and the
+                // refusal is shown only when there is no text. The paste
+                // stays pending until that text read resolves.
+                let rules = chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                let refusal = if !runtime.snapshot.capabilities.attachments {
+                    Some("The current model cannot accept images.")
+                } else if rules.max_count.is_some_and(|limit| {
+                    runtime.attachments.len() + runtime.image_pastes_saving >= limit
+                }) {
+                    Some("This chat has reached its attachment limit.")
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    return iced::clipboard::read().map(move |text| {
+                        cosmic::Action::App(Message::ChatUi(match text {
+                            Some(text) => Action::PastedText(target, Some(text)),
+                            None => Action::PasteRefused(target, refusal),
+                        }))
+                    });
+                }
+                runtime.image_pastes_saving += 1;
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        clipboard_image::save(image, rules.max_image_bytes)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::ChatUi(Action::ImageSaved(target, result))
+                });
+            }
+            Action::PastedImage(target, None) => {
+                return iced::clipboard::read().map(move |text| {
+                    cosmic::Action::App(Message::ChatUi(Action::PastedText(target, text)))
+                });
+            }
+            Action::PastedText(target, Some(text)) => {
+                let submit = if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    (runtime.pastes_pending == 0)
+                        .then(|| runtime.submit_after_paste.take())
+                        .flatten()
+                } else {
+                    None
+                };
+                let edited = self.handle_chat_ui(Action::Composer(
+                    target,
+                    text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text))),
+                ));
+                return Task::batch(
+                    std::iter::once(edited).chain(
+                        submit.map(|mode| self.handle_chat_ui(Action::Submit(target, mode))),
+                    ),
+                );
+            }
+            Action::PastedText(target, None) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    if runtime.pastes_pending == 0
+                        && let Some(mode) = runtime.submit_after_paste.take()
+                    {
+                        return self.handle_chat_ui(Action::Submit(target, mode));
+                    }
+                }
+            }
+            Action::PasteRefused(target, refusal) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    runtime.submit_after_paste = None;
+                    runtime.error = Some(refusal.into());
+                }
+            }
+            Action::ImageSaved(target, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.pastes_pending = runtime.pastes_pending.saturating_sub(1);
+                    runtime.image_pastes_saving = runtime.image_pastes_saving.saturating_sub(1);
+                    let rules =
+                        chat::AttachmentRules::for_provider(runtime.session.launch.provider);
+                    let success = match result {
+                        Ok(path)
+                            if runtime.snapshot.capabilities.attachments
+                                && rules
+                                    .max_count
+                                    .is_none_or(|limit| runtime.attachments.len() < limit) =>
+                        {
+                            runtime.attach([path]);
+                            true
+                        }
+                        Ok(path) => {
+                            let _ = std::fs::remove_file(path);
+                            runtime.error = Some(
+                                if runtime.snapshot.capabilities.attachments {
+                                    "This chat has reached its attachment limit."
+                                } else {
+                                    "The current model cannot accept images."
+                                }
+                                .into(),
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            runtime.error = Some(error);
+                            false
+                        }
+                    };
+                    if !success {
+                        runtime.submit_after_paste = None;
+                    } else if runtime.pastes_pending == 0
+                        && let Some(mode) = runtime.submit_after_paste.take()
+                    {
+                        return self.handle_chat_ui(Action::Submit(target, mode));
+                    }
+                } else if let Ok(path) = result {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
             Action::AppendProviderDraft(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if let Some(provided) = &runtime.snapshot.composer {
@@ -4680,6 +4885,10 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.pastes_pending > 0 {
+                    runtime.submit_after_paste = Some(mode);
+                    return Task::none();
+                }
                 if runtime.composer.text().trim().is_empty() && runtime.attachments.is_empty() {
                     return Task::none();
                 }
@@ -4740,9 +4949,6 @@ impl Cagents {
                 };
                 let first_prompt = match result {
                     Ok(()) => {
-                        if let Some(mode) = pending.permission_mode {
-                            runtime.permission_mode = Some(mode);
-                        }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
                             runtime.attachments.clear();
@@ -5039,6 +5245,17 @@ impl Cagents {
                     .permission_modes
                     .contains(&mode)
                 {
+                    return Task::none();
+                }
+                if runtime.is_draft() {
+                    if !runtime.choosing() {
+                        return Task::none();
+                    }
+                    let provider = runtime.session.launch.provider;
+                    set_draft_permission_mode(&mut runtime.session.launch.recipe, provider, &mode);
+                    Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
+                    let session = runtime.session.clone();
+                    self.replace_chat_conversation(target.card, session);
                     return Task::none();
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
@@ -5971,6 +6188,98 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
     }
 
+    #[test]
+    fn a_pending_image_paste_stays_with_the_message_it_precedes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "describe this image");
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot)
+                .capabilities
+                .attachments = true;
+            runtime.pastes_pending = 1;
+            runtime.image_pastes_saving = 1;
+        }
+        submit(&mut app, card);
+        assert!(chat_runtime(&app, card).pending.is_none());
+        assert_eq!(
+            chat_runtime(&app, card).submit_after_paste,
+            Some(PromptMode::Send)
+        );
+        assert_eq!(
+            chat_runtime(&app, card).composer.text().trim(),
+            "describe this image"
+        );
+
+        let path = PathBuf::from("/fixture/pasted.png");
+        let _ = app.update(Message::ChatUi(Action::ImageSaved(
+            target,
+            Ok(path.clone()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert_eq!(runtime.image_pastes_saving, 0);
+        assert_eq!(runtime.submit_after_paste, None);
+        assert_eq!(runtime.attachments, [Attachment { path }]);
+        assert!(
+            runtime.pending.is_some(),
+            "send resumes after the image is ready"
+        );
+    }
+
+    #[test]
+    fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("thread"));
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            Arc::make_mut(&mut runtime.snapshot)
+                .capabilities
+                .attachments = false;
+            runtime.pastes_pending = 1;
+            runtime.submit_after_paste = Some(PromptMode::Send);
+        }
+        let image = clipboard_image::Image::try_from((
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+            "image/png".to_owned(),
+        ))
+        .unwrap();
+        let _ = app.update(Message::ChatUi(Action::PastedImage(target, Some(image))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error, None, "the clipboard text is read first");
+        assert_eq!(runtime.pastes_pending, 1);
+        assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
+
+        let _ = app.update(Message::ChatUi(Action::PastedText(
+            target,
+            Some("pasted cell".into()),
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachments.is_empty());
+        assert!(
+            runtime.pending.is_some(),
+            "the send waiting on the paste goes ahead with its text"
+        );
+
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.pastes_pending = 1;
+        let _ = app.update(Message::ChatUi(Action::PasteRefused(
+            target,
+            "The current model cannot accept images.",
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.pastes_pending, 0);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("The current model cannot accept images.")
+        );
+    }
+
     /// A new conversation whose start, for its first message, is still in
     /// flight.
     fn starting_chat(app: &mut Cagents) -> (CardId, Target) {
@@ -6726,6 +7035,69 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn draft_permission_choice_sets_the_first_turns_launch_policy() {
+        let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "claude".into(),
+            arguments: vec!["--permission-mode".into(), "auto".into()],
+            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
+            environment: Default::default(),
+        };
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("auto")
+        );
+        set_draft_permission_mode(&mut recipe, Provider::Claude, "bypassPermissions");
+        assert_eq!(recipe.arguments, ["--permission-mode", "bypassPermissions"]);
+        set_draft_permission_mode(&mut recipe, Provider::Claude, "manual");
+        assert_eq!(recipe.arguments, ["--permission-mode", "manual"]);
+
+        recipe.arguments.clear();
+        recipe.environment.insert(
+            "CLAUDE_CODE_PERMISSION_MODE".into(),
+            "bypassPermissions".into(),
+        );
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("bypassPermissions")
+        );
+        set_draft_permission_mode(&mut recipe, Provider::Claude, "manual");
+        assert!(
+            !recipe
+                .environment
+                .contains_key("CLAUDE_CODE_PERMISSION_MODE")
+        );
+
+        recipe.program = "codex".into();
+        recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        set_draft_permission_mode(&mut recipe, Provider::Codex, "yolo");
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        assert!(recipe.arguments.contains(&"--yolo".into()));
+        set_draft_permission_mode(&mut recipe, Provider::Codex, "workspaceWrite");
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("workspaceWrite")
+        );
+        assert_eq!(
+            &recipe.arguments[2..],
+            &[
+                "--ask-for-approval",
+                "on-request",
+                "--sandbox",
+                "workspace-write"
+            ]
+        );
+        set_draft_permission_mode(&mut recipe, Provider::Codex, "readOnly");
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("readOnly")
+        );
     }
 
     /// A draft moved to another provider, then to another account, is saved
@@ -8741,58 +9113,40 @@ mod tests {
     }
 
     /// A fence that names its language is highlighted in both of the
-    /// editor's palettes the moment it is cached, and looked up by exactly
-    /// what the Markdown hands the viewer; a fence without one is left to
-    /// draw plain rather than guessed at.
+    /// editor's palettes the moment it is cached, as one paragraph whose lines
+    /// are joined the way the fence wrote them, and looked up by exactly what
+    /// the Markdown hands the renderer; a fence without one is cached to draw
+    /// plain rather than guessed at.
     #[test]
     fn a_named_fence_is_highlighted_in_both_palettes() {
         const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
         let cached = CachedItem::new(
-            &text(
-                "```rust
-fn main() {}
-```
-
-```
-plain
-```
-",
-            ),
+            &text("```rust\nfn main() {}\nlet x = 1;\n```\n\n```\nplain\n```\n"),
             THEME,
         );
-        let lines = cached
-            .block(
-                Some("rust"),
-                "fn main() {}
-",
-            )
-            .expect("the Rust fence is highlighted");
-        for palette in lines {
-            assert_eq!(palette.len(), 1, "one line of spans per line of code");
+        let text_of = |spans: &[iced::widget::text::Span<'static>]| {
+            spans
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect::<String>()
+        };
+        let block = cached
+            .block(Some("rust"), "fn main() {}\nlet x = 1;\n")
+            .expect("the Rust fence is cached");
+        for dark in [false, true] {
+            let spans = block.spans(dark);
+            assert_eq!(text_of(spans), "fn main() {}\nlet x = 1;");
             assert!(
-                crate::diff_view::syntax_spans("fn main() {}", &palette[0])
-                    .iter()
-                    .any(|span| span.color.is_some()),
+                spans.iter().any(|span| span.color.is_some()),
                 "a keyword takes a color"
             );
         }
-        assert!(
-            cached
-                .block(
-                    None, "plain
-"
-                )
-                .is_none()
-        );
-        assert!(
-            cached
-                .block(
-                    Some("rust"),
-                    "fn other() {}
-"
-                )
-                .is_none()
-        );
+        let plain = cached
+            .block(None, "plain\n")
+            .expect("an unnamed fence is cached too");
+        assert_eq!(text_of(plain.spans(true)), "plain");
+        assert!(plain.spans(true).iter().all(|span| span.color.is_none()));
+        assert!(cached.block(Some("rust"), "fn other() {}\n").is_none());
     }
 
     /// The token is what licenses reusing a parse, so it must refuse anything

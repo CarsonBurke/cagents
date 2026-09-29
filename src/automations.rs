@@ -9,6 +9,9 @@ use crate::{
     model::{AgentId, ChannelId, RunId},
 };
 
+#[cfg(any(feature = "host", feature = "ui"))]
+pub mod schedule;
+
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
