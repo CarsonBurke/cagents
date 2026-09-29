@@ -73,7 +73,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
 | Close focused pane | `Ctrl+Shift+W` |
-| Search projects | `Ctrl+F` (outside terminals) |
+| Find in the focused pane / search projects | `Ctrl+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Ctrl+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
@@ -83,15 +83,15 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
 | Stage / unstage the open file | `Ctrl+Shift+S` |
 
-Every shortcut is configurable; see
+Workspace and review shortcuts are configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
 
 - The defaults leave the keys shells, editors, and agent CLIs use to the
   focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
   deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
-  bind is withheld from the terminal, except **Search projects**, which a
-  focused terminal receives as input (in an editor it finds in the file), and
-  the review chords, which act in pull request and local diff panes. As in those
+  bind is withheld from the terminal. **Ctrl+F** finds in the focused terminal,
+  chat transcript or editor, and otherwise searches projects. The
+  review chords act in pull request and local diff panes. As in those
   terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
   longer reach terminal programs such as Vim.
 - Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
@@ -438,6 +438,15 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   to save manually.
 - **Wrap long lines** is off by default. Editor and terminal text default to 14
   logical pixels; a terminal font size you already saved is kept.
+- Editor settings can override the terminal font family and size. **Ctrl+=**,
+  **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
+- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
+  **Shift+Enter** move forward and backward; replacement controls offer one
+  match or all matches.
+- With a language server running, diagnostics appear in the gutter and under
+  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  result and **Tab** or **Enter** applies it. Hover over a symbol for details,
+  use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
 - Working-tree diffs edit the real file buffer with the same selection, IME,
@@ -447,6 +456,18 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
 - Comparisons load on demand and cancelled jobs stop. Switching files or modes
   keeps bounded in-memory viewport positions without duplicating buffers or
   writing every scroll to disk.
+- Unchanged diff regions fold by default, with context around each change.
+  Expand a region from either end or reveal it entirely. Editor settings can
+  turn off **Hide unchanged diff lines**; switching the preference keeps the
+  logical reading position and review comments.
+
+## Browser panes
+
+The address bar keeps the complete URL and accepts local addresses such as
+`localhost:3000`. Failed navigation keeps your input available to correct.
+**Ctrl+L** focuses the address bar; **Ctrl+R** or **F5** reloads, and **Alt+Left**
+and **Alt+Right** navigate history. The loading indicator reserves its space,
+and Stop cancels navigation. Search input uses the configured search URL.
 
 ## Native agent chat
 
@@ -568,13 +589,20 @@ the source for resumed history.
 
 ## Terminals and agent status
 
+- **Ctrl+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
+  navigate matches; the search controls can match case. The current match has
+  a stronger highlight than the other matches.
+- Right-click for copy, paste, select all, clear scrollback and link actions.
+  **Shift+Insert** pastes. A multiline paste asks before sending commands to a
+  shell unless bracketed paste is active; the confirmation can be disabled in
+  Terminal settings.
 - Drag over terminal output to select text, then press `Ctrl+Shift+C` to copy.
   Agent terminals keep ordinary clicks available to the CLI while drags select
   text. Hold Alt to send a drag to the agent, or Shift to select text in other
   mouse-aware terminal applications. Empty rows and right-side padding do not
   start selections.
-- Ctrl-click an HTTP or HTTPS address in a terminal to open it using the
-  configured link behavior.
+- Ctrl-click an HTTP or HTTPS address, an OSC 8 link, or a compiler
+  `path:line:column` location to open it using the configured link behavior.
 - Ctrl-click a local `file://` address in a terminal, or follow one in chat,
   to open an editor beside the current pane. A visible clean file editor is
   reused; unsaved buffers stay open. HTML opens as source; **Preview HTML**

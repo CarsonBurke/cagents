@@ -12435,6 +12435,75 @@ mod tests {
     }
 
     #[test]
+    fn folded_changes_step_exactly_when_every_scroll_target_is_clamped() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let before = (0..100)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 20\n", "first change\n")
+            .replace("line 80\n", "second change\n");
+        runtime.diff_viewport.height = 2000.0;
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        assert_eq!(runtime.change_count(), 2);
+        runtime.diff_change = 0;
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(runtime.navigate_change(true));
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_change, 1);
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        assert!(!runtime.navigate_change(true));
+        assert!(runtime.navigate_change(false));
+        runtime.realize_current_change();
+        assert_eq!(runtime.diff_change, 0);
+        assert!(!runtime.navigate_change(false));
+    }
+
+    #[test]
+    fn changing_folding_preference_preserves_the_logical_viewport() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let before = (0..100)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let after = before.replace("line 50\n", "changed\n");
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+                &before, &after,
+            ))),
+        );
+        let row = runtime
+            .diff_model()
+            .unwrap()
+            .change_starts(runtime.diff_mode)[0];
+        let display = runtime
+            .diff_layout()
+            .unwrap()
+            .folded(runtime.diff_mode)
+            .display(row);
+        runtime.diff_viewport = ListViewport {
+            offset: runtime.diff_rows().unwrap().offset(display),
+            height: 20.0,
+        };
+        let folded_offset = runtime.diff_viewport.offset;
+        drop(runtime.set_diff_hide_unchanged(false));
+        assert_eq!(
+            runtime.diff_viewport.offset,
+            runtime.diff_rows().unwrap().offset(row)
+        );
+        drop(runtime.set_diff_hide_unchanged(true));
+        assert_eq!(runtime.diff_viewport.offset, folded_offset);
+    }
+
+    #[test]
     fn file_discussion_is_offered_only_where_the_diff_can_show_it() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
