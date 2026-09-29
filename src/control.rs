@@ -534,9 +534,25 @@ impl ControlClient {
     pub fn notification_preferences(
         &mut self,
         preferences: Option<crate::notifications::Preferences>,
-        test: bool,
     ) -> Result<(), ControlError> {
-        self.accepted(ClientRequest::NotificationPreferencesChanged { preferences, test })
+        self.accepted(ClientRequest::NotificationPreferencesChanged { preferences })
+    }
+
+    /// Asks the daemon to show a test notification and waits for the
+    /// desktop's answer.
+    pub fn send_test_notification(
+        &mut self,
+    ) -> Result<crate::notifications::TestOutcome, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::SendTestNotification,
+            Instant::now() + crate::notifications::TEST_TIMEOUT + IO_TIMEOUT,
+        )? {
+            ServerResponse::NotificationTest { outcome } => Ok(outcome),
+            response => Err(unexpected_response(
+                "a test notification outcome",
+                &response,
+            )),
+        }
     }
 
     pub fn acknowledge_notification(&mut self, id: uuid::Uuid) -> Result<(), ControlError> {
@@ -1478,6 +1494,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Automation(_) => "automation",
         ServerResponse::Agent(_) => "agent",
         ServerResponse::Notifications { .. } => "notifications",
+        ServerResponse::NotificationTest { .. } => "notification_test",
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",

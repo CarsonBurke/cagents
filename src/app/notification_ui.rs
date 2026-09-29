@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     control::ControlClient,
-    notifications::{Preferences, Presence, Snapshot, Target, Update},
+    notifications::{Preferences, Presence, Snapshot, Target, TestOutcome, Update},
 };
 use std::{
     collections::BTreeSet,
@@ -20,6 +20,7 @@ pub enum Action {
     },
     ReviewsReported(Result<(), String>),
     Test,
+    Tested(Result<TestOutcome, String>),
     Failed(String),
 }
 
@@ -27,7 +28,6 @@ pub enum Action {
 struct Pending {
     presence: Option<Presence>,
     preferences: Option<Preferences>,
-    test: bool,
     acknowledged: BTreeSet<uuid::Uuid>,
 }
 
@@ -42,6 +42,8 @@ pub(super) struct State {
     last_workspace: Weak<WorkspaceState>,
     last_focus: Option<(Option<CardId>, bool)>,
     acknowledged: BTreeSet<uuid::Uuid>,
+    /// Whether a test notification is waiting on the desktop's answer.
+    pub testing: bool,
 }
 
 impl Default for State {
@@ -57,6 +59,7 @@ impl Default for State {
             last_workspace: Weak::new(),
             last_focus: None,
             acknowledged: BTreeSet::new(),
+            testing: false,
         }
     }
 }
@@ -69,11 +72,8 @@ impl State {
         }
     }
 
-    pub fn preferences(&self, preferences: Preferences, test: bool) {
-        self.changed(|pending| {
-            pending.preferences = Some(preferences);
-            pending.test |= test;
-        });
+    pub fn preferences(&self, preferences: Preferences) {
+        self.changed(|pending| pending.preferences = Some(preferences));
     }
 
     /// Preferences queued for the daemon and not yet sent.
@@ -168,9 +168,9 @@ impl Cagents {
                                     .notification_presence(presence)
                                     .map_err(|error| error.to_string())?;
                             }
-                            if requests.preferences.is_some() || requests.test {
+                            if requests.preferences.is_some() {
                                 client
-                                    .notification_preferences(requests.preferences, requests.test)
+                                    .notification_preferences(requests.preferences)
                                     .map_err(|error| error.to_string())?;
                             }
                             for id in &requests.acknowledged {
@@ -186,7 +186,6 @@ impl Cagents {
                             let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
                             newer.presence = newer.presence.take().or(requests.presence);
                             newer.preferences = newer.preferences.or(requests.preferences);
-                            newer.test |= requests.test;
                             newer.acknowledged.extend(requests.acknowledged);
                             drop(newer);
                             if last_error.as_ref() != Some(&error) {
@@ -206,7 +205,7 @@ impl Cagents {
                 }
             });
         self.notification_ui
-            .preferences(self.settings.notifications, false);
+            .preferences(self.settings.notifications);
     }
 
     pub(super) fn sync_notification_presence(&mut self) {
@@ -469,8 +468,25 @@ impl Cagents {
                 Task::batch([open, read, self.activate_main_window(None)])
             }
             Action::Test => {
-                self.notification_ui
-                    .preferences(self.settings.notifications, true);
+                if std::mem::replace(&mut self.notification_ui.testing, true) {
+                    return Task::none();
+                }
+                // Its own connection, so the answer is not queued behind the
+                // presence and acknowledgement traffic of the control thread.
+                cosmic::task::future(async {
+                    let outcome = tokio::task::spawn_blocking(|| {
+                        connect()?
+                            .send_test_notification()
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    Message::NotificationUi(Action::Tested(outcome))
+                })
+            }
+            Action::Tested(outcome) => {
+                self.notification_ui.testing = false;
+                self.status = Some(test_notice(outcome));
                 Task::none()
             }
             Action::Failed(error) => {
@@ -488,6 +504,23 @@ impl Cagents {
     }
 }
 
+fn test_notice(outcome: Result<TestOutcome, String>) -> TransientNotice {
+    match outcome {
+        Ok(TestOutcome::Sent) => TransientNotice::success(
+            "Test notification sent. Your desktop decides how it looks and whether it plays a sound.",
+        ),
+        Ok(TestOutcome::Unavailable(error)) => TransientNotice::error(format!(
+            "Your desktop's notification service is unavailable: {error}"
+        )),
+        Ok(TestOutcome::TimedOut) => {
+            TransientNotice::error("Your desktop's notification service did not answer in time.")
+        }
+        Err(error) => TransientNotice::error(format!(
+            "Could not reach the cagents daemon to send a test notification: {error}"
+        )),
+    }
+}
+
 fn card_session(card: &CardState) -> Option<TerminalId> {
     match &card.kind {
         CardKind::Terminal(session) => Some(session.id),
@@ -499,6 +532,39 @@ fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_test_notification_answer_is_reported_with_its_own_severity() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for _ in 0..2 {
+            let _ = app.update(Message::NotificationUi(Action::Tested(Ok(
+                TestOutcome::Sent,
+            ))));
+        }
+        // A repeat is still news: the entry moves up and counts it, rather
+        // than the second press going unanswered.
+        let latest = app.notices.recent().next().unwrap();
+        assert_eq!(latest.notice.severity, NoticeSeverity::Success);
+        assert_eq!(latest.repeats, 2);
+
+        let _ = app.update(Message::NotificationUi(Action::Tested(Ok(
+            TestOutcome::TimedOut,
+        ))));
+        assert_eq!(
+            app.notices.recent().next().unwrap().notice.severity,
+            NoticeSeverity::Error
+        );
+    }
+
+    #[test]
+    fn a_test_notification_is_not_requested_again_while_one_is_pending() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.notification_ui.testing = true;
+        let _ = app.update_notifications(Action::Test);
+        assert!(app.notification_ui.testing);
+        let _ = app.update_notifications(Action::Tested(Err("offline".into())));
+        assert!(!app.notification_ui.testing);
+    }
 
     #[test]
     fn completed_run_activation_opens_history_without_mounting_a_provider() {

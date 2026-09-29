@@ -7568,6 +7568,7 @@ impl Cagents {
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
                 self.default_account_choices(),
+                self.notification_ui.testing,
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
@@ -9958,7 +9959,7 @@ impl Cagents {
         }
         if previous.notifications != self.settings.notifications {
             self.notification_ui
-                .preferences(self.settings.notifications, false);
+                .preferences(self.settings.notifications);
         }
         if previous.hibernation_delay_ms != self.settings.hibernation_delay_ms {
             // Reconciled here rather than through a queued `LifecycleSweep`,
