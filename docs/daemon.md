@@ -15,7 +15,10 @@ that runs independently of the UI so sessions survive window and UI-process
 restarts. There is no system daemon or service unit. The standard production
 installation starts the daemon immediately and registers it for
 graphical-login autostart. While the daemon runs, cagents shows a system-tray
-item that opens the UI and can stop the daemon.
+item that opens the UI and can stop the daemon. Its menu leads with the
+daemon's state, or an action's result for a few seconds, and how many hosted
+agents are working or waiting for you. Stopping a daemon that still hosts
+terminals or agent work asks for a counted confirmation first.
 
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes

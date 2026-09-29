@@ -232,7 +232,12 @@ pub fn run() -> Result<(), HostError> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    let _tray = crate::tray::start();
+    let tally_host = Arc::downgrade(&host);
+    let _tray = crate::tray::start(move || {
+        let host = tally_host.upgrade()?;
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        Some(state.agent_tally())
+    });
 
     let automation_broker = match automations::start(&host) {
         Ok(broker) => Some(broker),
