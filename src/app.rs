@@ -7570,7 +7570,8 @@ impl Cagents {
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
-        if focus_changed {
+        if self.chrome_ui.tabs_focus != focused {
+            self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
         }
         // Every focus move lands here, including those whose handlers return
@@ -20874,9 +20875,11 @@ mod tests {
             let _ = app.update_chrome(chrome_ui::Action::Rename(source));
             let _ = app.update_chrome(chrome_ui::Action::RenameChanged("Release review".into()));
             let _ = app.update_chrome(chrome_ui::Action::RenameSubmit);
+            app.chrome_ui.tabs_focus = Some(source);
             let _ = app.clone_focused_pane();
             let cloned = app.workspace.focused().unwrap();
             assert_ne!(cloned, source);
+            assert_eq!(app.chrome_ui.tabs_focus, Some(cloned));
             assert_eq!(app.card_state(cloned).unwrap().title, "Release review");
             assert_eq!(app.chrome_ui.user_titles[&cloned], "Release review");
             assert!(!app.apply_reported_title(cloned, "automatic process title".into()));
@@ -20896,12 +20899,14 @@ mod tests {
             app.card_state(source).unwrap().clone(),
             app.active_workspace_destination(),
         ));
+        app.chrome_ui.tabs_focus = Some(source);
         let _ = app.run_workspace_command(
             workspace_widget::GlobalShortcut::ReopenPane,
             keyboard::Modifiers::empty(),
         );
         let reopened = app.workspace.focused().unwrap();
         assert_ne!(reopened, source);
+        assert_eq!(app.chrome_ui.tabs_focus, Some(reopened));
         assert!(app.recently_closed.is_empty());
         assert_eq!(app.chrome_ui.user_titles[&reopened], "Release logs");
         assert!(!app.apply_reported_title(reopened, "automatic process title".into()));

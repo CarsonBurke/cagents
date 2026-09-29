@@ -6,6 +6,9 @@ pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    /// Tab visibility follows pane focus even when a creation path already
+    /// updated durable focus before applying its viewport changes.
+    pub(super) tabs_focus: Option<CardId>,
     rename: Option<(RenameTarget, String)>,
     pub(super) workspace_preview: Option<SidebarAction>,
     pub(super) projects_collapsed: bool,
