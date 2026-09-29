@@ -2099,6 +2099,22 @@ mod tests {
         assert!(!activate_running_ui_in(runtime.path()).unwrap());
     }
 
+    /// An exiting window closes its receiver while it still holds a clone;
+    /// its activations must then be refused, never acknowledged.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn activation_is_refused_once_an_exiting_window_closes_its_receiver() {
+        let runtime = tempdir().unwrap();
+        let (sender, receiver) = async_channel::unbounded::<UiActivation>();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_running_ui_in(runtime.path()).unwrap());
+        assert!(receiver.recv_blocking().is_ok());
+
+        receiver.close();
+
+        assert!(!activate_running_ui_in(runtime.path()).unwrap());
+    }
+
     #[cfg(feature = "ui")]
     #[test]
     fn activation_replaces_a_stale_socket_and_rejects_a_symlink() {

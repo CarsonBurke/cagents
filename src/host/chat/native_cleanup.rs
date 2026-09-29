@@ -212,6 +212,8 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         if let Some(notifications) = &state.notifications {
             notifications.retire(source.id);
         }
+        drop(state);
+        super::super::state::retire_unattached_upgrade_chat(host, source.id);
     }
     result
 }

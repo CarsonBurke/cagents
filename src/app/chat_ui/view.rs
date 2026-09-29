@@ -777,11 +777,12 @@ impl Runtime {
         // controls, and code inside them at the body size rather than the
         // three quarters of it iced defaults to, which put a code span at
         // ten pixels.
+        let dark = cosmic::theme::is_dark();
         let markdown_settings = markdown::Settings {
             code_size: design::TEXT_BODY.into(),
             ..markdown::Settings::with_text_size(
                 design::TEXT_PROSE,
-                markdown::Style::from(if cosmic::theme::is_dark() {
+                markdown::Style::from(if dark {
                     iced::Theme::Dark
                 } else {
                     iced::Theme::Light
@@ -869,7 +870,7 @@ impl Runtime {
                 transcript.push(notice_entry(error));
             }
             for turn in &self.turns {
-                transcript.push(self.turn_view(turn, markdown_settings));
+                transcript.push(self.turn_view(turn, markdown_settings, dark));
                 for (_, error) in self
                     .failures
                     .iter()
@@ -1101,10 +1102,11 @@ impl Runtime {
                 );
             }
         }
-        let draft = self.composer.text();
+        // The draft is copied out only where its text is shown or searched:
+        // `text()` allocates the whole draft, and this runs on every frame.
         if let Some(provided) = &snapshot.composer
             && !provided.trim().is_empty()
-            && !draft.contains(provided.as_str())
+            && !self.composer.text().contains(provided.as_str())
         {
             content.push(
                 widget::button::text("Append provider's suggested draft")
@@ -1167,10 +1169,12 @@ impl Runtime {
         // A skill the provider will not load reaches the agent as words; the
         // draft says so rather than let the name pass for one that runs.
         let reach = snapshot.capabilities.skill_reach;
-        if let Some(hint) = unloaded_hint(
-            &completion::unloaded(&draft, &snapshot.skills, reach),
-            reach,
-        ) {
+        let unloaded = if reach == chat::SkillReach::Anywhere || snapshot.skills.is_empty() {
+            Vec::new()
+        } else {
+            completion::unloaded(&self.composer.text(), &snapshot.skills, reach)
+        };
+        if let Some(hint) = unloaded_hint(&unloaded, reach) {
             content.push(
                 design::caption(hint)
                     .class(cosmic::theme::Text::Custom(design::muted_text))
@@ -1180,9 +1184,13 @@ impl Runtime {
         for (index, attachment) in self.attachments.iter().enumerate() {
             content.push(
                 widget::row::with_children(vec![
-                    crate::design::caption(attachment.path.display().to_string())
-                        .width(Length::Fill)
-                        .into(),
+                    crate::design::caption(if clipboard_image::is_pasted(&attachment.path) {
+                        "Pasted image".to_owned()
+                    } else {
+                        attachment.path.display().to_string()
+                    })
+                    .width(Length::Fill)
+                    .into(),
                     icon(
                         "edit-delete-symbolic",
                         "Remove attachment",
@@ -1195,6 +1203,13 @@ impl Runtime {
                 .into(),
             );
         }
+        if self.pastes_pending > 0 {
+            content.push(
+                design::caption("Pasting…")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            );
+        }
         // Keep the named composer in a fixed sibling slot as provider controls,
         // requests, and attachments arrive. The pinned Iced child reconciler
         // finds named siblings but does not move their trees to new indices.
@@ -1204,7 +1219,11 @@ impl Runtime {
                 .height(Length::Fill)
                 .into(),
         ];
-        let has_draft = !draft.trim().is_empty() || !self.attachments.is_empty();
+        let has_draft = self
+            .composer
+            .lines()
+            .any(|line| !line.text.trim().is_empty())
+            || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
         let modes: &[PromptMode] = if snapshot.busy {
@@ -1253,7 +1272,7 @@ impl Runtime {
             // floats at that viewport's right edge either way, so the draft
             // text would still run underneath it.
             widget::container(
-                widget::scrollable(widget::container(body(draft)).padding(
+                widget::scrollable(widget::container(body(self.composer.text())).padding(
                     crate::design::with_vertical_rail(iced::Padding::from(COMPOSER_PADDING)),
                 ))
                 .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -1328,7 +1347,13 @@ impl Runtime {
                             Action::HistoryNewer(target)
                         })));
                     }
-                    word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press))
+                    let binding =
+                        word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
+                    if matches!(binding, Some(text_editor::Binding::Paste)) {
+                        Some(text_editor::Binding::Custom(action(Action::Paste(target))))
+                    } else {
+                        binding
+                    }
                 })
                 .into()
         };
@@ -2010,28 +2035,128 @@ impl Runtime {
     }
 
     /// One exchange: what was asked, what was done, and what came back.
+    ///
+    /// An exchange is kept between frames, and built and laid out again only
+    /// when something it draws changes, which is what stops a streaming
+    /// answer from paying for every exchange above it twenty times a second.
+    /// The one thing that cannot be kept is an open step's raw output, whose
+    /// read-only editor borrows its text from the cache; an exchange showing
+    /// one is built afresh each frame, in the same place in the tree.
     fn turn_view<'a>(
         &'a self,
         turn: &'a turn::Turn,
         settings: markdown::Settings,
+        dark: bool,
     ) -> Element<'a, Message> {
+        if !self.retainable(turn) {
+            return retained::fresh(self.turn_rows(
+                turn,
+                |item, cached| self.step_view(item, cached, settings),
+                settings,
+            ));
+        }
+        retained::kept(self.turn_fingerprint(turn, dark), move || {
+            self.turn_rows(
+                turn,
+                |item, cached| self.step_header(item, cached, false),
+                settings,
+            )
+        })
+    }
+
+    /// Whether `turn` can be kept between frames: none of its steps is open.
+    fn retainable(&self, turn: &turn::Turn) -> bool {
+        turn.prompt
+            .iter()
+            .chain(
+                turn.steps
+                    .iter()
+                    .chain(&turn.prose)
+                    .map(|placed| &placed.index),
+            )
+            .filter_map(|index| self.snapshot.items.get(*index))
+            .all(|item| !self.expanded.contains(&item.id))
+    }
+
+    /// Everything a retained exchange draws, folded into the value that
+    /// decides whether it is drawn again.
+    ///
+    /// It reads the items' change tokens rather than their bodies, so it
+    /// costs the same for a one-line answer as for a long one.
+    fn turn_fingerprint(&self, turn: &turn::Turn, dark: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        (
+            &turn.key,
+            &turn.summary,
+            turn.glyph().map(|status| status as u8),
+        )
+            .hash(&mut hasher);
+        self.opened.get(&turn.key).hash(&mut hasher);
+        // A running group's duration counts up, so its strip changes with the
+        // clock; a finished one's is fixed at how long the work took.
+        if !turn.steps.is_empty() {
+            chat::now_ms()
+                .and_then(|now| turn.working_for(now))
+                .hash(&mut hasher);
+        }
+        let placed = turn.prompt.iter().map(|index| (*index, None)).chain(
+            turn.steps
+                .iter()
+                .chain(&turn.prose)
+                .map(|placed| (placed.index, Some(placed.slot))),
+        );
+        for (index, slot) in placed {
+            let Some(item) = self.snapshot.items.get(index) else {
+                continue;
+            };
+            (&item.id, item.at, slot).hash(&mut hasher);
+            self.cache
+                .get(&item.id)
+                .map(|cached| cached.token)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// The rows of one exchange, with `step` drawing each of its steps.
+    fn turn_rows<'s, 'a>(
+        &'s self,
+        turn: &'s turn::Turn,
+        step: impl Fn(&'s chat::Item, &'s CachedItem) -> Element<'a, Message>,
+        settings: markdown::Settings,
+    ) -> Element<'a, Message> {
+        let items = &self.snapshot.items;
+        let placed = |index: usize| {
+            let item = items.get(index)?;
+            Some((item, self.cache.get(&item.id)?))
+        };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         for index in &turn.prompt {
-            if let Some(item) = self.snapshot.items.get(*index) {
-                rows.push(self.prompt_view(item));
+            if let Some(item) = items.get(*index) {
+                rows.push(Self::prompt_view(item));
             }
         }
         if !turn.steps.is_empty() {
-            rows.push(self.step_strip(turn.key.as_str(), turn, settings));
+            rows.push(self.step_strip(turn, || {
+                turn.steps
+                    .iter()
+                    .filter_map(|placed_step| placed(placed_step.index))
+                    .map(|(item, cached)| step(item, cached))
+                    .collect()
+            }));
         }
-        for placed in &turn.prose {
-            let Some(item) = self.snapshot.items.get(placed.index) else {
+        for prose in &turn.prose {
+            let Some((item, cached)) = placed(prose.index) else {
                 continue;
             };
-            let Some(cached) = self.cache.get(&item.id) else {
-                continue;
-            };
-            rows.push(self.prose_view(item, cached, placed.slot, settings));
+            rows.push(match &item.content {
+                ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
+                // Anything else in the answer slot is a step the grouping did
+                // not recognize, drawn the way a step is.
+                _ => step(item, cached),
+            });
         }
         widget::column::with_children(rows)
             .spacing(step::GAP_M)
@@ -2142,17 +2267,18 @@ impl Runtime {
     /// its author squared off. That asymmetry is what identifies the author
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
-    fn prompt_view<'a>(&'a self, item: &'a chat::Item) -> Element<'a, Message> {
+    fn prompt_view(item: &chat::Item) -> Element<'static, Message> {
         let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
             ItemContent::Image { path, description } => Self::attachment_label(path, description),
             content => turn::step_label(content),
-        };
+        }
+        .to_owned();
         // An attachment sits under its prompt as an outlined chip rather than
         // another filled bubble, so a message with two images does not read as
         // three separate things the reader said.
-        let body: Element<'a, Message> = if attachment {
+        let body: Element<'static, Message> = if attachment {
             widget::row::with_children(vec![
                 widget::icon(crate::ui_controls::symbolic_icon(
                     "mail-attachment-symbolic",
@@ -2201,9 +2327,26 @@ impl Runtime {
         slot: turn::Slot,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
+        let ItemContent::Text { .. } = &item.content else {
+            // Anything else in the answer slot is a step the grouping did not
+            // recognize; render it the way a step renders rather than
+            // inventing a second treatment for it.
+            return self.step_view(item, cached, settings);
+        };
+        self.text_view(item, cached, slot, settings)
+    }
+
+    /// A text item in its slot, as an element that owns what it draws.
+    fn text_view(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        slot: turn::Slot,
+        settings: markdown::Settings,
+    ) -> Element<'static, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
-            return widget::container(Prose::view(cached, settings))
+            return widget::container(prose::view(cached, settings))
                 .max_width(design::READABLE_MEASURE)
                 .width(Length::Fill)
                 .into();
@@ -2211,7 +2354,7 @@ impl Runtime {
         if slot == turn::Slot::Thinking {
             // Reasoning keeps a subtle surface without shrinking the prose.
             return widget::container(
-                widget::container(Prose::view(cached, settings))
+                widget::container(prose::view(cached, settings))
                     .class(design::surface(
                         Some(design::sunken),
                         [design::RADIUS_S; 4],
@@ -2224,13 +2367,7 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        let ItemContent::Text { .. } = &item.content else {
-            // Anything else in the answer slot is a step the grouping did not
-            // recognize; render it the way a step renders rather than
-            // inventing a second treatment for it.
-            return self.step_view(item, cached, settings);
-        };
-        let mut rows: Vec<Element<'a, Message>> = vec![Prose::view(cached, settings)];
+        let mut rows: Vec<Element<'static, Message>> = vec![prose::view(cached, settings)];
         // An answer's footer says when it finished and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
@@ -2239,7 +2376,7 @@ impl Runtime {
         // reader reaches for copy far more often than they read the stamp,
         // and an icon in the text color beside a muted stamp was the one
         // thing on the row that looked like it wanted attention.
-        let mut controls: Vec<Element<'a, Message>> = vec![small_icon(
+        let mut controls: Vec<Element<'static, Message>> = vec![small_icon(
             "edit-copy-symbolic",
             "Copy this message",
             Action::Copy(target, item.id.clone(), CopyPart::Text),
@@ -2867,8 +3004,143 @@ fn model_list<'a>(
 }
 
 #[cfg(test)]
+mod frame_cost;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fingerprint of every exchange on screen, oldest first.
+    fn fingerprints(runtime: &Runtime, dark: bool) -> Vec<u64> {
+        runtime
+            .turns
+            .iter()
+            .map(|turn| runtime.turn_fingerprint(turn, dark))
+            .collect()
+    }
+
+    /// Publishes `items` to `runtime` as a provider frame would.
+    fn publish(
+        runtime: &mut Runtime,
+        handle: &ClientHandle,
+        items: &[chat::Item],
+        generation: u64,
+    ) {
+        handle.publish_snapshot_for_test(Snapshot {
+            generation,
+            ready: true,
+            items: items.to_vec(),
+            ..Snapshot::default()
+        });
+        runtime.refresh();
+    }
+
+    /// A streaming answer is the only exchange that changes, so it is the
+    /// only one drawn again; the ones above it keep what they drew.
+    #[test]
+    fn only_the_streaming_exchange_is_drawn_again() {
+        let mut items = frame_cost::transcript(3);
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let before = fingerprints(&runtime, true);
+        assert!(before.len() >= 3);
+        let last = items.len() - 1;
+        let ItemContent::Text { text, .. } = &mut items[last].content else {
+            unreachable!()
+        };
+        text.push_str(" and one more word");
+        publish(&mut runtime, &handle, &items, 1);
+        let after = fingerprints(&runtime, true);
+        assert_eq!(before[..before.len() - 1], after[..after.len() - 1]);
+        assert_ne!(before.last(), after.last());
+        // A republished snapshot with nothing new changes nothing.
+        publish(&mut runtime, &handle, &items, 2);
+        assert_eq!(fingerprints(&runtime, true), after);
+    }
+
+    /// Anything a retained exchange draws besides its items is part of what
+    /// decides whether it is drawn again.
+    #[test]
+    fn an_exchange_is_drawn_again_when_its_presentation_changes() {
+        let items = frame_cost::transcript(1);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let strip = runtime
+            .turns
+            .iter()
+            .position(|turn| !turn.steps.is_empty())
+            .expect("a group with steps");
+        let fingerprint = |runtime: &Runtime, dark| fingerprints(runtime, dark)[strip];
+        let light = fingerprint(&runtime, false);
+        assert_ne!(light, fingerprint(&runtime, true), "the appearance");
+        let key = runtime.turns[strip].key.clone();
+        let open = runtime.opened[&key];
+        runtime.opened.insert(key, !open);
+        let toggled = fingerprint(&runtime, false);
+        assert_ne!(light, toggled, "the strip opening or closing");
+        runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::SolarizedDark);
+        assert_ne!(toggled, fingerprint(&runtime, false), "the syntax theme");
+    }
+
+    /// An open step shows its output in an editor that borrows from the
+    /// cache, so its exchange is built afresh rather than kept.
+    #[test]
+    fn an_exchange_with_an_open_step_is_not_retained() {
+        let items = frame_cost::transcript(1);
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        let strip = runtime
+            .turns
+            .iter()
+            .position(|turn| !turn.steps.is_empty())
+            .expect("a group with steps");
+        assert!(runtime.retainable(&runtime.turns[strip]));
+        let step = runtime.turns[strip].steps[0].index;
+        runtime
+            .expanded
+            .insert(runtime.snapshot.items[step].id.clone());
+        assert!(!runtime.retainable(&runtime.turns[strip]));
+    }
+
+    /// Every kind of Markdown block an answer can hold is drawn by the
+    /// transcript's own renderer, including those inside lists and quotes.
+    #[test]
+    fn every_markdown_block_is_drawn() {
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "# Title\n\nA [link](https://example.com) and `code`.\n\n\
+                       - one\n- [x] done\n\n3. three\n4. four\n\n> quoted\n>\n> ```sh\n> ls\n> ```\n\n\
+                       ---\n\n| a | b |\n|:-:|--:|\n| 1 | 2 |\n\n![alt](image.png)\n\n\
+                       ```rust\nfn main() {}\n```\n"
+                    .into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        assert_eq!(
+            cached.blocks.len(),
+            2,
+            "the quoted fence and the top-level one"
+        );
+        let settings = markdown::Settings::with_text_size(
+            design::TEXT_PROSE,
+            markdown::Style::from(iced::Theme::Dark),
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = prose::view(&cached, settings);
+        let mut tree = iced::advanced::widget::Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 4_000.0)),
+        );
+        // Heading, paragraph, both lists, the quote, the rule, the table, the
+        // image and the fence, each laid out with room of its own.
+        assert_eq!(node.children().len(), 9);
+        assert!(
+            node.children()
+                .iter()
+                .all(|block| block.size().width > 0.0 && block.size().height > 0.0)
+        );
+    }
 
     fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {
         let key = keyboard::Key::Named(keyboard::key::Named::Enter);

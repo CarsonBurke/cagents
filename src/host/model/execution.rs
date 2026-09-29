@@ -1591,6 +1591,7 @@ mod tests {
                 surface: Surface::Chat,
                 model: None,
                 permission_mode: None,
+                reasoning_effort: None,
             }),
             prompt: "Read the fixture".into(),
             idempotency_key: "first-request".into(),

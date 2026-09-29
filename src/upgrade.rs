@@ -829,6 +829,66 @@ pub(crate) mod handoff {
         Ok(())
     }
 
+    /// The durable record of retained native conversations that an upgrade
+    /// restore could not reattach. The daemon started without them: each
+    /// provider holder was left as it was, nothing was relaunched or resent,
+    /// and the exact checkpoint entry is kept here as evidence for recovery.
+    const UNATTACHED_FILE: &str = "daemon-upgrade.unattached.json";
+    const UNATTACHED_VERSION: u16 = 1;
+
+    /// What any client may read about an unattached conversation. The host
+    /// writes the exact evidence beside it; readers ignore that payload.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+    pub(crate) struct UnattachedSummary {
+        pub id: crate::model::TerminalId,
+        pub provider: crate::agent::Provider,
+        /// The provider's confirmed conversation (Codex thread) identity.
+        pub conversation: Option<String>,
+        pub working_directory: PathBuf,
+        /// Why reattachment was refused, as the daemon reported it.
+        pub reason: String,
+    }
+
+    #[cfg(any(feature = "host", test))]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(crate) struct UnattachedChat {
+        #[serde(flatten)]
+        pub summary: UnattachedSummary,
+        /// The checkpoint entry exactly as the previous daemon issued it.
+        pub evidence: Chat,
+        /// The conversation's paired terminal, when the checkpoint asked for it
+        /// to be relaunched. Relaunching it would attach an unowned client to
+        /// the retained server, so it is kept here instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub terminal: Option<Terminal>,
+    }
+
+    #[cfg(any(feature = "host", test))]
+    impl UnattachedChat {
+        pub fn new(evidence: Chat, reason: String) -> Self {
+            const REASON_BYTES: usize = 4096;
+            let reason = reason[..reason.floor_char_boundary(REASON_BYTES)].to_owned();
+            Self {
+                summary: UnattachedSummary {
+                    id: evidence.source.id,
+                    provider: evidence.launch.provider,
+                    conversation: evidence.launch.session_id.clone(),
+                    working_directory: evidence.launch.recipe.working_directory.clone(),
+                    reason,
+                },
+                evidence,
+                terminal: None,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[cfg_attr(any(feature = "host", test), derive(Serialize))]
+    struct UnattachedReport<T> {
+        version: u16,
+        conversations: T,
+    }
+
     /// Budget sequential provider confirmation without parsing session payloads.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
         Store::discover()?.startup_timeout()
@@ -869,6 +929,10 @@ pub(crate) mod handoff {
     pub(crate) struct Store {
         root: fs_safety::Root,
         pub path: PathBuf,
+        /// Serializes this daemon's read-modify-write updates of the
+        /// unattached record; only the lease-holding daemon writes it.
+        #[cfg(any(feature = "host", test))]
+        unattached: std::sync::Mutex<()>,
     }
 
     impl Store {
@@ -878,6 +942,19 @@ pub(crate) mod handoff {
             Self::open(&dirs.data_local_dir().join("daemon-upgrade"))
         }
 
+        /// Opens the durable storage only if some daemon already created it,
+        /// so read-only callers never create it.
+        pub fn existing() -> Result<Option<Self>, String> {
+            let dirs =
+                crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
+            let directory = dirs.data_local_dir().join("daemon-upgrade");
+            match std::fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+                Ok(_) => Self::open(&directory).map(Some),
+            }
+        }
+
         pub fn open(directory: &Path) -> Result<Self, String> {
             crate::secure_file::prepare_private_directory(directory)
                 .map_err(|error| error.to_string())?;
@@ -885,11 +962,17 @@ pub(crate) mod handoff {
             Ok(Self {
                 root,
                 path: directory.join(FILE),
+                #[cfg(any(feature = "host", test))]
+                unattached: Default::default(),
             })
         }
 
         fn read_bytes(&self) -> Result<Option<Vec<u8>>, String> {
-            let mut file = match fs_safety::open_beneath(&self.root, Path::new(FILE)) {
+            self.read_named(FILE)
+        }
+
+        fn read_named(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
+            let mut file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
                 Ok(file) => file,
                 Err(error) if error.is_not_found() => return Ok(None),
                 Err(error) => return Err(error.to_string()),
@@ -900,12 +983,15 @@ pub(crate) mod handoff {
                 || metadata.mode() & 0o077 != 0
                 || metadata.nlink() != 1
             {
-                return Err(format!("Unsafe upgrade checkpoint {}", self.path.display()));
+                return Err(format!(
+                    "Unsafe upgrade evidence {}",
+                    self.path.with_file_name(name).display()
+                ));
             }
             let bytes =
                 fs_safety::read_bounded(&mut file, MAX_BYTES).map_err(|error| error.to_string())?;
             if bytes.len() as u64 > MAX_BYTES {
-                return Err("Upgrade checkpoint exceeds durable byte limit".into());
+                return Err("Upgrade evidence exceeds durable byte limit".into());
             }
             Ok(Some(bytes))
         }
@@ -974,20 +1060,154 @@ pub(crate) mod handoff {
             };
             let mut bytes = Bounded(Vec::new());
             serde_json::to_writer(&mut bytes, &versioned).map_err(|error| error.to_string())?;
-            let (mut file, name) = fs_safety::create_temporary_in(&self.root, 0o600)
+            self.write_named(FILE, &bytes.0)
+        }
+
+        /// Atomically and durably replaces `name` with `bytes`.
+        #[cfg(any(feature = "host", test))]
+        fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+            let (mut file, temporary) = fs_safety::create_temporary_in(&self.root, 0o600)
                 .map_err(|error| error.to_string())?;
             let result = (|| {
-                file.write_all(&bytes.0)
-                    .map_err(|error| error.to_string())?;
+                file.write_all(bytes).map_err(|error| error.to_string())?;
                 file.sync_all().map_err(|error| error.to_string())?;
-                fs_safety::rename_within(&self.root, &name, OsStr::new(FILE))
+                fs_safety::rename_within(&self.root, &temporary, OsStr::new(name))
                     .map_err(|error| error.to_string())?;
                 fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
             })();
             if result.is_err() {
-                let _ = fs_safety::unlink_within(&self.root, &name);
+                let _ = fs_safety::unlink_within(&self.root, &temporary);
             }
             result
+        }
+
+        /// Where retained conversations that could not be reattached are
+        /// recorded; see [`Store::unattached`].
+        pub fn unattached_path(&self) -> PathBuf {
+            self.path.with_file_name(UNATTACHED_FILE)
+        }
+
+        /// Retained native conversations an upgrade restore left unattached
+        /// that have not since been reattached or explicitly closed.
+        pub fn unattached(&self) -> Result<Vec<UnattachedSummary>, String> {
+            Ok(self
+                .read_unattached::<UnattachedSummary>()?
+                .unwrap_or_default())
+        }
+
+        fn read_unattached<T: serde::de::DeserializeOwned>(
+            &self,
+        ) -> Result<Option<Vec<T>>, String> {
+            let Some(bytes) = self.read_named(UNATTACHED_FILE)? else {
+                return Ok(None);
+            };
+            let report: UnattachedReport<Vec<T>> =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if report.version != UNATTACHED_VERSION {
+                return Err(format!(
+                    "Unsupported unattached conversation evidence {}",
+                    self.unattached_path().display()
+                ));
+            }
+            Ok(Some(report.conversations))
+        }
+
+        /// Adds conversations to the unattached record, replacing any earlier
+        /// entry for the same conversation, and forgets `resolved` ones, in one
+        /// durable replacement. The record stays within its count and byte
+        /// bounds: the entries recorded longest ago give way first, because an
+        /// oversized record must never make a restore fail.
+        #[cfg(any(feature = "host", test))]
+        pub fn record_unattached(
+            &self,
+            entries: &[UnattachedChat],
+            resolved: &[crate::model::TerminalId],
+        ) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let mut conversations = match self.read_unattached::<UnattachedChat>() {
+                Ok(None) if entries.is_empty() => return Ok(()),
+                Ok(conversations) => conversations.unwrap_or_default(),
+                // Evidence this release cannot read, such as a newer release's
+                // before a rollback, must neither block the restore recording
+                // its own nor be overwritten. Keep it intact beside the new one.
+                Err(_) if entries.is_empty() => return Ok(()),
+                Err(error) => {
+                    let aside = format!(
+                        "daemon-upgrade.unattached.{}.unreadable.json",
+                        uuid::Uuid::new_v4()
+                    );
+                    fs_safety::rename_new_within(
+                        &self.root,
+                        OsStr::new(UNATTACHED_FILE),
+                        OsStr::new(&aside),
+                    )
+                    .map_err(|rename| {
+                        format!("Cannot set aside unreadable evidence ({error}): {rename}")
+                    })?;
+                    tracing::warn!(%error, aside, "set aside unattached-conversation evidence this release cannot read");
+                    Vec::new()
+                }
+            };
+            let before = conversations.len();
+            conversations.retain(|old| {
+                !resolved.contains(&old.summary.id)
+                    && !entries
+                        .iter()
+                        .any(|entry| entry.summary.id == old.summary.id)
+            });
+            if entries.is_empty() && conversations.len() == before {
+                return Ok(());
+            }
+            conversations.extend(entries.iter().cloned());
+            let excess = conversations.len().saturating_sub(MAX_CHATS);
+            conversations.drain(..excess);
+            self.write_unattached(conversations)
+        }
+
+        /// Forgets a conversation that has since been reattached or closed,
+        /// removing the record once nothing in it needs attention.
+        #[cfg(any(feature = "host", test))]
+        pub fn retire_unattached(&self, id: crate::model::TerminalId) -> Result<(), String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(mut conversations) = self.read_unattached::<UnattachedChat>()? else {
+                return Ok(());
+            };
+            let before = conversations.len();
+            conversations.retain(|entry| entry.summary.id != id);
+            if conversations.len() == before {
+                return Ok(());
+            }
+            self.write_unattached(conversations)
+        }
+
+        /// Durably replaces the record, or removes it when empty, evicting the
+        /// oldest entries while it exceeds the durable byte limit.
+        #[cfg(any(feature = "host", test))]
+        fn write_unattached(&self, mut conversations: Vec<UnattachedChat>) -> Result<(), String> {
+            loop {
+                if conversations.is_empty() {
+                    return match fs_safety::unlink_within(&self.root, OsStr::new(UNATTACHED_FILE)) {
+                        Err(error) if error.is_not_found() => Ok(()),
+                        result => result.map_err(|error| error.to_string()).and_then(|()| {
+                            fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+                        }),
+                    };
+                }
+                let bytes = serde_json::to_vec(&UnattachedReport {
+                    version: UNATTACHED_VERSION,
+                    conversations: &conversations,
+                })
+                .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 <= MAX_BYTES {
+                    return self.write_named(UNATTACHED_FILE, &bytes);
+                }
+                let evicted = conversations.remove(0);
+                tracing::warn!(session = %evicted.summary.id,
+                    conversation = ?evicted.summary.conversation,
+                    working_directory = %evicted.summary.working_directory.display(),
+                    reason = %evicted.summary.reason,
+                    "unattached-conversation evidence exceeded its byte limit; forgot the oldest entry");
+            }
         }
 
         pub fn archive(&self) -> Result<PathBuf, String> {
@@ -1658,6 +1878,162 @@ mod tests {
         writers.terminals[0].source.launch = exact.clone();
         writers.terminals[0].recipe = recovery_recipe(&writers.terminals[0].source).unwrap();
         assert!(writers.validate().is_err());
+    }
+
+    #[test]
+    fn unattached_conversations_are_recorded_exactly_bounded_and_retired() {
+        use handoff::{Chat, UnattachedChat};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.unattached().unwrap().is_empty());
+        store.retire_unattached(TerminalId::new()).unwrap();
+        let unattached = |reason: &str| {
+            let source = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: LaunchRecipe {
+                        program: "codex".into(),
+                        arguments: vec!["resume".into()],
+                        working_directory: directory.path().into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: crate::chat::NativeContinuity::Durable {
+                    provider_version: "0.157.1".into(),
+                },
+            };
+            UnattachedChat::new(
+                Chat {
+                    launch: source.launch.clone(),
+                    source,
+                    previous_sources: Vec::new(),
+                },
+                reason.into(),
+            )
+        };
+        let first = unattached("no rollout found for thread id");
+        let second = unattached(&"é".repeat(4096));
+        assert_eq!(second.summary.reason.len(), 4096, "reasons are bounded");
+        store
+            .record_unattached(&[first.clone(), second.clone()], &[])
+            .unwrap();
+        assert_eq!(
+            fs::metadata(store.unattached_path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            store.unattached().unwrap(),
+            vec![first.summary.clone(), second.summary.clone()]
+        );
+        assert_eq!(
+            first.summary.conversation, first.evidence.launch.session_id,
+            "the confirmed conversation is named"
+        );
+        // A later restore of the same conversation replaces its entry.
+        let mut again = first.clone();
+        again.summary.reason = "The durable native holder is unavailable".into();
+        store
+            .record_unattached(std::slice::from_ref(&again), &[])
+            .unwrap();
+        assert_eq!(
+            store.unattached().unwrap(),
+            vec![second.summary.clone(), again.summary.clone()]
+        );
+        // Readers need only the summary, whatever evidence a newer daemon keeps.
+        let exact = fs::read(store.unattached_path()).unwrap();
+        let mut report: serde_json::Value = serde_json::from_slice(&exact).unwrap();
+        report["conversations"][0]["evidence"] = serde_json::json!({ "future": [1, 2] });
+        fs::write(
+            store.unattached_path(),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store.unattached().unwrap()[0], second.summary);
+        // The daemon never rewrites evidence it cannot read exactly.
+        assert!(store.retire_unattached(second.summary.id).is_err());
+        fs::write(store.unattached_path(), exact).unwrap();
+        store.retire_unattached(second.summary.id).unwrap();
+        assert_eq!(store.unattached().unwrap(), vec![again.summary.clone()]);
+        // The record stays bounded, giving way oldest first.
+        let many = (0..130)
+            .map(|_| unattached("unavailable"))
+            .collect::<Vec<_>>();
+        store.record_unattached(&many, &[]).unwrap();
+        let listed = store.unattached().unwrap();
+        assert_eq!(listed.len(), 128);
+        assert_eq!(listed[0], many[2].summary);
+        // Resolution and new refusals land in one replacement.
+        let resolved = many[2..]
+            .iter()
+            .map(|entry| entry.summary.id)
+            .collect::<Vec<_>>();
+        store
+            .record_unattached(std::slice::from_ref(&second), &resolved)
+            .unwrap();
+        assert_eq!(store.unattached().unwrap(), vec![second.summary.clone()]);
+        store.record_unattached(&[], &[second.summary.id]).unwrap();
+        assert!(
+            !store.unattached_path().exists(),
+            "nothing left needs attention"
+        );
+        // An oversized record gives way oldest first rather than failing.
+        let bulky = |reason: &str| {
+            let mut entry = unattached(reason);
+            entry.evidence.launch.recipe.environment =
+                [("PAYLOAD".into(), "x".repeat(3 * 1024 * 1024))].into();
+            entry
+        };
+        let (old, newer, newest) = (bulky("old"), bulky("newer"), bulky("newest"));
+        store.record_unattached(&[old, newer.clone()], &[]).unwrap();
+        store
+            .record_unattached(std::slice::from_ref(&newest), &[])
+            .unwrap();
+        assert_eq!(
+            store.unattached().unwrap(),
+            vec![newer.summary.clone(), newest.summary.clone()]
+        );
+        store
+            .record_unattached(&[], &[newer.summary.id, newest.summary.id])
+            .unwrap();
+        assert!(!store.unattached_path().exists());
+        // Unreadable evidence is an error, never an empty report.
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(store.unattached_path())
+            .unwrap()
+            .write_all(br#"{"version":2,"conversations":[]}"#)
+            .unwrap();
+        let error = store.unattached().unwrap_err();
+        assert!(error.contains("Unsupported"), "{error}");
+        // Recording never waits on, or overwrites, evidence it cannot read.
+        store.record_unattached(&[], &[first.summary.id]).unwrap();
+        assert!(
+            store.unattached().is_err(),
+            "resolving alone never sets evidence aside"
+        );
+        store
+            .record_unattached(std::slice::from_ref(&first), &[])
+            .unwrap();
+        assert_eq!(store.unattached().unwrap(), vec![first.summary.clone()]);
+        let aside = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(".unreadable.json"))
+            .collect::<Vec<_>>();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            fs::read(&aside[0]).unwrap(),
+            br#"{"version":2,"conversations":[]}"#
+        );
     }
 
     #[test]

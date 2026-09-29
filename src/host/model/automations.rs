@@ -1498,6 +1498,7 @@ mod tests {
                 surface: Surface::Chat,
                 model: None,
                 permission_mode: None,
+                reasoning_effort: None,
             },
             schedule: Schedule {
                 pattern: SchedulePattern::Daily { hour: 9, minute: 0 },

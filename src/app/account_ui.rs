@@ -88,6 +88,12 @@ pub(super) struct State {
     table: table::Table,
     /// Accounts being signed out and deleted.
     removing: BTreeSet<AccountId>,
+    /// Accounts whose home was found signed in to another login than the
+    /// one it was added with, and the login each was reported signed in to.
+    login_changes_reported: BTreeMap<AccountId, Identity>,
+    /// Accounts whose home reported another login, waiting for the
+    /// registry to be read again before that is reported.
+    login_changes_unconfirmed: BTreeSet<AccountId>,
     /// Accounts whose figures a running conversation reported and the cache
     /// has not been given yet.
     live_unsaved: BTreeSet<AccountId>,
@@ -165,6 +171,8 @@ impl State {
             table: table::Table::default(),
             removing: BTreeSet::new(),
             live_unsaved: BTreeSet::new(),
+            login_changes_reported: BTreeMap::new(),
+            login_changes_unconfirmed: BTreeSet::new(),
             catalogs: BTreeMap::new(),
             catalogs_unsaved: BTreeSet::new(),
             saving_live: false,
@@ -276,6 +284,64 @@ impl State {
         } else {
             format!("{} account", account.name())
         }
+    }
+
+    /// Why `account` cannot be trusted to be the login it is listed as, if
+    /// it cannot: each account is a home of its own holding a login of its
+    /// own, and two rows that are one home, or one login, count one
+    /// allowance twice and run each other's work.
+    fn login_conflict(&self, account: &AccountState) -> Option<LoginConflict> {
+        if account.account.is_brokered() {
+            return None;
+        }
+        let current = account.identity.as_ref();
+        if let (Some(registered), Some(current)) = (
+            account
+                .account
+                .registry_key()
+                .and_then(|key| self.registry.find(key)),
+            current,
+        ) && registered.conflicts_with(current)
+        {
+            // The same address in another organization is told apart by it.
+            let recorded = registered.identity();
+            let same_address = recorded
+                .email
+                .as_deref()
+                .map(str::trim)
+                .zip(current.email.as_deref().map(str::trim))
+                .is_some_and(|(mine, theirs)| mine.eq_ignore_ascii_case(theirs));
+            let name = |identity: &Identity| {
+                let email = identity.email.clone().unwrap_or_default();
+                match identity.organization.as_deref() {
+                    Some(organization) if same_address => format!("{email} ({organization})"),
+                    _ => email,
+                }
+            };
+            return Some(LoginConflict::Changed {
+                added_as: name(&recorded),
+                now: name(current),
+            });
+        }
+        let home = account.account.resolved_home();
+        let others = self
+            .of(account.account.provider)
+            .filter(|other| other.id != account.id && !other.account.is_brokered());
+        for other in others {
+            if home.is_some() && other.account.resolved_home() == home {
+                return Some(LoginConflict::SameHome {
+                    with: self.display_name(other),
+                });
+            }
+            if let (Some(mine), Some(theirs)) = (current, other.identity.as_ref())
+                && mine.same_login(theirs)
+            {
+                return Some(LoginConflict::SameLogin {
+                    with: self.display_name(other),
+                });
+            }
+        }
+        None
     }
 
     /// The accounts of `provider`, in list order.
@@ -434,6 +500,42 @@ impl Default for State {
     }
 }
 
+/// Why an account row does not stand for a login of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoginConflict {
+    /// Its home now reports another login than the one it was added with:
+    /// something replaced the credentials in it.
+    Changed { added_as: String, now: String },
+    /// It is the same home as another row.
+    SameHome { with: String },
+    /// Its home is signed in to the same login as another row's.
+    SameLogin { with: String },
+}
+
+impl LoginConflict {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Changed { .. } => "Login changed",
+            Self::SameHome { .. } => "Same home",
+            Self::SameLogin { .. } => "Same login",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Changed { added_as, now } => format!(
+                "Added as {added_as}, but its home is now signed in to {now}. Sign it in to {added_as} again, or remove it."
+            ),
+            Self::SameHome { with } => {
+                format!("This is the same provider home as {with}, so both rows are one login.")
+            }
+            Self::SameLogin { with } => format!(
+                "Signed in to the same login as {with}. Both draw on one allowance; sign one of them in to another login."
+            ),
+        }
+    }
+}
+
 struct AccountState {
     account: Account,
     id: AccountId,
@@ -450,6 +552,9 @@ struct AccountState {
     /// A probe that came due while another account of the same provider was
     /// being probed, and starts once that one answers.
     queued: Option<Trigger>,
+    /// The login the account reported when the reader started signing it
+    /// in, while that sign-in is watched for.
+    signing_in_from: Option<Identity>,
 }
 
 impl AccountState {
@@ -463,6 +568,7 @@ impl AccountState {
             schedule: Schedule::default(),
             failure: None,
             queued: None,
+            signing_in_from: None,
         }
     }
 
@@ -478,17 +584,17 @@ impl AccountState {
             .map(account::plan_label)
     }
 
-    /// The address the account is signed in as: as its CLI last reported, or
-    /// as the registry remembers from when it was added.
+    /// The login this account is known as: the one it was added with, and
+    /// otherwise whatever its CLI last reported. A home that now reports
+    /// another login keeps its name; [`State::login_conflict`] says so.
     fn email<'a>(&'a self, registry: &'a Registry) -> Option<&'a str> {
-        self.identity
-            .as_ref()
-            .and_then(|identity| identity.email.as_deref())
+        self.account
+            .registry_key()
+            .and_then(|key| registry.find(key)?.email.as_deref())
             .or_else(|| {
-                registry
-                    .find(self.account.registry_key()?)?
-                    .email
-                    .as_deref()
+                self.identity
+                    .as_ref()
+                    .and_then(|identity| identity.email.as_deref())
             })
     }
 
@@ -823,11 +929,50 @@ fn reset_countdown(window: &UsageWindow, now: Millis) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChipTone {
     Current,
+    /// Current figures running low: worth a glance before starting work.
+    Low,
+    /// Current figures at or next to the limit: new work will fail or stall.
+    Exhausted,
     /// Figures the reader should not plan around: old, or from before a
     /// reset.
     Stale,
     /// Something the reader has to do.
     Attention,
+}
+
+impl ChipTone {
+    /// How current figures read, from the provider's own verdict and from
+    /// how full the window the chip leads with is. Healthy accounts stay
+    /// neutral, so only an account in trouble draws the eye along the bar.
+    fn of_usage(status: UsageStatus, used: f32) -> Self {
+        if status == UsageStatus::Limited || used > design::BUDGET_CRITICAL {
+            Self::Exhausted
+        } else if status == UsageStatus::Warning || used > design::BUDGET_WARNING {
+            Self::Low
+        } else {
+            Self::Current
+        }
+    }
+
+    /// The color the chip's gauge takes, or `None` for the neutral stroke.
+    fn color(self) -> Option<fn(&cosmic::Theme) -> cosmic::iced::Color> {
+        match self {
+            Self::Low | Self::Attention => Some(design::warning_color),
+            Self::Exhausted => Some(design::destructive_color),
+            Self::Current | Self::Stale => None,
+        }
+    }
+
+    /// The chip's text in the same tone as its gauge.
+    fn text_class(self) -> cosmic::theme::Text {
+        match self {
+            Self::Current => cosmic::theme::Text::Default,
+            Self::Low | Self::Attention => cosmic::theme::Text::Custom(design::warning_text),
+            Self::Exhausted => cosmic::theme::Text::Custom(design::destructive_text),
+            // A caption's own muted ink.
+            Self::Stale => cosmic::theme::Text::Custom(design::muted_text),
+        }
+    }
 }
 
 /// What an account's chip says.
@@ -948,15 +1093,18 @@ fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
                     percent_left(scoped.used)
                 ));
             }
+            let tone = if stale {
+                ChipTone::Stale
+            } else {
+                ChipTone::of_usage(snapshot.status, window.used)
+            };
             Chip {
                 text,
                 gauge: Some(window.used),
-                tone: if stale {
-                    ChipTone::Stale
-                } else {
-                    ChipTone::Current
-                },
-                essential: false,
+                tone,
+                // An account that cannot take new work keeps its figure even
+                // in a bar too narrow for the others'.
+                essential: tone == ChipTone::Exhausted,
                 tooltip,
             }
         }
@@ -1092,6 +1240,17 @@ pub(super) struct ChatAccounts {
 }
 
 impl Cagents {
+    /// The models, and their efforts, a new conversation's composer offers.
+    pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
+        Provider::ALL
+            .into_iter()
+            .filter_map(|provider| {
+                let catalog = self.account_ui.catalog(provider)?;
+                Some((provider, catalog.models.clone()))
+            })
+            .collect()
+    }
+
     pub(super) fn automation_account_choices(&self) -> Vec<crate::automation_ui::AccountChoice> {
         let mut choices = self
             .account_ui
@@ -1732,6 +1891,9 @@ impl Cagents {
                     let migrate = registry.migrate_project_ids(&projects);
                     let before = self.account_ui.accounts.len();
                     self.account_ui.set_registry(registry);
+                    for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
+                        self.report_login_change(&id);
+                    }
                     let probe = if self.account_ui.accounts.len() != before {
                         self.probe_accounts(Trigger::Focus)
                     } else {
@@ -1745,6 +1907,10 @@ impl Cagents {
                         Task::none()
                     };
                     return Task::batch([probe, save]);
+                }
+                // Unconfirmable: report against the registry as last read.
+                for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
+                    self.report_login_change(&id);
                 }
                 Task::none()
             }
@@ -2066,9 +2232,30 @@ impl Cagents {
             Outcome::Answered {
                 identity, snapshot, ..
             } => {
+                // A login the reader started for this very account is theirs
+                // to choose, whoever it signs in as - once the home reports
+                // a login other than the one it had when they started it.
+                // Until then an answer is the home as it was, and the watch
+                // for the new login goes on - unless the home was signed
+                // out, when being signed in again, even to the same login,
+                // is that sign-in finishing.
+                let was_signed_out = state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.status == UsageStatus::NeedsLogin);
+                let signed_in_here = state.schedule.awaiting_login(now)
+                    && identity.as_ref().is_some_and(|reported| {
+                        state
+                            .signing_in_from
+                            .as_ref()
+                            .is_none_or(|before| !before.same_login(reported))
+                    });
+                let unchanged_by_login =
+                    state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
-                if snapshot.status != UsageStatus::NeedsLogin {
+                if snapshot.status != UsageStatus::NeedsLogin && !unchanged_by_login {
                     state.schedule.login_settled();
+                    state.signing_in_from = None;
                 }
                 state.present =
                     snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
@@ -2081,7 +2268,7 @@ impl Cagents {
                 if let (Some(key), Some(identity)) =
                     (state.account.registry_key(), state.identity.as_ref())
                 {
-                    learned = Some((key, identity.clone()));
+                    learned = Some((key, identity.clone(), signed_in_here));
                 }
                 state.snapshot = Some(snapshot);
                 state.failure = None;
@@ -2096,23 +2283,98 @@ impl Cagents {
         if !present && self.account_ui.popover.as_ref() == Some(&id) {
             self.account_ui.popover = None;
         }
-        // A managed account's address is remembered, so the next sign-in can
-        // be told apart from it before this window has probed it.
         let remember = learned
-            .filter(|(key, identity)| {
-                self.account_ui.registry.find(*key).is_some_and(|managed| {
-                    identity.email.is_some() && managed.email != identity.email
-                        || identity.organization.is_some()
-                            && managed.organization != identity.organization
-                })
-            })
-            .map(|(key, identity)| {
-                self.save_registry(move |registry| {
-                    registry.observe_identity(key, &identity);
-                })
+            .map(|(key, identity, signed_in_here)| {
+                self.remember_identity(&id, key, identity, signed_in_here)
             })
             .unwrap_or_else(Task::none);
         Task::batch([remember, self.probe_queued(provider)])
+    }
+
+    /// Records who a registered account's home reported it is.
+    ///
+    /// A managed account's address is remembered, so the next sign-in can be
+    /// told apart from it before this window has probed it. A home that
+    /// reports another login than the one it was added with had its
+    /// credentials replaced: that is reported, never recorded, unless the
+    /// reader has just signed this account in themselves.
+    fn remember_identity(
+        &mut self,
+        id: &AccountId,
+        key: uuid::Uuid,
+        identity: Identity,
+        signed_in_here: bool,
+    ) -> Task<Message> {
+        let Some(registered) = self.account_ui.registry.find(key) else {
+            return Task::none();
+        };
+        if registered.conflicts_with(&identity) {
+            if signed_in_here {
+                self.account_ui.login_changes_reported.remove(id);
+                return self.save_registry(move |registry| {
+                    registry.adopt_identity(key, &identity);
+                });
+            }
+            if self
+                .account_ui
+                .login_changes_reported
+                .get(id)
+                .is_some_and(|reported| reported.same_login(&identity))
+            {
+                return Task::none();
+            }
+            // Another window may have just signed this account in to the
+            // login it reports; only the registry as it stands can say.
+            if self.account_ui.store.is_some() {
+                if !self.account_ui.login_changes_unconfirmed.insert(id.clone()) {
+                    // A reload to confirm it is already under way.
+                    return Task::none();
+                }
+                return self.reload_registry();
+            }
+            self.report_login_change(id);
+            return Task::none();
+        }
+        self.account_ui.login_changes_reported.remove(id);
+        let learns = identity.email.is_some() && registered.email.is_none()
+            || identity.organization.is_some() && registered.organization.is_none();
+        if !learns {
+            return Task::none();
+        }
+        self.save_registry(move |registry| {
+            registry.observe_identity(key, &identity);
+        })
+    }
+
+    /// Reports, once per login, that `id`'s home is signed in to another
+    /// login than the one it was added with - if it still is.
+    fn report_login_change(&mut self, id: &AccountId) {
+        let Some(account) = self.account_ui.account(id) else {
+            return;
+        };
+        let Some(LoginConflict::Changed { now, .. }) = self.account_ui.login_conflict(account)
+        else {
+            return;
+        };
+        let Some(identity) = account.identity.clone() else {
+            return;
+        };
+        let name = self.account_ui.display_name(account);
+        if self
+            .account_ui
+            .login_changes_reported
+            .insert(id.clone(), identity.clone())
+            .is_some_and(|reported| reported.same_login(&identity))
+        {
+            return;
+        }
+        tracing::warn!(
+            account = %id,
+            "account home reports a different login than it was added with"
+        );
+        self.status = Some(TransientNotice::error(format!(
+            "{name} is now signed in to a different login ({now}) than it was added with. Sign it in again, or remove it."
+        )));
     }
 
     /// A synchronous fence covering discovery and terminals awaiting spawn.
@@ -2201,6 +2463,7 @@ impl Cagents {
         let now = now_ms();
         if let Some(state) = self.account_ui.account_mut(id) {
             state.schedule.await_login(now);
+            state.signing_in_from = state.identity.clone();
         }
         self.open_login_terminal(launch, title).0
     }
@@ -3190,22 +3453,17 @@ impl Cagents {
                 .size(CHIP_ICON_SIZE)
                 .into(),
         ];
+        let tone = summary.tone.color();
         if let Some(used) = summary.gauge {
-            items.push(crate::ui_controls::budget_radial(used));
+            items.push(crate::ui_controls::budget_radial_toned(
+                used,
+                tone.map(design::Tone::Themed),
+            ));
         }
         if !compact || summary.essential {
             let text =
                 design::caption(summary.text).wrapping(cosmic::iced::widget::text::Wrapping::None);
-            items.push(
-                match summary.tone {
-                    ChipTone::Current => text.class(cosmic::theme::Text::Default),
-                    ChipTone::Stale => text,
-                    ChipTone::Attention => {
-                        text.class(cosmic::theme::Text::Custom(design::warning_text))
-                    }
-                }
-                .into(),
-            );
+            items.push(text.class(summary.tone.text_class()).into());
         }
         if others > 0 && !compact {
             items.push(
@@ -3854,6 +4112,36 @@ mod tests {
     }
 
     #[test]
+    fn a_chip_takes_the_warning_or_error_tone_as_its_account_runs_out() {
+        let tone = |used: f32, status: UsageStatus| {
+            let mut snapshot = snapshot(vec![window(used, None)], NOW);
+            snapshot.status = status;
+            chip(&state_with(Some(snapshot)), "Claude", NOW)
+        };
+        assert_eq!(tone(0.05, UsageStatus::Ok).tone, ChipTone::Current);
+        assert_eq!(tone(0.8, UsageStatus::Ok).tone, ChipTone::Low);
+        // The provider's own verdict counts even below the local thresholds.
+        assert_eq!(tone(0.5, UsageStatus::Warning).tone, ChipTone::Low);
+        let exhausted = tone(1.0, UsageStatus::Limited);
+        assert_eq!(exhausted.tone, ChipTone::Exhausted);
+        assert!(exhausted.essential, "a narrow bar still says 0% left");
+        assert_eq!(tone(0.95, UsageStatus::Ok).tone, ChipTone::Exhausted);
+        assert_eq!(ChipTone::Current.color(), None);
+        assert!(ChipTone::Exhausted.color().is_some());
+
+        // Old figures stay muted however low they were.
+        let mut old = snapshot(
+            vec![window(1.0, None)],
+            NOW - schedule::DISPLAY_STALE_AFTER - 1,
+        );
+        old.status = UsageStatus::Limited;
+        assert_eq!(
+            chip(&state_with(Some(old)), "Claude", NOW).tone,
+            ChipTone::Stale
+        );
+    }
+
+    #[test]
     fn old_figures_and_figures_from_before_a_reset_are_shown_as_of_when_they_were_read() {
         let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
         let old = chip(
@@ -4380,6 +4668,277 @@ mod app_tests {
             1
         );
         // The pane renders at any width without panicking.
+        let _ = app.accounts_pane();
+    }
+
+    /// Links a Codex home per login, each registered as signed in to it.
+    fn linked_logins(
+        app: &mut Cagents,
+        directory: &Path,
+        logins: &[&str],
+    ) -> Vec<(uuid::Uuid, AccountId)> {
+        let mut registry = app.account_ui.registry.clone();
+        let accounts = logins
+            .iter()
+            .enumerate()
+            .map(|(index, email)| {
+                let home = directory.join(format!("home-{index}"));
+                std::fs::create_dir(&home).unwrap();
+                let key = uuid::Uuid::new_v4();
+                registry
+                    .link(Provider::Codex, key, home.clone(), None, None, 1)
+                    .unwrap();
+                registry.observe_identity(
+                    key,
+                    &Identity {
+                        email: Some((*email).into()),
+                        ..Identity::default()
+                    },
+                );
+                (key, Account::linked(Provider::Codex, key, home).id())
+            })
+            .collect();
+        app.account_ui.set_registry(registry);
+        accounts
+    }
+
+    fn signed_in_as(id: &AccountId, email: &str) -> Message {
+        Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: Some(Identity {
+                    email: Some(email.into()),
+                    ..Identity::default()
+                }),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "", NOW),
+            },
+        })
+    }
+
+    #[test]
+    fn a_home_signed_in_to_another_login_is_flagged_rather_than_renamed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.login_conflict(state), None);
+
+        // Something replaced the credentials in its home.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        let recorded = |app: &Cagents| {
+            app.account_ui
+                .registry
+                .find(key)
+                .unwrap()
+                .email
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(recorded(&app), "work@example.com");
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(
+            app.account_ui.login_conflict(state),
+            Some(LoginConflict::Changed {
+                added_as: "work@example.com".into(),
+                now: "personal@example.com".into(),
+            })
+        );
+        assert!(
+            app.account_ui
+                .display_name(state)
+                .ends_with("work@example.com")
+        );
+        assert_eq!(login_changes_noticed(&app), 1, "reported, not absorbed");
+        // Once per change, not on every probe.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(login_changes_noticed(&app), 1);
+        assert_eq!(recorded(&app), "work@example.com");
+
+        // Signing the account in again is the reader choosing its login -
+        // but an answer from before that sign-in finished is still the
+        // replaced login, and chooses nothing.
+        let sign_in_again = |app: &mut Cagents| {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.schedule.await_login(now_ms());
+            state.signing_in_from = state.identity.clone();
+        };
+        sign_in_again(&mut app);
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(recorded(&app), "work@example.com");
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .awaiting_login(now_ms()),
+            "the sign-in is still watched for"
+        );
+        // Signed back in to the login it was added with: nothing to adopt.
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        assert_eq!(recorded(&app), "work@example.com");
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.login_conflict(state), None);
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        // Signed in to another login on purpose: that is its login now.
+        sign_in_again(&mut app);
+        let _ = app.update(signed_in_as(&id, "new@example.com"));
+        assert_eq!(recorded(&app), "new@example.com");
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.login_conflict(state), None);
+    }
+
+    #[test]
+    fn signing_a_signed_out_account_back_in_to_its_login_ends_the_watch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        // Its token expired: signed out, still the account it was.
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW),
+            },
+        }));
+        let state = app.account_ui.account_mut(&id).unwrap();
+        assert_eq!(
+            state
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref()),
+            Some("work@example.com")
+        );
+        state.schedule.await_login(now_ms());
+        state.signing_in_from = state.identity.clone();
+
+        // Signed back in to the same login: the sign-in is over.
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        assert_eq!(state.signing_in_from, None);
+        assert_eq!(app.account_ui.login_conflict(state), None);
+
+        // A login that replaces it afterwards is reported, not adopted.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(login_changes_noticed(&app), 1);
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(login_changes_noticed(&app), 1, "once per login");
+        // Replaced again, by yet another login: that is a change of its own.
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(login_changes_noticed(&app), 2);
+    }
+
+    fn login_changes_noticed(app: &Cagents) -> usize {
+        app.notices
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .notice
+                    .message
+                    .contains("signed in to a different login")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_login_change_is_confirmed_against_the_registry_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.store = Some(Store::at(directory.path().join("registry")));
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let changed = Identity {
+            email: Some("personal@example.com".into()),
+            ..Identity::default()
+        };
+
+        // Another window signed it in to the login it now reports: the
+        // registry it saved says so, and there is nothing to report.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(
+            login_changes_noticed(&app),
+            0,
+            "reported only once confirmed"
+        );
+        let mut adopted = app.account_ui.registry.clone();
+        adopted.adopt_identity(key, &changed);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(adopted))));
+        assert_eq!(login_changes_noticed(&app), 0);
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.login_conflict(state), None);
+
+        // Replaced behind every window's back: the registry still records
+        // the login it was last signed in to, so the change is reported -
+        // once, however many probes answer while the registry is read.
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(app.account_ui.login_changes_unconfirmed.len(), 1);
+        let on_disk = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(on_disk))));
+        assert_eq!(login_changes_noticed(&app), 1);
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(login_changes_noticed(&app), 1);
+    }
+
+    #[test]
+    fn a_login_change_the_registry_cannot_confirm_is_still_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.store = Some(Store::at(directory.path().join("registry")));
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(login_changes_noticed(&app), 0);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Err(
+            "unreadable".into(),
+        ))));
+        assert_eq!(login_changes_noticed(&app), 1);
+        assert!(app.account_ui.login_changes_unconfirmed.is_empty());
+    }
+
+    #[test]
+    fn two_homes_signed_in_to_one_login_are_both_flagged() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let accounts = linked_logins(
+            &mut app,
+            directory.path(),
+            &["one@example.com", "two@example.com"],
+        );
+        for (_, id) in &accounts {
+            let _ = app.update(signed_in_as(id, "one@example.com"));
+        }
+        let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
+        // The second home was added as another login: that is the louder
+        // problem, and the one to name.
+        assert!(matches!(
+            app.account_ui.login_conflict(state(1)),
+            Some(LoginConflict::Changed { .. })
+        ));
+        assert_eq!(
+            app.account_ui.login_conflict(state(0)),
+            Some(LoginConflict::SameLogin {
+                with: app.account_ui.display_name(state(1)),
+            })
+        );
+        // The pane renders the flags without panicking.
         let _ = app.accounts_pane();
     }
 

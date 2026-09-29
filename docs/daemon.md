@@ -15,7 +15,10 @@ that runs independently of the UI so sessions survive window and UI-process
 restarts. There is no system daemon or service unit. The standard production
 installation starts the daemon immediately and registers it for
 graphical-login autostart. While the daemon runs, cagents shows a system-tray
-item that opens the UI and can stop the daemon.
+item that opens the UI and can stop the daemon. Its menu leads with the
+daemon's state, or an action's result for a few seconds, and how many hosted
+agents are working or waiting for you. Stopping a daemon that still hosts
+terminals or agent work asks for a counted confirmation first.
 
 Full and browserless production builds share one daemon socket
 (`$XDG_RUNTIME_DIR/cagents/`) and one session store. IPC protocol changes
@@ -240,6 +243,23 @@ version and starts its daemon against the durable handoff. A replacement startup
 failure rolls back only when its status proves it stopped; if startup state is
 ambiguous, the installer keeps the new installation and recovery state rather
 than risk a second writer. Inspect `cagents daemon status` before retrying.
+
+A retained native conversation that its provider refuses to reattach, for
+example because Codex no longer finds the thread's rollout in its account
+storage, does not fail the restore. The replacement daemon still starts and
+adopts every carried terminal and other session; nothing is started or resent
+for that conversation, including a paired terminal view the checkpoint would
+otherwise relaunch, and its provider holder keeps running. The exact checkpoint
+entries and the provider's reason are recorded in
+`daemon-upgrade/daemon-upgrade.unattached.json`, `cagents daemon start` and
+`cagents daemon status` warn about each such conversation (JSON output carries
+them under `upgrade_attention`), and while its holder remains its card shows
+the reason when reopened. Each later daemon start tries again to reattach the
+retained holder; the record is cleared once the conversation is reattached or
+explicitly closed, or at the next daemon start after its holder is gone (for
+example after a reboot), when only the log names it for manual recovery from
+provider storage. Failures that concern the checkpoint itself still stop
+startup and keep it replayable.
 
 An interrupted checkpoint is never blindly replayed. After confirming that every
 previous provider writer has stopped, `cagents daemon abandon-upgrade --yes`
