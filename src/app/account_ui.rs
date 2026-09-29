@@ -2183,7 +2183,13 @@ impl Cagents {
                 // to choose, whoever it signs in as - once the home reports
                 // a login other than the one it had when they started it.
                 // Until then an answer is the home as it was, and the watch
-                // for the new login goes on.
+                // for the new login goes on - unless the home was signed
+                // out, when being signed in again, even to the same login,
+                // is that sign-in finishing.
+                let was_signed_out = state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| current.status == UsageStatus::NeedsLogin);
                 let signed_in_here = state.schedule.awaiting_login(now)
                     && identity.as_ref().is_some_and(|reported| {
                         state
@@ -2191,7 +2197,8 @@ impl Cagents {
                             .as_ref()
                             .is_none_or(|before| !before.same_login(reported))
                     });
-                let unchanged_by_login = state.schedule.awaiting_login(now) && !signed_in_here;
+                let unchanged_by_login =
+                    state.schedule.awaiting_login(now) && !signed_in_here && !was_signed_out;
                 state.schedule.succeed(snapshot.observed_at);
                 if snapshot.status != UsageStatus::NeedsLogin && !unchanged_by_login {
                     state.schedule.login_settled();
@@ -4693,6 +4700,50 @@ mod app_tests {
         assert_eq!(recorded(&app), "new@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
+    }
+
+    #[test]
+    fn signing_a_signed_out_account_back_in_to_its_login_ends_the_watch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        // Its token expired: signed out, still the account it was.
+        let _ = app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "", NOW),
+            },
+        }));
+        let state = app.account_ui.account_mut(&id).unwrap();
+        assert_eq!(
+            state
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.email.as_deref()),
+            Some("work@example.com")
+        );
+        state.schedule.await_login(now_ms());
+        state.signing_in_from = state.identity.clone();
+
+        // Signed back in to the same login: the sign-in is over.
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        assert_eq!(state.signing_in_from, None);
+        assert_eq!(app.account_ui.login_conflict(state), None);
+
+        // A login that replaces it afterwards is reported, not adopted.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(
+            app.account_ui.registry.find(key).unwrap().email.as_deref(),
+            Some("work@example.com")
+        );
+        assert_eq!(login_changes_noticed(&app), 1);
     }
 
     fn login_changes_noticed(app: &Cagents) -> usize {
