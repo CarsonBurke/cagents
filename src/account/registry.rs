@@ -576,6 +576,7 @@ pub struct LaunchAccountLease {
 ///
 /// The registry is read without its lock: it is replaced by rename, and a
 /// launch may already hold the account lifecycle lock.
+#[cfg(feature = "host")]
 pub(crate) fn selection_marker(home_of: impl Fn(&str) -> Option<String>) -> Option<String> {
     let linked: Vec<PathBuf> = Store::installation()
         .and_then(|store| read(&store.path()).ok())

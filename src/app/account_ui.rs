@@ -1855,6 +1855,10 @@ impl Cagents {
                     };
                     return Task::batch([probe, save]);
                 }
+                // Unconfirmable: report against the registry as last read.
+                for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
+                    self.report_login_change(&id);
+                }
                 Task::none()
             }
             Action::Saved(result) => {
@@ -2257,7 +2261,10 @@ impl Cagents {
             // Another window may have just signed this account in to the
             // login it reports; only the registry as it stands can say.
             if self.account_ui.store.is_some() {
-                self.account_ui.login_changes_unconfirmed.insert(id.clone());
+                if !self.account_ui.login_changes_unconfirmed.insert(id.clone()) {
+                    // A reload to confirm it is already under way.
+                    return Task::none();
+                }
                 return self.reload_registry();
             }
             self.report_login_change(id);
@@ -2283,15 +2290,17 @@ impl Cagents {
         if !matches!(
             self.account_ui.login_conflict(account),
             Some(LoginConflict::Changed { .. })
-        ) || !self.account_ui.login_changes_reported.insert(id.clone())
-        {
+        ) {
+            return;
+        }
+        let name = self.account_ui.display_name(account);
+        if !self.account_ui.login_changes_reported.insert(id.clone()) {
             return;
         }
         tracing::warn!(
             account = %id,
             "account home reports a different login than it was added with"
         );
-        let name = self.account_ui.display_name(account);
         self.status = Some(TransientNotice::error(format!(
             "{name} is now signed in to a different login than it was added with. Sign it in again, or remove it."
         )));
@@ -4623,7 +4632,6 @@ mod app_tests {
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // Something replaced the credentials in its home.
-        app.status = None;
         let _ = app.update(signed_in_as(&id, "personal@example.com"));
         let recorded = |app: &Cagents| {
             app.account_ui
@@ -4648,11 +4656,10 @@ mod app_tests {
                 .display_name(state)
                 .ends_with("work@example.com")
         );
-        assert!(app.status.is_some(), "the change is reported, not absorbed");
+        assert_eq!(login_changes_noticed(&app), 1, "reported, not absorbed");
         // Once per change, not on every probe.
-        app.status = None;
         let _ = app.update(signed_in_as(&id, "personal@example.com"));
-        assert!(app.status.is_none());
+        assert_eq!(login_changes_noticed(&app), 1);
         assert_eq!(recorded(&app), "work@example.com");
 
         // Signing the account in again is the reader choosing its login -
@@ -4686,6 +4693,79 @@ mod app_tests {
         assert_eq!(recorded(&app), "new@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
+    }
+
+    fn login_changes_noticed(app: &Cagents) -> usize {
+        app.notices
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .notice
+                    .message
+                    .contains("signed in to a different login")
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_login_change_is_confirmed_against_the_registry_on_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.store = Some(Store::at(directory.path().join("registry")));
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let changed = Identity {
+            email: Some("personal@example.com".into()),
+            ..Identity::default()
+        };
+
+        // Another window signed it in to the login it now reports: the
+        // registry it saved says so, and there is nothing to report.
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(
+            login_changes_noticed(&app),
+            0,
+            "reported only once confirmed"
+        );
+        let mut adopted = app.account_ui.registry.clone();
+        adopted.adopt_identity(key, &changed);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(adopted))));
+        assert_eq!(login_changes_noticed(&app), 0);
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(app.account_ui.login_conflict(state), None);
+
+        // Replaced behind every window's back: the registry still records
+        // the login it was last signed in to, so the change is reported -
+        // once, however many probes answer while the registry is read.
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(app.account_ui.login_changes_unconfirmed.len(), 1);
+        let on_disk = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(on_disk))));
+        assert_eq!(login_changes_noticed(&app), 1);
+        let _ = app.update(signed_in_as(&id, "other@example.com"));
+        assert_eq!(login_changes_noticed(&app), 1);
+    }
+
+    #[test]
+    fn a_login_change_the_registry_cannot_confirm_is_still_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.store = Some(Store::at(directory.path().join("registry")));
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let _ = app.update(signed_in_as(&id, "work@example.com"));
+        let _ = app.update(signed_in_as(&id, "personal@example.com"));
+        assert_eq!(login_changes_noticed(&app), 0);
+        let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Err(
+            "unreadable".into(),
+        ))));
+        assert_eq!(login_changes_noticed(&app), 1);
+        assert!(app.account_ui.login_changes_unconfirmed.is_empty());
     }
 
     #[test]
