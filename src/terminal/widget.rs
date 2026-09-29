@@ -972,6 +972,8 @@ impl PtySize {
 
 #[derive(Default)]
 struct WidgetState {
+    history_total: u64,
+    completed_read_only: bool,
     shortcut_keys: Vec<keyboard::key::Physical>,
     select_all_request: u64,
     pty_size: PtySize,
@@ -1754,9 +1756,6 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn apply_scroll(&self, scroll: ViewportScroll, shell: &mut Shell<'_, Message>) {
-        if self.read_only {
-            return;
-        }
         if let Err(error) = scroll.apply(&self.handle) {
             self.publish_error(error, shell);
         }
@@ -1801,9 +1800,6 @@ impl<Message> TerminalWidget<Message> {
         geometry: TerminalGeometry,
         shell: &mut Shell<'_, Message>,
     ) {
-        if self.read_only {
-            return;
-        }
         match state
             .pty_size
             .observe(geometry.terminal_size(), Instant::now())
@@ -2026,6 +2022,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_mut::<WidgetState>();
+        if self.snapshot.scroll.total < state.history_total
+            || (self.read_only && !state.completed_read_only)
+        {
+            state.selection = None;
+            state.selecting = false;
+            state.selection_click = None;
+        }
+        state.history_total = self.snapshot.scroll.total;
+        state.completed_read_only = self.read_only;
         self.synchronize_size(state, geometry, shell);
         if state.select_all_request != self.select_all_request {
             state.select_all_request = self.select_all_request;
@@ -2050,8 +2055,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar = TerminalScrollbar::new(bounds, self.snapshot.scroll)
-            .filter(|_| self.model_focused && !self.read_only);
+        let scrollbar =
+            TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -2452,10 +2457,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
-                if self.read_only {
-                    shell.capture_event();
-                    return;
-                }
                 let travel = match delta {
                     ScrollDelta::Lines { y, .. } => WheelTravel::Notches(*y),
                     ScrollDelta::Pixels { y, .. } => WheelTravel::Rows(*y / geometry.cell_height),

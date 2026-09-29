@@ -733,7 +733,7 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle.set_theme(theme).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -753,9 +753,9 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle
-                .search(request, query, case_sensitive)
+                .search_for(Some(client_id), request, query, case_sensitive)
                 .map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -763,7 +763,7 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle.clear_scrollback().map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -775,7 +775,7 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle
                 .copy_selection(request, selection)
                 .map_err(send_error)?;
@@ -798,7 +798,7 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             match scroll {
                 TerminalScroll::Lines(delta) => {
                     let delta = isize::try_from(delta).map_err(|_| {
@@ -845,7 +845,7 @@ pub(super) fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .surface_handle(client_id, terminal_id)?;
+                .history_handle(client_id, terminal_id)?;
             handle.resize(size.into()).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }

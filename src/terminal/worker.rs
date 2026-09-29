@@ -1,3 +1,4 @@
+mod archive;
 mod carry;
 mod close_processes;
 #[cfg(test)]
@@ -8,13 +9,14 @@ use close_processes::{FrozenFamily, RootIdentity};
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     fs::File,
     io::{BufWriter, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -86,10 +88,13 @@ enum Command {
         selection: super::SearchMatch,
     },
     Search {
+        owner: Option<u64>,
         request: u64,
         query: String,
         case_sensitive: bool,
+        latest: Arc<AtomicU64>,
     },
+    HostVisibility(Visibility),
     Hide,
     Reveal,
     Hibernate,
@@ -199,6 +204,18 @@ enum Visibility {
 
 type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 
+enum ArchivePhase {
+    Live,
+    Preparing,
+    Frozen {
+        history: Result<archive::History, String>,
+        events: Arc<Sender<TerminalEvent>>,
+    },
+    Released,
+}
+
+type ArchiveObserver = dyn Fn(TerminalEvent) + Send + Sync;
+
 struct PublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
@@ -211,7 +228,10 @@ struct PublishedState {
     agent_observer: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     semantic_events: OnceLock<Weak<Sender<TerminalEvent>>>,
     conversation_title: Mutex<Option<String>>,
-    latest_search: AtomicU64,
+    searches: Mutex<HashMap<Option<u64>, Weak<AtomicU64>>>,
+    archive: Mutex<ArchivePhase>,
+    archive_ready: Condvar,
+    archive_observer: OnceLock<Arc<ArchiveObserver>>,
     completed: AtomicBool,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
@@ -248,7 +268,10 @@ impl PublishedState {
             agent_observer: OnceLock::new(),
             semantic_events: OnceLock::new(),
             conversation_title: Mutex::new(None),
-            latest_search: AtomicU64::new(0),
+            searches: Mutex::new(HashMap::new()),
+            archive: Mutex::new(ArchivePhase::Live),
+            archive_ready: Condvar::new(),
+            archive_observer: OnceLock::new(),
             completed: AtomicBool::new(false),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -257,6 +280,140 @@ impl PublishedState {
             wake,
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
+        }
+    }
+
+    fn prepare_search(&self, owner: Option<u64>, request: u64) -> Arc<AtomicU64> {
+        let mut searches = self.searches.lock().unwrap_or_else(|p| p.into_inner());
+        // Only queued or active searches retain their cancellation token.
+        searches.retain(|_, token| token.strong_count() > 0);
+        let latest = searches
+            .get(&owner)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let latest = Arc::new(AtomicU64::new(request));
+                searches.insert(owner, Arc::downgrade(&latest));
+                latest
+            });
+        latest.store(request, Ordering::Release);
+        latest
+    }
+
+    fn archived_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        if let Command::HostVisibility(visibility) = &command {
+            // HostState already offers this retained generation when a view
+            // becomes visible. Calling its wake callback here would reenter
+            // the host mutex held by visibility/attach/detach operations.
+            self.visible
+                .store(*visibility == Visibility::Visible, Ordering::Release);
+            return Ok(());
+        }
+        if !matches!(
+            &command,
+            Command::Search { .. }
+                | Command::CopySelection { .. }
+                | Command::Scroll(_)
+                | Command::Resize(_)
+                | Command::SetTheme(_)
+                | Command::ClearScrollback
+                | Command::Hide
+                | Command::Hibernate
+                | Command::Reveal
+                | Command::Restore { .. }
+                | Command::Focus(_)
+        ) {
+            return Err(TerminalSendError::Closed);
+        }
+        let mut phase = self.archive.lock().unwrap_or_else(|p| p.into_inner());
+        let ArchivePhase::Frozen { history, events } = &mut *phase else {
+            return Err(TerminalSendError::Closed);
+        };
+        let events = events.clone();
+        let result = match history {
+            Err(message) => Some(TerminalEvent::Error {
+                operation: "review completed terminal",
+                message: message.clone(),
+            }),
+            Ok(history) => {
+                match command {
+                    Command::Search {
+                        owner,
+                        request,
+                        query,
+                        case_sensitive,
+                        latest,
+                    } => {
+                        let source = history.source();
+                        drop(phase);
+                        let result = source
+                            .search(&query, case_sensitive, || {
+                                latest.load(Ordering::Acquire) != request
+                            })
+                            .map(|(matches, truncated)| TerminalEvent::SearchResults {
+                                owner,
+                                request,
+                                query,
+                                matches,
+                                truncated,
+                            });
+                        if let Some(event) = result {
+                            self.emit_archived(&events, event);
+                        }
+                        return Ok(());
+                    }
+                    Command::CopySelection { request, selection } => {
+                        let source = history.source();
+                        drop(phase);
+                        let event = match source.copy(selection) {
+                            Ok(text) => TerminalEvent::ClipboardText { request, text },
+                            Err(message) => TerminalEvent::Error {
+                                operation: "copy completed terminal selection",
+                                message,
+                            },
+                        };
+                        self.emit_archived(&events, event);
+                        return Ok(());
+                    }
+                    Command::Scroll(scroll) => history.scroll(&scroll),
+                    Command::Resize(size) => history.resize(size),
+                    Command::SetTheme(theme) => history.set_theme(theme),
+                    Command::ClearScrollback => history.clear(),
+                    Command::Hide | Command::Hibernate => {
+                        self.visible.store(false, Ordering::Release)
+                    }
+                    Command::Reveal => self.visible.store(true, Ordering::Release),
+                    Command::Restore { visible } => self.visible.store(visible, Ordering::Release),
+                    Command::Focus(_) => return Ok(()),
+                    _ => return Err(TerminalSendError::Closed),
+                }
+                let snapshot = history.snapshot(
+                    self.published_generation
+                        .load(Ordering::Acquire)
+                        .saturating_add(1),
+                );
+                // Serialize mutations and publication; wake outside the lock
+                // so subscriber callbacks can inspect the retained surface.
+                let generation = snapshot.generation;
+                self.snapshot.store(snapshot);
+                self.published_generation
+                    .store(generation, Ordering::Release);
+                drop(phase);
+                self.request_wake(generation);
+                return Ok(());
+            }
+        };
+        drop(phase);
+        if let Some(event) = result {
+            self.emit_archived(&events, event);
+        }
+        Ok(())
+    }
+
+    fn emit_archived(&self, events: &Sender<TerminalEvent>, event: TerminalEvent) {
+        if let Some(observer) = self.archive_observer.get() {
+            observer(event);
+        } else {
+            let _ = events.send(event);
         }
     }
 
@@ -633,15 +790,51 @@ impl TerminalHandle {
         query: String,
         case_sensitive: bool,
     ) -> Result<(), TerminalSendError> {
-        self.inner
-            .published
-            .latest_search
-            .store(request, Ordering::Release);
+        self.search_for(None, request, query, case_sensitive)
+    }
+
+    pub(crate) fn search_for(
+        &self,
+        owner: Option<u64>,
+        request: u64,
+        query: String,
+        case_sensitive: bool,
+    ) -> Result<(), TerminalSendError> {
+        let latest = self.inner.published.prepare_search(owner, request);
         self.try_command(Command::Search {
+            owner,
             request,
             query,
             case_sensitive,
+            latest,
         })
+    }
+
+    pub(crate) fn set_archived_event_observer(
+        &self,
+        observer: impl Fn(&TerminalHandle, TerminalEvent) + Send + Sync + 'static,
+    ) {
+        let handle = Arc::downgrade(&self.inner);
+        let _ = self
+            .inner
+            .published
+            .archive_observer
+            .set(Arc::new(move |event| {
+                if let Some(inner) = handle.upgrade() {
+                    observer(&TerminalHandle { inner }, event);
+                }
+            }));
+    }
+
+    pub(crate) fn set_host_visibility(
+        &self,
+        visibility: super::ipc::TerminalVisibility,
+    ) -> Result<(), TerminalSendError> {
+        self.try_command(Command::HostVisibility(match visibility {
+            super::ipc::TerminalVisibility::Visible => Visibility::Visible,
+            super::ipc::TerminalVisibility::Hidden => Visibility::Hidden,
+            super::ipc::TerminalVisibility::Hibernated => Visibility::Hibernated,
+        }))
     }
 
     pub fn hide(&self) -> Result<(), TerminalSendError> {
@@ -718,11 +911,43 @@ impl TerminalHandle {
             deadline,
             reply,
         }) {
+            if error == TerminalSendError::Closed
+                && matches!(
+                    *self
+                        .inner
+                        .published
+                        .archive
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()),
+                    ArchivePhase::Frozen { .. }
+                )
+            {
+                return match self.shutdown() {
+                    Ok(()) => TerminalCloseResult::Closed,
+                    Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+                };
+            }
             return TerminalCloseResult::Unknown(error.to_string());
         }
         let outcome = result
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
+        if matches!(outcome, TerminalCloseResult::Unknown(_))
+            && matches!(
+                *self
+                    .inner
+                    .published
+                    .archive
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+                ArchivePhase::Frozen { .. }
+            )
+        {
+            return match self.shutdown() {
+                Ok(()) => TerminalCloseResult::Closed,
+                Err(error) => TerminalCloseResult::Unknown(error.to_string()),
+            };
+        }
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
             match self.inner.worker.lock() {
@@ -784,6 +1009,13 @@ impl TerminalHandle {
     }
 
     fn release_completed_holder(&self) {
+        *self
+            .inner
+            .published
+            .archive
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
+        self.inner.published.archive_ready.notify_all();
         let holder = self
             .inner
             .published
@@ -831,6 +1063,40 @@ impl TerminalHandle {
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
+        // Enqueue and archive preparation share this lock. No accepted query
+        // can land between the final drain and worker teardown.
+        let published = &self.inner.published;
+        let mut phase = published.archive.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(*phase, ArchivePhase::Preparing)
+            && let Command::HostVisibility(visibility) = &command
+        {
+            published
+                .visible
+                .store(*visibility == Visibility::Visible, Ordering::Release);
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while matches!(*phase, ArchivePhase::Preparing) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(TerminalSendError::Closed);
+            }
+            let (next, timeout) = published
+                .archive_ready
+                .wait_timeout(phase, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            phase = next;
+            if timeout.timed_out() && matches!(*phase, ArchivePhase::Preparing) {
+                return Err(TerminalSendError::Closed);
+            }
+        }
+        if matches!(*phase, ArchivePhase::Frozen { .. }) {
+            drop(phase);
+            return published.archived_command(command);
+        }
+        if matches!(*phase, ArchivePhase::Released) {
+            return Err(TerminalSendError::Closed);
+        }
         self.inner
             .commands
             .try_send(command)
@@ -1370,19 +1636,59 @@ impl Worker {
                 }
             }
         }
-        if let Some(TerminalEvent::Exited {
-            exit_code,
-            signal,
-            intentional,
-        }) = self.root_exit.take()
-        {
-            // The root can exit while descendants continue using the PTY.
-            // Only teardown after the drained PTY finalizes the surface.
-            self.emit(TerminalEvent::Completed {
+        let completion = self.root_exit.take().and_then(|event| match event {
+            TerminalEvent::Exited {
                 exit_code,
                 signal,
                 intentional,
-            });
+            } => Some(TerminalEvent::Completed {
+                exit_code,
+                signal,
+                intentional,
+            }),
+            _ => None,
+        });
+        if !shutting_down && completion.is_some() {
+            *self
+                .published
+                .archive
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Preparing;
+            let history = archive::History::capture(
+                &mut self.terminal,
+                &self.published.snapshot.load_full(),
+                holder::MAX_SCREEN,
+            );
+            if let Ok(history) = &history {
+                let generation = self
+                    .published
+                    .published_generation
+                    .load(Ordering::Acquire)
+                    .saturating_add(1);
+                self.published.snapshot.store(history.snapshot(generation));
+                self.published
+                    .published_generation
+                    .store(generation, Ordering::Release);
+                if history.omitted > 0 {
+                    self.error("retain completed terminal history", format!("The completed terminal retains its newest rows within 8 MiB; {} older rows are unavailable.", history.omitted));
+                }
+            } else if let Err(message) = &history {
+                self.error("retain completed terminal history", message.clone());
+            }
+            *self
+                .published
+                .archive
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Frozen {
+                history,
+                events: self.events.clone(),
+            };
+            self.published.archive_ready.notify_all();
+            self.published
+                .request_wake(self.published.published_generation.load(Ordering::Acquire));
+            while let Ok(command) = self.commands.try_recv() {
+                let _ = self.published.archived_command(command);
+            }
         }
         if !shutting_down && exited && self.holder.registered() {
             self.holder.prove_cleanup();
@@ -1401,6 +1707,9 @@ impl Worker {
         }
         drop(self.writer);
         drop(self.master);
+        if let Some(completion) = completion {
+            let _ = self.events.send(completion);
+        }
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
     }
@@ -1671,14 +1980,17 @@ impl Worker {
                 }
             }
             Command::Search {
+                owner,
                 request,
                 query,
                 case_sensitive,
+                latest,
             } => {
                 match super::search::search(&self.terminal, &query, case_sensitive, || {
-                    self.published.latest_search.load(Ordering::Acquire) != request
+                    latest.load(Ordering::Acquire) != request
                 }) {
                     Ok(Some((matches, truncated))) => self.emit(TerminalEvent::SearchResults {
+                        owner,
                         request,
                         query,
                         matches,
@@ -1699,6 +2011,11 @@ impl Worker {
                     Err(error) => self.error("copy terminal selection", error),
                 }
             }
+            Command::HostVisibility(visibility) => match visibility {
+                Visibility::Visible => self.reveal(),
+                Visibility::Hidden => self.set_hidden(),
+                Visibility::Hibernated => self.hibernate_visuals(),
+            },
             Command::Reveal => self.reveal(),
             Command::Hibernate => self.hibernate_visuals(),
             Command::Restore { visible } => self.restore_visuals(visible),
@@ -3113,6 +3430,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_second_search_window_cannot_cancel_the_first_windows_query() {
+        let published = PublishedState::new(true, Arc::new(|_| {}));
+        let first = published.prepare_search(Some(1), 4);
+        let other = published.prepare_search(Some(2), 7);
+        assert_eq!(first.load(Ordering::Acquire), 4);
+        let replacement = published.prepare_search(Some(1), 5);
+        assert_eq!(first.load(Ordering::Acquire), 5);
+        assert_eq!(other.load(Ordering::Acquire), 7);
+        drop((first, other, replacement));
+        let local = published.prepare_search(None, 1);
+        assert_eq!(published.searches.lock().unwrap().len(), 1);
+        assert_eq!(local.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn osc7_working_directory_accepts_this_host_and_decodes_its_path() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 80,
@@ -3190,6 +3522,190 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn completed_pty_retains_search_copy_scroll_theme_and_resize_without_a_worker() {
+        let handle = TerminalHandle::spawn(shell_session("i=0; while [ $i -lt 80 ]; do printf 'row%03d\\r\\n' \"$i\"; i=$((i+1)); done; printf '\\033[?2027h👩‍💻hit É Straße'; exit 7"), TerminalConfig { columns: 32, rows: 3, ..TerminalConfig::default() }, |_| {}).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            handle
+                .inner
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        let events = handle.events();
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, TerminalEvent::Completed { exit_code: 7, .. }))
+                .count(),
+            1
+        );
+        assert!(handle.snapshot().scroll.total > 80);
+        handle.search(3, "é".into(), false).unwrap();
+        let matches = match events.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TerminalEvent::SearchResults {
+                request: 3,
+                matches,
+                ..
+            } => matches,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start_column, 6);
+        handle.scroll_to_row(0).unwrap();
+        assert!(
+            handle.snapshot().lines[0]
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("row000")
+        );
+        handle.scroll_to_row(matches[0].start_row as usize).unwrap();
+        assert!(handle.snapshot().lines.iter().any(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("hit")
+        }));
+        let request = uuid::Uuid::new_v4();
+        handle
+            .copy_selection(
+                request,
+                super::super::SearchMatch {
+                    start_row: 0,
+                    start_column: 0,
+                    end_row: handle.snapshot().scroll.total - 1,
+                    end_column: 32,
+                },
+            )
+            .unwrap();
+        match events.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TerminalEvent::ClipboardText { request: id, text } => {
+                assert_eq!(id, request);
+                assert!(text.starts_with("row000\n"));
+                assert!(text.contains("👩‍💻hit É Straße"));
+            }
+            other => panic!("{other:?}"),
+        }
+        handle
+            .resize(TerminalSize {
+                columns: 10,
+                rows: 5,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            })
+            .unwrap();
+        assert_eq!(
+            handle.snapshot().columns,
+            32,
+            "read-only output preserves its original column coordinates"
+        );
+        assert_eq!(handle.snapshot().rows, 5);
+        let old_background = handle.snapshot().background;
+        handle.set_theme(TerminalTheme::Light).unwrap();
+        assert_ne!(handle.snapshot().background, old_background);
+        handle.clear_scrollback().unwrap();
+        handle.search(4, "row000".into(), true).unwrap();
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(1)).unwrap(), TerminalEvent::SearchResults { matches, .. } if matches.is_empty())
+        );
+        handle.shutdown().unwrap();
+        assert_eq!(
+            handle.search(5, "hit".into(), true),
+            Err(TerminalSendError::Closed)
+        );
+        assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn stalled_archive_preparation_bounds_request_wait() {
+        let handle = TerminalHandle::spawn(
+            shell_session("exec /bin/cat"),
+            TerminalConfig::default(),
+            |_| {},
+        )
+        .unwrap();
+        *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Preparing;
+        handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Hidden)
+            .unwrap();
+        assert!(!handle.inner.published.visible.load(Ordering::Acquire));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            handle.search(1, "query".into(), true),
+            Err(TerminalSendError::Closed)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        *handle.inner.published.archive.lock().unwrap() = ArchivePhase::Live;
+        handle.inner.published.archive_ready.notify_all();
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn accepted_search_is_not_lost_when_a_real_pty_completes() {
+        for request in 0..8 {
+            let handle = TerminalHandle::spawn(
+                shell_session("printf 'retained-hit\\r\\n'; read line; exit 0"),
+                TerminalConfig::default(),
+                |_| {},
+            )
+            .unwrap();
+            wait_for_text(&handle, "retained-hit");
+            handle.input(b"\n").unwrap();
+            handle.search(request, "retained-hit".into(), true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !handle.is_completed() {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(handle.events().try_iter().any(|event| matches!(event, TerminalEvent::SearchResults { request: id, matches, .. } if id == request && matches.len() == 1)));
+            handle.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn completed_hidden_no_output_pty_uses_fresh_grid_metadata() {
+        let handle = TerminalHandle::spawn(
+            shell_session("exit 0"),
+            TerminalConfig {
+                initially_visible: false,
+                columns: 17,
+                rows: 4,
+                ..TerminalConfig::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handle.snapshot().columns, 17);
+        assert_eq!(handle.snapshot().rows, 4);
+        assert!(
+            handle
+                .snapshot()
+                .lines
+                .iter()
+                .all(|row| row.cells.len() == 17)
+        );
+        handle.reveal().unwrap();
+        handle.search(1, "missing".into(), false).unwrap();
+        assert!(handle.events().try_iter().any(|event| matches!(event, TerminalEvent::SearchResults { matches, .. } if matches.is_empty())));
+        handle.shutdown().unwrap();
     }
 
     fn shell_session(script: &str) -> TerminalSession {
