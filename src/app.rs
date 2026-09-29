@@ -5909,7 +5909,6 @@ impl Cagents {
         Self::open_external_url(url)
     }
 
-    #[cfg(not(feature = "integrated-browser"))]
     fn open_external_url(url: Url) -> Task<Message> {
         cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
