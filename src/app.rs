@@ -5902,13 +5902,7 @@ impl Cagents {
         };
         let existing = self.durable.cards.iter().find(|card| {
             card.existence.is_open()
-                && self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card.id))
-                    .map(|channel| channel.id)
-                    == self.durable.active_channel
+                && self.workspace.card(card.id).is_some()
                 && matches!(&card.kind, CardKind::PullRequests(view) if view.repository == repository)
         });
         let (card, created) = match existing {
@@ -5932,9 +5926,7 @@ impl Cagents {
         let repository = project.repository.clone();
         let existing = self.durable.cards.iter().find(|card| {
             card.existence.is_open()
-                && self.durable.channels.iter().any(|channel| {
-                    Some(channel.id) == self.durable.active_channel && channel.cards.contains(&card.id)
-                })
+                && self.workspace.card(card.id).is_some()
                 && matches!(&card.kind, CardKind::PullRequests(view) if view.repository == repository)
         });
         let (card, created) = match existing {
@@ -6113,6 +6105,14 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card);
         durable.focused = Some(card_id);
+        // A review is work in the workspace where the user opened it. Unlike
+        // a global browser, it must not reappear when another worktree's
+        // metadata refresh rebuilds that worktree's strip.
+        if durable.active_channel.is_none() {
+            let scope = self.active_workspace.clone().unwrap_or(repository.clone());
+            durable.card_scopes.insert(card_id, scope.clone());
+            self.worktree_owners.insert(card_id, scope);
+        }
         self.register_channel_card(card_id);
         let pane = self.pull_request_pane(&view);
         self.cards
@@ -6208,13 +6208,25 @@ impl Cagents {
         let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) else {
             return Task::none();
         };
+        // Explicit selection or dismissal supersedes deferred restoration.
+        // Otherwise the next GitHub refresh can reopen a dismissed review.
+        let dismissed_pending =
+            matches!(&action, pull_request_review::Action::Close) && pane.pending_number.is_some();
+        if matches!(
+            action,
+            pull_request_review::Action::Open(_)
+                | pull_request_review::Action::OpenNumber(_)
+                | pull_request_review::Action::Close
+        ) {
+            pane.pending_number = None;
+        }
         let mut tasks = vec![
             pane.review
                 .update(action)
                 .map(move |action| Message::PullRequestReview { card, action })
                 .map(cosmic::Action::App),
         ];
-        let mut selection: Option<Option<u64>> = None;
+        let mut selection: Option<Option<u64>> = dismissed_pending.then_some(None);
         let mut links = Vec::new();
         let mut checkout = None;
         for effect in pane.review.take_effects() {
@@ -8868,16 +8880,8 @@ impl Cagents {
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {
-                    color: if focused {
-                        design::accent_color(theme)
-                    } else {
-                        design::warning_color(theme)
-                    },
-                    width: if focused || attention {
-                        design::BORDER_WIDTH
-                    } else {
-                        0.0
-                    },
+                    color: design::warning_color(theme),
+                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
                     ..Default::default()
                 },
                 ..Default::default()
@@ -13254,6 +13258,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
                     | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
@@ -24032,6 +24037,99 @@ mod tests {
             pull_request_cards(&app).is_empty(),
             "a link setting opens no review pane"
         );
+    }
+
+    #[test]
+    fn pull_request_panes_stay_in_the_worktree_where_the_user_opened_them() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let terminal = |path: &str| {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!();
+            };
+            session.launch.working_directory = path.into();
+            card
+        };
+        let feature = terminal("/repo/feature");
+        let other = terminal("/repo/other");
+        Arc::make_mut(&mut app.durable).cards = vec![feature.clone(), other.clone()];
+        let rows = &mut app.sidebar_model.projects[0].worktrees;
+        rows.extend(["/repo/feature", "/repo/other"].map(|path| {
+            SidebarWorktree::from_durable(WorktreeId::new(), path.into(), Some("feature".into()))
+        }));
+
+        drop(app.select_worktree("/repo/feature".into(), false));
+        drop(app.update(open_pull_request(project, 7)));
+        let review = pull_request_cards(&app)[0].0;
+        assert_eq!(
+            app.durable.card_scopes[&review],
+            PathBuf::from("/repo/feature")
+        );
+
+        drop(app.select_worktree("/repo/other".into(), false));
+        assert!(app.workspace.card(review).is_none());
+        assert_eq!(app.workspace.focused(), Some(other.id));
+        // Repository refreshes reselect the active worktree after discovery.
+        drop(app.select_worktree("/repo/other".into(), false));
+        app.repository_generations.insert(project, 1);
+        let availability = app.github_availability[&project].clone();
+        drop(app.update(Message::GitUi(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok((availability, Vec::new())),
+        })));
+        assert!(app.workspace.card(review).is_none());
+        assert_eq!(app.workspace.focused(), Some(other.id));
+        assert_eq!(pull_request_cards(&app).len(), 1);
+
+        drop(app.update(open_pull_request(project, 7)));
+        let other_review = app.workspace.focused().unwrap();
+        assert_ne!(
+            other_review, review,
+            "explicit opening belongs to this worktree"
+        );
+        assert_eq!(
+            app.durable.card_scopes[&other_review],
+            PathBuf::from("/repo/other")
+        );
+        drop(app.browse_pull_requests(project));
+        assert_eq!(
+            pull_request_cards(&app).len(),
+            2,
+            "browsing reuses the visible card"
+        );
+
+        // Persisted filing also controls a rebuilt session's strip.
+        Arc::make_mut(&mut app.durable).active_worktree = Some("/repo/feature".into());
+        app.worktree_owners.clear();
+        drop(app.restore_worktree_scope());
+        assert!(app.workspace.card(review).is_some());
+        assert!(app.workspace.card(other_review).is_none());
+    }
+
+    #[test]
+    fn dismissing_a_pending_restored_review_prevents_background_reopening() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            pane.pending_number = Some(7);
+        }
+        let CardKind::PullRequests(view) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!();
+        };
+        view.selected_number = Some(7);
+
+        drop(app.update(Message::PullRequestReview {
+            card,
+            action: pull_request_review::Action::Close,
+        }));
+        drop(app.open_pending_pull_requests(project));
+        assert_eq!(reviewed_number(&app, card), None);
+        assert_eq!(pull_request_cards(&app), vec![(card, None)]);
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+            unreachable!();
+        };
+        assert_eq!(pane.pending_number, None);
     }
 
     #[test]

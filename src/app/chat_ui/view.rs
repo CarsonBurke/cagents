@@ -1422,14 +1422,10 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
-            // Up on the draft's first line and Down on its last walk the
-            // sent messages, as a shell does; inside a longer draft the keys
-            // keep moving the caret.
-            let caret_line = self.composer.cursor().position.line;
-            let on_first_line = caret_line == 0;
-            let on_last_line = caret_line + 1 >= self.composer.line_count();
-            let recall_older = on_first_line && !self.history.is_empty();
-            let recall_newer = on_last_line && self.history_cursor.is_some();
+            // Up on a draft's first line starts browsing sent messages.
+            // While browsing, both arrows walk whole history entries so a
+            // multiline recalled prompt cannot trap the original draft.
+            let (recall_older, recall_newer) = self.history_navigation();
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
@@ -1999,15 +1995,24 @@ impl Runtime {
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor = widget::button::custom(design::caption(
-                    selected.map_or("Configured permissions", |index| {
-                        permission_mode_label(&modes[index])
-                    }),
-                ))
-                .name("Choose permission mode")
-                .class(crate::ui_controls::control_style(open, None))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(target, !open)));
+                let anchor =
+                    widget::button::custom(
+                        widget::row::with_children(vec![
+                            design::caption(selected.map_or("Permissions", |index| {
+                                permission_mode_label(&modes[index])
+                            }))
+                            .into(),
+                            widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                                .size(design::COMPACT_ICON_SIZE)
+                                .into(),
+                        ])
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                    )
+                    .name("Choose permission mode")
+                    .class(crate::ui_controls::control_style(open, None))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::PermissionPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         modes

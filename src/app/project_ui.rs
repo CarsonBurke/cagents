@@ -1434,24 +1434,39 @@ impl Cagents {
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
         }
-        if worktree
-            .dirty
-            .as_ref()
-            .is_some_and(|dirty| dirty.is_dirty())
-        {
-            return Some(
-                "Commit, stash, or discard the worktree changes before deleting it.".into(),
-            );
-        }
         if self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
-            if runtime.descriptor.worktree.starts_with(&target.path) && runtime.blocks_navigation())
+            if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_saving())
         }) {
-            return Some(
-                "Save and close this worktree’s unsaved editor buffers before deleting it.".into(),
-            );
+            return Some("Wait for this worktree’s pending file saves before deleting it.".into());
         }
         None
+    }
+
+    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
+        let dirty = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == target.project)
+            .and_then(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| Some(worktree.id) == target.worktree)
+            })
+            .and_then(|worktree| worktree.dirty.as_ref())
+            .is_some_and(crate::repository::DirtyState::is_dirty);
+        let unsaved = self.cards.values().any(|runtime| {
+            matches!(runtime, CardRuntime::Repository(runtime)
+                if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_dirty())
+        });
+        match (dirty, unsaved) {
+            (true, true) => Some("Uncommitted changes and unsaved editor changes in this worktree will be discarded.".into()),
+            (true, false) => Some("Uncommitted changes in this worktree will be discarded.".into()),
+            (false, true) => Some("Unsaved editor changes in this worktree will be discarded.".into()),
+            (false, false) => None,
+        }
     }
 
     /// What the deletion takes with it: the open terminal and chat cards
@@ -1538,11 +1553,14 @@ impl Cagents {
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
-                "Git will remove this clean worktree directory. The branch is retained. \
+                "Git will remove this worktree directory, including uncommitted and untracked files. The branch is retained. \
                  Terminals and chats running in it, including detached ones, are closed \
-                 first. Primary, locked, and dirty worktrees are never removed.",
+                 first.",
             ),
         ];
+        if let Some(warning) = self.worktree_deletion_warning(target) {
+            rows.push(super::notice_body(warning));
+        }
         if let Some(cascade) = self.worktree_cascade_summary(target) {
             rows.push(super::notice_body(cascade));
         }
@@ -2021,14 +2039,6 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if record.lock.locked {
         return Err("The worktree is locked; unlock it explicitly in Git first.".into());
     }
-    if service
-        .status(&target.path, &cancellation)
-        .map_err(|error| error.to_string())?
-        .dirty
-        .is_dirty()
-    {
-        return Err("The worktree has changes; commit, stash, or discard them first.".into());
-    }
     let removed = service
         .common_dir(&target.repository, &cancellation)
         .and_then(|common_dir| {
@@ -2048,14 +2058,9 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
         })
         .ok();
     close_worktree_sessions(target)?;
-    // Git itself rechecks cleanliness/locks and owns directory removal; no force,
-    // rm -rf, branch deletion, or shell interpolation.
-    let command = CommandSpec::new("git")
-        .cwd(&target.repository)
-        .args(["worktree", "remove", "--"])
-        .arg(target.path.as_os_str())
-        .timeout(Duration::from_secs(30))
-        .output_limits(64 * 1024, 64 * 1024);
+    // Confirmation authorizes discarding this worktree's changes. Git owns
+    // directory removal and still refuses locked worktrees with one --force.
+    let command = worktree_removal_command(target);
     let result = SystemProcessExecutor
         .execute(&command, &cancellation)
         .and_then(|output| output.require_success(&command.program));
@@ -2071,6 +2076,15 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
         }
     }
     Ok(removed)
+}
+
+fn worktree_removal_command(target: &Target) -> CommandSpec {
+    CommandSpec::new("git")
+        .cwd(&target.repository)
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(target.path.as_os_str())
+        .timeout(Duration::from_secs(30))
+        .output_limits(64 * 1024, 64 * 1024)
 }
 
 #[cfg(test)]
@@ -3015,13 +3029,6 @@ mod tests {
             "Worktree changed or disappeared; refresh before deleting."
         );
 
-        std::fs::write(linked.join("scratch"), "work").unwrap();
-        assert_eq!(
-            refusal(target(Some(linked_id), &linked)),
-            "The worktree has changes; commit, stash, or discard them first."
-        );
-        std::fs::remove_file(linked.join("scratch")).unwrap();
-
         git(&repository, &["worktree", "lock", linked.to_str().unwrap()]);
         assert_eq!(
             refusal(target(Some(linked_id), &linked)),
@@ -3048,5 +3055,110 @@ mod tests {
             "The primary worktree cannot be deleted."
         );
         assert!(bare.is_dir());
+    }
+
+    #[test]
+    fn dirty_worktree_confirmation_warns_without_blocking() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let mut linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        linked.dirty = Some(crate::repository::DirtyState {
+            unstaged: 1,
+            untracked: 1,
+            ..Default::default()
+        });
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let editor = CardId::new();
+        let mut runtime = RepositoryRuntime::dirty_fixture(editor);
+        runtime.descriptor.worktree = linked.path.clone();
+        app.cards
+            .insert(editor, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        let dialog = app.project_ui.dialog.as_ref().unwrap();
+        assert!(dialog.blocker.is_none());
+        assert_eq!(
+            app.worktree_deletion_warning(&dialog.target).as_deref(),
+            Some(
+                "Uncommitted changes and unsaved editor changes in this worktree will be discarded."
+            )
+        );
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        assert!(app.project_ui.dialog.is_none());
+        assert!(app.project_ui.is_deleting(linked.id));
+    }
+
+    #[test]
+    fn confirmed_removal_discards_worktree_changes_and_retains_the_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        let linked = root.join("linked");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        std::fs::write(repository.join("tracked.txt"), "initial\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-m", "initial"]);
+        git(
+            &repository,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let record = service
+            .list_worktrees(&repository, &cancellation)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == linked)
+            .unwrap();
+        let original_head = record.head_oid.clone();
+        std::fs::write(linked.join("tracked.txt"), "staged\n").unwrap();
+        git(&linked, &["add", "tracked.txt"]);
+        std::fs::write(linked.join("tracked.txt"), "unstaged\n").unwrap();
+        std::fs::write(linked.join("untracked.txt"), "untracked\n").unwrap();
+        let target = Target {
+            project: ProjectId::new(),
+            worktree: Some(record.id),
+            repository: repository.clone(),
+            path: linked.clone(),
+            label: "feature".into(),
+        };
+        // Exercise the actual Git removal command without reaching a user's daemon.
+        let command = worktree_removal_command(&target);
+        SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap()
+            .require_success(&command.program)
+            .unwrap();
+        assert!(!linked.exists());
+        assert!(
+            !service
+                .list_worktrees(&repository, &cancellation)
+                .unwrap()
+                .iter()
+                .any(|record| record.id == target.worktree.unwrap())
+        );
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["rev-parse", "feature"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(
+            String::from_utf8(head.stdout).unwrap().trim(),
+            original_head.unwrap()
+        );
+        assert!(repository.join("tracked.txt").exists());
     }
 }

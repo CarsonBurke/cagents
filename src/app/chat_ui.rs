@@ -1145,7 +1145,7 @@ pub(super) struct Runtime {
     history_cursor: Option<usize>,
     /// The draft that was in the composer when the walk began, restored when
     /// the walk goes past the newest message.
-    history_stash: String,
+    history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
     unseen_activity: bool,
@@ -1301,6 +1301,7 @@ impl Runtime {
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.history_cursor = None;
+        self.history_stash = None;
         true
     }
 
@@ -1329,7 +1330,7 @@ impl Runtime {
             self.history.push(sent);
         }
         self.history_cursor = None;
-        self.history_stash.clear();
+        self.history_stash = None;
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -1341,7 +1342,7 @@ impl Runtime {
                 let Some(newest) = self.history.len().checked_sub(1) else {
                     return;
                 };
-                self.history_stash = self.composer.text();
+                self.history_stash = Some(std::mem::take(&mut self.composer));
                 Some(newest)
             }
             (None, false) => return,
@@ -1350,12 +1351,32 @@ impl Runtime {
             (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
-        let text = match next {
-            Some(index) => self.history[index].clone(),
-            None => std::mem::take(&mut self.history_stash),
+        let composer = match next {
+            Some(index) => {
+                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
+            }
+            None => self.history_stash.take().unwrap_or_default(),
         };
         self.history_cursor = next;
-        self.replace_draft(text_editor::Content::with_text(text.trim_end_matches('\n')));
+        self.replace_draft(composer);
+    }
+
+    /// Recalled prompts are complete history entries, including multiline
+    /// ones. Both arrows keep walking that history until the draft returns.
+    fn history_navigation(&self) -> (bool, bool) {
+        let browsing = self.history_cursor.is_some();
+        let older =
+            !self.history.is_empty() && (browsing || self.composer.cursor().position.line == 0);
+        (older, browsing)
+    }
+
+    /// Browsing sent prompts does not replace the unsent draft on disk.
+    fn unsent_text(&self) -> String {
+        self.history_stash
+            .as_ref()
+            .filter(|_| self.history_cursor.is_some())
+            .unwrap_or(&self.composer)
+            .text()
     }
 
     /// Puts a whole new draft in the composer. Whatever the completion list
@@ -1421,7 +1442,7 @@ impl Runtime {
             account_picker: false,
             history: Vec::new(),
             history_cursor: None,
-            history_stash: String::new(),
+            history_stash: None,
             scroll: view::Scroll::default(),
             unseen_activity: false,
             earlier_asked: None,
@@ -1526,7 +1547,7 @@ impl Runtime {
         {
             return;
         }
-        if snapshot.permission_mode.is_none() {
+        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
                     draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
@@ -2141,43 +2162,151 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                         .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
                 })
                 .or_else(|| {
-                    recipe
-                        .environment
-                        .get("CLAUDE_CODE_PERMISSION_MODE")
-                        .cloned()
+                    (!recipe
+                        .unset_environment
+                        .contains("CLAUDE_CODE_PERMISSION_MODE"))
+                    .then(|| {
+                        recipe
+                            .environment
+                            .get("CLAUDE_CODE_PERMISSION_MODE")
+                            .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
+                    })
+                    .flatten()
                 })
                 .or_else(|| chat::claude_configured_default_mode(recipe))
                 .or_else(|| Some("manual".into()))
         }
-        Provider::Codex => {
-            if arguments.iter().any(|argument| {
+        Provider::Codex => codex_draft_permission_mode(recipe),
+        Provider::Omp => None,
+    }
+}
+
+/// Preview the launch policy without changing the CLI's configuration. Once
+/// connected, the thread's own reported policy replaces this preview.
+fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    let arguments = &recipe.arguments;
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+        )
+    }) {
+        return Some("yolo".into());
+    }
+    let environment = |name: &str| {
+        (!recipe.unset_environment.iter().any(|unset| unset == name))
+            .then(|| {
+                recipe
+                    .environment
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok())
+            })
+            .flatten()
+    };
+    let root = environment("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| environment("HOME").map(|home| PathBuf::from(home).join(".codex")));
+    let root = root.map(|root| {
+        if root.is_absolute() {
+            root
+        } else {
+            recipe.working_directory.join(root)
+        }
+    });
+    let config = root
+        .as_ref()
+        .and_then(|root| std::fs::read_to_string(root.join("config.toml")).ok())
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+
+    // These recipes are not supported for new native threads. Do not guess
+    // which profile or config override a resumed provider thread uses.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
+    }) {
+        return None;
+    }
+    if arguments.iter().enumerate().any(|(index, argument)| {
+        let override_value = argument.strip_prefix("--config=").or_else(|| {
+            matches!(argument.as_str(), "-c" | "--config")
+                .then(|| arguments.get(index + 1).map(String::as_str))
+                .flatten()
+        });
+        override_value.is_some_and(|value| {
+            value.split_once('=').is_some_and(|(key, _)| {
                 matches!(
-                    argument.as_str(),
-                    "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+                    key.trim(),
+                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
                 )
-            }) {
-                Some("yolo".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "workspace-write"])
-            {
-                Some("workspaceWrite".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "read-only"])
-            {
-                Some("readOnly".into())
-            } else {
-                None
+            })
+        })
+    }) {
+        return None;
+    }
+    let flag = |short: &str, long: &str| {
+        arguments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, argument)| {
+                argument.strip_prefix(&format!("{long}=")).or_else(|| {
+                    (argument == short || argument == long)
+                        .then(|| arguments.get(index + 1).map(String::as_str))
+                        .flatten()
+                })
+            })
+    };
+    let explicit_approval = flag("-a", "--ask-for-approval");
+    let explicit_sandbox = flag("-s", "--sandbox");
+    if explicit_approval.is_none() || explicit_sandbox.is_none() {
+        if config.contains_key("profile")
+            || config.contains_key("default_permissions")
+            || config.contains_key("permissions")
+        {
+            return None;
+        }
+        let user_home = environment("HOME").map(PathBuf::from);
+        let user_config =
+            root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
+        for directory in recipe.working_directory.ancestors() {
+            if user_home.as_deref() == Some(directory) {
+                break;
+            }
+            let path = directory.join(".codex/config.toml");
+            // The account's own config can also be an ancestor of cwd. It
+            // remains a user layer rather than a second project layer.
+            if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let project = contents.parse::<toml::Table>().ok()?;
+                if [
+                    "approval_policy",
+                    "sandbox_mode",
+                    "default_permissions",
+                    "permissions",
+                ]
+                .iter()
+                .any(|key| project.contains_key(*key))
+                {
+                    // Trust decides whether Codex loads this layer. Wait
+                    // for its authoritative thread policy rather than guess.
+                    return None;
+                }
             }
         }
-        Provider::Omp => None,
+    }
+    let approval =
+        explicit_approval.or_else(|| config.get("approval_policy").and_then(toml::Value::as_str));
+    let sandbox =
+        explicit_sandbox.or_else(|| config.get("sandbox_mode").and_then(toml::Value::as_str));
+    match (approval, sandbox) {
+        (Some("never"), Some("danger-full-access")) => Some("yolo".into()),
+        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite".into()),
+        (Some("on-request"), Some("read-only")) => Some("readOnly".into()),
+        _ => None,
     }
 }
 
@@ -2199,6 +2328,8 @@ fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode
             )
             | (Provider::Codex, "--yolo" | "--dangerously-bypass-approvals-and-sandbox") => {}
             (Provider::Claude, value) if value.starts_with("--permission-mode=") => {}
+            (Provider::Codex, value)
+                if value.starts_with("--ask-for-approval=") || value.starts_with("--sandbox=") => {}
             _ => arguments.push(argument.clone()),
         }
     }
@@ -2825,7 +2956,7 @@ impl Cagents {
             .collect();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
-                let draft = runtime.composer.text();
+                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -2837,7 +2968,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
-                let draft = runtime.composer.text();
+                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -3152,7 +3283,7 @@ impl Cagents {
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
-            let draft = runtime.composer.text();
+            let draft = runtime.unsent_text();
             if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
             } else {
@@ -3741,7 +3872,7 @@ impl Cagents {
         });
         runtime.replace_draft(text_editor::Content::new());
         runtime.history_cursor = None;
-        runtime.history_stash.clear();
+        runtime.history_stash = None;
         runtime.error = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
@@ -4956,6 +5087,7 @@ impl Cagents {
                         // Typing into a recalled message makes it the draft,
                         // so the next Up starts again from the newest.
                         runtime.history_cursor = None;
+                        runtime.history_stash = None;
                     }
                     // The completion rows follow the word at the caret, so
                     // anything that can change that word starts them afresh.
@@ -5548,6 +5680,7 @@ impl Cagents {
                 if !insertion.text.is_empty() {
                     runtime.revision = runtime.revision.wrapping_add(1);
                     runtime.history_cursor = None;
+                    runtime.history_stash = None;
                     runtime
                         .composer
                         .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
@@ -6660,6 +6793,83 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn multiline_prompt_history_restores_the_exact_unsent_draft_and_attachments() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("history"));
+        let original = "unsent message\nsecond line\n\n";
+        write(&mut app, card, original);
+        let target = chat_runtime(&app, card).target;
+        let (cursor, selection) = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["older\nmultiline".into(), "latest\nmultiline".into()];
+            Arc::make_mut(&mut runtime.snapshot).busy = true;
+            Arc::make_mut(&mut runtime.snapshot).capabilities.steer = true;
+            runtime.attach([PathBuf::from("/workspace/attachment.txt")]);
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+            runtime
+                .composer
+                .perform(text_editor::Action::Select(text_editor::Motion::Right));
+            assert_eq!(runtime.history_navigation(), (true, false));
+            (runtime.composer.cursor(), runtime.composer.selection())
+        };
+        for (action, expected) in [
+            (Action::HistoryOlder(target), "latest\nmultiline"),
+            (Action::HistoryOlder(target), "older\nmultiline"),
+            (Action::HistoryOlder(target), "older\nmultiline"),
+            (Action::HistoryNewer(target), "latest\nmultiline"),
+        ] {
+            drop(app.update(Message::ChatUi(action)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), expected);
+            assert_eq!(runtime.history_navigation(), (true, true));
+            assert_eq!(
+                runtime.attachments[0].path,
+                PathBuf::from("/workspace/attachment.txt")
+            );
+        }
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], original);
+
+        drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), original);
+        assert_eq!(runtime.composer.cursor(), cursor);
+        assert_eq!(runtime.composer.selection(), selection);
+        assert_eq!(runtime.history_cursor, None);
+        assert!(runtime.history_stash.is_none());
+        assert!(runtime.snapshot.busy && runtime.snapshot.capabilities.steer);
+        drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+        assert_eq!(chat_runtime(&app, card).composer.text(), original);
+    }
+
+    #[test]
+    fn prompt_history_keeps_multiline_draft_navigation_and_saved_text() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "unsent\nlast line");
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["sent prompt".into()];
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            assert_eq!(
+                runtime.history_navigation(),
+                (false, false),
+                "a multiline draft keeps caret navigation"
+            );
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+        }
+        drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+        app.chat_forget(card);
+        assert_eq!(app.chat_ui.drafts[&card], "unsent\nlast line");
+    }
+
     /// Sends what the composer of `card` holds.
     fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
@@ -7516,6 +7726,226 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        let account = crate::account::Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            config.path().into(),
+        );
+        let session = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            config.path().into(),
+            &account,
+        )
+        .unwrap();
+        let runtime = Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            session,
+            Connection::Draft,
+            true,
+            Default::default(),
+        );
+        assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("auto"));
+
+        let mut recipe = runtime.session.launch.recipe.clone();
+        recipe.arguments.clear();
+        recipe
+            .environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into(), "manual".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("manual")
+        );
+        recipe
+            .unset_environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("auto")
+        );
+    }
+
+    #[test]
+    fn codex_draft_permissions_wait_for_project_and_custom_policy_layers() {
+        let home = tempfile::tempdir().unwrap();
+        let account = home.path().join(".codex");
+        let project = home.path().join("project");
+        let cwd = project.join("nested");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let user_policy = "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n";
+        std::fs::write(account.join("config.toml"), user_policy).unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: cwd,
+            environment: [
+                ("HOME".into(), home.path().to_string_lossy().into_owned()),
+                ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        for policy in [
+            "approval_policy = 'on-request'",
+            "sandbox_mode = 'read-only'",
+            "default_permissions = 'restricted'",
+            "[permissions.restricted]\nnetwork = false",
+        ] {
+            std::fs::write(project.join(".codex/config.toml"), policy).unwrap();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+            recipe.arguments = vec!["--yolo".into()];
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("yolo")
+            );
+            recipe.arguments = ["-a", "on-request", "-s", "read-only"]
+                .map(String::from)
+                .into();
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("readOnly")
+            );
+            recipe.arguments.clear();
+        }
+        std::fs::remove_file(project.join(".codex/config.toml")).unwrap();
+        for policy in [
+            "default_permissions = ':read-only'",
+            "[permissions.restricted]\nnetwork = false",
+        ] {
+            std::fs::write(
+                account.join("config.toml"),
+                format!("{user_policy}{policy}\n"),
+            )
+            .unwrap();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+            recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
+                .map(String::from)
+                .into();
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("workspaceWrite")
+            );
+            recipe.arguments.clear();
+        }
+        std::fs::write(account.join("config.toml"), user_policy).unwrap();
+        // An account directory linked into the cwd hierarchy must not be
+        // mistaken for an independent project override.
+        recipe.working_directory = home.path().join("elsewhere");
+        recipe.unset_environment.insert("HOME".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+    }
+
+    #[test]
+    fn codex_draft_permissions_follow_the_selected_account_and_explicit_flags() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
+            environment: [(
+                "CODEX_HOME".into(),
+                home.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        for arguments in [
+            vec!["--profile", "restricted"],
+            vec!["-c", "sandbox_mode='read-only'"],
+            vec!["--config=approval_policy='on-request'"],
+        ] {
+            recipe.arguments = arguments.into_iter().map(String::from).collect();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        }
+        recipe.arguments = ["-a", "on-request", "--sandbox=workspace-write"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("workspaceWrite")
+        );
+        set_draft_permission_mode(&mut recipe, Provider::Codex, "readOnly");
+        assert!(
+            !recipe
+                .arguments
+                .iter()
+                .any(|arg| arg.starts_with("--sandbox="))
+        );
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            config
+        );
+
+        recipe.arguments.clear();
+        recipe.working_directory = home.path().to_path_buf();
+        recipe.environment.insert("CODEX_HOME".into(), ".".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        recipe
+            .environment
+            .insert("HOME".into(), home.path().to_string_lossy().into_owned());
+        recipe.unset_environment = ["CODEX_HOME".into(), "HOME".into()].into();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        recipe.unset_environment.clear();
+
+        recipe.arguments.clear();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("config.toml"),
+            "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
+        )
+        .unwrap();
+        recipe.environment.insert(
+            "CODEX_HOME".into(),
+            other.path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("readOnly")
+        );
+        std::fs::write(
+            other.path().join("config.toml"),
+            "approval_policy = 'untrusted'\nsandbox_mode = 'read-only'\n",
+        )
+        .unwrap();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        std::fs::write(other.path().join("config.toml"), "malformed TOML [").unwrap();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
     }
 
     #[test]

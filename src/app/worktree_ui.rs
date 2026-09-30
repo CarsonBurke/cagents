@@ -29,11 +29,10 @@ pub(super) fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
-        CardKind::Browser(_)
-        | CardKind::PullRequests(_)
-        | CardKind::Settings
-        | CardKind::Accounts
-        | CardKind::Automations => None,
+        CardKind::PullRequests(view) => Some(&view.repository),
+        CardKind::Browser(_) | CardKind::Settings | CardKind::Accounts | CardKind::Automations => {
+            None
+        }
     }
 }
 
@@ -349,7 +348,7 @@ impl Cagents {
     /// A pane belongs to the worktree `card_worktree` files it under, the path
     /// attribution agent updates use too, though every card kind counts here
     /// rather than only agents: any open pane is work in front of the user.
-    /// Global cards (browsers, pull request lists) and channel cards are
+    /// Global cards (browsers) and channel cards are
     /// nobody's worktree, so neither counts. A path listed under two projects
     /// marks both rows.
     ///

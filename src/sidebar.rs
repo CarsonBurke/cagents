@@ -26,7 +26,7 @@ use unicode_casefold::UnicodeCaseFold;
 use url::Url;
 
 use crate::{
-    design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
+    design::{self, NavigationLayout, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
@@ -65,7 +65,9 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-const CHILD_ROW_ICON_SIZE: u16 = design::ROW_ICON_SIZE;
+// Sidebar identities use a smaller glyph while retaining the shared row grid.
+const ROW_ICON_SIZE: u16 = 14;
+const CHILD_ROW_ICON_SIZE: u16 = ROW_ICON_SIZE;
 const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
@@ -2373,6 +2375,7 @@ struct SourceControlChrome {
     retry_id: Id,
     files_query_id: Id,
     commit_input_id: Id,
+    commit_description_id: Id,
     commit_id: Id,
     push_id: Id,
     /// One entry per configured remote, parallel to
@@ -2410,6 +2413,7 @@ impl SourceControlChrome {
             retry_id: entity_id("panel.retry", worktree_id),
             files_query_id: entity_id("panel.files.query", worktree_id),
             commit_input_id: entity_id("panel.commit.message", worktree_id),
+            commit_description_id: entity_id("panel.commit.description", worktree_id),
             commit_id: entity_id("panel.commit", worktree_id),
             push_id: entity_id("panel.push", worktree_id),
             publish_remote_ids: remotes
@@ -2683,6 +2687,8 @@ pub struct SidebarState {
     /// lookup however many cards are open.
     worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
     commit_message: String,
+    commit_subject: String,
+    commit_subject_composer: CommitComposer,
     commit_composer: CommitComposer,
     amend_commit: bool,
     /// File-tree folders the user opened. Everything else renders collapsed,
@@ -2964,6 +2970,8 @@ impl SidebarState {
     /// must not, because the message is the user's work.
     pub fn clear_commit_message(&mut self) {
         self.commit_message.clear();
+        self.commit_subject.clear();
+        self.commit_subject_composer = CommitComposer::default();
         self.commit_composer = CommitComposer::default();
         self.amend_commit = false;
     }
@@ -3129,14 +3137,41 @@ impl SidebarState {
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.commit_message.clone_from(message);
-                self.commit_composer = CommitComposer(
-                    cosmic::iced::widget::text_editor::Content::with_text(message),
+                let (subject, description) = message.split_once('\n').unwrap_or((message, ""));
+                self.commit_subject = subject.to_owned();
+                self.commit_subject_composer = CommitComposer(
+                    cosmic::iced::widget::text_editor::Content::with_text(subject),
                 );
+                self.commit_composer =
+                    CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+                        description.trim_start_matches('\n'),
+                    ));
+            }
+            SidebarAction::CommitSubjectEditorAction { action, .. } => {
+                self.commit_subject_composer.0.perform(action.clone());
+                if action.is_edit() {
+                    let text = self.commit_subject_composer.0.text();
+                    self.commit_subject = text.lines().collect::<Vec<_>>().join(" ");
+                    if text.trim_end_matches('\n').contains('\n') {
+                        // A pasted message stays a single subject line.
+                        self.commit_subject_composer =
+                            CommitComposer(cosmic::iced::widget::text_editor::Content::with_text(
+                                &self.commit_subject,
+                            ));
+                    }
+                    self.commit_message = compose_commit_message(
+                        &self.commit_subject,
+                        &self.commit_composer.0.text(),
+                    );
+                }
             }
             SidebarAction::CommitEditorAction { action, .. } => {
                 self.commit_composer.0.perform(action.clone());
                 if action.is_edit() {
-                    self.commit_message = self.commit_composer.0.text();
+                    self.commit_message = compose_commit_message(
+                        &self.commit_subject,
+                        &self.commit_composer.0.text(),
+                    );
                 }
             }
             SidebarAction::AmendChanged { amend, .. } => self.amend_commit = *amend,
@@ -3465,6 +3500,10 @@ pub enum SidebarAction {
     CommitMessageChanged {
         key: ActiveWorktreeKey,
         message: String,
+    },
+    CommitSubjectEditorAction {
+        key: ActiveWorktreeKey,
+        action: cosmic::iced::widget::text_editor::Action,
     },
     CommitEditorAction {
         key: ActiveWorktreeKey,
@@ -4313,14 +4352,15 @@ impl RowGrid {
 /// A project header: its identity row, with the hover-revealed commands
 /// mounted over the row's own trailing edge.
 ///
-/// The commands cover [`HEADER_ACTION_WIDTH`] of that edge, and the row is
-/// told so, which is what narrows the title for exactly as long as they are
-/// on screen and no longer.
+/// Only the identity yields space to hover commands. The disclosure stays at
+/// the right edge, so revealing commands cannot move its click target.
 fn project_header_row<'a>(
     identity: Element<'a, SidebarAction>,
     commands: Vec<Element<'a, SidebarAction>>,
+    disclosure: Element<'a, SidebarAction>,
 ) -> Element<'a, SidebarAction> {
-    RowInteraction::actions(
+    let reserve = commands.len() as f32 * ICON_CONTROL_SIZE;
+    let identity = RowInteraction::actions(
         identity,
         widget::container(
             widget::row::with_children(commands)
@@ -4330,8 +4370,12 @@ fn project_header_row<'a>(
         )
         .align_right(Length::Fill)
         .into(),
-        HEADER_ACTION_WIDTH,
-    )
+        reserve,
+    );
+    widget::row::with_children(vec![identity, disclosure])
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A project header's identity row: its icon and its name, across the whole
@@ -4354,18 +4398,7 @@ fn project_identity_row<'a>(
     let label = (!compact).then(|| project_name_label(project, query));
     let control = grid
         .control(
-            grid.content(
-                if compact {
-                    project_icon(project, ROW_ICON_SIZE)
-                } else {
-                    crate::ui_controls::symbolic_icon("project-drag-symbolic")
-                        .icon()
-                        .size(ROW_ICON_SIZE)
-                        .into()
-                },
-                label,
-                None,
-            ),
+            grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
             selected,
         )
         .id(chrome.open_id.clone())
@@ -4748,7 +4781,7 @@ fn project_view<'a>(
     );
 
     let disclosure: Element<'static, SidebarAction> = if has_children {
-        icon_action(
+        project_icon_action(
             if expanded {
                 "go-down-symbolic"
             } else {
@@ -4768,7 +4801,7 @@ fn project_view<'a>(
             .height(Length::Fixed(ICON_CONTROL_SIZE))
             .into()
     };
-    let add_worktree = icon_action(
+    let add_worktree = project_icon_action(
         "worktree-add-symbolic",
         chrome.new_worktree_name.to_string(),
         gated(
@@ -4780,7 +4813,7 @@ fn project_view<'a>(
         ),
         chrome.new_worktree_id.clone(),
     );
-    let add_channel = icon_action(
+    let add_channel = project_icon_action(
         "channel-add-symbolic",
         chrome.new_channel_name.to_string(),
         gated(SidebarAction::NewChannel { project_id }, modal_open),
@@ -4817,7 +4850,6 @@ fn project_view<'a>(
             (entity.channels.len() + entity.worktrees.len()).to_string(),
         ));
     }
-    identity = identity.push(disclosure);
     let header = project_header_row(
         identity.into(),
         if entity.kind == ProjectKind::Git {
@@ -4825,6 +4857,7 @@ fn project_view<'a>(
         } else {
             vec![add_channel]
         },
+        disclosure,
     );
     let header = context_controls(
         header,
@@ -7272,12 +7305,22 @@ fn changes_section<'a>(
     let mut column =
         widget::column::with_capacity(source.groups().len() + 1).spacing(spacing.space_xxxs);
     if source.groups().iter().all(ChangeGroup::is_empty) {
-        column = column.push(design::caption("No tracked changes."));
+        column = column.push(design::caption(if source.reloading {
+            "Loading changes…"
+        } else if state.section_expanded(PanelSection::Untracked) {
+            "Working tree clean."
+        } else {
+            "No tracked changes."
+        }));
     }
     for group in source.groups() {
-        // `Untracked` is always offered even when empty: it is the one group
-        // whose emptiness may only mean the snapshot did not walk for it.
-        if group.is_empty() && group.area != ChangeArea::Untracked {
+        // A collapsed untracked group remains discoverable because its
+        // snapshot omits the walk. Hide a measured empty group instead of
+        // spending two rows announcing that there are no files.
+        if group.is_empty()
+            && (group.area != ChangeArea::Untracked
+                || state.section_expanded(PanelSection::Untracked))
+        {
             continue;
         }
         let section = PanelSection::for_area(group.area);
@@ -7932,6 +7975,45 @@ fn single_discard_request(
     }
 }
 
+fn compose_commit_message(subject: &str, description: &str) -> String {
+    if description.trim().is_empty() {
+        subject.to_owned()
+    } else {
+        format!("{subject}\n\n{description}")
+    }
+}
+
+fn commit_input_border(theme: &cosmic::Theme, focused: bool) -> cosmic::iced::Border {
+    cosmic::iced::Border {
+        radius: design::RADIUS_S.into(),
+        width: design::BORDER_WIDTH,
+        color: if focused {
+            design::accent_color(theme)
+        } else {
+            design::hairline(theme)
+        },
+    }
+}
+
+fn commit_description_style(
+    theme: &cosmic::Theme,
+    status: cosmic::iced::widget::text_editor::Status,
+) -> cosmic::iced::widget::text_editor::Style {
+    cosmic::iced::widget::text_editor::Style {
+        background: design::sunken(theme).into(),
+        border: commit_input_border(
+            theme,
+            matches!(
+                status,
+                cosmic::iced::widget::text_editor::Status::Focused { .. }
+            ),
+        ),
+        placeholder: design::muted_color(theme),
+        value: theme.cosmic().palette.neutral_9.into(),
+        selection: design::accent_color(theme),
+    }
+}
+
 fn changes_footer<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -7944,7 +8026,7 @@ fn changes_footer<'a>(
     let input_key = key.clone();
     let can_commit = !modal_open
         && !source.busy()
-        && !message.trim().is_empty()
+        && !state.commit_subject.trim().is_empty()
         && (source.staged_count > 0 || (state.amend_commit && source.head_oid.is_some()));
     let commit_action = SidebarAction::Commit {
         key: key.clone(),
@@ -7952,17 +8034,64 @@ fn changes_footer<'a>(
         amend: state.amend_commit,
     };
     let submit = commit_action.clone();
-    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
-        .placeholder("Commit subject\n\nOptional description")
+    let subject_submit = commit_action.clone();
+    let mut subject_input = cosmic::iced::widget::text_editor(&state.commit_subject_composer.0)
+        .placeholder("Commit subject")
         .id(chrome.commit_input_id.clone())
+        .font(cosmic::iced::Font::DEFAULT)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
+        .size(design::TEXT_BODY)
+        .padding([8, 10])
+        .style(commit_description_style)
+        .key_binding(move |press| {
+            if !matches!(
+                press.status,
+                cosmic::iced::widget::text_editor::Status::Focused { .. }
+            ) {
+                return None;
+            }
+            if matches!(
+                press.key,
+                cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
+            ) {
+                if press.modifiers.control() && can_commit {
+                    Some(cosmic::iced::widget::text_editor::Binding::Custom(
+                        subject_submit.clone(),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                cosmic::iced::widget::text_editor::Binding::from_key_press(press)
+            }
+        });
+    if !modal_open {
+        let key = key.clone();
+        subject_input =
+            subject_input.on_action(move |action| SidebarAction::CommitSubjectEditorAction {
+                key: key.clone(),
+                action,
+            });
+    }
+    let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
+        .placeholder("Description (optional)")
+        .id(chrome.commit_description_id.clone())
         .height(Length::Fixed(
-            (state.commit_composer.0.line_count().clamp(3, 6) as f32) * design::TEXT_BODY * 1.3
+            (state.commit_composer.0.line_count().clamp(2, 4) as f32) * design::TEXT_BODY * 1.3
                 + 16.0,
         ))
-        .font(cosmic::iced::Font::MONOSPACE)
+        .font(cosmic::iced::Font::DEFAULT)
+        .style(commit_description_style)
         .size(design::TEXT_BODY)
         .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
         .key_binding(move |press| {
+            if !matches!(
+                press.status,
+                cosmic::iced::widget::text_editor::Status::Focused { .. }
+            ) {
+                return None;
+            }
             if press.modifiers.control()
                 && matches!(
                     press.key,
@@ -7982,11 +8111,13 @@ fn changes_footer<'a>(
         });
     }
 
-    let mut commit = button::suggested(if state.amend_commit {
+    let mut commit = button::custom(design::caption(if state.amend_commit {
         "Amend commit"
     } else {
         "Commit"
-    })
+    }))
+    .class(crate::ui_controls::control_style(can_commit, None))
+    .name("Commit (Ctrl+Enter)")
     .id(chrome.commit_id.clone())
     .padding([0, 8])
     .height(PANEL_ROW_HEIGHT);
@@ -7994,27 +8125,31 @@ fn changes_footer<'a>(
         commit = commit.on_press(commit_action);
     }
 
-    let mut column = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(5).spacing(spacing.space_xxs);
+    column = column.push(subject_input);
     column = column.push(commit_input);
-    column = column.push(
-        widget::checkbox(state.amend_commit)
-            .label("Amend last commit")
-            .on_toggle_maybe(
-                (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
-                    let key = key.clone();
-                    move |amend| SidebarAction::AmendChanged {
-                        key: key.clone(),
-                        amend,
-                    }
-                }),
-            ),
-    );
+    let amend = widget::checkbox(state.amend_commit)
+        .label("Amend")
+        .size(14)
+        .text_size(design::TEXT_CAPTION)
+        .spacing(6)
+        .on_toggle_maybe(
+            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+                let key = key.clone();
+                move |amend| SidebarAction::AmendChanged {
+                    key: key.clone(),
+                    amend,
+                }
+            }),
+        );
     if source.staged_count == 0 && !state.amend_commit {
         column = column.push(design::caption(
-            "Stage changes before committing. Ctrl+Enter commits.",
+            "Stage changes to commit. Ctrl+Enter commits.",
         ));
     }
-    let mut buttons = widget::row::with_capacity(2).spacing(spacing.space_xxs);
+    let mut buttons = widget::row::with_capacity(4)
+        .spacing(spacing.space_xxs)
+        .align_y(cosmic::iced::Alignment::Center);
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
         (Some(branch), Some(target)) => {
@@ -8025,7 +8160,8 @@ fn changes_footer<'a>(
                 TrackingState::Compared { ahead, .. } if *ahead > 0 => format!("Push ↑{ahead}"),
                 _ => "Push".to_owned(),
             };
-            let mut push = button::standard(push_label)
+            let mut push = button::custom(design::caption(push_label))
+                .class(crate::ui_controls::control_style(false, None))
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
                 .height(PANEL_ROW_HEIGHT);
@@ -8039,7 +8175,8 @@ fn changes_footer<'a>(
             buttons = buttons.push(push);
         }
         (Some(branch), None) if !source.upstream_reported() => {
-            let mut publish = button::standard("Publish branch")
+            let mut publish = button::custom(design::caption("Publish branch"))
+                .class(crate::ui_controls::control_style(false, None))
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
                 .height(PANEL_ROW_HEIGHT);
@@ -8056,17 +8193,21 @@ fn changes_footer<'a>(
             // `git status` reported an upstream this panel could not name, so
             // publishing would re-point the branch at whatever remote the
             // picker offered rather than push to the upstream it has.
-            buttons = buttons.push(design::caption(
+            column = column.push(design::caption(
                 "Upstream could not be read — nothing to push",
             ));
         }
         (None, _) => {
             // A branch this panel cannot name is not one it may invent a
             // mutation for, and each reason is stated as itself.
-            buttons = buttons.push(design::caption(source.no_branch_reason()));
+            column = column.push(design::caption(source.no_branch_reason()));
         }
     }
-    column = column.push(buttons);
+    column = column.push(
+        buttons
+            .push(widget::Space::new().width(Length::Fill))
+            .push(amend),
+    );
     column.into()
 }
 
@@ -8648,6 +8789,35 @@ fn panel_icon_action<'a>(
 }
 
 /// One icon command.
+fn project_icon_action<'a>(
+    icon_name: &'static str,
+    label: impl Into<Cow<'a, str>>,
+    action: Option<SidebarAction>,
+    id: Id,
+) -> Element<'a, SidebarAction> {
+    let label = label.into();
+    crate::interaction::tooltip(
+        button::custom(
+            widget::container(
+                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
+            )
+            .class(theme::Container::custom(|_| {
+                cosmic::iced::widget::container::Style::default()
+            }))
+            .center(Length::Fill),
+        )
+        .class(sidebar_button_style(false))
+        .id(id)
+        .name(label.clone())
+        .padding(0)
+        .width(ICON_CONTROL_SIZE)
+        .height(ICON_CONTROL_SIZE)
+        .on_press_maybe(action),
+        label,
+    )
+}
+
+/// One icon command in shared workspace chrome.
 fn icon_action<'a>(
     icon_name: &'static str,
     label: impl Into<Cow<'a, str>>,
@@ -9221,9 +9391,22 @@ fn search_label(
         weight: cosmic::iced::font::Weight::Bold,
         ..font
     };
+    let highlights = search_highlight_ranges(label, query);
+    if highlights.is_empty() {
+        return widget::text::body(label.to_owned())
+            .size(size)
+            .font(font)
+            .class(class)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into();
+    }
     let mut spans: Vec<Span<'_, ()>> = Vec::new();
     let mut cursor = 0;
-    for range in search_highlight_ranges(label, query) {
+    for range in highlights {
         if cursor < range.start {
             spans.push(Span::new(label[cursor..range.start].to_owned()));
         }
@@ -9237,7 +9420,7 @@ fn search_label(
     if cursor < label.len() {
         spans.push(Span::new(label[cursor..].to_owned()));
     }
-    cosmic::iced::widget::rich_text(spans)
+    let label = cosmic::iced::widget::rich_text(spans)
         .size(size)
         .font(font)
         .class(class)
@@ -9245,7 +9428,15 @@ fn search_label(
         .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
             EllipsizeHeightLimit::Lines(1),
         ))
+        .width(Length::Fill);
+    // The pinned rich paragraph renderer does not apply ellipsizing to spans.
+    // Its ink must still stay inside the label slot, clear of row indicators.
+    widget::container(label)
         .width(Length::Fill)
+        .clip(true)
+        .class(theme::Container::custom(|_| {
+            cosmic::iced::widget::container::Style::default()
+        }))
         .into()
 }
 
@@ -11194,6 +11385,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn long_worktree_labels_cannot_paint_over_status_or_badges() {
+        use cosmic::iced::{
+            Color, Rectangle,
+            advanced::{
+                mouse,
+                renderer::{Headless, Style},
+            },
+        };
+
+        let mut row = project().worktrees[1].clone();
+        row.chrome.label =
+            "feat(claws): add JMR Media and Kari with a very long worktree description".into();
+        row.detached = true;
+        row.locked = true;
+        row.chrome.dirty_badge = Some("3 changed files".into());
+        row.chrome.pull_request.as_mut().unwrap().checks = CheckStatus::Passing;
+
+        let frame = |worktree: &SidebarWorktree, query: &str, width: f32| {
+            let mut renderer = headless_renderer();
+            let mut element = worktree_view(
+                project_id(1),
+                worktree,
+                true,
+                false,
+                None,
+                false,
+                false,
+                &[],
+                false,
+                None,
+                true,
+                false,
+                None,
+                query,
+            );
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut rows = Vec::new();
+            navigation_rows(Layout::new(&node), &mut rows);
+            assert_eq!(rows.len(), 1);
+            let (bounds, slots) = &rows[0];
+            assert!(slots[1].width > 0.0);
+            for pair in slots.windows(2) {
+                assert!(pair[0].x + pair[0].width <= pair[1].x);
+            }
+            for slot in slots.iter().skip(2) {
+                assert!(slot.x + slot.width <= bounds.x + bounds.width);
+            }
+            let status_start = slots[2].x.ceil() as usize;
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::dark(),
+                &Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &viewport,
+            );
+            let size = Size::new(width as u32, WORKTREE_ROW_HEIGHT as u32);
+            (renderer.screenshot(size, 1.0, Color::BLACK), status_start)
+        };
+
+        let mut empty = row.clone();
+        empty.chrome.label = "".into();
+        for width in [220.0, 320.0] {
+            let (reference, status_start) = frame(&empty, "", width);
+            for query in ["", "claws"] {
+                let (painted, actual_start) = frame(&row, query, width);
+                assert_eq!(actual_start, status_start);
+                let stride = width as usize * 4;
+                for y in 0..WORKTREE_ROW_HEIGHT as usize {
+                    let region = y * stride + status_start * 4..(y + 1) * stride;
+                    assert_eq!(
+                        painted[region.clone()],
+                        reference[region],
+                        "label ink must stay clear of trailing indicators (width={width}, query={query:?}, y={y})",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn navigation_rows_share_one_content_grid() {
         let renderer = headless_renderer();
         let model = grid_fixture();
@@ -11310,7 +11589,7 @@ pub(crate) mod tests {
     /// they cost the title nothing until they appear. A reservation that is
     /// always there is the same as no overlay at all.
     #[test]
-    fn a_project_title_keeps_the_whole_row_until_its_commands_appear() {
+    fn project_hover_commands_preserve_disclosure_position_and_reserve_only_visible_commands() {
         use cosmic::iced::{
             Event, Point, Rectangle,
             advanced::{Shell, clipboard},
@@ -11324,12 +11603,6 @@ pub(crate) mod tests {
             project_identity_row(&model.projects[0], false, false, false, false, ""),
             vec![
                 icon_action(
-                    "go-down-symbolic",
-                    "Collapse",
-                    None,
-                    Id::new("test.collapse"),
-                ),
-                icon_action(
                     "channel-add-symbolic",
                     "New channel",
                     None,
@@ -11342,6 +11615,12 @@ pub(crate) mod tests {
                     Id::new("test.worktree"),
                 ),
             ],
+            project_icon_action(
+                "go-down-symbolic",
+                "Collapse",
+                None,
+                Id::new("test.collapse"),
+            ),
         );
         let mut tree = Tree::new(&element);
         let label_edge = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
@@ -11350,13 +11629,14 @@ pub(crate) mod tests {
             navigation_rows(Layout::new(&node), &mut rows);
             assert_eq!(rows.len(), 1, "one header row");
             let label = rows[0].1[1];
-            label.x + label.width
+            let disclosure = Layout::new(&node).children().last().unwrap().bounds();
+            (label.x + label.width, disclosure)
         };
 
         let resting = label_edge(&mut element, &mut tree);
-        let content_edge = width - RowGrid::project(false).gutter();
+        let content_edge = width - ICON_CONTROL_SIZE - RowGrid::project(false).gutter();
         assert_eq!(
-            resting, content_edge,
+            resting.0, content_edge,
             "a hidden control reserves nothing: the title runs to the row's own content edge",
         );
 
@@ -11377,11 +11657,13 @@ pub(crate) mod tests {
         );
         let hovered = label_edge(&mut element, &mut tree);
         assert_eq!(
-            hovered,
-            content_edge - HEADER_ACTION_WIDTH,
+            hovered.0,
+            content_edge - 2.0 * ICON_CONTROL_SIZE,
             "once the commands are drawn the title stops exactly where they start, so nothing \
              visible runs under them",
         );
+        assert_eq!(resting.1, hovered.1, "the disclosure target stays in place");
+        assert_eq!(hovered.1.x + hovered.1.width, width);
     }
 
     /// Rows with open panes keep full strength and the rest recede. Channel
@@ -12395,6 +12677,91 @@ pub(crate) mod tests {
                 !reachable.is_empty(),
                 "the dismissed menu leaves that control usable again (scroll={scroll})"
             );
+        }
+    }
+
+    #[test]
+    fn full_sidebar_hover_reveals_project_commands_without_moving_disclosure() {
+        use cosmic::iced::{
+            Point, Rectangle,
+            advanced::{
+                mouse,
+                widget::{Operation, operation},
+            },
+        };
+
+        struct ControlBounds {
+            target: Id,
+            bounds: Option<Rectangle>,
+        }
+        impl Operation for ControlBounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.target) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+
+        let control_bounds = |sidebar: &mut Sidebar, target: Id| {
+            let mut bounds = ControlBounds {
+                target,
+                bounds: None,
+            };
+            let mut interface = interface(
+                &sidebar.model,
+                &sidebar.state,
+                &sidebar.navigation,
+                sidebar.bounds,
+                std::mem::take(&mut sidebar.cache),
+                &mut sidebar.renderer,
+            );
+            interface.operate(&sidebar.renderer, &mut bounds);
+            sidebar.cache = interface.into_cache();
+            bounds.bounds.expect("the project control is mounted")
+        };
+
+        for expanded in [true, false] {
+            let mut sidebar = Sidebar::roomy();
+            let project = sidebar.model.projects[0].id;
+            let chrome = sidebar.model.projects[0].chrome.clone();
+            if !expanded {
+                sidebar.state.apply(&SidebarAction::ToggleProject(project));
+            }
+            sidebar.move_to(Point::new(400.0, 400.0));
+            let resting_identity = control_bounds(&mut sidebar, chrome.open_id.clone());
+            let resting_disclosure = control_bounds(&mut sidebar, chrome.toggle_id.clone());
+
+            sidebar.move_to(resting_identity.center());
+            let hovered_identity = control_bounds(&mut sidebar, chrome.open_id.clone());
+            let hovered_disclosure = control_bounds(&mut sidebar, chrome.toggle_id.clone());
+            assert_eq!(
+                hovered_identity.width,
+                resting_identity.width - 2.0 * ICON_CONTROL_SIZE,
+                "pointer movement alone reveals creation commands (expanded={expanded})",
+            );
+            assert_eq!(
+                hovered_disclosure, resting_disclosure,
+                "hover cannot move the disclosure target (expanded={expanded})",
+            );
+
+            let channel = control_bounds(&mut sidebar, chrome.new_channel_id.clone());
+            let actions = sidebar.click(mouse::Button::Left, channel.center());
+            assert!(
+                actions.contains(&SidebarAction::NewChannel {
+                    project_id: project
+                }),
+                "the revealed command responds without opening the project: {actions:?}",
+            );
+            assert!(!actions.contains(&SidebarAction::ToggleProject(project)));
         }
     }
 
@@ -14444,6 +14811,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn separate_commit_fields_preserve_description_and_clear_together() {
+        let mut state = SidebarState::default();
+        let key = main_key();
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: key.clone(),
+            message: "Original subject\n\nDescription paragraph\nAnother line".into(),
+        });
+        assert_eq!(state.commit_subject, "Original subject");
+        let description = state.commit_composer.0.text();
+        assert!(description.starts_with("Description paragraph\nAnother line"));
+        state.apply(&SidebarAction::CommitSubjectEditorAction {
+            key: key.clone(),
+            action: cosmic::iced::widget::text_editor::Action::SelectAll,
+        });
+        state.apply(&SidebarAction::CommitSubjectEditorAction {
+            key: key.clone(),
+            action: cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                    "Revised subject".into(),
+                )),
+            ),
+        });
+        assert_eq!(state.commit_composer.0.text(), description);
+        assert_eq!(
+            state.commit_message(),
+            compose_commit_message("Revised subject", &description)
+        );
+        state.apply(&SidebarAction::CommitEditorAction {
+            key,
+            action: cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                    "Added detail ".into(),
+                )),
+            ),
+        });
+        assert!(state.commit_message().starts_with("Revised subject\n\n"));
+        assert!(state.commit_message().contains("Added detail "));
+        state.clear_commit_message();
+        assert!(state.commit_subject.is_empty());
+        assert!(state.commit_message().is_empty());
+        assert!(state.commit_composer.0.text().trim().is_empty());
+        assert_eq!(compose_commit_message("Subject only", "\n"), "Subject only");
+        state.apply(&SidebarAction::CommitSubjectEditorAction {
+            key: main_key(),
+            action: cosmic::iced::widget::text_editor::Action::Edit(
+                cosmic::iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                    "First line\nSecond line\nThird line".into(),
+                )),
+            ),
+        });
+        assert_eq!(state.commit_subject, "First line Second line Third line");
+        assert!(
+            !state
+                .commit_subject_composer
+                .0
+                .text()
+                .trim_end_matches('\n')
+                .contains('\n')
+        );
+        assert_eq!(state.commit_message(), "First line Second line Third line");
+    }
+
+    #[test]
     fn rebinding_drops_every_draft_typed_for_the_worktree_being_left() {
         let model = panel_model();
         let mut state = SidebarState::default();
@@ -15007,7 +15437,10 @@ pub(crate) mod tests {
         let renderer = headless_renderer();
         let model = panel_model();
         let mut state = panel_state(&model);
-        state.commit_message.push_str("a message");
+        state.apply(&SidebarAction::CommitMessageChanged {
+            key: main_key(),
+            message: "a message".into(),
+        });
         for tab in ChangesTab::ALL {
             state.changes_tab = tab;
             let commits = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false))

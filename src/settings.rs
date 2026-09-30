@@ -297,7 +297,7 @@ impl Default for KeyboardShortcuts {
             review_next_change: vec!["Alt+J".to_owned()],
             review_previous_change: vec!["Alt+K".to_owned()],
             command_palette: vec!["Ctrl+Shift+P".to_owned()],
-            new_native_thread: vec!["Ctrl+Shift+N".to_owned()],
+            new_native_thread: vec!["Ctrl+T".to_owned(), "Ctrl+Shift+N".to_owned()],
             toggle_inspector: vec!["Ctrl+Shift+I".to_owned()],
             open_settings: vec!["Ctrl+Comma".to_owned()],
             move_pane_left: vec!["Alt+Shift+Left".to_owned()],
@@ -1099,7 +1099,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 2;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 3;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1120,6 +1120,7 @@ struct RetiredShortcutDefault {
 /// `Ctrl+T` and the `Alt` letters and arrows are readline, fish, vim, and
 /// agent CLI keys. `search_projects` kept `Ctrl+F`; a focused terminal now
 /// receives it instead.
+/// Revision 3 adds the conventional new-tab chord to native threads.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1155,6 +1156,11 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "cycle_pane_width",
         retired_in: 2,
         chords: &["Alt+R"],
+    },
+    RetiredShortcutDefault {
+        action: "new_native_thread",
+        retired_in: 3,
+        chords: &["Ctrl+Shift+N"],
     },
 ];
 
@@ -3350,6 +3356,38 @@ next_column = ["Alt+W", "Alt+Right"]
             vec!["Ctrl+Shift+W"].into()
         );
         assert_eq!(load(&path).unwrap(), desired);
+    }
+
+    #[test]
+    fn new_tab_default_upgrades_revision_two_without_overriding_user_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (previous, terminal, expected) in [
+            (
+                vec!["Ctrl+Shift+N"],
+                "Ctrl+Shift+T",
+                vec!["Ctrl+T", "Ctrl+Shift+N"],
+            ),
+            (vec!["Ctrl+Alt+N"], "Ctrl+Shift+T", vec!["Ctrl+Alt+N"]),
+            (vec![], "Ctrl+Shift+T", vec![]),
+            (vec!["Ctrl+Shift+N"], "Ctrl+T", vec!["Ctrl+Shift+N"]),
+        ] {
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 2.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("new_native_thread".into(), previous.into());
+            shortcuts.insert("new_terminal".into(), vec![terminal].into());
+            fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.keyboard_shortcuts.new_native_thread, expected);
+            assert_eq!(loaded.keyboard_shortcuts.new_terminal, [terminal]);
+            assert_eq!(
+                loaded.shortcut_defaults_revision,
+                SHORTCUT_DEFAULTS_REVISION
+            );
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+        }
     }
 
     #[test]

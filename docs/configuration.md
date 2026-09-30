@@ -95,10 +95,11 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
-shortcut_defaults_revision = 2
+shortcut_defaults_revision = 3
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
+new_native_thread = ["Ctrl+T", "Ctrl+Shift+N"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+Shift+W"]
@@ -170,7 +171,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `2` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `3` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -196,7 +197,7 @@ modifiers, joined by `+`. Names are case-insensitive.
   cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
   be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
   with a letter or arrow, can be bound but then no longer reach a terminal;
-  the defaults avoid them.
+  the defaults avoid them except **Ctrl+T**, which creates a native thread tab.
 - The `search_projects` chords reach terminal programs, except **Ctrl+F**,
   which opens terminal scrollback find. The same key finds in the focused
   editor or chat transcript, and otherwise searches projects.
@@ -333,6 +334,7 @@ them back as version 3 the next time it saves.
   | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Alt+R` | `Ctrl+Shift+R` |
+  | `new_native_thread` | `Ctrl+Shift+N` | `Ctrl+T`, `Ctrl+Shift+N` |
 
   An action the table leaves out counts as on its old default. A version-2
   file that spells `previous_column` as `"Alt+Q"` or `next_column` as
@@ -340,7 +342,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 2`, after which an old default you choose
+  `shortcut_defaults_revision = 3`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),

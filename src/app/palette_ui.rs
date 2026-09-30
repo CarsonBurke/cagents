@@ -579,6 +579,47 @@ impl ShortcutDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_new_tab_shortcut_creates_a_thread_once_and_respects_modals() {
+        for captured in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let press = |repeat| keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("t".into()),
+                modified_key: keyboard::Key::Character("t".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat,
+            };
+            let before = app.workspace.order().count();
+            let _ = app.update(Message::KeyEvent {
+                event: press(false),
+                captured,
+            });
+            assert_eq!(app.workspace.order().count(), before + 1);
+            let card = app.workspace.focused().unwrap();
+            assert!(matches!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(_)
+            ));
+            let _ = app.update(Message::KeyEvent {
+                event: press(true),
+                captured,
+            });
+            assert_eq!(app.workspace.order().count(), before + 1);
+
+            let _ = app.update_palette(Action::Open);
+            let _ = app.update(Message::KeyEvent {
+                event: press(false),
+                captured,
+            });
+            assert_eq!(app.workspace.order().count(), before + 1);
+        }
+    }
+
     #[test]
     fn closing_shortcut_recording_dismisses_the_modal_and_preserves_the_binding() {
         let mut app = super::super::tests::context_inspector_test_app(true);
