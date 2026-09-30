@@ -2057,20 +2057,34 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
 /// What the terminal replacing a chat runs once its actor is gone.
 ///
 /// A conversation the provider named resumes in its CLI, exactly as the
-/// daemon's own return would start it. Anything else becomes a shell in the
-/// directory the conversation was working in, which is the terminal the card
-/// stood in for.
+/// daemon's own return would start it. Before a conversation has an identity,
+/// open the selected provider's interactive CLI with its account and policy.
 fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
     if session.launch.session_id.is_none() {
-        let mut shell = LaunchRecipe::shell(session.launch.recipe.working_directory.clone())
-            .map_err(|error| format!("Could not open a terminal here: {error}"))?;
-        shell.unset_environment = session.launch.recipe.unset_environment.clone();
-        if let Some(variable) = account::home_variable(session.launch.provider)
-            && let Some(home) = session.launch.recipe.environment.get(variable)
-        {
-            shell.environment.insert(variable.to_owned(), home.clone());
+        let mut fresh = session.clone();
+        fresh.reset_owned_codex_listener();
+        let mut recipe = fresh.launch.recipe;
+        if session.launch.provider == Provider::Codex {
+            // The native launch reserves a local server before one exists.
+            // An interactive fresh CLI creates its own managed server.
+            let mut arguments = recipe.arguments.iter();
+            let mut interactive = Vec::with_capacity(recipe.arguments.len());
+            while let Some(argument) = arguments.next() {
+                if argument == "--remote"
+                    && arguments
+                        .clone()
+                        .next()
+                        .is_some_and(|value| value == "unix://")
+                {
+                    arguments.next();
+                } else if argument != "--remote=unix://" {
+                    interactive.push(argument.clone());
+                }
+            }
+            recipe.arguments = interactive;
         }
-        return Ok(shell);
+        return crate::model::agent_recovery::fresh_recipe(&recipe)
+            .ok_or_else(|| "Cannot form a safe provider CLI launch command.".to_owned());
     }
     session
         .launch
@@ -2312,33 +2326,28 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
 
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
     if provider == Provider::Claude {
-        recipe.environment.remove("CLAUDE_CODE_PERMISSION_MODE");
+        chat::apply_claude_permission_mode(recipe, mode);
+        return;
+    }
+    if provider != Provider::Codex || !matches!(mode, "yolo" | "readOnly" | "workspaceWrite") {
+        return;
     }
     let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
     let mut original = recipe.arguments.iter();
     while let Some(argument) = original.next() {
-        match (provider, argument.as_str()) {
-            (Provider::Claude, "--permission-mode")
-            | (Provider::Codex, "-a" | "--ask-for-approval" | "-s" | "--sandbox") => {
+        match argument.as_str() {
+            "-a" | "--ask-for-approval" | "-s" | "--sandbox" => {
                 original.next();
             }
-            (
-                Provider::Claude,
-                "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions",
-            )
-            | (Provider::Codex, "--yolo" | "--dangerously-bypass-approvals-and-sandbox") => {}
-            (Provider::Claude, value) if value.starts_with("--permission-mode=") => {}
-            (Provider::Codex, value)
+            "--yolo" | "--dangerously-bypass-approvals-and-sandbox" => {}
+            value
                 if value.starts_with("--ask-for-approval=") || value.starts_with("--sandbox=") => {}
             _ => arguments.push(argument.clone()),
         }
     }
-    match provider {
-        Provider::Claude => {
-            arguments.extend(["--permission-mode".into(), mode.into()]);
-        }
-        Provider::Codex if mode == "yolo" => arguments.push("--yolo".into()),
-        Provider::Codex if matches!(mode, "readOnly" | "workspaceWrite") => arguments.extend([
+    match mode {
+        "yolo" => arguments.push("--yolo".into()),
+        "readOnly" | "workspaceWrite" => arguments.extend([
             "--ask-for-approval".into(),
             "on-request".into(),
             "--sandbox".into(),
@@ -3364,7 +3373,7 @@ impl Cagents {
                 if named {
                     "Return to terminal"
                 } else {
-                    "Switch to a shell"
+                    "Open in terminal"
                 }
             }
             _ => "Switch to native chat",
@@ -3548,18 +3557,24 @@ impl Cagents {
     /// The actor is given up first, so the terminal never shares the
     /// conversation with it. The terminal is a new card beside the chat's
     /// rather than the chat card converted: a conversion is only ever an
-    /// exact handoff of one conversation, and a shell is not that.
+    /// exact handoff of one conversation; an unnamed chat starts a fresh CLI.
     fn return_chat_locally(&mut self, card: CardId) -> Task<Message> {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
-        let launch = match local_return_launch(&session) {
+        let mut launch = match local_return_launch(&session) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(error));
                 return Task::none();
             }
         };
+        if session.launch.provider == Provider::Claude
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+            && let Some(mode) = runtime.snapshot.permission_mode.as_deref()
+        {
+            chat::apply_claude_permission_mode(&mut launch, mode);
+        }
         let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) if runtime.connected() => runtime.handle().cloned(),
@@ -6299,6 +6314,13 @@ mod tests {
                     );
                 }
                 let returned = local_return_launch(&session).unwrap();
+                assert_eq!(returned.program, provider.executable());
+                assert_eq!(
+                    returned.working_directory,
+                    session.launch.recipe.working_directory
+                );
+                assert_eq!(returned.environment, session.launch.recipe.environment);
+                assert!(!returned.arguments.iter().any(|arg| arg == "unix://"));
                 assert_eq!(
                     returned.unset_environment,
                     session.launch.recipe.unset_environment
@@ -8331,7 +8353,7 @@ mod tests {
     /// yet, and silently did nothing for one that never started, so a chat
     /// that could not go back had no terminal to offer at all.
     #[test]
-    fn a_chat_with_no_conversation_to_return_to_switches_to_a_shell_in_its_directory() {
+    fn a_chat_with_no_conversation_to_return_to_opens_its_provider_cli() {
         for failed in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let account = app.account_ui.add_managed_fixture(Provider::Codex, 17);
@@ -8347,26 +8369,32 @@ mod tests {
             } else {
                 live_chat(&mut app, None)
             };
-            assert_eq!(app.chat_switch_label(card), "Switch to a shell");
+            assert_eq!(app.chat_switch_label(card), "Open in terminal");
             assert!(app.chat_switch_ready(card));
             let _ = app.update(Message::ChatUi(Action::Switch(card)));
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
             let (target, plan) = local_return(&app);
             assert!(!plan.resumes);
-            let mut shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
-            shell.unset_environment = app
-                .default_account(Provider::Codex)
-                .credential_overrides()
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect();
-            shell
-                .environment
-                .insert("CODEX_HOME".into(), home.display().to_string());
-            assert_eq!(plan.launch, shell);
+            let cli = plan.launch.clone();
+            assert_eq!(cli.program, "codex");
+            assert_eq!(cli.working_directory, PathBuf::from(FIXTURE_DIRECTORY));
+            assert!(
+                !cli.arguments
+                    .iter()
+                    .any(|argument| argument.starts_with("--remote"))
+            );
+            assert_eq!(cli.environment["CODEX_HOME"], home.display().to_string());
+            assert_eq!(
+                cli.unset_environment,
+                app.default_account(Provider::Codex)
+                    .credential_overrides()
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            );
             assert!(!app.chat_switch_ready(card), "one return at a time");
 
-            // The shell shares nothing with the actor, so doubt about the
+            // The fresh CLI shares no conversation with the actor, so doubt about the
             // actor does not keep the card a chat; the actor is given up
             // again, and that retirement reports whether it succeeded.
             let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
@@ -8378,7 +8406,7 @@ mod tests {
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
             let retry = retired(&mut app, card);
             let _ = app.update(Message::ChatUi(Action::Retired(retry, Ok(()))));
-            assert_replaced_by_terminal(&mut app, card, &shell);
+            assert_replaced_by_terminal(&mut app, card, &cli);
         }
     }
 
@@ -8907,7 +8935,7 @@ mod tests {
     /// A chat that switches to a shell leaves its channel only for the shell
     /// that takes its place; the channel is not empty, so it stays.
     #[test]
-    fn a_chat_replaced_by_a_shell_keeps_its_channel() {
+    fn a_chat_replaced_by_its_provider_cli_keeps_its_channel() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let channel = crate::model::ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
@@ -8933,18 +8961,11 @@ mod tests {
         };
         assert_eq!(members(&app), Some(vec![card]), "the chat's only pane");
         let _ = app.update(Message::ChatUi(Action::Switch(card)));
-        let target = local_return(&app).0;
+        let (target, plan) = local_return(&app);
+        let cli = plan.launch.clone();
+        assert_eq!(cli.program, "codex");
         let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
-        let mut shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
-        shell.environment.insert(
-            "CODEX_HOME".into(),
-            app.default_account(Provider::Codex)
-                .resolved_home()
-                .unwrap()
-                .display()
-                .to_string(),
-        );
-        assert_replaced_by_terminal(&mut app, card, &shell);
+        assert_replaced_by_terminal(&mut app, card, &cli);
         let terminal = terminal_cards(&app)[0];
         assert!(
             !app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel),

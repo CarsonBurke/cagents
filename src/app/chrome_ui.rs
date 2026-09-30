@@ -1470,6 +1470,25 @@ impl Cagents {
                 _ => {}
             }
         }
+        if focused && self.chat_switch_available(id) {
+            let ready = self.chat_switch_ready(id);
+            children.push(command(
+                crate::ui_controls::symbolic_icon(
+                    if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
+                        "utilities-terminal-symbolic"
+                    } else {
+                        "chat-bubble-text-symbolic"
+                    },
+                ),
+                if ready {
+                    self.chat_switch_label(id)
+                } else {
+                    "Wait for the chat handoff to finish"
+                },
+                card_control_id(id, "switch"),
+                ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
+            ));
+        }
         if focused || self.chrome_ui.hovered_tab == Some(id) {
             children.push(command(
                 crate::ui_controls::symbolic_icon("window-close-symbolic"),
