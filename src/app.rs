@@ -5329,7 +5329,17 @@ impl Cagents {
                 if started.session.id != terminal
                     && let Some(writer) = &self.session
                 {
-                    writer.replace_terminal_identity(card, terminal, started.session.clone());
+                    // Recovery can attach an already-live descendant. Establish
+                    // its new identity through the ordered relaunch write first;
+                    // the following snapshot saves the authenticated live proof.
+                    let mut replacement = started.session.clone();
+                    if replacement.continuity.live_proof().is_some() {
+                        replacement.continuity = TerminalContinuity::RelaunchAvailable {
+                            recipe: replacement.launch.clone(),
+                            last_exit: None,
+                        };
+                    }
+                    writer.replace_terminal_identity(card, terminal, replacement);
                 }
                 if let Some(state) = self.card_state_mut(card) {
                     state.kind = CardKind::Terminal(started.session);
@@ -19848,6 +19858,91 @@ mod tests {
             &app.card_state(card).unwrap().kind,
             &CardKind::Terminal(original)
         );
+    }
+
+    #[test]
+    fn recovered_live_terminal_identity_survives_save_exit_and_reload() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("recovered.sqlite3");
+        let boot = BootId::new("recovered-terminal-test");
+        let (writer, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let store = writer.operation_store();
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(original) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("expected terminal");
+        };
+        writer.snapshot(app.durable.clone());
+        writer.flush(Duration::from_secs(5)).unwrap();
+        app.session = Some(writer);
+        app.cards.insert(card, CardRuntime::Loading);
+        app.lifecycle.register(
+            card,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+            Instant::now(),
+        );
+        let recovered = TerminalSession {
+            id: TerminalId::new(),
+            recovery_origin: Some(original.id),
+            continuity: TerminalContinuity::Live {
+                host_session_id: HostSessionId::new("replacement-host"),
+                boot_id: boot.clone(),
+                host_incarnation: HostIncarnation::new("replacement-incarnation"),
+            },
+            ..original.clone()
+        };
+        drop(app.terminal_started(
+            card,
+            original.id,
+            Ok(StartedTerminal {
+                handle: unconnected_surface(directory.path(), recovered.id),
+                session: recovered.clone(),
+                spawned: false,
+            }),
+        ));
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(5)).unwrap();
+        let saved = store
+            .load_card(card, recovered.continuity.live_proof().as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.kind, CardKind::Terminal(recovered.clone()));
+
+        // The installed window remained blocked even after its recovered
+        // process exited. Its next save and the update flush must succeed too.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!();
+        };
+        transition_terminal_to_relaunchable(
+            session,
+            TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 42,
+            },
+        );
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let saved = store.load_card(card, None).unwrap().unwrap();
+        let CardKind::Terminal(saved) = saved.kind else {
+            unreachable!()
+        };
+        assert_eq!(saved.id, recovered.id);
+        assert_eq!(saved.recovery_origin, Some(original.id));
+        assert!(matches!(
+            saved.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
