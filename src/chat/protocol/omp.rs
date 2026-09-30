@@ -716,6 +716,9 @@ impl Adapter for Omp {
                 let data = &frame["data"];
                 match text(&frame, "command") {
                     "negotiate_protocol" => step = self.refresh(),
+                    "follow_up" => {
+                        step.writes.push(self.request("get_state"));
+                    }
                     "get_state" => {
                         let id = text(data, "sessionId");
                         if id.is_empty() {
@@ -749,6 +752,21 @@ impl Adapter for Omp {
                             step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
+                        if let Some(messages) = data["queuedMessages"]["followUp"].as_array() {
+                            step.events.push(Event::QueueChanged(
+                                messages
+                                    .iter()
+                                    .take(chat::QueuedMessage::LIMIT)
+                                    .enumerate()
+                                    .filter_map(|(index, message)| {
+                                        Some(chat::QueuedMessage::new(
+                                            format!("omp-followup-{index}"),
+                                            message.as_str()?.to_owned(),
+                                        ))
+                                    })
+                                    .collect(),
+                            ));
+                        }
                         self.busy = data["isStreaming"].as_bool().unwrap_or(false)
                             || data["isCompacting"].as_bool().unwrap_or(false);
                         if !self.ready && !self.busy && self.history_request.is_none() {
@@ -771,7 +789,7 @@ impl Adapter for Omp {
                         });
                         step.events.push(Event::Capabilities(chat::Capabilities {
                             steer: true,
-                            queue: true,
+                            queue: data["queuedMessages"]["followUp"].is_array(),
                             attachments: true,
                             compact: true,
                             model_selection: true,
@@ -857,7 +875,15 @@ impl Adapter for Omp {
                     _ => {}
                 }
             }
+            "queue_update" => {
+                step.writes.push(self.request("get_state"));
+            }
             "message_start" | "message_end" => {
+                if text(&frame, "type") == "message_start"
+                    && text(&frame["message"], "role") == "user"
+                {
+                    step.writes.push(self.request("get_state"));
+                }
                 // Only an assistant stop reason describes the turn outcome;
                 // a failed tool can be recovered from in the same turn.
                 if text(&frame, "type") == "message_end"
@@ -1603,6 +1629,42 @@ mod tests {
         assert!(
             matches!(&command.events[0],Event::Item(Item{content:ItemContent::Text{text,..},..}) if text=="Current model: example")
         );
+    }
+
+    #[test]
+    fn state_queue_contents_preserve_duplicates_and_older_providers_use_local_queueing() {
+        for contents in [None, Some(json!(["next", "next", ""]))] {
+            let mut adapter = Omp {
+                ready: true,
+                started: true,
+                ..Omp::default()
+            };
+            let request = adapter.request("get_state");
+            let mut data = json!({"sessionId":"session", "isStreaming":true});
+            if let Some(contents) = &contents {
+                data["queuedMessages"] = json!({"followUp":contents});
+            }
+            let response = adapter.receive(json!({"type":"response", "command":"get_state", "id":request["id"], "success":true,"data":data})).unwrap();
+            assert!(response.events.iter().any(|event| matches!(event, Event::Capabilities(caps) if caps.queue == contents.is_some())));
+            if contents.is_some() {
+                assert!(response.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len()==3 && messages[0].text==messages[1].text && messages[2].text.is_empty())));
+            }
+        }
+    }
+
+    #[test]
+    fn queue_ack_and_live_user_echo_refresh_authoritative_state() {
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            ..Omp::default()
+        };
+        let ack = adapter
+            .receive(json!({"type":"response","command":"follow_up","id":"queue-1","success":true}))
+            .unwrap();
+        assert_eq!(ack.writes[0]["type"], "get_state");
+        let echo = adapter.receive(json!({"type":"message_start","message":{"role":"user","timestamp":123,"content":"next"}})).unwrap();
+        assert_eq!(echo.writes[0]["type"], "get_state");
     }
 
     fn state_reply(request: &Value, id: &str) -> Value {

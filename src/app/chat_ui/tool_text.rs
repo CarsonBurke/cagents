@@ -222,6 +222,7 @@ impl ToolText {
                     .anchor_bottom()
                     .height(Length::Shrink),
                 None,
+                None,
             ))
             .max_height(height)
             .into(),

@@ -1853,7 +1853,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                     .map(|(index, item)| (item.id.clone(), index)),
             );
         }
+        Event::QueueChanged(messages) => state.queued_messages = messages,
         Event::Reset { reason } => {
+            state.queued_messages.clear();
             state.items.clear();
             state.subagents.clear();
             indices.clear();

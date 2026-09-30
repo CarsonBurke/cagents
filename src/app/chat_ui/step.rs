@@ -223,17 +223,29 @@ fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
         result.title.as_str()
     };
     if result.url.is_empty() {
-        rows.push(design::body(title).into());
+        rows.push(
+            widget::selectable_text(title)
+                .size(design::TEXT_BODY)
+                .into(),
+        );
     } else {
         rows.push(
             widget::button::link(title.to_owned())
                 .on_press(action(Action::OpenUrl(result.url.clone())))
                 .into(),
         );
-        rows.push(design::caption(result.url.as_str()).into());
+        rows.push(
+            widget::selectable_text(result.url.as_str())
+                .size(design::TEXT_CAPTION)
+                .into(),
+        );
     }
     if !result.snippet.is_empty() {
-        rows.push(design::body(result.snippet.as_str()).into());
+        rows.push(
+            widget::selectable_text(result.snippet.as_str())
+                .size(design::TEXT_BODY)
+                .into(),
+        );
     }
     widget::column::with_children(rows)
         .spacing(design::GRID_UNIT)
@@ -289,10 +301,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        // Every rendered group has a record, written when the group was first
-        // seen. This fallback is the same value that record was seeded with,
-        // so the two cannot disagree.
-        let open = self.opened.get(key).copied().unwrap_or(turn.running);
+        // Explicit reader choices override the configured default.
+        let open = self
+            .opened
+            .get(key)
+            .copied()
+            .unwrap_or(self.tool_groups_expanded);
         let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(if open {
                 "pan-down-symbolic"
@@ -468,7 +482,11 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        header.into()
+        widget::row::with_children(vec![header.into(), self.message_copy(item)])
+            .align_y(Alignment::Center)
+            .spacing(GAP_XS)
+            .width(Length::Fill)
+            .into()
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
@@ -538,7 +556,11 @@ impl Runtime {
                 }
             }
             ItemContent::WebSearch { query, results } => {
-                rows.push(design::body(query.as_str()).into());
+                rows.push(
+                    widget::selectable_text(query.as_str())
+                        .size(design::TEXT_BODY)
+                        .into(),
+                );
                 if results.is_empty() {
                     rows.push(design::caption("No results were reported.").into());
                 }
@@ -584,7 +606,11 @@ impl Runtime {
                     );
                 }
                 if !description.is_empty() {
-                    rows.push(design::body(description.as_str()).into());
+                    rows.push(
+                        widget::selectable_text(description.as_str())
+                            .size(design::TEXT_BODY)
+                            .into(),
+                    );
                 }
                 if path.starts_with("http://") || path.starts_with("https://") {
                     rows.push(
@@ -593,7 +619,11 @@ impl Runtime {
                             .into(),
                     );
                 } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(design::caption(path.as_str()).into());
+                    rows.push(
+                        widget::selectable_text(path.as_str())
+                            .size(design::TEXT_CAPTION)
+                            .into(),
+                    );
                 }
             }
         }

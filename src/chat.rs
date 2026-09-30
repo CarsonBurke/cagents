@@ -691,6 +691,28 @@ pub struct Snapshot {
     /// Whether the provider takes commands, so that what waits to be sent
     /// can wait for it rather than for a refusal.
     pub ready: bool,
+    #[serde(default)]
+    pub queued_messages: Vec<QueuedMessage>,
+}
+
+/// A bounded preview from the provider's confirmed queue, independent of history pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+}
+
+impl QueuedMessage {
+    pub const LIMIT: usize = 128;
+    pub fn new(mut id: String, mut text: String) -> Self {
+        id.truncate(id.floor_char_boundary(256));
+        const PREVIEW_BYTES: usize = 16 * 1024;
+        if text.len() > PREVIEW_BYTES {
+            text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
+            text.push_str("\n[Queue preview truncated]");
+        }
+        Self { id, text }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1224,6 +1246,7 @@ pub enum Event {
         run: crate::model::RunId,
         event: crate::agent_execution::ProviderEvent,
     },
+    QueueChanged(Vec<QueuedMessage>),
 }
 
 #[cfg(test)]

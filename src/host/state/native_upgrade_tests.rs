@@ -1022,7 +1022,7 @@ fn provider() {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
-                "thread/turns/list" => json!({"data":[],"nextCursor":null}),
+                "thread/turns/list" | "thread/queue/list" => json!({"data":[],"nextCursor":null}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 method => panic!("unexpected provider request {method}"),
             };
