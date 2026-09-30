@@ -21,6 +21,24 @@ const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
+/// Reserve an external action row so hovering never shifts the transcript.
+/// Iced's hover widget also keeps controls visible while keyboard-focused.
+fn message_actions<'a>(
+    message: Element<'a, Message>,
+    actions: Element<'a, Message>,
+    alignment: Alignment,
+) -> Element<'a, Message> {
+    iced::widget::hover(
+        widget::column::with_children(vec![message, widget::Space::new().height(24).into()])
+            .spacing(step::GAP_XS),
+        widget::container(actions)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(alignment)
+            .align_y(Alignment::End),
+    )
+}
+
 /// How tall the pinned plan is allowed to grow.
 ///
 /// The plan sits above the transcript, so it stays a reference a reader
@@ -472,6 +490,10 @@ impl Scroll {
         self.content
     }
 
+    pub(super) fn same_geometry(self, other: Self) -> bool {
+        self.content == other.content && self.window == other.window
+    }
+
     pub(super) fn page_height(self) -> f32 {
         (self.window * 0.9).max(1.0)
     }
@@ -680,6 +702,7 @@ impl Cagents {
                 let view = runtime.view(
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
+                    self.workspace.viewport_width() * self.settings.chat_content_fraction,
                     place,
                     !self.workspace_inputs_blocked(),
                     accounts,
@@ -703,6 +726,16 @@ impl Cagents {
             .padding(step::GAP_M)
             .into(),
         }
+    }
+}
+
+/// Prefer concrete activity from the newest assistant item when available.
+fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
+    match snapshot.items.last().map(|item| &item.content) {
+        Some(ItemContent::Text { thinking: true, .. }) => "Thinking",
+        Some(ItemContent::Text { .. }) => "Responding",
+        Some(ItemContent::Command { .. }) => "Running command",
+        _ => "Working",
     }
 }
 
@@ -749,6 +782,7 @@ impl Runtime {
         &'a self,
         transitioning: bool,
         enter_sends: bool,
+        content_width: f32,
         place: Place,
         accepting_drops: bool,
         accounts: Option<ChatAccounts>,
@@ -829,6 +863,7 @@ impl Runtime {
         } else {
             if snapshot.has_earlier {
                 transcript.push(paging_view(
+                    target,
                     Page::Earlier,
                     self.paging() == Some(Page::Earlier),
                 ));
@@ -862,10 +897,23 @@ impl Runtime {
                 }
             }
             if snapshot.has_later {
-                transcript.push(paging_view(Page::Newer, self.paging() == Some(Page::Newer)));
+                transcript.push(paging_view(
+                    target,
+                    Page::Newer,
+                    self.paging() == Some(Page::Newer),
+                ));
             }
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
+            }
+            if let Some((text, _)) = &self.followup {
+                transcript.push(self.followup_view(text, true));
+            }
+            for queued in &snapshot.queued_messages {
+                transcript.push(self.followup_view(&queued.text, false));
+            }
+            if snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
+                transcript.push(body("Queue preview is limited to the first 128 messages."));
             }
         }
         // A chat's heading is the conversation's own name or nothing at all.
@@ -967,8 +1015,12 @@ impl Runtime {
                 .and_then(|agent| agent.items.first())
                 .or_else(|| snapshot.items.first())
                 .map(|item| item.id.as_str()),
+            selected
+                .and_then(|agent| agent.items.last())
+                .or_else(|| snapshot.items.last())
+                .map(|item| item.id.as_str()),
         ));
-        if !self.scroll.at_bottom() {
+        if !self.scroll.at_bottom() || snapshot.has_later {
             content.push(
                 widget::button::custom(design::caption(if self.unseen_activity {
                     "↓ New activity"
@@ -980,25 +1032,6 @@ impl Runtime {
                     None,
                 ))
                 .on_press(action(Action::Latest(target)))
-                .into(),
-            );
-        }
-        if let Some((text, _)) = &self.followup {
-            content.push(
-                widget::row::with_children(vec![
-                    design::caption(format!(
-                        "Queued for next turn · {}",
-                        Self::short_description(text, 100)
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                    small_icon(
-                        "edit-undo-symbolic",
-                        "Take queued follow-up back to edit",
-                        Action::CancelFollowup(target),
-                    ),
-                ])
-                .align_y(Alignment::Center)
                 .into(),
             );
         }
@@ -1596,27 +1629,29 @@ impl Runtime {
         } else if snapshot.busy {
             (
                 Some("agent-working-symbolic"),
-                if snapshot.detail.is_empty() {
-                    "Working"
+                if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
+                    activity_label(snapshot)
                 } else {
                     snapshot.detail.as_str()
                 },
             )
         } else {
-            (None, "Ready")
+            (None, "")
         };
         if let Some(glyph) = glyph {
-            status.push(if snapshot.busy {
-                crate::ui_controls::activity_spinner_tone(
-                    f32::from(design::ROW_ICON_SIZE),
-                    design::accent_color,
-                )
-            } else {
-                crate::ui_controls::passive_icon(
-                    crate::ui_controls::symbolic_icon(glyph),
-                    design::COMPACT_ICON_SIZE,
-                )
-            });
+            status.push(
+                if glyph == "agent-working-symbolic" || glyph == "agent-waiting-symbolic" {
+                    crate::ui_controls::activity_spinner_tone(
+                        f32::from(design::ROW_ICON_SIZE),
+                        design::accent_color,
+                    )
+                } else {
+                    crate::ui_controls::passive_icon(
+                        crate::ui_controls::symbolic_icon(glyph),
+                        design::COMPACT_ICON_SIZE,
+                    )
+                },
+            );
         }
         status.push(
             design::caption(state)
@@ -1736,8 +1771,12 @@ impl Runtime {
                 .width(Length::Fill),
         )
         .padding(step::GAP_M)
+        .max_width(content_width.max(1.0))
         .width(Length::Fill)
         .height(Length::Fill);
+        let pane = widget::container(pane)
+            .center_x(Length::Fill)
+            .height(Length::Fill);
         // The whole pane takes a drop, not just the composer: the transcript
         // is most of what a reader aims at, and a drop lands in the draft
         // wherever it was aimed.
@@ -2254,6 +2293,7 @@ impl Runtime {
         )
             .hash(&mut hasher);
         self.opened.get(&turn.key).hash(&mut hasher);
+        self.tool_groups_expanded.hash(&mut hasher);
         self.find.hash(&mut hasher);
         self.copied.hash(&mut hasher);
         self.snapshot.busy.hash(&mut hasher);
@@ -2353,6 +2393,74 @@ impl Runtime {
         }
     }
 
+    fn followup_view<'a>(&'a self, text: &'a str, editable: bool) -> Element<'a, Message> {
+        let mut controls = vec![
+            design::caption("Queued for next turn").into(),
+            small_icon(
+                "edit-copy-symbolic",
+                "Copy queued message",
+                Action::CopyLiteral(text.to_owned()),
+            ),
+        ];
+        if editable {
+            controls.push(
+                crate::ui_controls::compact_icon_control(
+                    crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+                    "Take queued follow-up back to edit",
+                    (!self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.followup))
+                    .then(|| action(Action::CancelFollowup(self.target))),
+                )
+                .into(),
+            );
+        }
+        let message = widget::container(
+            widget::selectable_text(if text.is_empty() {
+                "Queued attachment"
+            } else {
+                text
+            })
+            .size(design::TEXT_PROSE)
+            .class(cosmic::theme::Text::Custom(design::muted_text)),
+        )
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_M; 4],
+            false,
+        ))
+        .padding(step::GAP_M)
+        .max_width(PROMPT_MEASURE)
+        .into();
+        widget::container(
+            widget::column::with_children(vec![
+                message,
+                widget::row::with_children(controls)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
+                    .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .max_width(PROMPT_MEASURE),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .into()
+    }
+
+    pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
+        small_icon(
+            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
+                "emblem-ok-symbolic"
+            } else {
+                "edit-copy-symbolic"
+            },
+            "Copy this message",
+            Action::Copy(self.target, item.id.clone(), CopyPart::Text),
+        )
+    }
+
     /// A draft's first message while its conversation starts.
     ///
     /// It is drawn where it will be once sent, as the reader's own message,
@@ -2373,7 +2481,7 @@ impl Runtime {
             .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
         let mut rows: Vec<Element<'a, Message>> = vec![
             widget::container(
-                widget::text(queued.text.trim_end())
+                widget::selectable_text(queued.text.trim_end())
                     .size(design::TEXT_PROSE)
                     .width(Length::Shrink),
             )
@@ -2412,6 +2520,11 @@ impl Runtime {
                 design::caption(waiting)
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .into(),
+                small_icon(
+                    "edit-copy-symbolic",
+                    "Copy queued message",
+                    Action::CopyLiteral(queued.text.clone()),
+                ),
                 crate::ui_controls::compact_icon_control(
                     crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
                     "Take the message back to edit it",
@@ -2467,7 +2580,9 @@ impl Runtime {
                 ))
                 .size(12)
                 .into(),
-                design::caption(text).into(),
+                widget::selectable_text(text)
+                    .size(design::TEXT_CAPTION)
+                    .into(),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -2495,21 +2610,25 @@ impl Runtime {
                 text
             }
         };
-        widget::container(
-            widget::container(body)
-                .class(design::surface(
-                    (!attachment).then_some(design::accent_wash),
-                    [
-                        design::RADIUS_L,
-                        design::RADIUS_L,
-                        design::RADIUS_XS,
-                        design::RADIUS_L,
-                    ],
-                    attachment,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(PROMPT_MEASURE),
-        )
+        let message = widget::container(body)
+            .class(design::surface(
+                (!attachment).then_some(design::accent_wash),
+                [
+                    design::RADIUS_L,
+                    design::RADIUS_L,
+                    design::RADIUS_XS,
+                    design::RADIUS_L,
+                ],
+                attachment,
+            ))
+            .padding([step::GAP_S as u16, step::GAP_M as u16])
+            .max_width(PROMPT_MEASURE)
+            .into();
+        widget::container(message_actions(
+            message,
+            self.message_copy(item),
+            Alignment::End,
+        ))
         .align_x(Alignment::End)
         .width(Length::Fill)
         .into()
@@ -2545,11 +2664,10 @@ impl Runtime {
     ) -> Element<'static, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
-            return widget::container(prose::view(
-                cached,
-                settings,
-                self.target,
-                self.find.as_deref(),
+            return widget::container(message_actions(
+                prose::view(cached, settings, self.target, self.find.as_deref()),
+                self.message_copy(item),
+                Alignment::Start,
             ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
@@ -2598,7 +2716,7 @@ impl Runtime {
             if expanded {
                 rows.push(prose::view(cached, settings, target, self.find.as_deref()));
             }
-            return widget::container(
+            let message =
                 widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
                     .class(cosmic::theme::Container::custom(|theme| {
                         widget::container::Style {
@@ -2612,18 +2730,17 @@ impl Runtime {
                         }
                     }))
                     .padding([step::GAP_S as u16, step::GAP_M as u16])
-                    .max_width(design::READABLE_MEASURE),
-            )
+                    .max_width(design::READABLE_MEASURE)
+                    .into();
+            return widget::container(message_actions(
+                message,
+                self.message_copy(item),
+                Alignment::Start,
+            ))
             .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
             .into();
         }
-        let mut rows: Vec<Element<'static, Message>> = vec![prose::view(
-            cached,
-            settings,
-            self.target,
-            self.find.as_deref(),
-        )];
         // An answer's footer says when it finished and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
@@ -2653,20 +2770,18 @@ impl Runtime {
                 .into(),
             );
         }
-        rows.push(
+        // The answer is bare prose on the pane's own surface. Wrapping it in
+        // a panel would put a frame around the one thing the reader came for,
+        // and would make it look like just another block.
+        widget::container(message_actions(
+            prose::view(cached, settings, self.target, self.find.as_deref()),
             widget::row::with_children(controls)
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-        );
-        // The answer is bare prose on the pane's own surface. Wrapping it in
-        // a panel would put a frame around the one thing the reader came for,
-        // and would make it look like just another block.
-        widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_S)
-                .max_width(design::READABLE_MEASURE),
-        )
+            Alignment::Start,
+        ))
+        .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
         .into()
     }
@@ -2695,7 +2810,7 @@ fn permission_mode_label(mode: &str) -> &str {
 /// end, where the transcript does, and that a page they have just asked
 /// for by scrolling is on its way. Both belong at the edge the rows will
 /// appear at rather than in a button beside it.
-fn paging_view(page: Page, loading: bool) -> Element<'static, Message> {
+fn paging_view(target: Target, page: Page, loading: bool) -> Element<'static, Message> {
     let mut row: Vec<Element<'_, Message>> = Vec::new();
     if loading {
         row.push(crate::ui_controls::activity_spinner_tone(
@@ -2706,17 +2821,26 @@ fn paging_view(page: Page, loading: bool) -> Element<'static, Message> {
     row.push(
         design::caption(match (page, loading) {
             (Page::Earlier, true) => "Loading earlier history…",
-            (Page::Earlier, false) => "Scroll up for earlier history",
+            (Page::Earlier, false) => "Load earlier history",
             (Page::Newer, true) => "Loading the newest messages…",
-            (Page::Newer, false) => "Scroll down for the newest messages",
+            (Page::Newer, false) => "Jump to latest messages",
         })
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .into(),
     );
     widget::container(
-        widget::row::with_children(row)
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center),
+        widget::button::custom(
+            widget::row::with_children(row)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+        )
+        .class(crate::ui_controls::control_style(false, None))
+        .on_press_maybe((!loading).then(|| {
+            action(match page {
+                Page::Earlier => Action::Command(target, Command::LoadEarlier),
+                Page::Newer => Action::Latest(target),
+            })
+        })),
     )
     .center_x(Length::Fill)
     .padding(step::GAP_S)
@@ -3268,6 +3392,30 @@ mod frame_cost;
 mod tests {
     use super::*;
 
+    #[test]
+    fn concrete_activity_is_inferred_from_streamed_items() {
+        let mut snapshot = Snapshot {
+            busy: true,
+            detail: "Working".into(),
+            ..Snapshot::default()
+        };
+        snapshot.items.push(chat::Item {
+            id: "thought".into(),
+            role: chat::Role::Assistant,
+            at: None,
+            content: ItemContent::Text {
+                text: "Planning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        });
+        assert_eq!(activity_label(&snapshot), "Thinking");
+        if let ItemContent::Text { thinking, .. } = &mut snapshot.items[0].content {
+            *thinking = false;
+        }
+        assert_eq!(activity_label(&snapshot), "Responding");
+    }
+
     /// The fingerprint of every exchange on screen, oldest first.
     fn fingerprints(runtime: &Runtime, dark: bool) -> Vec<u64> {
         runtime
@@ -3330,7 +3478,11 @@ mod tests {
         let light = fingerprint(&runtime, false);
         assert_ne!(light, fingerprint(&runtime, true), "the appearance");
         let key = runtime.turns[strip].key.clone();
-        let open = runtime.opened[&key];
+        let open = runtime
+            .opened
+            .get(&key)
+            .copied()
+            .unwrap_or(runtime.tool_groups_expanded);
         runtime.opened.insert(key, !open);
         let toggled = fingerprint(&runtime, false);
         assert_ne!(light, toggled, "the strip opening or closing");

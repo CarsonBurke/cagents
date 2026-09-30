@@ -221,6 +221,7 @@ fn measure(turns: usize) {
         let element = runtime.view(
             false,
             true,
+            720.0,
             Place {
                 name: "project".into(),
                 branch: None,

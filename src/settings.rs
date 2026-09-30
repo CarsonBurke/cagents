@@ -640,6 +640,10 @@ fn default_browser_search_url() -> String {
     "https://duckduckgo.com/?q={query}".into()
 }
 
+const fn default_native_fraction() -> f32 {
+    0.5
+}
+
 const fn default_chat_enter_sends() -> bool {
     true
 }
@@ -839,6 +843,12 @@ pub struct AppSettings {
     /// moves sending to Ctrl+Enter, which suits composing long prompts.
     #[serde(default = "default_chat_enter_sends")]
     pub chat_enter_sends: bool,
+    #[serde(default)]
+    pub chat_expand_tool_groups: bool,
+    #[serde(default = "default_native_fraction")]
+    pub chat_content_fraction: f32,
+    #[serde(default = "default_native_fraction")]
+    pub default_native_pane_fraction: f32,
     /// Whether the window keeps a status bar along its bottom edge, which
     /// reports how much of each signed-in provider account's usage limits
     /// is left. Hiding it also stops the account probes that feed it while
@@ -920,6 +930,9 @@ impl Default for AppSettings {
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
+            chat_expand_tool_groups: false,
+            chat_content_fraction: default_native_fraction(),
+            default_native_pane_fraction: default_native_fraction(),
             show_status_bar: default_show_status_bar(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
@@ -1608,6 +1621,13 @@ impl AppSettings {
         {
             return Err(SettingsError::Invalid(
                 "inspector_width must be between 320 and 480",
+            ));
+        }
+        if !(0.25..=1.0).contains(&self.chat_content_fraction)
+            || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
+        {
+            return Err(SettingsError::Invalid(
+                "Native pane and chat content widths must be between 0.25 and 1.0".into(),
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -2745,6 +2765,52 @@ mod tests {
         assert!(settings.validate().is_ok());
     }
     use super::*;
+
+    #[test]
+    fn native_chat_preferences_default_and_round_trip() {
+        let mut table = toml::Value::try_from(AppSettings::default())
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        for key in [
+            "chat_expand_tool_groups",
+            "chat_content_fraction",
+            "default_native_pane_fraction",
+        ] {
+            table.remove(key);
+        }
+        let legacy: AppSettings = toml::Value::Table(table).try_into().unwrap();
+        assert!(!legacy.chat_expand_tool_groups);
+        assert_eq!(legacy.chat_content_fraction, 0.5);
+        assert_eq!(legacy.default_native_pane_fraction, 0.5);
+        let customized = AppSettings {
+            chat_expand_tool_groups: true,
+            chat_content_fraction: 0.75,
+            default_native_pane_fraction: 0.6,
+            ..legacy
+        };
+        let decoded: AppSettings = toml::from_str(&toml::to_string(&customized).unwrap()).unwrap();
+        assert_eq!(decoded, customized);
+        for invalid in [f32::NAN, 0.0, 1.1] {
+            assert!(
+                AppSettings {
+                    chat_content_fraction: invalid,
+                    ..customized.clone()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                AppSettings {
+                    default_native_pane_fraction: invalid,
+                    ..customized.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn notification_preferences_default_for_existing_files_and_roundtrip() {

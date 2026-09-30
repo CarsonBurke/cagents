@@ -5141,10 +5141,12 @@ fn agent_indicator<'a>(
     unread: bool,
 ) -> Option<Element<'static, SidebarAction>> {
     if activity == Some(crate::agent::ActivityState::Waiting) {
-        return Some(status_icon(
-            "agent-waiting-symbolic",
+        return Some(crate::interaction::tooltip(
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(ROW_ICON_SIZE),
+                design::warning_color,
+            ),
             "An agent is waiting for input",
-            BadgeTone::Warning,
         ));
     }
     if activity == Some(crate::agent::ActivityState::Working) {
@@ -5158,7 +5160,7 @@ fn agent_indicator<'a>(
     }
     if unread {
         return Some(status_icon(
-            "agent-waiting-symbolic",
+            "notifications-symbolic",
             "Unread agent update",
             BadgeTone::Neutral,
         ));

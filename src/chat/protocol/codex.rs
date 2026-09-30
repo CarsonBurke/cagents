@@ -6,9 +6,9 @@
 use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
-    Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
-    FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode, Request,
-    Role, SearchResult, Skill, SkillReach, ToolStatus, Usage,
+    self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
+    Field, FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode,
+    Request, Role, SearchResult, Skill, SkillReach, ToolStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -369,6 +369,10 @@ fn create_inner(
             direct_input: false,
             cursor: None,
             history_loading: false,
+            queue_available: true,
+            queue_stale: false,
+            queue_listing: Vec::new(),
+            queue_cursors: std::collections::BTreeSet::new(),
             skills_stale: false,
             skill_paths: Vec::new(),
             materialized: launch.session_id.is_some(),
@@ -390,6 +394,8 @@ enum Pending {
     /// wire announces that the figures a reader was looking at have moved.
     Compact,
     Other,
+    QueueAdd,
+    QueueList,
 }
 
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
@@ -451,6 +457,10 @@ struct Codex {
     direct_input: bool,
     cursor: Option<String>,
     history_loading: bool,
+    queue_available: bool,
+    queue_stale: bool,
+    queue_listing: Vec<chat::QueuedMessage>,
+    queue_cursors: std::collections::BTreeSet<String>,
     /// Whether the catalog was invalidated again while a request for it was
     /// still outstanding, so exactly one refetch follows that answer.
     skills_stale: bool,
@@ -540,7 +550,83 @@ impl Codex {
             self.ready = true;
             self.model_events(step);
             step.events.push(Event::Ready(true));
+            if self.direct_input
+                && let Err(message) = self.read_queue(step)
+            {
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
         }
+    }
+
+    fn read_queue(&mut self, step: &mut Step) -> Result<(), String> {
+        if !self.queue_available {
+            return Ok(());
+        }
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::QueueList))
+        {
+            self.queue_stale = true;
+            return Ok(());
+        }
+        self.queue_listing.clear();
+        self.queue_cursors.clear();
+        self.queue_stale = false;
+        self.call(
+            step,
+            "thread/queue/list",
+            json!({"threadId":self.thread, "limit":64}),
+            Pending::QueueList,
+        )
+    }
+
+    fn queue_page(&mut self, result: &Value, step: &mut Step) -> Result<(), String> {
+        for entry in array(result, "data")? {
+            if self.queue_listing.len() >= chat::QueuedMessage::LIMIT {
+                break;
+            }
+            let id = string(entry, "id")?.to_owned();
+            let mut parts = Vec::new();
+            for input in array(entry, "input")? {
+                parts.push(match input["type"].as_str() {
+                    Some("text") => string(input, "text")?.to_owned(),
+                    Some("localImage") => format!("Image attachment: {}", string(input, "path")?),
+                    Some("image") => "Image attachment".to_owned(),
+                    Some("skill" | "mention") => format!(
+                        "{}: {}",
+                        input["type"].as_str().unwrap(),
+                        input["name"].as_str().unwrap_or_default()
+                    ),
+                    _ => "Attachment".to_owned(),
+                });
+            }
+            self.queue_listing
+                .push(chat::QueuedMessage::new(id, parts.join("\n")));
+        }
+        if let Some(cursor) = result["nextCursor"].as_str() {
+            if cursor.len() > 4096
+                || !self.queue_cursors.insert(cursor.to_owned())
+                || self.queue_cursors.len() > chat::QueuedMessage::LIMIT
+            {
+                return Err("Codex returned an invalid queue pagination cursor".into());
+            }
+            self.call(
+                step,
+                "thread/queue/list",
+                json!({"threadId":self.thread, "limit":64, "cursor":cursor}),
+                Pending::QueueList,
+            )?;
+        } else if self.queue_stale {
+            self.read_queue(step)?;
+        } else {
+            step.events
+                .push(Event::QueueChanged(std::mem::take(&mut self.queue_listing)));
+        }
+        Ok(())
     }
 
     fn call(
@@ -570,7 +656,7 @@ impl Codex {
             .and_then(|id| self.models.iter().find(|model| &model.id == id));
         Capabilities {
             steer: self.ready && self.direct_input,
-            queue: self.ready && self.direct_input,
+            queue: self.ready && self.direct_input && self.queue_available,
             attachments: self.direct_input
                 && self
                     .selected
@@ -1064,7 +1150,7 @@ impl Adapter for Codex {
                         self.call(&mut step, "turn/steer", json!({"threadId":self.thread,"expectedTurnId":turn,"input":input}), Pending::Other)?;
                     }
                     PromptMode::Queue => {
-                        self.call(&mut step, "thread/queue/add", json!({"threadId":self.thread,"clientUserMessageId":uuid::Uuid::new_v4().to_string(),"input":input}), Pending::Other)?;
+                        self.call(&mut step, "thread/queue/add", json!({"threadId":self.thread,"clientUserMessageId":uuid::Uuid::new_v4().to_string(),"input":input}), Pending::QueueAdd)?;
                         step.events.push(Event::Status { busy: self.busy, detail: "Submitting to Codex's native queue".into() });
                     }
                 }
@@ -1134,6 +1220,13 @@ impl Adapter for Codex {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
+                    self.queue_available = false;
+                    self.queue_listing.clear();
+                    step.events.push(Event::QueueChanged(Vec::new()));
+                    step.events.push(Event::Capabilities(self.capabilities()));
+                    return Ok(step);
+                }
                 if matches!(pending, Pending::Skills) {
                     // An app-server without a skills catalog answers with an
                     // error, and a composer that offers no completions is not
@@ -1474,6 +1567,16 @@ impl Adapter for Codex {
                 // exists to move kept its old reading until some later frame
                 // happened to carry a new one.
                 Pending::Compact => self.reread(&mut step)?,
+                Pending::QueueAdd => self.read_queue(&mut step)?,
+                Pending::QueueList => {
+                    if let Err(message) = self.queue_page(result, &mut step) {
+                        self.queue_listing.clear();
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
+                }
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -1741,10 +1844,7 @@ impl Adapter for Codex {
             "turn/plan/updated" => step.events.push(Event::Plan {
                 steps: plan_steps(&params["plan"]),
             }),
-            "thread/queue/changed" => step.events.push(Event::Status {
-                busy: self.busy,
-                detail: "Codex's native queue changed".into(),
-            }),
+            "thread/queue/changed" => self.read_queue(&mut step)?,
             // The catalog is a cache the server watches for itself, so a
             // change notification is an invalidation and nothing more.
             "skills/changed" => self.skills(&mut step)?,
@@ -2563,6 +2663,92 @@ mod tests {
         assert!(align_resume_identity(&mut vec!["resume".to_string()], "new").is_err());
     }
 
+    #[test]
+    fn native_queue_is_confirmed_paginated_and_refreshed_after_consumption() {
+        let mut adapter = adapter();
+        let prompt = adapter
+            .command(Command::Prompt {
+                text: "next".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Queue,
+            })
+            .unwrap();
+        assert!(
+            !prompt
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueChanged(_)))
+        );
+        let added = adapter.receive(json!({"id":prompt.writes[0]["id"], "result":{"queuedSubmission":{"id":"q1","input":[{"type":"text","text":"next"}]}}})).unwrap();
+        assert_eq!(added.writes[0]["method"], "thread/queue/list");
+        let page = adapter.receive(json!({"id":added.writes[0]["id"],"result":{"data":[{"id":"q1","input":[{"type":"text","text":"next"}]}],"nextCursor":"page2"}})).unwrap();
+        assert!(
+            !page
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueChanged(_)))
+        );
+        assert_eq!(page.writes[0]["params"]["cursor"], "page2");
+        let last = adapter.receive(json!({"id":page.writes[0]["id"],"result":{"data":[{"id":"q2","input":[{"type":"localImage","path":"/fixture/image.png"}]}],"nextCursor":null}})).unwrap();
+        assert!(last.events.iter().any(|event| matches!(event, Event::QueueChanged(messages) if messages.len() == 2 && messages[0].text == "next" && messages[1].text.contains("image.png"))));
+        let changed = adapter
+            .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        let empty = adapter
+            .receive(json!({"id":changed.writes[0]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        assert!(
+            empty
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueChanged(messages) if messages.is_empty()))
+        );
+    }
+
+    #[test]
+    fn native_queue_rejection_and_stale_pages_never_publish_false_previews() {
+        let mut adapter = adapter();
+        let prompt = adapter
+            .command(Command::Prompt {
+                text: "rejected".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Queue,
+            })
+            .unwrap();
+        let rejected = adapter
+            .receive(
+                json!({"id":prompt.writes[0]["id"],"error":{"code":-1,"message":"queue rejected"}}),
+            )
+            .unwrap();
+        assert!(
+            rejected
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(
+            !rejected
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueChanged(_)))
+        );
+        let first = adapter
+            .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        let invalidated = adapter
+            .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
+            .unwrap();
+        assert!(invalidated.writes.is_empty());
+        let stale = adapter.receive(json!({"id":first.writes[0]["id"],"result":{"data":[{"id":"old","input":[{"type":"text","text":"old"}]}],"nextCursor":null}})).unwrap();
+        assert!(
+            !stale
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::QueueChanged(_)))
+        );
+        assert_eq!(stale.writes[0]["method"], "thread/queue/list");
+    }
+
     fn adapter() -> Codex {
         Codex {
             server_identity: None,
@@ -2593,6 +2779,10 @@ mod tests {
             direct_input: true,
             cursor: None,
             history_loading: false,
+            queue_available: true,
+            queue_stale: false,
+            queue_listing: Vec::new(),
+            queue_cursors: std::collections::BTreeSet::new(),
             skills_stale: false,
             skill_paths: Vec::new(),
             materialized: true,

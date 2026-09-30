@@ -146,41 +146,36 @@ pub(super) fn code_frame<'a>(
             .width(Length::Fill)
             .into();
     };
-    widget::container(
-        widget::column::with_children(vec![
-            widget::container(
-                widget::row::with_children(match copy {
-                    Some(copy) => vec![
-                        design::caption(caption).width(Length::Fill).into(),
-                        // At the primary control size this one button was
-                        // taller than the caption row it sits in, which made
-                        // every code block look like it carried a toolbar.
-                        small_icon("edit-copy-symbolic", "Copy this block", copy),
-                    ],
-                    None => vec![design::caption(caption).into()],
-                })
-                .align_y(Alignment::Center)
-                .spacing(GAP_S),
-            )
-            .padding([GAP_XS as u16, GAP_M as u16])
+    let body = widget::container(body)
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_S; 4],
+            true,
+        ))
+        .width(Length::Fill)
+        .into();
+    let block = widget::column::with_children(vec![
+        widget::container(design::caption(caption))
+            .padding(iced::Padding::ZERO.right(24))
             .width(Length::Fill)
-            .class(design::surface(
-                Some(design::raised),
-                [design::RADIUS_S, design::RADIUS_S, 0.0, 0.0],
-                false,
-            ))
+            .height(24)
+            .align_y(Alignment::Center)
             .into(),
-            body,
-        ])
-        .width(Length::Fill),
-    )
-    .class(design::surface(
-        Some(design::sunken),
-        [design::RADIUS_S; 4],
-        true,
-    ))
-    .width(Length::Fill)
-    .into()
+        body,
+    ])
+    .spacing(GAP_XS)
+    .width(Length::Fill);
+    match copy {
+        Some(copy) => iced::widget::hover(
+            block,
+            widget::container(small_icon("edit-copy-symbolic", "Copy this block", copy))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::Start),
+        ),
+        None => block.into(),
+    }
 }
 
 fn change_verb(kind: &ChangeKind) -> &'static str {
@@ -223,17 +218,29 @@ fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
         result.title.as_str()
     };
     if result.url.is_empty() {
-        rows.push(design::body(title).into());
+        rows.push(
+            widget::selectable_text(title)
+                .size(design::TEXT_BODY)
+                .into(),
+        );
     } else {
         rows.push(
             widget::button::link(title.to_owned())
                 .on_press(action(Action::OpenUrl(result.url.clone())))
                 .into(),
         );
-        rows.push(design::caption(result.url.as_str()).into());
+        rows.push(
+            widget::selectable_text(result.url.as_str())
+                .size(design::TEXT_CAPTION)
+                .into(),
+        );
     }
     if !result.snippet.is_empty() {
-        rows.push(design::body(result.snippet.as_str()).into());
+        rows.push(
+            widget::selectable_text(result.snippet.as_str())
+                .size(design::TEXT_BODY)
+                .into(),
+        );
     }
     widget::column::with_children(rows)
         .spacing(design::GRID_UNIT)
@@ -289,10 +296,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        // Every rendered group has a record, written when the group was first
-        // seen. This fallback is the same value that record was seeded with,
-        // so the two cannot disagree.
-        let open = self.opened.get(key).copied().unwrap_or(turn.running);
+        // Explicit reader choices override the configured default.
+        let open = self
+            .opened
+            .get(key)
+            .copied()
+            .unwrap_or(self.tool_groups_expanded);
         let mut line: Vec<Element<'static, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(if open {
                 "pan-down-symbolic"
@@ -468,7 +477,17 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        header.into()
+        iced::widget::hover(
+            widget::row::with_children(vec![header.into(), widget::Space::new().width(24).into()])
+                .align_y(Alignment::Center)
+                .spacing(GAP_XS)
+                .width(Length::Fill),
+            widget::container(self.message_copy(item))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::Center),
+        )
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
@@ -538,7 +557,11 @@ impl Runtime {
                 }
             }
             ItemContent::WebSearch { query, results } => {
-                rows.push(design::body(query.as_str()).into());
+                rows.push(
+                    widget::selectable_text(query.as_str())
+                        .size(design::TEXT_BODY)
+                        .into(),
+                );
                 if results.is_empty() {
                     rows.push(design::caption("No results were reported.").into());
                 }
@@ -584,7 +607,11 @@ impl Runtime {
                     );
                 }
                 if !description.is_empty() {
-                    rows.push(design::body(description.as_str()).into());
+                    rows.push(
+                        widget::selectable_text(description.as_str())
+                            .size(design::TEXT_BODY)
+                            .into(),
+                    );
                 }
                 if path.starts_with("http://") || path.starts_with("https://") {
                     rows.push(
@@ -593,7 +620,11 @@ impl Runtime {
                             .into(),
                     );
                 } else if !path.is_empty() && !path.starts_with("data:") {
-                    rows.push(design::caption(path.as_str()).into());
+                    rows.push(
+                        widget::selectable_text(path.as_str())
+                            .size(design::TEXT_CAPTION)
+                            .into(),
+                    );
                 }
             }
         }

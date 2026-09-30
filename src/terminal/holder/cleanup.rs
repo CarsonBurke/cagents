@@ -146,7 +146,59 @@ fn confirmed_receipt(
         && receipt.record.version == 4
         && receipt.record.application == crate::instance::APPLICATION_ID
         && receipt.record.boot == proof.boot_id
-        && !receipt.record.holder.is_current()
+        && holder_exited(&receipt.record.holder)?
         && !receipt.record.root.is_current()
         && source.is_none_or(|digest| receipt.sources.contains(&digest)))
+}
+
+/// An orphan holder may remain a zombie until its new parent reaps it. Its
+/// exact identity still exists in /proc, but it can no longer own the socket.
+/// Keep this distinct from the root's stronger requirement to have been reaped.
+fn holder_exited(holder: &crate::daemon::holder_registry::Process) -> Result<bool, String> {
+    let stat = match fs::read(format!("/proc/{}/stat", holder.pid)) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.to_string()),
+    };
+    let (_, start) = crate::model::agent_recovery::process_identity(&stat)
+        .ok_or("Invalid terminal holder process identity")?;
+    let state = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .and_then(|end| {
+            stat[end + 1..]
+                .iter()
+                .find(|byte| !byte.is_ascii_whitespace())
+        })
+        .copied()
+        .ok_or("Invalid terminal holder process state")?;
+    Ok(start != holder.start || matches!(state, b'Z' | b'X'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exited_holder_is_proven_before_its_parent_reaps_it() {
+        use crate::daemon::holder_registry::Process;
+        let current = Process::read(std::process::id() as i32).unwrap();
+        assert!(!holder_exited(&current).unwrap());
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .unwrap();
+        let holder = Process::read(child.id() as i32).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !holder_exited(&holder).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "holder did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            holder.is_current(),
+            "fixture must remain an unreaped zombie"
+        );
+        child.wait().unwrap();
+        assert!(holder_exited(&holder).unwrap());
+    }
 }

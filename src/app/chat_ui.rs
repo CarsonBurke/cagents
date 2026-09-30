@@ -623,27 +623,11 @@ pub(super) fn format_duration(millis: u64) -> String {
     }
 }
 
-/// Settles which step strips are open for the groups that now exist.
-///
-/// Two jobs, and they have to happen together. A group is forgotten once the
-/// store's window no longer produces it, because the map would otherwise grow
-/// for the life of the card. A group that is new gets its automatic state
-/// written here, once: open while it is running, because watching the work is
-/// the point, and closed otherwise, because a finished group is read for its
-/// answer.
-///
-/// Writing that state instead of resolving it per frame is the whole point.
-/// The surface used to fall back to "open if running" whenever the reader had
-/// not toggled anything, which meant a strip the reader was reading collapsed
-/// under them the instant its last step finished - and a group they had
-/// deliberately opened reverted as soon as its key was rederived.
+/// Remember reader choices across bounded history pages without retaining transcript bodies.
 fn reconcile_disclosure(opened: &mut HashMap<String, bool>, turns: &[turn::Turn]) {
-    let keys: HashSet<&str> = turns.iter().map(|turn| turn.key.as_str()).collect();
-    opened.retain(|key, _| keys.contains(key.as_str()));
-    for turn in turns {
-        if !opened.contains_key(&turn.key) {
-            opened.insert(turn.key.clone(), turn.running);
-        }
+    if opened.len() > 4096 {
+        let keys: HashSet<&str> = turns.iter().map(|turn| turn.key.as_str()).collect();
+        opened.retain(|key, _| keys.contains(key.as_str()));
     }
 }
 
@@ -1123,12 +1107,10 @@ pub(super) struct Runtime {
     asked: HashSet<String>,
     /// Whether each group's step strip is open, keyed by the group.
     ///
-    /// A group's state is written once, when the group is first seen: open
-    /// while it is running, because watching the work is the point, and
-    /// closed otherwise, because the answer is what a finished group is read
-    /// for. From then on only a toggle changes it, so a group the reader
-    /// opened does not shut itself the moment its last step finishes.
+    /// Explicit reader choices override the configured default and survive
+    /// history-page eviction within a bounded disclosure budget.
     opened: HashMap<String, bool>,
+    pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
@@ -1415,6 +1397,7 @@ impl Runtime {
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
+            tool_groups_expanded: false,
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
@@ -1591,11 +1574,11 @@ impl Runtime {
             self.selected_subagent = None;
         }
         self.cache.retain(|id, _| live_ids.contains(id.as_str()));
-        // Both sets are keyed by item id and the store drops items past its
-        // window, so without this they grow for the life of the card: one
-        // entry per step the reader ever opened and per question they were
-        // ever asked, held after the item it named stopped existing.
-        self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        // Keep disclosure choices across page eviction, with a bounded budget.
+        // Question anchors only describe the currently loaded window.
+        if self.expanded.len() > 4096 {
+            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         for item in snapshot.items.iter().chain(
             snapshot
@@ -2979,7 +2962,9 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
+        let scope = if self.durable.active_channel.is_none()
+            && self.active_workspace.as_deref() != Some(working_directory.as_path())
+        {
             self.select_worktree(working_directory, false)
         } else {
             Task::none()
@@ -3036,8 +3021,12 @@ impl Cagents {
             title: chat_card_title(session.launch.provider).into(),
             width_fraction: beside
                 .and_then(|(source, _)| self.card_state(source))
-                .map_or(self.settings.default_column_fraction, |source| {
-                    source.width_fraction
+                .map_or(self.settings.default_native_pane_fraction, |source| {
+                    if matches!(source.kind, CardKind::Chat(_)) {
+                        source.width_fraction
+                    } else {
+                        self.settings.default_native_pane_fraction
+                    }
                 }),
             existence: Existence::Open,
             exposure: Exposure::Visible,
@@ -3123,6 +3112,7 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
         {
@@ -4556,6 +4546,7 @@ impl Cagents {
                             {
                                 runtime.replace_draft(text_editor::Content::with_text(&draft));
                             }
+                            runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
                                 .cards
@@ -5273,6 +5264,16 @@ impl Cagents {
                             runtime.answers.retain(|(id, _), _| id != &request);
                         }
                         runtime.refresh();
+                        if pending.page == Some(view::Page::Newer) {
+                            return iced::widget::scrollable::snap_to(
+                                card_control_id(target.card, "chat-transcript"),
+                                iced::widget::scrollable::RelativeOffset {
+                                    x: None,
+                                    y: Some(0.0),
+                                },
+                            )
+                            .map(cosmic::Action::App);
+                        }
                         pending.first_prompt
                     }
                     Err(error) => {
@@ -5328,13 +5329,13 @@ impl Cagents {
             }
             Action::ToggleTurn(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    // Every rendered group has a recorded state, written when
-                    // the group was first seen, so a toggle inverts exactly
-                    // what the reader is looking at. A key with no record
-                    // names a group that no longer exists, and inventing a
-                    // state for it would resurrect a strip under a group the
-                    // transcript has moved past.
-                    if let Some(open) = runtime.opened.get_mut(&key) {
+                    // Invert the visible default on the first toggle, then
+                    // remember explicit choices across paging. Ignore stale keys.
+                    if runtime.turns.iter().any(|turn| turn.key == key) {
+                        let open = runtime
+                            .opened
+                            .entry(key)
+                            .or_insert(runtime.tool_groups_expanded);
                         *open = !*open;
                     }
                 }
@@ -5428,6 +5429,9 @@ impl Cagents {
             Action::Latest(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.unseen_activity = false;
+                    if runtime.snapshot.has_later {
+                        return self.chat_send(target, Command::Refresh, false);
+                    }
                 }
                 return iced::widget::scrollable::snap_to(
                     card_control_id(target.card, "chat-transcript"),
@@ -5942,6 +5946,7 @@ impl Cagents {
                 if runtime.selected_subagent.is_some() {
                     return Task::none();
                 }
+                let same_geometry = runtime.scroll.same_geometry(scroll);
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
                 if at_bottom {
@@ -5957,16 +5962,23 @@ impl Cagents {
                     runtime.later_asked = None;
                 }
                 let height = Some(scroll.content());
-                // The earlier end wins where both are in reach at once, which
-                // happens on a window shorter than the pane it is drawn in: a
-                // reader whose transcript does not fill its own pane is
-                // looking for the rest of the conversation, and what came
-                // before this window is the part they cannot reach.
-                if at_top && runtime.snapshot.has_earlier && runtime.earlier_asked != height {
+                // A short page has no scroll direction. Its explicit history
+                // controls choose the end without triggering a paging loop.
+                if same_geometry
+                    && at_top
+                    && !at_bottom
+                    && runtime.snapshot.has_earlier
+                    && runtime.earlier_asked != height
+                {
                     runtime.earlier_asked = height;
                     return self.chat_send(target, Command::LoadEarlier, false);
                 }
-                if at_bottom && runtime.snapshot.has_later && runtime.later_asked != height {
+                if same_geometry
+                    && at_bottom
+                    && !at_top
+                    && runtime.snapshot.has_later
+                    && runtime.later_asked != height
+                {
                     runtime.later_asked = height;
                     return self.chat_send(target, Command::Refresh, false);
                 }
@@ -6189,86 +6201,97 @@ mod tests {
         }
     }
 
-    /// The reader's view of a group's steps must change when they say so, and
-    /// at no other time. A group that opened because it was running stays
-    /// open when it finishes, and a group they closed stays closed while the
-    /// agent keeps adding to it.
     #[test]
-    fn a_groups_disclosure_survives_the_work_finishing_and_continuing() {
-        let item = |id: &str, role: chat::Role, content: ItemContent| chat::Item {
-            id: id.to_owned(),
-            role,
-            content,
-            at: None,
-        };
-        let shell = |status: chat::ToolStatus| ItemContent::Command {
-            label: String::new(),
-            command: "cargo check".to_owned(),
-            working_directory: String::new(),
-            action: chat::CommandAction::Run,
-            status,
-            exit_code: None,
-            duration_ms: None,
-            output: String::new(),
-        };
-        let transcript = |status: chat::ToolStatus, extra: bool| {
-            let mut items = vec![
-                item("u1", chat::Role::User, text("look at this")),
-                item("c1", chat::Role::Assistant, shell(status)),
-            ];
-            if extra {
-                items.push(item(
-                    "c2",
-                    chat::Role::Assistant,
-                    shell(chat::ToolStatus::Succeeded),
-                ));
-            }
-            items
-        };
-        let mut opened = HashMap::new();
-        let running = turn::group(
-            &transcript(chat::ToolStatus::Running, false),
-            &HashSet::new(),
-        );
-        reconcile_disclosure(&mut opened, &running);
+    fn a_short_historical_page_can_explicitly_return_to_latest() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("history"));
+        let target = chat_runtime(&app, card).target;
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        let _ = app.handle_chat_ui(Action::Latest(target));
         assert_eq!(
-            opened.get("u1"),
-            Some(&true),
-            "a group with work in flight shows it without being asked"
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Newer)
         );
-        let finished = turn::group(
-            &transcript(chat::ToolStatus::Succeeded, false),
-            &HashSet::new(),
-        );
-        reconcile_disclosure(&mut opened, &finished);
-        assert_eq!(
-            opened.get("u1"),
-            Some(&true),
-            "a group the reader never touched must not shut itself when the work ends"
-        );
-        // What `Action::ToggleTurn` does, which is the only other way this
-        // state is allowed to change.
-        *opened.get_mut("u1").expect("the group has a record") = false;
-        let extended = turn::group(
-            &transcript(chat::ToolStatus::Succeeded, true),
-            &HashSet::new(),
-        );
-        reconcile_disclosure(&mut opened, &extended);
-        assert_eq!(
-            opened.get("u1"),
-            Some(&false),
-            "a group the reader closed stays closed when another step arrives"
-        );
+    }
+
+    #[test]
+    fn tool_group_toggles_override_both_default_choices() {
+        for default in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some("disclosure"));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.tool_groups_expanded = default;
+            runtime.turns = turn::group(
+                &[chat::Item {
+                    id: "u1".into(),
+                    role: chat::Role::User,
+                    content: text("hello"),
+                    at: None,
+                }],
+                &HashSet::new(),
+            );
+            let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
+            assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));
+            let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
+            assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&default));
+        }
+    }
+
+    #[test]
+    fn disclosure_choices_survive_history_eviction_and_are_bounded() {
+        let mut opened = HashMap::from([("u1".to_owned(), true)]);
         reconcile_disclosure(&mut opened, &[]);
-        assert!(
-            opened.is_empty(),
-            "a group the store no longer produces is forgotten rather than held for the session"
-        );
+        assert_eq!(opened.get("u1"), Some(&true));
+        opened.insert("u1".to_owned(), false);
+        reconcile_disclosure(&mut opened, &[]);
+        assert_eq!(opened.get("u1"), Some(&false));
+        opened.extend((0..4097).map(|index| (format!("old-{index}"), true)));
+        reconcile_disclosure(&mut opened, &[]);
+        assert!(opened.is_empty());
     }
 
     const FIXTURE_DIRECTORY: &str = "/workspace/chat-fixture";
     /// Providers name conversations by UUID; resume refuses anything else.
     const KNOWN_THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    #[test]
+    fn new_panes_keep_the_selected_channel_when_launch_directory_changes() {
+        for chat in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let source = app.workspace.focused().unwrap();
+            let root = PathBuf::from(FIXTURE_DIRECTORY);
+            let nested = root.join("src");
+            let channel = crate::model::ChannelId::new();
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Conversation".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![source],
+                focused: Some(source),
+            });
+            durable.active_channel = Some(channel);
+            app.active_workspace = Some(root.clone());
+            if chat {
+                drop(app.new_native_chat(Provider::Codex, Some(nested.clone())));
+            } else {
+                drop(app.add_terminal_recipe(LaunchRecipe::shell(nested.clone()).unwrap()));
+            }
+            let added = app.workspace.focused().unwrap();
+            assert_ne!(added, source);
+            assert_eq!(app.active_workspace, Some(root));
+            assert_eq!(app.durable.active_channel, Some(channel));
+            assert!(app.durable.channels[0].cards.contains(&added));
+            assert!(app.durable.channels[0].cards.contains(&source));
+            assert_eq!(
+                crate::app::worktree_ui::card_directory(app.card_state(added).unwrap()),
+                Some(nested.as_path())
+            );
+        }
+    }
 
     /// A new conversation, which runs nothing until its first message is
     /// sent. Tasks are dropped throughout: nothing here starts a provider or
@@ -7356,7 +7379,10 @@ mod tests {
         let chat = order[1];
         assert_eq!(app.workspace.focused(), Some(chat));
         let state = app.card_state(chat).unwrap();
-        assert_eq!(state.width_fraction, terminal.width_fraction);
+        assert_eq!(
+            state.width_fraction,
+            app.settings.default_native_pane_fraction
+        );
         let CardKind::Chat(session) = &state.kind else {
             panic!("the new card is a chat");
         };

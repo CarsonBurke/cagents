@@ -1460,9 +1460,10 @@ impl Cagents {
                     "Working",
                 )),
                 crate::agent::ActivityState::Waiting => children.push(tooltip(
-                    crate::ui_controls::symbolic_icon("agent-waiting-symbolic")
-                        .icon()
-                        .size(design::TAB_STATUS_ICON_SIZE),
+                    crate::ui_controls::activity_spinner_tone(
+                        design::TAB_STATUS_ICON_SIZE as f32,
+                        design::warning_color,
+                    ),
                     "Waiting for input",
                 )),
                 _ => {}

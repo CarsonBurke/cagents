@@ -460,21 +460,8 @@ fn settings_category_controls<'a>(
                     SettingsField::HibernationDelayMs,
                     invalid,
                 ),
-                setting_field(
-                    "Chat send key",
-                    "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
-                    crate::settings_widgets::toggle(
-                        "Enter sends a chat message",
-                        draft.chat_enter_sends,
-                        |enabled| Message::SettingsChanged {
-                            field: SettingsField::ChatEnterSends,
-                            value: enabled.to_string(),
-                        },
-                    ),
-                ),
             ];
             let reset = controls.remove(0);
-            let chat = controls.pop().expect("chat control");
             let performance = controls.split_off(5);
             let activation = controls.pop().expect("activation control");
             let channel = controls.remove(2);
@@ -489,7 +476,6 @@ fn settings_category_controls<'a>(
                     "Channels and pane focus.",
                     vec![channel, activation],
                 ),
-                settings_group("Chat", "Choose how to send messages.", vec![chat]),
                 settings_group(
                     "Performance",
                     "Balance active panes and background resource use.",
@@ -502,6 +488,47 @@ fn settings_category_controls<'a>(
                 ),
             ]
         }
+        SettingsCategory::NativeChat => vec![settings_group(
+            "Native chat",
+            "Message composition and conversation presentation.",
+            vec![
+                setting_field(
+                    "Chat send key",
+                    "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                    crate::settings_widgets::toggle(
+                        "Enter sends a chat message",
+                        draft.chat_enter_sends,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ChatEnterSends,
+                            value: enabled.to_string(),
+                        },
+                    ),
+                ),
+                setting_field(
+                    "Tool groups",
+                    "New tool-call groups start collapsed. Individual disclosure choices are remembered while paging.",
+                    crate::settings_widgets::toggle(
+                        "Expand tool groups by default",
+                        draft.chat_expand_tool_groups,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ChatExpandToolGroups,
+                            value: enabled.to_string(),
+                        },
+                    ),
+                ),
+                setting_stepper(
+                    "Chat content width",
+                    "Fraction of the whole workspace used by messages and the composer; fits inside narrower panes.",
+                    &draft.chat_content_fraction,
+                    SettingsField::ChatContentFraction,
+                    0.25,
+                    1.0,
+                    0.05,
+                    0.5,
+                    "",
+                ),
+            ],
+        )],
         SettingsCategory::Editor => vec![
             settings_group(
                 "Font",
@@ -605,17 +632,30 @@ fn settings_category_controls<'a>(
             settings_group(
                 "Workspace layout",
                 "Keep navigation and context readable without giving up working space.",
-                vec![setting_stepper(
-                    "New pane width",
-                    "Fraction of the workspace. Existing pane widths are preserved.",
-                    &draft.default_column_fraction,
-                    SettingsField::DefaultColumnFraction,
-                    0.25,
-                    1.0,
-                    0.05,
-                    0.5,
-                    "×",
-                )],
+                vec![
+                    setting_stepper(
+                        "New terminal/browser width",
+                        "Fraction of the workspace. Existing pane widths are preserved.",
+                        &draft.default_column_fraction,
+                        SettingsField::DefaultColumnFraction,
+                        0.25,
+                        1.0,
+                        0.05,
+                        0.5,
+                        "×",
+                    ),
+                    setting_stepper(
+                        "Native pane minimum width",
+                        "Fraction of the workspace used by new native panes when sharing space. A lone pane fills the workspace; resize or cycle its width to override.",
+                        &draft.default_native_pane_fraction,
+                        SettingsField::DefaultNativePaneFraction,
+                        0.25,
+                        1.0,
+                        0.05,
+                        0.5,
+                        "",
+                    ),
+                ],
             ),
         ],
         SettingsCategory::Terminal => vec![
@@ -1086,6 +1126,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Terminal => "utilities-terminal-symbolic",
         SettingsCategory::Links => "web-browser-symbolic",
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
+        SettingsCategory::NativeChat => "chat-bubble-text-symbolic",
         SettingsCategory::Editor => "accessories-text-editor-symbolic",
         SettingsCategory::Accounts => "system-users-symbolic",
         SettingsCategory::About => "dialog-information-symbolic",

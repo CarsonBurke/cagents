@@ -1035,6 +1035,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),
+                "thread/queue/list" => json!({"data":[],"nextCursor":null}),
                 "turn/start" => {
                     prompts += 1;
                     json!({"turn":{"id":"owned-turn"}})

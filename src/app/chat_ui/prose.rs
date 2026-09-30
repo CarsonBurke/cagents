@@ -157,12 +157,13 @@ impl Renderer<'_> {
             }
             Item::Rule => iced::widget::rule::horizontal(2).into(),
             Item::Table { columns, rows } => self.table(settings, columns, rows),
-            Item::Image { alt, .. } => widget::container(
-                iced::widget::rich_text(alt.spans(settings.style)).on_link_click({
-                    let target = self.target;
-                    move |uri| link(target, uri)
-                }),
-            )
+            Item::Image { alt, .. } => widget::container(selectable_prose::text(
+                alt.spans(settings.style),
+                settings.text_size,
+                iced::Font::default(),
+                self.target,
+                self.find,
+            ))
             .padding(settings.spacing.0)
             .class(design::surface(
                 Some(design::sunken),

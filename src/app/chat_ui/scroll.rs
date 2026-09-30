@@ -10,16 +10,19 @@ use iced::{Event, Rectangle, Size, Vector};
 pub(super) fn transcript<'a>(
     content: impl Into<Element<'a, Message>>,
     first_item: Option<&'a str>,
+    last_item: Option<&'a str>,
 ) -> Element<'a, Message> {
     Element::new(Anchored {
         content: content.into(),
         first_item,
+        last_item,
     })
 }
 
 struct Anchored<'a> {
     content: Element<'a, Message>,
     first_item: Option<&'a str>,
+    last_item: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,12 +48,14 @@ impl Geometry {
 struct Anchor {
     laid_out: Option<Geometry>,
     first_item: Option<String>,
+    last_item: Option<String>,
 }
 
 impl Anchor {
     fn layout(
         &mut self,
         first_item: Option<&str>,
+        last_item: Option<&str>,
         next: Geometry,
         current_top: Option<f32>,
     ) -> Option<f32> {
@@ -62,6 +67,11 @@ impl Anchor {
             // offset: Home leaves iced at Relative(1), which would otherwise
             // follow the newly prepended top and repeatedly load older pages.
             if self.first_item.as_deref() != first_item {
+                if self.last_item.as_deref() != last_item {
+                    // Replacing a bounded history page starts at its newest
+                    // boundary. It is not a prepend of the same transcript.
+                    return Some(0.0);
+                }
                 return Some(bottom.min(next.travel()));
             }
             let desired = if bottom <= 0.5 {
@@ -78,6 +88,9 @@ impl Anchor {
         self.laid_out = Some(next);
         if self.first_item.as_deref() != first_item {
             self.first_item = first_item.map(str::to_owned);
+        }
+        if self.last_item.as_deref() != last_item {
+            self.last_item = last_item.map(str::to_owned);
         }
         offset
     }
@@ -168,7 +181,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             viewport: node.size(),
             content: node.children()[0].size(),
         };
-        if let Some(offset) = anchor.layout(self.first_item, next, top.0) {
+        if let Some(offset) = anchor.layout(self.first_item, self.last_item, next, top.0) {
             self.content.as_widget_mut().operate(
                 child,
                 Layout::new(&node),
@@ -283,18 +296,21 @@ mod tests {
 
     fn reading() -> Anchor {
         let mut anchor = Anchor::default();
-        assert_eq!(anchor.layout(Some("first"), geometry(2000.0), None), None);
+        assert_eq!(
+            anchor.layout(Some("first"), Some("last"), geometry(2000.0), None),
+            None
+        );
         anchor
     }
 
     #[test]
     fn appends_preserve_reading_position_and_live_end_follows() {
         assert_eq!(
-            reading().layout(Some("first"), geometry(2200.0), Some(600.0)),
+            reading().layout(Some("first"), Some("last"), geometry(2200.0), Some(600.0)),
             Some(1200.0)
         );
         assert_eq!(
-            reading().layout(Some("first"), geometry(2200.0), Some(1600.0)),
+            reading().layout(Some("first"), Some("last"), geometry(2200.0), Some(1600.0)),
             None
         );
     }
@@ -303,12 +319,12 @@ mod tests {
     fn user_input_before_layout_is_authoritative() {
         // The app might still know top=600, but the user has scrolled to 900.
         assert_eq!(
-            reading().layout(Some("first"), geometry(2200.0), Some(900.0)),
+            reading().layout(Some("first"), Some("last"), geometry(2200.0), Some(900.0)),
             Some(900.0)
         );
         // End was pressed before layout: stay at the live end, not old history.
         assert_eq!(
-            reading().layout(Some("first"), geometry(2200.0), Some(1600.0)),
+            reading().layout(Some("first"), Some("last"), geometry(2200.0), Some(1600.0)),
             None
         );
     }
@@ -319,12 +335,17 @@ mod tests {
         // Any number of provider/status refreshes before layout cannot change
         // this marker. Bottom anchoring retains the old message after prepend.
         assert_eq!(
-            anchor.layout(Some("earlier"), geometry(2500.0), Some(600.0)),
+            anchor.layout(Some("earlier"), Some("last"), geometry(2500.0), Some(600.0)),
             Some(1000.0)
         );
         // The same message now sits 500px farther down. An append preserves it.
         assert_eq!(
-            anchor.layout(Some("earlier"), geometry(2700.0), Some(1100.0)),
+            anchor.layout(
+                Some("earlier"),
+                Some("last"),
+                geometry(2700.0),
+                Some(1100.0)
+            ),
             Some(1200.0)
         );
     }
@@ -335,17 +356,22 @@ mod tests {
         // Home snaps iced to Relative(1). Convert that old 1600px bottom
         // distance to Absolute(1600), putting the same message at top=500.
         let bottom = anchor
-            .layout(Some("earlier"), geometry(2500.0), Some(0.0))
+            .layout(Some("earlier"), Some("last"), geometry(2500.0), Some(0.0))
             .expect("prepend must replace the relative offset");
         assert_eq!(bottom, 1600.0);
         assert_eq!(geometry(2500.0).travel() - bottom, 500.0);
         assert_eq!(
-            anchor.layout(Some("earlier"), geometry(2500.0), Some(500.0)),
+            anchor.layout(Some("earlier"), Some("last"), geometry(2500.0), Some(500.0)),
             None,
             "an unchanged layout must not scroll back to the pagination edge"
         );
         assert_eq!(
-            reading().layout(Some("earlier"), geometry(2500.0), Some(1600.0)),
+            reading().layout(
+                Some("earlier"),
+                Some("last"),
+                geometry(2500.0),
+                Some(1600.0)
+            ),
             Some(0.0),
             "prepending while at the live end keeps the live end visible"
         );
@@ -355,12 +381,24 @@ mod tests {
     fn no_pending_correction_survives_an_unchanged_layout() {
         let mut anchor = reading();
         assert_eq!(
-            anchor.layout(Some("first"), geometry(2000.0), Some(600.0)),
+            anchor.layout(Some("first"), Some("last"), geometry(2000.0), Some(600.0)),
             None
         );
         assert_eq!(
-            anchor.layout(Some("first"), geometry(2200.0), Some(900.0)),
+            anchor.layout(Some("first"), Some("last"), geometry(2200.0), Some(900.0)),
             Some(900.0)
+        );
+    }
+    #[test]
+    fn replaced_history_pages_start_at_the_newest_boundary() {
+        let mut anchor = reading();
+        assert_eq!(
+            anchor.layout(Some("older"), Some("first"), geometry(900.0), Some(0.0)),
+            Some(0.0)
+        );
+        assert_eq!(
+            anchor.layout(Some("older"), Some("first"), geometry(900.0), Some(500.0)),
+            None
         );
     }
 }
