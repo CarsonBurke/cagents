@@ -566,7 +566,8 @@ impl Cagents {
                         .collect::<Vec<_>>(),
                     "these worktrees",
                 ),
-                "Git will remove these clean worktree directories. Their branches are retained. \
+                "Git will remove these worktree directories, including uncommitted and untracked files. \
+                 Unsaved editor changes are discarded. Their branches are retained. \
                  Terminals and chats running in them, including detached ones, are closed first.",
             ),
             SelectionRow::Channel(_) => {
