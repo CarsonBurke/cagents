@@ -1526,7 +1526,7 @@ impl Runtime {
         {
             return;
         }
-        if snapshot.permission_mode.is_none() {
+        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
                     draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
@@ -2149,35 +2149,137 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| chat::claude_configured_default_mode(recipe))
                 .or_else(|| Some("manual".into()))
         }
-        Provider::Codex => {
-            if arguments.iter().any(|argument| {
+        Provider::Codex => codex_draft_permission_mode(recipe),
+        Provider::Omp => None,
+    }
+}
+
+/// Preview the launch policy without changing the CLI's configuration. Once
+/// connected, the thread's own reported policy replaces this preview.
+fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    let arguments = &recipe.arguments;
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+        )
+    }) {
+        return Some("yolo".into());
+    }
+    let environment = |name: &str| {
+        (!recipe.unset_environment.iter().any(|unset| unset == name))
+            .then(|| {
+                recipe
+                    .environment
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok())
+            })
+            .flatten()
+    };
+    let root = environment("CODEX_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| environment("HOME").map(|home| PathBuf::from(home).join(".codex")));
+    let root = root.map(|root| {
+        if root.is_absolute() {
+            root
+        } else {
+            recipe.working_directory.join(root)
+        }
+    });
+    let config = root
+        .as_ref()
+        .and_then(|root| std::fs::read_to_string(root.join("config.toml")).ok())
+        .and_then(|contents| contents.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+
+    // These recipes are not supported for new native threads. Do not guess
+    // which profile or config override a resumed provider thread uses.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
+    }) {
+        return None;
+    }
+    if arguments.iter().enumerate().any(|(index, argument)| {
+        let override_value = argument.strip_prefix("--config=").or_else(|| {
+            matches!(argument.as_str(), "-c" | "--config")
+                .then(|| arguments.get(index + 1).map(String::as_str))
+                .flatten()
+        });
+        override_value.is_some_and(|value| {
+            value.split_once('=').is_some_and(|(key, _)| {
                 matches!(
-                    argument.as_str(),
-                    "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
+                    key.trim(),
+                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
                 )
-            }) {
-                Some("yolo".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "workspace-write"])
-            {
-                Some("workspaceWrite".into())
-            } else if arguments
-                .windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "on-request"])
-                && arguments
-                    .windows(2)
-                    .any(|pair| pair == ["--sandbox", "read-only"])
-            {
-                Some("readOnly".into())
-            } else {
-                None
+            })
+        })
+    }) {
+        return None;
+    }
+    let flag = |short: &str, long: &str| {
+        arguments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, argument)| {
+                argument.strip_prefix(&format!("{long}=")).or_else(|| {
+                    (argument == short || argument == long)
+                        .then(|| arguments.get(index + 1).map(String::as_str))
+                        .flatten()
+                })
+            })
+    };
+    let explicit_approval = flag("-a", "--ask-for-approval");
+    let explicit_sandbox = flag("-s", "--sandbox");
+    if explicit_approval.is_none() || explicit_sandbox.is_none() {
+        if config.contains_key("profile")
+            || config.contains_key("default_permissions")
+            || config.contains_key("permissions")
+        {
+            return None;
+        }
+        let user_home = environment("HOME").map(PathBuf::from);
+        let user_config =
+            root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
+        for directory in recipe.working_directory.ancestors() {
+            if user_home.as_deref() == Some(directory) {
+                break;
+            }
+            let path = directory.join(".codex/config.toml");
+            // The account's own config can also be an ancestor of cwd. It
+            // remains a user layer rather than a second project layer.
+            if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let project = contents.parse::<toml::Table>().ok()?;
+                if [
+                    "approval_policy",
+                    "sandbox_mode",
+                    "default_permissions",
+                    "permissions",
+                ]
+                .iter()
+                .any(|key| project.contains_key(*key))
+                {
+                    // Trust decides whether Codex loads this layer. Wait
+                    // for its authoritative thread policy rather than guess.
+                    return None;
+                }
             }
         }
-        Provider::Omp => None,
+    }
+    let approval =
+        explicit_approval.or_else(|| config.get("approval_policy").and_then(toml::Value::as_str));
+    let sandbox =
+        explicit_sandbox.or_else(|| config.get("sandbox_mode").and_then(toml::Value::as_str));
+    match (approval, sandbox) {
+        (Some("never"), Some("danger-full-access")) => Some("yolo".into()),
+        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite".into()),
+        (Some("on-request"), Some("read-only")) => Some("readOnly".into()),
+        _ => None,
     }
 }
 
@@ -2199,6 +2301,8 @@ fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode
             )
             | (Provider::Codex, "--yolo" | "--dangerously-bypass-approvals-and-sandbox") => {}
             (Provider::Claude, value) if value.starts_with("--permission-mode=") => {}
+            (Provider::Codex, value)
+                if value.starts_with("--ask-for-approval=") || value.starts_with("--sandbox=") => {}
             _ => arguments.push(argument.clone()),
         }
     }
@@ -7516,6 +7620,176 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn codex_draft_permissions_wait_for_project_and_custom_policy_layers() {
+        let home = tempfile::tempdir().unwrap();
+        let account = home.path().join(".codex");
+        let project = home.path().join("project");
+        let cwd = project.join("nested");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let user_policy = "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n";
+        std::fs::write(account.join("config.toml"), user_policy).unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: cwd,
+            environment: [
+                ("HOME".into(), home.path().to_string_lossy().into_owned()),
+                ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+            ]
+            .into(),
+        };
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        for policy in [
+            "approval_policy = 'on-request'",
+            "sandbox_mode = 'read-only'",
+            "default_permissions = 'restricted'",
+            "[permissions.restricted]\nnetwork = false",
+        ] {
+            std::fs::write(project.join(".codex/config.toml"), policy).unwrap();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+            recipe.arguments = vec!["--yolo".into()];
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("yolo")
+            );
+            recipe.arguments = ["-a", "on-request", "-s", "read-only"]
+                .map(String::from)
+                .into();
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("readOnly")
+            );
+            recipe.arguments.clear();
+        }
+        std::fs::remove_file(project.join(".codex/config.toml")).unwrap();
+        for policy in [
+            "default_permissions = ':read-only'",
+            "[permissions.restricted]\nnetwork = false",
+        ] {
+            std::fs::write(
+                account.join("config.toml"),
+                format!("{user_policy}{policy}\n"),
+            )
+            .unwrap();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+            recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
+                .map(String::from)
+                .into();
+            assert_eq!(
+                draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+                Some("workspaceWrite")
+            );
+            recipe.arguments.clear();
+        }
+        std::fs::write(account.join("config.toml"), user_policy).unwrap();
+        // An account directory linked into the cwd hierarchy must not be
+        // mistaken for an independent project override.
+        recipe.working_directory = home.path().join("elsewhere");
+        recipe.unset_environment.insert("HOME".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+    }
+
+    #[test]
+    fn codex_draft_permissions_follow_the_selected_account_and_explicit_flags() {
+        let home = tempfile::tempdir().unwrap();
+        let config = "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from(FIXTURE_DIRECTORY),
+            environment: [(
+                "CODEX_HOME".into(),
+                home.path().to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        for arguments in [
+            vec!["--profile", "restricted"],
+            vec!["-c", "sandbox_mode='read-only'"],
+            vec!["--config=approval_policy='on-request'"],
+        ] {
+            recipe.arguments = arguments.into_iter().map(String::from).collect();
+            assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        }
+        recipe.arguments = ["-a", "on-request", "--sandbox=workspace-write"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("workspaceWrite")
+        );
+        set_draft_permission_mode(&mut recipe, Provider::Codex, "readOnly");
+        assert!(
+            !recipe
+                .arguments
+                .iter()
+                .any(|arg| arg.starts_with("--sandbox="))
+        );
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("readOnly")
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+            config
+        );
+
+        recipe.arguments.clear();
+        recipe.working_directory = home.path().to_path_buf();
+        recipe.environment.insert("CODEX_HOME".into(), ".".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("yolo")
+        );
+        recipe
+            .environment
+            .insert("HOME".into(), home.path().to_string_lossy().into_owned());
+        recipe.unset_environment = ["CODEX_HOME".into(), "HOME".into()].into();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        recipe.unset_environment.clear();
+
+        recipe.arguments.clear();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("config.toml"),
+            "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
+        )
+        .unwrap();
+        recipe.environment.insert(
+            "CODEX_HOME".into(),
+            other.path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Codex).as_deref(),
+            Some("readOnly")
+        );
+        std::fs::write(
+            other.path().join("config.toml"),
+            "approval_policy = 'untrusted'\nsandbox_mode = 'read-only'\n",
+        )
+        .unwrap();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+        std::fs::write(other.path().join("config.toml"), "malformed TOML [").unwrap();
+        assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
     }
 
     #[test]

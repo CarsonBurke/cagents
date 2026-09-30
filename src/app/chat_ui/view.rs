@@ -1999,15 +1999,24 @@ impl Runtime {
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor = widget::button::custom(design::caption(
-                    selected.map_or("Configured permissions", |index| {
-                        permission_mode_label(&modes[index])
-                    }),
-                ))
-                .name("Choose permission mode")
-                .class(crate::ui_controls::control_style(open, None))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(target, !open)));
+                let anchor =
+                    widget::button::custom(
+                        widget::row::with_children(vec![
+                            design::caption(selected.map_or("Permissions", |index| {
+                                permission_mode_label(&modes[index])
+                            }))
+                            .into(),
+                            widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
+                                .size(design::COMPACT_ICON_SIZE)
+                                .into(),
+                        ])
+                        .spacing(step::GAP_XS)
+                        .align_y(Alignment::Center),
+                    )
+                    .name("Choose permission mode")
+                    .class(crate::ui_controls::control_style(open, None))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::PermissionPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         modes
