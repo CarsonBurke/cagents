@@ -2103,7 +2103,8 @@ fn process_inner(
                 (record.handle.clone(), record.session.clone())
             };
             session.launch.session_id = handle.confirmed_session_id();
-            let recipe = session.launch.terminal_recipe().ok_or_else(|| unavailable(
+            let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
             if session.launch.provider == Provider::Codex
@@ -2122,14 +2123,8 @@ fn process_inner(
                     "A shared Codex source must be reattached, not replaced",
                 ));
             }
-            let snapshot = handle.snapshot(None).expect("unconditional snapshot");
-            if snapshot.busy || !snapshot.requests.is_empty() {
-                return Err(unavailable(
-                    "Finish or interrupt the active exchange before returning to terminal",
-                ));
-            }
             let terminal_id = crate::model::TerminalId::new();
-            let terminal = crate::model::TerminalSession {
+            let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
                 id: terminal_id,
@@ -2161,6 +2156,8 @@ fn process_inner(
                 record.completion_observed = false;
                 state.inventory_generation += 1;
             }
+            // Closing interrupts active work and waits for confirmed teardown.
+            // Never start a second writer before teardown has been proved.
             handle.close().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
             if snapshot.session_id != session.launch.session_id {
@@ -2168,6 +2165,17 @@ fn process_inner(
                     "Provider identity changed during shutdown; retry the exact terminal handoff",
                 ));
             }
+            // Autonomous policy changes can arrive while the native writer
+            // shuts down. The final confirmed snapshot wins over launch flags.
+            let recipe = session
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
+            terminal.launch = recipe.clone();
+            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            };
             let descriptor = super::state::spawn_terminal_with_environment(
                 host,
                 client,
@@ -4056,15 +4064,25 @@ for line in sys.stdin:
     /// must still see the close succeed and its connection stay usable.
     #[test]
     fn a_control_client_closes_a_live_chat_it_attached_to() {
-        control_client_closes_chat(false);
+        control_client_closes_chat(false, false);
     }
 
     #[test]
     fn a_control_client_waits_for_slow_provider_interruption_before_closing() {
-        control_client_closes_chat(true);
+        control_client_closes_chat(true, false);
     }
 
-    fn control_client_closes_chat(slow: bool) {
+    #[test]
+    fn returning_to_terminal_waits_for_provider_interruption() {
+        control_client_closes_chat(true, true);
+    }
+
+    fn control_client_closes_chat(slow: bool, return_terminal: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = directory.path().join("claude");
+        std::fs::write(&cli, "#!/bin/sh\nexec cat\n").unwrap();
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         struct Interruptible;
         impl Adapter for Interruptible {
             fn initialize(&mut self) -> Result<Step, String> {
@@ -4077,12 +4095,19 @@ for line in sys.stdin:
                     events: Vec::new(),
                 })
             }
-            fn receive(&mut self, _: Value) -> Result<Step, String> {
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
                     writes: Vec::new(),
-                    events: vec![Event::Status {
-                        busy: false,
-                        detail: "Interrupted".into(),
+                    events: vec![if value.get("ready").is_some() {
+                        Event::Session {
+                            id: "12345678-1234-4234-8234-123456789abc".into(),
+                            title: None,
+                        }
+                    } else {
+                        Event::Status {
+                            busy: false,
+                            detail: "Interrupted".into(),
+                        }
                     }],
                 })
             }
@@ -4100,7 +4125,7 @@ for line in sys.stdin:
             arguments: if slow {
                 vec![
                     "-c".into(),
-                    "read -r interrupt; sleep 6; printf '{\"done\":true}\\n'; exec cat".into(),
+                    "printf '{\"ready\":true}\\n'; read -r interrupt; sleep 6; printf '{\"done\":true}\\n'; exec cat".into(),
                 ]
             } else {
                 Vec::new()
@@ -4116,6 +4141,19 @@ for line in sys.stdin:
                 detail: "Working".into(),
             });
         }
+        if return_terminal {
+            initial.events.push(Event::Session {
+                id: "12345678-1234-4234-8234-123456789abc".into(),
+                title: None,
+            });
+            initial.events.push(Event::Request(chat::Request {
+                id: "pending-approval".into(),
+                title: "Edit".into(),
+                description: "Waiting for approval".into(),
+                fields: Vec::new(),
+                actions: Vec::new(),
+            }));
+        }
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let weak = Arc::downgrade(&host);
         let handle = Handle::start(
@@ -4127,17 +4165,39 @@ for line in sys.stdin:
             },
             initial,
             store,
-            None,
+            return_terminal.then(|| "12345678-1234-4234-8234-123456789abc".into()),
             move |update| changed(&weak, chat_id, update),
         )
         .unwrap();
+        if return_terminal {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.confirmed_session_id().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider did not confirm identity"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         let session = Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: chat_id,
             launch: chat::Launch {
-                provider: Provider::Codex,
-                recipe,
+                provider: if return_terminal {
+                    Provider::Claude
+                } else {
+                    Provider::Codex
+                },
+                recipe: if return_terminal {
+                    LaunchRecipe {
+                        program: cli.to_string_lossy().into_owned(),
+                        arguments: Vec::new(),
+                        ..recipe
+                    }
+                } else {
+                    recipe
+                },
                 session_id: None,
             },
             proof: Some(proof),
@@ -4152,13 +4212,16 @@ for line in sys.stdin:
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
-                subscribers: BTreeMap::new(),
+                subscribers: if return_terminal {
+                    BTreeMap::from([(1, true)])
+                } else {
+                    BTreeMap::new()
+                },
                 observations: BTreeMap::new(),
                 completion_observed: false,
                 returning_terminal: false,
             },
         );
-        let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let server_host = Arc::clone(&host);
@@ -4169,7 +4232,26 @@ for line in sys.stdin:
 
         let mut client = crate::control::ControlClient::connect(&socket).unwrap();
         let started = Instant::now();
-        client.close_chat(session).unwrap();
+        if return_terminal {
+            host.lock().unwrap().register_client(1);
+            let ServerResponse::ChatTerminal {
+                session: terminal, ..
+            } = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap()
+            else {
+                panic!("chat did not return to terminal")
+            };
+            assert!(
+                terminal
+                    .launch
+                    .arguments
+                    .windows(2)
+                    .any(|args| args == ["--resume", "12345678-1234-4234-8234-123456789abc"])
+            );
+            let replacement = host.lock().unwrap().terminals.remove(&terminal.id).unwrap();
+            replacement.handle.shutdown();
+        } else {
+            client.close_chat(session).unwrap();
+        }
         if slow {
             assert!(started.elapsed() >= Duration::from_secs(6));
         }

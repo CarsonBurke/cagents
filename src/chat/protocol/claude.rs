@@ -169,7 +169,7 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                 return Err(format!("Invalid value for Claude {flag}"));
             }
             if flag == "--permission-mode"
-                && !matches!(value, "manual" | "auto" | "bypassPermissions")
+                && !matches!(value, "default" | "manual" | "auto" | "bypassPermissions")
                 && !MODES.contains(&value)
             {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
@@ -2354,6 +2354,7 @@ impl Claude {
             | "api_retry"
             | "thinking_tokens"
             | "background_tasks_changed"
+            | "vcs_state_changed"
             | "elicitation_complete" => {}
             other => step.events.push(Event::Error {
                 message: format!("Unsupported Claude system event {other}: {frame}"),
@@ -4301,11 +4302,13 @@ mod tests {
         ];
         let preserved = arguments(&launch).unwrap();
         assert_eq!(&preserved[..4], &launch.recipe.arguments);
-        launch.recipe.arguments = vec!["--permission-mode=auto".into()];
-        assert_eq!(
-            &arguments(&launch).unwrap()[..2],
-            &["--permission-mode", "auto"]
-        );
+        for mode in ["auto", "manual", "default"] {
+            launch.recipe.arguments = vec![format!("--permission-mode={mode}")];
+            assert_eq!(
+                &arguments(&launch).unwrap()[..2],
+                &["--permission-mode", mode]
+            );
+        }
     }
 
     #[test]
@@ -4635,6 +4638,55 @@ mod tests {
             quiet.events.is_empty() && quiet.writes.is_empty(),
             "an auxiliary frame is not transcript data: {quiet:?}"
         );
+    }
+
+    #[test]
+    fn vcs_notifications_do_not_interrupt_pending_permission_controls() {
+        let mut adapter = Claude::default();
+        let request = approval(
+            "approve-edit",
+            "Edit",
+            json!({"file_path":"/repo/file","old_string":"old","new_string":"new"}),
+        );
+        adapter.receive(request).unwrap();
+        let change = adapter
+            .command(Command::SetPermissionMode {
+                mode: "acceptEdits".into(),
+            })
+            .unwrap();
+        let quiet = adapter.receive(json!({"type":"system","subtype":"vcs_state_changed","uuid":"git-change","cwd":"/repo","kind":"rebase","session_id":"d1714898-6c54-4727-8113-0d5b9db7aeb9"})).unwrap();
+        assert!(
+            quiet
+                .events
+                .iter()
+                .all(|event| matches!(event, Event::Session { .. }))
+                && quiet.writes.is_empty()
+        );
+        let mode = adapter
+            .receive(reply(
+                change.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(mode.events.iter().any(
+            |event| matches!(event, Event::PermissionMode(Some(mode)) if mode == "acceptEdits")
+        ));
+        let approved = adapter
+            .command(Command::Answer {
+                request_id: "approve-edit".into(),
+                action: "allow".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            approved.writes[0]["response"]["response"]["behavior"],
+            "allow"
+        );
+        assert_eq!(
+            approved.writes[0]["response"]["response"]["updatedInput"]["new_string"],
+            "new"
+        );
+        assert!(adapter.pending.is_empty());
     }
 
     /// A list that does not mark Claude Code's own commands cannot tell

@@ -98,6 +98,21 @@ pub struct Launch {
 }
 
 impl Launch {
+    /// Resume with the last provider-confirmed Claude policy. A permission
+    /// change is session state, so an original CLI bypass must not restore it
+    /// when the user returns from native chat.
+    pub(crate) fn terminal_recipe_with_permission_mode(
+        &self,
+        mode: Option<&str>,
+    ) -> Option<LaunchRecipe> {
+        let mut recipe = self.terminal_recipe()?;
+        if self.provider == Provider::Claude
+            && let Some(mode) = mode
+        {
+            apply_claude_permission_mode(&mut recipe, mode);
+        }
+        Some(recipe)
+    }
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
@@ -132,6 +147,31 @@ impl Launch {
         recipe.arguments = arguments;
         crate::model::agent_recovery::resume_recipe(&recipe)
     }
+}
+
+pub(crate) fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
+    if !matches!(
+        mode,
+        "default" | "manual" | "auto" | "acceptEdits" | "plan" | "dontAsk" | "bypassPermissions"
+    ) {
+        return false;
+    }
+    recipe.environment.remove("CLAUDE_CODE_PERMISSION_MODE");
+    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+    let mut original = recipe.arguments.iter();
+    while let Some(argument) = original.next() {
+        match argument.as_str() {
+            "--permission-mode" => {
+                original.next();
+            }
+            "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions" => {}
+            value if value.starts_with("--permission-mode=") => {}
+            _ => arguments.push(argument.clone()),
+        }
+    }
+    arguments.extend(["--permission-mode".into(), mode.into()]);
+    recipe.arguments = arguments;
+    true
 }
 
 /// What a card is asking the daemon to do with a conversation.
@@ -1287,6 +1327,54 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {
+        let launch = Launch {
+            provider: Provider::Claude,
+            recipe: LaunchRecipe {
+                program: "claude".into(),
+                arguments: vec![
+                    "--permission-mode=manual".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--model".into(),
+                    "opus".into(),
+                ],
+                working_directory: "/project".into(),
+                environment: [("CLAUDE_CONFIG_DIR".into(), "/selected-account".into())].into(),
+                unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+            },
+            session_id: Some("d1714898-6c54-4727-8113-0d5b9db7aeb9".into()),
+        };
+        let recipe = launch
+            .terminal_recipe_with_permission_mode(Some("acceptEdits"))
+            .unwrap();
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--model",
+                "opus",
+                "--resume",
+                "d1714898-6c54-4727-8113-0d5b9db7aeb9",
+                "--permission-mode",
+                "acceptEdits"
+            ]
+        );
+        assert_eq!(recipe.environment, launch.recipe.environment);
+        assert_eq!(recipe.unset_environment, launch.recipe.unset_environment);
+        assert_eq!(recipe.working_directory, launch.recipe.working_directory);
+        assert!(
+            launch
+                .recipe
+                .arguments
+                .iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+        );
+        assert_eq!(
+            launch.terminal_recipe_with_permission_mode(None),
+            launch.terminal_recipe()
+        );
+    }
 
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]

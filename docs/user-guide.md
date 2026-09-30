@@ -563,6 +563,10 @@ the recorded account selection; choose **System default** to inherit credentials
 
 Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**,
 and the New tab menu starts a native conversation without a terminal.
+The focused tab has a switch button next to its close control; the same action
+is in its context menu. **Return to terminal** resumes an existing conversation
+in the provider's TUI. **Open in terminal** starts the selected provider's CLI
+when the chat has not started, preserving its account and permission settings.
 
 The switch uses the provider's exact conversation identity, never terminal-text
 scraping, a most-recent-session lookup, or a fork, and there is no
@@ -576,7 +580,8 @@ automatically.
 
 - **OMP and Claude** use a stop-and-resume handoff: active work is interrupted,
   the CLI stops, and native chat resumes the same conversation. Returning to
-  the terminal stops the native writer before resuming the CLI. Unsent drafts,
+  the terminal interrupts active work and stops the native writer before
+  resuming the CLI, preserving the confirmed Claude permission mode. Unsent drafts,
   attachments, and pending commands block the return so they are not lost.
   This is a handoff, not a simultaneous live view: only one side runs at a
   time, and available history depends on the provider. The original launch
