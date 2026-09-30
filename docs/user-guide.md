@@ -62,6 +62,10 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   scroll positions.
 - Right-click project or worktree rows for their actions. Icon tooltips appear
   after 300 milliseconds.
+- Deleting a worktree warns about uncommitted files and unsaved editor changes.
+  Confirming discards those changes and removes the worktree, while retaining
+  its branch. Primary and locked worktrees cannot be deleted; pending editor
+  saves must finish first.
 - Contextual external-editor icons open the current project, worktree, or file
   in your external editor.
 
@@ -146,6 +150,8 @@ request**, and **Details**; the sidebar toggle hides or reveals it.
   **History** (commits, their changed files, and diffs against the first
   parent, or the empty tree for an initial commit). Changes and Branch show
   their file counts.
+  The commit form has separate subject and optional description fields.
+  `Ctrl+Enter` commits when either field is focused and staged changes are ready.
 - **Pull request** inspects the worktree's matching PR, grouping description,
   checks, and discussion in collapsible sections.
 - **Details** follows the focused pane.
@@ -181,6 +187,10 @@ open PRs, including those with no local worktree. A matching worktree row opens
 its PR directly. The **pull request pane** shows open pull requests on the left, and the selected
 one's changed files with their GitHub **viewed** marks under a header that shows
 progress and links to GitHub.
+
+A pull request pane stays in the worktree or channel where you opened it.
+Worktree discovery and background GitHub refreshes update metadata without
+opening reviews in another workspace or moving focus to them.
 
 The shared browser in cagents and ceditor loads 50 PRs at a time. **Load more
 pull requests** follows the next cursor with no fixed total limit. Search by
@@ -610,8 +620,9 @@ Usage and cost come from provider reports.
   work when no picker is open. `Ctrl+End` returns to the latest messages;
   **New activity** indicates messages received while reading earlier history.
 - Type `@` to search tracked files by name. Attachment chips show the file name,
-  offer removal, and reveal the full path on hover. Up and Down in an empty
-  composer recall earlier prompts, including restored conversation history.
+  offer removal, and reveal the full path on hover. Up on the first line
+  recalls earlier prompts, including restored conversation history. Down past
+  the newest recalled prompt restores the unsent draft and its cursor position.
 - Claude permission controls describe each available mode and follow changes
   reported by the provider. Finished reasoning collapses into a summary that
   can be expanded. Long user prompts also offer an expand control.
