@@ -275,7 +275,8 @@ fn restore(
                     && restored.launch.provider == session.launch.provider =>
             {
                 if session.launch.session_id.is_some()
-                    && session.launch.session_id != restored.launch.session_id
+                    && (session.launch.session_id != restored.launch.session_id
+                        || session.launch.recipe != restored.launch.recipe)
                 {
                     if !super::is_upgrade_recovery(&session, &restored) {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
@@ -1816,6 +1817,68 @@ mod tests {
             &mut recovery,
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn same_thread_codex_resume_normalization_requires_explicit_rebind() {
+        let previous = host_proof("previous");
+        let live = host_proof("live");
+        let mut source = omp_card(None, Some(previous.clone()));
+        source.launch.provider = crate::agent::Provider::Codex;
+        source.launch.recipe.program = "codex".into();
+        source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        assert!(
+            source.claim_owned_codex_listener(std::path::Path::new("/run/test-native"), &previous)
+        );
+        source.launch.session_id = Some(CONVERSATION.into());
+        source.native_continuity = super::super::NativeContinuity::Durable {
+            provider_version: "0.100.0".into(),
+        };
+        let mut replacement = source.clone();
+        replacement.proof = Some(live.clone());
+        replacement
+            .launch
+            .recipe
+            .arguments
+            .splice(0..0, ["resume".into(), CONVERSATION.into()]);
+        let (outcome, _, recovery) = negotiate_with_recovery(
+            &live,
+            source.clone(),
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved {
+                    session: replacement.clone(),
+                },
+            },
+        );
+        assert!(
+            matches!(outcome, Ok(ClientRequest::ChatAttach { session }) if session == replacement)
+        );
+        assert_eq!(recovery, Some((source.clone(), replacement.clone())));
+        for alteration in 0..5 {
+            let mut invalid = replacement.clone();
+            match alteration {
+                0 => invalid.launch.recipe.arguments[1] = "other-thread".into(),
+                1 => invalid.launch.recipe.arguments.push("--different".into()),
+                2 => {
+                    invalid
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("ACCOUNT_HOME".into(), "/other".into());
+                }
+                3 => invalid.launch.recipe.program = "other-provider".into(),
+                _ => invalid.owned_codex_listener = None,
+            }
+            let (outcome, _, recovery) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Response {
+                    response: ServerResponse::UpgradeChatResolved { session: invalid },
+                },
+            );
+            assert!(outcome.is_err(), "alteration {alteration}");
+            assert!(recovery.is_none());
+        }
     }
 
     #[test]

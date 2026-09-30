@@ -665,7 +665,7 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
-    /// Commit a provider-confirmed ID rotation from authenticated daemon
+    /// Commit a provider-confirmed descriptor transition from authenticated daemon
     /// upgrade lineage. Ordinary snapshots cannot authorize this transition.
     pub fn rebind_chat_upgrade(
         &self,
@@ -4783,6 +4783,74 @@ mod tests {
         assert_eq!(restored_metadata.byte_len, 128);
         assert_eq!(restored_metadata.durable_offset, 96);
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn codex_resume_normalization_is_transactional_and_ordinary_saves_stay_strict() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Codex);
+        let previous = source
+            .terminal
+            .as_ref()
+            .unwrap()
+            .continuity
+            .live_proof()
+            .unwrap();
+        let conversation = source.launch.session_id.take();
+        source.proof = Some(previous.clone());
+        source.terminal = None;
+        source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        assert!(source.claim_owned_codex_listener(Path::new("/run/test-native"), &previous));
+        source.launch.session_id = conversation;
+        source.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.100.0".into(),
+        };
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement.proof.as_mut().unwrap().host_incarnation = "next-daemon".into();
+        replacement.launch.recipe.arguments.splice(
+            0..0,
+            [
+                "resume".into(),
+                replacement.launch.session_id.clone().unwrap(),
+            ],
+        );
+        workspace.cards[0].kind = CardKind::Chat(replacement.clone());
+        assert!(lane.save(&store, &workspace).is_err());
+        let mut stale = source.clone();
+        stale
+            .launch
+            .recipe
+            .environment
+            .insert("ACCOUNT_HOME".into(), "/other".into());
+        assert!(
+            store
+                .rebind_chat_upgrade(card, &stale, &replacement)
+                .is_err()
+        );
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        store
+            .rebind_chat_upgrade(card, &source, &replacement)
+            .unwrap();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let reopened =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        assert_eq!(
+            reopened.load_card(card, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
     }
 
     #[test]
