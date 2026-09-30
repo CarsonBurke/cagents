@@ -1687,6 +1687,13 @@ fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>
             live.insert(row?);
         }
     }
+    let mut statement = connection.prepare(
+        "SELECT content_json FROM cards WHERE kind_tag = 'terminal' AND content_json IS NOT NULL",
+    )?;
+    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        let terminal: TerminalSession = from_json("archived terminal", &row?)?;
+        live.insert(terminal.id.to_string());
+    }
     Ok(())
 }
 
@@ -2722,6 +2729,26 @@ fn save_closed_card(
     stored: Option<&ExistingCard>,
     timestamp: i64,
 ) -> Result<u64> {
+    if let Some(stored) = stored
+        && stored.kind == PersistedCardKind::Terminal
+        && transaction.query_row(
+            "SELECT content_json IS NOT NULL FROM cards WHERE card_id = ?1",
+            [card.id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        if expected != stored.generation {
+            return Err(StoreError::StaleGeneration {
+                entity: format!("card {}", card.id),
+                expected,
+                actual: stored.generation,
+            });
+        }
+        // This tombstone's terminal is now owned by another open card. Keep
+        // its archived historical descriptor; a stale snapshot must never
+        // reclaim that live identity or erase the archive.
+        return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
+    }
     transaction.execute_batch("SAVEPOINT closed_card")?;
     let written = save_card(
         transaction,
@@ -3392,20 +3419,27 @@ fn replace_terminal_identity_transaction(
         )));
     }
 
-    if let Some(existing_card) = transaction
+    let archived_owner = if let Some((existing_card, existence)) = transaction
         .query_row(
-            "SELECT card_id FROM terminal_recipes WHERE terminal_id = ?1",
+            "SELECT t.card_id, c.existence_json FROM terminal_recipes t
+             JOIN cards c ON c.card_id = t.card_id WHERE t.terminal_id = ?1",
             [replacement.id.to_string()],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
         && existing_card != card_id.to_string()
     {
-        return Err(StoreError::InvalidState(format!(
-            "terminal_id {} already belongs to card {existing_card}",
-            replacement.id
-        )));
-    }
+        let existence: Existence = from_json("card existence", &existence)?;
+        if !matches!(existence, Existence::Closed { .. }) {
+            return Err(StoreError::InvalidState(format!(
+                "terminal_id {} already belongs to card {existing_card}",
+                replacement.id
+            )));
+        }
+        Some(parse_id::<CardId>("card", &existing_card)?)
+    } else {
+        None
+    };
 
     let Some(kind) = transaction
         .query_row(
@@ -3415,6 +3449,11 @@ fn replace_terminal_identity_transaction(
         )
         .optional()?
     else {
+        if archived_owner.is_some() {
+            return Err(StoreError::InvalidState(format!(
+                "terminal card {card_id} must be saved before adopting a closed card's terminal"
+            )));
+        }
         // A terminal can exit before its first debounced workspace snapshot.
         // The ordered snapshot following this operation establishes the fresh
         // identity without ever persisting the superseded one.
@@ -3450,6 +3489,14 @@ fn replace_terminal_identity_transaction(
     let recipe_json = to_json(&replacement.launch)?;
     let continuity_json = to_json(&replacement.continuity)?;
     let timestamp = now_unix_ms();
+    if let Some(owner) = archived_owner {
+        let archived = load_terminal_record(transaction, owner)?;
+        transaction.execute(
+            "UPDATE cards SET content_json = ?1, content_hash = NULL, updated_at_unix_ms = ?2
+             WHERE card_id = ?3",
+            params![to_json(&archived)?, timestamp, owner.to_string()],
+        )?;
+    }
     transaction.execute(
         "DELETE FROM transcript_metadata WHERE terminal_id = ?1",
         [expected_terminal_id.to_string()],
@@ -3463,11 +3510,10 @@ fn replace_terminal_identity_transaction(
             "terminal identity {expected_terminal_id} changed during relaunch"
         )));
     }
+    // A closed historical owner has just been archived. Updating this same
+    // terminal row transfers ownership without dropping its transcript metadata.
     transaction.execute(
-        "INSERT INTO terminal_recipes (
-            terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-            updated_at_unix_ms, recovery_origin, owned_codex_listener
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        UPSERT_TERMINAL_RECIPE,
         params![
             replacement.id.to_string(),
             card_id.to_string(),
@@ -3486,10 +3532,7 @@ fn replace_terminal_identity_transaction(
     )?;
     if let Some(path) = &replacement.transcript_path {
         transaction.execute(
-            "INSERT INTO transcript_metadata (
-                terminal_id, generation, path_json, byte_len, durable_offset,
-                updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            UPSERT_TRANSCRIPT_PATH,
             params![
                 replacement.id.to_string(),
                 generation,
@@ -3839,6 +3882,15 @@ fn load_card_connection(
         return Ok(None);
     };
     let kind = match PersistedCardKind::parse(&kind)? {
+        PersistedCardKind::Terminal
+            if content.is_some()
+                && matches!(
+                    from_json::<Existence>("card existence", &existence)?,
+                    Existence::Closed { .. }
+                ) =>
+        {
+            CardKind::Terminal(from_json("archived terminal", content.as_deref().unwrap())?)
+        }
         PersistedCardKind::Terminal => {
             CardKind::Terminal(load_terminal(connection, id, current_boot, proof)?)
         }
@@ -3893,6 +3945,13 @@ fn load_terminal(
     current_boot: &BootId,
     proof: Option<&HostSessionProof>,
 ) -> Result<TerminalSession> {
+    let mut terminal = load_terminal_record(connection, card_id)?;
+    terminal.continuity =
+        continuity_for_restore(terminal.continuity, &terminal.launch, current_boot, proof);
+    Ok(terminal)
+}
+
+fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<TerminalSession> {
     // `.optional()` rather than `?`: a terminal card whose recipe row is gone
     // is a per-card restore failure the caller can report, not a raw
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
@@ -3929,8 +3988,7 @@ fn load_terminal(
     };
     let terminal_id: TerminalId = parse_id("terminal", &terminal_id)?;
     let launch = from_json("terminal recipe", &recipe_json)?;
-    let stored = from_json("terminal continuity", &continuity_json)?;
-    let continuity = continuity_for_restore(stored, &launch, current_boot, proof);
+    let continuity = from_json("terminal continuity", &continuity_json)?;
     let transcript_path = connection
         .query_row(
             "SELECT path_json FROM transcript_metadata WHERE terminal_id = ?1",
@@ -6228,6 +6286,159 @@ mod tests {
         assert_eq!(stored_card_row(&store, card_id).2, None);
         lane.save(&store, &loaded).unwrap();
         assert!(stored_card_row(&store, card_id).2.is_some());
+    }
+
+    #[test]
+    fn recovered_identity_transfers_from_closed_card_without_losing_history() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let original_card = workspace.cards[0].id;
+        let CardKind::Terminal(original) = workspace.cards[0].kind.clone() else {
+            panic!();
+        };
+        let mut history = workspace.cards[0].clone();
+        history.id = CardId::new();
+        let mut replacement = original.clone();
+        replacement.id = TerminalId::new();
+        replacement.recovery_origin = Some(original.id);
+        replacement.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: replacement.launch.clone(),
+            last_exit: None,
+        };
+        history.kind = CardKind::Terminal(replacement.clone());
+        let history_card = history.id;
+        workspace.cards.push(history);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        // An open card's identity remains exclusive.
+        assert!(
+            store
+                .replace_terminal_identity(original_card, original.id, &replacement)
+                .is_err()
+        );
+        workspace.cards[1].existence = Existence::Closing {
+            operation_id: OperationId::new(),
+        };
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .replace_terminal_identity(original_card, original.id, &replacement)
+                .is_err()
+        );
+        workspace.cards[1].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 123,
+                reason: Some("closed by user".into()),
+            },
+        };
+        lane.save(&store, &workspace).unwrap();
+        // A stale source cannot archive or transfer the closed owner's payload.
+        assert!(
+            store
+                .replace_terminal_identity(CardId::new(), original.id, &replacement)
+                .is_err()
+        );
+        assert!(
+            store
+                .replace_terminal_identity(original_card, TerminalId::new(), &replacement)
+                .is_err()
+        );
+        assert!(
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .query_row(
+                    "SELECT content_json IS NULL FROM cards WHERE card_id = ?1",
+                    [history_card.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+        store
+            .save_transcript_metadata(
+                replacement.id,
+                &TranscriptMetadata {
+                    path: replacement.transcript_path.clone().unwrap(),
+                    byte_len: 123,
+                    durable_offset: 100,
+                    updated_at_unix_ms: 42,
+                },
+                0,
+            )
+            .unwrap();
+        let transcript_before = store.load_transcript_metadata(replacement.id).unwrap();
+        store
+            .replace_terminal_identity(original_card, original.id, &replacement)
+            .unwrap();
+        assert_eq!(
+            store
+                .load_transcript_metadata(replacement.id)
+                .unwrap()
+                .map(|(_, metadata)| (metadata.byte_len, metadata.durable_offset)),
+            transcript_before.map(|(_, metadata)| (metadata.byte_len, metadata.durable_offset))
+        );
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored.cards[0].kind,
+            CardKind::Terminal(replacement.clone())
+        );
+        assert_eq!(
+            restored.cards[1].kind,
+            CardKind::Terminal(replacement.clone())
+        );
+        assert_eq!(restored.cards[1].existence, workspace.cards[1].existence);
+        workspace.cards[0].kind = CardKind::Terminal(replacement.clone());
+        lane.save(&store, &workspace).unwrap();
+        // Even after active ownership is released, an old closed snapshot
+        // must not reclaim the payload identity or erase its archived history.
+        {
+            let inner = store.lock_inner().unwrap();
+            inner
+                .connection
+                .execute(
+                    "DELETE FROM transcript_metadata WHERE terminal_id = ?1",
+                    [replacement.id.to_string()],
+                )
+                .unwrap();
+            inner
+                .connection
+                .execute(
+                    "DELETE FROM terminal_recipes WHERE terminal_id = ?1",
+                    [replacement.id.to_string()],
+                )
+                .unwrap();
+        }
+        let inner = store.lock_inner().unwrap();
+        let mut live = HashSet::new();
+        collect_live_terminal_ids(&inner.connection, &mut live).unwrap();
+        assert!(live.contains(&replacement.id.to_string()));
+        drop(inner);
+        // Save just the closed card: the active card has been deliberately
+        // removed from this fixture's snapshot and becomes a tombstone.
+        workspace.cards.remove(0);
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store.load_card(history_card, None).unwrap().unwrap().kind,
+            CardKind::Terminal(replacement)
+        );
+        let inner = store.lock_inner().unwrap();
+        assert_eq!(
+            inner
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM terminal_recipes WHERE card_id = ?1",
+                    [history_card.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

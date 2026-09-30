@@ -5504,7 +5504,8 @@ impl Cagents {
         if self.refuse_in_deleting_worktree(&launch.working_directory) {
             return Task::none();
         }
-        let scope = if self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
+        let scope = if self.durable.active_channel.is_none()
+            && self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
         {
             self.select_worktree(launch.working_directory.clone(), false)
         } else {

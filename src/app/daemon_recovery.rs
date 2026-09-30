@@ -88,35 +88,19 @@ fn reconcile_at(
     let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
     let proof = client.proof().clone();
     let terminals = client.list().map_err(|error| error.to_string())?;
+    let original = terminals.iter().find(|terminal| {
+        terminal.session.id == session.id && terminal.session.launch == session.launch
+    });
     if proof == expected {
-        let terminal = terminals
-            .iter()
-            .find(|terminal| {
-                terminal.session.id == session.id && terminal.session.launch == session.launch
-            })
-            .ok_or(
-                "the original daemon is live but no matching terminal exists; relaunch is unsafe",
-            )?;
-        if terminal.session.continuity.can_resume_live(&expected) {
+        if let Some(terminal) = original
+            && terminal.session.continuity.can_resume_live(&expected)
+        {
             return Ok(RecoveredTerminal {
                 attach_completed: false,
                 session: terminal.session.clone(),
                 expected_host: Some(expected),
                 recovery_lease,
             });
-        }
-        if !matches!(
-            terminal.session.continuity,
-            crate::model::TerminalContinuity::RelaunchAvailable { .. }
-        ) {
-            return Err(
-                "the original terminal's exit is not established; preserving its identity".into(),
-            );
-        }
-        if !explicit_retry {
-            return Err(
-                "the terminal exited while disconnected; use Retry to launch it again".into(),
-            );
         }
     }
     if proof != expected
@@ -156,8 +140,7 @@ fn reconcile_at(
     // only when its exact conversation or plain terminal recipe agrees too.
     let origin = session.recovery_origin.unwrap_or(session.id);
     let mut descendants = terminals.iter().filter(|terminal| {
-        proof != expected
-            && terminal.session.recovery_origin == Some(origin)
+        terminal.session.recovery_origin == Some(origin)
             && terminal.session.continuity.can_resume_live(&proof)
             && same_recovery_content(&session, &terminal.session)
     });
@@ -174,13 +157,32 @@ fn reconcile_at(
             recovery_lease,
         });
     }
-    if proof != expected
-        && terminals.iter().any(|terminal| {
-            terminal.session.recovery_origin == Some(origin)
-                && terminal.session.continuity.can_resume_live(&proof)
-        })
-    {
+    if terminals.iter().any(|terminal| {
+        terminal.session.recovery_origin == Some(origin)
+            && terminal.session.continuity.can_resume_live(&proof)
+    }) {
         return Err("a live terminal shares this recovery lineage but its command or conversation differs; preserving it".into());
+    }
+    // An earlier recovery may already have replaced this terminal in the
+    // same daemon. Discover that authenticated live descendant before offering
+    // replay of the completed original; replay would duplicate its process.
+    if proof == expected {
+        let terminal = original.ok_or(
+            "the original daemon is live but no matching terminal exists; relaunch is unsafe",
+        )?;
+        if !matches!(
+            terminal.session.continuity,
+            crate::model::TerminalContinuity::RelaunchAvailable { .. }
+        ) {
+            return Err(
+                "the original terminal's exit is not established; preserving its identity".into(),
+            );
+        }
+        if !explicit_retry {
+            return Err(
+                "the terminal exited while disconnected; use Retry to launch it again".into(),
+            );
+        }
     }
     let owner = crate::daemon::replacement_owner(socket, &proof)
         .map_err(|error| format!("cannot establish replacement daemon ownership: {error}"))?;
@@ -451,6 +453,78 @@ mod tests {
         server.join().unwrap();
         assert_eq!(recovered.session, original);
         assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn same_daemon_adopts_live_recovery_descendant_before_replay() {
+        for explicit_retry in [false, true] {
+            for retain_original in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let socket = directory.path().join("daemon.sock");
+                let owner = proof("live");
+                let original = session(directory.path(), &owner);
+                let mut descendant = session(directory.path(), &owner);
+                descendant.recovery_origin = Some(original.id);
+                let mut descriptor = TerminalDescriptor::relaunchable(
+                    descendant.id,
+                    descendant.launch.clone(),
+                    None,
+                );
+                descriptor.session = descendant.clone();
+                let mut terminals = vec![descriptor];
+                if retain_original {
+                    terminals.push(TerminalDescriptor::relaunchable(
+                        original.id,
+                        original.launch.clone(),
+                        None,
+                    ));
+                }
+                let _lease = lease(directory.path(), &owner);
+                let server = discovery(&socket, owner.clone(), terminals, 1);
+                let recovered =
+                    reconcile_at(original, explicit_retry, &socket, directory.path()).unwrap();
+                server.join().unwrap();
+                assert_eq!(recovered.session, descendant);
+                assert_eq!(recovered.expected_host, Some(owner));
+                assert!(!recovered.attach_completed);
+            }
+        }
+    }
+
+    #[test]
+    fn same_daemon_recovery_rejects_conflicting_live_descendants() {
+        for ambiguous in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let owner = proof("live");
+            let original = session(directory.path(), &owner);
+            let mut descendant = session(directory.path(), &owner);
+            descendant.recovery_origin = Some(original.id);
+            if !ambiguous {
+                descendant
+                    .launch
+                    .arguments
+                    .push("--different-command".into());
+            }
+            let mut descriptor =
+                TerminalDescriptor::relaunchable(descendant.id, descendant.launch.clone(), None);
+            descriptor.session = descendant;
+            let mut terminals = vec![descriptor.clone()];
+            if ambiguous {
+                descriptor.session.id = crate::model::TerminalId::new();
+                terminals.push(descriptor);
+            }
+            let server = discovery(&socket, owner, terminals, 0);
+            let error = reconcile_at(original, true, &socket, directory.path())
+                .err()
+                .unwrap();
+            server.join().unwrap();
+            assert!(error.contains(if ambiguous {
+                "multiple live terminals"
+            } else {
+                "command or conversation differs"
+            }));
+        }
     }
 
     #[test]

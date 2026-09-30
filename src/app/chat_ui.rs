@@ -2962,7 +2962,9 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
+        let scope = if self.durable.active_channel.is_none()
+            && self.active_workspace.as_deref() != Some(working_directory.as_path())
+        {
             self.select_worktree(working_directory, false)
         } else {
             Task::none()
@@ -6252,6 +6254,44 @@ mod tests {
     const FIXTURE_DIRECTORY: &str = "/workspace/chat-fixture";
     /// Providers name conversations by UUID; resume refuses anything else.
     const KNOWN_THREAD: &str = "0199a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b";
+
+    #[test]
+    fn new_panes_keep_the_selected_channel_when_launch_directory_changes() {
+        for chat in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let source = app.workspace.focused().unwrap();
+            let root = PathBuf::from(FIXTURE_DIRECTORY);
+            let nested = root.join("src");
+            let channel = crate::model::ChannelId::new();
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.push(crate::model::ProjectChannel {
+                id: channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Conversation".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![source],
+                focused: Some(source),
+            });
+            durable.active_channel = Some(channel);
+            app.active_workspace = Some(root.clone());
+            if chat {
+                drop(app.new_native_chat(Provider::Codex, Some(nested.clone())));
+            } else {
+                drop(app.add_terminal_recipe(LaunchRecipe::shell(nested.clone()).unwrap()));
+            }
+            let added = app.workspace.focused().unwrap();
+            assert_ne!(added, source);
+            assert_eq!(app.active_workspace, Some(root));
+            assert_eq!(app.durable.active_channel, Some(channel));
+            assert!(app.durable.channels[0].cards.contains(&added));
+            assert!(app.durable.channels[0].cards.contains(&source));
+            assert_eq!(
+                crate::app::worktree_ui::card_directory(app.card_state(added).unwrap()),
+                Some(nested.as_path())
+            );
+        }
+    }
 
     /// A new conversation, which runs nothing until its first message is
     /// sent. Tasks are dropped throughout: nothing here starts a provider or
