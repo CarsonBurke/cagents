@@ -2162,10 +2162,16 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                         .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
                 })
                 .or_else(|| {
-                    recipe
-                        .environment
-                        .get("CLAUDE_CODE_PERMISSION_MODE")
-                        .cloned()
+                    (!recipe
+                        .unset_environment
+                        .contains("CLAUDE_CODE_PERMISSION_MODE"))
+                    .then(|| {
+                        recipe
+                            .environment
+                            .get("CLAUDE_CODE_PERMISSION_MODE")
+                            .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
+                    })
+                    .flatten()
                 })
                 .or_else(|| chat::claude_configured_default_mode(recipe))
                 .or_else(|| Some("manual".into()))
@@ -7720,6 +7726,56 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        let account = crate::account::Account::managed(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            config.path().into(),
+        );
+        let session = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            config.path().into(),
+            &account,
+        )
+        .unwrap();
+        let runtime = Runtime::new(
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+            session,
+            Connection::Draft,
+            true,
+            Default::default(),
+        );
+        assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("auto"));
+
+        let mut recipe = runtime.session.launch.recipe.clone();
+        recipe.arguments.clear();
+        recipe
+            .environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into(), "manual".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("manual")
+        );
+        recipe
+            .unset_environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into());
+        assert_eq!(
+            draft_permission_mode(&recipe, Provider::Claude).as_deref(),
+            Some("auto")
+        );
     }
 
     #[test]

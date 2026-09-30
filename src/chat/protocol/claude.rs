@@ -223,10 +223,14 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
     // defaults. Apply the account choice at the final transport boundary too.
     if !result.iter().any(|argument| {
         argument == "--permission-mode" || argument == "--dangerously-skip-permissions"
-    }) && !launch
+    }) && (!launch
         .recipe
         .environment
         .contains_key("CLAUDE_CODE_PERMISSION_MODE")
+        || launch
+            .recipe
+            .unset_environment
+            .contains("CLAUDE_CODE_PERMISSION_MODE"))
         && let Some(mode) = crate::chat::claude_configured_default_mode(&launch.recipe)
     {
         result.extend(["--permission-mode".into(), mode]);
@@ -4333,6 +4337,35 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--permission-mode", "auto"])
         );
+        let launch_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(launch_home.path().join(".claude")).unwrap();
+        std::fs::write(
+            launch_home.path().join(".claude/settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            launch_home.path().join(".claude/settings.local.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        launch.recipe.working_directory = launch_home.path().into();
+        launch.recipe.environment.insert(
+            "HOME".into(),
+            launch_home.path().to_string_lossy().into_owned(),
+        );
+        launch
+            .recipe
+            .unset_environment
+            .insert("CLAUDE_CONFIG_DIR".into());
+        assert!(
+            !arguments(&launch)
+                .unwrap()
+                .contains(&"--permission-mode".into())
+        );
+        launch.recipe.working_directory = config.path().into();
+        launch.recipe.unset_environment.clear();
+        launch.recipe.environment.remove("HOME");
         launch.recipe.environment.insert(
             "CLAUDE_CODE_PERMISSION_MODE".into(),
             "bypassPermissions".into(),
@@ -4341,6 +4374,16 @@ mod tests {
             !arguments(&launch)
                 .unwrap()
                 .contains(&"--permission-mode".into())
+        );
+        launch
+            .recipe
+            .unset_environment
+            .insert("CLAUDE_CODE_PERMISSION_MODE".into());
+        assert!(
+            arguments(&launch)
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "auto"])
         );
     }
 

@@ -1332,6 +1332,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn claude_default_permissions_use_the_launch_home_and_account_settings_layer() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".claude");
+        let cwd = home.path().join("project");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("settings.local.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        let mut recipe = LaunchRecipe {
+            unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: cwd,
+            environment: [("HOME".into(), home.path().to_string_lossy().into_owned())].into(),
+        };
+        assert_eq!(
+            claude_configured_default_mode(&recipe).as_deref(),
+            Some("auto")
+        );
+        recipe.working_directory = home.path().into();
+        assert_eq!(claude_configured_default_mode(&recipe), None);
+        recipe.working_directory = home.path().join("project");
+        recipe.unset_environment.clear();
+        recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "../.claude".into());
+        assert_eq!(
+            claude_configured_default_mode(&recipe).as_deref(),
+            Some("auto")
+        );
+        recipe.unset_environment = ["HOME".into(), "CLAUDE_CONFIG_DIR".into()].into();
+        assert_eq!(claude_configured_default_mode(&recipe), None);
+    }
+
+    #[test]
     fn a_provider_is_offered_only_the_attachments_it_takes() {
         let directory = tempfile::tempdir().unwrap();
         let file = |name: &str, bytes: u64| {
@@ -1600,14 +1644,55 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
         .then(|| mode.to_owned())
     }
 
-    let user_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let environment = |name: &str| {
+        (!recipe.unset_environment.contains(name))
+            .then(|| {
+                recipe
+                    .environment
+                    .get(name)
+                    .cloned()
+                    .or_else(|| std::env::var(name).ok())
+            })
+            .flatten()
+            .filter(|value| !value.is_empty())
+    };
+    let resolve = |path: std::path::PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            recipe.working_directory.join(path)
+        }
+    };
+    let user_home = environment("HOME")
+        .map(std::path::PathBuf::from)
+        .map(resolve);
+    let root = environment("CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .map(resolve)
+        .or_else(|| user_home.as_ref().map(|home| home.join(".claude")))?;
+    let account_settings = std::fs::canonicalize(root.join("settings.json")).ok();
     for directory in recipe.working_directory.ancestors() {
         if user_home.as_deref() == Some(directory) {
+            if recipe.working_directory == directory
+                && setting(&directory.join(".claude/settings.local.json")).is_some()
+            {
+                // HOME itself can be a project cwd. Its local setting then
+                // belongs to that session, but never to descendant projects.
+                return None;
+            }
             break;
         }
         if ["settings.local.json", "settings.json"]
             .into_iter()
-            .any(|name| setting(&directory.join(".claude").join(name)).is_some())
+            .any(|name| {
+                let path = directory.join(".claude").join(name);
+                if account_settings.is_some()
+                    && std::fs::canonicalize(&path).ok() == account_settings
+                {
+                    return false;
+                }
+                setting(&path).is_some()
+            })
         {
             // A project-specific choice belongs to Claude's own settings
             // handling, not to a command-line override from another account.
@@ -1615,16 +1700,7 @@ pub(crate) fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<St
         }
     }
 
-    let root = recipe
-        .environment
-        .get("CLAUDE_CONFIG_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".claude"))
-        })?;
-    ["settings.local.json", "settings.json"]
-        .into_iter()
-        .find_map(|name| setting(&root.join(name)))
-        .filter(|mode| mode != "default")
+    // Local settings belong to a project; a settings.local.json beside the
+    // account's user settings is not a user configuration layer.
+    setting(&root.join("settings.json")).filter(|mode| mode != "default")
 }
