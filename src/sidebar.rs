@@ -26,7 +26,7 @@ use unicode_casefold::UnicodeCaseFold;
 use url::Url;
 
 use crate::{
-    design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
+    design::{self, NavigationLayout, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
@@ -65,7 +65,9 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-const CHILD_ROW_ICON_SIZE: u16 = design::ROW_ICON_SIZE;
+// Sidebar identities use a smaller glyph while retaining the shared row grid.
+const ROW_ICON_SIZE: u16 = 14;
+const CHILD_ROW_ICON_SIZE: u16 = ROW_ICON_SIZE;
 const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
@@ -4313,14 +4315,15 @@ impl RowGrid {
 /// A project header: its identity row, with the hover-revealed commands
 /// mounted over the row's own trailing edge.
 ///
-/// The commands cover [`HEADER_ACTION_WIDTH`] of that edge, and the row is
-/// told so, which is what narrows the title for exactly as long as they are
-/// on screen and no longer.
+/// Only the identity yields space to hover commands. The disclosure stays at
+/// the right edge, so revealing commands cannot move its click target.
 fn project_header_row<'a>(
     identity: Element<'a, SidebarAction>,
     commands: Vec<Element<'a, SidebarAction>>,
+    disclosure: Element<'a, SidebarAction>,
 ) -> Element<'a, SidebarAction> {
-    RowInteraction::actions(
+    let reserve = commands.len() as f32 * ICON_CONTROL_SIZE;
+    let identity = RowInteraction::actions(
         identity,
         widget::container(
             widget::row::with_children(commands)
@@ -4330,8 +4333,12 @@ fn project_header_row<'a>(
         )
         .align_right(Length::Fill)
         .into(),
-        HEADER_ACTION_WIDTH,
-    )
+        reserve,
+    );
+    widget::row::with_children(vec![identity, disclosure])
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A project header's identity row: its icon and its name, across the whole
@@ -4354,18 +4361,7 @@ fn project_identity_row<'a>(
     let label = (!compact).then(|| project_name_label(project, query));
     let control = grid
         .control(
-            grid.content(
-                if compact {
-                    project_icon(project, ROW_ICON_SIZE)
-                } else {
-                    crate::ui_controls::symbolic_icon("project-drag-symbolic")
-                        .icon()
-                        .size(ROW_ICON_SIZE)
-                        .into()
-                },
-                label,
-                None,
-            ),
+            grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
             selected,
         )
         .id(chrome.open_id.clone())
@@ -4748,7 +4744,7 @@ fn project_view<'a>(
     );
 
     let disclosure: Element<'static, SidebarAction> = if has_children {
-        icon_action(
+        project_icon_action(
             if expanded {
                 "go-down-symbolic"
             } else {
@@ -4768,7 +4764,7 @@ fn project_view<'a>(
             .height(Length::Fixed(ICON_CONTROL_SIZE))
             .into()
     };
-    let add_worktree = icon_action(
+    let add_worktree = project_icon_action(
         "worktree-add-symbolic",
         chrome.new_worktree_name.to_string(),
         gated(
@@ -4780,7 +4776,7 @@ fn project_view<'a>(
         ),
         chrome.new_worktree_id.clone(),
     );
-    let add_channel = icon_action(
+    let add_channel = project_icon_action(
         "channel-add-symbolic",
         chrome.new_channel_name.to_string(),
         gated(SidebarAction::NewChannel { project_id }, modal_open),
@@ -4817,7 +4813,6 @@ fn project_view<'a>(
             (entity.channels.len() + entity.worktrees.len()).to_string(),
         ));
     }
-    identity = identity.push(disclosure);
     let header = project_header_row(
         identity.into(),
         if entity.kind == ProjectKind::Git {
@@ -4825,6 +4820,7 @@ fn project_view<'a>(
         } else {
             vec![add_channel]
         },
+        disclosure,
     );
     let header = context_controls(
         header,
@@ -8648,6 +8644,35 @@ fn panel_icon_action<'a>(
 }
 
 /// One icon command.
+fn project_icon_action<'a>(
+    icon_name: &'static str,
+    label: impl Into<Cow<'a, str>>,
+    action: Option<SidebarAction>,
+    id: Id,
+) -> Element<'a, SidebarAction> {
+    let label = label.into();
+    crate::interaction::tooltip(
+        button::custom(
+            widget::container(
+                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
+            )
+            .class(theme::Container::custom(|_| {
+                cosmic::iced::widget::container::Style::default()
+            }))
+            .center(Length::Fill),
+        )
+        .class(sidebar_button_style(false))
+        .id(id)
+        .name(label.clone())
+        .padding(0)
+        .width(ICON_CONTROL_SIZE)
+        .height(ICON_CONTROL_SIZE)
+        .on_press_maybe(action),
+        label,
+    )
+}
+
+/// One icon command in shared workspace chrome.
 fn icon_action<'a>(
     icon_name: &'static str,
     label: impl Into<Cow<'a, str>>,
@@ -11310,7 +11335,7 @@ pub(crate) mod tests {
     /// they cost the title nothing until they appear. A reservation that is
     /// always there is the same as no overlay at all.
     #[test]
-    fn a_project_title_keeps_the_whole_row_until_its_commands_appear() {
+    fn project_hover_commands_preserve_disclosure_position_and_reserve_only_visible_commands() {
         use cosmic::iced::{
             Event, Point, Rectangle,
             advanced::{Shell, clipboard},
@@ -11324,12 +11349,6 @@ pub(crate) mod tests {
             project_identity_row(&model.projects[0], false, false, false, false, ""),
             vec![
                 icon_action(
-                    "go-down-symbolic",
-                    "Collapse",
-                    None,
-                    Id::new("test.collapse"),
-                ),
-                icon_action(
                     "channel-add-symbolic",
                     "New channel",
                     None,
@@ -11342,6 +11361,12 @@ pub(crate) mod tests {
                     Id::new("test.worktree"),
                 ),
             ],
+            project_icon_action(
+                "go-down-symbolic",
+                "Collapse",
+                None,
+                Id::new("test.collapse"),
+            ),
         );
         let mut tree = Tree::new(&element);
         let label_edge = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
@@ -11350,13 +11375,14 @@ pub(crate) mod tests {
             navigation_rows(Layout::new(&node), &mut rows);
             assert_eq!(rows.len(), 1, "one header row");
             let label = rows[0].1[1];
-            label.x + label.width
+            let disclosure = Layout::new(&node).children().last().unwrap().bounds();
+            (label.x + label.width, disclosure)
         };
 
         let resting = label_edge(&mut element, &mut tree);
-        let content_edge = width - RowGrid::project(false).gutter();
+        let content_edge = width - ICON_CONTROL_SIZE - RowGrid::project(false).gutter();
         assert_eq!(
-            resting, content_edge,
+            resting.0, content_edge,
             "a hidden control reserves nothing: the title runs to the row's own content edge",
         );
 
@@ -11377,11 +11403,13 @@ pub(crate) mod tests {
         );
         let hovered = label_edge(&mut element, &mut tree);
         assert_eq!(
-            hovered,
-            content_edge - HEADER_ACTION_WIDTH,
+            hovered.0,
+            content_edge - 2.0 * ICON_CONTROL_SIZE,
             "once the commands are drawn the title stops exactly where they start, so nothing \
              visible runs under them",
         );
+        assert_eq!(resting.1, hovered.1, "the disclosure target stays in place");
+        assert_eq!(hovered.1.x + hovered.1.width, width);
     }
 
     /// Rows with open panes keep full strength and the rest recede. Channel
