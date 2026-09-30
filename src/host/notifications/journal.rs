@@ -1,15 +1,56 @@
 //! Single-writer durable attention, independent of workspace/card persistence.
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
 use uuid::Uuid;
 
 use crate::notifications::{Event, Notice, Target};
 
-const MAX_SESSIONS: usize = 2048;
-const KEYS_PER_SESSION: usize = 32;
+const MAX_SESSIONS: i64 = 2048;
+const KEYS_PER_SESSION: i64 = 32;
 
-pub(super) struct Journal(Connection);
+mod schema {
+    diesel::table! {
+        notices (session) {
+            session -> Text,
+            id -> Text,
+            event -> Text,
+            delivered -> Bool,
+            acknowledged -> Bool,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        seen (ordinal) {
+            session -> Text,
+            evidence -> Text,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        owners (session) {
+            session -> Text,
+            window -> Text,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        review_requests_seen (identity) {
+            identity -> Text,
+        }
+    }
+    diesel::allow_tables_to_appear_in_same_query!(notices, seen, owners, review_requests_seen);
+}
+use schema::{notices, owners, review_requests_seen, seen};
+
+// PRAGMAs describe the SQLite connection rather than application rows.
+#[derive(diesel::QueryableByName)]
+struct SchemaVersion {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    user_version: i32,
+}
+
+pub(super) struct Journal(SqliteConnection);
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -17,18 +58,29 @@ impl Journal {
             crate::secure_file::open_private_append_file(path)
                 .map_err(|error| error.to_string())?,
         );
-        let connection = Connection::open(path).map_err(|error| error.to_string())?;
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
+        // A URI preserves non-UTF8 filesystem names and quotes SQLite's URI
+        // metacharacters. A lossy display path could open a different database.
+        let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let uri = url::Url::from_file_path(absolute)
+            .map_err(|()| "Notification journal path cannot be represented as a file URI")?;
+        let mut connection =
+            SqliteConnection::establish(uri.as_str()).map_err(|error| error.to_string())?;
+        let version: SchemaVersion = diesel::sql_query("PRAGMA user_version")
+            .get_result(&mut connection)
             .map_err(|error| error.to_string())?;
-        if version > 3 {
+        if version.user_version > 3 {
             return Err("Notification journal was created by a newer cagents version".into());
         }
         connection
-            .busy_timeout(std::time::Duration::from_secs(1))
+            .batch_execute("PRAGMA busy_timeout=1000;")
             .map_err(|error| error.to_string())?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS notices (
+        connection
+            .batch_execute("PRAGMA journal_mode=WAL;")
+            .map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA synchronous=FULL;")
+            .map_err(|error| error.to_string())?;
+        connection.batch_execute("CREATE TABLE IF NOT EXISTS notices (
                 session TEXT PRIMARY KEY, id TEXT NOT NULL, event TEXT NOT NULL,
                 delivered INTEGER NOT NULL, acknowledged INTEGER NOT NULL,
                 ordinal INTEGER NOT NULL);
@@ -41,93 +93,122 @@ impl Journal {
         Ok(Self(connection))
     }
 
-    /// Coalesce a session's latest attention while retaining a bounded replay
-    /// ledger. A duplicate must not resurrect a dismissed notification.
+    /// Coalesce latest attention without resurrecting dismissed duplicates.
     pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
         event.validate()?;
         let session = event.target().storage_key();
         let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
         let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
-        let transaction = self.0.transaction().map_err(|error| error.to_string())?;
-        if let Target::PullRequest(request) = &event.target {
-            request.validate()?;
-            // The compact immutable identity outlives bounded notice payloads,
-            // dismissal, request removal, and daemon restarts. A new GitHub
-            // request node still receives its own alert.
-            let inserted = transaction
-                .execute(
-                    "INSERT OR IGNORE INTO review_requests_seen(identity) VALUES (?1)",
-                    [&session],
+        let result = self
+            .0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                if let Target::PullRequest(request) = &event.target {
+                    // Immutable review identity outlives bounded payloads and
+                    // dismissal; every new request node receives its own alert.
+                    debug_assert!(request.validate().is_ok());
+                    let inserted = diesel::insert_into(review_requests_seen::table)
+                        .values(review_requests_seen::identity.eq(&session))
+                        .on_conflict_do_nothing()
+                        .execute(connection)?;
+                    if inserted == 0 {
+                        return Err(diesel::result::Error::RollbackTransaction);
+                    }
+                }
+                let ordinal = diesel::insert_into(seen::table)
+                    .values((seen::session.eq(&session), seen::evidence.eq(&evidence)))
+                    .on_conflict_do_nothing()
+                    .returning(seen::ordinal)
+                    .get_result::<i64>(connection)
+                    .optional()?;
+                let Some(ordinal) = ordinal else {
+                    return Err(diesel::result::Error::RollbackTransaction);
+                };
+                let owner = event
+                    .source_session()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| session.clone());
+                let window = owners::table
+                    .find(&owner)
+                    .select(owners::window)
+                    .first::<String>(connection)
+                    .optional()?;
+                if let Some(window) = &window {
+                    remember_owner(connection, &session, window)?;
+                }
+                let notice = Notice {
+                    id: Uuid::new_v4(),
+                    event,
+                    delivered: suppressed,
+                    acknowledged: false,
+                    window,
+                };
+                let values = (
+                    notices::id.eq(notice.id.to_string()),
+                    notices::event.eq(&serialized),
+                    notices::delivered.eq(suppressed),
+                    notices::acknowledged.eq(false),
+                    notices::ordinal.eq(ordinal),
+                );
+                diesel::insert_into(notices::table)
+                    .values((notices::session.eq(&session), values.clone()))
+                    .on_conflict(notices::session)
+                    .do_update()
+                    .set(values)
+                    .execute(connection)?;
+                let recent_seen = diesel::alias!(seen as recent_seen);
+                diesel::delete(
+                    seen::table.filter(seen::session.eq(&session)).filter(
+                        seen::ordinal.ne_all(
+                            recent_seen
+                                .filter(recent_seen.field(seen::session).eq(&session))
+                                .select(recent_seen.field(seen::ordinal))
+                                .order(recent_seen.field(seen::ordinal).desc())
+                                .limit(KEYS_PER_SESSION),
+                        ),
+                    ),
                 )
-                .map_err(|error| error.to_string())?;
-            if inserted == 0 {
-                return Ok(None);
-            }
+                .execute(connection)?;
+                let recent_notices = diesel::alias!(notices as recent_notices);
+                diesel::delete(
+                    notices::table.filter(
+                        notices::session.ne_all(
+                            recent_notices
+                                .select(recent_notices.field(notices::session))
+                                .order(recent_notices.field(notices::ordinal).desc())
+                                .limit(MAX_SESSIONS),
+                        ),
+                    ),
+                )
+                .execute(connection)?;
+                diesel::delete(
+                    seen::table
+                        .filter(seen::session.ne_all(notices::table.select(notices::session))),
+                )
+                .execute(connection)?;
+                prune_owners(connection)?;
+                Ok(Some(notice))
+            });
+        match result {
+            Err(diesel::result::Error::RollbackTransaction) => Ok(None),
+            other => other.map_err(|error| error.to_string()),
         }
-        let inserted = transaction
-            .execute(
-                "INSERT OR IGNORE INTO seen(session,evidence) VALUES (?1,?2)",
-                params![session, evidence],
-            )
-            .map_err(|error| error.to_string())?;
-        if inserted == 0 {
-            return Ok(None);
-        }
-        let ordinal = transaction.last_insert_rowid();
-        let owner = event
-            .source_session()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| session.clone());
-        let window = transaction
-            .query_row(
-                "SELECT window FROM owners WHERE session=?1",
-                [&owner],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(window) = &window {
-            transaction.execute("INSERT INTO owners(session,window,ordinal) VALUES (?1,?2,(SELECT coalesce(max(ordinal),0)+1 FROM owners)) ON CONFLICT(session) DO UPDATE SET window=excluded.window,ordinal=excluded.ordinal", params![session, window]).map_err(|error| error.to_string())?;
-        }
-        let notice = Notice {
-            id: Uuid::new_v4(),
-            event,
-            delivered: suppressed,
-            acknowledged: false,
-            window,
-        };
-        transaction.execute("INSERT INTO notices(session,id,event,delivered,acknowledged,ordinal) VALUES (?1,?2,?3,?4,0,?5)
-            ON CONFLICT(session) DO UPDATE SET id=excluded.id,event=excluded.event,delivered=excluded.delivered,acknowledged=0,ordinal=excluded.ordinal",
-            params![session, notice.id.to_string(), serialized, suppressed, ordinal]).map_err(|error| error.to_string())?;
-        transaction.execute("DELETE FROM seen WHERE session=?1 AND ordinal NOT IN (SELECT ordinal FROM seen WHERE session=?1 ORDER BY ordinal DESC LIMIT ?2)", params![session, KEYS_PER_SESSION]).map_err(|error| error.to_string())?;
-        transaction.execute("DELETE FROM notices WHERE session NOT IN (SELECT session FROM notices ORDER BY ordinal DESC LIMIT ?1)", [MAX_SESSIONS]).map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM seen WHERE session NOT IN (SELECT session FROM notices)",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction.execute("DELETE FROM owners WHERE session NOT IN (SELECT session FROM owners ORDER BY ordinal DESC LIMIT ?1)", [MAX_SESSIONS]).map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(Some(notice))
     }
 
-    pub fn list(&self) -> Result<Vec<Notice>, String> {
-        let mut statement = self.0.prepare("SELECT id,event,delivered,acknowledged,(SELECT window FROM owners WHERE owners.session=notices.session) FROM notices ORDER BY ordinal DESC").map_err(|error| error.to_string())?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, bool>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })
+    pub fn list(&mut self) -> Result<Vec<Notice>, String> {
+        notices::table
+            .left_join(owners::table.on(owners::session.eq(notices::session)))
+            .select((
+                notices::id,
+                notices::event,
+                notices::delivered,
+                notices::acknowledged,
+                owners::window.nullable(),
+            ))
+            .order(notices::ordinal.desc())
+            .load::<(String, String, bool, bool, Option<String>)>(&mut self.0)
             .map_err(|error| error.to_string())?
-            .map(|row| {
-                let (id, event, delivered, acknowledged, window) =
-                    row.map_err(|error| error.to_string())?;
+            .into_iter()
+            .map(|(id, event, delivered, acknowledged, window)| {
                 Ok(Notice {
                     id: id.parse().map_err(|error: uuid::Error| error.to_string())?,
                     event: Event::from_journal(&event).map_err(|error| error.to_string())?,
@@ -139,53 +220,33 @@ impl Journal {
             .collect()
     }
 
-    pub fn delivered(&self, id: Uuid) -> Result<(), String> {
-        self.0
-            .execute(
-                "UPDATE notices SET delivered=1 WHERE id=?1",
-                [id.to_string()],
-            )
+    pub fn delivered(&mut self, id: Uuid) -> Result<(), String> {
+        diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
+            .set(notices::delivered.eq(true))
+            .execute(&mut self.0)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
-    pub fn acknowledge(&self, id: Uuid) -> Result<Option<String>, String> {
-        let session = self
-            .0
-            .query_row(
-                "SELECT session FROM notices WHERE id=?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
+    pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
+        diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
+            .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+            .returning(notices::session)
+            .get_result(&mut self.0)
             .optional()
-            .map_err(|error| error.to_string())?;
-        self.0
-            .execute(
-                "UPDATE notices SET acknowledged=1,delivered=1 WHERE id=?1",
-                [id.to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(session)
+            .map_err(|error| error.to_string())
     }
 
     pub fn retire(&mut self, target: Target) -> Result<(), String> {
-        let transaction = self.0.transaction().map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM notices WHERE session=?1",
-                [target.storage_key()],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute("DELETE FROM seen WHERE session=?1", [target.storage_key()])
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "DELETE FROM owners WHERE session=?1",
-                [target.storage_key()],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())
+        let key = target.storage_key();
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                diesel::delete(notices::table.find(&key)).execute(connection)?;
+                diesel::delete(seen::table.filter(seen::session.eq(&key))).execute(connection)?;
+                diesel::delete(owners::table.find(&key)).execute(connection)?;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
     }
 
     pub fn remember_window(
@@ -193,15 +254,52 @@ impl Journal {
         sessions: impl IntoIterator<Item = crate::model::TerminalId>,
         window: &str,
     ) -> Result<(), String> {
-        let transaction = self.0.transaction().map_err(|error| error.to_string())?;
-        for session in sessions {
-            transaction.execute("INSERT INTO owners(session,window,ordinal) VALUES (?1,?2,(SELECT coalesce(max(ordinal),0)+1 FROM owners)) ON CONFLICT(session) DO UPDATE SET window=excluded.window,ordinal=excluded.ordinal", params![session.to_string(), window]).map_err(|error| error.to_string())?;
-        }
-        transaction.execute("DELETE FROM owners WHERE session NOT IN (SELECT session FROM owners ORDER BY ordinal DESC LIMIT ?1)", [MAX_SESSIONS]).map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                for session in sessions {
+                    remember_owner(connection, &session.to_string(), window)?;
+                }
+                prune_owners(connection)
+            })
+            .map_err(|error| error.to_string())
     }
 }
 
+fn remember_owner(
+    connection: &mut SqliteConnection,
+    session: &str,
+    window: &str,
+) -> QueryResult<()> {
+    let ordinal = owners::table
+        .select(diesel::dsl::max(owners::ordinal))
+        .first::<Option<i64>>(connection)?
+        .unwrap_or(0)
+        + 1;
+    let values = (owners::window.eq(window), owners::ordinal.eq(ordinal));
+    diesel::insert_into(owners::table)
+        .values((owners::session.eq(session), values))
+        .on_conflict(owners::session)
+        .do_update()
+        .set(values)
+        .execute(connection)
+        .map(|_| ())
+}
+
+fn prune_owners(connection: &mut SqliteConnection) -> QueryResult<()> {
+    let recent_owners = diesel::alias!(owners as recent_owners);
+    diesel::delete(
+        owners::table.filter(
+            owners::session.ne_all(
+                recent_owners
+                    .select(recent_owners.field(owners::session))
+                    .order(recent_owners.field(owners::ordinal).desc())
+                    .limit(MAX_SESSIONS),
+            ),
+        ),
+    )
+    .execute(connection)
+    .map(|_| ())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +308,184 @@ mod tests {
         model::TerminalId,
         notifications::{Evidence, Kind},
     };
+    use rusqlite::Connection;
+
+    fn seed_owners(journal: &mut Journal) {
+        let rows: Vec<_> = (1..MAX_SESSIONS)
+            .map(|i| {
+                (
+                    owners::session.eq(format!("old-{i}")),
+                    owners::window.eq("other"),
+                    owners::ordinal.eq(10000 + i),
+                )
+            })
+            .collect();
+        diesel::insert_into(owners::table)
+            .values(rows)
+            .execute(&mut journal.0)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_notice_write_rolls_back_replay_and_owner_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.remember_window([session], "owned").unwrap();
+        journal.0.batch_execute("CREATE TRIGGER reject_notice BEFORE INSERT ON notices BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        let mut run = event(session, "run");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        assert!(journal.record(run.clone(), false).is_err());
+        assert_eq!(
+            seen::table
+                .count()
+                .get_result::<i64>(&mut journal.0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            owners::table
+                .count()
+                .get_result::<i64>(&mut journal.0)
+                .unwrap(),
+            1
+        );
+        journal
+            .0
+            .batch_execute("DROP TRIGGER reject_notice;")
+            .unwrap();
+        assert!(journal.record(run, false).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_uri_preserves_non_utf8_and_uri_metacharacters() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(std::ffi::OsString::from_vec(
+            b"attention-\xff?#%.sqlite3".to_vec(),
+        ));
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal
+            .record(event(TerminalId::new(), "uri"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        assert_eq!(Journal::open(&path).unwrap().list().unwrap(), vec![notice]);
+        assert!(path.is_file());
+        assert!(
+            !directory
+                .path()
+                .join("attention-\u{fffd}?#%.sqlite3")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn typed_schema_matches_existing_sqlite_columns_and_durability() {
+        #[derive(diesel::QueryableByName)]
+        struct Durability {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            synchronous: i32,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Timeout {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            timeout: i32,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Mode {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            journal_mode: String,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            diesel::sql_query("PRAGMA synchronous")
+                .get_result::<Durability>(&mut journal.0)
+                .unwrap()
+                .synchronous,
+            2
+        );
+        assert_eq!(
+            diesel::sql_query("PRAGMA busy_timeout")
+                .get_result::<Timeout>(&mut journal.0)
+                .unwrap()
+                .timeout,
+            1000
+        );
+        assert_eq!(
+            diesel::sql_query("PRAGMA journal_mode")
+                .get_result::<Mode>(&mut journal.0)
+                .unwrap()
+                .journal_mode,
+            "wal"
+        );
+        // Read through the old driver: no format conversion or new ledger.
+        let legacy = Connection::open(&path).unwrap();
+        for (table, expected) in [
+            (
+                "notices",
+                vec![
+                    ("session", "TEXT"),
+                    ("id", "TEXT"),
+                    ("event", "TEXT"),
+                    ("delivered", "INTEGER"),
+                    ("acknowledged", "INTEGER"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            (
+                "seen",
+                vec![
+                    ("session", "TEXT"),
+                    ("evidence", "TEXT"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            (
+                "owners",
+                vec![
+                    ("session", "TEXT"),
+                    ("window", "TEXT"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            ("review_requests_seen", vec![("identity", "TEXT")]),
+        ] {
+            let actual: Vec<(String, String)> = legacy
+                .prepare("SELECT name,type FROM pragma_table_info(?1) ORDER BY cid")
+                .unwrap()
+                .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            legacy
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            3
+        );
+        let notice = journal
+            .record(event(TerminalId::new(), "compatible"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy
+                .query_row("SELECT id FROM notices", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            notice.id.to_string()
+        );
+    }
 
     fn event(session: TerminalId, key: &str) -> Event {
         Event {
@@ -256,7 +532,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
         let session = TerminalId::new();
-        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        seed_owners(&mut journal);
         journal.remember_window([session], "chosen").unwrap();
         let mut run = event(session, "first-attention");
         run.target = Target::AgentRun(crate::model::RunId::new());
@@ -330,13 +606,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let legacy = serde_json::json!({"session":session,"provider":Provider::Codex,"directory":"/project","evidence":{"key":"old","kind":"Succeeded"}});
-        journal
-            .0
-            .execute("UPDATE notices SET event=?1", [legacy.to_string()])
+        diesel::update(notices::table)
+            .set(notices::event.eq(legacy.to_string()))
+            .execute(&mut journal.0)
             .unwrap();
-        journal.0.execute_batch("PRAGMA user_version=1").unwrap();
+        journal.0.batch_execute("PRAGMA user_version=1").unwrap();
         drop(journal);
-        let journal = Journal::open(&path).unwrap();
+        let mut journal = Journal::open(&path).unwrap();
         assert_eq!(journal.list().unwrap(), vec![notice]);
     }
 
@@ -345,7 +621,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
         let session = TerminalId::new();
-        journal.0.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1) INSERT INTO owners(session,window,ordinal) SELECT 'old-'||i,'other',10000+i FROM n", [MAX_SESSIONS - 1]).unwrap();
+        seed_owners(&mut journal);
         journal.remember_window([session], "chosen").unwrap();
         journal
             .record(event(session, "first-attention"), false)
@@ -454,10 +730,7 @@ mod tests {
                 .record(event(session, &number.to_string()), true)
                 .unwrap();
         }
-        let count: usize = journal
-            .0
-            .query_row("SELECT count(*) FROM seen", [], |row| row.get(0))
-            .unwrap();
+        let count: i64 = seen::table.count().get_result(&mut journal.0).unwrap();
         assert_eq!(count, KEYS_PER_SESSION);
         assert_eq!(journal.list().unwrap().len(), 1);
         assert!(journal.list().unwrap()[0].delivered);
