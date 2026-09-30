@@ -1422,14 +1422,10 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
-            // Up on the draft's first line and Down on its last walk the
-            // sent messages, as a shell does; inside a longer draft the keys
-            // keep moving the caret.
-            let caret_line = self.composer.cursor().position.line;
-            let on_first_line = caret_line == 0;
-            let on_last_line = caret_line + 1 >= self.composer.line_count();
-            let recall_older = on_first_line && !self.history.is_empty();
-            let recall_newer = on_last_line && self.history_cursor.is_some();
+            // Up on a draft's first line starts browsing sent messages.
+            // While browsing, both arrows walk whole history entries so a
+            // multiline recalled prompt cannot trap the original draft.
+            let (recall_older, recall_newer) = self.history_navigation();
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)

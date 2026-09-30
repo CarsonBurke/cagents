@@ -1145,7 +1145,7 @@ pub(super) struct Runtime {
     history_cursor: Option<usize>,
     /// The draft that was in the composer when the walk began, restored when
     /// the walk goes past the newest message.
-    history_stash: String,
+    history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
     unseen_activity: bool,
@@ -1301,6 +1301,7 @@ impl Runtime {
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.history_cursor = None;
+        self.history_stash = None;
         true
     }
 
@@ -1329,7 +1330,7 @@ impl Runtime {
             self.history.push(sent);
         }
         self.history_cursor = None;
-        self.history_stash.clear();
+        self.history_stash = None;
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -1341,7 +1342,7 @@ impl Runtime {
                 let Some(newest) = self.history.len().checked_sub(1) else {
                     return;
                 };
-                self.history_stash = self.composer.text();
+                self.history_stash = Some(std::mem::take(&mut self.composer));
                 Some(newest)
             }
             (None, false) => return,
@@ -1350,12 +1351,32 @@ impl Runtime {
             (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
-        let text = match next {
-            Some(index) => self.history[index].clone(),
-            None => std::mem::take(&mut self.history_stash),
+        let composer = match next {
+            Some(index) => {
+                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
+            }
+            None => self.history_stash.take().unwrap_or_default(),
         };
         self.history_cursor = next;
-        self.replace_draft(text_editor::Content::with_text(text.trim_end_matches('\n')));
+        self.replace_draft(composer);
+    }
+
+    /// Recalled prompts are complete history entries, including multiline
+    /// ones. Both arrows keep walking that history until the draft returns.
+    fn history_navigation(&self) -> (bool, bool) {
+        let browsing = self.history_cursor.is_some();
+        let older =
+            !self.history.is_empty() && (browsing || self.composer.cursor().position.line == 0);
+        (older, browsing)
+    }
+
+    /// Browsing sent prompts does not replace the unsent draft on disk.
+    fn unsent_text(&self) -> String {
+        self.history_stash
+            .as_ref()
+            .filter(|_| self.history_cursor.is_some())
+            .unwrap_or(&self.composer)
+            .text()
     }
 
     /// Puts a whole new draft in the composer. Whatever the completion list
@@ -1421,7 +1442,7 @@ impl Runtime {
             account_picker: false,
             history: Vec::new(),
             history_cursor: None,
-            history_stash: String::new(),
+            history_stash: None,
             scroll: view::Scroll::default(),
             unseen_activity: false,
             earlier_asked: None,
@@ -2929,7 +2950,7 @@ impl Cagents {
             .collect();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
-                let draft = runtime.composer.text();
+                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -2941,7 +2962,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
-                let draft = runtime.composer.text();
+                let draft = runtime.unsent_text();
                 if draft.is_empty() {
                     chat_drafts.remove(card);
                 } else {
@@ -3256,7 +3277,7 @@ impl Cagents {
         // here rather than lost. `chat_forget` is the single place a chat
         // runtime stops existing while its card lives on.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
-            let draft = runtime.composer.text();
+            let draft = runtime.unsent_text();
             if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
             } else {
@@ -3845,7 +3866,7 @@ impl Cagents {
         });
         runtime.replace_draft(text_editor::Content::new());
         runtime.history_cursor = None;
-        runtime.history_stash.clear();
+        runtime.history_stash = None;
         runtime.error = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
@@ -5060,6 +5081,7 @@ impl Cagents {
                         // Typing into a recalled message makes it the draft,
                         // so the next Up starts again from the newest.
                         runtime.history_cursor = None;
+                        runtime.history_stash = None;
                     }
                     // The completion rows follow the word at the caret, so
                     // anything that can change that word starts them afresh.
@@ -5652,6 +5674,7 @@ impl Cagents {
                 if !insertion.text.is_empty() {
                     runtime.revision = runtime.revision.wrapping_add(1);
                     runtime.history_cursor = None;
+                    runtime.history_stash = None;
                     runtime
                         .composer
                         .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
@@ -6762,6 +6785,83 @@ mod tests {
             target,
             text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.to_owned()))),
         )));
+    }
+
+    #[test]
+    fn multiline_prompt_history_restores_the_exact_unsent_draft_and_attachments() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("history"));
+        let original = "unsent message\nsecond line\n\n";
+        write(&mut app, card, original);
+        let target = chat_runtime(&app, card).target;
+        let (cursor, selection) = {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["older\nmultiline".into(), "latest\nmultiline".into()];
+            Arc::make_mut(&mut runtime.snapshot).busy = true;
+            Arc::make_mut(&mut runtime.snapshot).capabilities.steer = true;
+            runtime.attach([PathBuf::from("/workspace/attachment.txt")]);
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+            runtime
+                .composer
+                .perform(text_editor::Action::Select(text_editor::Motion::Right));
+            assert_eq!(runtime.history_navigation(), (true, false));
+            (runtime.composer.cursor(), runtime.composer.selection())
+        };
+        for (action, expected) in [
+            (Action::HistoryOlder(target), "latest\nmultiline"),
+            (Action::HistoryOlder(target), "older\nmultiline"),
+            (Action::HistoryOlder(target), "older\nmultiline"),
+            (Action::HistoryNewer(target), "latest\nmultiline"),
+        ] {
+            drop(app.update(Message::ChatUi(action)));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), expected);
+            assert_eq!(runtime.history_navigation(), (true, true));
+            assert_eq!(
+                runtime.attachments[0].path,
+                PathBuf::from("/workspace/attachment.txt")
+            );
+        }
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], original);
+
+        drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), original);
+        assert_eq!(runtime.composer.cursor(), cursor);
+        assert_eq!(runtime.composer.selection(), selection);
+        assert_eq!(runtime.history_cursor, None);
+        assert!(runtime.history_stash.is_none());
+        assert!(runtime.snapshot.busy && runtime.snapshot.capabilities.steer);
+        drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+        assert_eq!(chat_runtime(&app, card).composer.text(), original);
+    }
+
+    #[test]
+    fn prompt_history_keeps_multiline_draft_navigation_and_saved_text() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        write(&mut app, card, "unsent\nlast line");
+        let target = chat_runtime(&app, card).target;
+        {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["sent prompt".into()];
+            runtime
+                .composer
+                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+            assert_eq!(
+                runtime.history_navigation(),
+                (false, false),
+                "a multiline draft keeps caret navigation"
+            );
+            runtime.composer.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
+        }
+        drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+        app.chat_forget(card);
+        assert_eq!(app.chat_ui.drafts[&card], "unsent\nlast line");
     }
 
     /// Sends what the composer of `card` holds.
