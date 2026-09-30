@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::{
-    model::{ChannelId, ProjectKind},
+    model::{ChannelId, ChannelTitleSource, ProjectKind},
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
@@ -28,7 +28,7 @@ mod automations;
 pub(super) use automations::Claimed;
 mod execution;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -126,7 +126,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let mut channels = self
             .db
-            .prepare("SELECT id, repository, title, ordinal FROM channels ORDER BY ordinal")
+            .prepare("SELECT id, repository, title, ordinal, title_source FROM channels ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let rows = channels
             .query_map([], |row| {
@@ -135,14 +135,21 @@ impl Registry {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(|error| error.to_string())?;
         let channels = rows
             .into_iter()
-            .map(|(id, repository, title, ordinal)| {
+            .map(|(id, repository, title, ordinal, source)| {
                 Ok(ModelChannel {
+                    title_source: match source {
+                        0 => ChannelTitleSource::Prompt,
+                        1 => ChannelTitleSource::Provider,
+                        2 => ChannelTitleSource::Manual,
+                        _ => return Err("invalid stored channel title source".into()),
+                    },
                     id: parse_channel_id(&id)?,
                     repository: PathBuf::from(repository),
                     title,
@@ -284,6 +291,7 @@ impl Registry {
                 id,
                 repository,
                 title,
+                title_source,
             } => {
                 let key = repository_key(repository)?;
                 let exists: bool = transaction
@@ -312,9 +320,9 @@ impl Registry {
                     let ordinal = take_ordinal(&transaction, "next_channel_ordinal")?;
                     transaction
                         .execute(
-                            "INSERT INTO channels(id, repository, title, ordinal) \
-                             VALUES (?1, ?2, ?3, ?4)",
-                            params![id.to_string(), key, title, ordinal],
+                            "INSERT INTO channels(id, repository, title, ordinal, title_source) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![id.to_string(), key, title, ordinal, *title_source as i64],
                         )
                         .map_err(|error| error.to_string())?;
                     true
@@ -327,11 +335,20 @@ impl Registry {
             ModelEdit::RetitleChannel { id, title } => {
                 transaction
                     .execute(
-                        "UPDATE channels SET title = ?2 WHERE id = ?1 AND title <> ?2",
+                        "UPDATE channels SET title = ?2, title_source = 2 WHERE id = ?1 AND (title <> ?2 OR title_source <> 2)",
                         params![id.to_string(), title],
                     )
                     .map_err(|error| error.to_string())?
                     > 0
+            }
+            ModelEdit::SuggestChannelTitle { id, title, source } => {
+                if *source == ChannelTitleSource::Manual || title.is_empty() {
+                    return Err("channel title suggestions require a nonempty inferred title".into());
+                }
+                transaction.execute(
+                    "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source < ?3)",
+                    params![id.to_string(), title, *source as i64],
+                ).map_err(|error| error.to_string())? > 0
             }
             ModelEdit::DeleteChannel { id } => {
                 transaction
@@ -538,12 +555,131 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 2 {
         automations::migrate(db)?;
     }
+    if version < 3 {
+        let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current: u32 = tx
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if current < 3 {
+            tx.execute_batch("ALTER TABLE channels ADD COLUMN title_source INTEGER NOT NULL DEFAULT 2 CHECK(title_source BETWEEN 0 AND 2); PRAGMA user_version = 3;")
+                .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inferred_names_upgrade_once_and_manual_renames_win_even_when_text_matches() {
+        let (mut registry, _) = registry();
+        registry.apply(&open("/project")).unwrap();
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: "/project".into(),
+                title: String::new(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let suggest = |title: &str, source| ModelEdit::SuggestChannelTitle {
+            id,
+            title: title.into(),
+            source,
+        };
+        assert!(
+            registry
+                .apply(&suggest("Fix navigation", ChannelTitleSource::Prompt))
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&suggest(
+                    "Repair channel navigation",
+                    ChannelTitleSource::Provider
+                ))
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !registry
+                .apply(&suggest("Later prompt", ChannelTitleSource::Prompt))
+                .unwrap()
+                .changed
+        );
+        assert!(
+            registry
+                .apply(&ModelEdit::RetitleChannel {
+                    id,
+                    title: "Repair channel navigation".into()
+                })
+                .unwrap()
+                .changed
+        );
+        assert!(
+            !registry
+                .apply(&suggest(
+                    "Stale provider title",
+                    ChannelTitleSource::Provider
+                ))
+                .unwrap()
+                .changed
+        );
+        let channel = registry.model().unwrap().channels.remove(0);
+        assert_eq!(channel.title, "Repair channel navigation");
+        assert_eq!(channel.title_source, ChannelTitleSource::Manual);
+        registry.apply(&ModelEdit::DeleteChannel { id }).unwrap();
+        assert!(
+            !registry
+                .apply(&suggest("Do not resurrect", ChannelTitleSource::Provider))
+                .unwrap()
+                .changed
+        );
+    }
+
+    #[test]
+    fn legacy_channel_names_migrate_as_authoritative() {
+        let (mut registry, directory) = registry();
+        registry.apply(&open("/project")).unwrap();
+        let id = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id,
+                repository: "/project".into(),
+                title: "My channel".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        registry
+            .db
+            .execute_batch(
+                "ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(registry);
+        let mut restored = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert!(
+            !restored
+                .apply(&ModelEdit::SuggestChannelTitle {
+                    id,
+                    title: "Provider title".into(),
+                    source: ChannelTitleSource::Provider
+                })
+                .unwrap()
+                .changed
+        );
+        assert_eq!(restored.model().unwrap().channels[0].title, "My channel");
+        assert_eq!(
+            restored.model().unwrap().channels[0].title_source,
+            ChannelTitleSource::Manual
+        );
+    }
 
     fn registry() -> (Registry, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -564,6 +700,7 @@ mod tests {
             id,
             repository: PathBuf::from(repository),
             title: title.to_owned(),
+            title_source: Default::default(),
         }
     }
 

@@ -92,6 +92,7 @@ pub enum Action {
     Weekday(usize),
     Reuse(bool),
     Precheck(bool),
+    ToggleAdvanced,
     Prompt(text_editor::Action),
     Shell(text_editor::Action),
     Enable,
@@ -173,6 +174,7 @@ pub struct Draft {
     weekday: usize,
     reuse: bool,
     precheck: bool,
+    advanced: bool,
     prompt: text_editor::Content<cosmic::Renderer>,
     shell: text_editor::Content<cosmic::Renderer>,
     // Indices are frozen against the options with which this draft opened.
@@ -209,6 +211,7 @@ impl Draft {
             weekday: 0,
             reuse: false,
             precheck: false,
+            advanced: false,
             prompt: text_editor::Content::new(),
             shell: text_editor::Content::new(),
             targets: targets.to_vec(),
@@ -221,6 +224,7 @@ impl Draft {
             value.model = definition.agent.model.clone().unwrap_or_default();
             value.effort = definition.agent.reasoning_effort.clone();
             value.permission = definition.agent.permission_mode.clone().unwrap_or_default();
+            value.advanced = !value.permission.is_empty() || definition.precheck.is_some();
             value.timezone = definition.schedule.timezone.clone();
             value.loaded_timezone = Some(definition.schedule.timezone.clone());
             value.provider = provider_index(definition.agent.provider);
@@ -864,6 +868,11 @@ impl State {
                     draft.precheck = value;
                 }
             }
+            Action::ToggleAdvanced => {
+                if let Some(draft) = &mut self.draft {
+                    draft.advanced = !draft.advanced;
+                }
+            }
             Action::Prompt(action) => {
                 if let Some(draft) = &mut self.draft {
                     draft.prompt.perform(action);
@@ -1036,7 +1045,7 @@ impl State {
                 .wrap(),
             );
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy, &self.models, self.error.as_deref()));
+            content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
             content = content.push(
                 widget::row::with_children(vec![
@@ -1301,6 +1310,7 @@ impl Draft {
         busy: bool,
         models: &'a Models,
         error: Option<&'a str>,
+        width: f32,
     ) -> Element<'a, Action> {
         let provider_accounts = self
             .accounts
@@ -1308,15 +1318,9 @@ impl Draft {
             .enumerate()
             .filter(|(_, account)| account.provider == provider(self.provider))
             .collect::<Vec<_>>();
-        let mut fields = widget::column::with_children(vec![
-            widget::text::title4(if self.base.is_some() {
-                "Edit automation"
-            } else {
-                "New automation"
-            })
-            .into(),
+        let work = widget::column::with_children(vec![
             input("Name", &self.name, Field::Name),
-            widget::text::body("Project / working directory").into(),
+            crate::design::caption("Project / working directory").into(),
             widget::dropdown(
                 self.targets
                     .iter()
@@ -1326,9 +1330,9 @@ impl Draft {
                 Action::Target,
             )
             .into(),
-            widget::text::body("Provider").into(),
+            crate::design::caption("Provider").into(),
             widget::dropdown(PROVIDERS.to_vec(), Some(self.provider), Action::Provider).into(),
-            widget::text::body("Account").into(),
+            crate::design::caption("Account").into(),
             widget::dropdown(
                 provider_accounts
                     .iter()
@@ -1342,46 +1346,117 @@ impl Draft {
             .into(),
             self.model_picker(models),
             self.effort_picker(models),
-            input(
-                "Permission mode (blank uses provider default)",
-                &self.permission,
-                Field::Permission,
-            ),
-            widget::text::body("Prompt").into(),
+            crate::design::caption("Instructions").into(),
             cosmic::iced::widget::text_editor(&self.prompt)
                 .on_action(Action::Prompt)
-                .height(160)
+                .height(220)
                 .into(),
-            widget::text::body("Schedule").into(),
+        ])
+        .spacing(2.0 * crate::design::GRID_UNIT)
+        .width(Length::Fill);
+        let mut schedule = widget::column::with_children(vec![
+            crate::design::caption("Repeat").into(),
             widget::dropdown(SCHEDULES.to_vec(), Some(self.schedule), Action::Schedule).into(),
         ])
         .spacing(2.0 * crate::design::GRID_UNIT)
         .width(Length::Fill);
         if self.schedule == 4 {
-            fields = fields.push(input("Five-field cron", &self.cron, Field::Cron));
+            schedule = schedule.push(input("Five-field cron", &self.cron, Field::Cron));
         } else {
+            let mut time = Vec::new();
             if self.schedule != 0 {
-                fields = fields.push(input("Hour (0–23)", &self.hour, Field::Hour));
+                time.push(input("Hour (0–23)", &self.hour, Field::Hour));
             }
-            fields = fields.push(input("Minute (0–59)", &self.minute, Field::Minute));
+            time.push(input("Minute (0–59)", &self.minute, Field::Minute));
+            schedule = schedule.push(widget::row::with_children(time).spacing(8));
             if self.schedule == 3 {
-                fields = fields.push(widget::dropdown(
+                schedule = schedule.push(widget::dropdown(
                     WEEKDAYS.to_vec(),
                     Some(self.weekday),
                     Action::Weekday,
                 ));
             }
         }
-        fields = fields.push(self.timezone_picker()).push(self.next_run());
-        fields = fields.push(widget::checkbox(self.reuse).label("Reuse this automation's idle agent").on_toggle(Action::Reuse))
-            .push(widget::text::body("Fresh sessions close after a result. Reuse keeps the same account, model, reasoning effort and permissions; interactive takeover pauses automation reuse."))
-            .push(widget::checkbox(self.precheck).label("Run a shell precheck").on_toggle(Action::Precheck));
-        if self.precheck {
-            fields = fields.push(widget::text::body("Runs once in the selected directory. A non-zero exit skips the agent; commands can change files."))
-                .push(cosmic::iced::widget::text_editor(&self.shell).on_action(Action::Shell).height(100))
-                .push(input("Precheck timeout in seconds (1–300)", &self.timeout, Field::Timeout));
+        schedule = schedule
+            .push(self.timezone_picker())
+            .push(self.next_run())
+            .push(crate::design::horizontal_rule())
+            .push(
+                widget::checkbox(self.reuse)
+                    .label("Continue in the same agent")
+                    .on_toggle(Action::Reuse),
+            )
+            .push(crate::design::caption(
+                "Otherwise, each run starts a fresh session. Taking over the agent pauses reuse.",
+            ));
+        let work = form_section("Work", "What the agent should do", work.into());
+        let schedule = form_section("Schedule", "When it should run", schedule.into());
+        let layout: Element<'a, Action> = if width >= 820.0 {
+            widget::row::with_children(vec![
+                widget::container(work).width(Length::FillPortion(2)).into(),
+                widget::container(schedule)
+                    .width(Length::FillPortion(1))
+                    .into(),
+            ])
+            .spacing(16)
+            .into()
+        } else {
+            widget::column::with_children(vec![work, schedule])
+                .spacing(16)
+                .into()
+        };
+        let mut fields = widget::column::with_children(vec![
+            crate::design::heading(if self.base.is_some() {
+                "Edit automation"
+            } else {
+                "New automation"
+            })
+            .into(),
+            layout,
+            widget::button::custom(crate::design::caption(if self.advanced {
+                "▾ Advanced settings"
+            } else {
+                "▸ Advanced settings"
+            }))
+            .class(crate::ui_controls::control_style(false, None))
+            .on_press(Action::ToggleAdvanced)
+            .into(),
+        ])
+        .spacing(16)
+        .width(Length::Fill);
+        if self.advanced {
+            let mut advanced = widget::column::with_children(vec![
+                input("Permission mode", &self.permission, Field::Permission),
+                crate::design::caption("Leave blank to use the provider default.").into(),
+                widget::checkbox(self.precheck)
+                    .label("Run a shell precheck")
+                    .on_toggle(Action::Precheck)
+                    .into(),
+            ])
+            .spacing(8);
+            if self.precheck {
+                advanced = advanced
+                    .push(crate::design::caption(
+                        "Runs in the selected directory. A non-zero exit skips the agent.",
+                    ))
+                    .push(
+                        cosmic::iced::widget::text_editor(&self.shell)
+                            .on_action(Action::Shell)
+                            .height(120),
+                    )
+                    .push(input(
+                        "Timeout in seconds (1–300)",
+                        &self.timeout,
+                        Field::Timeout,
+                    ));
+            }
+            fields = fields.push(form_section(
+                "Execution",
+                "Optional permissions and precheck",
+                advanced.into(),
+            ));
         }
-        fields = fields.push(widget::text::body("New automations start paused. Changing the schedule or execution settings requires enabling them again. Missed runs older than 15 minutes are skipped; overlapping runs never start."));
+        fields = fields.push(crate::design::caption("New automations start paused. Changes to schedule or execution settings pause existing automations. Runs never overlap; missed runs older than 15 minutes are skipped."));
         if let Some(error) = error {
             fields = fields.push(
                 crate::design::body(error).class(cosmic::theme::Text::Custom(|theme| {
@@ -1392,19 +1467,45 @@ impl Draft {
                 })),
             );
         }
-        fields
-            .push(
-                widget::row::with_children(vec![
-                    button("Cancel", Action::CancelEdit, !busy),
-                    widget::button::suggested("Save")
-                        .on_press_maybe((!busy).then_some(Action::Save))
-                        .into(),
-                ])
-                .spacing(2.0 * crate::design::GRID_UNIT)
-                .wrap(),
-            )
+        let fields = fields.push(
+            widget::row::with_children(vec![
+                button("Cancel", Action::CancelEdit, !busy),
+                widget::button::suggested("Save automation")
+                    .on_press_maybe((!busy).then_some(Action::Save))
+                    .into(),
+            ])
+            .spacing(2.0 * crate::design::GRID_UNIT)
+            .wrap(),
+        );
+        widget::container(fields)
+            .max_width(1040)
+            .width(Length::Fill)
             .into()
     }
+}
+
+fn form_section<'a>(
+    title: &'static str,
+    subtitle: &'static str,
+    content: Element<'a, Action>,
+) -> Element<'a, Action> {
+    widget::container(
+        widget::column::with_children(vec![
+            crate::design::heading(title).into(),
+            crate::design::caption(subtitle).into(),
+            crate::design::horizontal_rule(),
+            content,
+        ])
+        .spacing(12),
+    )
+    .padding(16)
+    .width(Length::Fill)
+    .class(crate::design::surface(
+        Some(crate::design::raised),
+        [crate::design::RADIUS_M; 4],
+        false,
+    ))
+    .into()
 }
 
 impl Draft {
@@ -1629,7 +1730,7 @@ fn button_owned(label: String, action: Action, enabled: bool) -> Element<'static
 }
 fn input<'a>(label: &'static str, value: &'a str, field: Field) -> Element<'a, Action> {
     widget::column::with_children(vec![
-        widget::text::body(label).into(),
+        crate::design::caption(label).into(),
         widget::text_input(label, value)
             .on_input(move |value| Action::Field(field, value))
             .into(),

@@ -2740,6 +2740,7 @@ fn channel_output(
                     id,
                     repository,
                     title,
+                    title_source: Default::default(),
                 })
                 .map_err(protocol_error)?;
             let channel = model.channel(id).cloned().ok_or_else(|| {
@@ -3262,6 +3263,7 @@ mod tests {
                         id,
                         repository: asked,
                         title,
+                        ..
                     },
             } = created.request
             else {
@@ -3274,6 +3276,7 @@ mod tests {
                 sequence: 2,
                 projects: Vec::new(),
                 channels: vec![ModelChannel {
+                    title_source: Default::default(),
                     id,
                     repository: server_repository,
                     title,
@@ -3766,6 +3769,7 @@ mod tests {
             channels: channels
                 .iter()
                 .map(|(id, title, ordinal)| ModelChannel {
+                    title_source: Default::default(),
                     id: *id,
                     repository: repository.to_path_buf(),
                     title: (*title).to_owned(),

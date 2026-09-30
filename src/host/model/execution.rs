@@ -756,8 +756,8 @@ impl Registry {
                         let channel = ChannelId::new();
                         let ordinal = take_ordinal(&tx, "next_channel_ordinal")?;
                         tx.execute(
-                            "INSERT INTO channels(id, repository, title, ordinal) VALUES (?1, ?2, ?3, ?4)",
-                            params![channel.to_string(), repository, format!("{} agent", spec.provider.label()), ordinal],
+                            "INSERT INTO channels(id, repository, title, ordinal, title_source) VALUES (?1, ?2, ?3, ?4, 0)",
+                            params![channel.to_string(), repository, crate::workspace_model::channel_title_from_prompt(&request.prompt).unwrap_or_else(|| format!("{} agent", spec.provider.label())), ordinal],
                         ).map_err(|error| error.to_string())?;
                         channel
                     }

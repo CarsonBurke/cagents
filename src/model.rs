@@ -1057,6 +1057,8 @@ pub struct ProjectChannel {
     pub id: ChannelId,
     pub project_id: ProjectId,
     pub title: String,
+    #[serde(default)]
+    pub title_source: ChannelTitleSource,
     /// The creation rank the shared registry assigned, mirrored here so the
     /// order survives a restart without a daemon round trip.
     ///
@@ -1082,6 +1084,22 @@ pub struct ProjectChannel {
     pub shared: bool,
     pub cards: Vec<CardId>,
     pub focused: Option<CardId>,
+}
+
+/// Legacy nonempty names remain authoritative; inferred names may improve
+/// only until a provider supplies a title or a person explicitly renames it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ChannelTitleSource {
+    Prompt,
+    Provider,
+    #[default]
+    Manual,
+}
+
+impl ChannelTitleSource {
+    pub fn accepts(self, title: &str, suggested: Self) -> bool {
+        suggested != Self::Manual && (title.is_empty() || suggested > self)
+    }
 }
 
 /// Repair navigation references without deleting any durable card. First
@@ -1359,6 +1377,7 @@ mod tests {
         let b = ChannelId::new();
         let mut channels = vec![
             ProjectChannel {
+                title_source: Default::default(),
                 id: a,
                 project_id,
                 title: "A".into(),
@@ -1368,6 +1387,7 @@ mod tests {
                 focused: Some(missing),
             },
             ProjectChannel {
+                title_source: Default::default(),
                 id: b,
                 project_id,
                 title: "B".into(),

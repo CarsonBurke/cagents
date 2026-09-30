@@ -2450,6 +2450,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: project,
                 title: "Investigation".into(),
@@ -2501,6 +2502,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: child,
                 title: "Child".into(),

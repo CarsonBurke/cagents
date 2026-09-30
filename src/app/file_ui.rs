@@ -382,6 +382,7 @@ mod tests {
         let channel = crate::model::ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.channels.push(crate::model::ProjectChannel {
+            title_source: Default::default(),
             id: channel,
             project_id: ProjectId::new(),
             title: "Results".into(),

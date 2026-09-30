@@ -599,6 +599,7 @@ impl Cagents {
                             .find(|channel| channel.id == id)
                         {
                             channel.title = title.clone();
+                            channel.title_source = crate::model::ChannelTitleSource::Manual;
                         }
                         self.publish_model_edit(
                             crate::workspace_model::ModelEdit::RetitleChannel { id, title },

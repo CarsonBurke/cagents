@@ -53,6 +53,8 @@ pub struct ModelChannel {
     pub id: ChannelId,
     pub repository: PathBuf,
     pub title: String,
+    #[serde(default)]
+    pub title_source: crate::model::ChannelTitleSource,
     /// Creation rank, assigned by the registry: strictly increasing, never
     /// reused, and therefore stable across a window restart.
     ///
@@ -60,6 +62,55 @@ pub struct ModelChannel {
     /// channel at the same moment cannot mint the same rank. The sidebar renders
     /// a project's channels by descending rank, so the newest sits on top.
     pub ordinal: u32,
+}
+
+/// A prompt fallback labels its first substantive line, rather than flattening
+/// attached context into the sidebar. Provider titles use `channel_title`.
+pub fn channel_title_from_prompt(prompt: &str) -> Option<String> {
+    let mut fence = false;
+    let mut context = false;
+    prompt.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fence = !fence;
+            return None;
+        }
+        if matches!(
+            line,
+            "<INSTRUCTIONS>" | "<environment_context>" | "<system-reminder>"
+        ) {
+            context = true;
+            return None;
+        }
+        if matches!(
+            line,
+            "</INSTRUCTIONS>" | "</environment_context>" | "</system-reminder>"
+        ) {
+            context = false;
+            return None;
+        }
+        if fence || context || line.starts_with("# AGENTS.md") || line.starts_with("<image ") {
+            return None;
+        }
+        let line = line.trim_start_matches(['#', '*', '-', '>', ' ']);
+        channel_title(line)
+    })
+}
+
+pub fn channel_title(text: &str) -> Option<String> {
+    let title = crate::names::normalize_card_name(text)?;
+    if title.chars().count() <= 80 {
+        return Some(title);
+    }
+    let shortened: String = title.chars().take(79).collect();
+    let end = shortened
+        .rfind(' ')
+        .filter(|end| *end > shortened.len() / 2);
+    Some(format!(
+        "{}…",
+        end.map_or(shortened.as_str(), |end| &shortened[..end])
+            .trim_end()
+    ))
 }
 
 /// The identity of a registry that has never been created.
@@ -158,9 +209,11 @@ impl WorkspaceModel {
                 id,
                 repository,
                 title,
+                title_source,
             } => {
                 if self.channel(*id).is_none() {
                     self.channels.push(ModelChannel {
+                        title_source: *title_source,
                         id: *id,
                         repository: repository.clone(),
                         title: title.clone(),
@@ -171,6 +224,15 @@ impl WorkspaceModel {
             ModelEdit::RetitleChannel { id, title } => {
                 if let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id) {
                     channel.title = title.clone();
+                    channel.title_source = crate::model::ChannelTitleSource::Manual;
+                }
+            }
+            ModelEdit::SuggestChannelTitle { id, title, source } => {
+                if let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id)
+                    && channel.title_source.accepts(&channel.title, *source)
+                {
+                    channel.title = title.clone();
+                    channel.title_source = *source;
                 }
             }
             ModelEdit::DeleteChannel { id } => {
@@ -211,10 +273,19 @@ pub enum ModelEdit {
         id: ChannelId,
         repository: PathBuf,
         title: String,
+        #[serde(default)]
+        title_source: crate::model::ChannelTitleSource,
     },
     /// A no-op on an unknown id: a retitle racing a delete must not resurrect
     /// what the delete removed.
     RetitleChannel { id: ChannelId, title: String },
+    /// Conditional inference never overwrites a manual rename, including a
+    /// rename committed by another window while this suggestion was queued.
+    SuggestChannelTitle {
+        id: ChannelId,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    },
     /// A no-op on an unknown id, so a second delete of one channel is not an
     /// error for the second window to issue it.
     DeleteChannel { id: ChannelId },
@@ -255,12 +326,15 @@ impl ModelEdit {
                 id,
                 repository,
                 title,
+                title_source,
             } => Self::CreateChannel {
                 id,
                 repository: canonical_repository(&repository)?,
                 title,
+                title_source,
             },
             edit @ (Self::RetitleChannel { .. }
+            | Self::SuggestChannelTitle { .. }
             | Self::DeleteChannel { .. }
             | Self::AgentsChanged) => edit,
         })
@@ -311,4 +385,80 @@ pub fn repository_display_name(repository: &Path) -> String {
     checkout
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repository.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {
+        assert_eq!(
+            channel_title_from_prompt(
+                "# AGENTS.md instructions\n<INSTRUCTIONS>\nDo everything idiomatically\n</INSTRUCTIONS>\n\n## Repair channel navigation\nMore details"
+            ),
+            Some("Repair channel navigation".into())
+        );
+        assert_eq!(
+            channel_title_from_prompt("```rust\nlet context = 1;\n```\n- Fix history paging"),
+            Some("Fix history paging".into())
+        );
+        assert_eq!(
+            channel_title_from_prompt("\u{202e}\nMeaningful task"),
+            Some("Meaningful task".into())
+        );
+        let title = channel_title_from_prompt(&"navigation ".repeat(20)).unwrap();
+        assert!(title.chars().count() <= 80);
+        assert!(title.ends_with("navigation…"));
+        assert!(channel_title(&"界".repeat(100)).unwrap().chars().count() <= 80);
+    }
+
+    #[test]
+    fn optimistic_title_suggestions_cannot_overwrite_manual_names() {
+        let id = ChannelId::new();
+        let mut model = WorkspaceModel::default();
+        model.fold(
+            1,
+            &ModelEdit::CreateChannel {
+                id,
+                repository: "/repo".into(),
+                title: String::new(),
+                title_source: Default::default(),
+            },
+        );
+        model.fold(
+            2,
+            &ModelEdit::SuggestChannelTitle {
+                id,
+                title: "Prompt fallback".into(),
+                source: ChannelTitleSource::Prompt,
+            },
+        );
+        model.fold(
+            3,
+            &ModelEdit::SuggestChannelTitle {
+                id,
+                title: "Provider name".into(),
+                source: ChannelTitleSource::Provider,
+            },
+        );
+        model.fold(
+            4,
+            &ModelEdit::RetitleChannel {
+                id,
+                title: "Provider name".into(),
+            },
+        );
+        model.fold(
+            5,
+            &ModelEdit::SuggestChannelTitle {
+                id,
+                title: "Stale inferred name".into(),
+                source: ChannelTitleSource::Provider,
+            },
+        );
+        assert_eq!(model.channels[0].title, "Provider name");
+        assert_eq!(model.channels[0].title_source, ChannelTitleSource::Manual);
+    }
 }

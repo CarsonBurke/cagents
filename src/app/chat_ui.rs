@@ -959,20 +959,22 @@ fn fence_key(language: &str, code: &str) -> u64 {
 
 /// Provider snapshots also cover restored chats and prompts sent through the
 /// paired CLI. Never infer a conversation from another process in the same cwd.
-fn snapshot_channel_name(snapshot: &Snapshot) -> Option<&str> {
+fn snapshot_channel_name(
+    snapshot: &Snapshot,
+) -> Option<(String, crate::model::ChannelTitleSource)> {
     snapshot
         .title
         .as_deref()
-        .filter(|title| !title.trim().is_empty())
+        .and_then(crate::workspace_model::channel_title)
+        .map(|title| (title, crate::model::ChannelTitleSource::Provider))
         .or_else(|| {
             snapshot
                 .items
                 .iter()
                 .find_map(|item| match (&item.role, &item.content) {
-                    (chat::Role::User, ItemContent::Text { text, .. })
-                        if !text.trim().is_empty() =>
-                    {
-                        Some(text.as_str())
+                    (chat::Role::User, ItemContent::Text { text, .. }) => {
+                        crate::workspace_model::channel_title_from_prompt(text)
+                            .map(|title| (title, crate::model::ChannelTitleSource::Prompt))
                     }
                     _ => None,
                 })
@@ -4511,7 +4513,7 @@ impl Cagents {
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
-                        let channel_name = snapshot_channel_name(&snapshot).map(str::to_owned);
+                        let channel_name = snapshot_channel_name(&snapshot);
                         let title = snapshot.title.clone();
                         let activity = Activity {
                             provider: session.launch.provider,
@@ -4569,8 +4571,8 @@ impl Cagents {
                         {
                             self.persist();
                         }
-                        if let Some(name) = channel_name {
-                            self.name_channel_from_prompt(target.card, &name);
+                        if let Some((name, source)) = channel_name {
+                            self.suggest_channel_title(target.card, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // Reports that raced the attachment woke nothing.
@@ -4800,7 +4802,7 @@ impl Cagents {
                 {
                     let name = match runtime.handle() {
                         Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
-                            snapshot_channel_name(&handle.snapshot()).map(str::to_owned)
+                            snapshot_channel_name(&handle.snapshot())
                         }
                         _ => None,
                     };
@@ -4808,8 +4810,8 @@ impl Cagents {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some(name) = name {
-                        self.name_channel_from_prompt(target.card, &name);
+                    if let Some((name, source)) = name {
+                        self.suggest_channel_title(target.card, name, source);
                     }
                     return Task::none();
                 }
@@ -4831,11 +4833,11 @@ impl Cagents {
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
                         let channel_name = needs_name
-                            .then(|| snapshot_channel_name(&snapshot).map(str::to_owned))
+                            .then(|| snapshot_channel_name(&snapshot))
                             .flatten();
                         let title = snapshot.title.clone();
-                        if let Some(name) = channel_name {
-                            self.name_channel_from_prompt(target.card, &name);
+                        if let Some((name, source)) = channel_name {
+                            self.suggest_channel_title(target.card, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.commit_chat_session(target.card, session);
@@ -6184,12 +6186,23 @@ mod tests {
         });
         assert_eq!(
             snapshot_channel_name(&snapshot),
-            Some("Implement the requested feature")
+            Some((
+                "Implement the requested feature".into(),
+                crate::model::ChannelTitleSource::Prompt
+            ))
         );
         snapshot.title = Some("Provider conversation name".into());
         assert_eq!(
             snapshot_channel_name(&snapshot),
-            Some("Provider conversation name")
+            Some((
+                "Provider conversation name".into(),
+                crate::model::ChannelTitleSource::Provider
+            ))
+        );
+        snapshot.title = Some("\u{202e}\u{2066}".into());
+        assert_eq!(
+            snapshot_channel_name(&snapshot).unwrap().0,
+            "Implement the requested feature"
         );
     }
 
@@ -6265,6 +6278,7 @@ mod tests {
             let channel = crate::model::ChannelId::new();
             let durable = Arc::make_mut(&mut app.durable);
             durable.channels.push(crate::model::ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: crate::model::ProjectId::new(),
                 title: "Conversation".into(),
@@ -8203,6 +8217,7 @@ mod tests {
             let channel = crate::model::ChannelId::new();
             let durable = Arc::make_mut(&mut app.durable);
             durable.channels.push(crate::model::ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: crate::model::ProjectId::new(),
                 title: String::new(),
@@ -8467,6 +8482,7 @@ mod tests {
         let channel = crate::model::ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.channels.push(crate::model::ProjectChannel {
+            title_source: Default::default(),
             id: channel,
             project_id: crate::model::ProjectId::new(),
             title: String::new(),
