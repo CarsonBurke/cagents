@@ -3649,9 +3649,6 @@ fn view_inner<'a>(
         .width(Length::Fill)
         .height(Length::Fill),
     );
-    if !state.rows.is_empty() {
-        content = content.push(selection_controls(state, compact, modal_open));
-    }
     content = content
         .push(crate::design::horizontal_rule())
         .push(footer(compact, modal_open))
@@ -3685,61 +3682,6 @@ fn view_inner<'a>(
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
-}
-
-/// The bulk bar. It exists only while the user has explicitly picked rows
-/// with Ctrl or Shift; opening a row never mounts it.
-fn selection_controls(
-    state: &SidebarState,
-    compact: bool,
-    modal_open: bool,
-) -> Element<'static, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    let count = state.rows.len();
-    // Every member must be one kind: a project is removed, a worktree or
-    // channel deleted, and one confirmation cannot promise both.
-    let kind = state
-        .rows
-        .first()
-        .filter(|row| state.rows.group_size(*row).is_some());
-    let mut controls = Vec::with_capacity(3);
-    if !compact {
-        controls.push(
-            design::caption(format!("{count} selected"))
-                .width(Length::Fill)
-                .into(),
-        );
-    }
-    controls.push(icon_action(
-        "edit-delete-symbolic",
-        kind.map_or_else(
-            || "Select one kind of row to delete together".to_owned(),
-            |row| format!("{}…", row.deletion_label(count)),
-        ),
-        kind.and_then(|_| gated(SidebarAction::DeleteSelectedRows, modal_open)),
-        stable_id("selection.delete"),
-    ));
-    controls.push(icon_action(
-        "window-close-symbolic",
-        "Clear selection",
-        gated(SidebarAction::ClearRowSelection, modal_open),
-        stable_id("selection.clear"),
-    ));
-    let controls: Element<'static, SidebarAction> = if compact {
-        widget::column::with_children(controls)
-            .align_x(Alignment::Center)
-            .spacing(spacing.space_xxxs)
-            .into()
-    } else {
-        widget::row::with_children(controls)
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxxs)
-            .into()
-    };
-    widget::container(controls)
-        .padding([spacing.space_xxxs, spacing.space_xxs])
-        .width(Length::Fill)
-        .into()
 }
 
 fn header<'a>(
