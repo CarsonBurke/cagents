@@ -1031,7 +1031,7 @@ async fn run(
         diagnostic: settings_error,
         ..Default::default()
     };
-    match &journal {
+    match &mut journal {
         Ok(journal) => match journal.list() {
             Ok(notices) => snapshot.notices = notices,
             Err(error) => snapshot.diagnostic = Some(error),
