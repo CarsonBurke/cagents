@@ -3,8 +3,8 @@
 //! Navigation and selection are different things: opening a row makes it the
 //! active workspace and only moves the range anchor, while the selection holds
 //! rows the user picked on purpose with Ctrl or Shift. The selection is
-//! therefore empty almost all of the time, and anything that acts on it - the
-//! bulk footer, group deletion - is absent unless the user asked for it.
+//! therefore empty almost all of the time. Shared context-menu actions and
+//! keyboard deletion target the group only when the user explicitly selects it.
 
 use std::collections::BTreeSet;
 
@@ -66,12 +66,6 @@ pub(super) struct Selection {
 impl Selection {
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
-    }
-    pub(super) fn len(&self) -> usize {
-        self.rows.len()
-    }
-    pub(super) fn first(&self) -> Option<Row> {
-        self.rows.first().copied()
     }
     pub(super) fn group_size(&self, row: Row) -> Option<usize> {
         if !self.contains(row) {
