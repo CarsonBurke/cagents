@@ -197,7 +197,7 @@ impl Cagents {
                     ))
                 })
                 .unwrap_or_else(|| self.terminal_insertion_indices());
-            let width = 1.0 / 3.0;
+            let width = self.settings.default_native_pane_fraction;
             let state = CardState {
                 id: card,
                 generation: self.durable.generation,
@@ -324,7 +324,10 @@ mod tests {
         );
         assert!(runtime(&app, editor).is_directory_only());
         assert_eq!(app.durable.card_scopes.get(&editor), Some(&scope));
-        assert_eq!(app.card_state(editor).unwrap().width_fraction, 1.0 / 3.0);
+        assert_eq!(
+            app.card_state(editor).unwrap().width_fraction,
+            app.settings.default_native_pane_fraction
+        );
         assert_ne!(
             app.workspace.visibility(editor),
             Some(VisibilityClass::Visible),

@@ -1677,20 +1677,6 @@ fn pull_request_head(
         .unwrap_or_default()
 }
 
-fn lone_chat_width(available: f32, preferred: CardWidth) -> f32 {
-    let available = if available.is_finite() {
-        available.max(0.0)
-    } else {
-        0.0
-    };
-    let limits = crate::workspace::WidthLimits::default();
-    let preferred = preferred
-        .resolve(available, limits)
-        .clamp(limits.minimum.min(available), available);
-    let wide = ((available - limits.minimum * 2.0) / limits.minimum).clamp(0.0, 1.0);
-    available + (preferred - available) * wide
-}
-
 /// The GitHub base branch a comparison has already proved, or empty.
 ///
 /// A remote-tracking ref is reduced with the remote names this worktree
@@ -2133,6 +2119,7 @@ pub enum SettingsCategory {
     Appearance,
     Terminal,
     Editor,
+    NativeChat,
     Links,
     Keyboard,
     Accounts,
@@ -2140,11 +2127,12 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
         Self::Editor,
+        Self::NativeChat,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
@@ -2159,6 +2147,7 @@ impl SettingsCategory {
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
             Self::Editor => "Editor",
+            Self::NativeChat => "Native chat",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
@@ -2658,6 +2647,9 @@ pub enum SettingsField {
     EditorWrapLines,
     DiffHideUnchanged,
     ChatEnterSends,
+    ChatExpandToolGroups,
+    ChatContentFraction,
+    DefaultNativePaneFraction,
     ShowStatusBar,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
@@ -2796,6 +2788,9 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => "Focus pane 7",
             Self::ShortcutFocusPane8 => "Focus pane 8",
             Self::ShortcutFocusPane9 => "Focus pane 9",
+            Self::ChatExpandToolGroups => "Expand tool groups by default",
+            Self::ChatContentFraction => "Chat content width",
+            Self::DefaultNativePaneFraction => "Native pane minimum width",
             Self::ChatEnterSends => "Chat send key",
             Self::ShowStatusBar => "Status bar",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
@@ -2849,8 +2844,11 @@ impl SettingsField {
             | Self::WorktreeSort
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
-            | Self::ChatEnterSends
             | Self::FocusFollowsMouse => SettingsCategory::General,
+            Self::ChatEnterSends | Self::ChatExpandToolGroups | Self::ChatContentFraction => {
+                SettingsCategory::NativeChat
+            }
+            Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
             | Self::EditorSyntaxTheme
@@ -3026,6 +3024,9 @@ struct SettingsDraft {
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
     chat_enter_sends: bool,
+    chat_expand_tool_groups: bool,
+    chat_content_fraction: String,
+    default_native_pane_fraction: String,
     show_status_bar: bool,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
@@ -3082,6 +3083,9 @@ impl SettingsDraft {
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
             chat_enter_sends: settings.chat_enter_sends,
+            chat_expand_tool_groups: settings.chat_expand_tool_groups,
+            chat_content_fraction: settings.chat_content_fraction.to_string(),
+            default_native_pane_fraction: settings.default_native_pane_fraction.to_string(),
             show_status_bar: settings.show_status_bar,
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
@@ -3132,6 +3136,9 @@ impl SettingsDraft {
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
+            SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
+            SettingsField::ChatContentFraction => self.chat_content_fraction = value,
+            SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = value,
             SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
@@ -3340,6 +3347,18 @@ fn settings_update(
             next.browser_search_url = value.to_owned();
             Ok(())
         }
+        SettingsField::ChatExpandToolGroups => value
+            .parse::<bool>()
+            .map(|enabled| next.chat_expand_tool_groups = enabled)
+            .map_err(|_| "Choose whether tool groups start expanded.".to_owned()),
+        SettingsField::ChatContentFraction => value
+            .parse::<f32>()
+            .map(|fraction| next.chat_content_fraction = fraction)
+            .map_err(|_| "Chat width must be a number.".to_owned()),
+        SettingsField::DefaultNativePaneFraction => value
+            .parse::<f32>()
+            .map(|fraction| next.default_native_pane_fraction = fraction)
+            .map_err(|_| "Native pane width must be a number.".to_owned()),
         SettingsField::ChatEnterSends => value
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
@@ -6084,7 +6103,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.settings.default_native_pane_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6104,7 +6123,7 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_column_fraction),
+                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
                 )
                 .expect("pull request card is valid"),
                 index,
@@ -6481,7 +6500,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.settings.default_native_pane_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6511,7 +6530,7 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_column_fraction),
+                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
                 )
                 .expect("repository card is valid"),
                 index,
@@ -8334,43 +8353,13 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    /// The workspace always fills its viewport. Only a lone native chat
-    /// keeps a readable, centered surface within that full-width pane.
     fn workspace_card_view(
         &self,
         id: CardId,
         focused: bool,
         splitter: bool,
     ) -> Element<'_, Message> {
-        if !self
-            .card_state(id)
-            .is_some_and(|card| matches!(card.kind, CardKind::Chat(_)))
-        {
-            return self.card_view(id, focused, splitter);
-        }
-        let preferred = self
-            .workspace
-            .card(id)
-            .map_or(CardWidth::Fraction(0.5), |card| card.width);
-        // Keep the same widget root when a neighbor opens or closes, so
-        // composer selection, focus, and transcript state survive re-layout.
-        let lone = self.workspace.cards().len() == 1;
-        iced::widget::responsive(move |size| {
-            let width = if lone {
-                lone_chat_width(size.width, preferred)
-            } else {
-                size.width
-            };
-            widget::container(
-                widget::container(self.card_view(id, focused, splitter))
-                    .width(Length::Fixed(width))
-                    .height(Length::Fill),
-            )
-            .center_x(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        })
-        .into()
+        self.card_view(id, focused, splitter)
     }
 
     fn card_view<'a>(
@@ -11098,7 +11087,7 @@ impl Cagents {
             id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.settings.default_native_pane_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -11524,6 +11513,11 @@ impl Cagents {
     /// rest of the application - or the daemon - is not using.
     fn synchronize_settings(&mut self, previous: &AppSettings) -> Task<Message> {
         self.synchronize_lifecycle_budget();
+        for runtime in self.cards.values_mut() {
+            if let CardRuntime::Chat(runtime) = runtime {
+                runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
+            }
+        }
         let mut tasks = Vec::new();
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
@@ -23989,18 +23983,6 @@ mod tests {
             number,
             url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
         })
-    }
-
-    #[test]
-    fn lone_native_chat_uses_readable_width_without_a_compact_breakpoint_jump() {
-        let preferred = CardWidth::Fraction(0.35);
-        assert_eq!(lone_chat_width(800.0, preferred), 800.0);
-        assert!((lone_chat_width(1440.0, preferred) - 504.0).abs() < 0.001);
-        assert_eq!(lone_chat_width(320.0, CardWidth::Fixed(2000.0)), 320.0);
-        assert_eq!(lone_chat_width(1440.0, CardWidth::Fraction(0.125)), 480.0);
-        assert!(
-            (lone_chat_width(961.0, preferred) - lone_chat_width(959.0, preferred)).abs() < 3.0
-        );
     }
 
     #[test]

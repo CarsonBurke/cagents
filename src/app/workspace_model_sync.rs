@@ -568,7 +568,11 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: format!("{} agent", agent.spec.provider.label()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: if matches!(kind, CardKind::Chat(_)) {
+                self.settings.default_native_pane_fraction
+            } else {
+                self.settings.default_column_fraction
+            },
             existence: Existence::Open,
             exposure: Exposure::Offscreen,
             residency: Residency::Cold,
