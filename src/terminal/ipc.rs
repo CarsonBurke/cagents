@@ -97,7 +97,7 @@ use crate::{
 /// Version 35 carries row wrapping, OSC 8 links, bracketed-paste state, live cwd,
 /// and terminal-owner scrollback search, clearing, and selection copying.
 /// Snapshots require a matched set.
-pub const PROTOCOL_VERSION: u16 = 36;
+pub const PROTOCOL_VERSION: u16 = 37;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

@@ -629,7 +629,7 @@ impl Cagents {
         // The shared title wins even where this window's own derivation would
         // differ: one window deferring is better than two windows showing one
         // channel under two names.
-        let retitle = local.title != shared.title;
+        let retitle = local.title != shared.title || local.title_source != shared.title_source;
         // A rank the registry has not assigned yet must not overwrite one it
         // has, which is what a folded create carries until a read supplies the
         // real one.
@@ -643,6 +643,7 @@ impl Cagents {
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {
             channel.title = shared.title.clone();
+            channel.title_source = shared.title_source;
         }
         if rerank {
             channel.ordinal = shared.ordinal;
@@ -663,6 +664,7 @@ impl Cagents {
         Arc::make_mut(&mut self.durable)
             .channels
             .push(ProjectChannel {
+                title_source: shared.title_source,
                 id: shared.id,
                 project_id,
                 title: shared.title.clone(),
@@ -799,6 +801,7 @@ impl Cagents {
             id,
             repository,
             title: String::new(),
+            title_source: Default::default(),
         });
     }
 
@@ -810,6 +813,7 @@ impl Cagents {
             return;
         };
         let title = channel.title.clone();
+        let title_source = channel.title_source;
         let project_id = channel.project_id;
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;
@@ -832,6 +836,7 @@ impl Cagents {
             id,
             repository,
             title,
+            title_source,
         });
     }
 
@@ -1030,6 +1035,7 @@ mod tests {
 
     fn shared(id: ChannelId, repository: &Path, title: &str, ordinal: u32) -> ModelChannel {
         ModelChannel {
+            title_source: Default::default(),
             id,
             repository: repository.to_path_buf(),
             title: title.to_owned(),
@@ -1039,6 +1045,7 @@ mod tests {
 
     fn local(id: ChannelId, project: ProjectId, title: &str, ordinal: u32) -> ProjectChannel {
         ProjectChannel {
+            title_source: Default::default(),
             id,
             project_id: project,
             title: title.to_owned(),
@@ -1431,6 +1438,7 @@ mod tests {
         let id = ChannelId::new();
         let conversation = app.durable.cards[0].id;
         let mut channel = local(id, project, "mine", 0);
+        channel.title_source = crate::model::ChannelTitleSource::Prompt;
         channel.cards = vec![conversation];
         channel.focused = Some(conversation);
         Arc::make_mut(&mut app.durable).channels.push(channel);
@@ -1471,6 +1479,7 @@ mod tests {
                     // The title the user has already seen, not an empty one: a
                     // channel being introduced is not a channel being created.
                     title: "mine".into(),
+                    title_source: crate::model::ChannelTitleSource::Prompt,
                 },
             ],
             "the project comes first, or the channel would have no owner"

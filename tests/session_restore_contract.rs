@@ -429,6 +429,7 @@ fn a_selected_channel_restores_its_chats_focus_and_title() {
     let mut fixture = RestoreFixture::new();
     let channel_id = ChannelId::new();
     fixture.workspace.channels = vec![ProjectChannel {
+        title_source: Default::default(),
         id: channel_id,
         project_id: fixture.project.id,
         title: "Investigate startup".into(),

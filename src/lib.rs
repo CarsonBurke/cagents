@@ -4,6 +4,8 @@
 /// identity; ignore its metadata only when ordering published release versions.
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
+mod names;
+
 pub mod account;
 pub mod agent;
 pub mod agent_execution;

@@ -716,6 +716,7 @@ mod tests {
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.push(target);
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: channel,
             project_id: project,
             title: "Target".into(),

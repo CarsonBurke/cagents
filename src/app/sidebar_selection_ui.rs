@@ -27,6 +27,7 @@ mod tests {
         let durable = Arc::make_mut(&mut app.durable);
         for (index, id) in channels.iter().enumerate() {
             durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
                 id: *id,
                 project_id: project,
                 title: format!("Channel {index}"),

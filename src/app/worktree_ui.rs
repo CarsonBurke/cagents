@@ -745,6 +745,7 @@ mod tests {
             ],
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: app.sidebar_model.projects[0].id,
                 title: "Channel".into(),
@@ -796,6 +797,7 @@ mod tests {
             active_channel: Some(a),
             channels: vec![
                 ProjectChannel {
+                    title_source: Default::default(),
                     id: a,
                     project_id,
                     title: "A".into(),
@@ -805,6 +807,7 @@ mod tests {
                     focused: Some(focused.id),
                 },
                 ProjectChannel {
+                    title_source: Default::default(),
                     id: b,
                     project_id,
                     title: "B".into(),
@@ -855,6 +858,7 @@ mod tests {
         app.durable = Arc::new(WorkspaceState {
             cards: vec![main.clone(), closed.clone()],
             channels: vec![ProjectChannel {
+                title_source: Default::default(),
                 id,
                 project_id,
                 title: "Channel".into(),
@@ -962,6 +966,7 @@ mod tests {
         app.durable = Arc::new(WorkspaceState {
             cards: vec![root.clone(), nested.clone(), channeled.clone()],
             channels: vec![ProjectChannel {
+                title_source: Default::default(),
                 id: ChannelId::new(),
                 project_id,
                 title: "Channel".into(),
@@ -1046,6 +1051,7 @@ mod tests {
             cards: vec![main.clone(), nested.clone(), channeled.clone()],
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: app.sidebar_model.projects[0].id,
                 title: "Channel".into(),
@@ -1108,6 +1114,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(ProjectChannel {
+                title_source: Default::default(),
                 id: empty,
                 project_id: app.sidebar_model.projects[0].id,
                 title: "Empty".into(),

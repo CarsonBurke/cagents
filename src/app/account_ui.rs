@@ -5614,6 +5614,7 @@ mod app_tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(crate::model::ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: project,
                 title: "discussion".into(),

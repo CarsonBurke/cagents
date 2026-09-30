@@ -2190,6 +2190,7 @@ mod tests {
             1,
             ClientRequest::EditWorkspaceModel {
                 edit: crate::workspace_model::ModelEdit::CreateChannel {
+                    title_source: Default::default(),
                     id: channel,
                     repository,
                     title: "shared".into(),

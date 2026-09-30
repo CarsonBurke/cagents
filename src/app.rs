@@ -8046,7 +8046,13 @@ impl Cagents {
                     self.terminal_search_results(card, request, query, matches, truncated);
                 }
                 TerminalEvent::ConversationTitleChanged(title) => {
-                    self.name_channel_from_prompt(card, &title);
+                    if let Some(title) = crate::workspace_model::channel_title(&title) {
+                        self.suggest_channel_title(
+                            card,
+                            title,
+                            crate::model::ChannelTitleSource::Provider,
+                        );
+                    }
                 }
                 TerminalEvent::ResumeHintChanged(hint) => {
                     if let Some(state) = self.card_state_mut(card)
@@ -17622,6 +17628,7 @@ mod tests {
         let newer = crate::model::ChannelId::new();
         let identity = uuid::Uuid::new_v4();
         let shared = |id, title: &str, ordinal| crate::workspace_model::ModelChannel {
+            title_source: Default::default(),
             id,
             repository: repository.clone(),
             title: title.to_owned(),
@@ -20403,6 +20410,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(ProjectChannel {
+                title_source: Default::default(),
                 id: channel,
                 project_id: other,
                 title: "channel".into(),
@@ -20465,6 +20473,7 @@ mod tests {
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards = cards;
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: channel,
             project_id: project,
             title: "Migration".into(),
@@ -22207,6 +22216,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(ProjectChannel {
+                title_source: Default::default(),
                 id: ChannelId::new(),
                 project_id: channel_project,
                 title: "channel".into(),

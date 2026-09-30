@@ -370,6 +370,7 @@ impl Cagents {
                 Arc::make_mut(&mut self.durable)
                     .channels
                     .push(ProjectChannel {
+                        title_source: Default::default(),
                         id,
                         project_id,
                         // Empty means awaiting the channel's first accepted prompt.
@@ -767,31 +768,38 @@ impl Cagents {
         ))
     }
     pub(super) fn channel_needs_name(&self, card: CardId) -> bool {
-        self.durable
-            .channels
-            .iter()
-            .any(|channel| channel.title.is_empty() && channel.cards.contains(&card))
+        self.durable.channels.iter().any(|channel| {
+            (channel.title.is_empty()
+                || channel.title_source == crate::model::ChannelTitleSource::Prompt)
+                && channel.cards.contains(&card)
+        })
     }
 
     /// Names a new channel from its first submitted prompt or conversation name.
     ///
-    /// A title that already exists is authoritative: it may have been entered
-    /// by the user, supplied by another window, or restored from persistence.
+    /// Prompt fallbacks may later improve to provider titles. Manual and legacy
+    /// titles remain authoritative, including renames from another window.
     pub(super) fn name_channel_from_prompt(&mut self, card: CardId, prompt: &str) {
-        let Some(index) = self
-            .durable
-            .channels
-            .iter()
-            .position(|channel| channel.title.is_empty() && channel.cards.contains(&card))
-        else {
-            return;
-        };
-        let Some(title) = channel_title_from_prompt(prompt) else {
+        if let Some(title) = channel_title_from_prompt(prompt) {
+            self.suggest_channel_title(card, title, crate::model::ChannelTitleSource::Prompt);
+        }
+    }
+
+    pub(super) fn suggest_channel_title(
+        &mut self,
+        card: CardId,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        let Some(index) = self.durable.channels.iter().position(|channel| {
+            channel.title_source.accepts(&channel.title, source) && channel.cards.contains(&card)
+        }) else {
             return;
         };
         let id = self.durable.channels[index].id;
         Arc::make_mut(&mut self.durable).channels[index].title = title.clone();
-        self.publish_model_edit(ModelEdit::RetitleChannel { id, title });
+        Arc::make_mut(&mut self.durable).channels[index].title_source = source;
+        self.publish_model_edit(ModelEdit::SuggestChannelTitle { id, title, source });
         self.refresh_sidebar_channels();
         self.persist();
     }
@@ -886,11 +894,8 @@ impl Cagents {
     }
 }
 
-const MAX_CHANNEL_TITLE_CHARS: usize = 80;
-
 fn channel_title_from_prompt(prompt: &str) -> Option<String> {
-    let title = normalize_card_name(prompt)?;
-    Some(title.chars().take(MAX_CHANNEL_TITLE_CHARS).collect())
+    crate::workspace_model::channel_title_from_prompt(prompt)
 }
 
 /// A channel still waiting for its first accepted prompt has to be nameable
@@ -1039,6 +1044,7 @@ mod tests {
         durable.cards[0].title = "Native chat".into();
         durable.cards[0].kind = crate::model::CardKind::Chat(chat_session());
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id,
             project_id: project,
             title: String::new(),
@@ -1127,6 +1133,7 @@ mod tests {
         chat.title = "Draft the migration".into();
         durable.cards.push(chat);
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id,
             project_id: project,
             title: "Investigation".into(),
@@ -1173,6 +1180,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(ProjectChannel {
+                title_source: Default::default(),
                 id: ChannelId::new(),
                 project_id: project,
                 title: "Investigation".into(),
@@ -1219,6 +1227,7 @@ mod tests {
                 Vec::new()
             };
             durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
                 id,
                 project_id: ProjectId::new(),
                 title: "Empty".into(),
@@ -1242,6 +1251,7 @@ mod tests {
         Arc::make_mut(&mut app.durable)
             .channels
             .push(ProjectChannel {
+                title_source: Default::default(),
                 id,
                 project_id: ProjectId::new(),
                 title: "CLI".into(),
@@ -1271,6 +1281,7 @@ mod tests {
         chat.title = "Explain the parser".into();
         durable.cards.push(chat);
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: doomed,
             project_id: project,
             title: "Investigation".into(),
@@ -1280,6 +1291,7 @@ mod tests {
             focused: Some(conversation),
         });
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: survivor,
             project_id: project,
             title: "Migration".into(),
@@ -1437,6 +1449,7 @@ mod tests {
         pane.title = "Settings".into();
         durable.cards.extend([chat, pane]);
         durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: channel,
             project_id: ProjectId::new(),
             title: "Investigation".into(),

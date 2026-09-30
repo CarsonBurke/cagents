@@ -4561,6 +4561,7 @@ mod tests {
         };
         let terminal_id = terminal.id;
         workspace.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: ChannelId::new(),
             project_id: project.id,
             title: "Owned outside cwd".into(),
@@ -4610,6 +4611,7 @@ mod tests {
         };
         store.save_project(&other).unwrap();
         channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: ChannelId::new(),
             project_id: other.id,
             ..channels[0].clone()
@@ -4651,6 +4653,7 @@ mod tests {
         let project_id = ProjectId::new();
         let id = ChannelId::new();
         workspace.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id,
             project_id,
             title: "Investigate startup".into(),
@@ -4687,6 +4690,7 @@ mod tests {
             vec![card, unrelated_id]
         );
         workspace.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: ChannelId::new(),
             project_id,
             title: "Conflicting owner".into(),
@@ -5964,6 +5968,7 @@ mod tests {
         workspace.project_order = vec![ProjectId::new()];
         let channel_id = ChannelId::new();
         workspace.channels.push(ProjectChannel {
+            title_source: Default::default(),
             id: channel_id,
             project_id: workspace.project_order[0],
             title: "Legacy".into(),
