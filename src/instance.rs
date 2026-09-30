@@ -1572,6 +1572,32 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
             continue;
         };
         if name.trim_end() == LEGACY_PROCESS_NAME {
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let fields = stat
+                .rsplit_once(')')
+                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid legacy UI process state",
+                    )
+                })?;
+            let state = fields.first().copied().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing legacy UI process state",
+                )
+            })?;
+            // An exited single-thread UI has released its descriptors and
+            // cannot write the store, even if its parent never collects it.
+            // A zombie leader may still have live worker threads.
+            if matches!(state, "Z" | "X") && fields.get(17) == Some(&"1") {
+                continue;
+            }
             return Ok(true);
         }
     }
@@ -1858,7 +1884,25 @@ mod tests {
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
 
         fs::write(legacy.join("comm"), "cagents-ui\n").unwrap();
+        let mut fields = ["0"; 18];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[17] = "1";
+        let stat = |fields: &[&str]| format!("4294967294 (cagents-ui) {}", fields.join(" "));
+        fs::write(legacy.join("stat"), stat(&fields)).unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        for state in ["Z", "X"] {
+            fields[0] = state;
+            fs::write(legacy.join("stat"), stat(&fields)).unwrap();
+            assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+        }
+        fields[17] = "2";
+        fs::write(legacy.join("stat"), stat(&fields)).unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::write(legacy.join("stat"), "malformed").unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).is_err());
+        fs::remove_file(legacy.join("stat")).unwrap();
+        assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
     }
 
     #[test]
