@@ -70,7 +70,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Action | Default |
 | --- | --- |
 | New terminal | `Ctrl+Shift+T` |
-| New native thread | `Ctrl+Shift+N` |
+| New native thread tab | `Ctrl+T` or `Ctrl+Shift+N` |
 | Command palette | `Ctrl+Shift+P` |
 | Open settings | `Ctrl+Comma` |
 | Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
@@ -96,7 +96,8 @@ Workspace and review shortcuts are configurable; see
 
 - The defaults leave the keys shells, editors, and agent CLIs use to the
   focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
-  deletes a word, `Ctrl+T` and `Alt` letters reach the program. A chord you
+  deletes a word and `Alt` letters reach the program. **Ctrl+T** creates a
+  native thread tab, including from a terminal. A chord you
   bind is withheld from the terminal. **Ctrl+F** finds in the focused terminal,
   chat transcript or editor, and otherwise searches projects. The
   review chords act in pull request and local diff panes. As in those

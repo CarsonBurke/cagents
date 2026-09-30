@@ -90,8 +90,7 @@ pub enum GlobalShortcut {
 /// scope reaches over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutScope {
-    /// Anywhere in the workspace, a focused terminal included. Its default
-    /// chords are ones a shell has no use for.
+    /// Anywhere in the workspace, a focused terminal included.
     Workspace,
     /// Anywhere but a focused terminal, which receives the chord as input.
     /// For an action whose chord means something to a shell and the same kind
@@ -2688,6 +2687,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_tab_chord_is_reserved_in_every_pane_and_does_not_repeat() {
+        use keyboard::key::Code;
+
+        let shortcuts = KeyboardShortcuts::default();
+        for focused in [
+            FocusedPane::Other,
+            FocusedPane::Terminal,
+            FocusedPane::Review,
+        ] {
+            assert!(is_global_shortcut_chord(
+                &keyboard::Key::Character("t".into()),
+                keyboard::key::Physical::Code(Code::KeyT),
+                keyboard::Modifiers::CTRL,
+                &shortcuts,
+                focused,
+            ));
+            for repeat in [false, true] {
+                assert_eq!(
+                    global_shortcut(
+                        &key_press("t", Code::KeyT, keyboard::Modifiers::CTRL, repeat),
+                        &shortcuts,
+                        focused,
+                    ),
+                    (!repeat).then_some(GlobalShortcut::NewThread),
+                );
+            }
+        }
+    }
+
     /// The keys a shell, an editor, or an agent CLI in a terminal relies on
     /// reach it: no default binds them, so a focused terminal receives every
     /// one. `Ctrl+W` deleting a word used to close the pane instead.
@@ -2714,7 +2743,6 @@ mod tests {
         let alt = keyboard::Modifiers::ALT;
         for (key, physical, modifiers) in [
             character("w", Code::KeyW, ctrl),
-            character("t", Code::KeyT, ctrl),
             character("f", Code::KeyF, ctrl),
             character("r", Code::KeyR, ctrl),
             character("e", Code::KeyE, ctrl),
@@ -3464,7 +3492,7 @@ mod tests {
         };
         let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
         assert!(reserved("t".into(), Code::KeyT, ctrl_shift));
-        assert!(!reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
+        assert!(reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
         assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
@@ -3479,6 +3507,18 @@ mod tests {
             "t".into(),
             Code::KeyT,
             ctrl_shift | keyboard::Modifiers::ALT,
+        ));
+
+        let customized = KeyboardShortcuts {
+            new_native_thread: vec!["Ctrl+Shift+N".into()],
+            ..shortcuts
+        };
+        assert!(!is_global_shortcut_chord(
+            &keyboard::Key::Character("t".into()),
+            Physical::Code(Code::KeyT),
+            keyboard::Modifiers::CTRL,
+            &customized,
+            FocusedPane::Other,
         ));
     }
 
