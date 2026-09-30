@@ -13246,6 +13246,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::CommitSubjectEditorAction { .. }
                     | SidebarAction::CommitEditorAction { .. }
                     | SidebarAction::AmendChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
