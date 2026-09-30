@@ -2017,13 +2017,15 @@ fn decision_label(id: &str, value: &Value) -> String {
 fn item_key(turn: &str, item: &str) -> String {
     format!("{turn}/{item}")
 }
-/// Items the app-server keeps writing into after announcing them, which is why
-/// they are retained and re-emitted rather than rendered once and forgotten.
+/// Running items the app-server can still write into. A live turn's history
+/// also contains settled tools; retaining those exhausts the concurrency
+/// bound when a long conversation is resumed or refreshed.
 fn streams_updates(content: &ItemContent) -> bool {
-    matches!(
-        content,
-        ItemContent::Tool { .. } | ItemContent::Command { .. } | ItemContent::Changes { .. }
-    )
+    content.status() == Some(ToolStatus::Running)
+        && matches!(
+            content,
+            ItemContent::Tool { .. } | ItemContent::Command { .. } | ItemContent::Changes { .. }
+        )
 }
 /// Codex leaves `phase` null for models that do not classify their messages,
 /// and an unclassified message has to be treated as the turn's answer or the
@@ -3481,6 +3483,46 @@ mod tests {
         assert_ne!(one[0].id, two[0].id);
         let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"answer"}})).unwrap();
         assert!(matches!(&live.events[0],Event::TextDelta { id,.. } if id == &one[0].id));
+    }
+
+    #[test]
+    fn long_active_turn_history_tracks_only_running_tools() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut items: Vec<_> = (0..MAX_ACTIVE_ITEMS + 32)
+            .map(|index| json!({"id":index.to_string(),"type":"commandExecution","command":"echo done","cwd":"/repo","status":"completed","aggregatedOutput":"done"}))
+            .collect();
+        items.push(json!({"id":"running","type":"commandExecution","command":"echo live","cwd":"/repo","status":"inProgress","aggregatedOutput":"start"}));
+        let turn = json!({"id":"long","status":"inProgress","items":items});
+        let mut page = Step::default();
+        adapter
+            .page(&json!({"data":[turn.clone()],"nextCursor":null}), &mut page)
+            .unwrap();
+        assert_eq!(adapter.active_items.len(), 1);
+        assert!(
+            matches!(&page.events[0], Event::History { items, .. } if items.len() == MAX_ACTIVE_ITEMS + 33)
+        );
+        let started = adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":turn}}),
+            )
+            .unwrap();
+        assert_eq!(adapter.active_items.len(), 1);
+        assert_eq!(
+            started
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Item(_)))
+                .count(),
+            MAX_ACTIVE_ITEMS + 33
+        );
+        let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"long","itemId":"running","delta":" tail"}})).unwrap();
+        assert!(
+            matches!(&delta.events[0], Event::Item(Item { content: ItemContent::Command { output, .. }, .. }) if output == "start tail")
+        );
+        let completed = json!({"id":"running","type":"commandExecution","command":"echo live","cwd":"/repo","status":"completed","aggregatedOutput":"start tail"});
+        adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"long","item":completed}})).unwrap();
+        assert!(adapter.active_items.is_empty());
     }
 
     #[test]
