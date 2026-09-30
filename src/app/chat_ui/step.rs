@@ -146,41 +146,36 @@ pub(super) fn code_frame<'a>(
             .width(Length::Fill)
             .into();
     };
-    widget::container(
-        widget::column::with_children(vec![
-            widget::container(
-                widget::row::with_children(match copy {
-                    Some(copy) => vec![
-                        design::caption(caption).width(Length::Fill).into(),
-                        // At the primary control size this one button was
-                        // taller than the caption row it sits in, which made
-                        // every code block look like it carried a toolbar.
-                        small_icon("edit-copy-symbolic", "Copy this block", copy),
-                    ],
-                    None => vec![design::caption(caption).into()],
-                })
-                .align_y(Alignment::Center)
-                .spacing(GAP_S),
-            )
-            .padding([GAP_XS as u16, GAP_M as u16])
+    let body = widget::container(body)
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_S; 4],
+            true,
+        ))
+        .width(Length::Fill)
+        .into();
+    let block = widget::column::with_children(vec![
+        widget::container(design::caption(caption))
+            .padding(iced::Padding::ZERO.right(24))
             .width(Length::Fill)
-            .class(design::surface(
-                Some(design::raised),
-                [design::RADIUS_S, design::RADIUS_S, 0.0, 0.0],
-                false,
-            ))
+            .height(24)
+            .align_y(Alignment::Center)
             .into(),
-            body,
-        ])
-        .width(Length::Fill),
-    )
-    .class(design::surface(
-        Some(design::sunken),
-        [design::RADIUS_S; 4],
-        true,
-    ))
-    .width(Length::Fill)
-    .into()
+        body,
+    ])
+    .spacing(GAP_XS)
+    .width(Length::Fill);
+    match copy {
+        Some(copy) => iced::widget::hover(
+            block,
+            widget::container(small_icon("edit-copy-symbolic", "Copy this block", copy))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::Start),
+        ),
+        None => block.into(),
+    }
 }
 
 fn change_verb(kind: &ChangeKind) -> &'static str {
@@ -482,11 +477,17 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        widget::row::with_children(vec![header.into(), self.message_copy(item)])
-            .align_y(Alignment::Center)
-            .spacing(GAP_XS)
-            .width(Length::Fill)
-            .into()
+        iced::widget::hover(
+            widget::row::with_children(vec![header.into(), widget::Space::new().width(24).into()])
+                .align_y(Alignment::Center)
+                .spacing(GAP_XS)
+                .width(Length::Fill),
+            widget::container(self.message_copy(item))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::End)
+                .align_y(Alignment::Center),
+        )
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it

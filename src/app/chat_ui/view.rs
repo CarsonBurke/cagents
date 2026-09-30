@@ -21,6 +21,24 @@ const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
+/// Reserve an external action row so hovering never shifts the transcript.
+/// Iced's hover widget also keeps controls visible while keyboard-focused.
+fn message_actions<'a>(
+    message: Element<'a, Message>,
+    actions: Element<'a, Message>,
+    alignment: Alignment,
+) -> Element<'a, Message> {
+    iced::widget::hover(
+        widget::column::with_children(vec![message, widget::Space::new().height(24).into()])
+            .spacing(step::GAP_XS),
+        widget::container(actions)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(alignment)
+            .align_y(Alignment::End),
+    )
+}
+
 /// How tall the pinned plan is allowed to grow.
 ///
 /// The plan sits above the transcript, so it stays a reference a reader
@@ -2398,22 +2416,14 @@ impl Runtime {
                 .into(),
             );
         }
-        widget::container(
-            widget::column::with_children(vec![
-                widget::selectable_text(if text.is_empty() {
-                    "Queued attachment"
-                } else {
-                    text
-                })
-                .size(design::TEXT_PROSE)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
-                widget::row::with_children(controls)
-                    .spacing(step::GAP_S)
-                    .align_y(Alignment::Center)
-                    .into(),
-            ])
-            .spacing(step::GAP_S),
+        let message = widget::container(
+            widget::selectable_text(if text.is_empty() {
+                "Queued attachment"
+            } else {
+                text
+            })
+            .size(design::TEXT_PROSE)
+            .class(cosmic::theme::Text::Custom(design::muted_text)),
         )
         .class(design::surface(
             Some(design::sunken),
@@ -2422,6 +2432,20 @@ impl Runtime {
         ))
         .padding(step::GAP_M)
         .max_width(PROMPT_MEASURE)
+        .into();
+        widget::container(
+            widget::column::with_children(vec![
+                message,
+                widget::row::with_children(controls)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
+                    .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .max_width(PROMPT_MEASURE),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
         .into()
     }
 
@@ -2556,7 +2580,9 @@ impl Runtime {
                 ))
                 .size(12)
                 .into(),
-                design::caption(text).into(),
+                widget::selectable_text(text)
+                    .size(design::TEXT_CAPTION)
+                    .into(),
             ])
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center)
@@ -2584,23 +2610,25 @@ impl Runtime {
                 text
             }
         };
-        let body = widget::column::with_children(vec![body, self.message_copy(item)])
-            .spacing(step::GAP_XS);
-        widget::container(
-            widget::container(body)
-                .class(design::surface(
-                    (!attachment).then_some(design::accent_wash),
-                    [
-                        design::RADIUS_L,
-                        design::RADIUS_L,
-                        design::RADIUS_XS,
-                        design::RADIUS_L,
-                    ],
-                    attachment,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(PROMPT_MEASURE),
-        )
+        let message = widget::container(body)
+            .class(design::surface(
+                (!attachment).then_some(design::accent_wash),
+                [
+                    design::RADIUS_L,
+                    design::RADIUS_L,
+                    design::RADIUS_XS,
+                    design::RADIUS_L,
+                ],
+                attachment,
+            ))
+            .padding([step::GAP_S as u16, step::GAP_M as u16])
+            .max_width(PROMPT_MEASURE)
+            .into();
+        widget::container(message_actions(
+            message,
+            self.message_copy(item),
+            Alignment::End,
+        ))
         .align_x(Alignment::End)
         .width(Length::Fill)
         .into()
@@ -2636,13 +2664,11 @@ impl Runtime {
     ) -> Element<'static, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
-            return widget::container(
-                widget::column::with_children(vec![
-                    prose::view(cached, settings, self.target, self.find.as_deref()),
-                    self.message_copy(item),
-                ])
-                .spacing(step::GAP_XS),
-            )
+            return widget::container(message_actions(
+                prose::view(cached, settings, self.target, self.find.as_deref()),
+                self.message_copy(item),
+                Alignment::Start,
+            ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
             .into();
@@ -2690,8 +2716,7 @@ impl Runtime {
             if expanded {
                 rows.push(prose::view(cached, settings, target, self.find.as_deref()));
             }
-            rows.push(self.message_copy(item));
-            return widget::container(
+            let message =
                 widget::container(widget::column::with_children(rows).spacing(step::GAP_S))
                     .class(cosmic::theme::Container::custom(|theme| {
                         widget::container::Style {
@@ -2705,18 +2730,17 @@ impl Runtime {
                         }
                     }))
                     .padding([step::GAP_S as u16, step::GAP_M as u16])
-                    .max_width(design::READABLE_MEASURE),
-            )
+                    .max_width(design::READABLE_MEASURE)
+                    .into();
+            return widget::container(message_actions(
+                message,
+                self.message_copy(item),
+                Alignment::Start,
+            ))
             .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
             .into();
         }
-        let mut rows: Vec<Element<'static, Message>> = vec![prose::view(
-            cached,
-            settings,
-            self.target,
-            self.find.as_deref(),
-        )];
         // An answer's footer says when it finished and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
@@ -2746,20 +2770,18 @@ impl Runtime {
                 .into(),
             );
         }
-        rows.push(
+        // The answer is bare prose on the pane's own surface. Wrapping it in
+        // a panel would put a frame around the one thing the reader came for,
+        // and would make it look like just another block.
+        widget::container(message_actions(
+            prose::view(cached, settings, self.target, self.find.as_deref()),
             widget::row::with_children(controls)
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-        );
-        // The answer is bare prose on the pane's own surface. Wrapping it in
-        // a panel would put a frame around the one thing the reader came for,
-        // and would make it look like just another block.
-        widget::container(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_S)
-                .max_width(design::READABLE_MEASURE),
-        )
+            Alignment::Start,
+        ))
+        .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
         .into()
     }
