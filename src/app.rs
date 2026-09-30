@@ -8868,16 +8868,8 @@ impl Cagents {
             iced::widget::container::Style {
                 background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
                 border: iced::Border {
-                    color: if focused {
-                        design::accent_color(theme)
-                    } else {
-                        design::warning_color(theme)
-                    },
-                    width: if focused || attention {
-                        design::BORDER_WIDTH
-                    } else {
-                        0.0
-                    },
+                    color: design::warning_color(theme),
+                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
                     ..Default::default()
                 },
                 ..Default::default()
