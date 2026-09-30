@@ -8987,10 +8987,28 @@ mod tests {
 
     #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for stale_reply in [false, true] {
+        for (stale_reply, codex_resume) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
-            let source = chat_runtime(&app, card).session.clone();
+            let mut source = chat_runtime(&app, card).session.clone();
+            if codex_resume {
+                source.launch.provider = Provider::Codex;
+                source.launch.recipe.program = "codex".into();
+                source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+                source.launch.session_id = None;
+                let allocator = source.proof.clone().unwrap();
+                assert!(source.claim_owned_codex_listener(
+                    std::path::Path::new("/run/test-native"),
+                    &allocator
+                ));
+                source.launch.session_id = Some(KNOWN_THREAD.into());
+                source.native_continuity = chat::NativeContinuity::Durable {
+                    provider_version: "0.100.0".into(),
+                };
+                app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            }
             let directory = tempfile::tempdir().unwrap();
             let (writer, _) = crate::session::SessionRuntime::open(
                 directory.path().join("state.sqlite3"),
@@ -9006,7 +9024,15 @@ mod tests {
                 .unwrap();
             let mut replacement = source.clone();
             replacement.proof.as_mut().unwrap().host_incarnation = "upgraded-daemon".into();
-            replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            if codex_resume {
+                replacement
+                    .launch
+                    .recipe
+                    .arguments
+                    .splice(0..0, ["resume".into(), KNOWN_THREAD.into()]);
+            } else {
+                replacement.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
+            }
             let handle = Arc::new(ClientHandle::fixture_upgrade(
                 source.clone(),
                 replacement.clone(),

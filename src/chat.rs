@@ -391,7 +391,7 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         || old == new
         || source.id != replacement.id
         || source.launch.provider != replacement.launch.provider
-        || source.launch.recipe != replacement.launch.recipe
+        || !upgrade_recipe_matches(source, replacement)
         || source.owned_codex_listener != replacement.owned_codex_listener
         || (source.native_continuity != replacement.native_continuity
             && !matches!(source.native_continuity, NativeContinuity::ReconnectOnly))
@@ -418,6 +418,41 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         }
         _ => false,
     }
+}
+
+/// A retained Codex holder may have issued the same confirmed thread with an
+/// explicit resume prefix after its original fresh-thread descriptor. Only
+/// that prefix can change; the endpoint and all execution settings stay exact.
+fn upgrade_recipe_matches(source: &Session, replacement: &Session) -> bool {
+    if source.launch.recipe == replacement.launch.recipe {
+        return true;
+    }
+    if source.launch.provider != Provider::Codex
+        || source.launch.session_id != replacement.launch.session_id
+        || !matches!(source.native_continuity, NativeContinuity::Durable { .. })
+        || !source.owns_codex_listener()
+        || !replacement.owns_codex_listener()
+        || source
+            .launch
+            .recipe
+            .arguments
+            .iter()
+            .any(|argument| argument == "resume")
+    {
+        return false;
+    }
+    let mut normalized = replacement.launch.recipe.clone();
+    let Some(conversation) = replacement.launch.session_id.as_ref() else {
+        return false;
+    };
+    let arguments = &normalized.arguments;
+    if arguments.first().map(String::as_str) != Some("resume")
+        || arguments.get(1) != Some(conversation)
+    {
+        return false;
+    }
+    normalized.arguments.drain(..2);
+    normalized == source.launch.recipe
 }
 
 /// The exact endpoint a daemon allocated for one native Codex conversation.
