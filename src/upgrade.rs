@@ -155,6 +155,7 @@ pub(crate) fn ensure_no_surviving_process(
 ) -> Result<(), String> {
     use std::collections::HashMap;
     let mut processes = HashMap::new();
+    let mut starts = HashMap::new();
     let manager = UserManagerSession::connect();
     for entry in fs::read_dir(proc_root).map_err(process_error)? {
         let entry = entry.map_err(process_error)?;
@@ -190,6 +191,9 @@ pub(crate) fn ensure_no_surviving_process(
             .ok_or("cannot inspect process parent")?;
         if state != "Z" && state != "X" {
             processes.insert(pid, parent);
+            if let Some(start) = fields.nth(17).and_then(|start| start.parse::<u64>().ok()) {
+                starts.insert(pid, start);
+            }
         }
     }
     let exact_resume = session.agent_resume_recipe();
@@ -212,6 +216,31 @@ pub(crate) fn ensure_no_surviving_process(
         // exec can temporarily expose an empty proc file before publishing the
         // new arguments/environment. Absence of evidence cannot permit replay.
         if argv.is_empty() {
+            // A PID-namespace init can remain sleeping inside do_exit while
+            // waiting for its children, after losing its address space and
+            // proc invocation. PF_EXITING is kernel-owned and irreversible:
+            // a single-thread process cannot return to userspace or write the
+            // conversation. An exiting leader can still have live threads.
+            // Keep its ancestry above; descendants are inspected separately.
+            let stat = match fs::read_to_string(path.join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            if stat.rsplit_once(')').is_some_and(|(_, fields)| {
+                let fields: Vec<_> = fields.split_whitespace().collect();
+                fields.get(17) == Some(&"1")
+                    && fields
+                        .get(19)
+                        .and_then(|start| start.parse::<u64>().ok())
+                        .is_some_and(|start| starts.get(&pid) == Some(&start))
+                    && fields
+                        .get(6)
+                        .and_then(|flags| flags.parse::<u64>().ok())
+                        .is_some_and(|flags| flags & 0x4 != 0)
+            }) {
+                continue;
+            }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
         if argv.split(|byte| *byte == 0).any(|arg| {
@@ -1643,6 +1672,48 @@ mod tests {
 
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn exiting_namespace_init_does_not_hide_a_surviving_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let parent = directory.path().join("42");
+        fs::create_dir(&parent).unwrap();
+        let mut fields = ["0"; 20];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[6] = "4";
+        fields[17] = "1";
+        fields[19] = "123";
+        let stat = |fields: &[&str]| format!("42 (namespace init) {}", fields.join(" "));
+        fs::write(parent.join("stat"), stat(&fields)).unwrap();
+        fs::write(parent.join("cmdline"), b"").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+
+        let child = directory.path().join("43");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("stat"), "43 (writer) S 42").unwrap();
+        fs::write(child.join("cmdline"), b"/bin/fish\0").unwrap();
+        fs::write(
+            child.join("environ"),
+            format!("CAGENTS_TERMINAL_ID={}\0", source.id),
+        )
+        .unwrap();
+        assert!(
+            ensure_no_surviving_process(&source, u32::MAX, directory.path())
+                .unwrap_err()
+                .contains("live process (43)")
+        );
+        fs::remove_dir_all(child).unwrap();
+        fields[17] = "2";
+        fs::write(parent.join("stat"), stat(&fields)).unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+        fields[17] = "1";
+        fields[6] = "0";
+        fs::write(parent.join("stat"), stat(&fields)).unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]
