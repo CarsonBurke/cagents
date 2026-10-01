@@ -521,6 +521,9 @@ mod tests {
         assert!(runtime(&app, browser).selected_path().is_none());
         assert_eq!(runtime(&app, file_a).descriptor.project, project_a);
         assert_eq!(app.durable.card_scopes.get(&file_a), Some(&scope_a));
+        // Repository loading does not advance the pane's layout/reveal animation.
+        let update = app.workspace.tick(std::time::Duration::from_secs(1));
+        drop(app.apply_viewport(update, true, false));
         assert_eq!(
             app.workspace.visibility(file_a),
             Some(VisibilityClass::Visible)

@@ -131,8 +131,10 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static SIDEBAR: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // Both gear and hub are symmetric around (8, 8). Render this vector
+    // directly at the control's icon size, without a bitmap intermediate.
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.5 1.5h3l.3 1.55c.45.15.87.39 1.23.7l1.5-.55 1.5 2.6-1.2 1.05c.08.48.08.96 0 1.44l1.2 1.05-1.5 2.6-1.5-.55c-.36.31-.78.55-1.23.7l-.3 1.55h-3l-.3-1.55c-.45-.15-.87-.39-1.23-.7l-1.5.55-1.5-2.6 1.2-1.05a4.3 4.3 0 0 1 0-1.44l-1.2-1.05 1.5-2.6 1.5.55c.36-.31.78-.55 1.23-.7z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="2" fill="none" stroke="black" stroke-width="1.2"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"><path d="M6.52 3.43L6.65 1.64L9.35 1.64L9.48 3.43L11.21 4.43L12.83 3.65L14.18 5.99L12.70 7.00L12.70 9.00L14.18 10.01L12.83 12.35L11.21 11.57L9.48 12.57L9.35 14.36L6.65 14.36L6.52 12.57L4.79 11.57L3.17 12.35L1.82 10.01L3.30 9.00L3.30 7.00L1.82 5.99L3.17 3.65L4.79 4.43Z"/><circle cx="8" cy="8" r="2.2"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
@@ -556,58 +558,82 @@ pub fn view_tabs<'a, Message: Clone + 'a>(
     tabs: Vec<ViewTab<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let inset = if compact {
-        spacing.space_xxs
-    } else {
-        spacing.space_xs
-    };
     let row = widget::row::with_children(
         tabs.into_iter()
-            .map(|tab| {
-                let ViewTab {
-                    label,
-                    description,
-                    count,
-                    selected,
-                    id,
-                    on_press,
-                } = tab;
-                let mut content = widget::row::with_capacity(2)
-                    .spacing(spacing.space_xxs)
-                    .align_y(iced::Alignment::Center)
-                    .push(crate::design::body(label).wrapping(iced::widget::text::Wrapping::None));
-                // The count is drawn, so it is spoken too: a name that left it
-                // out would describe a different tab than the one on screen.
-                let name: Cow<'a, str> = match &count {
-                    Some((count, _)) => format!("{description}: {count}").into(),
-                    None => description,
-                };
-                if let Some((count, style)) = count {
-                    content = content.push(
-                        crate::design::caption(count)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .class(cosmic::theme::Text::Custom(style)),
-                    );
-                }
-                let mut button =
-                    widget::button::custom(widget::container(content).center_y(Length::Fill))
-                        .class(view_tab_style(selected))
-                        .name(name.clone())
-                        .selected(selected)
-                        .padding([0, inset])
-                        .height(crate::design::DENSE_ROW_HEIGHT)
-                        .on_press_maybe(if selected { None } else { on_press });
-                if let Some(id) = id {
-                    button = button.id(id);
-                }
-                tooltip(crate::interaction::hover(button), name)
-            })
+            .map(|tab| view_tab(tab, compact, None))
             .collect::<Vec<_>>(),
     )
-    .spacing(spacing.space_xxxs)
+    .spacing(cosmic::theme::spacing().space_xxxs)
     .align_y(iced::Alignment::Center);
     widget::container(row).width(Length::Fill).clip(true).into()
+}
+
+/// A shared view tab, with an optional leading status mark. Compact tabs use
+/// caption text and the smaller inline-control height.
+pub fn view_tab<'a, Message: Clone + 'a>(
+    tab: ViewTab<'a, Message>,
+    compact: bool,
+    leading: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let ViewTab {
+        label,
+        description,
+        count,
+        selected,
+        id,
+        on_press,
+    } = tab;
+    let mut content = widget::row::with_capacity(3)
+        .spacing(spacing.space_xxs)
+        .align_y(iced::Alignment::Center);
+    if let Some(leading) = leading {
+        content = content.push(leading);
+    }
+    let label = if compact {
+        crate::design::caption(label)
+    } else {
+        crate::design::body(label)
+    };
+    content = content.push(label.wrapping(iced::widget::text::Wrapping::None));
+    // The count is drawn, so it is spoken too.
+    let name: Cow<'a, str> = match &count {
+        Some((count, _)) => format!("{description}: {count}").into(),
+        None => description,
+    };
+    if let Some((count, style)) = count {
+        content = content.push(
+            crate::design::caption(count)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .class(cosmic::theme::Text::Custom(style)),
+        );
+    }
+    let mut button = widget::button::custom(widget::container(content).center_y(Length::Fill))
+        .class(view_tab_style(selected))
+        .name(name.clone())
+        .selected(selected)
+        .padding([
+            0,
+            if compact {
+                spacing.space_xxs
+            } else {
+                spacing.space_xs
+            },
+        ])
+        .height(view_tab_height(compact))
+        .on_press_maybe(if selected { None } else { on_press });
+    if let Some(id) = id {
+        button = button.id(id);
+    }
+    tooltip(crate::interaction::hover(button), name)
+}
+
+pub fn view_tab_height(compact: bool) -> f32 {
+    if compact {
+        crate::design::COMPACT_CONTROL_SIZE
+    } else {
+        crate::design::DENSE_ROW_HEIGHT
+    }
 }
 
 /// [`control_style`]'s surface with a label tone: the selected tab keeps its
@@ -1128,6 +1154,54 @@ mod tests {
     use std::f32::consts::TAU;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn compact_status_tabs_select_only_an_inactive_view() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 80.0));
+        for selected in [false, true] {
+            let mut tab = view_tab(
+                ViewTab {
+                    label: "Worker".into(),
+                    description: "Worker · Running".into(),
+                    count: None,
+                    selected,
+                    id: None,
+                    on_press: Some(()),
+                },
+                true,
+                Some(activity_spinner_tone(12.0, crate::design::accent_color)),
+            );
+            let mut tree = Tree::new(tab.as_widget());
+            let node = tab.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            assert_eq!(node.size().height, crate::design::COMPACT_CONTROL_SIZE);
+            let cursor = mouse::Cursor::Available(node.bounds().center());
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                tab.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(messages.len(), usize::from(!selected));
+        }
+    }
 
     /// Symbolic names the application leaves to the desktop theme. Each
     /// ships under its exact name in the stock COSMIC chain: the Cosmic

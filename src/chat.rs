@@ -347,6 +347,10 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
         })
 }
 
+/// Inline tool images are spooled to private files before entering a snapshot.
+pub(crate) const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_INLINE_IMAGE_URL_BYTES: usize = (MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4) + 128;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,

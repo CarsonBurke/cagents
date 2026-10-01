@@ -10354,6 +10354,7 @@ impl Cagents {
             return true;
         }
         self.dirty_repository_close.is_some()
+            || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.settings_reset_confirm
@@ -14420,6 +14421,23 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
+                if self.chat_ui.image_viewer.is_some() {
+                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                        match key {
+                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                self.chat_ui.image_viewer = None
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Task::none();
+                }
                 if !captured
                     && !self.workspace_inputs_blocked()
                     && workspace_widget::global_shortcut(
@@ -15232,6 +15250,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(gallery) = &self.chat_ui.image_viewer {
+            return Some(gallery.view());
+        }
         if let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
         }

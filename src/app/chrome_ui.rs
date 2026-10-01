@@ -444,8 +444,51 @@ fn column_title_style() -> cosmic::theme::Button {
     }
 }
 
+fn column_tab_style(
+    theme: &cosmic::Theme,
+    selected: bool,
+    hovered: bool,
+) -> iced::widget::container::Style {
+    let component = &theme.current_container().component;
+    iced::widget::container::Style {
+        background: if selected {
+            Some(iced::Background::Color(
+                component.selected_state_color().into(),
+            ))
+        } else if hovered {
+            Some(iced::Background::Color(component.hover.into()))
+        } else {
+            None
+        },
+        border: iced::Border {
+            radius: theme.cosmic().corner_radii.radius_s.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tab_style_tests {
+    #[test]
+    fn whole_tab_hover_is_visible_and_preserves_selection() {
+        let theme = cosmic::Theme::dark();
+        assert!(
+            super::column_tab_style(&theme, false, false)
+                .background
+                .is_none()
+        );
+        assert!(
+            super::column_tab_style(&theme, false, true)
+                .background
+                .is_some()
+        );
+        assert_eq!(
+            super::column_tab_style(&theme, true, true).background,
+            super::column_tab_style(&theme, true, false).background,
+        );
+    }
+
     #[test]
     fn inline_tab_mark_and_title_do_not_paint_a_nested_hover_button() {
         let cosmic::theme::Button::Custom {
@@ -1481,7 +1524,7 @@ impl Cagents {
             |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
         ))
         .class(column_title_style())
-        .padding([0, 8])
+        .padding([0, 4])
         .width(Length::Fill)
         .height(Length::Fill)
         .on_press(Message::FocusCard(id));
@@ -1587,25 +1630,11 @@ impl Cagents {
                     .spacing(2)
                     .width(Length::Fill),
             )
+            .padding([0, 4])
             .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {
-                iced::widget::container::Style {
-                    background: focused.then(|| {
-                        iced::Background::Color(
-                            theme
-                                .current_container()
-                                .component
-                                .selected_state_color()
-                                .into(),
-                        )
-                    }),
-                    border: iced::Border {
-                        radius: theme.cosmic().corner_radii.radius_s.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
+                column_tab_style(theme, focused, self.chrome_ui.hovered_tab == Some(id))
             })),
             Message::CloseCard(id),
         );
@@ -1751,19 +1780,19 @@ impl Cagents {
         .spacing(2)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.
-        // Alerts, then the update icon on their right, then the sidebar toggle.
+        // Alerts and updates remain beside the window controls; the toggle
+        // belongs at the leading edge of the inspector it controls.
         // This header is the one mounted while the panel owns those controls,
         // including a docked inspector: the workspace header must not also
         // show the update or the icon stays on the far side of the window.
         let end = widget::row::with_children(vec![
             widget::row::with_children(self.notice_control()).into(),
             widget::row::with_children(self.update_control()).into(),
-            self.sidebar_toggle(),
         ])
         .spacing(2)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(iced::widget::Space::new().into(), Some(end), true);
+        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
         let tabs = widget::container(tabs)
             .padding([0, 8])
             .center_y(design::HEADER_CONTENT_HEIGHT)

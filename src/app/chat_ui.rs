@@ -14,6 +14,7 @@ use std::sync::{
 
 mod clipboard_image;
 mod completion;
+mod images;
 mod prose;
 mod retained;
 mod scroll;
@@ -168,6 +169,11 @@ pub enum Action {
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     OpenDocument(Target, String),
+    OpenImage(Target, String),
+    CloseImage,
+    ImageNext(bool),
+    ImageFit,
+    ImageExternal,
     CopyLiteral(String),
     Latest(Target),
     CancelFollowup(Target),
@@ -249,6 +255,10 @@ impl Action {
                 | Self::Files(..)
                 | Self::Tick
                 | Self::AccountPicker(_, false)
+                | Self::CloseImage
+                | Self::ImageNext(_)
+                | Self::ImageFit
+                | Self::ImageExternal
         )
     }
 
@@ -341,6 +351,7 @@ impl Phase {
 }
 
 pub(super) struct State {
+    pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
@@ -381,6 +392,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            image_viewer: None,
             files: HashMap::new(),
             sender,
             receiver,
@@ -860,17 +872,17 @@ impl CachedItem {
             }
             ItemContent::Image { path, .. } => {
                 cached.image = match path {
-                    path if Path::new(path).is_absolute() => {
-                        Some(iced::widget::image::Handle::from_path(path))
-                    }
-                    path if path.len() <= 24 * 1024 * 1024 && path.starts_with("data:image/") => {
+                    path if Path::new(path).is_absolute() => images::file_handle(path),
+                    path if path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES
+                        && path.starts_with("data:image/") =>
+                    {
                         path.split_once(";base64,")
                             .and_then(|(_, encoded)| {
                                 base64::engine::general_purpose::STANDARD
                                     .decode(encoded)
                                     .ok()
                             })
-                            .map(iced::widget::image::Handle::from_bytes)
+                            .and_then(images::bytes_handle)
                     }
                     _ => None,
                 };
@@ -5637,6 +5649,35 @@ impl Cagents {
                     return self.open_document_link(Some(target.card), &raw);
                 }
             }
+            Action::OpenImage(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let gallery = images::Gallery::new(runtime, &id);
+                    self.chat_ui.image_viewer = gallery;
+                }
+            }
+            Action::CloseImage => self.chat_ui.image_viewer = None,
+            Action::ImageNext(forward) => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.next(forward);
+                }
+            }
+            Action::ImageFit => {
+                if let Some(gallery) = &mut self.chat_ui.image_viewer {
+                    gallery.reset = gallery.reset.wrapping_add(1);
+                }
+            }
+            Action::ImageExternal => {
+                if let Some(url) = self
+                    .chat_ui
+                    .image_viewer
+                    .as_ref()
+                    .and_then(|gallery| gallery.url())
+                {
+                    return cosmic::task::future(async move {
+                        Message::ExternalLinkOpened(open_system_url(url).await)
+                    });
+                }
+            }
             Action::CopyLiteral(text) => {
                 self.status = Some(TransientNotice::success("Copied code block"));
                 return iced::clipboard::write(text).map(cosmic::Action::App);
@@ -6312,6 +6353,44 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let content = ItemContent::Image {
+            path: "/fixture/image.png".into(),
+            description: "Generated image".into(),
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        cached.image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![0, 0, 0, 255],
+        ));
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![chat::Item {
+            id: "image".into(),
+            role: chat::Role::Assistant,
+            content,
+            at: None,
+        }];
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
+        assert!(app.chat_ui.image_viewer.is_some());
+        assert!(app.modal_is_open());
+        assert!(app.dialog().is_some());
+        let before = app.context_inspector_open;
+        drop(app.update(Message::ToggleContextInspector));
+        assert_eq!(app.context_inspector_open, before);
+        assert!(Action::ImageNext(true).allowed_while_modal());
+        assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
+        drop(app.update(Message::ChatUi(Action::CloseImage)));
+        assert!(!app.modal_is_open());
+    }
     #[test]
     fn a_busy_provider_without_native_queue_keeps_a_followup_editable() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
