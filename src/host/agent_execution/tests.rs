@@ -1306,3 +1306,117 @@ fn changed_target_refuses_new_work_but_keeps_interrupt_and_close_available() {
         "prompt\n"
     );
 }
+
+/// Registers a workspace-model watcher, as a window's observer does.
+fn model_watcher(host: &SharedHost) -> Arc<crate::host::delivery::DeliveryQueue> {
+    const WATCHER: u64 = 7;
+    let mut state = host.lock().unwrap();
+    let delivery = state.register_client(WATCHER);
+    state.watch_model(WATCHER).unwrap();
+    delivery
+}
+
+/// Model edges delivered to `watcher` until one reaches `sequence`.
+fn edges_through(
+    watcher: &Arc<crate::host::delivery::DeliveryQueue>,
+    sequence: u64,
+) -> Vec<(u64, ModelEdit)> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let queue = Arc::clone(watcher);
+    std::thread::spawn(move || {
+        while let Some(queued) = queue.pop() {
+            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } =
+                queued.message
+                && sender.send((sequence, edit)).is_err()
+            {
+                return;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut edges = Vec::new();
+    while edges
+        .last()
+        .is_none_or(|(observed, _): &(u64, ModelEdit)| *observed < sequence)
+    {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(edge) => edges.push(edge),
+            Err(_) => panic!("no model edge reached sequence {sequence}: {edges:?}"),
+        }
+    }
+    edges
+}
+
+#[test]
+fn provider_run_transitions_announce_agents_changed_to_model_watchers() {
+    if isolated("provider_run_transitions_announce_agents_changed_to_model_watchers").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let watcher = model_watcher(&host);
+    let before = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execution_sequence()
+        .unwrap();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    let after = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execution_sequence()
+        .unwrap();
+    // Acceptance and binding are two edges; the provider's start and its
+    // settlement must each be another, so a watcher can stop treating the run
+    // as active without polling.
+    assert!(after >= before + 4, "{before} -> {after}");
+    let edges = edges_through(&watcher, after);
+    watcher.close_after_drain();
+    assert!(
+        edges
+            .iter()
+            .all(|(_, edit)| matches!(edit, ModelEdit::AgentsChanged))
+    );
+    assert!(
+        edges.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "edges arrive in sequence order: {edges:?}"
+    );
+    assert_eq!(edges.last().unwrap().0, after, "settlement was announced");
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
+fn failed_dispatch_announces_its_settlement_exactly_once() {
+    if isolated("failed_dispatch_announces_its_settlement_exactly_once").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let registry = registry(&host).unwrap();
+    let accepted = registry
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, now())
+        .unwrap();
+    let watcher = model_watcher(&host);
+    let before = registry.lock().unwrap().execution_sequence().unwrap();
+    finish_failure(&host, accepted.run.id, State::Failed, "fixture".into());
+    // Repeating a failure for a settled run records nothing and stays silent.
+    finish_failure(&host, accepted.run.id, State::Failed, "again".into());
+    watcher.close_after_drain();
+    let edges = std::iter::from_fn(|| watcher.pop())
+        .filter_map(|queued| match queued.message {
+            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                Some((sequence, edit))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(edges, vec![(before + 1, ModelEdit::AgentsChanged)]);
+    let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
+    assert_eq!(run.state, State::Failed);
+    assert_eq!(run.result.diagnostic.as_deref(), Some("fixture"));
+}
