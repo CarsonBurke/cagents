@@ -270,7 +270,7 @@ impl Provider {
                 let rest = title.strip_prefix("π ")?;
                 rest[rest.chars().next()?.len_utf8()..].trim()
             }
-            Self::Codex => codex_title_without_spinner(title).trim(),
+            Self::Codex => codex_title_without_status(title).trim(),
             // Claude exposes names through its PID-scoped inventory. Arbitrary
             // OSC titles are not an alternative to that authoritative source.
             Self::Claude => return None,
@@ -301,8 +301,6 @@ impl Provider {
             ]
             .iter()
             .any(|default| label.eq_ignore_ascii_case(default))
-            || label.starts_with("[ ! ] Action Required")
-            || label.starts_with("[ . ] Action Required")
         {
             return None;
         }
@@ -324,9 +322,21 @@ impl Provider {
     }
 }
 
-/// Codex's configured leading activity item is rendered by the shared app
-/// spinner instead. This is presentation only; it never infers agent activity.
-pub(crate) fn codex_title_without_spinner(title: &str) -> &str {
+/// Strip Codex's activity decoration from the conversation name. The app
+/// renders status with icons using observed activity, never inferred title text.
+pub(crate) fn codex_title_without_status(title: &str) -> &str {
+    for marker in ["[ ! ] ", "[ . ] ", "[!] ", "[.] "] {
+        if let Some(status) = title.strip_prefix(marker)
+            && let Some(rest) = status.strip_prefix("Action Required")
+        {
+            if rest.is_empty() {
+                return rest;
+            }
+            if let Some(name) = rest.strip_prefix(" | ") {
+                return name;
+            }
+        }
+    }
     let Some(first) = title.chars().next() else {
         return title;
     };
@@ -373,6 +383,21 @@ mod tests {
         assert_eq!(Provider::Codex.conversation_title("⠋ project", cwd), None);
         assert_eq!(Provider::Codex.conversation_title("codex", cwd), None);
         assert_eq!(Provider::Claude.conversation_title("Fix parser", cwd), None);
+        for marker in ["[ ! ]", "[ . ]", "[!]", "[.]"] {
+            let title = format!("{marker} Action Required | Fix parser | project");
+            assert_eq!(
+                Provider::Codex.conversation_title(&title, cwd),
+                Some("Fix parser")
+            );
+            assert_eq!(
+                Provider::Codex.conversation_title(&format!("{marker} Action Required"), cwd),
+                None
+            );
+        }
+        assert_eq!(
+            Provider::Codex.conversation_title("[ ! ] Action Required documentation", cwd),
+            Some("[ ! ] Action Required documentation")
+        );
     }
 
     fn launch(program: &str, arguments: &[&str]) -> LaunchRecipe {

@@ -448,7 +448,9 @@ whether the desktop portal accepted the request; desktop settings control its
 presentation and sound.
 
 The daemon delivers alerts even with every window closed. Clicking one opens its
-owning window and selects the session. Native chats use explicit provider turn
+owning window and selects the session. Review-request alerts bring their window
+forward while preserving the current pane; open the review explicitly from
+**Pull requests**. Native chats use explicit provider turn
 outcomes. Terminal Codex sessions use main CLI rollout completion/cancellation
 records; Claude sessions use their exact main transcript's `end_turn` and
 PID-scoped waiting state. Unsupported providers or log formats remain activity

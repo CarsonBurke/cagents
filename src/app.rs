@@ -7111,15 +7111,35 @@ impl Cagents {
                 )),
             );
         }
-        (
-            Cow::Borrowed(
-                self.chrome_ui
-                    .user_titles
-                    .get(&card.id)
-                    .unwrap_or(&card.title),
-            ),
-            None,
-        )
+        (Cow::Borrowed(self.card_display_title(card)), None)
+    }
+
+    /// Provider activity belongs in the status icon, including restored titles.
+    fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
+        if let Some(title) = self.chrome_ui.user_titles.get(&card.id) {
+            return title;
+        }
+        if let CardKind::Terminal(session) = &card.kind
+            && (self
+                .sidebar_state
+                .card_activity(card.id)
+                .is_some_and(|activity| activity.provider == crate::agent::Provider::Codex)
+                || crate::agent::Provider::recognize_launch(&session.launch)
+                    == Some(crate::agent::Provider::Codex)
+                || session
+                    .agent_resume_recipe()
+                    .as_ref()
+                    .and_then(crate::agent::Provider::recognize_launch)
+                    == Some(crate::agent::Provider::Codex))
+        {
+            let title = crate::agent::codex_title_without_status(&card.title);
+            return if title.is_empty() {
+                crate::agent::Provider::Codex.label()
+            } else {
+                title
+            };
+        }
+        &card.title
     }
 
     /// Names the window and its header bar after whatever the window is showing.
@@ -7141,7 +7161,7 @@ impl Cagents {
                 .durable
                 .focused
                 .and_then(|id| self.card_state(id))
-                .map(|card| card.title.trim())
+                .map(|card| self.card_display_title(card).trim())
                 .filter(|title| !title.is_empty())
                 .unwrap_or(APPLICATION_NAME);
             if self.core.window.header_title == showing {

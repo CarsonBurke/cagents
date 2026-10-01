@@ -5174,12 +5174,10 @@ fn agent_indicator<'a>(
     unread: bool,
 ) -> Option<Element<'static, SidebarAction>> {
     if activity == Some(crate::agent::ActivityState::Waiting) {
-        return Some(crate::interaction::tooltip(
-            crate::ui_controls::activity_spinner_tone(
-                f32::from(ROW_ICON_SIZE),
-                design::warning_color,
-            ),
+        return Some(status_icon(
+            "dialog-warning-symbolic",
             "An agent is waiting for input",
+            BadgeTone::Warning,
         ));
     }
     if activity == Some(crate::agent::ActivityState::Working) {
@@ -8074,6 +8072,13 @@ fn changes_footer<'a>(
                 action,
             });
     }
+    let mut column = widget::column::with_capacity(5)
+        .spacing(spacing.space_xxs)
+        .push(subject_input);
+    if state.commit_subject.trim().is_empty() {
+        return column.into();
+    }
+
     let mut commit_input = cosmic::iced::widget::text_editor(&state.commit_composer.0)
         .placeholder("Description (optional)")
         .id(chrome.commit_description_id.clone())
@@ -8125,8 +8130,6 @@ fn changes_footer<'a>(
         commit = commit.on_press(commit_action);
     }
 
-    let mut column = widget::column::with_capacity(5).spacing(spacing.space_xxs);
-    column = column.push(subject_input);
     column = column.push(commit_input);
     let amend = widget::checkbox(state.amend_commit)
         .label("Amend")
