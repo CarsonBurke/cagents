@@ -772,6 +772,10 @@ pub struct Snapshot {
     pub ready: bool,
     #[serde(default)]
     pub queued_messages: Vec<QueuedMessage>,
+    /// A provider history request remains in flight after its command was
+    /// acknowledged. Cached pages do not enter this state.
+    #[serde(default)]
+    pub history_loading: bool,
 }
 
 /// A bounded preview from the provider's confirmed queue, independent of history pages.
@@ -1412,6 +1416,23 @@ pub enum Event {
         event: crate::agent_execution::ProviderEvent,
     },
     QueueChanged(Vec<QueuedMessage>),
+    /// Published until the provider has answered the asynchronous history
+    /// request, independently of the command acknowledgement.
+    HistoryLoading(bool),
+    /// A reread of the newest provider page, which may contain entirely new
+    /// items after missed live notifications. Disjoint older pages prepend;
+    /// disjoint latest pages append.
+    LatestHistory {
+        items: Vec<Item>,
+        has_earlier: bool,
+    },
+    /// Establish the cached/live boundary before an asynchronous newest-page
+    /// request. Its response may arrive after newer live items.
+    LatestHistoryStarted,
+    /// A retryable history RPC failure, independent of turn failures.
+    HistoryError(String),
+    /// A successful cached/provider page can recover its own active error.
+    HistoryRecovered,
 }
 
 #[cfg(test)]

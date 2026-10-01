@@ -447,10 +447,8 @@ pub(super) enum Page {
 /// Where the transcript's viewport sits in the conversation it is scrolling.
 ///
 /// The transcript is anchored to its bottom, because a conversation grows at
-/// the newest end, which means the offset the scrollable reports is measured
-/// from the newest message. Everything asked of it here - have I reached the
-/// top, how far down am I, how much is on screen - is asked from the top, so
-/// that conversion happens once, here, rather than at each caller.
+/// the newest end. The anchoring wrapper measures the actual top offset and
+/// reports it even when the loaded page fits entirely inside the viewport.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Scroll {
     from_top: f32,
@@ -459,14 +457,13 @@ pub struct Scroll {
 }
 
 impl Scroll {
-    fn of(viewport: &iced::widget::scrollable::Viewport) -> Self {
+    pub(super) fn new(from_top: f32, content: f32, window: f32) -> Self {
         Self {
-            from_top: viewport.absolute_offset_reversed().y,
-            content: viewport.content_bounds().height,
-            window: viewport.bounds().height,
+            from_top,
+            content,
+            window,
         }
     }
-
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
         (self.content - self.window).max(0.0)
@@ -475,8 +472,8 @@ impl Scroll {
     /// Whether the reader has reached the oldest message that is loaded.
     ///
     /// A transcript shorter than the pane it is drawn in counts as reached:
-    /// no gesture can take the reader any further up it, so earlier history
-    /// has to arrive without one or it can never arrive at all.
+    /// no gesture can take the reader any further up it. The explicit history
+    /// control remains available without starting a paging loop.
     pub(super) fn at_top(self) -> bool {
         self.travel() <= 0.0 || self.from_top <= PAGE_REACH
     }
@@ -495,10 +492,6 @@ impl Scroll {
     /// reader has already asked for from the one they are asking for now.
     pub(super) fn content(self) -> f32 {
         self.content
-    }
-
-    pub(super) fn same_geometry(self, other: Self) -> bool {
-        self.content == other.content && self.window == other.window
     }
 
     pub(super) fn page_height(self) -> f32 {
@@ -816,6 +809,7 @@ impl Runtime {
             .selected_subagent
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let mut anchors = Vec::new();
         let mut transcript = Vec::new();
         if let Some(agent) = selected {
             let heading = if agent.description.is_empty() {
@@ -851,6 +845,7 @@ impl Runtime {
                 let Some(cached) = self.cache.get(&item.id) else {
                     continue;
                 };
+                anchors.push((transcript.len(), item.id.as_str()));
                 transcript.push(match &item.content {
                     ItemContent::Text { thinking, .. } => self.prose_view(
                         item,
@@ -874,6 +869,7 @@ impl Runtime {
                     target,
                     Page::Earlier,
                     self.paging() == Some(Page::Earlier),
+                    self.disconnected || self.paging().is_some(),
                 ));
             }
             if self.turns.is_empty() && self.queued.is_none() {
@@ -895,6 +891,7 @@ impl Runtime {
                 transcript.push(notice_entry(error));
             }
             for turn in &self.turns {
+                anchors.push((transcript.len(), turn.key.as_str()));
                 transcript.push(self.turn_view(turn, markdown_settings, dark));
                 for (_, error) in self
                     .failures
@@ -909,6 +906,7 @@ impl Runtime {
                     target,
                     Page::Newer,
                     self.paging() == Some(Page::Newer),
+                    self.disconnected || self.paging() == Some(Page::Newer),
                 ));
             }
             if let Some(queued) = &self.queued {
@@ -1010,36 +1008,33 @@ impl Runtime {
         ))
         .id(card_control_id(target.card, "chat-transcript"))
         .anchor_bottom()
-        // Reaching either end of the loaded window is what asks for the next
-        // page of history, so the viewport is the pagination control. The
-        // signal is published when the viewport moves rather than once per
-        // frame, which is what a streaming turn needs it to be.
-        .on_scroll(move |viewport| action(Action::Scrolled(target, Scroll::of(&viewport))))
+        // The wrapper reports fitting pages too and distinguishes user
+        // navigation from layout corrections, so reflow never requests history.
         .height(Length::Fill)
         .width(Length::Fill);
         content.push(scroll::transcript(
             transcript,
-            selected
-                .and_then(|agent| agent.items.first())
-                .or_else(|| snapshot.items.first())
-                .map(|item| item.id.as_str()),
-            selected
-                .and_then(|agent| agent.items.last())
-                .or_else(|| snapshot.items.last())
-                .map(|item| item.id.as_str()),
+            target,
+            self.selected_subagent.as_deref(),
+            anchors,
         ));
-        if !self.scroll.at_bottom() || snapshot.has_later {
+        if !self.active_scroll().at_bottom() || (selected.is_none() && snapshot.has_later) {
             content.push(
-                widget::button::custom(design::caption(if self.unseen_activity {
-                    "↓ New activity"
-                } else {
-                    "↓ Jump to latest"
-                }))
+                widget::button::custom(design::caption(
+                    if selected.is_none() && self.unseen_activity {
+                        "↓ New activity"
+                    } else {
+                        "↓ Jump to latest"
+                    },
+                ))
                 .class(crate::ui_controls::control_style(
-                    self.unseen_activity,
+                    selected.is_none() && self.unseen_activity,
                     None,
                 ))
-                .on_press(action(Action::Latest(target)))
+                .on_press_maybe(
+                    (selected.is_some() || !self.disconnected || !snapshot.has_later)
+                        .then(|| action(Action::Latest(target))),
+                )
                 .into(),
             );
         }
@@ -1801,7 +1796,14 @@ impl Runtime {
 
     /// The page of history this conversation is waiting on, if any.
     fn paging(&self) -> Option<Page> {
-        self.pending.as_ref().and_then(|pending| pending.page)
+        if self.disconnected {
+            return None;
+        }
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.page)
+            .or(self.page_request.map(|(page, _)| page))
+            .or(self.snapshot.history_loading.then_some(Page::Earlier))
     }
 
     /// The plan the conversation is working to, or nothing where the provider
@@ -2994,7 +2996,12 @@ fn permission_mode_label(mode: &str) -> &str {
 /// end, where the transcript does, and that a page they have just asked
 /// for by scrolling is on its way. Both belong at the edge the rows will
 /// appear at rather than in a button beside it.
-fn paging_view(target: Target, page: Page, loading: bool) -> Element<'static, Message> {
+fn paging_view(
+    target: Target,
+    page: Page,
+    loading: bool,
+    blocked: bool,
+) -> Element<'static, Message> {
     let mut row: Vec<Element<'_, Message>> = Vec::new();
     if loading {
         row.push(crate::ui_controls::activity_spinner_tone(
@@ -3019,7 +3026,7 @@ fn paging_view(target: Target, page: Page, loading: bool) -> Element<'static, Me
                 .align_y(Alignment::Center),
         )
         .class(crate::ui_controls::control_style(false, None))
-        .on_press_maybe((!loading).then(|| {
+        .on_press_maybe((!blocked).then(|| {
             action(match page {
                 Page::Earlier => Action::Command(target, Command::LoadEarlier),
                 Page::Newer => Action::Latest(target),

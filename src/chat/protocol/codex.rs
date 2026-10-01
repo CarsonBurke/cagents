@@ -370,7 +370,9 @@ fn create_inner(
             attached: false,
             direct_input: false,
             cursor: None,
+            history_initialized: false,
             history_loading: false,
+            history_refresh: false,
             queue_available: true,
             queue_stale: false,
             queue_listing: Vec::new(),
@@ -389,7 +391,9 @@ enum Pending {
     Attach,
     Models,
     Skills,
-    History,
+    History {
+        earlier: bool,
+    },
     Turn,
     /// Compaction rewrites the thread's history and its context occupancy, so
     /// its acknowledgement is what a re-read hangs off: nothing else on the
@@ -458,7 +462,9 @@ struct Codex {
     attached: bool,
     direct_input: bool,
     cursor: Option<String>,
+    history_initialized: bool,
     history_loading: bool,
+    history_refresh: bool,
     queue_available: bool,
     queue_stale: bool,
     queue_listing: Vec<chat::QueuedMessage>,
@@ -715,30 +721,45 @@ impl Codex {
         if self.history_loading {
             return Err("Codex history is already loading".into());
         }
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History)?;
+        let earlier = cursor.is_some();
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier })?;
         self.history_loading = true;
+        step.events.push(if earlier {
+            Event::HistoryLoading(true)
+        } else {
+            Event::LatestHistoryStarted
+        });
         Ok(())
     }
     /// Re-reads the thread's metadata and its history.
     ///
-    /// A history load already in flight will itself deliver the current
-    /// thread, so it is left running rather than refused. That matters
-    /// because this is also the path a compaction acknowledgement takes, and
-    /// an acknowledgement must not turn into an error the reader has to read.
+    /// An outstanding page finishes first, followed by one newest-page reread.
+    /// Repeated refreshes coalesce instead of issuing competing requests. This
+    /// also lets a compaction acknowledgement refresh history without failing
+    /// merely because the reader was loading an older page.
     fn reread(&mut self, step: &mut Step) -> Result<(), String> {
+        if self.history_loading {
+            self.history_refresh = true;
+            return Ok(());
+        }
         self.call(
             step,
             "thread/read",
             json!({"threadId":self.thread,"includeTurns":false}),
             Pending::Other,
         )?;
-        if self.history_loading {
-            return Ok(());
-        }
         self.history(step, None)
     }
-    fn page(&mut self, page: &Value, step: &mut Step) -> Result<(), String> {
-        self.cursor = page["nextCursor"].as_str().map(str::to_owned);
+    fn finish_history(&mut self, step: &mut Step) -> Result<(), String> {
+        self.history_loading = false;
+        if std::mem::take(&mut self.history_refresh) {
+            self.reread(step)
+        } else {
+            step.events.push(Event::HistoryLoading(false));
+            Ok(())
+        }
+    }
+    fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
@@ -768,9 +789,23 @@ impl Codex {
                 }
             }
         }
-        step.events.push(Event::History {
-            items,
-            has_earlier: self.cursor.is_some(),
+        // Refreshing the live end must not rewind the older-history traversal
+        // through pages already cached. Commit only after validating the page;
+        // a failed decode must preserve the cursor the reader can retry.
+        if earlier || !self.history_initialized {
+            self.cursor = page["nextCursor"].as_str().map(str::to_owned);
+            self.history_initialized = true;
+        }
+        step.events.push(if earlier {
+            Event::History {
+                items,
+                has_earlier: self.cursor.is_some(),
+            }
+        } else {
+            Event::LatestHistory {
+                items,
+                has_earlier: self.cursor.is_some(),
+            }
         });
         Ok(())
     }
@@ -1191,8 +1226,10 @@ impl Adapter for Codex {
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
             }
             Command::Refresh => {
-                if self.history_loading { return Err("Codex history is already loading".into()); }
                 if self.pending.len() > MAX_PENDING - 2 { return Err("Too many outstanding Codex requests".into()); }
+                // Returning to the cached live end cancels the store's older
+                // page pin. An already outstanding history read may populate
+                // the cache without moving the reader back into that page.
                 self.reread(&mut step)?;
             }
             Command::LoadEarlier => {
@@ -1218,10 +1255,13 @@ impl Adapter for Codex {
                 .pending
                 .remove(&id)
                 .ok_or("Codex response has an unknown request ID")?;
-            if matches!(pending, Pending::History) {
+            if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if matches!(pending, Pending::History { .. }) {
+                    self.finish_history(&mut step)?;
+                }
                 if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
                     self.queue_available = false;
                     self.queue_listing.clear();
@@ -1243,16 +1283,19 @@ impl Adapter for Codex {
                     self.model_events(&mut step);
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
-                step.events.push(Event::Error {
-                    message: format!(
-                        "Codex RPC error: {}",
-                        error["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| error.to_string())
-                    ),
-                    fatal,
-                });
+                let message = format!(
+                    "Codex RPC error: {}",
+                    error["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string())
+                );
+                step.events
+                    .push(if matches!(pending, Pending::History { .. }) {
+                        Event::HistoryError(message)
+                    } else {
+                        Event::Error { message, fatal }
+                    });
                 if self.execution.as_ref().is_some_and(|execution| {
                     frame["id"].as_str() == Some(execution.request.as_str())
                 }) {
@@ -1322,6 +1365,10 @@ impl Adapter for Codex {
                                 .into(),
                         );
                     }
+                    if self.thread.is_none() {
+                        self.cursor = None;
+                        self.history_initialized = false;
+                    }
                     self.thread = Some(id.into());
                     self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
@@ -1345,7 +1392,7 @@ impl Adapter for Codex {
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
                     if result["initialTurnsPage"].is_object() {
-                        self.page(&result["initialTurnsPage"], &mut step)?;
+                        self.page(&result["initialTurnsPage"], &mut step, false)?;
                     } else {
                         self.history(&mut step, None)?;
                     }
@@ -1531,7 +1578,10 @@ impl Adapter for Codex {
                         self.skills(&mut step)?;
                     }
                 }
-                Pending::History => self.page(result, &mut step)?,
+                Pending::History { earlier } => {
+                    self.page(result, &mut step, earlier)?;
+                    self.finish_history(&mut step)?;
+                }
                 Pending::Turn => {
                     self.materialized = true;
                     self.turn = Some(string(&result["turn"], "id")?.into());
@@ -2823,7 +2873,9 @@ mod tests {
             attached: true,
             direct_input: true,
             cursor: None,
+            history_initialized: false,
             history_loading: false,
+            history_refresh: false,
             queue_available: true,
             queue_stale: false,
             queue_listing: Vec::new(),
@@ -2833,6 +2885,142 @@ mod tests {
             materialized: true,
             execution: None,
         }
+    }
+
+    #[test]
+    fn history_loading_lasts_until_the_provider_response_and_refresh_coalesces() {
+        let mut adapter = adapter();
+        adapter.cursor = Some("older".into());
+        let request = adapter.command(Command::LoadEarlier).unwrap();
+        assert!(request.events.contains(&Event::HistoryLoading(true)));
+        assert!(adapter.history_loading);
+        assert!(adapter.command(Command::LoadEarlier).is_err());
+
+        // Returning to cached latest must succeed while the older page is
+        // still in flight, without issuing a competing history request.
+        let refresh = adapter.command(Command::Refresh).unwrap();
+        assert!(refresh.writes.is_empty());
+        assert!(adapter.command(Command::Refresh).unwrap().writes.is_empty());
+        assert!(adapter.history_loading);
+        assert!(!refresh.events.contains(&Event::HistoryLoading(false)));
+
+        let answer = adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        assert!(
+            adapter.history_loading,
+            "the requested latest reread follows the older page"
+        );
+        assert!(matches!(answer.events[0], Event::History { .. }));
+        assert_eq!(answer.writes.len(), 2);
+        assert_eq!(answer.writes[0]["method"], "thread/read");
+        assert_eq!(answer.writes[1]["method"], "thread/turns/list");
+        assert!(answer.writes[1]["params"]["cursor"].is_null());
+        assert_eq!(answer.events.last(), Some(&Event::LatestHistoryStarted));
+        let latest = adapter
+            .receive(json!({"id":answer.writes[1]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        assert!(!adapter.history_loading);
+        assert!(matches!(latest.events[0], Event::LatestHistory { .. }));
+        assert_eq!(latest.events.last(), Some(&Event::HistoryLoading(false)));
+    }
+
+    #[test]
+    fn failed_history_request_releases_loading_and_can_be_retried() {
+        let mut adapter = adapter();
+        adapter.cursor = Some("older".into());
+        let request = adapter.command(Command::LoadEarlier).unwrap();
+        let failed = adapter
+            .receive(
+                json!({"id":request.writes[0]["id"],"error":{"code":-1,"message":"try later"}}),
+            )
+            .unwrap();
+        assert!(!adapter.history_loading);
+        assert_eq!(failed.events[0], Event::HistoryLoading(false));
+        assert!(matches!(failed.events[1], Event::HistoryError(_)));
+        assert!(adapter.command(Command::LoadEarlier).is_ok());
+    }
+
+    #[test]
+    fn failed_older_history_still_runs_one_coalesced_latest_refresh() {
+        let mut adapter = adapter();
+        adapter.cursor = Some("older".into());
+        let request = adapter.command(Command::LoadEarlier).unwrap();
+        for _ in 0..10 {
+            assert!(adapter.command(Command::Refresh).unwrap().writes.is_empty());
+        }
+        let failed = adapter
+            .receive(
+                json!({"id":request.writes[0]["id"],"error":{"message":"older page unavailable"}}),
+            )
+            .unwrap();
+        assert!(adapter.history_loading);
+        assert_eq!(failed.writes.len(), 2);
+        assert_eq!(failed.writes[1]["method"], "thread/turns/list");
+        assert!(failed.writes[1]["params"]["cursor"].is_null());
+        let latest = adapter
+            .receive(json!({"id":failed.writes[1]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        assert!(!adapter.history_loading);
+        assert_eq!(latest.events.last(), Some(&Event::HistoryLoading(false)));
+    }
+
+    #[test]
+    fn latest_history_refresh_keeps_the_furthest_older_cursor_including_exhaustion() {
+        let mut adapter = adapter();
+        let mut step = Step::default();
+        for (cursor, earlier) in [
+            (Some("100"), false),
+            (Some("80"), true),
+            (Some("60"), true),
+            (Some("100"), false),
+        ] {
+            adapter
+                .page(&json!({"data":[],"nextCursor":cursor}), &mut step, earlier)
+                .unwrap();
+        }
+        let request = adapter.command(Command::LoadEarlier).unwrap();
+        assert_eq!(request.writes[0]["params"]["cursor"], "60");
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        adapter
+            .page(&json!({"data":[],"nextCursor":"100"}), &mut step, false)
+            .unwrap();
+        assert!(adapter.cursor.is_none());
+        assert!(adapter.command(Command::LoadEarlier).is_err());
+    }
+
+    #[test]
+    fn malformed_history_page_preserves_initialization_and_the_retry_cursor() {
+        let mut adapter = adapter();
+        let mut step = Step::default();
+        let malformed = json!({"data":[{"id":"turn","status":"completed","itemsView":"compact","items":[]}],"nextCursor":"lost"});
+        assert!(adapter.page(&malformed, &mut step, false).is_err());
+        assert!(!adapter.history_initialized);
+        adapter
+            .page(&json!({"data":[],"nextCursor":"100"}), &mut step, false)
+            .unwrap();
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
+        assert!(adapter.page(&malformed, &mut step, true).is_err());
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn failed_initial_history_request_can_initialize_its_cursor_on_retry() {
+        let mut adapter = adapter();
+        let request = adapter.command(Command::Refresh).unwrap();
+        adapter
+            .receive(json!({"id":request.writes[1]["id"],"error":{"message":"try later"}}))
+            .unwrap();
+        assert!(!adapter.history_initialized);
+        assert!(adapter.cursor.is_none());
+        let retry = adapter.command(Command::Refresh).unwrap();
+        adapter
+            .receive(json!({"id":retry.writes[1]["id"],"result":{"data":[],"nextCursor":"100"}}))
+            .unwrap();
+        assert!(adapter.history_initialized);
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
     }
 
     #[test]
@@ -3515,7 +3703,7 @@ mod tests {
         adapter.busy = true;
         let item = json!({"id":"0","type":"commandExecution","command":"echo hello","cwd":"/tmp","status":"inProgress","aggregatedOutput":"hel"});
         let mut page = Step::default();
-        adapter.page(&json!({"data":[{"id":"turn-a","status":"inProgress","items":[item]}],"nextCursor":"older"}),&mut page).unwrap();
+        adapter.page(&json!({"data":[{"id":"turn-a","status":"inProgress","items":[item]}],"nextCursor":"older"}),&mut page, false).unwrap();
         let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"lo"}})).unwrap();
         assert!(
             matches!(&delta.events[0],Event::Item(Item { id,content:ItemContent::Command { output,.. },.. }) if id == "turn-a/0" && output == "hello")
@@ -3539,11 +3727,15 @@ mod tests {
         let turn = json!({"id":"long","status":"inProgress","items":items});
         let mut page = Step::default();
         adapter
-            .page(&json!({"data":[turn.clone()],"nextCursor":null}), &mut page)
+            .page(
+                &json!({"data":[turn.clone()],"nextCursor":null}),
+                &mut page,
+                false,
+            )
             .unwrap();
         assert_eq!(adapter.active_items.len(), 1);
         assert!(
-            matches!(&page.events[0], Event::History { items, .. } if items.len() == MAX_ACTIVE_ITEMS + 33)
+            matches!(&page.events[0], Event::LatestHistory { items, .. } if items.len() == MAX_ACTIVE_ITEMS + 33)
         );
         let started = adapter
             .receive(

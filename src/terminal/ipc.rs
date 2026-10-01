@@ -96,10 +96,11 @@ use crate::{
 /// Version 34 answers a test notification request with its own outcome.
 /// Version 35 carries row wrapping, OSC 8 links, bracketed-paste state, live cwd,
 /// and terminal-owner scrollback search, clearing, and selection copying.
-/// Snapshots require a matched set.
 /// Version 38 adds a read-only directory of hosted sessions to agent operations.
 /// Version 39 adds transcript items another agent delivered.
-pub const PROTOCOL_VERSION: u16 = 39;
+/// Version 40 carries provider history-loading state in native chat snapshots.
+/// Snapshots require a matched set.
+pub const PROTOCOL_VERSION: u16 = 40;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
