@@ -3491,6 +3491,67 @@ mod tests {
     }
 
     #[test]
+    fn queue_mutations_and_forks_use_exact_provider_identifiers() {
+        let mut adapter = adapter();
+        for (command, method) in [
+            (
+                Command::RemoveQueued {
+                    id: "queue-exact".into(),
+                },
+                "thread/queue/delete",
+            ),
+            (
+                Command::StartQueued {
+                    id: "queue-exact".into(),
+                },
+                "thread/queue/start",
+            ),
+            (
+                Command::UpdateQueued {
+                    id: "queue-exact".into(),
+                    text: "edited".into(),
+                },
+                "thread/queue/update",
+            ),
+        ] {
+            let request = adapter.command(command).unwrap();
+            assert_eq!(request.writes[0]["method"], method);
+            assert_eq!(request.writes[0]["params"]["threadId"], "thread-exact");
+            assert_eq!(
+                request.writes[0]["params"]["queuedSubmissionId"],
+                "queue-exact"
+            );
+        }
+        adapter.branch_points.push(chat::BranchPoint {
+            id: "completed-turn".into(),
+            label: "Prompt".into(),
+        });
+        assert!(
+            adapter
+                .command(Command::Branch {
+                    id: Some("unknown-turn".into())
+                })
+                .is_err()
+        );
+        adapter.busy = true;
+        assert!(adapter.command(Command::Branch { id: None }).is_err());
+        adapter.busy = false;
+        let fork = adapter
+            .command(Command::Branch {
+                id: Some("completed-turn".into()),
+            })
+            .unwrap();
+        assert_eq!(fork.writes[0]["params"]["lastTurnId"], "completed-turn");
+        let fork_id = "f0e49307-af96-4edd-b23f-60b185fe4fea";
+        let response = adapter
+            .receive(json!({"id":fork.writes[0]["id"],"result":{"thread":{"id":fork_id}}}))
+            .unwrap();
+        assert!(response.events.contains(&Event::Forked(fork_id.into())));
+        assert_eq!(adapter.thread.as_deref(), Some("thread-exact"));
+        assert_eq!(response.writes[0]["method"], "thread/unsubscribe");
+    }
+
+    #[test]
     fn child_listing_recovers_newest_first_descendants_without_trusting_foreign_threads() {
         let mut adapter = adapter();
         let mut request = Step::default();

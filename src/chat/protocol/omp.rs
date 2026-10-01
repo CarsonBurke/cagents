@@ -1615,6 +1615,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("original".into()),
+            ..Default::default()
+        };
+        assert!(
+            adapter
+                .command(Command::SetInterruptMode {
+                    mode: "unknown".into()
+                })
+                .is_err()
+        );
+        let timing = adapter
+            .command(Command::SetInterruptMode {
+                mode: "wait".into(),
+            })
+            .unwrap();
+        assert_eq!(timing.writes[0]["type"], "set_interrupt_mode");
+        assert_eq!(timing.writes[0]["mode"], "wait");
+        adapter.busy = true;
+        assert!(
+            adapter
+                .command(Command::Branch {
+                    id: Some("entry-exact".into())
+                })
+                .is_err()
+        );
+        adapter.busy = false;
+        let branch = adapter
+            .command(Command::Branch {
+                id: Some("entry-exact".into()),
+            })
+            .unwrap();
+        assert_eq!(branch.writes[0]["entryId"], "entry-exact");
+        let response = adapter.receive(json!({"type":"response","id":branch.writes[0]["id"],"command":"branch","success":true,"data":{"text":"Selected prompt"}})).unwrap();
+        assert!(response.events.contains(&Event::Ready(false)));
+        assert!(
+            !response
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Composer { .. }))
+        );
+        let state = adapter.receive(json!({"type":"response","id":response.writes[0]["id"],"command":"get_state","success":true,"data":{"sessionId":"branched","isStreaming":false,"interruptMode":"wait","queuedMessages":{"followUp":[]}}})).unwrap();
+        let reset = state
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Reset { .. }))
+            .unwrap();
+        let draft = state
+            .events
+            .iter()
+            .position(
+                |event| matches!(event, Event::Composer { text } if text == "Selected prompt"),
+            )
+            .unwrap();
+        assert!(reset < draft);
+        assert_eq!(adapter.session_id.as_deref(), Some("branched"));
+        assert!(state.events.contains(&Event::InterruptMode("wait".into())));
+    }
+
+    #[test]
     fn oversized_optional_child_history_preserves_parent_control() {
         let mut adapter = Omp {
             ready: true,

@@ -4295,7 +4295,7 @@ for line in sys.stdin:
                     .any(|args| args == ["--resume", "12345678-1234-4234-8234-123456789abc"])
             );
             let replacement = host.lock().unwrap().terminals.remove(&terminal.id).unwrap();
-            replacement.handle.shutdown();
+            let _ = replacement.handle.shutdown();
         } else {
             client.close_chat(session).unwrap();
         }
