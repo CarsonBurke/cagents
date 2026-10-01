@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     agent::Provider,
-    agent_execution::{Operation, Reply, Target},
+    agent_execution::{Control, Operation, Reply, Target},
     host::state::HostState,
     model::{HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
     workspace_model::ModelEdit,
@@ -77,9 +77,24 @@ while IFS= read -r frame; do
       id=${id%%'"'*}
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       ;;
+    *'"type":"control_response"'*)
+      # The answer to a permission request raised below finishes its turn.
+      case "$frame" in
+        *'"behavior":"allow"'*) printf 'allow\n' >> "$HOME/../decisions" ;;
+        *) printf 'deny\n' >> "$HOME/../decisions" ;;
+      esac
+      printf '{"type":"assistant","uuid":"message-%s","message":{"id":"message-%s","role":"assistant","content":[{"type":"text","text":"SERVICE_RESULT_%s"}],"usage":{"input_tokens":7,"output_tokens":3}}}\n' "$n" "$n" "$n"
+      printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":false,"session_id":"%s","usage":{"input_tokens":7,"output_tokens":3}}\n' "$n" "$session"
+      ;;
     *'"type":"user"'*)
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
+      case "$frame" in
+        *ASK_PERMISSION*)
+          printf '{"type":"control_request","request_id":"permission-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
+          continue
+          ;;
+      esac
       printf '{"type":"assistant","uuid":"message-%s","message":{"id":"message-%s","role":"assistant","content":[{"type":"text","text":"SERVICE_RESULT_%s"}],"usage":{"input_tokens":7,"output_tokens":3}}}\n' "$n" "$n" "$n"
       printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":false,"session_id":"%s","usage":{"input_tokens":7,"output_tokens":3}}\n' "$n" "$session"
       ;;
@@ -1528,4 +1543,230 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     // Seeing a session confers no control over it.
     assert!(status(&host, &child_authority, parent.agent.id).is_err());
     assert!(close(&host, &Authority::default(), child.agent.id).is_err());
+}
+
+#[test]
+fn only_an_agents_owner_reads_its_requests_and_controls_it() {
+    if isolated("only_an_agents_owner_reads_its_requests_and_controls_it").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let owner = Authority::default();
+    let agent = accepted.agent.id;
+    let requests = |authority: &Authority, operation| -> Result<Vec<chat::Request>, String> {
+        match process(&host, authority.clone(), operation)? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    assert!(
+        requests(&owner, Operation::Requests(agent))
+            .unwrap()
+            .is_empty()
+    );
+    let error = requests(
+        &owner,
+        Operation::Control {
+            agent,
+            command: Control::Interrupt,
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("no active run"), "{error}");
+    // Controlling on its owner's behalf is not a person taking the agent over.
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+
+    let parent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap();
+    let child_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(parent.session.as_ref().unwrap().id())
+        .unwrap();
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &child_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    for operation in [
+        Operation::Requests(child.agent.id),
+        Operation::Control {
+            agent: child.agent.id,
+            command: Control::Interrupt,
+        },
+    ] {
+        let error = requests(&owner, operation).unwrap_err();
+        assert!(error.contains("does not own"), "{error}");
+    }
+    assert!(
+        close(&host, &child_authority, child.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(requests(&child_authority, Operation::Requests(child.agent.id)).is_err());
+}
+
+/// Polls until the agent's latest run waits on a request, and returns them.
+fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = process(host, Authority::default(), Operation::Requests(agent));
+        if let Ok(Reply::Requests(requests)) = &reply
+            && !requests.is_empty()
+        {
+            return requests.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never asked: {reply:?} {:?}",
+            status(host, &Authority::default(), agent)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_owner_answers_and_interrupts_only_its_own_active_run() {
+    if isolated("an_owner_answers_and_interrupts_only_its_own_active_run").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let owner = Authority::default();
+    request.prompt = "ASK_PERMISSION before running".into();
+    let accepted = submit(&host, &owner, request).unwrap();
+    let agent = accepted.agent.id;
+    let control = |command| -> Result<Vec<chat::Request>, String> {
+        match process(&host, owner.clone(), Operation::Control { agent, command })? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    let answer = |request_id: &str, action: &str, answers| Control::Answer {
+        request_id: request_id.into(),
+        action: action.into(),
+        answers,
+    };
+
+    let asked = pending_requests(&host, agent);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(
+        status(&host, &owner, agent).unwrap().1.state,
+        State::Waiting
+    );
+    let error = control(answer(&asked.id, "always", Vec::new())).unwrap_err();
+    assert!(error.contains("accepts the actions allow, deny"), "{error}");
+    let error = control(answer(
+        &asked.id,
+        "allow",
+        vec![chat::Answer {
+            field: "reason".into(),
+            values: vec!["because".into()],
+        }],
+    ))
+    .unwrap_err();
+    assert!(error.contains("has no field reason"), "{error}");
+    assert!(
+        control(answer(&asked.id, "allow", Vec::new()))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let root = path.parent().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\n"
+    );
+    let error = control(Control::Interrupt).unwrap_err();
+    assert!(error.contains("no active run"), "{error}");
+
+    // Once a person takes the agent over, the question its next turn raises
+    // is theirs, though its owner may still see it.
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            destination: Destination::Existing(agent),
+            prompt: "ASK_PERMISSION again".into(),
+            idempotency_key: "second".into(),
+        },
+    )
+    .unwrap();
+    let asked = pending_requests(&host, agent);
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_agent_interaction(agent, None)
+        .unwrap();
+    for command in [answer(&asked[0].id, "deny", Vec::new()), Control::Interrupt] {
+        let error = control(command).unwrap_err();
+        assert!(error.contains("took this agent over"), "{error}");
+    }
+    assert_eq!(pending_requests(&host, agent), asked);
+    assert_eq!(status(&host, &owner, agent).unwrap().1.id, followup.run.id);
+    // The person answers it at the agent's own controls.
+    let (agent_record, _) = status(&host, &owner, agent).unwrap();
+    let handle = host
+        .lock()
+        .unwrap()
+        .chats
+        .get(&agent_record.session.as_ref().unwrap().id())
+        .unwrap()
+        .handle
+        .clone();
+    handle
+        .command(Command::Answer {
+            request_id: asked[0].id.clone(),
+            action: "deny".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "allow\ndeny\n"
+    );
+}
+
+#[test]
+fn a_project_is_found_by_its_name() {
+    if isolated("a_project_is_found_by_its_name").is_some() {
+        return;
+    }
+    let (host, _, path) = fixture();
+    let project = path.parent().unwrap().join("project");
+    let read = |scope| match process(&host, Authority::default(), Operation::Directory(scope)) {
+        Ok(Reply::Directory(directory)) => Ok(directory.scope),
+        Ok(reply) => panic!("{reply:?}"),
+        Err(error) => Err(error),
+    };
+    use crate::agent_execution::directory::Scope;
+    assert_eq!(
+        read(Scope::Project("service FIXTURE".into())).unwrap(),
+        Scope::Project(project.clone())
+    );
+    let error = read(Scope::Project("elsewhere".into())).unwrap_err();
+    assert!(
+        error.contains("No open project is named elsewhere"),
+        "{error}"
+    );
+    assert_eq!(
+        read(Scope::Project(project.clone())).unwrap(),
+        Scope::Project(project)
+    );
 }

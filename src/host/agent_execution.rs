@@ -815,7 +815,137 @@ pub(super) fn process(
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
+        Operation::Requests(id) => {
+            let (_, _, handle) = owned_provider(host, &authority, id)?;
+            Ok(Reply::Requests(displayed_requests(&handle)))
+        }
+        Operation::Control { agent, command } => {
+            control(host, &authority, agent, command).map(Reply::Requests)
+        }
     }
+}
+
+/// The live provider of an open agent the caller owns, and the agent's
+/// latest run.
+fn owned_provider(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+) -> Result<(Agent, Run, chat::runtime::Handle), String> {
+    let (agent, run) = status(host, authority, id)?;
+    if agent.closed {
+        return Err("The agent is closed".into());
+    }
+    let Some(HostedSession::Chat(session)) = &agent.session else {
+        return Err("The agent has no live provider to control".into());
+    };
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .chats
+            .get(&session.id)
+            .filter(|record| {
+                !record.handle.is_completed()
+                    && HostedSession::Chat(session.clone())
+                        .same_process(&HostedSession::Chat(record.session.clone()))
+            })
+            .map(|record| record.handle.clone())
+            .ok_or("The agent's provider is no longer live")?
+    };
+    Ok((agent, run, handle))
+}
+
+/// Pending requests as a caller may see them: a secret field's prefilled
+/// value is never sent back out of the provider.
+fn displayed_requests(handle: &chat::runtime::Handle) -> Vec<chat::Request> {
+    let mut requests = handle.requests();
+    hide_secrets(&mut requests);
+    requests
+}
+
+fn hide_secrets(requests: &mut [chat::Request]) {
+    for field in requests.iter_mut().flat_map(|request| &mut request.fields) {
+        if field.secret {
+            field.initial.clear();
+        }
+    }
+}
+
+/// Interrupts or answers an owned agent's provider without a console. The
+/// owner acts as the agent's caller, not as a person taking it over, so the
+/// agent stays under its owner's control afterwards. Both act only on the
+/// owner's own active run: once a person has taken the agent over, its turns
+/// and the questions they raise are that person's.
+fn control(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+    command: crate::agent_execution::Control,
+) -> Result<Vec<chat::Request>, String> {
+    use crate::agent_execution::Control;
+    // Ownership first, so a caller cannot make the daemon keep a gate for an
+    // agent it does not own.
+    status(host, authority, id)?;
+    let gate = agent_gate(host, id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let (_, run, handle) = owned_provider(host, authority, id)?;
+    if registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_is_interactive(id)?
+    {
+        return Err("A person took this agent over; its controls are theirs".into());
+    }
+    if run.state.is_terminal() {
+        return Err(format!(
+            "The agent has no active run; its latest is {:?}",
+            run.state
+        ));
+    }
+    let answered = match command {
+        Control::Interrupt => {
+            handle.interrupt_run(run.id)?;
+            None
+        }
+        Control::Answer {
+            request_id,
+            action,
+            answers,
+        } => {
+            let requests = handle.requests();
+            let request = requests
+                .iter()
+                .find(|request| request.id == request_id)
+                .ok_or_else(|| format!("No pending request {request_id}"))?;
+            if !request.actions.iter().any(|choice| choice.id == action) {
+                let actions: Vec<_> = request.actions.iter().map(|c| c.id.as_str()).collect();
+                return Err(format!(
+                    "Request {request_id} accepts the actions {}",
+                    actions.join(", ")
+                ));
+            }
+            if let Some(answer) = answers
+                .iter()
+                .find(|answer| !request.fields.iter().any(|field| field.id == answer.field))
+            {
+                return Err(format!(
+                    "Request {request_id} has no field {}",
+                    answer.field
+                ));
+            }
+            handle.command(Command::Answer {
+                request_id: request_id.clone(),
+                action,
+                answers,
+            })?;
+            Some(request_id)
+        }
+    };
+    // An answered request is no longer the caller's to answer, even before the
+    // provider has dropped it.
+    let mut requests = displayed_requests(&handle);
+    requests.retain(|request| Some(&request.id) != answered.as_ref());
+    Ok(requests)
 }
 
 enum ConsoleError {
@@ -1157,13 +1287,7 @@ fn console(
             }
             chunks.reverse();
             let mut requests = snapshot.requests;
-            for request in &mut requests {
-                for field in &mut request.fields {
-                    if field.secret {
-                        field.initial.clear();
-                    }
-                }
-            }
+            hide_secrets(&mut requests);
             Ok(Reply::Console(Some(ConsoleView {
                 generation: snapshot.generation,
                 text: chunks.concat(),

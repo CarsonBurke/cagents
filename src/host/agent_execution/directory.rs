@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 /// What the host lock yields; everything slower happens after releasing it.
@@ -102,6 +102,8 @@ pub(super) fn read(
         Scope::Project(path) => {
             let project = if model.project(&path).is_some() {
                 path
+            } else if path.is_relative() {
+                named(&model, &path)?
             } else {
                 place_cached(&path)
                     .1
@@ -188,6 +190,30 @@ pub(super) fn read(
 
 /// Live provider conversations and terminals; the caller decides which
 /// plain shells matter.
+/// The open project called `name`, ignoring case. Names are not unique, so a
+/// name two projects share is refused with their paths.
+fn named(model: &crate::workspace_model::WorkspaceModel, name: &Path) -> Result<PathBuf, String> {
+    let wanted = name.to_string_lossy();
+    let matches: Vec<_> = model
+        .projects
+        .iter()
+        .filter(|project| project.name.eq_ignore_ascii_case(&wanted))
+        .collect();
+    match matches.as_slice() {
+        [project] => Ok(project.repository.clone()),
+        [] => Err(format!("No open project is named {wanted}")),
+        projects => Err(format!(
+            "{} open projects are named {wanted}; pass one's path: {}",
+            projects.len(),
+            projects
+                .iter()
+                .map(|project| project.repository.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
