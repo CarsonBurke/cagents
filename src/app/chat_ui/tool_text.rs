@@ -214,15 +214,13 @@ impl ToolText {
             });
         let body = crate::interaction::parent_wheel(editor);
         match limit {
-            Some(height) => widget::container(scroll::transcript(
+            Some(height) => widget::container(scroll::tool_output(
                 widget::scrollable(body)
                     .direction(iced::widget::scrollable::Direction::Vertical(
                         design::scrollbar(),
                     ))
                     .anchor_bottom()
                     .height(Length::Shrink),
-                None,
-                None,
             ))
             .max_height(height)
             .into(),
