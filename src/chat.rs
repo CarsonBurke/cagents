@@ -975,6 +975,78 @@ pub enum ItemContent {
         path: String,
         description: String,
     },
+    /// Something another agent, or the harness on its behalf, delivered to
+    /// this conversation: a subagent's report, a teammate's or another
+    /// session's message, or word that background work changed state.
+    ///
+    /// It arrives in the user's slot and the agent acts on it as on a
+    /// prompt, but the user did not write it. Typesetting it as their own
+    /// message, wrapped in the framing the harness adds for the model,
+    /// made the transcript read as though they had.
+    Delivery {
+        kind: DeliveryKind,
+        /// The name the sender goes by: a subagent's type, a teammate's or a
+        /// session's name. Empty when it has none.
+        from: String,
+        /// An opaque identifier telling this sender apart from others of the
+        /// same name, such as a subagent's task ID. Empty when there is none.
+        sender: String,
+        /// A one-line account of the delivery: the harness's own, such as
+        /// `Agent "Review" finished`, or the one a teammate wrote for its
+        /// message. Empty when there is none.
+        summary: String,
+        /// A report's or message's Markdown, or the output a notice quotes,
+        /// with the harness's framing removed.
+        body: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryKind {
+    /// A delegated agent's final report to the conversation that started it.
+    Report,
+    /// A message from a teammate or another session.
+    Message,
+    /// The harness reporting that background work - a command, a monitor or
+    /// an agent - finished or produced an event.
+    Notice,
+}
+
+impl DeliveryKind {
+    /// The words a delivery's heading opens with; a notice's own summary
+    /// stands in their place.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Report => "Report from",
+            Self::Message => "Message from",
+            Self::Notice => "",
+        }
+    }
+}
+
+/// Who sent a delivery, as one phrase: its name, or failing that its
+/// identifier, which is shortened because a task ID is only ever needed to
+/// tell two senders apart at a glance.
+pub fn delivery_sender(from: &str, sender: &str) -> String {
+    let short: String = sender.chars().take(8).collect();
+    match (from.is_empty(), short.is_empty()) {
+        (false, _) => from.into(),
+        (true, false) => format!("agent {short}"),
+        (true, true) => "another agent".into(),
+    }
+}
+
+/// A delivery's heading as plain text. A named sender leads, followed by
+/// the summary it wrote, as in `Message from tester: Suite passes`; an
+/// unnamed one is described by the harness's own summary where it wrote one,
+/// such as `Agent "Review" finished`, and otherwise by its identifier.
+pub fn delivery_heading(kind: DeliveryKind, from: &str, sender: &str, summary: &str) -> String {
+    match (kind, from.is_empty(), summary.is_empty()) {
+        (DeliveryKind::Notice, _, false) | (_, true, false) => summary.into(),
+        (DeliveryKind::Notice, _, true) => "Background work changed state".into(),
+        (_, false, false) => format!("{} {from}: {summary}", kind.verb()),
+        (_, _, true) => format!("{} {}", kind.verb(), delivery_sender(from, sender)),
+    }
 }
 
 impl ItemContent {
@@ -1020,6 +1092,17 @@ impl ItemContent {
                 .saturating_add(input.len())
                 .saturating_add(output.len()),
             Self::Image { path, description } => path.len().saturating_add(description.len()),
+            Self::Delivery {
+                from,
+                sender,
+                summary,
+                body,
+                ..
+            } => from
+                .len()
+                .saturating_add(sender.len())
+                .saturating_add(summary.len())
+                .saturating_add(body.len()),
         }
     }
 
@@ -1037,7 +1120,7 @@ impl ItemContent {
             | Self::Changes { .. }
             | Self::WebSearch { .. }
             | Self::Tool { .. } => true,
-            Self::Text { .. } | Self::Image { .. } => false,
+            Self::Text { .. } | Self::Image { .. } | Self::Delivery { .. } => false,
         }
     }
 
@@ -1046,7 +1129,10 @@ impl ItemContent {
             Self::Command { status, .. }
             | Self::Changes { status, .. }
             | Self::Tool { status, .. } => Some(*status),
-            Self::Text { .. } | Self::WebSearch { .. } | Self::Image { .. } => None,
+            Self::Text { .. }
+            | Self::WebSearch { .. }
+            | Self::Image { .. }
+            | Self::Delivery { .. } => None,
         }
     }
 }
@@ -1331,6 +1417,27 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_headings_name_the_sender_before_any_summary() {
+        use DeliveryKind::*;
+        assert_eq!(
+            delivery_heading(Message, "tester", "", "CI is down"),
+            "Message from tester: CI is down"
+        );
+        assert_eq!(
+            delivery_heading(Report, "", "a17925ac2cee519e2", ""),
+            "Report from agent a17925ac"
+        );
+        assert_eq!(
+            delivery_heading(Report, "", "a1", "Agent \"Review\" finished"),
+            "Agent \"Review\" finished"
+        );
+        assert_eq!(
+            delivery_heading(Notice, "", "", ""),
+            "Background work changed state"
+        );
+    }
 
     #[test]
     fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {

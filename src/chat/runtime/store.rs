@@ -188,6 +188,10 @@ impl Store {
         }
         let (body0, body1, body2) = match &mut item.content {
             ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
+            // A delivery's body is as unbounded as prose; who sent it is identity.
+            ItemContent::Delivery { body, .. } => {
+                (std::mem::take(body), String::new(), String::new())
+            }
             // A command's output is the only field of it that grows without a
             // bound; its label, argv and directory are identity.
             ItemContent::Command { output, .. } => {
@@ -577,6 +581,7 @@ impl Store {
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
                     ItemContent::Text { text, .. } => *text = body0,
+                    ItemContent::Delivery { body, .. } => *body = body0,
                     ItemContent::Command {
                         label,
                         command,
@@ -731,6 +736,16 @@ fn shrink(content: &mut ItemContent) {
             });
         }
         ItemContent::Tool { name, .. } => clamp(name, NAME_BYTES),
+        ItemContent::Delivery {
+            from,
+            sender,
+            summary,
+            ..
+        } => {
+            clamp(from, NAME_BYTES);
+            clamp(sender, NAME_BYTES);
+            clamp(summary, NAME_BYTES);
+        }
         // Prose and attachments keep nothing but their role and ID here; their
         // text was already taken out into chunks.
         ItemContent::Text { .. } | ItemContent::Image { .. } => {}
@@ -795,6 +810,7 @@ fn layout(content: &ItemContent) -> &'static str {
         ItemContent::WebSearch { .. } => "search",
         ItemContent::Tool { .. } => "tool",
         ItemContent::Image { .. } => "image",
+        ItemContent::Delivery { .. } => "delivery",
     }
 }
 fn insert_body(
@@ -870,6 +886,29 @@ mod tests {
         store.latest();
         assert!(!store.window().unwrap().has_later);
     }
+    #[test]
+    fn delivery_round_trips_with_its_body_paged_like_prose() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let delivery = ItemContent::Delivery {
+            kind: crate::chat::DeliveryKind::Report,
+            from: "general-purpose".into(),
+            sender: "a17925ac2cee519e2".into(),
+            summary: String::new(),
+            body: "## Findings\n".repeat(16),
+        };
+        store
+            .apply(Event::Item(Item {
+                id: "report".into(),
+                role: Role::User,
+                content: delivery.clone(),
+                at: None,
+            }))
+            .unwrap();
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        assert_eq!(window.items[0].content, delivery);
+    }
+
     /// A 2 MiB screenshot used to be rejected by the 64 KiB identity guard, which
     /// killed the provider and made the session unreopenable.
     #[test]

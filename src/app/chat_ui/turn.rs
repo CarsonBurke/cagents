@@ -387,6 +387,21 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
         ItemContent::WebSearch { query, .. } => query.as_str(),
         ItemContent::Tool { name, .. } => name.as_str(),
         ItemContent::Image { description, .. } => description.as_str(),
+        // As `chat::delivery_heading` has it, less a named sender's summary.
+        ItemContent::Delivery {
+            from,
+            sender,
+            summary,
+            ..
+        } => {
+            if !from.is_empty() {
+                from.as_str()
+            } else if !summary.is_empty() {
+                summary.as_str()
+            } else {
+                sender.get(..8).unwrap_or(sender)
+            }
+        }
     }
 }
 
@@ -413,6 +428,8 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
         ItemContent::WebSearch { .. } => "Searched the web for",
         ItemContent::Tool { .. } => "Called",
         ItemContent::Image { .. } => "Viewed",
+        ItemContent::Delivery { from, summary, .. } if from.is_empty() && !summary.is_empty() => "",
+        ItemContent::Delivery { kind, .. } => kind.verb(),
     }
 }
 
@@ -439,7 +456,7 @@ fn summarize_steps(steps: &[Placed], items: &[Item]) -> Option<String> {
             ItemContent::WebSearch { .. } => web += 1,
             ItemContent::Tool { .. } => called += 1,
             ItemContent::Image { .. } => viewed += 1,
-            ItemContent::Text { .. } => {}
+            ItemContent::Text { .. } | ItemContent::Delivery { .. } => {}
         }
     }
     let counted = |count: usize, one: &str, many: &str| match count {
@@ -548,6 +565,36 @@ mod tests {
     /// No question was pending, which is the ordinary case.
     fn unasked() -> HashSet<String> {
         HashSet::new()
+    }
+
+    /// A subagent's report prompts the work that follows it the way the
+    /// reader's own message does, so that work is attributed to it rather
+    /// than to whatever ran before it landed.
+    #[test]
+    fn a_delivery_opens_the_group_of_the_work_it_prompted() {
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            text("a1", Role::Assistant, Phase::Final, false),
+            Item {
+                id: "report".into(),
+                role: Role::User,
+                content: ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Report,
+                    from: "general-purpose".into(),
+                    sender: "a1b2c3d4e5".into(),
+                    summary: String::new(),
+                    body: "Done".into(),
+                },
+                at: None,
+            },
+            command("c1", ToolStatus::Succeeded),
+            text("a2", Role::Assistant, Phase::Final, false),
+        ];
+        let turns = group(&items, &unasked());
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].prompt, vec![2]);
+        assert_eq!(steps(&turns[1]), vec![3]);
+        assert_eq!(slots(&turns[1]), vec![(4, Slot::Prose)]);
     }
 
     #[test]

@@ -1129,6 +1129,20 @@ fn console(
                         output,
                         ..
                     } => format!("Tool {name} ({status:?}): {output}\n"),
+                    chat::ItemContent::Delivery {
+                        kind,
+                        from,
+                        sender,
+                        summary,
+                        body,
+                    } => {
+                        let heading = chat::delivery_heading(*kind, from, sender, summary);
+                        if body.is_empty() {
+                            format!("{heading}\n")
+                        } else {
+                            format!("{heading}:\n{body}\n")
+                        }
+                    }
                     _ => continue,
                 };
                 if text.len() > remaining {
