@@ -479,11 +479,14 @@ fn load_regular_file(
         Err(_) => return Ok(FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)),
     };
     let markdown = relative_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
-        });
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
+        || relative_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
+            });
     Ok(FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
@@ -527,7 +530,7 @@ fn decode_raster(bytes: &[u8], format: image::ImageFormat) -> Result<FileContent
     })
 }
 
-fn decode_svg(bytes: &[u8]) -> Result<FileContent, String> {
+pub(crate) fn decode_svg(bytes: &[u8]) -> Result<FileContent, String> {
     if bytes.len() > MAX_SVG_BYTES {
         return Err("SVG exceeds the 256 KiB safe preview limit.".into());
     }
@@ -1319,6 +1322,32 @@ mod tests {
             source: PathBuf::from(source),
             content,
         }
+    }
+
+    #[test]
+    fn extensionless_text_is_readable_and_readme_uses_markdown() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, text, markdown) in [
+            ("README", "# Heading\n", true),
+            ("LICENSE", "# Literal\n", false),
+            ("notes.txt", "Text\n", false),
+            ("flow.mmd", "flowchart LR; A-->B", false),
+        ] {
+            std::fs::write(root.path().join(name), text).unwrap();
+            assert_eq!(
+                load_file(root.path(), Path::new(name), PdfTone::Original)
+                    .unwrap()
+                    .content,
+                editable(text, markdown)
+            );
+        }
+        std::fs::write(root.path().join("binary"), b"a\0b").unwrap();
+        assert_eq!(
+            load_file(root.path(), Path::new("binary"), PdfTone::Original)
+                .unwrap()
+                .content,
+            FileContent::ReadOnly(ReadOnlyReason::Binary)
+        );
     }
 
     fn editable(text: &str, markdown: bool) -> FileContent {

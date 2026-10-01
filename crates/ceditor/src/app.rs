@@ -708,6 +708,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
+            | RepositoryAction::DiagramsRendered { .. }
+            | RepositoryAction::MarkdownDue { .. }
             | RepositoryAction::AutoSaveDue { .. }
             | RepositoryAction::Save { .. }
             | RepositoryAction::Reload { .. }
@@ -5535,6 +5537,7 @@ mod tests {
             SidebarAction::Commit {
                 key: key.clone(),
                 message: "Keep my message".into(),
+                amend: false,
             },
         );
         assert!(app.notice.as_deref().unwrap().contains("Commit failed"));
@@ -5554,6 +5557,7 @@ mod tests {
         let task = app.update(Message::Sidebar(SidebarAction::Commit {
             key: key.clone(),
             message: "Keep my message".into(),
+            amend: false,
         }));
         assert!(app.tab(id).unwrap().mutation.is_some());
         assert!(
@@ -5612,6 +5616,7 @@ mod tests {
             SidebarAction::Commit {
                 key: key.clone(),
                 message: "Second".into(),
+                amend: false,
             },
         );
         let target = app
@@ -5766,6 +5771,7 @@ mod tests {
             SidebarAction::Commit {
                 key,
                 message: "blocked".into(),
+                amend: false,
             },
         );
         assert!(app.notice.as_deref().unwrap().contains("Save open files"));

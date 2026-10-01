@@ -226,6 +226,15 @@ scripts/install-ceditor                  # default prefix ~/.local
 scripts/install-ceditor --prefix /absolute/path
 ```
 
+Preview supports UTF-8 text, including extensionless files. Plain text preserves
+its literal content; extensionless `README` uses Markdown. Mermaid fences in
+Markdown and standalone `.mmd` / `.mermaid` files render natively, without a
+browser or Node.js. The native renderer supports flowcharts, sequence, class,
+state, ER, pie and other Mermaid diagram types; it may differ from Mermaid.js
+in styling or syntax coverage. Unsupported or oversized diagrams keep their
+source visible alongside an error. Rendering is debounced, uses at most two
+workers, and retains at most 24 diagrams / 32 MiB of pixels per document.
+
 The development runner uses an isolated application and settings identity.
 The editor runner and installer honor `CARGO_BUILD_TARGET` when locating the
 built executable.

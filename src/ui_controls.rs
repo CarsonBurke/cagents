@@ -1065,6 +1065,7 @@ fn bar_fill(width: f32, fraction: f32) -> f32 {
 /// The ring is right where a budget sits beside a caption; where several
 /// windows are listed one under another, bars of one length let the eye
 /// compare them down the column, which rings of one size cannot.
+/// The highlighted fraction is the allowance still available.
 pub fn budget_bar<'a, Message: 'a>(
     fraction: f32,
     tone: crate::design::Tone,
@@ -1131,7 +1132,7 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
                 cosmic::iced::advanced::renderer::Quad {
                     bounds: cosmic::iced::Rectangle {
                         // Never narrower than the bar is tall, so a sliver of
-                        // use still reads as a rounded mark rather than a seam.
+                        // remaining allowance reads as a rounded mark rather than a seam.
                         width: filled.max(bounds.height).min(bounds.width),
                         ..bounds
                     },

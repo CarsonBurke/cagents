@@ -1389,6 +1389,20 @@ impl Runtime {
         }
     }
 
+    fn restore_followup(&mut self) {
+        let Some((text, attachments)) = self.followup.take() else {
+            return;
+        };
+        let draft = self.composer.text();
+        self.replace_draft(text_editor::Content::with_text(&format!(
+            "{}\n{draft}",
+            text.trim_end()
+        )));
+        let later = std::mem::replace(&mut self.attachments, attachments);
+        self.attach(later.into_iter().map(|attachment| attachment.path));
+        let _ = self.present();
+    }
+
     /// Records a message the provider accepted. The same message sent twice
     /// in a row is one entry, as a shell keeps it, and the walk restarts
     /// from the newest.
@@ -1918,6 +1932,8 @@ impl Runtime {
             Some("Wait for the pending chat command to finish before leaving the chat.")
         } else if self.queued.is_some() {
             Some(QUEUED_BLOCKER)
+        } else if self.followup.is_some() {
+            Some("Send or take back the queued follow-up before leaving the chat.")
         } else if !self.attachments.is_empty() {
             Some("Send or remove the attached files before leaving the chat.")
         } else if self
@@ -1938,7 +1954,13 @@ impl Runtime {
     /// conversation holds it back; the terminal would never send it.
     fn handoff_blocker(&self) -> Option<&'static str> {
         if self.session.launch.provider == Provider::Codex {
-            self.queued.is_some().then_some(QUEUED_BLOCKER)
+            if self.queued.is_some() {
+                Some(QUEUED_BLOCKER)
+            } else if self.followup.is_some() {
+                Some("Send or take back the queued follow-up before leaving the chat.")
+            } else {
+                None
+            }
         } else {
             self.transition_blocker()
         }
@@ -4088,8 +4110,17 @@ impl Cagents {
         let latest = handle.snapshot();
         if latest.ready && !latest.busy && !latest.exited && runtime.followup.is_some() {
             let (text, attachments) = runtime.followup.as_ref().unwrap();
-            let command = match submission(text, &latest, attachments, PromptMode::Send) {
-                Ok(command) => command,
+            // A queued message remains a prompt. Resolving it as an idle
+            // slash command could discard everything combined after /compact.
+            let command = match submission(text, &latest, attachments, PromptMode::Queue) {
+                Ok(Command::Prompt {
+                    text, attachments, ..
+                }) => Command::Prompt {
+                    text,
+                    attachments,
+                    mode: PromptMode::Send,
+                },
+                Ok(_) => unreachable!("queue submission always constructs a prompt"),
                 Err(error) => {
                     runtime.error = Some(error.into());
                     return Task::none();
@@ -5522,23 +5553,59 @@ impl Cagents {
                 if runtime.is_draft() {
                     return self.start_chat_draft(target);
                 }
-                if runtime.followup.is_some() {
-                    return Task::none();
-                }
-                if mode == PromptMode::Queue
-                    && !runtime.snapshot.capabilities.queue
-                    && runtime.snapshot.busy
-                    && runtime.followup.is_none()
+                if (runtime.followup.is_some() && mode != PromptMode::Steer
+                    || mode == PromptMode::Queue
+                        && !runtime.snapshot.capabilities.queue
+                        && runtime.snapshot.busy)
                     && runtime.pending.is_none()
                     && !runtime.disconnected
+                    && !runtime.snapshot.exited
                 {
-                    runtime.followup = Some((
-                        runtime.composer.text(),
-                        std::mem::take(&mut runtime.attachments),
-                    ));
+                    let previous = runtime.followup.as_ref();
+                    let count = previous.map_or(0, |(_, attachments)| attachments.len())
+                        + runtime
+                            .attachments
+                            .iter()
+                            .filter(|attachment| {
+                                previous.is_none_or(|(_, attachments)| {
+                                    !attachments.iter().any(|old| old.path == attachment.path)
+                                })
+                            })
+                            .count();
+                    if chat::AttachmentRules::for_provider(runtime.session.launch.provider)
+                        .max_count
+                        .is_some_and(|limit| count > limit)
+                    {
+                        runtime.error = Some(
+                            "The combined queued message exceeds this chat's attachment limit."
+                                .into(),
+                        );
+                        return Task::none();
+                    }
+                    let text = runtime.composer.text();
+                    let (combined, attachments) = runtime
+                        .followup
+                        .get_or_insert_with(|| (String::new(), Vec::new()));
+                    if !text.trim().is_empty() {
+                        if !combined.trim().is_empty() {
+                            combined.truncate(combined.trim_end().len());
+                            combined.push('\n');
+                        }
+                        combined.push_str(&text);
+                    }
+                    for attachment in std::mem::take(&mut runtime.attachments) {
+                        if !attachments.iter().any(|old| old.path == attachment.path) {
+                            attachments.push(attachment);
+                        }
+                    }
                     runtime.replace_draft(text_editor::Content::new());
+                    runtime.error = None;
                     let _ = runtime.present();
-                    return Task::none();
+                    return if runtime.snapshot.busy {
+                        Task::none()
+                    } else {
+                        self.dispatch_queued(target)
+                    };
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
@@ -5658,6 +5725,7 @@ impl Cagents {
                     Ok(()) => {
                         if pending.followup {
                             runtime.followup = None;
+                            let _ = runtime.present();
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
@@ -5678,7 +5746,7 @@ impl Cagents {
                         if pending.page == Some(view::Page::Newer)
                             && runtime.selected_subagent.is_none()
                         {
-                            return iced::widget::scrollable::snap_to(
+                            let snap = iced::widget::scrollable::snap_to(
                                 card_control_id(target.card, "chat-transcript"),
                                 iced::widget::scrollable::RelativeOffset {
                                     x: None,
@@ -5686,6 +5754,11 @@ impl Cagents {
                                 },
                             )
                             .map(cosmic::Action::App);
+                            return Task::batch([
+                                snap,
+                                self.dispatch_queued(target),
+                                self.resume_history_navigation(target),
+                            ]);
                         }
                         pending.first_prompt
                     }
@@ -5695,15 +5768,8 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
-                        if pending.followup
-                            && let Some((text, attachments)) = runtime.followup.take()
-                        {
-                            let draft = runtime.composer.text();
-                            runtime.replace_draft(text_editor::Content::with_text(&format!(
-                                "{text}\n{draft}"
-                            )));
-                            runtime
-                                .attach(attachments.into_iter().map(|attachment| attachment.path));
+                        if pending.followup {
+                            runtime.restore_followup();
                         }
                         runtime.note(error.clone());
                         runtime.error = Some(error);
@@ -5713,7 +5779,13 @@ impl Cagents {
                 if let Some(prompt) = first_prompt {
                     self.name_channel_from_prompt(target.card, &prompt);
                 }
-                return self.resume_history_navigation(target);
+                // Idle may have arrived while this command was awaiting its
+                // acknowledgement. No later provider event is guaranteed to
+                // wake the follow-up again once the command releases it.
+                return Task::batch([
+                    self.dispatch_queued(target),
+                    self.resume_history_navigation(target),
+                ]);
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -5907,13 +5979,8 @@ impl Cagents {
                         .pending
                         .as_ref()
                         .is_some_and(|pending| pending.followup)
-                    && let Some((text, attachments)) = runtime.followup.take()
                 {
-                    let draft = runtime.composer.text();
-                    runtime.replace_draft(text_editor::Content::with_text(&format!(
-                        "{text}\n{draft}"
-                    )));
-                    runtime.attach(attachments.into_iter().map(|attachment| attachment.path));
+                    runtime.restore_followup();
                 }
             }
             Action::Attach(target) => {
@@ -6626,6 +6693,214 @@ mod tests {
             chat_runtime(&app, card).composer.text().trim(),
             "next task\nlater draft"
         );
+    }
+
+    #[test]
+    fn multiple_local_followups_combine_in_order_and_cancel_before_later_drafts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let runtime = app
+            .chat_runtime_mut(chat_runtime(&app, card).target)
+            .unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+        let target = runtime.target;
+        for (text, paths) in [
+            ("first task", vec!["first.png"]),
+            ("second task", vec!["first.png", "second.png"]),
+            ("", vec!["third.png"]),
+        ] {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.replace_draft(text_editor::Content::with_text(text));
+            runtime.attach(paths.into_iter().map(PathBuf::from));
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        }
+        let runtime = chat_runtime(&app, card);
+        let (text, attachments) = runtime.followup.as_ref().unwrap();
+        assert_eq!(text.trim(), "first task\nsecond task");
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|attachment| attachment.path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("first.png"),
+                Path::new("second.png"),
+                Path::new("third.png")
+            ]
+        );
+        assert!(runtime.pending.is_none());
+        assert!(runtime.composer.text().trim().is_empty());
+        assert!(runtime.transition_blocker().is_some());
+        assert!(runtime.handoff_blocker().is_some());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        runtime.attach([PathBuf::from("later.png")]);
+        drop(app.handle_chat_ui(Action::CancelFollowup(target)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "first task\nsecond task\nlater draft"
+        );
+        assert_eq!(
+            runtime
+                .attachments
+                .iter()
+                .map(|attachment| attachment.path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("first.png"),
+                Path::new("second.png"),
+                Path::new("third.png"),
+                Path::new("later.png")
+            ]
+        );
+        assert!(runtime.followup.is_none());
+    }
+
+    #[test]
+    fn a_local_followup_resumes_when_idle_arrives_before_an_unrelated_ack() {
+        for refreshing in [false, true] {
+            for result in [Ok(()), Err("fixture refused selection".into())] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some("followup"));
+                let target = chat_runtime(&app, card).target;
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                Arc::make_mut(&mut runtime.snapshot).busy = true;
+                Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+                runtime.replace_draft(text_editor::Content::with_text("next task"));
+                drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+                drop(app.chat_send(
+                    target,
+                    if refreshing {
+                        Command::Refresh
+                    } else {
+                        Command::SetPermissionMode {
+                            mode: "manual".into(),
+                        }
+                    },
+                    false,
+                ));
+                let id = chat_runtime(&app, card).pending.as_ref().unwrap().id;
+                drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+                assert_eq!(chat_runtime(&app, card).pending.as_ref().unwrap().id, id);
+                settle(&mut app, card, result);
+                let pending = chat_runtime(&app, card).pending.as_ref().unwrap();
+                assert_ne!(pending.id, id);
+                assert!(pending.followup);
+                assert_eq!(pending.sent.as_deref().unwrap().trim(), "next task");
+                settle(&mut app, card, Ok(()));
+                assert!(chat_runtime(&app, card).followup.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_combined_followup_is_sent_as_one_prompt_and_keeps_the_new_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.compact = true;
+        for text in ["/compact", "also include the second task"] {
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text(text));
+            drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        }
+        drop(app.dispatch_queued(target));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let pending = runtime.pending.as_ref().unwrap();
+        assert!(pending.followup);
+        assert_eq!(
+            pending.sent.as_deref().unwrap().trim(),
+            "/compact\nalso include the second task"
+        );
+        runtime.replace_draft(text_editor::Content::with_text("later draft"));
+        settle(&mut app, card, Ok(()));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.followup.is_none());
+        assert_eq!(runtime.composer.text().trim(), "later draft");
+        assert_eq!(
+            runtime.history.last().unwrap().trim(),
+            "/compact\nalso include the second task"
+        );
+    }
+
+    #[test]
+    fn a_rejected_combined_followup_restores_order_without_consuming_an_inflight_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.followup = Some((
+            "first\nsecond".into(),
+            vec![Attachment {
+                path: "first.png".into(),
+            }],
+        ));
+        drop(app.dispatch_queued(target));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("later"));
+        runtime.attach([PathBuf::from("later.png")]);
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        assert_eq!(
+            chat_runtime(&app, card).followup.as_ref().unwrap().0,
+            "first\nsecond"
+        );
+        assert_eq!(chat_runtime(&app, card).composer.text().trim(), "later");
+        drop(app.handle_chat_ui(Action::CancelFollowup(target)));
+        assert!(
+            chat_runtime(&app, card).followup.is_some(),
+            "cannot cancel an in-flight send"
+        );
+        settle(&mut app, card, Err("fixture rejected".into()));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "first\nsecond\nlater");
+        assert_eq!(
+            runtime
+                .attachments
+                .iter()
+                .map(|attachment| attachment.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("first.png"), Path::new("later.png")]
+        );
+        assert!(runtime.followup.is_none());
+    }
+
+    #[test]
+    fn combined_followup_attachment_limit_keeps_both_messages_editable() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.session.launch.provider = Provider::Claude;
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+        let attachments = (0..8)
+            .map(|index| Attachment {
+                path: format!("{index}.png").into(),
+            })
+            .collect::<Vec<_>>();
+        runtime.followup = Some(("first".into(), attachments.clone()));
+        runtime.replace_draft(text_editor::Content::with_text("second"));
+        runtime.attach([PathBuf::from("extra.png")]);
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.followup.as_ref().unwrap(),
+            &("first".into(), attachments)
+        );
+        assert_eq!(runtime.composer.text().trim(), "second");
+        assert_eq!(
+            runtime.attachments,
+            [Attachment {
+                path: "extra.png".into()
+            }]
+        );
+        assert!(runtime.error.as_ref().unwrap().contains("attachment limit"));
     }
 
     #[test]

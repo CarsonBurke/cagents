@@ -14,6 +14,7 @@ use std::{
 mod text_editor;
 
 mod diff_layout;
+mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
@@ -409,6 +410,12 @@ pub enum RepositoryAction {
         card: CardId,
         ticket: u64,
     },
+    DiagramsRendered {
+        identity: AsyncIdentity,
+        revision: u64,
+        tone_generation: u64,
+        result: Vec<(blake3::Hash, preview::Diagram)>,
+    },
     OpenFile {
         card: CardId,
         path: PathBuf,
@@ -711,6 +718,7 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
             | Self::DiffBasisResolved { identity, .. }
@@ -753,6 +761,12 @@ struct EditorDocument {
     /// at the debounce boundary — or at the moment the preview is mounted,
     /// whichever comes first.
     markdown_stale: bool,
+    preview_text: String,
+    diagrams: HashMap<blake3::Hash, preview::Diagram>,
+    diagram_pending: Option<u64>,
+    diagram_cancel: Option<preview::CancellationGuard>,
+    diagram_dark: bool,
+    diagram_tone_generation: u64,
     dirty: bool,
     revision: u64,
     /// Version of this buffer as the language server counts it: monotonic and
@@ -812,7 +826,13 @@ impl EditorDocument {
             disk_hash,
             markdown,
             markdown_items,
-            markdown_stale: false,
+            markdown_stale: true,
+            preview_text: String::new(),
+            diagrams: HashMap::new(),
+            diagram_pending: None,
+            diagram_cancel: None,
+            diagram_dark: cosmic::theme::is_dark(),
+            diagram_tone_generation: 0,
             dirty: false,
             revision: 0,
             lsp_version: 1,
@@ -884,7 +904,10 @@ impl EditorDocument {
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
         self.dirty = !content_matches(&self.content, &self.saved_text);
-        self.markdown_stale |= self.markdown;
+        self.markdown_stale = true;
+        if let Some(cancel) = &self.diagram_cancel {
+            cancel.0.cancel();
+        }
     }
 
     /// Steps through the edit history, reporting what changed for the
@@ -964,7 +987,10 @@ impl EditorDocument {
         }
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
-        self.markdown_stale |= self.markdown;
+        self.markdown_stale = true;
+        if let Some(cancel) = &self.diagram_cancel {
+            cancel.0.cancel();
+        }
         self.dirty = false;
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
@@ -997,7 +1023,10 @@ impl EditorDocument {
         // The positions the history recorded address the buffer that was
         // just thrown away.
         self.history.clear();
-        self.markdown_stale |= self.markdown;
+        self.markdown_stale = true;
+        if let Some(cancel) = &self.diagram_cancel {
+            cancel.0.cancel();
+        }
         self.dirty = text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
     }
@@ -1042,7 +1071,12 @@ impl EditorDocument {
         if !std::mem::take(&mut self.markdown_stale) {
             return;
         }
-        self.markdown_items = markdown::parse(&self.content.text()).collect();
+        self.preview_text = self.content.text();
+        self.markdown_items = if self.markdown {
+            markdown::parse(&self.preview_text).collect()
+        } else {
+            Vec::new()
+        };
     }
 }
 
@@ -2145,6 +2179,18 @@ impl RepositoryRuntime {
         card: CardId,
         theme: &cosmic::Theme,
     ) -> Task<RepositoryAction> {
+        if let DocumentState::Editable(document) = &mut self.document {
+            let dark = theme.theme_type.is_dark();
+            if document.diagram_dark != dark {
+                document.diagram_dark = dark;
+                document.diagram_tone_generation = document.diagram_tone_generation.wrapping_add(1);
+                document.diagrams.clear();
+                document.diagram_cancel = None;
+                document.diagram_pending = None;
+                return self.diagram_task(card);
+            }
+            return Task::none();
+        }
         let DocumentState::Pdf {
             page,
             zoom,
@@ -2915,11 +2961,10 @@ impl RepositoryRuntime {
     /// Markdown preview renders the parsed document, so neither has a buffer
     /// to focus or search.
     fn editable_surface_visible(&self) -> bool {
-        let DocumentState::Editable(document) = &self.document else {
+        let DocumentState::Editable(_) = &self.document else {
             return false;
         };
-        self.source_surface == SourceSurface::Editor
-            && !(document.markdown && self.markdown_mode == MarkdownMode::Preview)
+        self.source_surface == SourceSurface::Editor && self.markdown_mode != MarkdownMode::Preview
     }
 
     /// Gives the keyboard to the editable buffer.
@@ -3376,23 +3421,25 @@ impl RepositoryRuntime {
         self.source_surface = SourceSurface::Editor;
         self.markdown_mode = MarkdownMode::Preview;
         if fragment.is_empty() {
-            return iced::widget::scrollable::scroll_to(
-                self.preview_scroll_id.clone(),
-                iced::widget::scrollable::AbsoluteOffset {
-                    x: None,
-                    y: Some(0.0),
-                },
-            );
+            return Task::batch([
+                self.diagram_task(card),
+                iced::widget::scrollable::scroll_to(
+                    self.preview_scroll_id.clone(),
+                    iced::widget::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(0.0),
+                    },
+                ),
+            ]);
         }
-        crate::document_link::heading_index(&document.markdown_items, fragment).map_or_else(
-            Task::none,
-            |index| {
+        let scroll = crate::document_link::heading_index(&document.markdown_items, fragment)
+            .map_or_else(Task::none, |index| {
                 crate::document_link::scroll_to_heading(
                     self.preview_scroll_id.clone(),
                     crate::document_link::heading_id(card, index),
                 )
-            },
-        )
+            });
+        Task::batch([scroll, self.diagram_task(card)])
     }
 
     /// The live buffer, or nothing while no editable document is open.
@@ -3449,6 +3496,9 @@ impl RepositoryRuntime {
     /// so continuous typing in a large Markdown file parses once rather than
     /// once per character.
     fn markdown_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.markdown_mode != MarkdownMode::Preview {
+            return Task::none();
+        }
         let DocumentState::Editable(document) = &self.document else {
             return Task::none();
         };
@@ -3487,7 +3537,59 @@ impl RepositoryRuntime {
         if let DocumentState::Editable(document) = &mut self.document {
             document.sync_markdown();
         }
-        Task::none()
+        self.diagram_task(card)
+    }
+
+    fn diagram_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.markdown_mode != MarkdownMode::Preview {
+            return Task::none();
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        if document.diagram_pending.is_some() {
+            return Task::none();
+        }
+        document.sync_markdown();
+        let sources = preview::sources(
+            &document.path,
+            &document.preview_text,
+            &document.markdown_items,
+        );
+        let keys: std::collections::HashSet<_> = sources
+            .iter()
+            .map(|source| blake3::hash(source.as_bytes()))
+            .collect();
+        document.diagrams.retain(|key, _| keys.contains(key));
+        let sources: Vec<_> = sources
+            .into_iter()
+            .filter(|source| {
+                !document
+                    .diagrams
+                    .contains_key(&blake3::hash(source.as_bytes()))
+            })
+            .collect();
+        if sources.is_empty() {
+            return Task::none();
+        }
+        let available = preview::available_budget(&document.diagrams);
+        let path = document.path.clone();
+        let revision = document.revision;
+        document.diagram_pending = Some(revision);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        document.diagram_cancel = Some(preview::CancellationGuard(cancel.clone()));
+        let dark = document.diagram_dark;
+        let tone_generation = document.diagram_tone_generation;
+        let identity = self.current_identity(card, path);
+        cosmic::task::future(async move {
+            let result = preview::render(sources, dark, available, cancel).await;
+            RepositoryAction::DiagramsRendered {
+                identity,
+                revision,
+                tone_generation,
+                result,
+            }
+        })
     }
 
     /// Records that the open buffer's text changed, whatever changed it, and
@@ -3852,7 +3954,7 @@ impl RepositoryRuntime {
     fn can_apply_markdown_mode(&self, preview: bool) -> bool {
         !self.is_saving()
             && match &self.document {
-                DocumentState::Editable(document) => !preview || document.markdown,
+                DocumentState::Editable(_) => true,
                 DocumentState::Image { .. } => preview,
                 _ => false,
             }
@@ -3989,10 +4091,9 @@ impl RepositoryRuntime {
             MarkdownMode::Edit => "Edit",
             MarkdownMode::Preview => "Preview",
         });
-        let markdown_mode =
-            matches!(&self.document, DocumentState::Editable(document) if document.markdown)
-                .then_some(markdown_mode)
-                .flatten();
+        let markdown_mode = matches!(&self.document, DocumentState::Editable(_))
+            .then_some(markdown_mode)
+            .flatten();
         let (diff_state, diff_error, diff_additions, diff_deletions, diff_change) = if !diff {
             (None, None, None, None, None)
         } else if let Some(resolution) = &self.basis_resolution {
@@ -4950,7 +5051,7 @@ impl RepositoryRuntime {
                     self.restore_visible_scroll(),
                 ])
             }
-            RepositoryAction::ApplyMarkdownMode { preview, .. } => {
+            RepositoryAction::ApplyMarkdownMode { card, preview } => {
                 if !self.can_apply_markdown_mode(preview) {
                     return Task::none();
                 }
@@ -4976,7 +5077,34 @@ impl RepositoryRuntime {
                     document.sync_markdown();
                 }
                 self.restore_native_viewport();
-                self.restore_visible_scroll()
+                Task::batch([self.restore_visible_scroll(), self.diagram_task(card)])
+            }
+            RepositoryAction::DiagramsRendered {
+                identity,
+                revision,
+                tone_generation,
+                result,
+            } => {
+                if !self.accepts_selected(&identity) {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if document.diagram_pending != Some(revision)
+                    || document.diagram_tone_generation != tone_generation
+                {
+                    return Task::none();
+                }
+                document.diagram_pending = None;
+                document.diagram_cancel = None;
+                if document.revision == revision {
+                    document.diagrams.extend(result);
+                    self.diagram_task(identity.card)
+                } else {
+                    // A superseded worker never bypasses the typing debounce.
+                    self.markdown_task(identity.card)
+                }
             }
             RepositoryAction::MarkdownDue { card, ticket } => self.finish_markdown(card, ticket),
             RepositoryAction::ApplyDiffMode { split, .. } => {
@@ -5846,7 +5974,7 @@ impl RepositoryRuntime {
             ),
             SourceSurface::Editor
                 if self.markdown_mode == MarkdownMode::Preview
-                    && matches!(&self.document, DocumentState::Editable(document) if document.markdown) =>
+                    && matches!(&self.document, DocumentState::Editable(_)) =>
             {
                 (&self.preview_scroll_id, 0.0, self.viewports.preview)
             }
@@ -7060,7 +7188,7 @@ pub fn selected_file_toolbar_with<'a>(
         .width(Length::FillPortion(1))
         .max_width(220)
     });
-    // Unsupported text has no preview renderer. Noneditable load/error states
+    // Noneditable load/error states
     // still expose file information, so inspecting a binary diff is reversible.
     let file_information = !editable && !matches!(runtime.document, DocumentState::Image { .. });
     let preview = icon_control(
@@ -7816,12 +7944,23 @@ fn editable_document_view<'a>(
                 .into(),
         );
     }
-    let content: Element<'a, RepositoryAction> = if document.markdown
-        && runtime.source_surface == SourceSurface::Editor
+    let content: Element<'a, RepositoryAction> = if runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Preview
     {
         widget::scrollable(
-            widget::container(
+            widget::container(if preview::standalone(&document.path) {
+                preview::diagram_view(
+                    document
+                        .diagrams
+                        .get(&blake3::hash(document.preview_text.as_bytes())),
+                    &document.preview_text,
+                    document.diagram_pending.is_some(),
+                )
+            } else if !document.markdown {
+                widget::selectable_text(document.preview_text.as_str())
+                    .font(Font::MONOSPACE)
+                    .into()
+            } else {
                 widget::column::with_children(
                     document
                         .markdown_items
@@ -7829,7 +7968,10 @@ fn editable_document_view<'a>(
                         .enumerate()
                         .map(|(index, item)| {
                             let content = markdown::item(
-                                &crate::document_link::PreviewViewer,
+                                &preview::Viewer {
+                                    diagrams: &document.diagrams,
+                                    loading: document.diagram_pending.is_some(),
+                                },
                                 crate::design::markdown_settings(
                                     &cosmic::theme::active(),
                                     crate::design::TEXT_BODY,
@@ -7851,8 +7993,9 @@ fn editable_document_view<'a>(
                     )
                     .spacing
                     .0,
-                ),
-            )
+                )
+                .into()
+            })
             .padding(spacing.space_m)
             .max_width(900),
         )
@@ -10769,6 +10912,155 @@ mod tests {
     }
 
     #[test]
+    fn text_preview_preserves_literal_extensionless_content_and_retains_its_viewport() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "LICENSE");
+        let text = "# Literal text\n\tIndented\n<tag>& symbol\n";
+        runtime.document = DocumentState::Editable(EditorDocument::unlinked(
+            "LICENSE".into(),
+            text.into(),
+            blake3::hash(text.as_bytes()),
+            false,
+        ));
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.preview_text, text);
+        assert!(document.markdown_items.is_empty());
+        assert!(!runtime.editable_surface_visible());
+        drop(runtime.update(RepositoryAction::PreviewViewport {
+            card,
+            offset: 420.0,
+        }));
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: false,
+        }));
+        assert!(runtime.editable_surface_visible());
+        assert_eq!(runtime.viewports.preview, 420.0);
+    }
+
+    #[test]
+    fn diagram_theme_change_cancels_work_and_fences_old_tone_completions() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "chart.mmd");
+        runtime.document = DocumentState::Editable(EditorDocument::unlinked(
+            "chart.mmd".into(),
+            "flowchart LR; A-->B".into(),
+            blake3::hash(b"fixture"),
+            false,
+        ));
+        runtime.markdown_mode = MarkdownMode::Preview;
+        drop(runtime.diagram_task(card));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        let old_cancel = document.diagram_cancel.as_ref().unwrap().0.clone();
+        let other = if document.diagram_dark {
+            cosmic::Theme::light()
+        } else {
+            cosmic::Theme::dark()
+        };
+        drop(runtime.retone_document(card, &other));
+        assert!(old_cancel.is_cancelled());
+        let key = blake3::hash(b"flowchart LR; A-->B");
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity: identity.clone(),
+            revision: 0,
+            tone_generation: 0,
+            result: vec![(key, preview::Diagram::Error("old tone".into()))],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert!(document.diagrams.is_empty());
+        assert_eq!(document.diagram_pending, Some(0));
+        assert_eq!(document.diagram_tone_generation, 1);
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity,
+            revision: 0,
+            tone_generation: 1,
+            result: vec![(key, preview::Diagram::Error("new tone".into()))],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert!(document.diagrams.contains_key(&key));
+        assert_eq!(document.diagram_pending, None);
+        drop(runtime.retone_document(card, &other));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.diagram_pending, None);
+        assert_eq!(document.diagram_tone_generation, 1);
+    }
+
+    #[test]
+    fn diagram_completion_is_fenced_by_document_identity_and_buffer_revision() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "chart.mmd");
+        runtime.document = DocumentState::Editable(EditorDocument::unlinked(
+            "chart.mmd".into(),
+            "flowchart LR; A-->B".into(),
+            blake3::hash(b"fixture"),
+            false,
+        ));
+        runtime.markdown_mode = MarkdownMode::Preview;
+        drop(runtime.diagram_task(card));
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.diagram_pending, Some(0));
+        document.revision = 1;
+        document.content = text_editor::Content::with_text("flowchart LR; A-->C");
+        document.markdown_stale = true;
+        drop(runtime.diagram_task(card)); // Coalesces onto the one outstanding worker.
+        let key = blake3::hash(b"flowchart LR; A-->B");
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity: identity.clone(),
+            revision: 0,
+            tone_generation: 0,
+            result: vec![(key, preview::Diagram::Error("stale".into()))],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert!(!document.diagrams.contains_key(&key));
+        assert_eq!(document.diagram_pending, None);
+        let ticket = runtime.markdown_debounce.timer.unwrap();
+        runtime.markdown_debounce.deadline = None;
+        drop(runtime.finish_markdown(card, ticket));
+        let mut stale = identity.clone();
+        stale.generation += 1;
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity: stale,
+            revision: 1,
+            tone_generation: 0,
+            result: vec![],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.diagram_pending, Some(1));
+        let key = blake3::hash(b"flowchart LR; A-->C");
+        drop(runtime.update(RepositoryAction::DiagramsRendered {
+            identity,
+            revision: 1,
+            tone_generation: 0,
+            result: vec![(key, preview::Diagram::Error("invalid".into()))],
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert!(document.diagrams.contains_key(&key));
+        assert_eq!(document.diagram_pending, None);
+    }
+
+    #[test]
     fn preview_actions_require_a_preview_renderer_and_preserve_the_current_surface() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
@@ -10778,13 +11070,13 @@ mod tests {
             blake3::hash(b"fn main() {}\n"),
             false,
         ));
-        assert!(!runtime.can_apply_markdown_mode(true));
+        assert!(runtime.can_apply_markdown_mode(true));
         drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
             card,
             preview: true,
         }));
-        assert_eq!(runtime.source_surface, SourceSurface::Diff);
-        assert_eq!(runtime.markdown_mode, MarkdownMode::Edit);
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
+        assert_eq!(runtime.markdown_mode, MarkdownMode::Preview);
         drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
             card,
             preview: false,
