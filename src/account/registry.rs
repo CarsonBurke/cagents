@@ -33,7 +33,7 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -125,6 +125,10 @@ pub struct Registry {
     system_labels: BTreeMap<String, String>,
     #[serde(default, rename = "account", skip_serializing_if = "Vec::is_empty")]
     accounts: Vec<Registered>,
+    /// Hidden duplicate homes remain registered so saved sessions can resume
+    /// and orphan cleanup never deletes their credentials or history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    archived: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<Pending>,
 }
@@ -171,6 +175,22 @@ impl Registry {
     /// Every account, system accounts first and then registered ones in the
     /// order they were added.
     pub fn accounts(&self, homes: Option<&Homes>) -> Vec<Account> {
+        self.all_accounts(homes)
+            .into_iter()
+            .filter(|account| {
+                !account
+                    .registry_key()
+                    .is_some_and(|key| self.is_archived(key))
+            })
+            .collect()
+    }
+
+    pub fn is_archived(&self, key: Uuid) -> bool {
+        self.archived.contains(&key)
+    }
+
+    /// Includes preserved homes for resolving existing session recipes.
+    pub fn all_accounts(&self, homes: Option<&Homes>) -> Vec<Account> {
         let mut accounts: Vec<Account> = Account::system_accounts().into();
         accounts.extend(self.accounts.iter().filter_map(|registered| {
             if let Some(path) = &registered.linked_home {
@@ -225,7 +245,7 @@ impl Registry {
         let registered = Some(chosen)
             .and_then(|key| Uuid::parse_str(key).ok())
             .and_then(|key| self.find(key))
-            .filter(|managed| managed.provider == provider);
+            .filter(|managed| managed.provider == provider && !self.is_archived(managed.key));
         match registered {
             Some(Registered {
                 key,
@@ -255,12 +275,18 @@ impl Registry {
             return false;
         };
         match account.registry_key() {
-            Some(key) => Uuid::parse_str(chosen).ok() == Some(key),
+            Some(key) => !self.is_archived(key) && Uuid::parse_str(chosen).ok() == Some(key),
             None => account.is_system() && chosen == SYSTEM,
         }
     }
 
     pub fn set_project_default(&mut self, repository: &Path, account: &Account) {
+        if account
+            .registry_key()
+            .is_some_and(|key| self.is_archived(key))
+        {
+            return;
+        }
         let chosen = match account.registry_key() {
             Some(key) => key.hyphenated().to_string(),
             None if account.is_system() => SYSTEM.to_owned(),
@@ -312,16 +338,24 @@ impl Registry {
                     || Uuid::parse_str(chosen)
                         .ok()
                         .and_then(|key| self.find(key))
+                        .filter(|account| !self.is_archived(account.key))
                         .is_none()
             }),
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
-                chosen.is_some_and(|chosen| Uuid::parse_str(chosen).ok() == Some(*key))
+                !self.is_archived(*key)
+                    && chosen.is_some_and(|chosen| Uuid::parse_str(chosen).ok() == Some(*key))
             }
             AccountHome::Brokered { .. } => false,
         }
     }
 
     pub fn set_default(&mut self, account: &Account) {
+        if account
+            .registry_key()
+            .is_some_and(|key| self.is_archived(key))
+        {
+            return;
+        }
         let value = match &account.home {
             AccountHome::System => SYSTEM.to_owned(),
             AccountHome::Managed { key, .. } | AccountHome::Linked { key, .. } => {
@@ -389,7 +423,7 @@ impl Registry {
         }
         if let Some(existing) = self.accounts.iter().find(|existing| {
             existing.key != managed.key
-                && existing.linked_home.is_none()
+                && !self.archived.contains(&existing.key)
                 && existing.provider == managed.provider
                 && existing.identity().same_login(&identity)
         }) {
@@ -410,7 +444,7 @@ impl Registry {
     /// Records an existing provider home without taking ownership of it.
     /// Its canonical path, not its reported email, determines whether it is
     /// already registered: separate homes can hold the same login but have
-    /// different histories.
+    /// different histories. Linking an archived home restores its row.
     pub fn link(
         &mut self,
         provider: Provider,
@@ -419,7 +453,7 @@ impl Registry {
         system_home: Option<&Path>,
         homes: Option<&Homes>,
         added_at: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Uuid, String> {
         if !path.is_absolute() {
             return Err("Choose an absolute account home path".into());
         }
@@ -436,6 +470,22 @@ impl Registry {
         {
             return Err("That account home is already listed".into());
         }
+        if let Some(existing) = self.accounts.iter().find(|account| {
+            account.provider == provider
+                && self.archived.contains(&account.key)
+                && account
+                    .linked_home
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| homes.map(|homes| homes.path(provider, account.key)))
+                    .and_then(|home| fs::canonicalize(home).ok())
+                    .as_ref()
+                    == Some(&path)
+        }) {
+            let key = existing.key;
+            self.archived.retain(|archived| *archived != key);
+            return Ok(key);
+        }
         self.accounts.push(Registered {
             key,
             provider,
@@ -445,7 +495,7 @@ impl Registry {
             organization: None,
             added_at,
         });
-        Ok(())
+        Ok(key)
     }
 
     /// Records a home created for a sign-in that is about to start.
@@ -518,6 +568,7 @@ impl Registry {
             .iter()
             .position(|managed| managed.key == key)?;
         let removed = self.accounts.remove(index);
+        self.archived.retain(|archived| *archived != key);
         let key = key.hyphenated().to_string();
         self.defaults.retain(|_, chosen| *chosen != key);
         self.project_defaults.retain(|_, choices| {
@@ -525,6 +576,45 @@ impl Registry {
             !choices.is_empty()
         });
         Some(removed)
+    }
+
+    /// Hides a redundant home while preserving its files and saved-session
+    /// identity. New work uses the retained account instead.
+    pub fn archive_duplicate(&mut self, key: Uuid, retained: &Account) -> bool {
+        let Some(duplicate) = self.find(key) else {
+            return false;
+        };
+        if duplicate.provider != retained.provider
+            || self.archived.contains(&key)
+            || retained.registry_key() == Some(key)
+            || retained.is_brokered()
+        {
+            return false;
+        }
+        let replacement = match retained.registry_key() {
+            Some(keep)
+                if self
+                    .find(keep)
+                    .is_some_and(|account| account.provider == retained.provider)
+                    && !self.archived.contains(&keep) =>
+            {
+                keep.hyphenated().to_string()
+            }
+            None if retained.is_system() => SYSTEM.to_owned(),
+            _ => return false,
+        };
+        let removed = key.hyphenated().to_string();
+        for chosen in self.defaults.values_mut().chain(
+            self.project_defaults
+                .values_mut()
+                .flat_map(|choices| choices.values_mut()),
+        ) {
+            if *chosen == removed {
+                *chosen = replacement.clone();
+            }
+        }
+        self.archived.push(key);
+        true
     }
 
     /// Whether a newer cagents wrote this registry, in which case this one
@@ -1150,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn linking_and_signing_in_to_the_same_identity_are_order_independent() {
+    fn a_new_managed_login_cannot_duplicate_a_linked_identity() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("existing");
         fs::create_dir(&home).unwrap();
@@ -1166,10 +1256,112 @@ mod tests {
                 ..Identity::default()
             },
         );
-        registry
-            .register(managed(Provider::Codex, "same@example.com"), &[])
-            .expect("a managed home has its own history and may share a login with a linked home");
-        assert_eq!(registry.registered().len(), 2);
+        assert_eq!(
+            registry.register(managed(Provider::Codex, "same@example.com"), &[]),
+            Err(Account::linked(Provider::Codex, linked, home).id())
+        );
+        assert_eq!(registry.registered().len(), 1);
+    }
+
+    #[test]
+    fn archiving_preserves_home_launches_and_defaults_and_can_be_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let history = home.join("history.jsonl");
+        fs::write(&history, "saved conversation").unwrap();
+        fs::File::open(&home)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+        let duplicate = Account::managed(Provider::Claude, key, home.clone());
+        let retained = Account::system(Provider::Claude);
+        let repository = directory.path().join("project");
+        store
+            .update(|registry| {
+                let mut registered = managed(Provider::Claude, "same@example.com");
+                registered.key = key;
+                registry.register(registered, &[]).unwrap();
+                registry.set_default(&duplicate);
+                registry.set_project_default(&repository, &duplicate);
+                assert!(registry.archive_duplicate(key, &retained));
+            })
+            .unwrap();
+        let mut registry = store.load_and_sweep(&homes).unwrap();
+        assert!(registry.is_archived(key));
+        assert!(registry.find(key).is_some());
+        assert!(registry.contains_managed_home(&homes, Provider::Claude, key));
+        assert!(!registry.accounts(Some(&homes)).contains(&duplicate));
+        assert!(registry.all_accounts(Some(&homes)).contains(&duplicate));
+        assert_eq!(
+            registry.default_account(Provider::Claude, Some(&homes)),
+            retained
+        );
+        assert_eq!(
+            registry.project_default_account(&repository, Provider::Claude, Some(&homes)),
+            retained
+        );
+        registry.set_default(&duplicate);
+        registry.set_project_default(&repository, &duplicate);
+        assert!(registry.is_default(&retained));
+        assert_eq!(fs::read_to_string(&history).unwrap(), "saved conversation");
+        let environment = [(
+            "CLAUDE_CONFIG_DIR".into(),
+            home.to_string_lossy().into_owned(),
+        )]
+        .into();
+        assert!(
+            store
+                .authorize_environment(&homes, &environment, Some(Provider::Claude))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            registry.link(
+                Provider::Claude,
+                Uuid::new_v4(),
+                home.clone(),
+                Some(&home),
+                Some(&homes),
+                2
+            ),
+            Err("That account home is already listed".into())
+        );
+        assert!(registry.is_archived(key));
+        assert_eq!(
+            registry.link(
+                Provider::Claude,
+                Uuid::new_v4(),
+                home,
+                None,
+                Some(&homes),
+                2
+            ),
+            Ok(key)
+        );
+        assert!(!registry.is_archived(key));
+        assert!(registry.accounts(Some(&homes)).contains(&duplicate));
+        assert_eq!(registry.registered().len(), 1);
+    }
+
+    #[test]
+    fn archiving_requires_a_distinct_active_account_of_the_same_provider() {
+        let mut registry = Registry::default();
+        let registered = managed(Provider::Claude, "me@example.com");
+        let key = registered.key;
+        registry.register(registered, &[]).unwrap();
+        assert!(!registry.archive_duplicate(key, &Account::system(Provider::Codex)));
+        assert!(!registry.archive_duplicate(
+            key,
+            &Account::managed(Provider::Claude, key, PathBuf::new())
+        ));
+        assert!(!registry.archive_duplicate(
+            key,
+            &Account::managed(Provider::Claude, Uuid::new_v4(), PathBuf::new())
+        ));
+        assert!(registry.archive_duplicate(key, &Account::system(Provider::Claude)));
+        assert!(!registry.archive_duplicate(key, &Account::system(Provider::Claude)));
     }
 
     #[test]

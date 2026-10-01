@@ -214,7 +214,7 @@ impl State {
     /// they no longer name go, new ones join, and every account that stays
     /// keeps what is known about it.
     fn sync_accounts(&mut self) {
-        let mut wanted = self.registry.accounts(self.homes.as_ref());
+        let mut wanted = self.registry.all_accounts(self.homes.as_ref());
         wanted.extend(self.omp.accounts.iter().cloned());
         let mut previous: BTreeMap<AccountId, AccountState> = std::mem::take(&mut self.accounts)
             .into_iter()
@@ -364,11 +364,44 @@ impl State {
         None
     }
 
+    /// A current, unchanged login to retain when archiving a duplicate.
+    /// System homes are always kept; prefer them over other registered homes.
+    fn duplicate_to_keep(&self, account: &AccountState) -> Option<&AccountState> {
+        account.account.registry_key()?;
+        if matches!(
+            self.login_conflict(account),
+            Some(LoginConflict::Changed { .. })
+        ) {
+            return None;
+        }
+        let identity = account.identity.as_ref()?;
+        self.of(account.account.provider)
+            .filter(|other| {
+                other.id != account.id
+                    && !other.account.is_brokered()
+                    && other
+                        .identity
+                        .as_ref()
+                        .is_some_and(|known| identity.same_login(known))
+                    && !matches!(
+                        self.login_conflict(other),
+                        Some(LoginConflict::Changed { .. })
+                    )
+            })
+            .min_by_key(|other| !other.account.is_system())
+    }
+
     /// The accounts of `provider`, in list order.
     fn of(&self, provider: Provider) -> impl Iterator<Item = &AccountState> {
         self.accounts
             .iter()
             .filter(move |account| account.account.provider == provider)
+            .filter(|account| {
+                !account
+                    .account
+                    .registry_key()
+                    .is_some_and(|key| self.registry.is_archived(key))
+            })
     }
 
     /// Whether any account of `provider` other than `except` has a probe in
@@ -550,7 +583,7 @@ impl LoginConflict {
                 format!("This is the same provider home as {with}, so both rows are one login.")
             }
             Self::SameLogin { with } => format!(
-                "Signed in to the same login as {with}. Both draw on one allowance; sign one of them in to another login."
+                "Signed in to the same login as {with}. Both draw on one allowance. Use Archive duplicate in the extra home's menu to keep its files, or sign it in to another login."
             ),
         }
     }
@@ -628,6 +661,11 @@ impl AccountState {
         )
         .then(|| headline_window(snapshot))
         .flatten()
+    }
+
+    fn selection_window(&self) -> Option<&UsageWindow> {
+        self.headline()?;
+        selection_window(self.snapshot.as_ref()?)
     }
 }
 
@@ -807,6 +845,7 @@ pub enum Action {
     Remove(AccountId),
     RemoveConfirm(AccountId),
     RemoveCancel,
+    ArchiveDuplicate(AccountId),
     /// A removal finished: the registry as it now stands, where it was
     /// changed, and what went wrong, if anything.
     Removed {
@@ -844,6 +883,7 @@ impl Action {
                 | Self::RenameCommit
                 | Self::Remove(_)
                 | Self::RemoveConfirm(_)
+                | Self::ArchiveDuplicate(_)
                 | Self::Menu(Some(_))
                 | Self::AddMenu(true)
                 | Self::OwnCodexConfig(_)
@@ -1045,6 +1085,27 @@ fn headline_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
 }
 
 fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
+    chip_with_window(account, name, now, headline_window)
+}
+
+/// Account choices compare the same weekly allowance, regardless of which
+/// shorter window currently binds an individual account.
+fn selection_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
+    account::tightest(
+        snapshot
+            .windows
+            .iter()
+            .filter(|window| window.kind == account::WindowKind::Weekly),
+    )
+    .or_else(|| headline_window(snapshot))
+}
+
+fn chip_with_window(
+    account: &AccountState,
+    name: &str,
+    now: Millis,
+    window_of: fn(&UsageSnapshot) -> Option<&UsageWindow>,
+) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
             Some(failure) => Chip {
@@ -1082,7 +1143,7 @@ fn chip(account: &AccountState, name: &str, now: Millis) -> Chip {
                 .unwrap_or_else(|| format!("{name} reports no usage")),
         },
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
-            let Some(window) = headline_window(snapshot) else {
+            let Some(window) = window_of(snapshot) else {
                 return Chip {
                     text: "No limits".into(),
                     gauge: None,
@@ -1295,6 +1356,12 @@ impl Cagents {
             .accounts
             .iter()
             .filter(|state| !state.account.is_brokered())
+            .filter(|state| {
+                !state
+                    .account
+                    .registry_key()
+                    .is_some_and(|key| self.account_ui.registry.is_archived(key))
+            })
             .map(|state| crate::automation_ui::AccountChoice {
                 label: self.account_ui.display_name(state),
                 provider: state.account.provider,
@@ -1563,6 +1630,12 @@ impl Cagents {
         // Omp's accounts are asked about together, by reading its record.
         if account.is_brokered() {
             return self.read_omp(trigger, now);
+        }
+        if account
+            .registry_key()
+            .is_some_and(|key| self.account_ui.registry.is_archived(key))
+        {
+            return None;
         }
         let provider = account.provider;
         let busy = self.account_ui.provider_busy(provider, id, now);
@@ -2213,6 +2286,30 @@ impl Cagents {
                 Task::none()
             }
             Action::RemoveConfirm(id) => self.remove_account(id),
+            Action::ArchiveDuplicate(id) => {
+                let Some((key, retained)) = self.account_ui.account(&id).and_then(|account| {
+                    Some((
+                        account.account.registry_key()?,
+                        self.account_ui.duplicate_to_keep(account)?.account.clone(),
+                    ))
+                }) else {
+                    return Task::none();
+                };
+                self.account_ui.table.close_popups();
+                let expected = self.account_ui.registry.find(key).cloned();
+                let expected_retained = retained
+                    .registry_key()
+                    .and_then(|key| self.account_ui.registry.find(key))
+                    .cloned();
+                self.save_registry(move |registry| {
+                    if registry.find(key) == expected.as_ref()
+                        && retained.registry_key().and_then(|key| registry.find(key))
+                            == expected_retained.as_ref()
+                    {
+                        registry.archive_duplicate(key, &retained);
+                    }
+                })
+            }
             Action::Removed {
                 id,
                 registry,
@@ -2674,17 +2771,21 @@ impl Cagents {
                     Some(store) => store
                         .update(change)
                         .map_err(|error| error.to_string())
-                        .and_then(|(registry, result)| result.map(|()| registry)),
+                        .and_then(|(registry, result)| result.map(|key| (registry, key))),
                     None => {
                         let mut registry = fallback;
-                        change(&mut registry)?;
-                        Ok(registry)
+                        let key = change(&mut registry)?;
+                        Ok((registry, key))
                     }
                 }
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
+            let (key, result) = match result {
+                Ok((registry, key)) => (key, Ok(registry)),
+                Err(error) => (key, Err(error)),
+            };
             Message::AccountUi(Action::LinkReady { key, result })
         })
     }
@@ -3337,7 +3438,7 @@ impl Cagents {
                 if let Some(plan) = account.plan() {
                     detail.push(plan);
                 }
-                let headline = account.headline();
+                let headline = account.selection_window();
                 match (&account.snapshot, headline) {
                     (_, Some(window)) => {
                         detail.push(format!("{}% left", percent_left(window.used)))
@@ -3579,7 +3680,7 @@ impl Cagents {
             .map(|account| {
                 let selected = &account.id == shown;
                 let mut items: Vec<Element<'a, Message>> = Vec::new();
-                match account.headline() {
+                match account.selection_window() {
                     Some(window) => {
                         items.push(crate::ui_controls::budget_radial(window.used));
                     }
@@ -3600,9 +3701,11 @@ impl Cagents {
                         .into(),
                 );
                 items.push(
-                    design::caption(chip(account, account.name(), now).text)
-                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                        .into(),
+                    design::caption(
+                        chip_with_window(account, account.name(), now, selection_window).text,
+                    )
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                    .into(),
                 );
                 widget::button::custom(
                     widget::row::with_children(items)
@@ -4153,6 +4256,28 @@ mod tests {
             reset_countdown(&window(0.38, Some(reset)), NOW).as_deref(),
             Some("2h 14m")
         );
+    }
+
+    #[test]
+    fn account_choices_consistently_show_weekly_usage_and_reset() {
+        for (session_used, weekly_used, days) in [(0.03, 0.01, 2), (0.04, 0.09, 5)] {
+            let mut weekly = window(weekly_used, Some(unix_seconds(NOW) + days * 86400));
+            weekly.kind = WindowKind::Weekly;
+            weekly.label = "Weekly".into();
+            let account = state_with(Some(snapshot(
+                vec![window(session_used, Some(unix_seconds(NOW) + 3600)), weekly],
+                NOW,
+            )));
+            let summary = chip_with_window(&account, "Claude", NOW, selection_window);
+            assert_eq!(summary.gauge, Some(weekly_used));
+            assert!(
+                summary.text.ends_with(&format!("{days}d")),
+                "{}",
+                summary.text
+            );
+            assert!(summary.tooltip.contains("Weekly:"));
+            assert_eq!(account.selection_window().unwrap().kind, WindowKind::Weekly);
+        }
     }
 
     /// Claude marks one model's exhausted weekly allowance as the binding
@@ -5002,6 +5127,8 @@ mod app_tests {
             app.account_ui.login_conflict(state(1)),
             Some(LoginConflict::Changed { .. })
         ));
+        assert!(app.account_ui.duplicate_to_keep(state(0)).is_none());
+        assert!(app.account_ui.duplicate_to_keep(state(1)).is_none());
         assert_eq!(
             app.account_ui.login_conflict(state(0)),
             Some(LoginConflict::SameLogin {
@@ -5009,6 +5136,54 @@ mod app_tests {
             })
         );
         // The pane renders the flags without panicking.
+        let _ = app.accounts_pane();
+    }
+
+    #[test]
+    fn archiving_a_duplicate_keeps_existing_session_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let accounts = linked_logins(
+            &mut app,
+            directory.path(),
+            &["same@example.com", "same@example.com"],
+        );
+        for (_, id) in &accounts {
+            let _ = app.update(signed_in_as(id, "same@example.com"));
+        }
+        let (_, duplicate) = &accounts[1];
+        let home = app
+            .account_ui
+            .account(duplicate)
+            .unwrap()
+            .account
+            .resolved_home()
+            .unwrap();
+        let recipe = recipe_on(&app, duplicate);
+        let _ = app.update(Message::AccountUi(Action::ArchiveDuplicate(
+            duplicate.clone(),
+        )));
+        assert!(app.account_ui.registry.is_archived(accounts[1].0));
+        assert!(app.account_ui.account(duplicate).is_some());
+        assert_eq!(
+            app.account_ui
+                .of(Provider::Codex)
+                .filter(|state| !state.account.is_system())
+                .count(),
+            1
+        );
+        assert!(home.is_dir());
+        assert_eq!(
+            app.chat_account(Provider::Codex, &recipe).as_ref(),
+            Some(duplicate)
+        );
+        assert!(
+            !app.automation_account_choices()
+                .iter()
+                .any(|choice| &choice.id == duplicate)
+        );
+        let retained = app.account_ui.account(&accounts[0].1).unwrap();
+        assert_eq!(app.account_ui.login_conflict(retained), None);
         let _ = app.accounts_pane();
     }
 
