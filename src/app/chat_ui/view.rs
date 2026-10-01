@@ -1567,7 +1567,7 @@ impl Runtime {
         let mut actions = Vec::new();
         if snapshot.capabilities.branch {
             actions.push(icon(
-                "view-branch-symbolic",
+                "git-branch-symbolic",
                 "Branch conversation history",
                 available && !snapshot.busy,
                 Action::BranchPicker(target, !self.branch_picker),

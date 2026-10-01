@@ -3154,7 +3154,7 @@ print(json.dumps({"type": "ready"}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     command = request["type"]
-    if command not in ("negotiate_protocol", "get_state", "get_available_models", "get_available_commands", "get_session_stats", "get_messages_page"):
+    if command not in ("negotiate_protocol", "get_state", "get_available_models", "get_available_commands", "get_session_stats", "get_messages_page", "get_subagents", "set_subagent_subscription"):
         sys.exit(7)
     data = {"sessionId": os.environ.get("REPORTED_SESSION", identity), "messages": []}
     print(json.dumps({"type": "response", "id": request["id"], "command": command, "success": True, "data": data}), flush=True)

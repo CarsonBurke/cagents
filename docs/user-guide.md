@@ -539,14 +539,17 @@ be replaced through the plain text editor.
 The branch control opens a separate Codex conversation, either from the whole
 thread or after a completed turn. OMP branches before the selected user message
 and restores that message as an editable draft in the branched conversation.
-Its steering control switches between immediate interruption and waiting for
-the current tool boundary, using OMP's own interrupt mode.
+Its steering control chooses delivery between tool calls or after the current
+turn completes, using OMP's own interrupt mode.
 
 Child agent tabs show isolated transcripts and lifecycle status for all three
 providers. Codex child approvals remain explicit and are labeled as child
 requests. OMP child activity is read-only: its installed RPC API has no child
 messaging, stop, or restart command. Large optional child histories are omitted
 without disconnecting the parent, while live activity remains available.
+
+See [native chat provider parity](native-chat-parity.md) for the supported
+operations and remaining provider-specific differences.
 
 ### Account credential isolation
 

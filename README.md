@@ -61,7 +61,8 @@ cagents ui
 Add a repository from the **Projects** pane, select a worktree, and press
 `Ctrl+Shift+T` for a terminal. Start your agent there, or use **New tab → New
 thread** for a native chat. Use **New tab → Resume conversation** to search saved
-native chats, including closed conversations from previous runs. Move between panes with `Ctrl+PageUp` and
+native chats and configured provider history, including closed conversations from
+previous runs. Move between panes with `Ctrl+PageUp` and
 `Ctrl+PageDown`, and resize the focused pane with `Alt+R`. The
 [user guide](docs/user-guide.md#navigation) lists every shortcut.
 

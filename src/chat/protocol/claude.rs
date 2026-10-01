@@ -1649,8 +1649,9 @@ impl Adapter for Claude {
                     },
                     &mut step,
                 );
-                self.streams.clear();
-                self.blocks.clear();
+                if let Some(stream) = self.streams.remove("") {
+                    self.settle(&stream.message);
+                }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
                 if let Some(tokens) = frame["usage"]["input_tokens"].as_u64() {
@@ -4932,6 +4933,32 @@ mod tests {
         assert!(delta.events.iter().any(
             |e| matches!(e, Event::TextDelta { id, delta, .. } if id == "main:0" && delta == "Done")
         ));
+    }
+
+    #[test]
+    fn a_parent_result_preserves_background_child_streams() {
+        let mut adapter = Claude::default();
+        let child = |event: Value| json!({"type":"stream_event", "parent_tool_use_id":"child", "event":event});
+        adapter
+            .receive(child(
+                json!({"type":"message_start","message":{"id":"child-message"}}),
+            ))
+            .unwrap();
+        adapter.receive(child(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))).unwrap();
+        adapter
+            .receive(json!({"type":"result","uuid":"parent-result","is_error":false}))
+            .unwrap();
+        let delta = adapter.receive(child(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"still working"}}))).unwrap();
+        assert!(delta.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child" && delta == "still working")));
+        adapter
+            .receive(child(json!({"type":"content_block_stop","index":0})))
+            .unwrap();
+        adapter
+            .receive(child(json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(adapter.streams.is_empty());
+        assert!(adapter.blocks.is_empty());
+        assert!(!adapter.busy);
     }
 
     /// Claude Code closes a message it abandons mid-stream, but a message

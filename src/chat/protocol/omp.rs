@@ -798,10 +798,11 @@ impl Adapter for Omp {
                     // Chunk zero contains the response envelope before its data.
                     // Authenticate that request ID before discarding an optional
                     // transcript; mandatory parent replies still fail normally.
-                    let envelope = std::str::from_utf8(&decoded)
-                        .ok()
-                        .and_then(|text| text.split_once("\"data\":"))
-                        .and_then(|(prefix, _)| {
+                    let envelope = decoded
+                        .windows(b"\"data\":".len())
+                        .position(|bytes| bytes == b"\"data\":")
+                        .and_then(|end| std::str::from_utf8(&decoded[..end]).ok())
+                        .and_then(|prefix| {
                             serde_json::from_str::<Value>(&format!("{prefix}\"data\":null}}")).ok()
                         });
                     if let Some(envelope) = envelope
@@ -1625,6 +1626,9 @@ mod tests {
         let prefix = format!(
             "{{\"type\":\"response\",\"id\":\"{request_id}\",\"command\":\"get_subagent_messages\",\"success\":true,\"data\":{{"
         );
+        // Chunks can end midway through a UTF-8 code point in the data body.
+        let mut prefix = prefix.into_bytes();
+        prefix.extend_from_slice(&[b'"', 0xe2, 0x82]);
         let dropped = adapter.receive(json!({"type":"rpc_chunk","chunkId":"large","index":0,"count":2,"byteLength":MAX_PAYLOAD+1,"data":STANDARD.encode(prefix)})).unwrap();
         assert!(
             dropped

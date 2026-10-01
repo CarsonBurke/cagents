@@ -330,6 +330,9 @@ impl Cagents {
                 match result {
                     Ok(session) => {
                         entry.session = session;
+                        if self.existing_conversation_card(&entry.session).is_some() {
+                            return self.resume_saved_conversation(entry);
+                        }
                         self.insert_resumed_conversation(entry)
                     }
                     Err(error) => {
@@ -634,6 +637,45 @@ mod tests {
         let before = app.durable.cards.len();
         let _ = app.resume_saved_conversation(entry);
         assert_eq!(app.durable.cards.len(), before);
+    }
+
+    #[test]
+    fn cancelling_resume_ignores_late_preparation_and_allows_another_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = saved(directory.path());
+        app.resume_ui.open = true;
+        app.resume_ui.loading = true;
+        app.resume_ui.generation = 7;
+        let _ = app.update_resume(Action::Close);
+        assert!(!app.resume_ui.loading);
+        let _ = app.update_resume(Action::Prepared(
+            7,
+            entry.clone(),
+            Ok(entry.session.clone()),
+        ));
+        assert!(app.durable.cards.is_empty());
+        let _ = app.resume_saved_conversation(entry);
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn preparation_rechecks_a_conversation_opened_while_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = saved(directory.path());
+        let _ = app.resume_saved_conversation(entry.clone());
+        let card = app.workspace.focused();
+        app.resume_ui.loading = true;
+        let generation = app.resume_ui.generation;
+        let _ = app.update_resume(Action::Prepared(
+            generation,
+            entry.clone(),
+            Ok(entry.session),
+        ));
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), card);
+        assert!(!app.resume_ui.loading);
     }
 
     #[test]

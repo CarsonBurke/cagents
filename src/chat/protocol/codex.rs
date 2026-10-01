@@ -969,8 +969,6 @@ impl Codex {
                 }
             }
         }
-        step.events
-            .push(Event::BranchPoints(self.branch_points.clone()));
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
         // a failed decode must preserve the cursor the reader can retry.
@@ -989,6 +987,8 @@ impl Codex {
                 has_earlier: self.cursor.is_some(),
             }
         });
+        step.events
+            .push(Event::BranchPoints(self.branch_points.clone()));
         Ok(())
     }
     fn input(&self, text: String, attachments: Vec<Attachment>) -> Result<Vec<Value>, String> {
@@ -1481,6 +1481,16 @@ impl Adapter for Codex {
                     let content = child.receive(response)?;
                     self.child_step(id, content, &mut step)?;
                 }
+                if self
+                    .children
+                    .get(id)
+                    .is_some_and(|child| !child.history_loading)
+                {
+                    for buffered in self.child_buffer.remove(id).unwrap_or_default() {
+                        let content = self.children.get_mut(id).unwrap().receive(buffered)?;
+                        self.child_step(id, content, &mut step)?;
+                    }
+                }
                 return Ok(step);
             }
             if matches!(pending, Pending::History { .. }) {
@@ -1501,7 +1511,9 @@ impl Adapter for Codex {
                     });
                     return Ok(step);
                 }
-                if matches!(pending, Pending::ChildList) { return Ok(step); }
+                if matches!(pending, Pending::ChildList) {
+                    return Ok(step);
+                }
                 if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
                     self.queue_available = false;
                     self.queue_listing.clear();
@@ -1880,10 +1892,36 @@ impl Adapter for Codex {
                     step.events.push(Event::Forked(id.into()));
                 }
                 Pending::ChildList => {
-                    for thread in result["data"].as_array().into_iter().flatten().take(32) {
-                        if let Some(id) = thread["id"].as_str() {
-                            self.discover_child(id, thread, &mut step)?;
+                    let mut remaining = result["data"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(32)
+                        .collect::<Vec<_>>();
+                    while !remaining.is_empty() {
+                        let before = remaining.len();
+                        let mut deferred = Vec::new();
+                        for thread in remaining {
+                            // Older servers can ignore an unknown list filter.
+                            // Require explicit lineage before subscribing or routing
+                            // approvals from an account-wide result.
+                            let Some(parent) = thread["parentThreadId"].as_str() else {
+                                continue;
+                            };
+                            if self.thread.as_deref() != Some(parent)
+                                && !self.children.contains_key(parent)
+                            {
+                                deferred.push(thread);
+                                continue;
+                            }
+                            if let Some(id) = thread["id"].as_str() {
+                                self.discover_child(id, thread, &mut step)?;
+                            }
                         }
+                        if deferred.len() == before {
+                            break;
+                        }
+                        remaining = deferred;
                     }
                 }
                 Pending::ChildResume(id) => {
@@ -1898,8 +1936,9 @@ impl Adapter for Codex {
                         let mut content = Step::default();
                         child.thread_state(&result["thread"], &mut content)?;
                         child.ready = true;
+                        child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
-                            child.page(&result["initialTurnsPage"], &mut content)?;
+                            child.page(&result["initialTurnsPage"], &mut content, false)?;
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
                                 for value in turn["items"].as_array().into_iter().flatten() {
@@ -1908,10 +1947,25 @@ impl Adapter for Codex {
                                     }
                                 }
                             }
+                            if result["thread"]["turns"]
+                                .as_array()
+                                .is_none_or(Vec::is_empty)
+                            {
+                                child.history(&mut content, None)?;
+                            }
                         }
                         self.child_step(&id, content, &mut step)?;
                     }
-                    for frame in self.child_buffer.remove(&id).unwrap_or_default() {
+                    let buffered = if self
+                        .children
+                        .get(&id)
+                        .is_some_and(|child| child.history_loading)
+                    {
+                        Vec::new()
+                    } else {
+                        self.child_buffer.remove(&id).unwrap_or_default()
+                    };
+                    for frame in buffered {
                         if let Some(child) = self.children.get_mut(&id) {
                             let content = child.receive(frame)?;
                             self.child_step(&id, content, &mut step)?;
@@ -3434,6 +3488,80 @@ mod tests {
         assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "child-exact")));
         let foreign = adapter.receive(json!({"method":"turn/started","params":{"threadId":"unrelated","turn":{"id":"bad","items":[]}}})).unwrap();
         assert!(foreign.events.is_empty());
+    }
+
+    #[test]
+    fn child_listing_recovers_newest_first_descendants_without_trusting_foreign_threads() {
+        let mut adapter = adapter();
+        let mut request = Step::default();
+        adapter
+            .call(&mut request, "thread/list", json!({}), Pending::ChildList)
+            .unwrap();
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":[
+                {"id":"grandchild","parentThreadId":"child","status":{"type":"idle"}},
+                {"id":"foreign","parentThreadId":"another-root"},
+                {"id":"child","parentThreadId":"thread-exact","status":{"type":"idle"}}
+            ]}}))
+            .unwrap();
+        assert!(adapter.children.contains_key("child"));
+        assert!(adapter.children.contains_key("grandchild"));
+        assert!(!adapter.children.contains_key("foreign"));
+    }
+
+    #[test]
+    fn child_resume_without_embedded_turns_reads_history_and_settles_idle() {
+        let mut adapter = adapter();
+        let mut discovered = Step::default();
+        adapter
+            .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+            .unwrap();
+        adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"child-exact","turnId":"turn","itemId":"answer","delta":" tail"}})).unwrap();
+        let resumed = adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"idle"},"turns":[]}}})).unwrap();
+        assert!(resumed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "child-exact")));
+        assert_eq!(resumed.writes[0]["method"], "thread/turns/list");
+        assert!(adapter.child_buffer.contains_key("child-exact"));
+        let history = adapter.receive(json!({"id":resumed.writes[0]["id"],"result":{"data":[{"id":"turn","status":"completed","items":[{"id":"answer","type":"agentMessage","text":"head"}]}],"nextCursor":null}})).unwrap();
+        assert!(
+            history.events.iter().any(
+                |event| matches!(event, Event::SubagentItem { id, .. } if id == "child-exact")
+            )
+        );
+        assert!(!adapter.child_buffer.contains_key("child-exact"));
+    }
+
+    #[test]
+    fn child_approvals_resolve_in_parent_and_failed_turns_keep_their_outcome() {
+        let mut adapter = adapter();
+        let mut discovered = Step::default();
+        adapter
+            .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+            .unwrap();
+        adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        let approval = |id| json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"threadId":"child-exact","turnId":"turn","itemId":"tool","availableDecisions":["accept","decline"],"command":"echo requested"}});
+        let requested = adapter.receive(approval(71)).unwrap();
+        assert!(requested.events.iter().any(|event| matches!(event, Event::Request(request) if request.title.starts_with("Child agent"))));
+        let resolved = adapter.receive(json!({"method":"serverRequest/resolved","params":{"threadId":"child-exact","requestId":71}})).unwrap();
+        assert!(
+            resolved
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::RequestResolved { id } if id == "71"))
+        );
+        assert!(adapter.requests.is_empty());
+        let failed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"turn","status":"failed","error":{"message":"fixture"},"items":[]}}})).unwrap();
+        assert!(failed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Failed), .. } if id == "child-exact")));
+        adapter.receive(approval(72)).unwrap();
+        let closed = adapter
+            .receive(json!({"method":"thread/closed","params":{"threadId":"child-exact"}}))
+            .unwrap();
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::RequestResolved { id } if id == "72"))
+        );
+        assert!(adapter.requests.is_empty());
     }
 
     #[test]

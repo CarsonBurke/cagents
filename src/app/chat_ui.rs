@@ -1151,6 +1151,7 @@ pub(super) struct Runtime {
     queued: Option<Queued>,
     followup: Option<(String, Vec<Attachment>)>,
     queue_edit: Option<(String, String)>,
+    queue_edit_submitted: Option<(String, String)>,
     branch_picker: bool,
     fork_requested: bool,
     fork_seen: Option<String>,
@@ -1496,6 +1497,7 @@ impl Runtime {
             queued: None,
             followup: None,
             queue_edit: None,
+            queue_edit_submitted: None,
             branch_picker: false,
             fork_requested: false,
             fork_seen: None,
@@ -1671,9 +1673,14 @@ impl Runtime {
                 .queued_messages
                 .iter()
                 .find(|message| &message.id == id)
-                .is_none_or(|message| !message.editable || &message.text == text)
+                .is_none_or(|message| {
+                    !message.editable
+                        || (self.queue_edit_submitted.as_ref() == self.queue_edit.as_ref()
+                            && &message.text == text)
+                })
         }) {
             self.queue_edit = None;
+            self.queue_edit_submitted = None;
         }
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
@@ -4481,6 +4488,9 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
+        if let Command::UpdateQueued { id, text } = &command {
+            runtime.queue_edit_submitted = Some((id.clone(), text.clone()));
+        }
         runtime.pending = Some(PendingCommand {
             followup: false,
             id,
@@ -5692,6 +5702,7 @@ impl Cagents {
             }
             Action::EditQueue(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.queue_edit_submitted = None;
                     runtime.queue_edit = id.and_then(|id| {
                         runtime
                             .snapshot
@@ -5707,6 +5718,7 @@ impl Cagents {
                     && let Some((_, draft)) = &mut runtime.queue_edit
                 {
                     *draft = text;
+                    runtime.queue_edit_submitted = None;
                 }
             }
             Action::SaveQueue(target) => {
@@ -5888,6 +5900,7 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
+                        runtime.queue_edit_submitted = None;
                         if pending.followup {
                             runtime.restore_followup();
                         }
@@ -7161,6 +7174,41 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         runtime.refresh();
         (card, target, handle)
+    }
+
+    #[test]
+    fn queue_editor_survives_streaming_until_its_save_is_confirmed() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let queued = chat::QueuedMessage {
+            id: "queued".into(),
+            text: "original".into(),
+            editable: true,
+        };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages = vec![queued];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let _ = app.handle_chat_ui(Action::EditQueue(target, Some("queued".into())));
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_eq!(
+            chat_runtime(&app, card).queue_edit.as_ref().unwrap().1,
+            "original"
+        );
+        let _ = app.handle_chat_ui(Action::QueueText(target, "edited".into()));
+        let _ = app.handle_chat_ui(Action::SaveQueue(target));
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).queue_edit.is_some());
+        snapshot.queued_messages[0].text = "edited".into();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).queue_edit.is_none());
     }
 
     #[test]
