@@ -213,7 +213,7 @@ pub enum Action {
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history.
-    Scrolled(Target, view::Scroll),
+    Scrolled(Target, Option<String>, view::Scroll, bool),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
@@ -295,7 +295,7 @@ impl Action {
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
             | Self::Complete(target, _, _)
-            | Self::Scrolled(target, _)
+            | Self::Scrolled(target, _, _, _)
             | Self::ModelPicker(target, _)
             | Self::ModelQuery(target, _) => Some(*target),
             _ => None,
@@ -1038,6 +1038,13 @@ fn snapshot_channel_name(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryNavigation {
+    EarlierEdge,
+    EarlierExplicit,
+    Latest,
+}
+
 struct PendingCommand {
     followup: bool,
     id: u64,
@@ -1205,6 +1212,9 @@ pub(super) struct Runtime {
     history_stash: Option<text_editor::Content<cosmic::Renderer>>,
     /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
+    subagent_scroll: HashMap<String, view::Scroll>,
+    page_request: Option<(view::Page, u64)>,
+    deferred_page: Option<HistoryNavigation>,
     unseen_activity: bool,
     /// The loaded transcript's height when a page of history was last asked
     /// for from that end, and `None` while the reader is not at that end.
@@ -1501,6 +1511,9 @@ impl Runtime {
             history_cursor: None,
             history_stash: None,
             scroll: view::Scroll::default(),
+            subagent_scroll: HashMap::new(),
+            page_request: None,
+            deferred_page: None,
             unseen_activity: false,
             earlier_asked: None,
             later_asked: None,
@@ -1516,6 +1529,10 @@ impl Runtime {
         self.cache.clear();
         self.turns.clear();
         self.selected_subagent = None;
+        self.subagent_scroll.clear();
+        self.page_request = None;
+        self.deferred_page = None;
+        self.scroll = view::Scroll::default();
         self.asked_after.clear();
         self.asked.clear();
         self.opened.clear();
@@ -1591,6 +1608,12 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    fn active_scroll(&self) -> view::Scroll {
+        match self.selected_subagent.as_ref() {
+            Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
+            None => self.scroll,
+        }
+    }
     fn refresh(&mut self) {
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
@@ -1600,10 +1623,23 @@ impl Runtime {
             return;
         };
         let mut snapshot = handle.snapshot();
+        if self.page_request.is_some_and(|(_, generation)| {
+            snapshot.generation > generation && !snapshot.history_loading
+        }) && self
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.page.is_none())
+        {
+            self.page_request = None;
+            self.earlier_asked = None;
+            self.later_asked = None;
+        }
         if self.snapshot.generation == snapshot.generation && Arc::ptr_eq(&self.snapshot, &snapshot)
         {
             return;
         }
+        self.subagent_scroll
+            .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
@@ -1611,6 +1647,9 @@ impl Runtime {
                 });
         }
         if !self.scroll.at_bottom()
+            && !snapshot.has_later
+            && self.page_request.is_none()
+            && !snapshot.history_loading
             && snapshot.items.last().is_some_and(|item| {
                 self.cache
                     .get(&item.id)
@@ -2916,7 +2955,7 @@ impl Cagents {
                     id,
                     iced::widget::scrollable::AbsoluteOffset {
                         x: 0.0,
-                        y: runtime.scroll.page_height()
+                        y: runtime.active_scroll().page_height()
                             * if *key == Named::PageUp { 1.0 } else { -1.0 },
                     },
                 )
@@ -4274,6 +4313,36 @@ impl Cagents {
         self.revert_chat_draft(target, None)
     }
 
+    fn resume_history_navigation(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if runtime.pending.is_some()
+            || runtime.queued.is_some()
+            || runtime.disconnected
+            || runtime.selected_subagent.is_some()
+        {
+            return Task::none();
+        }
+        let Some(page) = runtime.deferred_page.take() else {
+            return Task::none();
+        };
+        match page {
+            HistoryNavigation::Latest => self.handle_chat_action(Action::Latest(target)),
+            HistoryNavigation::EarlierExplicit if runtime.snapshot.has_earlier => {
+                self.chat_send(target, Command::LoadEarlier, false)
+            }
+            HistoryNavigation::EarlierEdge
+                if runtime.scroll.at_top()
+                    && !runtime.scroll.at_bottom()
+                    && runtime.snapshot.has_earlier =>
+            {
+                self.chat_send(target, Command::LoadEarlier, false)
+            }
+            _ => Task::none(),
+        }
+    }
+
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
         self.chat_send_step(target, command, clear_draft, None)
     }
@@ -4317,6 +4386,14 @@ impl Cagents {
         } else {
             None
         };
+        if command == Command::LoadEarlier
+            && (runtime.selected_subagent.is_some()
+                || !runtime.snapshot.has_earlier
+                || runtime.snapshot.history_loading
+                || runtime.page_request.is_some())
+        {
+            return Task::none();
+        }
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
         let page = match &command {
@@ -4324,6 +4401,13 @@ impl Cagents {
             Command::Refresh => Some(view::Page::Newer),
             _ => None,
         };
+        if let Some(page) = page {
+            runtime.page_request = Some((page, runtime.snapshot.generation));
+            match page {
+                view::Page::Earlier => runtime.earlier_asked = Some(runtime.scroll.content()),
+                view::Page::Newer => runtime.later_asked = Some(runtime.scroll.content()),
+            }
+        }
         let first_prompt = match &command {
             Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
             _ => None,
@@ -4814,6 +4898,12 @@ impl Cagents {
                             runtime.session = session.clone();
                             runtime.disconnected = false;
                             runtime.pending = None;
+                            // Request generations belong to the old handle. A
+                            // restarted daemon can begin again at generation 1.
+                            runtime.page_request = None;
+                            runtime.deferred_page = None;
+                            runtime.earlier_asked = None;
+                            runtime.later_asked = None;
                             runtime.error = None;
                             runtime.show(visible);
                         } else {
@@ -5143,6 +5233,7 @@ impl Cagents {
                         return Task::batch([
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
+                            self.resume_history_navigation(target),
                         ]);
                     }
                     Wake::Observed => {
@@ -5520,7 +5611,25 @@ impl Cagents {
                     runtime.recall(false);
                 }
             }
-            Action::Command(target, command) => return self.chat_send(target, command, false),
+            Action::Command(target, command) => {
+                if command == Command::LoadEarlier {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        if runtime.selected_subagent.is_some() {
+                            return Task::none();
+                        }
+                        if runtime
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.page.is_none())
+                            && runtime.deferred_page != Some(HistoryNavigation::Latest)
+                        {
+                            runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
+                            return Task::none();
+                        }
+                    }
+                }
+                return self.chat_send(target, command, false);
+            }
             Action::CommandFinished(target, id, result) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -5561,7 +5670,14 @@ impl Cagents {
                             runtime.answers.retain(|(id, _), _| id != &request);
                         }
                         runtime.refresh();
-                        if pending.page == Some(view::Page::Newer) {
+                        if pending.page == Some(view::Page::Newer)
+                            && runtime.deferred_page == Some(HistoryNavigation::Latest)
+                        {
+                            runtime.deferred_page = None;
+                        }
+                        if pending.page == Some(view::Page::Newer)
+                            && runtime.selected_subagent.is_none()
+                        {
                             return iced::widget::scrollable::snap_to(
                                 card_control_id(target.card, "chat-transcript"),
                                 iced::widget::scrollable::RelativeOffset {
@@ -5574,6 +5690,11 @@ impl Cagents {
                         pending.first_prompt
                     }
                     Err(error) => {
+                        if pending.page.is_some() {
+                            runtime.page_request = None;
+                            runtime.earlier_asked = None;
+                            runtime.later_asked = None;
+                        }
                         if pending.followup
                             && let Some((text, attachments)) = runtime.followup.take()
                         {
@@ -5592,6 +5713,7 @@ impl Cagents {
                 if let Some(prompt) = first_prompt {
                     self.name_channel_from_prompt(target.card, &prompt);
                 }
+                return self.resume_history_navigation(target);
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -5646,13 +5768,7 @@ impl Cagents {
                             .iter()
                             .any(|agent| &agent.id == id)
                     });
-                    return iced::widget::scrollable::snap_to(
-                        card_control_id(target.card, "chat-transcript"),
-                        iced::widget::scrollable::RelativeOffset {
-                            x: None,
-                            y: Some(1.0),
-                        },
-                    );
+                    runtime.deferred_page = None;
                 }
             }
             Action::Copy(target, id, part) => {
@@ -5754,9 +5870,26 @@ impl Cagents {
             }
             Action::Latest(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.unseen_activity = false;
-                    if runtime.snapshot.has_later {
-                        return self.chat_send(target, Command::Refresh, false);
+                    if runtime.selected_subagent.is_none() {
+                        if runtime.pending.is_some() {
+                            if !runtime
+                                .pending
+                                .as_ref()
+                                .is_some_and(|pending| pending.page == Some(view::Page::Newer))
+                            {
+                                runtime.deferred_page = Some(HistoryNavigation::Latest);
+                            }
+                            return Task::none();
+                        }
+                        if runtime.snapshot.has_later
+                            || runtime.snapshot.history_loading
+                            || runtime
+                                .page_request
+                                .is_some_and(|(page, _)| page == view::Page::Earlier)
+                        {
+                            return self.chat_send(target, Command::Refresh, false);
+                        }
+                        runtime.unseen_activity = false;
                     }
                 }
                 return iced::widget::scrollable::snap_to(
@@ -6266,14 +6399,17 @@ impl Cagents {
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
             }
-            Action::Scrolled(target, scroll) => {
+            Action::Scrolled(target, subagent, scroll, user_input) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if runtime.selected_subagent.is_some() {
+                if runtime.selected_subagent != subagent {
                     return Task::none();
                 }
-                let same_geometry = runtime.scroll.same_geometry(scroll);
+                if let Some(id) = subagent {
+                    runtime.subagent_scroll.insert(id, scroll);
+                    return Task::none();
+                }
                 runtime.scroll = scroll;
                 let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
                 if at_bottom {
@@ -6283,6 +6419,9 @@ impl Cagents {
                 // scrolls away and comes back asks again, while one who stays
                 // put asks once.
                 if !at_top {
+                    if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
+                        runtime.deferred_page = None;
+                    }
                     runtime.earlier_asked = None;
                 }
                 if !at_bottom {
@@ -6291,22 +6430,37 @@ impl Cagents {
                 let height = Some(scroll.content());
                 // A short page has no scroll direction. Its explicit history
                 // controls choose the end without triggering a paging loop.
-                if same_geometry
+                if user_input
                     && at_top
                     && !at_bottom
                     && runtime.snapshot.has_earlier
                     && runtime.earlier_asked != height
                 {
-                    runtime.earlier_asked = height;
+                    if runtime.pending.is_some() {
+                        if runtime
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.page.is_none())
+                            && runtime
+                                .deferred_page
+                                .is_none_or(|page| page == HistoryNavigation::EarlierEdge)
+                        {
+                            runtime.deferred_page = Some(HistoryNavigation::EarlierEdge);
+                        }
+                        return Task::none();
+                    }
                     return self.chat_send(target, Command::LoadEarlier, false);
                 }
-                if same_geometry
+                if user_input
                     && at_bottom
                     && !at_top
                     && runtime.snapshot.has_later
                     && runtime.later_asked != height
                 {
-                    runtime.later_asked = height;
+                    if runtime.pending.is_some() {
+                        runtime.deferred_page = Some(HistoryNavigation::Latest);
+                        return Task::none();
+                    }
                     return self.chat_send(target, Command::Refresh, false);
                 }
             }
@@ -6595,6 +6749,301 @@ mod tests {
             chat_runtime(&app, card).pending.as_ref().unwrap().page,
             Some(view::Page::Newer)
         );
+    }
+
+    fn history_fixture(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
+        let card = live_chat(app, Some(KNOWN_THREAD));
+        let runtime = app
+            .chat_runtime_mut(chat_runtime(app, card).target)
+            .unwrap();
+        runtime.show(true);
+        let target = runtime.target;
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.has_earlier = true;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        (card, target, handle)
+    }
+
+    #[test]
+    fn history_reconnect_discards_old_request_generation_and_navigation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.page_request = Some((view::Page::Earlier, 100));
+        runtime.deferred_page = Some(HistoryNavigation::Latest);
+        runtime.earlier_asked = Some(1000.0);
+        runtime.later_asked = Some(1000.0);
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let reconnect = app.chat_ui.attempt(card).unwrap().target;
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation = 1;
+        snapshot.has_earlier = true;
+        handle.publish_snapshot_for_test(snapshot);
+        answer_start(&mut app, reconnect, Ok(handle));
+        let runtime = app.chat_runtime_mut(reconnect).unwrap();
+        runtime.show(true);
+        runtime.refresh();
+        assert!(runtime.page_request.is_none());
+        assert!(runtime.deferred_page.is_none());
+        assert!(runtime.earlier_asked.is_none());
+        assert!(runtime.later_asked.is_none());
+        drop(app.handle_chat_ui(Action::Command(reconnect, Command::LoadEarlier)));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier)
+        );
+    }
+
+    #[test]
+    fn history_loading_outlives_ack_and_releases_on_provider_response() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.history_loading = true;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        settle(&mut app, card, Ok(()));
+        assert_eq!(
+            chat_runtime(&app, card).page_request.map(|(page, _)| page),
+            Some(view::Page::Earlier)
+        );
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        assert!(
+            chat_runtime(&app, card).pending.is_none(),
+            "duplicate request is suppressed after command ACK"
+        );
+        snapshot.generation += 1;
+        snapshot.history_loading = false;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).page_request.is_none());
+    }
+
+    #[test]
+    fn history_cached_response_before_ack_does_not_latch_loading_forever() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).page_request.is_some());
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).page_request.is_none());
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier)
+        );
+    }
+
+    #[test]
+    fn history_edge_and_short_page_click_wait_for_unrelated_command() {
+        for explicit in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, _) = history_fixture(&mut app);
+            let scroll = view::Scroll::new(0.0, if explicit { 200.0 } else { 1000.0 }, 400.0);
+            app.chat_runtime_mut(target).unwrap().scroll = scroll;
+            drop(app.chat_send(
+                target,
+                Command::SetPermissionMode {
+                    mode: "manual".into(),
+                },
+                false,
+            ));
+            drop(app.handle_chat_ui(if explicit {
+                Action::Command(target, Command::LoadEarlier)
+            } else {
+                Action::Scrolled(target, None, scroll, true)
+            }));
+            assert_eq!(
+                chat_runtime(&app, card).deferred_page,
+                Some(if explicit {
+                    HistoryNavigation::EarlierExplicit
+                } else {
+                    HistoryNavigation::EarlierEdge
+                })
+            );
+            assert!(chat_runtime(&app, card).earlier_asked.is_none());
+            settle(&mut app, card, Ok(()));
+            assert_eq!(
+                chat_runtime(&app, card).pending.as_ref().unwrap().page,
+                Some(view::Page::Earlier)
+            );
+        }
+    }
+
+    #[test]
+    fn history_explicit_navigation_survives_wheeling_away_from_the_edge() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        drop(app.chat_send(
+            target,
+            Command::SetPermissionMode {
+                mode: "manual".into(),
+            },
+            false,
+        ));
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(0.0, 1000.0, 400.0),
+            true,
+        )));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(200.0, 1000.0, 400.0),
+            true,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).deferred_page,
+            Some(HistoryNavigation::EarlierExplicit)
+        );
+        settle(&mut app, card, Ok(()));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier)
+        );
+    }
+
+    #[test]
+    fn history_failure_can_retry_without_leaving_the_boundary() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let scroll = view::Scroll::new(0.0, 1000.0, 400.0);
+        app.chat_runtime_mut(target).unwrap().scroll = scroll;
+        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        settle(&mut app, card, Err("temporary history failure".into()));
+        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier)
+        );
+    }
+
+    #[test]
+    fn history_provider_failure_can_retry_at_the_same_edge_after_ack() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let scroll = view::Scroll::new(0.0, 1000.0, 400.0);
+        app.chat_runtime_mut(target).unwrap().scroll = scroll;
+        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.history_loading = true;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        settle(&mut app, card, Ok(()));
+        snapshot.generation += 1;
+        snapshot.history_loading = false;
+        snapshot.error = Some("temporary provider error".into());
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, true)));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier)
+        );
+    }
+
+    #[test]
+    fn history_geometry_changes_never_trigger_paging_even_when_page_heights_match() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
+        for scroll in [
+            view::Scroll::new(0.0, 1000.0, 400.0),
+            view::Scroll::new(600.0, 1000.0, 400.0),
+            view::Scroll::new(0.0, 100.0, 400.0),
+        ] {
+            drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, false)));
+            assert!(chat_runtime(&app, card).pending.is_none());
+        }
+    }
+
+    #[test]
+    fn history_repeated_latest_is_fulfilled_by_the_pending_refresh() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.has_later = true;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        snapshot.generation += 1;
+        snapshot.has_later = false;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        settle(&mut app, card, Ok(()));
+        assert!(chat_runtime(&app, card).deferred_page.is_none());
+        assert!(chat_runtime(&app, card).page_request.is_none());
+        drop(app.chat_send(
+            target,
+            Command::SetPermissionMode {
+                mode: "manual".into(),
+            },
+            false,
+        ));
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        assert_eq!(
+            chat_runtime(&app, card).deferred_page,
+            Some(HistoryNavigation::EarlierExplicit)
+        );
+    }
+
+    #[test]
+    fn history_latest_cancels_earlier_even_before_historical_page_arrives() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.history_loading = true;
+        assert!(!snapshot.has_later);
+        handle.publish_snapshot_for_test(snapshot);
+        settle(&mut app, card, Ok(()));
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Newer)
+        );
+    }
+
+    #[test]
+    fn history_subagent_scroll_and_latest_never_page_parent() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = history_fixture(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.selected_subagent = Some("child".into());
+        Arc::make_mut(&mut runtime.snapshot).has_later = true;
+        let parent = view::Scroll::new(500.0, 1000.0, 400.0);
+        runtime.scroll = parent;
+        assert_eq!(runtime.active_scroll(), view::Scroll::default());
+        let child = view::Scroll::new(0.0, 200.0, 400.0);
+        drop(app.handle_chat_ui(Action::Scrolled(target, Some("child".into()), child, true)));
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            view::Scroll::new(0.0, 1000.0, 400.0),
+            false,
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).scroll,
+            parent,
+            "queued parent measurement is stale after tab switch"
+        );
+        assert_eq!(chat_runtime(&app, card).active_scroll(), child);
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        assert!(chat_runtime(&app, card).pending.is_none());
     }
 
     #[test]
