@@ -1,5 +1,5 @@
 use super::{Provider, ProviderAdapter};
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -60,7 +60,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 /// character but ASCII alphanumerics replaced, and cuts a long name at 200
 /// characters followed by a hash this does not reproduce. Such a name is found
 /// by the transcript it holds and refused when more than one does.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String> {
     // Only a hyphenated UUID names a transcript, never a path.
     if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {

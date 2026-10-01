@@ -225,6 +225,16 @@ pub struct CardSummary {
     pub kind: PersistedCardKind,
 }
 
+/// A retained native conversation, including cards closed in an earlier run.
+#[derive(Debug, Clone)]
+pub struct SavedConversation {
+    pub card: CardId,
+    pub title: String,
+    pub session: crate::chat::Session,
+    pub open: bool,
+    pub updated_at_unix_ms: i64,
+}
+
 /// A restored workspace together with the cards that could not be restored
 /// into it.
 ///
@@ -1005,6 +1015,53 @@ impl StateStore {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         load_card_connection(&inner.connection, id, &self.boot_id, proof)
+    }
+
+    pub fn saved_conversations(&self) -> Result<Vec<SavedConversation>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let mut statement = inner.connection.prepare(
+            "SELECT card_id, title, content_json, existence_json, updated_at_unix_ms
+             FROM cards WHERE kind_tag = 'chat'
+             ORDER BY updated_at_unix_ms DESC, card_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut conversations = Vec::new();
+        for row in rows {
+            let parsed: Result<Option<SavedConversation>> = (|| {
+                let (id, title, content, existence, updated_at_unix_ms) = row?;
+                let session: crate::chat::Session = from_json("saved conversation", &content)?;
+                if !session.has_valid_native_continuity() {
+                    return Err(StoreError::InvalidState(
+                        "Invalid saved native continuity".into(),
+                    ));
+                }
+                if session.launch.session_id.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(SavedConversation {
+                    card: parse_id("card", &id)?,
+                    title,
+                    session,
+                    open: from_json::<Existence>("conversation existence", &existence)?.is_open(),
+                    updated_at_unix_ms,
+                }))
+            })();
+            match parsed {
+                Ok(Some(conversation)) => conversations.push(conversation),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, "Skipping unreadable saved conversation"),
+            }
+        }
+        Ok(conversations)
     }
 
     pub fn load_workspace(
@@ -4538,6 +4595,63 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn saved_conversations_retain_closed_chats_after_restart_and_omit_drafts() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("resume.sqlite3");
+        let (mut workspace, session) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(session.clone());
+        let store = StateStore::open(&path, boot("resume-boot")).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&path, boot("next-boot")).unwrap();
+        let saved = store.saved_conversations().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].card, card);
+        assert!(!saved[0].open);
+        assert_eq!(saved[0].session, session);
+        let mut draft = session;
+        draft.launch.session_id = None;
+        workspace.cards = vec![CardState {
+            id: CardId::new(),
+            existence: Existence::Open,
+            kind: CardKind::Chat(draft),
+            ..workspace.cards[0].clone()
+        }];
+        let base = store.stored_generations(workspace.id).unwrap();
+        store
+            .save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: base.workspace,
+                    cards: &base.cards,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.saved_conversations().unwrap().len(), 1);
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE cards SET content_json = '{invalid' WHERE card_id = ?1",
+                [workspace.cards[0].id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.saved_conversations().unwrap().len(), 1);
     }
 
     #[test]

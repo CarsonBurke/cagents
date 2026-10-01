@@ -20,6 +20,7 @@ mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
+mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
@@ -3773,6 +3774,7 @@ pub enum Message {
     },
     ReviewFilePanelResizeFinished,
     Palette(palette_ui::Action),
+    ResumeConversation(resume_ui::Action),
     RunCommand(workspace_widget::GlobalShortcut),
     /// A worktree snapshot for the source-control panel.
     ///
@@ -4638,6 +4640,7 @@ pub struct Cagents {
     channel_ui: channel_ui::State,
     sidebar_selection_ui: sidebar_selection_ui::State,
     chat_ui: chat_ui::State,
+    resume_ui: resume_ui::State,
     update_ui: update_ui::State,
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
@@ -10316,11 +10319,14 @@ impl Cagents {
     /// The worktree and pull request dialogs: forms, whose focused field
     /// captures the keys the dialog itself answers.
     fn form_dialog_is_open(&self) -> bool {
-        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some()
+        self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() || self.resume_ui.open
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
+        if self.resume_ui.open {
+            return self.update_resume(resume_ui::Action::Close);
+        }
         if let Some(dialog) = self.worktree_dialog.take() {
             dialog.cancel();
         } else if self.pull_request_dialog.take().is_some() {
@@ -11006,6 +11012,9 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
+        if self.resume_ui.open {
+            return Some(resume_ui::focus_id());
+        }
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
@@ -11907,6 +11916,7 @@ impl Application for Cagents {
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_drafts(chat_drafts),
+            resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
@@ -14502,6 +14512,11 @@ impl Application for Cagents {
                 if is_escape_press(&event) && self.form_dialog_on_top() {
                     return self.cancel_form_dialog();
                 }
+                if self.form_dialog_on_top()
+                    && let Some(task) = self.resume_key_event(&event)
+                {
+                    return task;
+                }
                 if is_escape_press(&event) && !captured {
                     if let Some((card, _)) = &self.terminal_paste {
                         return self
@@ -14783,6 +14798,7 @@ impl Application for Cagents {
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
+            Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
@@ -15392,6 +15408,10 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
+        if let Some(dialog) = self.resume_dialog() {
+            return Some(dialog);
+        }
+
         let dialog = self.pull_request_dialog.as_ref()?;
         let head = dialog.head.trim();
         let base = dialog.base.trim();
@@ -15571,6 +15591,10 @@ impl Application for Cagents {
                         chrome_ui::NewTab::Thread,
                     )))
                     .into(),
+                    widget::button::standard("Resume conversation")
+                        .id(widget::Id::new("empty.resume-conversation"))
+                        .on_press(Message::ResumeConversation(resume_ui::Action::Open))
+                        .into(),
                     widget::button::standard(format!(
                         "New terminal · {}",
                         workspace_widget::shortcut_chords(
@@ -22067,6 +22091,7 @@ mod tests {
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::default(),
+            resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::default(),
             chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),

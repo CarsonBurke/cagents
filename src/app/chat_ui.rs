@@ -3203,7 +3203,11 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 ViewportUpdate::unchanged()
             });
-        let skills = self.open_chat_draft(card_id, session);
+        let skills = if session.is_unstarted() {
+            self.open_chat_draft(card_id, session)
+        } else {
+            self.open_chat(card_id, session, chat::Intent::Start)
+        };
         self.persist();
         Task::batch([
             skills,

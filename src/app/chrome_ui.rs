@@ -331,16 +331,23 @@ enum Popup {
 pub enum NewTab {
     Terminal,
     Thread,
+    Resume,
     Browser,
 }
 
 // Threads choose their model in the composer; backend details are automatic.
-const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 3] = [
+const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     (
         "New thread",
         "Choose a model and start a conversation",
         NewTab::Thread,
         "chrome.new-tab.thread",
+    ),
+    (
+        "Resume conversation",
+        "Search saved conversations across projects and accounts",
+        NewTab::Resume,
+        "chrome.new-tab.resume",
     ),
     (
         "Terminal",
@@ -818,6 +825,7 @@ impl Cagents {
                 match kind {
                     NewTab::Terminal => cosmic::task::message(Message::NewTerminal),
                     NewTab::Thread => self.new_native_thread(),
+                    NewTab::Resume => self.update_resume(resume_ui::Action::Open),
                     NewTab::Browser => cosmic::task::message(Message::NewBrowser),
                 }
             }
@@ -854,7 +862,7 @@ impl Cagents {
                         NewTab::Terminal => {
                             crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                         }
-                        NewTab::Thread => {
+                        NewTab::Thread | NewTab::Resume => {
                             crate::ui_controls::symbolic_icon("chat-bubble-text-symbolic")
                         }
                         NewTab::Browser => {
@@ -879,7 +887,7 @@ impl Cagents {
                                     &self.settings.keyboard_shortcuts
                                 )
                             ),
-                            NewTab::Browser => description.to_owned(),
+                            NewTab::Browser | NewTab::Resume => description.to_owned(),
                         },
                         Message::ChromeUi(Action::Launch(kind)),
                     )

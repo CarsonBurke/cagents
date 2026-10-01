@@ -3426,6 +3426,16 @@ impl Cagents {
         account_of_recipe(&self.account_ui.accounts, provider, recipe).map(|state| state.id.clone())
     }
 
+    pub(super) fn resume_account_label(&self, session: &crate::chat::Session) -> String {
+        account_of_recipe(
+            &self.account_ui.accounts,
+            session.launch.provider,
+            &session.launch.recipe,
+        )
+        .map(|state| self.account_ui.display_name(state))
+        .unwrap_or_else(|| "Original account".into())
+    }
+
     /// The accounts a conversation launched as `recipe` could run on, for
     /// its composer's picker, or `None` where there is nothing to choose
     /// between and nothing worth naming: one account, and it is the system
