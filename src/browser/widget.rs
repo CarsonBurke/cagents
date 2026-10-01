@@ -238,6 +238,15 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     fn synchronize_focus(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
         let focused = self.model_focused && !self.obscured;
+        if self.obscured {
+            // A pointer press can request model focus one message before the
+            // model grants it. Covering that pending request must release its
+            // capture even if the browser had not become focused yet.
+            state.focus_requested = false;
+            state.pointer_capture = 0;
+            state.touch_capture.clear();
+            state.preedit = None;
+        }
         if focused {
             state.focus_requested = false;
         }
@@ -747,6 +756,7 @@ mod tests {
         let commands = handle.mailbox.drain_coalesced();
         assert_eq!(commands.presented, Some(false));
         assert!(commands.wheel.is_none());
+        assert_eq!(tree.state.downcast_ref::<WidgetState>().pointer_capture, 0);
     }
 
     #[test]
