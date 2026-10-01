@@ -708,6 +708,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::PdfPageRendered { .. }
+            | RepositoryAction::DiagramsRendered { .. }
+            | RepositoryAction::MarkdownDue { .. }
             | RepositoryAction::AutoSaveDue { .. }
             | RepositoryAction::Save { .. }
             | RepositoryAction::Reload { .. }

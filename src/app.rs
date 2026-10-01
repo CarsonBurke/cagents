@@ -2297,6 +2297,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             // behind their own debounce until the next self-heal.
             | RepositoryAction::FileListUnchanged { .. }
             | RepositoryAction::MarkdownDue { .. }
+            | RepositoryAction::DiagramsRendered { .. }
     )
 }
 
