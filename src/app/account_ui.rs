@@ -1350,24 +1350,37 @@ impl Cagents {
             .collect()
     }
 
-    pub(super) fn automation_account_choices(&self) -> Vec<crate::automation_ui::AccountChoice> {
-        let mut choices = self
-            .account_ui
+    fn automation_account_entries(
+        &self,
+        archived: bool,
+    ) -> Vec<crate::automation_ui::AccountChoice> {
+        self.account_ui
             .accounts
             .iter()
             .filter(|state| !state.account.is_brokered())
             .filter(|state| {
-                !state
+                state
                     .account
                     .registry_key()
                     .is_some_and(|key| self.account_ui.registry.is_archived(key))
+                    == archived
             })
             .map(|state| crate::automation_ui::AccountChoice {
                 label: self.account_ui.display_name(state),
                 provider: state.account.provider,
                 id: state.id.clone(),
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    pub(super) fn automation_archived_account_choices(
+        &self,
+    ) -> Vec<crate::automation_ui::AccountChoice> {
+        self.automation_account_entries(true)
+    }
+
+    pub(super) fn automation_account_choices(&self) -> Vec<crate::automation_ui::AccountChoice> {
+        let mut choices = self.automation_account_entries(false);
         let omp = Account::system(Provider::Omp);
         if !choices.iter().any(|choice| choice.id == omp.id()) {
             choices.push(crate::automation_ui::AccountChoice {
