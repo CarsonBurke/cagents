@@ -1,25 +1,36 @@
 ---
 name: cagents-agents
-description: Delegate work to daemon-hosted Claude, Codex, or Oh My Pi agents, inspect structured results, and coordinate follow-up prompts through the cagents CLI. Use when the user asks to create, oversee, or coordinate agents in cagents.
+description: Start daemon-hosted Claude, Codex, or Oh My Pi sessions, find the other live sessions in a project, and oversee agents you started through the cagents CLI. Use when work needs a separate session (another provider, another project, or one that outlives this conversation), or when coordinating with other sessions working nearby.
 metadata:
-  cagents-bundle-version: "1"
+  cagents-bundle-version: "2"
 ---
 
-Use the same `cagents --json agent` commands from native chats and terminal sessions. The daemon owns execution even with no application window open. Ask the user for missing task scope; do not fabricate a repository, account, model, or permission policy.
+## Choose the lightest tool
 
-1. Choose an absolute repository and working directory. The repository must already be open in cagents. Use an existing channel ID when given; otherwise acceptance creates a channel. Choose `claude`, `codex`, or `omp`. An omitted account resolves the project default once, before acceptance; `--account PROVIDER/system` selects its system configuration explicitly.
-2. Submit one task with a unique, stable idempotency key:
+- Work that belongs to this conversation: use your own harness's subagents, tasks, and background commands. They are cheaper and report straight back to you.
+- Work that needs its own session: a different provider, another open project, a conversation the user should see and be able to take over in cagents, or one that must outlive yours. Use `cagents agent`.
+- Other sessions already running: `cagents whoami` shows your session, its relatives, and peers in your checkout; `cagents ls` lists the project's live sessions (`--project PATH` for another project, `--all` for every one). Check before editing a checkout someone else is working in. Listing is read-only: you control only agents you started.
 
-   ```sh
-   cagents --json agent spawn --provider codex --repository /absolute/repository --directory /absolute/repository/worktree --prompt 'Concrete task and completion criteria' --idempotency-key task-unique-key --surface chat
-   ```
+## Start and oversee agents
 
-   Optional flags: `--channel CHANNEL_ID`, `--account PROVIDER/ACCOUNT_ID`, `--model MODEL`, `--permission-mode MODE`, `--reasoning-effort LEVEL`. Do not weaken permissions just to make unattended work proceed. `--surface terminal` opens a cagents console over the same hosted provider; it is not the provider's stock TUI.
-3. Read `data.agent.id`, `data.run.id`, and `data.created` from the JSON response. A lost CLI response may be retried only with the identical request and key. A changed request requires a new key. Do not repeat work merely because the first call timed out.
-4. Use `cagents --json agent wait RUN_ID --timeout 60` for bounded waiting, `agent status AGENT_ID` for the latest run, and `agent list` for your agents. Inspect `data.run.state`, `data.run.result.text`, `usage`, `truncated`, and `diagnostic`. `Waiting` is a request for human input, not completion. Open the agent's native controls or terminal console to answer it. Never infer success from terminal output, idle appearance, or absence of an error.
-5. After a settled run, send a follow-up with `cagents --json agent send AGENT_ID --prompt 'Follow-up task' --idempotency-key follow-up-unique-key`. Each accepted prompt has a distinct run ID. Do not send more work to an `Interrupted` run: its effects may already have happened. Inspect and explicitly close/reconcile the old session before deciding what to do next.
-6. When finished, use `cagents --json agent close AGENT_ID`. Close waits for confirmed teardown; do not bypass a failure by starting another writer on the same conversation.
+```sh
+cagents agent spawn 'Concrete task and completion criteria'      # same provider, current directory
+cagents agent spawn --provider codex --project /abs/repo --directory /abs/repo/.worktrees/x --wait 'Task'
+cagents agent list                       # your open agents, with short IDs
+cagents agent status 1a2b                # latest run and the end of its result; --full for all of it
+cagents agent wait 1a2b 9f8e --timeout 300   # until all settle or ask for input; --any for the first
+cagents agent send 1a2b 'Follow-up task' --wait
+cagents agent close 1a2b
+```
 
-The daemon supplies session-bound delegation authority automatically. Never print, copy, unset, or fabricate `CAGENTS_AGENT_AUTHORITY`, and never pass a parent session ID as authority. Agents can inspect and control only their own children; human CLI calls without a token own their separately created agents. Delegation depth, children, and simultaneous work are bounded. Handle capacity errors by waiting for and closing existing work, not by bypassing ownership.
+- The provider defaults to yours and the directory to the current one; the repository must already be open in cagents. Optional: `--channel ID`, `--account PROVIDER/system|PROVIDER/UUID`, `--model`, `--permission-mode`, `--reasoning-effort`, `--surface terminal`. Do not weaken permissions to make unattended work proceed. Ask the user rather than guessing a repository, account, or policy.
+- A prompt can also come from `--prompt-file FILE` or standard input (`-`, or piped in). Quote it so the shell passes it as one argument.
+- Handles are agent or run IDs, or any unique prefix of one. An agent stands for its latest run. Add `--json` before `agent` for structured output: `data.agent`, `data.run` (`state`, `result.text`, `usage`, `truncated`, `diagnostic`), `data.timed_out`.
+- Each submission has an idempotency key, generated unless you pass `--idempotency-key`, and reported in the JSON. A lost response is retried once automatically with the same key. Retry by hand only with the identical request and key; a timeout is not a reason to submit again.
+- Runs end `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. `Waiting` is not completion: see `cagents agent requests AGENT`, then `cagents agent answer AGENT REQUEST ACTION [--field FIELD=VALUE ...]` using exactly the IDs it lists. Answer questions your task already settles; ask the user before approving anything they would have to approve for you. `cagents agent interrupt AGENT` stops the active run.
+- Never send more work after `Interrupted`: its effects may already have happened. Inspect, then close or reconcile it.
+- Never infer success from terminal output or an idle look. Close agents you no longer need; children, depth, and concurrent runs are bounded, so handle capacity errors by finishing and closing work.
 
-Terminal console input accepts ordinary follow-up prompts, `/interrupt`, and `/answer REQUEST_ID ACTION [ANSWERS_JSON]` using exactly the request, action, and field IDs displayed by the provider. `/quit` detaches the console and leaves the provider hosted. Closing the terminal card uses cagents' normal active-work confirmation.
+The daemon gives each session its delegation authority. Never print, copy, unset, or fabricate `CAGENTS_AGENT_AUTHORITY`, and never pass a session ID as authority.
+
+A `--surface terminal` agent opens a cagents console over the same provider, not its stock TUI. It accepts follow-up prompts, `/interrupt`, `/answer REQUEST_ID ACTION [ANSWERS_JSON]`, and `/quit`, which detaches and leaves the provider hosted.

@@ -16,19 +16,20 @@ pub enum AgentCommand {
     Console { agent_id: AgentId },
     /// Start a provider session on one prompt, accepted durably.
     ///
-    /// The provider defaults to the calling session's, and the directory to
-    /// the current one.
+    /// The provider defaults to the calling session's, the directory to the
+    /// current one, and the project to the open one containing it.
     Spawn {
         #[command(flatten)]
         prompt: PromptArgs,
         /// claude, codex, or omp. Defaults to the calling session's provider.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
-        /// A directory in the open project to work in. Defaults to the
-        /// working directory.
+        /// The open project to work in, by any directory inside it.
+        /// Defaults to the one containing the agent's directory.
         #[arg(long, visible_alias = "project")]
         repository: Option<PathBuf>,
-        /// The agent's working directory. Defaults to the current directory.
+        /// The agent's working directory. Defaults to the --project path when
+        /// given, and otherwise the current directory.
         #[arg(long)]
         directory: Option<PathBuf>,
         #[arg(long)]
@@ -450,14 +451,17 @@ impl Session {
         }
     }
 
-    /// The calling session's provider, which a spawned agent defaults to.
-    fn caller_provider(&mut self, directory: &Path) -> Result<Option<Provider>, AppError> {
-        match self.call(Operation::Directory(Scope::Containing(
-            directory.to_owned(),
-        )))? {
-            Reply::Directory(directory) => Ok(directory.caller.and_then(|caller| caller.provider)),
-            _ => Err(AppError::new("sessions", "Unexpected directory response")),
-        }
+    /// The open project `scope` names, and the calling session's provider,
+    /// which a spawned agent defaults to.
+    fn context(&mut self, scope: Scope) -> Result<(Option<PathBuf>, Option<Provider>), AppError> {
+        let Reply::Directory(directory) = self.call(Operation::Directory(scope))? else {
+            return Err(AppError::new("sessions", "Unexpected directory response"));
+        };
+        let project = match directory.scope {
+            Scope::Project(project) => Some(project),
+            _ => None,
+        };
+        Ok((project, directory.caller.and_then(|caller| caller.provider)))
     }
 }
 
@@ -485,20 +489,33 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         } => {
             let absolute =
                 |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let directory = absolute(match directory {
-                Some(directory) => directory,
-                None => std::env::current_dir().map_err(|e| AppError::new("target", e))?,
+            let repository = repository.map(absolute).transpose()?;
+            // An agent sent to another project works at the path given for
+            // it, and otherwise here.
+            let directory = absolute(match (directory, &repository) {
+                (Some(directory), _) => directory,
+                (None, Some(repository)) => repository.clone(),
+                (None, None) => std::env::current_dir().map_err(|e| AppError::new("target", e))?,
             })?;
-            let repository = match repository {
-                Some(repository) => absolute(repository)?,
-                None => directory.clone(),
+            // The project is the open one containing the given path, which
+            // may be any directory in it, such as a worktree.
+            let scope = match repository {
+                Some(repository) => Scope::Project(repository),
+                None => Scope::Containing(directory.clone()),
             };
-            let provider = match provider {
-                Some(provider) => provider,
-                None => session.caller_provider(&directory)?.ok_or_else(|| {
-                    AppError::new("agent_request", "Choose --provider claude, codex, or omp")
-                })?,
-            };
+            let (repository, caller) = session.context(scope)?;
+            let repository = repository.ok_or_else(|| {
+                AppError::new(
+                    "target",
+                    format!(
+                        "No open project contains {}; open it in cagents or pass --project",
+                        directory.display()
+                    ),
+                )
+            })?;
+            let provider = provider.or(caller).ok_or_else(|| {
+                AppError::new("agent_request", "Choose --provider claude, codex, or omp")
+            })?;
             let request = Submit {
                 destination: Destination::New(Spec {
                     provider,

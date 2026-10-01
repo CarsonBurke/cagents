@@ -22,6 +22,8 @@ const BUNDLED: &[&str] = &[
     "9305357e17ee29e04d13494dc2a86a066684c3c7952c4f1bd4a45c577350308b",
     // e0bf6c0 / #546: documents --reasoning-effort.
     "7213ff9f5c012409711c3183c82f4dbb5293cbb309251334f83efda7fb863b33",
+    // #620: chooses between the harness and a hosted session; short handles.
+    "8d8dc60a9670d934f668904ecf461c141c61201cf4df316ddb1d91858e00f444",
 ];
 /// Larger than any bundled revision, so an oversized file is user content
 /// without being read in full.
