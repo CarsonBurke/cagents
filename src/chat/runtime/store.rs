@@ -568,6 +568,7 @@ impl Store {
                     self.end = Some(first);
                 }
                 self.dirty = true;
+                out.push(Event::HistoryRecovered);
             }
             Event::TextDelta {
                 id,

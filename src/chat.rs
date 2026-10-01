@@ -1429,6 +1429,10 @@ pub enum Event {
     /// Establish the cached/live boundary before an asynchronous newest-page
     /// request. Its response may arrive after newer live items.
     LatestHistoryStarted,
+    /// A retryable history RPC failure, independent of turn failures.
+    HistoryError(String),
+    /// A successful cached/provider page can recover its own active error.
+    HistoryRecovered,
 }
 
 #[cfg(test)]

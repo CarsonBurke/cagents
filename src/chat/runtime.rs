@@ -331,6 +331,7 @@ impl Handle {
                     stderr: VecDeque::new(),
                     indices: BTreeMap::new(),
                     retained: 0,
+                    history_error: None,
                     dirty: false,
                     activity: ActivityState::Idle,
                     attention: TurnAttention::default(),
@@ -1109,6 +1110,9 @@ struct Actor {
     stderr: VecDeque<u8>,
     indices: BTreeMap<String, usize>,
     retained: usize,
+    /// Only the active error published by the most recent history failure.
+    /// Recovery must not erase an unrelated provider/cache error.
+    history_error: Option<String>,
     dirty: bool,
     activity: ActivityState,
     attention: TurnAttention,
@@ -1470,6 +1474,7 @@ impl Actor {
                     Ok(cached) => {
                         self.touch();
                         if cached {
+                            self.apply(Event::HistoryRecovered);
                             let _ = reply.send(Ok(()));
                             continue;
                         }
@@ -1728,6 +1733,7 @@ impl Actor {
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        recover_history_error(&mut state.error, &mut self.history_error, &event);
         apply_event(&mut state, &mut self.indices, event);
         // Only metadata is resident independently of the disk-backed window.
         let items = std::mem::take(&mut state.items);
@@ -1836,6 +1842,27 @@ impl Write for ByteCounter {
 pub(super) fn observed_at() -> Option<u64> {
     crate::chat::now_ms()
 }
+fn recover_history_error(
+    error: &mut Option<String>,
+    history_error: &mut Option<String>,
+    event: &Event,
+) {
+    match event {
+        Event::HistoryError(message) => *history_error = Some(message.clone()),
+        Event::HistoryRecovered => {
+            if history_error
+                .take()
+                .as_ref()
+                .is_some_and(|previous| error.as_ref() == Some(previous))
+            {
+                *error = None;
+            }
+        }
+        Event::Error { .. } | Event::Reset { .. } | Event::Exited { .. } => *history_error = None,
+        _ => {}
+    }
+}
+
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     match event {
@@ -1858,6 +1885,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::QueueChanged(messages) => state.queued_messages = messages,
         Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::LatestHistoryStarted => state.history_loading = true,
+        Event::HistoryError(message) => state.error = Some(message),
+        Event::HistoryRecovered => {}
         Event::Reset { reason } => {
             state.queued_messages.clear();
             state.items.clear();
@@ -2652,6 +2681,92 @@ mod tests {
     }
 
     struct Echo;
+    #[test]
+    fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
+        struct HistoryFixture {
+            attempts: usize,
+        }
+        impl Adapter for HistoryFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::History {
+                            items: vec![text("current", "current")],
+                            has_earlier: true,
+                        },
+                    ],
+                    ..Step::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let events = match command {
+                    Command::LoadEarlier => {
+                        self.attempts += 1;
+                        if self.attempts <= 2 {
+                            vec![
+                                Event::HistoryLoading(false),
+                                Event::HistoryError("page failed".into()),
+                            ]
+                        } else {
+                            vec![Event::History {
+                                items: vec![text("older", "older")],
+                                has_earlier: false,
+                            }]
+                        }
+                    }
+                    Command::SetModel { model, .. } => vec![Event::Error {
+                        message: model,
+                        fatal: false,
+                    }],
+                    _ => return Err("unexpected fixture command".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Step::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        for unrelated in [None, Some("different failure"), Some("page failed")] {
+            let spec = ProcessSpec {
+                execution: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: std::env::temp_dir(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(HistoryFixture { attempts: 0 });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            until(&handle, |snapshot| snapshot.ready);
+            for _ in 0..2 {
+                handle.command(Command::LoadEarlier).unwrap();
+                assert_eq!(
+                    handle.snapshot(None).unwrap().error.as_deref(),
+                    Some("page failed")
+                );
+            }
+            if let Some(message) = unrelated {
+                handle
+                    .command(Command::SetModel {
+                        model: message.into(),
+                        reasoning: None,
+                    })
+                    .unwrap();
+            }
+            handle.command(Command::LoadEarlier).unwrap();
+            let snapshot = handle.snapshot(None).unwrap();
+            assert_eq!(snapshot.error.as_deref(), unrelated);
+            assert_eq!(snapshot.items[0].id, "older");
+            handle.close().unwrap();
+        }
+    }
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {

@@ -370,6 +370,7 @@ fn create_inner(
             attached: false,
             direct_input: false,
             cursor: None,
+            history_initialized: false,
             history_loading: false,
             history_refresh: false,
             queue_available: true,
@@ -461,6 +462,7 @@ struct Codex {
     attached: bool,
     direct_input: bool,
     cursor: Option<String>,
+    history_initialized: bool,
     history_loading: bool,
     history_refresh: bool,
     queue_available: bool,
@@ -758,7 +760,6 @@ impl Codex {
         }
     }
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
-        self.cursor = page["nextCursor"].as_str().map(str::to_owned);
         let mut items = Vec::new();
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
@@ -787,6 +788,13 @@ impl Codex {
                     items.push(item);
                 }
             }
+        }
+        // Refreshing the live end must not rewind the older-history traversal
+        // through pages already cached. Commit only after validating the page;
+        // a failed decode must preserve the cursor the reader can retry.
+        if earlier || !self.history_initialized {
+            self.cursor = page["nextCursor"].as_str().map(str::to_owned);
+            self.history_initialized = true;
         }
         step.events.push(if earlier {
             Event::History {
@@ -1275,16 +1283,19 @@ impl Adapter for Codex {
                     self.model_events(&mut step);
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
-                step.events.push(Event::Error {
-                    message: format!(
-                        "Codex RPC error: {}",
-                        error["message"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| error.to_string())
-                    ),
-                    fatal,
-                });
+                let message = format!(
+                    "Codex RPC error: {}",
+                    error["message"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string())
+                );
+                step.events
+                    .push(if matches!(pending, Pending::History { .. }) {
+                        Event::HistoryError(message)
+                    } else {
+                        Event::Error { message, fatal }
+                    });
                 if self.execution.as_ref().is_some_and(|execution| {
                     frame["id"].as_str() == Some(execution.request.as_str())
                 }) {
@@ -1353,6 +1364,10 @@ impl Adapter for Codex {
                             "Codex resumed a different thread; refusing conversation takeover"
                                 .into(),
                         );
+                    }
+                    if self.thread.is_none() {
+                        self.cursor = None;
+                        self.history_initialized = false;
                     }
                     self.thread = Some(id.into());
                     self.attached = true;
@@ -2858,6 +2873,7 @@ mod tests {
             attached: true,
             direct_input: true,
             cursor: None,
+            history_initialized: false,
             history_loading: false,
             history_refresh: false,
             queue_available: true,
@@ -2921,10 +2937,7 @@ mod tests {
             .unwrap();
         assert!(!adapter.history_loading);
         assert_eq!(failed.events[0], Event::HistoryLoading(false));
-        assert!(matches!(
-            failed.events[1],
-            Event::Error { fatal: false, .. }
-        ));
+        assert!(matches!(failed.events[1], Event::HistoryError(_)));
         assert!(adapter.command(Command::LoadEarlier).is_ok());
     }
 
@@ -2950,6 +2963,64 @@ mod tests {
             .unwrap();
         assert!(!adapter.history_loading);
         assert_eq!(latest.events.last(), Some(&Event::HistoryLoading(false)));
+    }
+
+    #[test]
+    fn latest_history_refresh_keeps_the_furthest_older_cursor_including_exhaustion() {
+        let mut adapter = adapter();
+        let mut step = Step::default();
+        for (cursor, earlier) in [
+            (Some("100"), false),
+            (Some("80"), true),
+            (Some("60"), true),
+            (Some("100"), false),
+        ] {
+            adapter
+                .page(&json!({"data":[],"nextCursor":cursor}), &mut step, earlier)
+                .unwrap();
+        }
+        let request = adapter.command(Command::LoadEarlier).unwrap();
+        assert_eq!(request.writes[0]["params"]["cursor"], "60");
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":[],"nextCursor":null}}))
+            .unwrap();
+        adapter
+            .page(&json!({"data":[],"nextCursor":"100"}), &mut step, false)
+            .unwrap();
+        assert!(adapter.cursor.is_none());
+        assert!(adapter.command(Command::LoadEarlier).is_err());
+    }
+
+    #[test]
+    fn malformed_history_page_preserves_initialization_and_the_retry_cursor() {
+        let mut adapter = adapter();
+        let mut step = Step::default();
+        let malformed = json!({"data":[{"id":"turn","status":"completed","itemsView":"compact","items":[]}],"nextCursor":"lost"});
+        assert!(adapter.page(&malformed, &mut step, false).is_err());
+        assert!(!adapter.history_initialized);
+        adapter
+            .page(&json!({"data":[],"nextCursor":"100"}), &mut step, false)
+            .unwrap();
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
+        assert!(adapter.page(&malformed, &mut step, true).is_err());
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn failed_initial_history_request_can_initialize_its_cursor_on_retry() {
+        let mut adapter = adapter();
+        let request = adapter.command(Command::Refresh).unwrap();
+        adapter
+            .receive(json!({"id":request.writes[1]["id"],"error":{"message":"try later"}}))
+            .unwrap();
+        assert!(!adapter.history_initialized);
+        assert!(adapter.cursor.is_none());
+        let retry = adapter.command(Command::Refresh).unwrap();
+        adapter
+            .receive(json!({"id":retry.writes[1]["id"],"result":{"data":[],"nextCursor":"100"}}))
+            .unwrap();
+        assert!(adapter.history_initialized);
+        assert_eq!(adapter.cursor.as_deref(), Some("100"));
     }
 
     #[test]
