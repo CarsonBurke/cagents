@@ -8481,7 +8481,7 @@ impl Cagents {
             }
             let toolbar = widget::container(
                 widget::row::with_children(vec![
-                    crate::interaction::tooltip(
+                    crate::interaction::tooltip_above(
                         widget::button::icon(crate::ui_controls::symbolic_icon(
                             "go-previous-symbolic",
                         ))
@@ -8495,7 +8495,7 @@ impl Cagents {
                         .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
                         "Back",
                     ),
-                    crate::interaction::tooltip(
+                    crate::interaction::tooltip_above(
                         widget::button::icon(crate::ui_controls::symbolic_icon("go-next-symbolic"))
                             .id(chrome.map_or_else(
                                 || card_control_id(id, "browser.forward"),
@@ -8507,7 +8507,7 @@ impl Cagents {
                             .on_press_maybe(can_go_forward.then_some(Message::BrowserForward(id))),
                         "Forward",
                     ),
-                    crate::interaction::tooltip(
+                    crate::interaction::tooltip_above(
                         widget::button::icon(crate::ui_controls::symbolic_icon(
                             if browser_loading {
                                 "process-stop-symbolic"
@@ -8532,6 +8532,17 @@ impl Cagents {
                         if browser_loading { "Stop" } else { "Reload" },
                     ),
                     address_input.into(),
+                    crate::interaction::tooltip_above(
+                        widget::button::icon(crate::ui_controls::symbolic_icon(
+                            "document-import-symbolic",
+                        ))
+                        .id(card_control_id(id, "browser.import-logins"))
+                        .name("Import browser logins")
+                        .width(ICON_CONTROL_SIZE)
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
+                        "Import browser logins",
+                    ),
                 ])
                 .align_y(Alignment::Center)
                 .spacing(spacing.space_xxxs)
@@ -8763,6 +8774,7 @@ impl Cagents {
             }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
+                .obscured(self.workspace_inputs_blocked())
                 .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))

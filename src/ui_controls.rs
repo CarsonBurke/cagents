@@ -1221,6 +1221,7 @@ mod tests {
         "dialog-error-symbolic",
         "dialog-warning-symbolic",
         "display-brightness-symbolic",
+        "document-import-symbolic",
         "edit-clear-symbolic",
         "edit-copy-symbolic",
         "edit-delete-symbolic",

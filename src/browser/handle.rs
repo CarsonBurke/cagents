@@ -371,6 +371,15 @@ impl std::fmt::Debug for BrowserHandle {
 }
 
 impl BrowserHandle {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self {
+            mailbox: CommandMailbox::new(),
+            events: EventBus::new(),
+            teardown: None,
+        }
+    }
+
     pub fn import_cookies(&self, request: super::ImportRequest) -> Result<(), BrowserError> {
         self.mailbox.send(Command::Import(request))
     }
@@ -466,7 +475,8 @@ impl BrowserHandle {
     /// Owned exclusively by [`BrowserWidget`](super::BrowserWidget), which
     /// derives it from real geometry. Partial clipping is expressed through
     /// [`place`](Self::place)'s source rectangle instead, so this only goes
-    /// false when the card is entirely off screen.
+    /// false when the card is entirely off screen or an application overlay
+    /// must cover its native child surface.
     pub fn set_presented(&self, presented: bool) -> Result<(), BrowserError> {
         self.mailbox
             .update_coalesced(|state| state.presented = Some(presented))
@@ -478,6 +488,9 @@ impl BrowserHandle {
     }
 
     pub fn input(&self, input: BrowserInput) -> Result<(), BrowserError> {
+        // Coalesce in one unit so switching between a mouse and touchpad
+        // cannot discard the previous device's still-pending movement.
+        let input = super::input::normalize_wheel(input);
         match input {
             BrowserInput::MouseMove { .. } => self
                 .mailbox
@@ -622,6 +635,39 @@ mod tests {
             commands.pointer_motion,
             Some(BrowserInput::MouseMove { point }) if point.x == 1000.0 && point.y == 1001.0
         ));
+    }
+
+    #[test]
+    fn switching_wheel_units_preserves_all_pending_distance_and_latest_hit_point() {
+        let handle = BrowserHandle::fixture();
+        for (y, unit, x) in [
+            (-1.0, super::super::WheelUnit::Lines, 4.0),
+            (-12.5, super::super::WheelUnit::Pixels, 8.0),
+            (0.5, super::super::WheelUnit::Lines, 10.0),
+        ] {
+            handle
+                .input(BrowserInput::Wheel {
+                    x: 0.0,
+                    y,
+                    unit,
+                    point: super::super::DevicePoint { x, y: 20.0 },
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            handle.mailbox.receiver().try_recv(),
+            Ok(Command::WakeCoalesced)
+        ));
+        assert!(handle.mailbox.receiver().try_recv().is_err());
+        assert_eq!(
+            handle.mailbox.drain_coalesced().wheel,
+            Some(BrowserInput::Wheel {
+                x: 0.0,
+                y: -50.5,
+                unit: super::super::WheelUnit::Pixels,
+                point: super::super::DevicePoint { x: 10.0, y: 20.0 },
+            })
+        );
     }
 
     #[test]

@@ -352,6 +352,22 @@ pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'a, str>>,
 ) -> Element<'a, Message> {
+    tooltip_positioned(content, label, false)
+}
+
+/// Keep a tooltip above chrome whose native child surface covers the area below.
+pub fn tooltip_above<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tooltip_positioned(content, label, true)
+}
+
+fn tooltip_positioned<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+    prefer_above: bool,
+) -> Element<'a, Message> {
     let label = label.into();
     // The shell's type scale owns this size. Tooltip text is the whole content
     // of its surface rather than secondary metadata beside something else, so
@@ -365,7 +381,10 @@ pub fn tooltip<'a, Message: 'a>(
     Effect {
         content: content.into(),
         kind: Kind::Tooltip,
-        tip: Some(Tip { content: tip }),
+        tip: Some(Tip {
+            content: tip,
+            prefer_above,
+        }),
         on_escape: None,
     }
     .into()
@@ -1121,6 +1140,7 @@ struct Effect<'a, Message> {
 
 struct Tip<'a, Message> {
     content: Element<'a, Message>,
+    prefer_above: bool,
 }
 
 // Distinct tags prevent a positional diff from reusing a tooltip's clock as a
@@ -1654,6 +1674,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
                     tree: &mut tip_state[0],
                     anchor: layout.bounds() + translation,
                     progress: state.tooltip.interpolate(0.0, 1.0, state.now),
+                    prefer_above: tip.prefer_above,
                 }));
                 return Some(if let Some(child) = child {
                     overlay::Group::with_children(vec![child, tip]).overlay()
@@ -2377,6 +2398,7 @@ struct TipOverlay<'a, 'b, Message> {
     tree: &'a mut Tree,
     anchor: Rectangle,
     progress: f32,
+    prefer_above: bool,
 }
 
 impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, Message> {
@@ -2390,7 +2412,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, 
         let x = (self.anchor.center_x() - size.width / 2.0)
             .clamp(0.0, (bounds.width - size.width).max(0.0));
         let below = self.anchor.y + self.anchor.height + 4.0;
-        let y = if below + size.height <= bounds.height {
+        let y = if !self.prefer_above && below + size.height <= bounds.height {
             below
         } else {
             self.anchor.y - size.height - 4.0

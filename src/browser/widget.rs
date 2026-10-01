@@ -17,7 +17,7 @@ use cosmic::{Element, Renderer, Theme};
 use super::{
     BrowserError, BrowserHandle, BrowserInput, ButtonState, ImeInput, InputMethodState,
     PhysicalViewport, SurfacePlacement, TouchState, WheelUnit,
-    input::{iced_key, iced_mouse_button, local_device_point},
+    input::{iced_key, iced_mouse_button, local_device_point, wheel_pixels},
 };
 
 #[derive(Default)]
@@ -32,6 +32,7 @@ struct WidgetState {
     last_geometry: Option<(PhysicalViewport, SurfacePlacement)>,
     last_scale_factor: Option<f32>,
     last_presented: Option<bool>,
+    geometry_presented: bool,
     preedit: Option<Preedit>,
 }
 
@@ -119,6 +120,7 @@ pub struct BrowserWidget<'a, Message> {
     scale_factor: f32,
     ui_scale: f32,
     model_focused: bool,
+    obscured: bool,
     virtual_offset: f32,
     on_focus: Option<Message>,
     on_shortcut: Option<Box<dyn Fn(keyboard::Event) -> Option<Message> + 'a>>,
@@ -145,6 +147,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
             ui_scale: 1.0,
             virtual_offset: 0.0,
             model_focused: false,
+            obscured: false,
             on_focus: None,
             on_shortcut: None,
             on_error: None,
@@ -191,6 +194,23 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         self
     }
 
+    /// Native child surfaces stack above the application's rendered overlays.
+    /// Hide their pixels while an overlay owns the workspace, retaining the
+    /// browser's layout and residency so dismissal restores the same page.
+    pub fn obscured(mut self, obscured: bool) -> Self {
+        self.obscured = obscured;
+        self
+    }
+
+    fn synchronize_presentation(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
+        let presented = state.geometry_presented && !self.obscured;
+        if state.last_presented != Some(presented) {
+            self.handle.set_presented(presented)?;
+            state.last_presented = Some(presented);
+        }
+        Ok(())
+    }
+
     pub fn on_focus(mut self, message: Message) -> Self {
         self.on_focus = Some(message);
         self
@@ -216,24 +236,31 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         }
     }
 
-    fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
-        if self.model_focused {
+    fn synchronize_focus(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
+        let focused = self.model_focused && !self.obscured;
+        if self.obscured {
+            // A pointer press can request model focus one message before the
+            // model grants it. Covering that pending request must release its
+            // capture even if the browser had not become focused yet.
+            state.focus_requested = false;
+            state.pointer_capture = 0;
+            state.touch_capture.clear();
+            state.preedit = None;
+        }
+        if focused {
             state.focus_requested = false;
         }
-        if state.focused == self.model_focused {
-            return;
+        if state.focused == focused {
+            return Ok(());
         }
-        match self.handle.set_focused(self.model_focused) {
-            Ok(()) => {
-                state.focused = self.model_focused;
-                if !state.focused {
-                    state.pointer_capture = 0;
-                    state.touch_capture.clear();
-                    state.preedit = None;
-                }
-            }
-            Err(error) => self.publish_error(error, shell),
+        self.handle.set_focused(focused)?;
+        state.focused = focused;
+        if !focused {
+            state.pointer_capture = 0;
+            state.touch_capture.clear();
+            state.preedit = None;
         }
+        Ok(())
     }
 
     fn device_point(&self, bounds: Rectangle, point: Point) -> super::DevicePoint {
@@ -287,6 +314,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         tree::State::new(WidgetState::default())
     }
 
+    fn diff(&mut self, tree: &mut Tree) {
+        // Overlay widgets may stop forwarding events to their covered content.
+        // Reconcile at tree construction, before that overlay is first drawn.
+        let state = tree.state.downcast_mut::<WidgetState>();
+        let _ = self.synchronize_presentation(state);
+        let _ = self.synchronize_focus(state);
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -328,15 +363,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         // visibility; the application owns the other half through
         // `set_visible`. Partial clipping never lands here - it is carried by
         // the placement's source rectangle instead.
-        if state.last_presented != Some(native.presented) {
-            state.last_presented = Some(native.presented);
-            if let Err(error) = self.handle.set_presented(native.presented)
-                && let Some(mapper) = &self.on_error
-            {
-                shell.publish(mapper(error));
-            }
+        state.geometry_presented = native.presented;
+        if let Err(error) = self.synchronize_presentation(state) {
+            self.publish_error(error, shell);
         }
-        self.synchronize_focus(state, shell);
+        if let Err(error) = self.synchronize_focus(state) {
+            self.publish_error(error, shell);
+        }
+
+        if self.obscured {
+            return;
+        }
 
         match event {
             Event::Mouse(cosmic::iced::mouse::Event::CursorMoved { position }) => {
@@ -403,7 +440,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 shell.capture_event();
             }
             Event::Mouse(cosmic::iced::mouse::Event::WheelScrolled { delta })
-                if state.cursor_inside || state.pointer_capture != 0 =>
+                if cursor.is_over(bounds) && cursor.is_over(*viewport) =>
             {
                 let (x, y, unit) = match delta {
                     ScrollDelta::Lines { x, y } => (f64::from(*x), f64::from(*y), WheelUnit::Lines),
@@ -411,12 +448,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                         (f64::from(*x), f64::from(*y), WheelUnit::Pixels)
                     }
                 };
-                let point = state.last_cursor.unwrap_or(Point::new(bounds.x, bounds.y));
+                let (x, y) = wheel_pixels(x, y, unit);
+                let point = cursor.position().expect("wheel cursor is over the widget");
                 self.send(
                     BrowserInput::Wheel {
                         x,
                         y,
-                        unit,
+                        unit: WheelUnit::Pixels,
                         point: self.device_point(bounds, point),
                     },
                     shell,
@@ -617,6 +655,152 @@ impl<'a, Message: Clone + 'a> From<BrowserWidget<'a, Message>> for Element<'a, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::iced::advanced::renderer::Headless;
+
+    #[test]
+    fn wheel_uses_current_visible_hit_without_requiring_a_previous_pointer_move() {
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let handle = BrowserHandle::fixture();
+        let mut widget = BrowserWidget::<()>::new(&handle).scale_factor(2.0);
+        let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
+        let node = layout::Node::new(Size::new(200.0, 200.0));
+        let clip = Rectangle::new(Point::new(50.0, 50.0), Size::new(100.0, 100.0));
+        let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let mut messages = Vec::new();
+        widget.update(
+            &mut tree,
+            &wheel,
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(60.0, 80.0)),
+            &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &clip,
+        );
+        assert_eq!(
+            handle.mailbox.drain_coalesced().wheel,
+            Some(BrowserInput::Wheel {
+                x: 0.0,
+                y: -76.0,
+                unit: WheelUnit::Pixels,
+                point: super::super::DevicePoint { x: 120.0, y: 160.0 },
+            })
+        );
+        widget.update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: ScrollDelta::Pixels { x: 2.5, y: -14.5 },
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(60.0, 80.0)),
+            &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &clip,
+        );
+        assert_eq!(
+            handle.mailbox.drain_coalesced().wheel,
+            Some(BrowserInput::Wheel {
+                x: 2.5,
+                y: -14.5,
+                unit: WheelUnit::Pixels,
+                point: super::super::DevicePoint { x: 120.0, y: 160.0 },
+            })
+        );
+        // An old hover or pressed mouse button must not send a wheel aimed
+        // outside the browser or inside the portion clipped by the workspace.
+        let state = tree.state.downcast_mut::<WidgetState>();
+        state.cursor_inside = true;
+        state.pointer_capture = 1;
+        state.last_cursor = Some(Point::new(60.0, 80.0));
+        for cursor in [
+            mouse::Cursor::Available(Point::new(250.0, 80.0)),
+            mouse::Cursor::Available(Point::new(20.0, 20.0)),
+            mouse::Cursor::Unavailable,
+        ] {
+            widget.update(
+                &mut tree,
+                &wheel,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &clip,
+            );
+            assert!(handle.mailbox.drain_coalesced().wheel.is_none());
+        }
+        let mut covered = BrowserWidget::<()>::new(&handle)
+            .model_focused(true)
+            .obscured(true);
+        covered.update(
+            &mut tree,
+            &wheel,
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(60.0, 80.0)),
+            &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &clip,
+        );
+        let commands = handle.mailbox.drain_coalesced();
+        assert_eq!(commands.presented, Some(false));
+        assert!(commands.wheel.is_none());
+        assert_eq!(tree.state.downcast_ref::<WidgetState>().pointer_capture, 0);
+    }
+
+    #[test]
+    fn covering_overlay_hides_native_pixels_without_waiting_for_input() {
+        let handle = BrowserHandle::fixture();
+        let mut widget = BrowserWidget::<()>::new(&handle);
+        let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
+        {
+            let state = tree.state.downcast_mut::<WidgetState>();
+            state.geometry_presented = true;
+            state.last_presented = Some(true);
+            state.focused = true;
+            state.pointer_capture = 1;
+            state.touch_capture.insert(7);
+            state.preedit = Some(Preedit::new());
+        }
+        let mut covered = BrowserWidget::<()>::new(&handle).obscured(true);
+        covered.diff(&mut tree);
+        let commands = handle.mailbox.drain_coalesced();
+        assert_eq!(commands.presented, Some(false));
+        assert_eq!(commands.focused, Some(false));
+        let state = tree.state.downcast_ref::<WidgetState>();
+        assert!(!state.focused);
+        assert_eq!(state.pointer_capture, 0);
+        assert!(state.touch_capture.is_empty());
+        assert!(state.preedit.is_none());
+        covered.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, None);
+
+        widget.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(true));
+    }
+
+    #[test]
+    fn dismissing_an_overlay_does_not_reveal_a_clipped_browser() {
+        let handle = BrowserHandle::fixture();
+        let mut widget = BrowserWidget::<()>::new(&handle).obscured(true);
+        let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
+        widget.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(false));
+        BrowserWidget::<()>::new(&handle).diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, None);
+    }
 
     #[test]
     fn native_placement_tracks_the_horizontal_camera_offset() {
