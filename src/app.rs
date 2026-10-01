@@ -13015,6 +13015,7 @@ impl Application for Cagents {
                     self.select_sidebar_rows(row, sidebar::SelectionIntent::Navigate);
                 }
                 match action {
+                    SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
                         let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
@@ -15494,6 +15495,7 @@ impl Application for Cagents {
             self.settings.sidebar_width,
             self.modal_is_open(),
             &self.navigation_cache,
+            &self.settings.keyboard_shortcuts,
         )
         .map(Message::Sidebar);
 

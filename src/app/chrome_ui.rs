@@ -1290,15 +1290,6 @@ impl Cagents {
             return Vec::new();
         }
         let mut actions = Vec::with_capacity(8);
-        actions.push(command(
-            crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
-            workspace_widget::shortcut_tooltip(
-                workspace_widget::GlobalShortcut::ToggleProjects,
-                &self.settings.keyboard_shortcuts,
-            ),
-            widget::Id::new("command.toggle-projects"),
-            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleProjects)),
-        ));
         let total = self.workspace.cards().len();
         if should_show_card_navigator(total) {
             let current = self
