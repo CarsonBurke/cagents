@@ -8534,7 +8534,7 @@ impl Cagents {
                     address_input.into(),
                     crate::interaction::tooltip(
                         widget::button::icon(crate::ui_controls::symbolic_icon(
-                            "dialog-password-symbolic",
+                            "document-import-symbolic",
                         ))
                         .id(card_control_id(id, "browser.import-logins"))
                         .name("Import browser logins")
