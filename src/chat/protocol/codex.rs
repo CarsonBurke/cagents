@@ -719,9 +719,14 @@ impl Codex {
         if self.history_loading {
             return Err("Codex history is already loading".into());
         }
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier: cursor.is_some() })?;
+        let earlier = cursor.is_some();
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier })?;
         self.history_loading = true;
-        step.events.push(Event::HistoryLoading(true));
+        step.events.push(if earlier {
+            Event::HistoryLoading(true)
+        } else {
+            Event::LatestHistoryStarted
+        });
         Ok(())
     }
     /// Re-reads the thread's metadata and its history.
@@ -2895,7 +2900,7 @@ mod tests {
         assert_eq!(answer.writes[0]["method"], "thread/read");
         assert_eq!(answer.writes[1]["method"], "thread/turns/list");
         assert!(answer.writes[1]["params"]["cursor"].is_null());
-        assert_eq!(answer.events.last(), Some(&Event::HistoryLoading(true)));
+        assert_eq!(answer.events.last(), Some(&Event::LatestHistoryStarted));
         let latest = adapter
             .receive(json!({"id":answer.writes[1]["id"],"result":{"data":[],"nextCursor":null}}))
             .unwrap();

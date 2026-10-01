@@ -33,6 +33,11 @@ const BULK_BYTES: usize = METADATA_LIMIT / 2;
 /// tiny paths could satisfy the text budget and still overrun the serialized one.
 const ELEMENT_BYTES: usize = 16;
 type Cursor = (i64, usize);
+#[derive(Clone, Copy)]
+enum LatestBoundary {
+    BeforeAll,
+    After(i64),
+}
 pub(super) struct Window {
     pub items: Vec<Item>,
     pub has_earlier: bool,
@@ -46,6 +51,7 @@ pub(crate) struct Store {
     cached_earlier: bool,
     provider_earlier: bool,
     pending_earlier: Option<Cursor>,
+    latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     pending_text: Option<(String, Role, bool, String)>,
 }
@@ -121,6 +127,7 @@ impl Store {
                 cached_earlier: false,
                 provider_earlier: false,
                 pending_earlier: None,
+                latest_boundary: None,
                 dirty: true,
                 pending_text: None,
             })
@@ -376,6 +383,38 @@ impl Store {
         Err("Transcript history cannot be ordered between its anchors".into())
     }
 
+    fn latest_ordinals(&mut self, count: usize) -> Result<Vec<i64>, String> {
+        if self.latest_boundary.is_none() {
+            return self.edge_ordinals(false, count);
+        }
+        for _ in 0..2 {
+            let left: Option<i64> = match self.latest_boundary {
+                Some(LatestBoundary::After(ordinal)) => self
+                    .db
+                    .query_row(
+                        "SELECT MAX(ordinal) FROM items WHERE ordinal<=?1",
+                        [ordinal],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?,
+                _ => None,
+            };
+            let right: Option<i64> = self
+                .db
+                .query_row(
+                    "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
+                    [left.unwrap_or(i64::MIN)],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some(ordinals) = Self::spaced(left, right, count) {
+                return Ok(ordinals);
+            }
+            self.rebalance()?;
+        }
+        Err("Transcript latest page cannot be ordered before live output".into())
+    }
+
     /// Rebalance only when repeated insertion has exhausted an integer gap.
     /// The temporary range is disjoint from every normally allocated ordinal,
     /// so UNIQUE stays enforced through both phases of the atomic update.
@@ -410,6 +449,19 @@ impl Store {
             remap(self.first)?,
             remap(self.pending_earlier)?,
         );
+        let latest_boundary = match self.latest_boundary {
+            Some(LatestBoundary::After(ordinal)) => {
+                let mapped: Option<i64> = transaction
+                    .query_row(
+                        "SELECT MAX(new) FROM ordinal_remap WHERE old<=?1",
+                        [ordinal],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Some(mapped.map_or(LatestBoundary::BeforeAll, LatestBoundary::After))
+            }
+            boundary => boundary,
+        };
         transaction.execute_batch("UPDATE items SET ordinal=(SELECT temporary FROM ordinal_remap WHERE old=items.ordinal);
             UPDATE items SET ordinal=(SELECT new FROM ordinal_remap WHERE temporary=items.ordinal);
             DROP TABLE ordinal_remap;").map_err(|e| e.to_string())?;
@@ -417,6 +469,7 @@ impl Store {
         self.end = end;
         self.first = first;
         self.pending_earlier = pending_earlier;
+        self.latest_boundary = latest_boundary;
         self.dirty = true;
         Ok(())
     }
@@ -443,7 +496,11 @@ impl Store {
         }
         if !run.is_empty() {
             let ordinals = if after.is_none() {
-                self.edge_ordinals(earlier, run.len())?
+                if earlier {
+                    self.edge_ordinals(true, run.len())?
+                } else {
+                    self.latest_ordinals(run.len())?
+                }
             } else {
                 self.history_ordinals(None, after.as_deref(), run.len())?
             };
@@ -488,6 +545,9 @@ impl Store {
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
                 let warnings = self.merge_history(items, earlier)?;
+                if !earlier {
+                    self.latest_boundary = None;
+                }
                 if let Some(warning) = warnings.first() {
                     out.push(nonfatal(if warnings.len() > 1 {
                         format!("{warning} ({} replayed items affected)", warnings.len())
@@ -555,6 +615,7 @@ impl Store {
                 self.provider_earlier = false;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
+                self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
                 return Ok(out);
@@ -564,7 +625,24 @@ impl Store {
                 // for an unrelated later history response. Successful pages
                 // consume the cursor before publishing loading=false.
                 self.pending_earlier = None;
+                self.latest_boundary = None;
                 out.push(Event::HistoryLoading(false));
+                return Ok(out);
+            }
+            Event::LatestHistoryStarted => {
+                let latest: Option<i64> = self
+                    .db
+                    .query_row("SELECT MAX(ordinal) FROM items", [], |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                self.latest_boundary =
+                    Some(latest.map_or(LatestBoundary::BeforeAll, LatestBoundary::After));
+                out.push(Event::LatestHistoryStarted);
+                return Ok(out);
+            }
+            event @ (Event::Exited { .. } | Event::Error { fatal: true, .. }) => {
+                self.latest_boundary = None;
+                self.pending_earlier = None;
+                out.push(event);
                 return Ok(out);
             }
             other => {
@@ -1142,6 +1220,117 @@ mod tests {
         assert!(store.pending_earlier.is_none());
         assert!(!store.window().unwrap().has_later);
         assert_eq!(ids(&mut store), ["A", "B"]);
+    }
+
+    #[test]
+    fn latest_history_response_preserves_newer_live_items_after_its_request_boundary() {
+        for with_cached_items in [false, true] {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            if with_cached_items {
+                store.apply(Event::Item(history_item("A", "A"))).unwrap();
+                // Capture must include buffered text, not just flushed items.
+                store
+                    .apply(Event::TextDelta {
+                        id: "B".into(),
+                        role: Role::Assistant,
+                        thinking: false,
+                        delta: "B".into(),
+                    })
+                    .unwrap();
+            }
+            store.apply(Event::LatestHistoryStarted).unwrap();
+            store.apply(Event::Item(history_item("F", "live"))).unwrap();
+            store
+                .apply(Event::LatestHistory {
+                    items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
+                    has_earlier: false,
+                })
+                .unwrap();
+            assert_eq!(
+                ids(&mut store),
+                if with_cached_items {
+                    vec!["A", "B", "D", "E", "F"]
+                } else {
+                    vec!["D", "E", "F"]
+                }
+            );
+            assert!(store.latest_boundary.is_none());
+        }
+    }
+
+    #[test]
+    fn latest_history_boundary_survives_rebalance_and_keeps_the_held_page() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["A", "B"] {
+            store.apply(Event::Item(history_item(id, id))).unwrap();
+        }
+        store
+            .db
+            .execute(
+                "UPDATE items SET ordinal=CASE id WHEN 'A' THEN 1 ELSE 2 END",
+                [],
+            )
+            .unwrap();
+        store.end = Some((2, 0));
+        store.apply(Event::LatestHistoryStarted).unwrap();
+        store.apply(Event::Item(history_item("F", "live"))).unwrap();
+        store
+            .db
+            .execute("UPDATE items SET ordinal=3 WHERE id='F'", [])
+            .unwrap();
+        store
+            .apply(Event::LatestHistory {
+                items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(store.end, Some((2 * ORDINAL_STRIDE, 0)));
+        assert_eq!(ids(&mut store), ["A"]);
+        store.latest();
+        assert_eq!(ids(&mut store), ["A", "B", "D", "E", "F"]);
+    }
+
+    #[test]
+    fn latest_history_boundary_uses_the_predecessor_if_its_item_is_removed() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["A", "B"] {
+            store.apply(Event::Item(history_item(id, id))).unwrap();
+        }
+        store.apply(Event::LatestHistoryStarted).unwrap();
+        store.apply(Event::Item(history_item("F", "live"))).unwrap();
+        store
+            .apply(Event::ItemsRemoved {
+                ids: vec!["B".into()],
+            })
+            .unwrap();
+        store
+            .apply(Event::LatestHistory {
+                items: vec![history_item("D", "D")],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(ids(&mut store), ["A", "D", "F"]);
+    }
+
+    #[test]
+    fn latest_history_boundary_clears_on_failure_reset_and_exit() {
+        for event in [
+            Event::HistoryLoading(false),
+            Event::Reset {
+                reason: "reset".into(),
+            },
+            Event::Exited { code: None },
+            Event::Error {
+                message: "failed".into(),
+                fatal: true,
+            },
+        ] {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            store.apply(Event::LatestHistoryStarted).unwrap();
+            assert!(store.latest_boundary.is_some());
+            store.apply(event).unwrap();
+            assert!(store.latest_boundary.is_none());
+        }
     }
 
     #[test]

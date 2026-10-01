@@ -1857,6 +1857,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
         Event::HistoryLoading(loading) => state.history_loading = loading,
+        Event::LatestHistoryStarted => state.history_loading = true,
         Event::Reset { reason } => {
             state.queued_messages.clear();
             state.items.clear();

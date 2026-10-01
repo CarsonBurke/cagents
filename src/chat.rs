@@ -1426,6 +1426,9 @@ pub enum Event {
         items: Vec<Item>,
         has_earlier: bool,
     },
+    /// Establish the cached/live boundary before an asynchronous newest-page
+    /// request. Its response may arrive after newer live items.
+    LatestHistoryStarted,
 }
 
 #[cfg(test)]
