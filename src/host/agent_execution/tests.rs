@@ -1419,6 +1419,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
     assert_eq!(run.state, State::Failed);
     assert_eq!(run.result.diagnostic.as_deref(), Some("fixture"));
+}
 
 #[test]
 fn directory_lists_live_sessions_with_relations_and_without_granting_control() {

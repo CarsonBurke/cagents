@@ -103,15 +103,9 @@ pub struct Directory {
     pub sessions: Vec<Entry>,
 }
 
-/// The first eight hex digits; enough to tell sessions apart at a glance.
-pub fn short_id(id: &impl ToString) -> String {
-    let mut text = id.to_string();
-    text.truncate(8);
-    text
-}
-
 impl Entry {
-    /// One compact line for people and agents scanning a list.
+    /// One line for people and agents scanning a list. IDs are printed whole
+    /// because they are what every other command takes.
     pub fn line(&self) -> String {
         let provider = self
             .provider
@@ -122,13 +116,16 @@ impl Entry {
             ActivityState::Working => "working",
             ActivityState::Waiting => "waiting",
         };
-        let relation = match self.relation {
-            Relation::Myself => " (me)",
-            Relation::Parent => " (my parent)",
-            Relation::Child => " (my agent)",
-            Relation::Peer => "",
+        let relation = match (self.relation, self.delegation.as_ref().map(|d| &d.owner)) {
+            (Relation::Myself, _) => " (me)",
+            (Relation::Parent, _) => " (my parent)",
+            // A caller outside cagents controls every agent another such
+            // caller started; they are shared, not personal.
+            (Relation::Child, Some(Owner::User)) => " (user agent)",
+            (Relation::Child, _) => " (my agent)",
+            (Relation::Peer, _) => "",
         };
-        let mut line = format!("{}  {provider:<6} {state:<8}", short_id(&self.id));
+        let mut line = format!("{}  {provider:<6} {state:<8}", self.id);
         if let Some(name) = &self.project_name {
             line.push_str(&format!(" [{name}]"));
         }
@@ -139,6 +136,12 @@ impl Entry {
             line.push_str(&format!("  \"{title}\""));
         }
         line.push_str(relation);
+        if let Some(delegation) = &self.delegation {
+            line.push_str(&format!("\n    agent {}", delegation.agent));
+            if let Some(state) = delegation.run_state {
+                line.push_str(&format!(", latest run {state:?}"));
+            }
+        }
         line
     }
 }

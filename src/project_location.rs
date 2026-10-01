@@ -126,7 +126,12 @@ pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel)
     let Ok(directory) = fs::canonicalize(path) else {
         return Placement::default();
     };
-    let checkout = checkout(&directory);
+    placed(&directory, model)
+}
+
+#[cfg(feature = "host")]
+fn placed(directory: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+    let checkout = checkout(directory);
     // An open folder keeps its own identity, as in `resolve`, and the nearest
     // open project wins over an enclosing one: a folder inside the checkout,
     // then the checkout's repository, then a folder that encloses it.
@@ -153,25 +158,30 @@ pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel)
                 .find(|ancestor| opened(ancestor))
                 .map(Path::to_path_buf)
         });
-    Placement {
-        worktree: checkout.map(|(worktree, _)| worktree),
-        project,
-    }
+    let worktree = checkout.map(|(worktree, _)| worktree);
+    // A submodule or a clone nested in an open repository is not opened
+    // itself; it belongs to the project of the checkout around it.
+    let project = project.or_else(|| {
+        worktree
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|parent| placed(parent, model).project)
+    });
+    Placement { worktree, project }
 }
 
 /// The working tree that contains `directory` and its Git common directory.
 #[cfg(feature = "host")]
 fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
-    for ancestor in directory.ancestors() {
+    directory.ancestors().find_map(|ancestor| {
         let marker = ancestor.join(".git");
-        let Ok(metadata) = fs::metadata(&marker) else {
-            continue;
-        };
+        let metadata = fs::metadata(&marker).ok()?;
         if metadata.is_dir() {
             return Some((ancestor.to_path_buf(), fs::canonicalize(&marker).ok()?));
         }
         // A linked worktree or submodule names its private Git directory, and
         // that directory names the shared one it borrows objects and refs from.
+        // A marker that names nothing readable is skipped, not trusted.
         let content = fs::read_to_string(&marker).ok()?;
         let private = ancestor.join(content.strip_prefix("gitdir:")?.trim());
         let private = fs::canonicalize(private).ok()?;
@@ -179,9 +189,8 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
             Ok(common) => fs::canonicalize(private.join(common.trim())).ok()?,
             Err(_) => private,
         };
-        return Some((ancestor.to_path_buf(), common));
-    }
-    None
+        Some((ancestor.to_path_buf(), common))
+    })
 }
 
 #[cfg(test)]
@@ -268,9 +277,23 @@ mod tests {
             place(&linked, &model),
             Placement {
                 worktree: Some(linked),
-                project: Some(key),
+                project: Some(key.clone()),
             }
         );
         assert_eq!(place(root.path(), &model), Placement::default());
+        // A submodule's marker names a private directory with no `commondir`,
+        // so it is a checkout of its own inside the open one.
+        let module = repository.join("vendor/lib");
+        fs::create_dir_all(&module).unwrap();
+        let private = repository.join(".git/modules/lib");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(module.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+        assert_eq!(
+            place(&module, &model),
+            Placement {
+                worktree: Some(module.canonicalize().unwrap()),
+                project: Some(key),
+            }
+        );
     }
 }

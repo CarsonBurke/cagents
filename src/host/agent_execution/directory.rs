@@ -31,36 +31,53 @@ pub(super) fn read(
     authority: &Authority,
     scope: Scope,
 ) -> Result<Directory, String> {
-    let caller_origin = origin(host, authority)?;
+    // Reading confers nothing, so a capability whose session has ended reads
+    // as a caller outside cagents rather than failing the whole listing.
+    let caller_origin = origin(host, authority).unwrap_or(Origin::User);
     let caller = match caller_origin {
         Origin::Child { parent } => Some(parent),
         Origin::User | Origin::Automation { .. } => None,
     };
-    let live = live_sessions(host, caller);
+    let mut live = live_sessions(host);
     let (model, delegations) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let model = registry.model()?;
         let mut delegations = BTreeMap::new();
-        for agent in registry.agents(None)? {
+        // Only a live session's delegation is listed, so only its latest run
+        // is read.
+        for agent in &model.agents {
             let Some(session) = &agent.session else {
                 continue;
             };
-            let run = registry.latest_agent_run(agent.id).ok();
+            if !live.iter().any(|entry| entry.id == session.id()) {
+                continue;
+            }
+            let run = registry.latest_agent_run(agent.id)?;
             delegations.insert(
                 session.id(),
                 (
                     Delegation {
                         agent: agent.id,
                         owner: Owner::from(&agent.origin),
-                        run: run.as_ref().map(|run| run.id),
-                        run_state: run.map(|run| run.state),
+                        run: Some(run.id),
+                        run_state: Some(run.state),
                     },
                     agent.channel,
                 ),
             );
         }
-        (registry.model()?, delegations)
+        (model, delegations)
     };
+    // A plain shell is listed only where it matters: as the caller, or as the
+    // session that owns a listed agent.
+    live.retain(|entry| {
+        entry.provider.is_some()
+            || Some(entry.id) == caller
+            || delegations
+                .values()
+                .any(|(delegation, _)| delegation.owner == Owner::Session(entry.id))
+    });
     let caller_owner = Owner::from(&caller_origin);
     let parent = caller
         .and_then(|caller| delegations.get(&caller))
@@ -142,7 +159,7 @@ pub(super) fn read(
             sessions.push(entry);
         }
     }
-    sessions.sort_by_key(|entry| {
+    sessions.sort_by_cached_key(|entry| {
         (
             match entry.relation {
                 Relation::Parent => 0,
@@ -155,7 +172,10 @@ pub(super) fn read(
                 ActivityState::Idle => 2,
                 ActivityState::Unknown => 3,
             },
+            // Sessions outside every open project come after those in one.
+            entry.project_name.is_none(),
             entry.project_name.clone(),
+            entry.title.is_none(),
             entry.title.clone(),
         )
     });
@@ -166,8 +186,9 @@ pub(super) fn read(
     })
 }
 
-/// Live provider conversations, plus the caller even when it is a plain shell.
-fn live_sessions(host: &SharedHost, caller: Option<TerminalId>) -> Vec<Live> {
+/// Live provider conversations and terminals; the caller decides which
+/// plain shells matter.
+fn live_sessions(host: &SharedHost) -> Vec<Live> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let mut live = Vec::new();
     for (id, record) in &state.chats {
@@ -194,9 +215,6 @@ fn live_sessions(host: &SharedHost, caller: Option<TerminalId>) -> Vec<Live> {
             continue;
         }
         let activity = record.handle.agent_activity();
-        if activity.is_none() && Some(*id) != caller {
-            continue;
-        }
         live.push(Live {
             id: *id,
             surface: Surface::Terminal,

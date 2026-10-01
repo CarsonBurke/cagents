@@ -55,13 +55,14 @@ cagents whoami
 ```
 
 ```text
-7c0fba49  claude idle     [cagents] /repo/.worktrees/fix  "Fix flaky login test" (my agent)
-3e81d0aa  codex  working  [cagents] /repo
+7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60  claude idle     [cagents] /repo/.worktrees/fix  "Fix flaky login test" (my agent)
+    agent 51c3e8a2-6d7f-4a1b-8c9d-0e1f2a3b4c5d, latest run Succeeded
+3e81d0aa-9b8c-4d7e-a6f5-e4d3c2b1a090  codex  working  [cagents] /repo
 ```
 
-Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (the session that owns the caller), `Child` (an agent the caller may control), or `Peer`. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
+Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (the session that owns the caller), `Child` (an agent the caller may control; one started by a CLI outside cagents is shown as a user agent, because every such caller shares it), or `Peer`. A plain shell appears only as the caller or as the owner of a listed agent. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
 
-The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: control remains restricted to an agent's owner as described below. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID.
+The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. The lower-level `cagents terminal` commands are not: any process that can reach the daemon socket can already write to or close a terminal by ID, so treat a listed peer's terminal as someone else's work and coordinate through its owner. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID.
 
 ## Console surface
 

@@ -39,7 +39,7 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     }
     Ok(CommandOutput {
         command: "whoami",
-        data: json!({ "me": directory.caller, "scope": directory.scope, "related": peers }),
+        data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": peers }),
         human,
     })
 }
