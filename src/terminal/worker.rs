@@ -2334,7 +2334,7 @@ impl Worker {
                 }
                 Effect::Title(title) => {
                     let title = if self.agent_provider == Some(crate::agent::Provider::Codex) {
-                        crate::agent::codex_title_without_spinner(&title)
+                        crate::agent::codex_title_without_status(&title)
                     } else {
                         &title
                     };

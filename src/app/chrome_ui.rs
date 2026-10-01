@@ -32,6 +32,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn showing_a_switch_failure_keeps_its_explanation_open() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.notices
+            .record(TransientNotice::error("Native attachment failed."));
+        let _ = app.update_chrome(Action::ShowNoticesFor(card));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        let focus = app.chrome_ui.focus_index;
+        let _ = app.update_chrome(Action::ShowNoticesFor(card));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::Notices));
+        assert_eq!(app.chrome_ui.focus_index, focus);
+        let _ = app.update_chrome(Action::Close);
+        assert_eq!(app.chrome_ui.popup, None);
+    }
+
+    #[test]
+    fn a_late_switch_failure_does_not_take_over_another_pane_or_dialog() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let source = app.workspace.focused().unwrap();
+        app.notices
+            .record(TransientNotice::error("Native attachment failed."));
+        let next = super::super::tests::terminal_card_state();
+        let destination = next.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(next);
+        durable.focused = Some(destination);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let _ = app.update_chrome(Action::ShowNoticesFor(source));
+        assert_eq!(app.chrome_ui.popup, None);
+        assert_eq!(app.workspace.focused(), Some(destination));
+
+        app.settings_reset_confirm = true;
+        let _ = app.update_chrome(Action::ShowNoticesFor(destination));
+        assert_eq!(app.chrome_ui.popup, None);
+        assert!(app.settings_reset_confirm);
+        app.settings_reset_confirm = false;
+        let _ = app.update_chrome(Action::ToggleNewTab);
+        let _ = app.update_chrome(Action::ShowNoticesFor(destination));
+        assert_eq!(app.chrome_ui.popup, Some(Popup::NewTab));
+    }
+
+    #[test]
+    fn restored_codex_status_is_an_icon_not_a_tab_or_window_name() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        for (title, expected) in [
+            ("[ . ] Action Required | Fix parser", "Fix parser"),
+            ("[ ! ] Action Required | Fix parser", "Fix parser"),
+            ("[ ! ] Action Required", "Codex"),
+        ] {
+            let card = app.card_state_mut(id).unwrap();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!();
+            };
+            session.launch.program = "codex".into();
+            card.title = title.into();
+            drop(app.sync_chrome());
+            assert_eq!(app.card_chrome[&id].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+        }
+        let custom = "[ ! ] Action Required documentation";
+        app.chrome_ui.user_titles.insert(id, custom.into());
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&id].title, custom);
+        assert_eq!(app.core.window.header_title, custom);
+    }
+
+    #[test]
     fn tab_reaches_every_control_in_the_notices_popup() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.notices.record(TransientNotice::warning("first"));
@@ -304,6 +372,7 @@ pub enum Action {
     ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
+    ShowNoticesFor(CardId),
     Close,
     TabsScrolled(f32),
     Launch(NewTab),
@@ -541,6 +610,15 @@ impl Cagents {
         if self.modal_is_open() && !matches!(action, Action::Close) {
             return Task::none();
         }
+        if let Action::ShowNoticesFor(card) = &action
+            && (self.workspace.focused() != Some(*card)
+                || self
+                    .chrome_ui
+                    .popup
+                    .is_some_and(|popup| popup != Popup::Notices))
+        {
+            return Task::none();
+        }
         match action {
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
@@ -700,13 +778,16 @@ impl Cagents {
                 self.persist();
                 Task::none()
             }
-            Action::ToggleNewTab | Action::ToggleNotices => {
+            Action::ToggleNewTab | Action::ToggleNotices | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
                 } else {
                     Popup::Notices
                 };
                 if self.chrome_ui.popup == Some(popup) {
+                    if matches!(action, Action::ShowNoticesFor(_)) {
+                        return Task::none();
+                    }
                     return self.update_chrome(Action::Close);
                 }
                 self.chrome_ui.popup = Some(popup);
@@ -1416,6 +1497,7 @@ impl Cagents {
         );
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
             #[cfg(feature = "integrated-browser")]
@@ -1460,18 +1542,17 @@ impl Cagents {
                     ),
                     "Working",
                 )),
-                crate::agent::ActivityState::Waiting => children.push(tooltip(
-                    crate::ui_controls::activity_spinner_tone(
-                        design::TAB_STATUS_ICON_SIZE as f32,
-                        design::warning_color,
-                    ),
+                crate::agent::ActivityState::Waiting => children.push(sidebar::status_icon(
+                    "dialog-warning-symbolic",
                     "Waiting for input",
+                    sidebar::BadgeTone::Warning,
                 )),
                 _ => {}
             }
         }
         if focused && self.chat_switch_available(id) {
-            let ready = self.chat_switch_ready(id);
+            let blocker = self.chat_switch_blocker(id);
+            let ready = blocker.is_none();
             children.push(command(
                 crate::ui_controls::symbolic_icon(
                     if matches!(card.map(|state| &state.kind), Some(CardKind::Chat(_))) {
@@ -1480,11 +1561,7 @@ impl Cagents {
                         "chat-bubble-text-symbolic"
                     },
                 ),
-                if ready {
-                    self.chat_switch_label(id)
-                } else {
-                    "Wait for the chat handoff to finish"
-                },
+                blocker.unwrap_or_else(|| Cow::Borrowed(self.chat_switch_label(id))),
                 card_control_id(id, "switch"),
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));

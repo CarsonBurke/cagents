@@ -3384,10 +3384,70 @@ impl Cagents {
     /// A start, a return, or a close in flight owns the card until it answers,
     /// and a switch pressed meanwhile used to vanish without a word.
     pub(super) fn chat_switch_ready(&self, card: CardId) -> bool {
-        !self.chat_start_pending(card)
-            && self
-                .card_state(card)
-                .is_some_and(|state| state.existence.is_open())
+        self.chat_switch_blocker(card).is_none()
+    }
+    /// The control and its handler share the reason a handoff cannot start.
+    pub(super) fn chat_switch_blocker(&self, card: CardId) -> Option<Cow<'static, str>> {
+        if let Some(phase) = self.chat_ui.phases.get(&card) {
+            return Some(Cow::Borrowed(match phase {
+                Phase::Starting(_) => {
+                    "Connecting to native chat. Wait for the connection to finish."
+                }
+                Phase::Returning { .. } => {
+                    "Returning to the terminal. Wait for the handoff to finish."
+                }
+                Phase::Closing { .. } => "The conversation is closing. Wait for it to finish.",
+            }));
+        }
+        let Some(state) = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())
+        else {
+            return Some(Cow::Borrowed("This pane is closed."));
+        };
+        if self.chat_ui.parked.contains_key(&card) {
+            return None;
+        }
+        match &state.kind {
+            CardKind::Terminal(terminal) => {
+                if self.pending_terminal_spawn(card) {
+                    return Some(Cow::Borrowed(
+                        "This terminal is still starting. Wait for its agent to start.",
+                    ));
+                }
+                let session = match conversion(terminal) {
+                    Ok(session) => session,
+                    Err(reason) => return Some(Cow::Owned(reason)),
+                };
+                if terminal.continuity.live_proof().is_none()
+                    && !session.owns_codex_listener()
+                    && crate::model::agent_recovery::fresh_recipe(&session.launch.recipe).is_none()
+                {
+                    Some(Cow::Borrowed(
+                        "This terminal's launch options cannot be reused for a native conversation.",
+                    ))
+                } else {
+                    None
+                }
+            }
+            CardKind::Chat(_) => match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => {
+                    let named = runtime.connected()
+                        && runtime
+                            .handle()
+                            .is_some_and(|handle| handle.snapshot().session_id.is_some());
+                    if named {
+                        runtime.handoff_blocker().map(Cow::Borrowed)
+                    } else {
+                        runtime.transition_blocker().map(Cow::Borrowed)
+                    }
+                }
+                _ => None,
+            },
+            _ => Some(Cow::Borrowed(
+                "This pane does not contain an agent conversation.",
+            )),
+        }
     }
     /// The conversation a chat card would return from, as current as the card
     /// knows it: the runtime's session carries the identity the provider has
@@ -4302,7 +4362,14 @@ impl Cagents {
             }
             Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
-                if self.chat_start_pending(card) {
+                if let Some(reason) = self.chat_switch_blocker(card) {
+                    self.status = Some(
+                        if self.chat_start_pending(card) || self.pending_terminal_spawn(card) {
+                            TransientNotice::warning(reason.into_owned())
+                        } else {
+                            TransientNotice::error(reason.into_owned())
+                        },
+                    );
                     return Task::none();
                 }
                 if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
@@ -4782,6 +4849,10 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        let terminal_switch = matches!(
+                            self.card_state(target.card).map(|state| &state.kind),
+                            Some(CardKind::Terminal(_))
+                        );
                         let account_removed =
                             failure.recovery == chat::Recovery::Account || account_source.is_some();
                         if account_removed {
@@ -4820,6 +4891,13 @@ impl Cagents {
                         return Task::batch([
                             self.drain_terminal(target.card, 0),
                             cleanup,
+                            if terminal_switch {
+                                cosmic::task::message(Message::ChromeUi(
+                                    chrome_ui::Action::ShowNoticesFor(target.card),
+                                ))
+                            } else {
+                                Task::none()
+                            },
                             if account_removed {
                                 self.reload_registry()
                             } else {
@@ -10029,7 +10107,76 @@ mod tests {
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
+        assert!(app.chat_switch_ready(id));
         let _ = app.update(Message::ChatUi(Action::Switch(id)));
+        assert!(!app.chat_switch_ready(id));
+        assert!(app.chat_switch_blocker(id).unwrap().contains("Connecting"));
+        assert!(
+            app.notices.entries.is_empty(),
+            "progress is shown in the pane, without a warning"
+        );
+        let target = app.chat_ui.phases[&id].target();
+        let _ = app.update(Message::ChatUi(Action::Switch(id)));
+        assert_eq!(app.chat_ui.phases[&id].target(), target);
+        assert!(app.notices.entries.iter().any(|entry| entry.notice.message
+            == "Connecting to native chat. Wait for the connection to finish."));
+        let before = app.card_state(id).unwrap().clone();
+        let reason = "This Codex terminal does not expose its conversation for native attachment.";
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+                reason,
+            )))))),
+        )));
+        assert_eq!(
+            app.card_state(id).unwrap(),
+            &before,
+            "a failed switch preserves the terminal"
+        );
+        assert!(
+            app.chat_switch_ready(id),
+            "a failed attachment can be retried"
+        );
+        assert_eq!(errors(&app), [reason]);
+        assert!(
+            matches!(
+                crate::app::tests::task_app_message(task),
+                Message::ChromeUi(chrome_ui::Action::ShowNoticesFor(card)) if card == id
+            ),
+            "the failure opens its explanation"
+        );
+    }
+
+    #[test]
+    fn a_chat_switch_names_the_unsent_attachment_blocker_before_clicking() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        runtime.attachments.push(Attachment {
+            path: PathBuf::from("/tmp/unsent-attachment.png"),
+        });
+        let reason = "Send or remove the attached files before leaving the chat.";
+        assert_eq!(app.chat_switch_blocker(card).as_deref(), Some(reason));
+        assert!(!app.chat_switch_ready(card));
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        assert!(!app.chat_start_pending(card));
+        assert!(matches!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(_)
+        ));
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message == reason)
+        );
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        runtime.attachments.clear();
+        assert!(app.chat_switch_ready(card));
     }
 
     /// A message that arrives byte by byte must present exactly as one that

@@ -77,6 +77,6 @@ impl Cagents {
             }
         }
         self.review_alert_focus_changed();
-        Task::batch([task, report, self.open_pending_review_alert()])
+        Task::batch([task, report])
     }
 }
