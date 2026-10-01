@@ -205,7 +205,7 @@ impl HostState {
                 title: display_title(
                     record
                         .handle
-                        .update_title()
+                        .title()
                         .as_deref()
                         .unwrap_or(record.session.launch.provider.label()),
                     &record.session.launch.recipe.working_directory,

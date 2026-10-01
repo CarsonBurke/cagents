@@ -742,7 +742,8 @@ impl Handle {
             state.ready,
         )
     }
-    pub(crate) fn update_title(&self) -> Option<String> {
+    /// The provider-reported title, read without loading the transcript.
+    pub(crate) fn title(&self) -> Option<String> {
         self.0
             .state
             .lock()

@@ -111,6 +111,88 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Where a directory sits: the checkout containing it and the open project it
+/// belongs to. Read from the filesystem as Git discovers a repository, without
+/// running Git, so listing many sessions stays cheap.
+#[cfg(feature = "host")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub worktree: Option<PathBuf>,
+    pub project: Option<PathBuf>,
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+    let Ok(directory) = fs::canonicalize(path) else {
+        return Placement::default();
+    };
+    placed(&directory, model)
+}
+
+#[cfg(feature = "host")]
+fn placed(directory: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+    let checkout = checkout(directory);
+    // An open folder keeps its own identity, as in `resolve`, and the nearest
+    // open project wins over an enclosing one: a folder inside the checkout,
+    // then the checkout's repository, then a folder that encloses it.
+    let opened = |candidate: &Path| model.project(candidate).is_some();
+    let (inner, outer) = match &checkout {
+        Some((worktree, _)) => directory
+            .ancestors()
+            .partition::<Vec<_>, _>(|ancestor| ancestor.starts_with(worktree)),
+        None => (Vec::new(), directory.ancestors().collect()),
+    };
+    let project = inner
+        .into_iter()
+        .find(|ancestor| opened(ancestor))
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            checkout
+                .as_ref()
+                .map(|(_, common)| common.clone())
+                .filter(|common| opened(common))
+        })
+        .or_else(|| {
+            outer
+                .into_iter()
+                .find(|ancestor| opened(ancestor))
+                .map(Path::to_path_buf)
+        });
+    let worktree = checkout.map(|(worktree, _)| worktree);
+    // A submodule or a clone nested in an open repository is not opened
+    // itself; it belongs to the project of the checkout around it.
+    let project = project.or_else(|| {
+        worktree
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|parent| placed(parent, model).project)
+    });
+    Placement { worktree, project }
+}
+
+/// The working tree that contains `directory` and its Git common directory.
+#[cfg(feature = "host")]
+fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
+    directory.ancestors().find_map(|ancestor| {
+        let marker = ancestor.join(".git");
+        let metadata = fs::metadata(&marker).ok()?;
+        if metadata.is_dir() {
+            return Some((ancestor.to_path_buf(), fs::canonicalize(&marker).ok()?));
+        }
+        // A linked worktree or submodule names its private Git directory, and
+        // that directory names the shared one it borrows objects and refs from.
+        // A marker that names nothing readable is skipped, not trusted.
+        let content = fs::read_to_string(&marker).ok()?;
+        let private = ancestor.join(content.strip_prefix("gitdir:")?.trim());
+        let private = fs::canonicalize(private).ok()?;
+        let common = match fs::read_to_string(private.join("commondir")) {
+            Ok(common) => fs::canonicalize(private.join(common.trim())).ok()?,
+            Err(_) => private,
+        };
+        Some((ancestor.to_path_buf(), common))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +223,77 @@ mod tests {
         )
         .unwrap();
         assert!(discover(root.path()).is_err());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn placement_follows_linked_worktrees_to_their_open_project_without_git() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir_all(repository.join("src")).unwrap();
+        let git = |arguments: &[&str]| {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "root",
+        ]);
+        git(&["worktree", "add", "-q", "../linked"]);
+        let key = repository.join(".git").canonicalize().unwrap();
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        assert_eq!(
+            place(&repository.join("src"), &model),
+            Placement {
+                worktree: Some(repository.canonicalize().unwrap()),
+                project: None,
+            },
+            "a checkout outside every open project has no project"
+        );
+        model.projects.push(crate::workspace_model::ModelProject {
+            repository: key.clone(),
+            name: "repository".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        });
+        let linked = root.path().join("linked").canonicalize().unwrap();
+        assert_eq!(
+            place(&linked, &model),
+            Placement {
+                worktree: Some(linked),
+                project: Some(key.clone()),
+            }
+        );
+        assert_eq!(place(root.path(), &model), Placement::default());
+        // A submodule's marker names a private directory with no `commondir`,
+        // so it is a checkout of its own inside the open one.
+        let module = repository.join("vendor/lib");
+        fs::create_dir_all(&module).unwrap();
+        let private = repository.join(".git/modules/lib");
+        fs::create_dir_all(&private).unwrap();
+        fs::write(module.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+        assert_eq!(
+            place(&module, &model),
+            Placement {
+                worktree: Some(module.canonicalize().unwrap()),
+                project: Some(key),
+            }
+        );
     }
 }

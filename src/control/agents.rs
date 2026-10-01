@@ -243,6 +243,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             .join("\n"),
         Reply::Closed(agent) => format!("closed agent {}", agent.id),
         Reply::Console(_) => "Console updated".into(),
+        Reply::Directory(directory) => format!("{} sessions", directory.sessions.len()),
     };
     Ok(CommandOutput {
         command: name,
@@ -260,6 +261,7 @@ fn reply_data(reply: Reply, timed_out: bool) -> serde_json::Value {
         Reply::Listed(agents) => json!({"agents": agents}),
         Reply::Closed(agent) => json!({"agent": agent}),
         Reply::Console(view) => json!({"console": view}),
+        Reply::Directory(directory) => json!({ "directory": directory }),
     }
 }
 

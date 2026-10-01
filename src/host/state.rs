@@ -68,6 +68,22 @@ pub(crate) struct TerminalRecord {
     working_directory: Option<(u64, PathBuf)>,
 }
 
+impl TerminalRecord {
+    /// The title the provider last set, for the session directory.
+    pub(super) fn conversation_title(&self) -> Option<&str> {
+        self.conversation_title
+            .as_ref()
+            .map(|(_, title)| title.as_str())
+    }
+
+    /// The shell-reported working directory, falling back to the launch one.
+    pub(super) fn current_directory(&self) -> &std::path::Path {
+        self.working_directory
+            .as_ref()
+            .map_or(&self.session.launch.working_directory, |(_, path)| path)
+    }
+}
+
 #[derive(Default)]
 struct OutputObservation {
     epoch: u64,
