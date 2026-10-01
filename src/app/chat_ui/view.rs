@@ -1139,7 +1139,7 @@ impl Runtime {
         }
         if !snapshot.subagents.is_empty() {
             let mut chips: Vec<Element<'_, Message>> = vec![
-                widget::button::text("Conversation")
+                widget::button::custom(design::caption("Conversation"))
                     .class(crate::ui_controls::control_style(selected.is_none(), None))
                     .on_press(action(Action::SelectSubagent(target, None)))
                     .into(),

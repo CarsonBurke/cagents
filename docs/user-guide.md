@@ -555,6 +555,15 @@ it was added with (the recorded login is kept; sign that account in again to
 accept the new one, or remove it), and **Same home** or **Same login** when two
 rows are the same directory or signed in to the same login.
 
+For an unchanged **Same login** row, its menu offers **Archive duplicate**.
+This hides the extra account from choices without signing out or deleting its
+credentials, history, or files. Saved conversations keep their original home;
+global and project defaults move to the retained login (preferably the provider's
+own login). To restore an archived account, link its existing home again.
+New managed sign-ins cannot duplicate a listed system, managed, or linked login.
+The account picker compares weekly allowances consistently; the status bar still
+highlights the limit currently constraining the selected account.
+
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies
 remain user-controlled. This policy does not rewrite those settings or an

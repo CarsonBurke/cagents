@@ -19,6 +19,8 @@ impl Cagents {
     }
 
     fn refresh_automation_choices(&mut self) {
+        self.automation_ui
+            .set_archived_accounts(self.automation_archived_account_choices());
         let mut targets = Vec::new();
         for project in &self.sidebar_model.projects {
             let directories: Vec<&Path> = if project.kind == crate::model::ProjectKind::Folder {

@@ -1142,6 +1142,17 @@ fn menu<'a>(
             .into(),
         );
         if account.account.registry_key().is_some() {
+            if let Some(retained) = state.duplicate_to_keep(account) {
+                items.push(
+                    crate::ui_controls::popover_item(
+                        crate::ui_controls::symbolic_icon("folder-symbolic"),
+                        "Archive duplicate",
+                        format!("Keep {}. Preserve this home's login, files and saved sessions. Link its home to restore it.", state.display_name(retained)),
+                        action(Action::ArchiveDuplicate(id.clone())),
+                    )
+                    .into(),
+                );
+            }
             items.push(
                 crate::ui_controls::popover_item(
                     crate::ui_controls::symbolic_icon("list-remove-symbolic"),

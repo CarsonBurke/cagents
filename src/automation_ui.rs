@@ -505,9 +505,15 @@ pub struct State {
     targets: Vec<TargetChoice>,
     accounts: Vec<AccountChoice>,
     models: Models,
+    archived_accounts: Vec<AccountChoice>,
 }
 
 impl State {
+    /// Archived homes remain usable by definitions that already selected them,
+    /// but are never choices when creating a new automation.
+    pub fn set_archived_accounts(&mut self, accounts: Vec<AccountChoice>) {
+        self.archived_accounts = accounts;
+    }
     pub fn can_open_run(&self) -> bool {
         self.draft.is_none()
             && self.confirmation.is_none()
@@ -764,10 +770,16 @@ impl State {
                 return self.request(Pending::Show, Request::Show { id });
             }
             Action::Edit => {
-                self.draft = self
-                    .selected
-                    .as_ref()
-                    .map(|value| Draft::new(&self.targets, &self.accounts, Some(value)))
+                self.draft = self.selected.as_ref().map(|value| {
+                    let mut accounts = self.accounts.clone();
+                    if let Some(saved) = self.archived_accounts.iter().find(|account| {
+                        Some(&account.id) == value.definition.agent.account.as_ref()
+                            && account.provider == value.definition.agent.provider
+                    }) {
+                        accounts.push(saved.clone());
+                    }
+                    Draft::new(&self.targets, &accounts, Some(value))
+                })
             }
             Action::CancelEdit => self.draft = None,
             Action::Save => {
@@ -1020,9 +1032,13 @@ impl State {
             content = content.push(widget::text::body("Updating…"));
         }
         if let Some(confirmation) = &self.confirmation {
-            content = content
-                .push(widget::text::title4(confirmation.title))
-                .push(launch_description(&confirmation.automation, &self.accounts));
+            content =
+                content
+                    .push(widget::text::title4(confirmation.title))
+                    .push(launch_description(
+                        &confirmation.automation,
+                        self.accounts.iter().chain(&self.archived_accounts),
+                    ));
             content = content.push(widget::text::body(if matches!(confirmation.request, Request::Remove { .. }) {
                 "Past runs remain in history. Active or uncertain work must be closed before removal."
             } else {
@@ -1132,7 +1148,10 @@ impl State {
                     if let Some(selected) = &self.selected {
                         content = content
                             .push(widget::text::title4(selected.definition.name.as_str()))
-                            .push(launch_description(selected, &self.accounts))
+                            .push(launch_description(
+                                selected,
+                                self.accounts.iter().chain(&self.archived_accounts),
+                            ))
                             .push(widget::text::body(format!(
                                 "{} · Next: {} ({})",
                                 if selected.enabled {
@@ -1653,11 +1672,10 @@ impl Draft {
 
 fn launch_description<'a>(
     automation: &'a Automation,
-    accounts: &'a [AccountChoice],
+    mut accounts: impl Iterator<Item = &'a AccountChoice>,
 ) -> Element<'a, Action> {
     let definition = &automation.definition;
     let account = accounts
-        .iter()
         .find(|account| Some(&account.id) == definition.agent.account.as_ref())
         .map(|account| account.label.as_str())
         .unwrap_or("Saved account is unavailable");
@@ -2312,6 +2330,34 @@ mod tests {
                 .unwrap_err()
                 .contains("explicit provider account")
         );
+    }
+
+    #[test]
+    fn archived_accounts_remain_editable_only_for_their_existing_automation() {
+        let archived = account("Archived login", Provider::Claude);
+        let mut existing = automation();
+        existing.definition.agent.provider = Provider::Claude;
+        existing.definition.agent.account = Some(archived.id.clone());
+        let mut state = State {
+            selected: Some(existing),
+            ..State::default()
+        };
+        state.set_archived_accounts(vec![archived.clone()]);
+        state.update(Action::Edit);
+        assert_eq!(selected_account(&state), Some("Archived login"));
+        assert_eq!(
+            state
+                .draft
+                .as_ref()
+                .unwrap()
+                .definition(&state.models)
+                .unwrap()
+                .agent
+                .account,
+            Some(archived.id.clone())
+        );
+        state.update(Action::New);
+        assert!(state.draft.as_ref().unwrap().accounts.is_empty());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
