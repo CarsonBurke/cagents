@@ -9,7 +9,8 @@ pub struct SessionsArgs {
     /// List sessions in every project, not just the current one.
     #[arg(long, conflicts_with = "project")]
     all: bool,
-    /// List sessions in the open project containing this path.
+    /// List sessions in the open project with this name, or containing
+    /// this path.
     #[arg(long)]
     project: Option<PathBuf>,
 }
@@ -48,7 +49,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     let scope = if arguments.all {
         Scope::All
     } else if let Some(project) = arguments.project {
-        Scope::Project(std::path::absolute(project).map_err(|e| AppError::new("target", e))?)
+        Scope::Project(super::project_argument(project)?)
     } else {
         Scope::Containing(current_directory()?)
     };

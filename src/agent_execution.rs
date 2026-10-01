@@ -344,7 +344,7 @@ pub enum Operation {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Control {
-    /// Interrupt the latest run if it is still active.
+    /// Interrupt the latest run while it is active.
     Interrupt,
     /// Answer one displayed request with one of its explicit actions.
     Answer {

@@ -293,6 +293,21 @@ pub enum ChannelCommand {
     Close { channel_id: ChannelId },
 }
 
+/// A `--project` value: a path, made absolute, or the name of an open
+/// project, which the daemon looks up. A single word that is no directory
+/// here is a name.
+fn project_argument(value: PathBuf) -> Result<PathBuf, AppError> {
+    let mut components = value.components();
+    let word = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if word && !value.exists() {
+        return Ok(value);
+    }
+    std::path::absolute(value).map_err(|e| AppError::new("target", e))
+}
+
 fn parse_positive_seconds(value: &str) -> Result<f64, String> {
     let seconds = value
         .parse::<f64>()

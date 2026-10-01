@@ -369,3 +369,61 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
     assert_eq!(retry["agent"]["id"], first["agent"]["id"]);
     assert_eq!(retry["run"]["id"], first["run"]["id"]);
 }
+
+#[test]
+fn an_owner_drives_its_agent_by_short_handles() {
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--project",
+        project,
+        "first",
+    ]);
+    assert_eq!(accepted["agent"]["spec"]["target"]["directory"], project);
+    assert!(
+        accepted["idempotency_key"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty())
+    );
+    let agent = &accepted["agent"]["id"].as_str().unwrap()[..8];
+    let run = &accepted["run"]["id"].as_str().unwrap()[..8];
+
+    let waiting = fixture.cli(&["agent", "wait", agent, "--timeout", "10"]);
+    assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
+    let requests = fixture.cli(&["agent", "requests", agent]);
+    assert_eq!(
+        requests["requests"][0]["id"], "console-approval",
+        "{requests}"
+    );
+    let refused = fixture.output(&["agent", "answer", agent, "console-approval", "always"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let answered = fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
+    assert_eq!(answered["requests"], serde_json::json!([]));
+    let completed = fixture.cli(&["agent", "wait", run, "--timeout", "10"]);
+    assert_eq!(completed["run"]["state"], "Succeeded", "{completed}");
+    assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
+
+    let followed = fixture.cli(&[
+        "agent",
+        "send",
+        agent,
+        "second",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    assert_eq!(followed["run"]["state"], "Succeeded", "{followed}");
+    assert_eq!(followed["timed_out"], false);
+    let idle = fixture.output(&["agent", "interrupt", agent]);
+    assert!(!idle.status.success(), "nothing to interrupt: {idle:?}");
+    assert_eq!(
+        fixture.cli(&["agent", "close", agent])["agent"]["closed"],
+        true
+    );
+}

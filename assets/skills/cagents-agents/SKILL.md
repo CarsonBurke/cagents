@@ -15,7 +15,7 @@ metadata:
 
 ```sh
 cagents agent spawn 'Concrete task and completion criteria'      # same provider, current directory
-cagents agent spawn --provider codex --project /abs/repo --directory /abs/repo/.worktrees/x --wait 'Task'
+cagents agent spawn --provider codex --project other-project --wait 'Task'   # project by name or path
 cagents agent list                       # your open agents, with short IDs
 cagents agent status 1a2b                # latest run and the end of its result; --full for all of it
 cagents agent wait 1a2b 9f8e --timeout 300   # until all settle or ask for input; --any for the first
@@ -23,11 +23,11 @@ cagents agent send 1a2b 'Follow-up task' --wait
 cagents agent close 1a2b
 ```
 
-- The provider defaults to yours and the directory to the current one; the repository must already be open in cagents. Optional: `--channel ID`, `--account PROVIDER/system|PROVIDER/UUID`, `--model`, `--permission-mode`, `--reasoning-effort`, `--surface terminal`. Do not weaken permissions to make unattended work proceed. Ask the user rather than guessing a repository, account, or policy.
-- A prompt can also come from `--prompt-file FILE` or standard input (`-`, or piped in). Quote it so the shell passes it as one argument.
+- The provider defaults to yours, the project to the one you are in, and the directory to the current one when it is in that project (otherwise pass `--directory`). The project must already be open in cagents. Optional: `--channel ID`, `--account PROVIDER/system|PROVIDER/UUID`, `--model`, `--permission-mode`, `--reasoning-effort`, `--surface terminal`. Do not weaken permissions to make unattended work proceed. Ask the user rather than guessing a repository, account, or policy.
+- A prompt can also come from `--prompt-file FILE`, or standard input with `-`. Quote it so the shell passes it as one argument.
 - Handles are agent or run IDs, or any unique prefix of one. An agent stands for its latest run. Add `--json` before `agent` for structured output: `data.agent`, `data.run` (`state`, `result.text`, `usage`, `truncated`, `diagnostic`), `data.timed_out`.
-- Each submission has an idempotency key, generated unless you pass `--idempotency-key`, and reported in the JSON. A lost response is retried once automatically with the same key. Retry by hand only with the identical request and key; a timeout is not a reason to submit again.
-- Runs end `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. `Waiting` is not completion: see `cagents agent requests AGENT`, then `cagents agent answer AGENT REQUEST ACTION [--field FIELD=VALUE ...]` using exactly the IDs it lists. Answer questions your task already settles; ask the user before approving anything they would have to approve for you. `cagents agent interrupt AGENT` stops the active run.
+- Each submission has an idempotency key, generated unless you pass `--idempotency-key`, and reported in the JSON or the error. A lost response is retried once automatically with the same key. Retry by hand only with the identical request and that key; a timeout is not a reason to submit again.
+- Runs end `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. `Waiting` is not completion: see `cagents agent requests AGENT`, then `cagents agent answer AGENT REQUEST ACTION [--field FIELD=VALUE ...]` using exactly the IDs it lists. Answer questions your task already settles; ask the user before approving anything they would have to approve for you, and never pass secrets as `--field` values. `cagents agent interrupt AGENT` stops the active run. Once the user takes an agent over, its controls are theirs.
 - Never send more work after `Interrupted`: its effects may already have happened. Inspect, then close or reconcile it.
 - Never infer success from terminal output or an idle look. Close agents you no longer need; children, depth, and concurrent runs are bounded, so handle capacity errors by finishing and closing work.
 

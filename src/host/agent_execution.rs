@@ -816,7 +816,7 @@ pub(super) fn process(
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
         Operation::Requests(id) => {
-            let (_, handle) = owned_provider(host, &authority, id)?;
+            let (_, _, handle) = owned_provider(host, &authority, id)?;
             Ok(Reply::Requests(displayed_requests(&handle)))
         }
         Operation::Control { agent, command } => {
@@ -825,13 +825,14 @@ pub(super) fn process(
     }
 }
 
-/// The live provider of an open agent the caller owns.
+/// The live provider of an open agent the caller owns, and the agent's
+/// latest run.
 fn owned_provider(
     host: &SharedHost,
     authority: &Authority,
     id: AgentId,
-) -> Result<(Agent, chat::runtime::Handle), String> {
-    let (agent, _) = status(host, authority, id)?;
+) -> Result<(Agent, Run, chat::runtime::Handle), String> {
+    let (agent, run) = status(host, authority, id)?;
     if agent.closed {
         return Err("The agent is closed".into());
     }
@@ -843,11 +844,15 @@ fn owned_provider(
         state
             .chats
             .get(&session.id)
-            .filter(|record| !record.handle.is_completed() && record.session.proof == session.proof)
+            .filter(|record| {
+                !record.handle.is_completed()
+                    && HostedSession::Chat(session.clone())
+                        .same_process(&HostedSession::Chat(record.session.clone()))
+            })
             .map(|record| record.handle.clone())
             .ok_or("The agent's provider is no longer live")?
     };
-    Ok((agent, handle))
+    Ok((agent, run, handle))
 }
 
 /// Pending requests as a caller may see them: a secret field's prefilled
@@ -868,7 +873,9 @@ fn hide_secrets(requests: &mut [chat::Request]) {
 
 /// Interrupts or answers an owned agent's provider without a console. The
 /// owner acts as the agent's caller, not as a person taking it over, so the
-/// agent stays under its owner's control afterwards.
+/// agent stays under its owner's control afterwards. Both act only on the
+/// owner's own active run: once a person has taken the agent over, its turns
+/// and the questions they raise are that person's.
 fn control(
     host: &SharedHost,
     authority: &Authority,
@@ -876,11 +883,30 @@ fn control(
     command: crate::agent_execution::Control,
 ) -> Result<Vec<chat::Request>, String> {
     use crate::agent_execution::Control;
+    // Ownership first, so a caller cannot make the daemon keep a gate for an
+    // agent it does not own.
+    status(host, authority, id)?;
     let gate = agent_gate(host, id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-    let (_, handle) = owned_provider(host, authority, id)?;
-    let command = match command {
-        Control::Interrupt => Command::Interrupt,
+    let (_, run, handle) = owned_provider(host, authority, id)?;
+    if registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_is_interactive(id)?
+    {
+        return Err("A person took this agent over; its controls are theirs".into());
+    }
+    if run.state.is_terminal() {
+        return Err(format!(
+            "The agent has no active run; its latest is {:?}",
+            run.state
+        ));
+    }
+    let answered = match command {
+        Control::Interrupt => {
+            handle.interrupt_run(run.id)?;
+            None
+        }
         Control::Answer {
             request_id,
             action,
@@ -907,20 +933,16 @@ fn control(
                     answer.field
                 ));
             }
-            Command::Answer {
-                request_id,
+            handle.command(Command::Answer {
+                request_id: request_id.clone(),
                 action,
                 answers,
-            }
+            })?;
+            Some(request_id)
         }
     };
-    // The provider takes the command asynchronously; an answered request is
-    // no longer the caller's to answer even before the provider drops it.
-    let answered = match &command {
-        Command::Answer { request_id, .. } => Some(request_id.clone()),
-        _ => None,
-    };
-    handle.command(command)?;
+    // An answered request is no longer the caller's to answer, even before the
+    // provider has dropped it.
     let mut requests = displayed_requests(&handle);
     requests.retain(|request| Some(&request.id) != answered.as_ref());
     Ok(requests)

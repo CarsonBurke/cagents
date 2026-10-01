@@ -110,8 +110,9 @@ pub enum AgentCommand {
 /// A prompt given as an argument, in a file, or on standard input.
 #[derive(Debug, clap::Args)]
 pub struct PromptArgs {
-    /// The prompt; `-`, or none with input piped in, reads standard input.
-    #[arg(value_name = "PROMPT")]
+    /// The prompt, which may begin with `-`; a lone `-` reads it from
+    /// standard input.
+    #[arg(value_name = "PROMPT", allow_hyphen_values = true)]
     text: Option<String>,
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
@@ -134,7 +135,7 @@ pub struct WaitArgs {
     #[arg(long)]
     wait: bool,
     /// How long `--wait` waits.
-    #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
+    #[arg(long, default_value = "60", value_parser = parse_positive_seconds, requires = "wait")]
     timeout: f64,
 }
 
@@ -170,10 +171,12 @@ impl PromptArgs {
             (Some(text), ..) | (_, _, Some(text)) => Ok(text),
             (_, Some(file), _) => std::fs::read_to_string(&file)
                 .map_err(|e| AppError::new("prompt", format!("{}: {e}", file.display()))),
-            (None, None, None) if !io::stdin().is_terminal() => read_input(),
+            // Standard input is read only when asked for: a caller whose input
+            // is a pipe that never closes would otherwise wait forever on a
+            // forgotten prompt.
             (None, None, None) => Err(AppError::new(
                 "prompt",
-                "Give a prompt, --prompt-file FILE, or pipe it in",
+                "Give a prompt, --prompt-file FILE, or - to read standard input",
             )),
         }
     }
@@ -201,6 +204,17 @@ impl ShowArgs {
             if hidden == 1 { "" } else { "s" },
             lines[hidden..].join("\n")
         )
+    }
+}
+
+/// The directory a project named without a path works in: the checkout
+/// around a Git repository's metadata, and a folder project itself.
+fn checkout(project: &Path) -> PathBuf {
+    match project.parent() {
+        Some(parent) if project.file_name() == Some(std::ffi::OsStr::new(".git")) => {
+            parent.to_owned()
+        }
+        _ => project.to_owned(),
     }
 }
 
@@ -286,8 +300,10 @@ impl ControlClient {
             if Instant::now() >= deadline {
                 return Ok((replies, true));
             }
+            // A waiting run may be answered and resume, so only a finished
+            // one is known for good.
             for (run, reply) in runs.iter().zip(replies.iter_mut()) {
-                if ready(reply) {
+                if matches!(reply, Reply::Status { run, .. } if run.state.is_terminal()) {
                     continue;
                 }
                 match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
@@ -308,9 +324,10 @@ enum Handle {
 }
 
 /// Resolves a typed handle against the caller's agents and their latest
-/// runs: a whole ID, or a prefix that names exactly one of them. A whole ID
-/// that names none is taken as a run, which may be an older one.
-fn resolve(summaries: &[Summary], handle: &str) -> Result<Handle, AppError> {
+/// runs: a whole ID, or a prefix that names exactly one of them. `None` for
+/// a whole ID that names none of them, which the caller may still know as an
+/// older run or a closed agent.
+fn resolve(summaries: &[Summary], handle: &str) -> Result<Option<Handle>, AppError> {
     let wanted = handle.trim().to_ascii_lowercase();
     if wanted.is_empty() {
         return Err(AppError::new("handle", "An agent or run handle is empty"));
@@ -325,7 +342,7 @@ fn resolve(summaries: &[Summary], handle: &str) -> Result<Handle, AppError> {
             (Handle::Run(summary.run), summary.run.to_string()),
         ] {
             if text == wanted {
-                return Ok(candidate);
+                return Ok(Some(candidate));
             }
             if text.starts_with(&wanted) && !matches.iter().any(|(known, _)| *known == candidate) {
                 matches.push((candidate, text));
@@ -333,9 +350,9 @@ fn resolve(summaries: &[Summary], handle: &str) -> Result<Handle, AppError> {
         }
     }
     match matches.as_slice() {
-        [(handle, _)] => Ok(*handle),
-        [] => match wanted.parse::<RunId>() {
-            Ok(run) => Ok(Handle::Run(run)),
+        [(handle, _)] => Ok(Some(*handle)),
+        [] => match uuid::Uuid::parse_str(&wanted) {
+            Ok(_) => Ok(None),
             Err(_) => Err(AppError::new(
                 "handle",
                 format!("No agent or run of yours starts with {handle}; see agent list"),
@@ -358,32 +375,51 @@ fn resolve(summaries: &[Summary], handle: &str) -> Result<Handle, AppError> {
     }
 }
 
-/// A connected client with the caller's authority, and the caller's agents
-/// once a handle needed them.
+/// The caller's authority and, once a command first needs the daemon, a
+/// connection to it and the caller's agents.
 struct Session {
-    client: ControlClient,
     authority: Authority,
-    socket: PathBuf,
+    connection: Option<(ControlClient, PathBuf)>,
     summaries: Option<Vec<Summary>>,
 }
 
 impl Session {
-    fn connect() -> Result<Self, AppError> {
-        let socket =
-            terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
-        let client =
-            ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-        Ok(Self {
-            client,
+    fn new() -> Self {
+        Self {
             authority: Authority::from_environment(),
-            socket,
+            connection: None,
             summaries: None,
-        })
+        }
+    }
+
+    /// Connects on first use, starting the daemon if it is not running.
+    fn client(&mut self) -> Result<&mut ControlClient, AppError> {
+        if self.connection.is_none() {
+            let socket =
+                terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
+            let client = ControlClient::connect(&socket)
+                .map_err(|e| AppError::new("daemon_connection", e))?;
+            self.connection = Some((client, socket));
+        }
+        Ok(&mut self.connection.as_mut().expect("connected above").0)
     }
 
     fn call(&mut self, operation: Operation) -> Result<Reply, AppError> {
-        self.client
-            .agent(self.authority.clone(), operation)
+        let authority = self.authority.clone();
+        self.client()?
+            .agent(authority, operation)
+            .map_err(protocol_error)
+    }
+
+    fn wait(
+        &mut self,
+        runs: &[RunId],
+        any: bool,
+        timeout: f64,
+    ) -> Result<(Vec<Reply>, bool), AppError> {
+        let authority = self.authority.clone();
+        self.client()?
+            .wait_agents(authority, runs, any, Duration::from_secs_f64(timeout))
             .map_err(protocol_error)
     }
 
@@ -397,15 +433,16 @@ impl Session {
         Ok(self.summaries.as_deref().unwrap_or_default())
     }
 
-    /// An agent handle, or the agent of a run handle. A whole ID is taken
-    /// as an agent without listing.
+    /// An agent handle, or the agent of a run handle. A whole ID outside the
+    /// caller's open agents is taken as an agent, for the daemon to judge.
     fn agent(&mut self, handle: &str) -> Result<AgentId, AppError> {
-        if let Ok(agent) = handle.trim().parse::<AgentId>() {
-            return Ok(agent);
-        }
         match resolve(self.summaries()?, handle)? {
-            Handle::Agent(agent) => Ok(agent),
-            Handle::Run(run) => self
+            None => handle
+                .trim()
+                .parse()
+                .map_err(|e| AppError::new("handle", format!("{handle}: {e}"))),
+            Some(Handle::Agent(agent)) => Ok(agent),
+            Some(Handle::Run(run)) => self
                 .summaries()?
                 .iter()
                 .find(|summary| summary.run == run)
@@ -416,11 +453,16 @@ impl Session {
         }
     }
 
-    /// The latest run of an agent handle, or the run a run handle names.
+    /// The latest run of an agent handle, or the run a run handle names. A
+    /// whole ID outside the caller's open agents is taken as an older run.
     fn run(&mut self, handle: &str) -> Result<RunId, AppError> {
         match resolve(self.summaries()?, handle)? {
-            Handle::Run(run) => Ok(run),
-            Handle::Agent(agent) => self
+            None => handle
+                .trim()
+                .parse()
+                .map_err(|e| AppError::new("handle", format!("{handle}: {e}"))),
+            Some(Handle::Run(run)) => Ok(run),
+            Some(Handle::Agent(agent)) => self
                 .summaries()?
                 .iter()
                 .find(|summary| summary.agent.id == agent)
@@ -433,19 +475,20 @@ impl Session {
 
     /// Submits once, and once more with the same key if the daemon's answer
     /// was lost: the key makes the retry return the first acceptance rather
-    /// than start the work twice.
-    fn submit(&mut self, request: Submit) -> Result<Reply, AppError> {
+    /// than start the work twice. Says whether it retried.
+    fn submit(&mut self, request: Submit) -> Result<(Reply, bool), AppError> {
+        let authority = self.authority.clone();
         match self
-            .client
-            .agent(self.authority.clone(), Operation::Submit(request.clone()))
+            .client()?
+            .agent(authority, Operation::Submit(request.clone()))
         {
-            Ok(reply) => Ok(reply),
+            Ok(reply) => Ok((reply, false)),
             Err(
                 ControlError::Frame(_) | ControlError::ConnectionClosed | ControlError::Connect(_),
             ) => {
-                self.client = ControlClient::connect(&self.socket)
-                    .map_err(|e| AppError::new("daemon_connection", e))?;
-                self.call(Operation::Submit(request))
+                // A new connection, to the daemon that is running now.
+                self.connection = None;
+                Ok((self.call(Operation::Submit(request))?, true))
             }
             Err(error) => Err(protocol_error(error)),
         }
@@ -469,7 +512,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
     if let AgentCommand::Console { agent_id } = command {
         return run_console(agent_id);
     }
-    let mut session = Session::connect()?;
+    let mut session = Session::new();
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
         AgentCommand::Spawn {
@@ -487,32 +530,84 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             wait,
             show,
         } => {
+            let prompt = prompt.read()?;
             let absolute =
                 |path: PathBuf| std::path::absolute(path).map_err(|e| AppError::new("target", e));
-            let repository = repository.map(absolute).transpose()?;
-            // An agent sent to another project works at the path given for
-            // it, and otherwise here.
-            let directory = absolute(match (directory, &repository) {
-                (Some(directory), _) => directory,
-                (None, Some(repository)) => repository.clone(),
-                (None, None) => std::env::current_dir().map_err(|e| AppError::new("target", e))?,
-            })?;
-            // The project is the open one containing the given path, which
-            // may be any directory in it, such as a worktree.
-            let scope = match repository {
-                Some(repository) => Scope::Project(repository),
-                None => Scope::Containing(directory.clone()),
+            let given = directory.map(absolute).transpose()?;
+            let here = match &given {
+                Some(directory) => directory.clone(),
+                None => std::env::current_dir().map_err(|e| AppError::new("target", e))?,
             };
-            let (repository, caller) = session.context(scope)?;
-            let repository = repository.ok_or_else(|| {
-                AppError::new(
-                    "target",
-                    format!(
-                        "No open project contains {}; open it in cagents or pass --project",
-                        directory.display()
-                    ),
-                )
-            })?;
+            let (containing, caller) = session.context(Scope::Containing(here.clone()))?;
+            let (repository, directory) = match repository {
+                None => {
+                    let repository = containing.ok_or_else(|| {
+                        AppError::new(
+                            "target",
+                            format!(
+                                "No open project contains {}; open it in cagents or pass --project",
+                                here.display()
+                            ),
+                        )
+                    })?;
+                    (repository, here)
+                }
+                Some(project) => {
+                    let project = super::project_argument(project)?;
+                    let named =
+                        session
+                            .context(Scope::Project(project.clone()))
+                            .and_then(|(named, _)| {
+                                named.ok_or_else(|| {
+                                    AppError::new(
+                                        "target",
+                                        format!("No open project is {}", project.display()),
+                                    )
+                                })
+                            });
+                    match given {
+                        // A target given in full is sent as given, so retrying
+                        // it stays exact even after its directory has moved;
+                        // only a directory known to be elsewhere is refused.
+                        Some(_) => {
+                            if let (Ok(named), Some(containing)) = (&named, &containing)
+                                && named != containing
+                            {
+                                return Err(AppError::new(
+                                    "target",
+                                    format!(
+                                        "{} is not in the project {}",
+                                        here.display(),
+                                        named.display()
+                                    ),
+                                ));
+                            }
+                            let repository = if project.is_absolute() {
+                                project
+                            } else {
+                                named?
+                            };
+                            (repository, here)
+                        }
+                        // An agent sent to the project this one is working in
+                        // works here, as in a worktree; one sent elsewhere works
+                        // at the path given for it.
+                        None => {
+                            let named = named?;
+                            if containing.as_ref() == Some(&named) {
+                                (named, here)
+                            } else {
+                                let directory = if project.is_absolute() {
+                                    project
+                                } else {
+                                    checkout(&named)
+                                };
+                                (named, directory)
+                            }
+                        }
+                    }
+                }
+            };
             let provider = provider.or(caller).ok_or_else(|| {
                 AppError::new("agent_request", "Choose --provider claude, codex, or omp")
             })?;
@@ -534,7 +629,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                     permission_mode,
                     reasoning_effort,
                 }),
-                prompt: prompt.read()?,
+                prompt,
                 idempotency_key: retry.key(),
             };
             submitted(&mut session, "agent.spawn", request, wait, show)
@@ -546,9 +641,10 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
             wait,
             show,
         } => {
+            let prompt = prompt.read()?;
             let request = Submit {
                 destination: Destination::Existing(session.agent(&agent)?),
-                prompt: prompt.read()?,
+                prompt,
                 idempotency_key: retry.key(),
             };
             submitted(&mut session, "agent.send", request, wait, show)
@@ -600,15 +696,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 .iter()
                 .map(|handle| session.run(handle))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (replies, timed_out) = session
-                .client
-                .wait_agents(
-                    session.authority.clone(),
-                    &runs,
-                    any,
-                    Duration::from_secs_f64(timeout),
-                )
-                .map_err(protocol_error)?;
+            let (replies, timed_out) = session.wait(&runs, any, timeout)?;
             let statuses = replies
                 .into_iter()
                 .map(status_reply)
@@ -710,12 +798,28 @@ fn submitted(
         .validate()
         .map_err(|e| AppError::new("agent_request", e))?;
     let key = request.idempotency_key.clone();
-    let Reply::Accepted(accepted) = session.submit(request)? else {
+    // Whether a failed submission was accepted is unknown, so the key that
+    // makes retrying it safe goes with the error.
+    let (reply, retried) = session.submit(request).map_err(|mut error| {
+        error.message = format!(
+            "{}; retry with --idempotency-key {key} to avoid starting the work twice",
+            error.message
+        );
+        let mut details = match error.details.take() {
+            Some(Value::Object(details)) => details,
+            _ => serde_json::Map::new(),
+        };
+        details.insert("idempotency_key".into(), json!(key));
+        error.details = Some(Value::Object(details));
+        error
+    })?;
+    let Reply::Accepted(accepted) = reply else {
         return Err(AppError::new(command, "Unexpected submit response"));
     };
     let mut human = format!(
         "{} agent {} run {}",
-        if accepted.created {
+        // The retry finds the work this invocation's lost attempt accepted.
+        if accepted.created || retried {
             "Accepted"
         } else {
             "Already accepted"
@@ -730,15 +834,7 @@ fn submitted(
         "idempotency_key": key,
     });
     if wait.wait {
-        let (mut replies, timed_out) = session
-            .client
-            .wait_agents(
-                session.authority.clone(),
-                &[accepted.run.id],
-                false,
-                Duration::from_secs_f64(wait.timeout),
-            )
-            .map_err(protocol_error)?;
+        let (mut replies, timed_out) = session.wait(&[accepted.run.id], false, wait.timeout)?;
         let (agent, run) = status_reply(replies.remove(0))?;
         human = status_lines(&agent, &run, timed_out, show);
         data["agent"] = json!(agent);
@@ -1069,6 +1165,30 @@ mod tests {
             Cli::try_parse_from(["cagents", "agent", "spawn", "a", "--prompt", "b"]).is_err(),
             "one prompt source"
         );
+        let AgentCommand::Spawn { prompt, wait, .. } =
+            parse(&["spawn", "--wait", "- fix the parser\n- add tests"])
+        else {
+            panic!("agent spawn")
+        };
+        assert_eq!(prompt.read().unwrap(), "- fix the parser\n- add tests");
+        assert!(wait.wait);
+        let AgentCommand::Spawn { prompt, wait, .. } = parse(&["spawn", "--flag-like", "--wait"])
+        else {
+            panic!("agent spawn")
+        };
+        assert_eq!(prompt.read().unwrap(), "--flag-like");
+        assert!(wait.wait);
+        assert!(
+            Cli::try_parse_from(["cagents", "agent", "spawn", "--timeout", "5", "work"]).is_err(),
+            "a timeout means nothing without --wait"
+        );
+        let AgentCommand::Spawn { prompt, .. } = parse(&["spawn", "--provider", "codex"]) else {
+            panic!("agent spawn")
+        };
+        assert!(
+            prompt.read().is_err(),
+            "standard input is read only when asked for"
+        );
     }
 
     #[test]
@@ -1173,32 +1293,43 @@ mod tests {
             ),
         ];
         let first = summaries[0].agent.id;
-        assert_eq!(resolve(&summaries, "1a2b3").unwrap(), Handle::Agent(first));
+        let resolved = |handle: &str| resolve(&summaries, handle).unwrap();
+        assert_eq!(resolved("1a2b3"), Some(Handle::Agent(first)));
+        assert_eq!(resolved(" 1A2B3C "), Some(Handle::Agent(first)));
+        assert_eq!(resolved("9f8e"), Some(Handle::Run(summaries[0].run)));
+        assert_eq!(resolved(&first.to_string()), Some(Handle::Agent(first)));
         assert_eq!(
-            resolve(&summaries, " 1A2B3C ").unwrap(),
-            Handle::Agent(first)
-        );
-        assert_eq!(
-            resolve(&summaries, "9f8e").unwrap(),
-            Handle::Run(summaries[0].run)
-        );
-        assert_eq!(
-            resolve(&summaries, &first.to_string()).unwrap(),
-            Handle::Agent(first)
+            resolved(&summaries[1].run.to_string()),
+            Some(Handle::Run(summaries[1].run)),
+            "a whole run ID is a run, though it parses as an agent ID too"
         );
         let ambiguous = resolve(&summaries, "1a2b").unwrap_err().message;
         assert!(
             ambiguous.contains("agent 1a2b3c4d-000") && ambiguous.contains("agent 1a2b9999-000"),
             "{ambiguous}"
         );
-        let older = "77777777-0000-4000-8000-000000000003";
         assert_eq!(
-            resolve(&summaries, older).unwrap(),
-            Handle::Run(older.parse().unwrap()),
-            "a whole ID outside the list is an older run"
+            resolved("77777777-0000-4000-8000-000000000003"),
+            None,
+            "a whole ID outside the list is left to the command"
         );
         assert!(resolve(&summaries, "zzzz").is_err());
         assert!(resolve(&summaries, "").is_err());
+    }
+
+    #[test]
+    fn projects_are_named_or_located() {
+        let name = super::super::project_argument("no-such-project-here".into()).unwrap();
+        assert_eq!(name, Path::new("no-such-project-here"), "a word is a name");
+        let nested = super::super::project_argument("no/such/place".into()).unwrap();
+        assert!(nested.is_absolute(), "a path is a path, existing or not");
+        let here = super::super::project_argument("src".into()).unwrap();
+        assert!(
+            here.is_absolute() && here.ends_with("src"),
+            "an existing word is a path"
+        );
+        assert_eq!(checkout(Path::new("/repo/.git")), Path::new("/repo"));
+        assert_eq!(checkout(Path::new("/notes")), Path::new("/notes"));
     }
 
     #[test]

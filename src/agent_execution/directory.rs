@@ -22,8 +22,9 @@ pub enum Scope {
     /// Sessions in the project that contains this directory. A directory
     /// outside every open project widens to `All`, and the reply says so.
     Containing(PathBuf),
-    /// Sessions in this open project, identified by its repository key or by
-    /// any directory inside it.
+    /// Sessions in this open project, identified by its repository key, by
+    /// any directory inside it, or, as a relative path of one component, by
+    /// its name.
     Project(PathBuf),
     All,
 }
