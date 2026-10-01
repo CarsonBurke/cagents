@@ -813,7 +813,7 @@ impl Cagents {
                 let expected_job = self.update_ui.job.as_ref().map(|job| job.id.clone());
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(|| {
-                        crate::update::status().map_err(|error| error.to_string())
+                        crate::update::status_for_ui().map_err(|error| error.to_string())
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -848,12 +848,14 @@ impl Cagents {
                     Ok(None) => {
                         self.update_ui.poll_retry = self.update_ui.updating();
                         if !self.update_ui.poll_retry {
-                            self.update_ui.job = None;
+                            if self.update_ui.job.take().is_some() {
+                                self.update_ui.error = None;
+                            }
                         } else if let Some(job) = &mut self.update_ui.job {
                             job.confirmation = None;
                         }
                         self.update_ui.confirmation = None;
-                        if expected_job.is_some() {
+                        if self.update_ui.poll_retry && expected_job.is_some() {
                             self.update_ui.error = Some("Update status is unavailable".into());
                         }
                     }
@@ -926,6 +928,36 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reconciled_historical_failure_clears_the_live_warning() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.update_ui.job = Some(UpdateJob {
+            id: "historical-failure".into(),
+            version: "0.1.3+local.old".into(),
+            phase: UpdatePhase::Failed,
+            message: "installed daemon startup failed".into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+        });
+        app.update_ui.error = Some("installed daemon startup failed".into());
+        drop(app.update_update_ui(Action::Polled(Some("historical-failure".into()), Ok(None))));
+        assert!(app.update_ui.job.is_none());
+        assert!(app.update_ui.error.is_none());
+        assert!(!app.update_ui.poll_retry);
+        assert!(!app.has_update_control());
+    }
+
+    #[test]
+    fn an_update_that_failed_before_creating_a_job_keeps_its_warning() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.update_update_ui(Action::Applied(Err("Could not start update".into()))));
+        drop(app.update_update_ui(Action::Polled(None, Ok(None))));
+        assert_eq!(
+            app.update_ui.error.as_deref(),
+            Some("Could not start update")
+        );
+    }
 
     #[test]
     fn a_background_check_that_cannot_connect_stays_quiet_and_backs_off() {

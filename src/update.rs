@@ -699,6 +699,71 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
     Ok(Some(job))
 }
 
+/// Keep historical diagnostics available to the CLI without showing a resolved
+/// installation failure as a warning in every subsequently installed window.
+#[cfg(feature = "ui")]
+pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+    let Some(job) = status()? else {
+        return Ok(None);
+    };
+    // Failed local builds cannot be ordered by their metadata. A later switch
+    // of `current`, followed by a healthy matched application set, demonstrates
+    // supersession; a rollback before the failure was recorded does not.
+    let superseded = (|| -> Result<bool, UpdateError> {
+        if job.phase != UpdatePhase::Failed {
+            return Ok(false);
+        }
+        let window = locate(&std::env::current_exe()?)?;
+        let failed = fs::symlink_metadata(window.prefix.join(".update/status.json"))?;
+        let current = fs::symlink_metadata(window.prefix.join("current"))?;
+        let switched_after_failure = current.file_type().is_symlink()
+            && (current.ctime(), current.ctime_nsec()) > (failed.ctime(), failed.ctime_nsec());
+        let served = served_version_root(&window)?;
+        let daemon = installed_daemon_owner(&window)?;
+        if !failed_job_is_superseded(
+            &job,
+            &window,
+            &served,
+            daemon.as_ref(),
+            switched_after_failure,
+        ) {
+            return Ok(false);
+        }
+        let socket = crate::terminal_ipc::daemon_socket_path()?;
+        let mut client = crate::control::ControlClient::connect(&socket)
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(client
+            .daemon_version()
+            .map_err(|error| invalid(error.to_string()))?
+            == window.version)
+    })()
+    // Missing evidence or an incompatible/starting daemon keeps the failure
+    // visible. Reconciliation must never conceal an unresolved replacement.
+    .unwrap_or(false);
+    Ok((!superseded).then_some(job))
+}
+
+#[cfg(any(feature = "ui", test))]
+fn failed_job_is_superseded(
+    job: &UpdateJob,
+    window: &InstallLayout,
+    served: &Path,
+    daemon: Option<&InstallLayout>,
+    switched_after_failure: bool,
+) -> bool {
+    job.phase == UpdatePhase::Failed
+        && switched_after_failure
+        && job.version != window.version
+        && window.version_root == served
+        && daemon.is_some_and(|owner| {
+            owner.prefix == window.prefix && owner.version_root == window.version_root
+        })
+        && installed_version(&job.version)
+            .ok()
+            .zip(installed_version(&window.version).ok())
+            .is_some_and(|(target, running)| target <= running)
+}
+
 /// The installed UI executable, when the installation this window runs from has
 /// since switched `current` to another version.
 ///
@@ -1637,6 +1702,67 @@ mod tests {
         )
         .unwrap();
         fs::rename(root.join("current-next"), root.join("current")).unwrap();
+    }
+
+    #[test]
+    fn a_failed_build_requires_a_later_matched_installation_to_be_superseded() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let old = "0.1.3+local.old";
+        let current = "0.1.3+local.current";
+        install_tree(root, &[old, current], current);
+        let window = locate(&root.join("current/bin/cagents-ui")).unwrap();
+        let owner = locate(&root.join("current/bin/cagentsd")).unwrap();
+        let served = served_version_root(&window).unwrap();
+        let mut job = UpdateJob {
+            id: "historical-failure".into(),
+            version: old.into(),
+            phase: UpdatePhase::Failed,
+            message: "installed daemon startup failed".into(),
+            log_path: root.join(".update/historical-failure.log"),
+            confirmation: None,
+        };
+        let superseded = |job: &UpdateJob, switched| {
+            failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
+        };
+        assert!(superseded(&job, true));
+        assert!(
+            !superseded(&job, false),
+            "a rollback does not resolve its failure"
+        );
+        job.version = "0.1.4".into();
+        assert!(
+            !superseded(&job, true),
+            "a failed newer release remains actionable"
+        );
+        job.version = current.into();
+        assert!(
+            !superseded(&job, true),
+            "the running build can still have failed"
+        );
+        job.version = "0.1.2".into();
+        assert!(superseded(&job, true));
+        job.version = "invalid".into();
+        assert!(!superseded(&job, true));
+        job.version = old.into();
+        job.phase = UpdatePhase::Installing;
+        assert!(!superseded(&job, true), "never filter a live operation");
+        job.phase = UpdatePhase::Failed;
+        assert!(!failed_job_is_superseded(
+            &job, &window, &served, None, true
+        ));
+        let old_owner = locate(&root.join("versions").join(old).join("bin/cagentsd")).unwrap();
+        assert!(!failed_job_is_superseded(
+            &job,
+            &window,
+            &served,
+            Some(&old_owner),
+            true
+        ));
+        assert!(
+            !failed_job_is_superseded(&job, &old_owner, &served, Some(&owner), true),
+            "an old window still needs replacing"
+        );
     }
 
     #[test]
