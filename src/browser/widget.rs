@@ -655,6 +655,7 @@ impl<'a, Message: Clone + 'a> From<BrowserWidget<'a, Message>> for Element<'a, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::iced::advanced::renderer::Headless;
 
     #[test]
     fn wheel_uses_current_visible_hit_without_requiring_a_previous_pointer_move() {
