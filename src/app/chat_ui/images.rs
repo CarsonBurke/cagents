@@ -177,6 +177,8 @@ impl Runtime {
             .content_fit(iced::ContentFit::Contain);
         widget::column::with_children(vec![
             widget::button::custom(preview)
+                .class(crate::ui_controls::control_style(false, None))
+                .padding(0)
                 .on_press(action(Action::OpenImage(self.target, item.id.clone())))
                 .width(Length::Fill)
                 .into(),
