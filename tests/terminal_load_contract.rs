@@ -47,7 +47,12 @@ fn terminal_session(script: &str) -> TerminalSession {
         program: "/bin/sh".into(),
         arguments: vec!["-c".into(), script.into()],
         working_directory: std::env::temp_dir(),
-        environment: BTreeMap::new(),
+        // A shell may run any agent, so the host offers it the bundled skill
+        // under HOME. A missing home keeps that out of the developer's own.
+        environment: BTreeMap::from([(
+            "HOME".into(),
+            "/nonexistent/cagents-terminal-load-contract".into(),
+        )]),
     };
 
     TerminalSession {

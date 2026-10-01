@@ -57,11 +57,45 @@ pub(crate) fn install(
         });
     }
     for (root, create_root) in roots {
+        #[cfg(test)]
+        if in_account_home(&root) {
+            continue;
+        }
         if let Err(error) = install_at(&root, create_root) {
             tracing::warn!(path = %root.join("skills").join(NAME).join("SKILL.md").display(), %error,
                 "cannot install bundled agent skill; cagents --json agent remains available");
         }
     }
+}
+
+/// Unit tests launch providers and shells with the developer's inherited
+/// environment, `CLAUDE_CONFIG_DIR` included. Only fixture roots outside the
+/// account's home may receive the bundle; an account that cannot be looked up
+/// refuses every root.
+#[cfg(test)]
+fn in_account_home(root: &Path) -> bool {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = vec![0; 16 * 1024];
+    let mut found = std::ptr::null_mut();
+    // SAFETY: each pointer refers to live storage of the size given.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() {
+        return true;
+    }
+    // SAFETY: a found entry is initialized and its strings live in `buffer`.
+    let directory = unsafe { CStr::from_ptr(entry.assume_init_ref().pw_dir) };
+    let account = Path::new(std::ffi::OsStr::from_bytes(directory.to_bytes()));
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    canonical(root).starts_with(canonical(account))
 }
 
 fn install_at(root: &Path, create_root: bool) -> io::Result<()> {
