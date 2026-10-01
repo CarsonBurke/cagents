@@ -743,6 +743,15 @@ impl Handle {
             state.ready,
         )
     }
+    /// Pending questions and approvals, read without loading the transcript.
+    pub(crate) fn requests(&self) -> Vec<super::Request> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .requests
+            .clone()
+    }
     /// The provider-reported title, read without loading the transcript.
     pub(crate) fn title(&self) -> Option<String> {
         self.0

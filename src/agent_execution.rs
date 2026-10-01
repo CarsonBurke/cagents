@@ -333,6 +333,25 @@ pub enum Operation {
     },
     /// Read the caller and the sessions in a scope. Grants no control.
     Directory(directory::Scope),
+    /// The latest run's pending questions and approvals. Owner only.
+    Requests(AgentId),
+    /// Act on the latest run without a console. Owner only.
+    Control {
+        agent: AgentId,
+        command: Control,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Control {
+    /// Interrupt the latest run if it is still active.
+    Interrupt,
+    /// Answer one displayed request with one of its explicit actions.
+    Answer {
+        request_id: String,
+        action: String,
+        answers: Vec<chat::Answer>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -373,6 +392,8 @@ pub enum Reply {
     Closed(Agent),
     Console(Option<ConsoleView>),
     Directory(directory::Directory),
+    /// Requests still pending after a read or a control.
+    Requests(Vec<chat::Request>),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
