@@ -3450,6 +3450,55 @@ mod tests {
     }
 
     #[test]
+    fn opening_card_contents_are_not_built_until_their_space_is_ready() {
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(900.0);
+        let first = CardId::new();
+        let opening = CardId::new();
+        workspace
+            .add_card(
+                WorkspaceCard::new(first, "First", CardWidth::Fixed(300.0)).unwrap(),
+                0,
+                true,
+            )
+            .unwrap();
+        workspace
+            .add_card(
+                WorkspaceCard::new(opening, "Opening", CardWidth::Fixed(300.0)).unwrap(),
+                1,
+                true,
+            )
+            .unwrap();
+        let built = std::cell::RefCell::new(Vec::new());
+        let shortcuts = KeyboardShortcuts::default();
+        let input = InputTrace::default();
+        let render = |workspace: &Workspace| {
+            let element: Element<'_, ()> = view(
+                workspace,
+                &shortcuts,
+                FocusedPane::Other,
+                false,
+                &input,
+                900.0,
+                widget::Id::unique(),
+                |context| {
+                    built.borrow_mut().push(context.id);
+                    widget::Space::new().into()
+                },
+                card_widget_id,
+                Events { viewport: |_| () },
+            );
+            drop(element);
+            built.take()
+        };
+        assert_eq!(render(&workspace), [first]);
+        workspace.tick(Duration::from_millis(219));
+        assert_eq!(render(&workspace), [first]);
+        workspace.tick(Duration::from_millis(1));
+        assert_eq!(render(&workspace), [first, opening]);
+    }
+
+    #[test]
     fn composed_workspace_view_exposes_every_mounted_card_to_a_screen_reader() {
         use cosmic::iced::advanced::renderer::Headless;
         use iced_accessibility::A11yId;

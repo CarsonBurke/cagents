@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -600,6 +605,9 @@ pub struct Workspace {
     viewport_width: f32,
     geometry: StripGeometry,
     layout_transition: Option<LayoutTransition>,
+    /// New panes reserve animated space before mounting their contents. This
+    /// survives retargeting so rapid insertions never expose a partial slot.
+    opening: HashSet<CardId>,
     camera: Camera,
     scroll_sync: Option<ScrollSync>,
     visibility: HashMap<CardId, VisibilityClass>,
@@ -620,6 +628,7 @@ impl Workspace {
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
             layout_transition: None,
+            opening: HashSet::new(),
             camera: Camera::new(config.animation_omega)?,
             scroll_sync: None,
             visibility: HashMap::new(),
@@ -678,6 +687,10 @@ impl Workspace {
 
     pub fn is_animating(&self) -> bool {
         self.camera.is_animating() || self.layout_transition.is_some()
+    }
+
+    pub fn is_opening(&self, id: CardId) -> bool {
+        self.opening.contains(&id)
     }
 
     pub fn presentation_geometry(&self) -> &StripGeometry {
@@ -820,7 +833,20 @@ impl Workspace {
         if focus {
             self.reveal_focused();
         }
-        Ok(self.refresh_visibility(false))
+        let mut update = self.refresh_visibility(false);
+        if self.opening.contains(&id) {
+            // New app cards start with visible durable exposure. Report the
+            // reserved slot as offscreen before their runtime can hydrate.
+            update.transitions.push(VisibilityTransition {
+                id,
+                from: VisibilityClass::Visible,
+                to: VisibilityClass::Offscreen,
+            });
+            update
+                .transitions
+                .sort_unstable_by_key(|transition| self.card_indices.get(&transition.id).copied());
+        }
+        Ok(update)
     }
 
     pub fn set_card_width(
@@ -1232,6 +1258,9 @@ impl Workspace {
             .clone()
             .filter_map(|index| {
                 let card = geometry.card_at(index)?;
+                if self.opening.contains(&card.id) {
+                    return None;
+                }
                 let visibility = if bands.visible.contains(&index) {
                     VisibilityClass::Visible
                 } else {
@@ -1335,6 +1364,13 @@ impl Workspace {
             geometry: self.geometry.clone(),
             elapsed: Duration::ZERO,
         };
+        self.opening.extend(
+            self.geometry
+                .cards()
+                .iter()
+                .filter(|card| !widths.contains_key(&card.id))
+                .map(|card| card.id),
+        );
         Self::interpolate_layout(
             &mut transition,
             &self.geometry,
@@ -1403,6 +1439,15 @@ impl Workspace {
     }
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
+        let previous_opening = self.opening.len();
+        if self.layout_transition.is_none() {
+            self.opening.clear();
+        } else {
+            self.opening.retain(|id| self.card_indices.contains_key(id));
+        }
+        if self.opening.len() != previous_opening {
+            self.visibility_bands = None;
+        }
         let bands = visibility_bands(
             self.presentation_geometry(),
             self.camera.offset(),
@@ -1421,7 +1466,8 @@ impl Workspace {
             let mounted = self
                 .card_indices
                 .get(id)
-                .is_some_and(|index| bands.mounted.contains(index));
+                .is_some_and(|index| bands.mounted.contains(index))
+                && !self.opening.contains(id);
             if !mounted {
                 transitions.push(VisibilityTransition {
                     id: *id,
@@ -1433,6 +1479,9 @@ impl Workspace {
         });
         for index in bands.mounted.clone() {
             let id = self.geometry.cards[index].id;
+            if self.opening.contains(&id) {
+                continue;
+            }
             let class = if bands.visible.contains(&index) {
                 VisibilityClass::Visible
             } else {
@@ -1716,7 +1765,12 @@ mod tests {
         let second = workspace.order().nth(1).unwrap();
         let inserted = card(CardWidth::Fixed(300.0));
         let inserted_id = inserted.id;
-        workspace.add_card(inserted, 1, true).unwrap();
+        let update = workspace.add_card(inserted, 1, true).unwrap();
+        assert!(update.transitions.contains(&VisibilityTransition {
+            id: inserted_id,
+            from: VisibilityClass::Visible,
+            to: VisibilityClass::Offscreen,
+        }));
         let initial = workspace
             .presentation_geometry()
             .card(second)
@@ -1725,7 +1779,17 @@ mod tests {
         let target = workspace.geometry().card(second).unwrap().start;
         assert!(initial < target);
         assert_eq!(workspace.focused(), Some(inserted_id));
-        assert_eq!(workspace.take_widget_focus_request(), Some(inserted_id));
+        assert_eq!(workspace.take_widget_focus_request(), None);
+        assert_eq!(
+            workspace.visibility(inserted_id),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(
+            !workspace
+                .projection(900.0)
+                .mounted_ids()
+                .any(|id| id == inserted_id)
+        );
         workspace.tick(Duration::from_millis(80));
         let intermediate = workspace
             .presentation_geometry()
@@ -1734,7 +1798,30 @@ mod tests {
             .start;
         assert!(intermediate > initial && intermediate < target);
         assert!(workspace.projection(900.0).mounted_are_disjoint());
+        assert!(
+            !workspace
+                .projection(900.0)
+                .mounted_ids()
+                .any(|id| id == inserted_id)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), None);
         workspace.tick(LAYOUT_DURATION);
+        let revealed = workspace.projection(900.0);
+        let pane = revealed
+            .mounted
+            .iter()
+            .find(|pane| pane.id == inserted_id)
+            .unwrap();
+        assert_eq!(
+            pane.width,
+            workspace
+                .geometry()
+                .card(inserted_id)
+                .unwrap()
+                .width_within_boundaries()
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(inserted_id));
+        assert_eq!(workspace.take_widget_focus_request(), None);
         assert_eq!(
             workspace
                 .presentation_geometry()
@@ -1752,6 +1839,96 @@ mod tests {
         }
         assert!(!workspace.is_animating());
         assert_eq!(workspace.focused(), Some(inserted_id));
+    }
+
+    #[test]
+    fn opening_panes_stay_unmounted_across_rapid_insertions_and_width_retargets() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0)], 1200.0);
+        let first = card(CardWidth::Fixed(300.0));
+        let first_id = first.id;
+        workspace.add_card(first, 1, true).unwrap();
+        workspace.tick(Duration::from_millis(80));
+        let second = card(CardWidth::Fixed(300.0));
+        let second_id = second.id;
+        workspace.add_card(second, 2, true).unwrap();
+        workspace.tick(Duration::from_millis(80));
+        workspace
+            .animate_card_width(first_id, CardWidth::Fixed(350.0))
+            .unwrap();
+        for _ in 0..13 {
+            workspace.tick(Duration::from_millis(16));
+            let projection = workspace.projection(1200.0);
+            assert!(projection.mounted_are_disjoint());
+            assert!(
+                !projection
+                    .mounted_ids()
+                    .any(|id| id == first_id || id == second_id)
+            );
+            assert_eq!(workspace.take_widget_focus_request(), None);
+        }
+        let update = workspace.tick(Duration::from_millis(12));
+        for id in [first_id, second_id] {
+            assert!(
+                workspace
+                    .projection(1200.0)
+                    .mounted_ids()
+                    .any(|mounted| mounted == id)
+            );
+            assert!(
+                update
+                    .transitions
+                    .iter()
+                    .any(|transition| transition.id == id && transition.to.is_mounted())
+            );
+        }
+        assert_eq!(workspace.take_widget_focus_request(), Some(second_id));
+    }
+
+    #[test]
+    fn canceled_opening_mounts_at_full_size_and_removed_openings_never_reappear() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0)], 900.0);
+        let opening = card(CardWidth::Fixed(300.0));
+        let id = opening.id;
+        workspace.add_card(opening, 1, true).unwrap();
+        workspace.resize_viewport(1000.0);
+        assert!(
+            workspace
+                .projection(1000.0)
+                .mounted_ids()
+                .any(|mounted| mounted == id)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(id));
+        let removed = card(CardWidth::Fixed(300.0));
+        let removed_id = removed.id;
+        workspace.add_card(removed, 2, true).unwrap();
+        workspace.request_close(removed_id).unwrap();
+        workspace.commit_close(removed_id).unwrap();
+        workspace.tick(LAYOUT_DURATION);
+        assert!(workspace.card(removed_id).is_none());
+        assert!(
+            !workspace
+                .projection(1000.0)
+                .mounted_ids()
+                .any(|mounted| mounted == removed_id)
+        );
+        assert!(workspace.opening.is_empty());
+    }
+
+    #[test]
+    fn first_pane_has_its_space_immediately() {
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(900.0);
+        let first = card(CardWidth::Fixed(300.0));
+        let id = first.id;
+        workspace.add_card(first, 0, true).unwrap();
+        assert!(!workspace.is_animating());
+        assert!(
+            workspace
+                .projection(900.0)
+                .mounted_ids()
+                .any(|mounted| mounted == id)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(id));
     }
     #[test]
     fn held_navigation_reaches_the_strip_edge_without_restarting_the_camera() {

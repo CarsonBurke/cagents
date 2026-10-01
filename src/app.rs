@@ -5430,7 +5430,13 @@ impl Cagents {
                 // button. Once the terminal is mounted, move keyboard focus
                 // to its input surface; otherwise that button consumes the
                 // first Enter even though typed characters reach the PTY.
-                if self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
+                if self.workspace.focused() == Some(card)
+                    && self
+                        .workspace
+                        .visibility(card)
+                        .is_some_and(VisibilityClass::is_mounted)
+                    && !self.workspace_inputs_blocked()
+                {
                     tasks.push(
                         iced::widget::operation::focus(self.card_keyboard_focus(card))
                             .map(cosmic::Action::App),
@@ -7656,6 +7662,19 @@ impl Cagents {
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         tasks.push(self.acknowledge_active_pane());
+        if focused.is_some_and(|id| self.workspace.is_opening(id))
+            && (focus_changed
+                || update.transitions.iter().any(|transition| {
+                    Some(transition.id) == focused && transition.to == VisibilityClass::Offscreen
+                }))
+        {
+            // Do not leave keyboard input in the previous pane while the new
+            // one is still reserving its space. Its own focus request waits.
+            tasks.push(
+                iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                    .map(cosmic::Action::App),
+            );
+        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
