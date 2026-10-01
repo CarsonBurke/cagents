@@ -752,6 +752,19 @@ impl ControlClient {
         }
     }
 
+    pub fn prepare_chat_resume(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<crate::chat::Session, ControlError> {
+        match self.request_strict(ClientRequest::ChatPrepareResume { source })? {
+            ServerResponse::ChatResumePrepared { session } => Ok(session),
+            response => Err(unexpected_response(
+                "a prepared conversation resume",
+                &response,
+            )),
+        }
+    }
+
     pub fn resolve_upgrade_chat(
         &mut self,
         source: crate::chat::Session,
@@ -1547,6 +1560,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
         ServerResponse::WorkspaceModel { .. } => "workspace_model",
+        ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
     }
 }
 

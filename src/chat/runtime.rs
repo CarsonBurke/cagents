@@ -121,6 +121,7 @@ struct Inner {
     recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
+    retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -271,6 +272,7 @@ impl Handle {
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
+        let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -294,6 +296,7 @@ impl Handle {
             recovery_environment,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
+            retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -451,7 +454,9 @@ impl Handle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) = holder.close() {
+                    } else if let Err(error) =
+                        holder.close_inner(retain_cleanup_receipt.load(Ordering::Acquire))
+                    {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -793,6 +798,16 @@ impl Handle {
         self.close_inner(true)
     }
 
+    pub(crate) fn close_for_resume(&self) -> Result<(), String> {
+        if matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            self.0.retain_cleanup_receipt.store(true, Ordering::Release);
+        }
+        self.close()
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -826,7 +841,7 @@ impl Handle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close()?;
+                holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
             }
@@ -838,7 +853,11 @@ impl Handle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(owner) = detached.as_ref() {
-                owner.close()?;
+                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
+                    owner.close_retaining_receipt()?;
+                } else {
+                    owner.close()?;
+                }
                 detached.take();
             }
         }
@@ -1508,6 +1527,9 @@ impl Actor {
                 Command::Prompt { .. }
                 | Command::Compact
                 | Command::Slash { .. }
+                | Command::UpdateQueued { .. }
+                | Command::StartQueued { .. }
+                | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::Answer { action, .. } => !matches!(
                     action.as_str(),
@@ -1896,7 +1918,13 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::LatestHistoryStarted => state.history_loading = true,
         Event::HistoryError(message) => state.error = Some(message),
         Event::HistoryRecovered => {}
+        Event::InterruptMode(mode) => state.interrupt_mode = Some(mode),
+        Event::BranchPoints(points) => state.branch_points = points,
+        Event::Forked(id) => state.forked = Some(id),
         Event::Reset { reason } => {
+            state.branch_points.clear();
+            state.forked = None;
+            state.interrupt_mode = None;
             state.queued_messages.clear();
             state.items.clear();
             state.subagents.clear();

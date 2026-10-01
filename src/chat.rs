@@ -776,6 +776,12 @@ pub struct Snapshot {
     /// acknowledged. Cached pages do not enter this state.
     #[serde(default)]
     pub history_loading: bool,
+    #[serde(default)]
+    pub interrupt_mode: Option<String>,
+    #[serde(default)]
+    pub branch_points: Vec<BranchPoint>,
+    #[serde(default)]
+    pub forked: Option<String>,
 }
 
 /// A bounded preview from the provider's confirmed queue, independent of history pages.
@@ -783,6 +789,14 @@ pub struct Snapshot {
 pub struct QueuedMessage {
     pub id: String,
     pub text: String,
+    #[serde(default)]
+    pub editable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchPoint {
+    pub id: String,
+    pub label: String,
 }
 
 impl QueuedMessage {
@@ -794,7 +808,11 @@ impl QueuedMessage {
             text.truncate(text.floor_char_boundary(PREVIEW_BYTES));
             text.push_str("\n[Queue preview truncated]");
         }
-        Self { id, text }
+        Self {
+            id,
+            text,
+            editable: false,
+        }
     }
 }
 
@@ -806,6 +824,42 @@ pub struct Subagent {
     pub description: String,
     pub status: ToolStatus,
     pub items: Vec<Item>,
+}
+
+/// Route transcript content without letting child status, identity or usage
+/// overwrite the parent conversation. Adapters keep independent child state.
+#[cfg(feature = "host")]
+pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
+    events
+        .into_iter()
+        .flat_map(|event| match event {
+            Event::Item(item) => vec![Event::SubagentItem {
+                id: id.into(),
+                item,
+            }],
+            Event::TextDelta {
+                id: item_id,
+                role,
+                thinking,
+                delta,
+            } => vec![Event::SubagentTextDelta {
+                id: id.into(),
+                item_id,
+                role,
+                thinking,
+                delta,
+            }],
+            Event::ItemsRemoved { ids } => vec![Event::SubagentItemsRemoved { id: id.into(), ids }],
+            Event::History { items, .. } | Event::LatestHistory { items, .. } => items
+                .into_iter()
+                .map(|item| Event::SubagentItem {
+                    id: id.into(),
+                    item,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 impl Snapshot {
@@ -853,6 +907,24 @@ pub enum Command {
     /// Provider slash commands are sent through its own command dispatcher.
     Slash {
         command: String,
+    },
+    /// Mutate an authoritative provider queue entry, never a transcript item.
+    RemoveQueued {
+        id: String,
+    },
+    UpdateQueued {
+        id: String,
+        text: String,
+    },
+    StartQueued {
+        id: String,
+    },
+    SetInterruptMode {
+        mode: String,
+    },
+    ListBranches,
+    Branch {
+        id: Option<String>,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1252,6 +1324,16 @@ pub struct Capabilities {
     pub reasoning_selection: bool,
     pub permission_modes: Vec<String>,
     pub skill_reach: SkillReach,
+    #[serde(default)]
+    pub queue_remove: bool,
+    #[serde(default)]
+    pub queue_edit: bool,
+    #[serde(default)]
+    pub queue_start: bool,
+    #[serde(default)]
+    pub interrupt_modes: Vec<String>,
+    #[serde(default)]
+    pub branch: bool,
 }
 /// Which of the skills a message names the provider loads with it.
 ///
@@ -1433,6 +1515,9 @@ pub enum Event {
     HistoryError(String),
     /// A successful cached/provider page can recover its own active error.
     HistoryRecovered,
+    InterruptMode(String),
+    BranchPoints(Vec<BranchPoint>),
+    Forked(String),
 }
 
 #[cfg(test)]

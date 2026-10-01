@@ -118,10 +118,22 @@ struct Omp {
     history_request: Option<String>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
+    dropped_chunks: HashMap<String, (usize, usize)>,
     calls: HashMap<String, Call>,
     call_order: VecDeque<String>,
     usage: chat::Usage,
     execution: Option<Execution>,
+    children: HashMap<String, Box<Omp>>,
+    child_requests: HashMap<String, String>,
+    subscribed: bool,
+    subscription_request: Option<String>,
+    children_request: Option<String>,
+    child_loaded: std::collections::HashSet<String>,
+    child_buffer: HashMap<String, Vec<Value>>,
+    child_finished: VecDeque<String>,
+    branch_draft: Option<String>,
+    branch_request: Option<String>,
+    configured_reasoning: Option<String>,
 }
 struct Execution {
     run: crate::model::RunId,
@@ -214,10 +226,19 @@ impl Omp {
         if kind == "get_state" {
             self.state_request = Some(id.clone());
         }
+        if kind == "get_branch_messages" {
+            self.branch_request = Some(id.clone());
+        }
         json!({"id":id,"type":kind})
     }
     fn refresh(&mut self) -> Step {
         let mut step = Step::default();
+        if !self.subscribed && self.subscription_request.is_none() {
+            let mut subscription = self.request("set_subagent_subscription");
+            subscription["level"] = "events".into();
+            self.subscription_request = Some(text(&subscription, "id").into());
+            step.writes.push(subscription);
+        }
         for kind in [
             "get_state",
             "get_available_models",
@@ -226,7 +247,97 @@ impl Omp {
         ] {
             step.writes.push(self.request(kind));
         }
+        if self.children_request.is_none() {
+            let request = self.request("get_subagents");
+            self.children_request = Some(text(&request, "id").into());
+            step.writes.push(request);
+        }
         step
+    }
+    fn child(&mut self, id: &str) -> Option<&mut Omp> {
+        if !self.children.contains_key(id)
+            && self.children.len() >= 32
+            && let Some(old) = self.child_finished.pop_front()
+        {
+            self.children.remove(&old);
+            self.child_loaded.remove(&old);
+            self.child_buffer.remove(&old);
+            self.child_requests.retain(|_, id| id != &old);
+        }
+        if id.is_empty()
+            || id.len() > 256
+            || (!self.children.contains_key(id) && self.children.len() >= 32)
+        {
+            return None;
+        }
+        Some(self.children.entry(id.into()).or_default())
+    }
+    fn read_child(&mut self, id: &str, step: &mut Step) {
+        if self.child(id).is_none()
+            || self.child_loaded.contains(id)
+            || self.child_requests.values().any(|child| child == id)
+        {
+            return;
+        }
+        let mut request = self.request("get_subagent_messages");
+        request["subagentId"] = id.into();
+        self.child_requests
+            .insert(text(&request, "id").into(), id.into());
+        self.child_buffer.insert(id.into(), Vec::new());
+        step.writes.push(request);
+    }
+    fn child_metadata(&mut self, payload: &Value, step: &mut Step) {
+        let progress = if payload["progress"].is_object() {
+            &payload["progress"]
+        } else {
+            payload
+        };
+        let id = text(progress, "id");
+        if self.child(id).is_none() {
+            return;
+        }
+        let status = match text(progress, "status") {
+            "completed" => ToolStatus::Succeeded,
+            "failed" | "aborted" => ToolStatus::Failed,
+            _ => ToolStatus::Running,
+        };
+        if status == ToolStatus::Running {
+            self.child_finished.retain(|finished| finished != id);
+        } else if status != ToolStatus::Running
+            && !self.child_finished.iter().any(|finished| finished == id)
+        {
+            self.child_finished.push_back(id.into());
+        }
+        step.events.push(Event::Subagent {
+            id: id.into(),
+            kind: text(payload, "agent").into(),
+            description: payload["task"]
+                .as_str()
+                .or_else(|| payload["description"].as_str())
+                .or_else(|| progress["description"].as_str())
+                .unwrap_or_default()
+                .into(),
+            status: Some(status),
+        });
+        self.read_child(id, step);
+    }
+    fn child_content(&mut self, frame: Value) -> Result<Step, String> {
+        // The subscription includes the authoritative partial message. Reapply
+        // that full item after history hydration instead of appending a delta
+        // that may already be included in the snapshot.
+        if text(&frame, "type") == "message_update"
+            && frame["assistantMessageEvent"]["partial"].is_object()
+        {
+            return Ok(Step {
+                events: self
+                    .message_items(&frame["assistantMessageEvent"]["partial"])
+                    .into_iter()
+                    .map(Event::Item)
+                    .collect(),
+                ..Step::default()
+            });
+        }
+        self.receive(frame)
     }
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
         let mut request = self.request("get_messages_page");
@@ -609,6 +720,22 @@ impl Adapter for Omp {
                 step.writes.push(request);
             }
             Command::Interrupt => step.writes.push(self.request("abort")),
+            Command::SetInterruptMode { mode } => {
+                if !matches!(mode.as_str(), "immediate" | "wait") {
+                    return Err("Choose immediate or wait for OMP steering".into());
+                }
+                let mut request = self.request("set_interrupt_mode");
+                request["mode"] = mode.into();
+                step.writes.push(request);
+            }
+            Command::RemoveQueued { .. } | Command::UpdateQueued { .. } | Command::StartQueued { .. } => return Err("This OMP protocol does not support queue mutation".into()),
+            Command::ListBranches => step.writes.push(self.request("get_branch_messages")),
+            Command::Branch { id } => {
+                if self.busy { return Err("Branch requires an idle OMP conversation".into()); }
+                let mut request = self.request("branch");
+                request["entryId"] = id.ok_or("Choose the prompt to branch before")?.into();
+                step.writes.push(request);
+            }
             Command::Answer{request_id,action,answers} => {
                 let method=self.requests.get(&request_id).ok_or("This OMP request is no longer pending.")?;
                 let response=if action=="cancel" {json!({"type":"extension_ui_response","id":request_id,"cancelled":true})}
@@ -650,6 +777,56 @@ impl Adapter for Omp {
                 let bytes = frame["byteLength"]
                     .as_u64()
                     .ok_or("Invalid OMP chunk size")? as usize;
+                if let Some((expected, next)) = self.dropped_chunks.get_mut(&id) {
+                    if *expected != count || *next != index {
+                        return Err("Out-of-order OMP child history chunks".into());
+                    }
+                    *next += 1;
+                    if *next == count {
+                        self.dropped_chunks.remove(&id);
+                    }
+                    return Ok(step);
+                }
+                if index == 0
+                    && (bytes > MAX_PAYLOAD || count > 1024)
+                    && count <= 1_000_000
+                    && self.dropped_chunks.len() < 4
+                {
+                    let decoded = STANDARD
+                        .decode(text(&frame, "data"))
+                        .map_err(|error| error.to_string())?;
+                    // Chunk zero contains the response envelope before its data.
+                    // Authenticate that request ID before discarding an optional
+                    // transcript; mandatory parent replies still fail normally.
+                    let envelope = decoded
+                        .windows(b"\"data\":".len())
+                        .position(|bytes| bytes == b"\"data\":")
+                        .and_then(|end| std::str::from_utf8(&decoded[..end]).ok())
+                        .and_then(|prefix| {
+                            serde_json::from_str::<Value>(&format!("{prefix}\"data\":null}}")).ok()
+                        });
+                    if let Some(envelope) = envelope
+                        && envelope["command"] == "get_subagent_messages"
+                        && let Some(child_id) = self.child_requests.remove(text(&envelope, "id"))
+                    {
+                        if count > 1 {
+                            self.dropped_chunks.insert(id, (count, 1));
+                        }
+                        self.child_loaded.insert(child_id.clone());
+                        for event in self.child_buffer.remove(&child_id).unwrap_or_default() {
+                            if let Some(child) = self.children.get_mut(&child_id) {
+                                let content = child.child_content(event)?;
+                                step.events
+                                    .extend(chat::child_events(&child_id, content.events));
+                            }
+                        }
+                        step.events.push(Event::Subagent {
+                            id: child_id, kind: String::new(),
+                            description: "Earlier child history exceeds the display limit; live activity remains available".into(), status: None,
+                        });
+                        return Ok(step);
+                    }
+                }
                 if count == 0 || count > 1024 || bytes > MAX_PAYLOAD || self.chunks.len() > 4 {
                     return Err("OMP chunked frame exceeds protocol limits.".into());
                 }
@@ -680,11 +857,42 @@ impl Adapter for Omp {
                 }
             }
             "response" => {
+                if text(&frame, "command") == "get_subagent_messages" {
+                    let Some(id) = self.child_requests.remove(text(&frame, "id")) else {
+                        return Ok(step);
+                    };
+                    if frame["success"] == true {
+                        self.child_loaded.insert(id.clone());
+                    }
+                    if let Some(child) = self.children.get_mut(&id) {
+                        for message in frame["data"]["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|_| frame["success"].as_bool() == Some(true))
+                        {
+                            for item in child.message_items(message) {
+                                step.events.push(Event::SubagentItem {
+                                    id: id.clone(),
+                                    item,
+                                });
+                            }
+                        }
+                        for event in self.child_buffer.remove(&id).unwrap_or_default() {
+                            let content = child.child_content(event)?;
+                            step.events.extend(chat::child_events(&id, content.events));
+                        }
+                    }
+                    return Ok(step);
+                }
                 // Replies may arrive after a local extension has switched sessions.
                 // Only the current state request and current page may mutate the view.
                 let pending = match text(&frame, "command") {
                     "get_state" => Some(&mut self.state_request),
                     "get_messages_page" => Some(&mut self.history_request),
+                    "get_subagents" => Some(&mut self.children_request),
+                    "set_subagent_subscription" => Some(&mut self.subscription_request),
+                    "get_branch_messages" => Some(&mut self.branch_request),
                     _ => None,
                 };
                 if let Some(pending) = pending {
@@ -745,6 +953,14 @@ impl Adapter for Omp {
                             self.requests.clear();
                             self.calls.clear();
                             self.call_order.clear();
+                            self.children.clear();
+                            self.child_requests.clear();
+                            self.child_loaded.clear();
+                            self.child_buffer.clear();
+                            self.child_finished.clear();
+                            self.children_request = None;
+                            self.branch_request = None;
+                            self.configured_reasoning = None;
                             self.usage = chat::Usage::default();
                             step.events.push(Event::Reset {
                                 reason: "OMP changed the current conversation.".into(),
@@ -752,6 +968,12 @@ impl Adapter for Omp {
                             step.events.push(Event::Ready(false));
                         }
                         self.session_id = Some(id.into());
+                        if let Some(text) = self.branch_draft.take() {
+                            step.events.push(Event::Composer { text });
+                        }
+                        if let Some(mode) = data["interruptMode"].as_str() {
+                            step.events.push(Event::InterruptMode(mode.into()));
+                        }
                         if let Some(messages) = data["queuedMessages"]["followUp"].as_array() {
                             step.events.push(Event::QueueChanged(
                                 messages
@@ -796,11 +1018,17 @@ impl Adapter for Omp {
                             reasoning_selection: true,
                             permission_modes: Vec::new(),
                             skill_reach: chat::SkillReach::First,
+                            interrupt_modes: vec!["immediate".into(), "wait".into()],
+                            branch: true,
+                            ..chat::Capabilities::default()
                         }));
                         step.events.push(Event::Models {
                             models: Vec::new(),
                             selected: model_id(&data["model"]),
-                            reasoning: data["thinkingLevel"].as_str().map(str::to_owned),
+                            reasoning: self
+                                .configured_reasoning
+                                .clone()
+                                .or_else(|| data["thinkingLevel"].as_str().map(str::to_owned)),
                         });
                         let usage = &data["contextUsage"];
                         self.usage.context_tokens = usage["tokens"].as_u64().unwrap_or(0);
@@ -819,13 +1047,22 @@ impl Adapter for Omp {
                                         .as_str()
                                         .unwrap_or_else(|| text(model, "id"))
                                         .into(),
-                                    reasoning: [
-                                        "off", "minimal", "low", "medium", "high", "xhigh", "max",
-                                        "auto",
-                                    ]
-                                    .into_iter()
-                                    .map(str::to_owned)
-                                    .collect(),
+                                    reasoning: if model["reasoning"].as_bool() == Some(true) {
+                                        ["off", "auto"]
+                                            .into_iter()
+                                            .map(str::to_owned)
+                                            .chain(
+                                                model["thinking"]["efforts"]
+                                                    .as_array()
+                                                    .into_iter()
+                                                    .flatten()
+                                                    .filter_map(Value::as_str)
+                                                    .map(str::to_owned),
+                                            )
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    },
                                 })
                             })
                             .collect();
@@ -834,6 +1071,53 @@ impl Adapter for Omp {
                             selected: None,
                             reasoning: None,
                         });
+                    }
+                    "get_subagents" => {
+                        for agent in data["subagents"]
+                            .as_array()
+                            .or_else(|| data.as_array())
+                            .into_iter()
+                            .flatten()
+                            .take(32)
+                        {
+                            self.child_metadata(agent, &mut step);
+                        }
+                    }
+                    "set_subagent_subscription" => {
+                        self.subscribed = text(data, "level") == "events"
+                    }
+                    "set_interrupt_mode" => step.writes.push(self.request("get_state")),
+                    "get_branch_messages" => {
+                        let points = data["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .rev()
+                            .take(128)
+                            .filter_map(|point| {
+                                Some(chat::BranchPoint {
+                                    id: point["entryId"].as_str()?.into(),
+                                    label: crate::account::clean_label(point["text"].as_str()?)?,
+                                })
+                            })
+                            .collect();
+                        step.events.push(Event::BranchPoints(points));
+                    }
+                    "branch" => {
+                        if data["cancelled"] != true {
+                            self.ready = false;
+                            step.events.push(Event::Ready(false));
+                            self.history_request = None;
+                            self.branch_request = None;
+                            self.children.clear();
+                            self.child_requests.clear();
+                            self.child_loaded.clear();
+                            self.child_buffer.clear();
+                            self.child_finished.clear();
+                            self.children_request = None;
+                            step.writes.push(self.request("get_state"));
+                            self.branch_draft = data["text"].as_str().map(str::to_owned);
+                        }
                     }
                     "get_available_commands" => step.events.extend(commands(data)),
                     "get_messages_page" => {
@@ -977,30 +1261,50 @@ impl Adapter for Omp {
                 }));
             }
             "subagent_lifecycle" | "subagent_progress" => {
-                let payload = &frame["payload"];
-                let id = format!("subagent:{}", text(payload, "id"));
-                let status = match text(payload, "status") {
-                    "completed" => ToolStatus::Succeeded,
-                    "failed" | "aborted" => ToolStatus::Failed,
-                    _ => ToolStatus::Running,
-                };
-                step.events.push(Event::Subagent {
-                    id: id.clone(),
-                    kind: text(payload, "agent").into(),
-                    description: text(payload, "task").into(),
-                    status: Some(status),
+                self.child_metadata(&frame["payload"], &mut step)
+            }
+            "subagent_event" => {
+                let id = text(&frame["payload"], "id");
+                if let Some(buffer) = self.child_buffer.get_mut(id) {
+                    if buffer.len() < 128
+                        && buffer
+                            .iter()
+                            .map(|event| event.to_string().len())
+                            .sum::<usize>()
+                            + frame.to_string().len()
+                            <= 512 * 1024
+                    {
+                        buffer.push(frame["payload"]["event"].clone());
+                        return Ok(step);
+                    }
+                    // Keep live content if a snapshot is too slow. Its reply
+                    // will be discarded rather than overwrite newer text.
+                    self.child_requests.retain(|_, child| child != id);
+                    self.child_loaded.insert(id.into());
+                    let buffered = self.child_buffer.remove(id).unwrap_or_default();
+                    if let Some(child) = self.children.get_mut(id) {
+                        for event in buffered {
+                            let content = child.child_content(event)?;
+                            step.events.extend(chat::child_events(id, content.events));
+                        }
+                    }
+                }
+                if let Some(child) = self.child(id) {
+                    let child_step = child.child_content(frame["payload"]["event"].clone())?;
+                    step.events
+                        .extend(chat::child_events(id, child_step.events));
+                }
+            }
+            "thinking_level_changed" => {
+                self.configured_reasoning = frame["configured"]
+                    .as_str()
+                    .or_else(|| frame["thinkingLevel"].as_str())
+                    .map(str::to_owned);
+                step.events.push(Event::Models {
+                    models: Vec::new(),
+                    selected: None,
+                    reasoning: self.configured_reasoning.clone(),
                 });
-                step.events.push(Event::Item(Item {
-                    id,
-                    role: Role::Assistant,
-                    content: ItemContent::Tool {
-                        name: format!("Agent {}", text(payload, "agent")),
-                        input: text(payload, "task").into(),
-                        output: payload.to_string(),
-                        status,
-                    },
-                    at: None,
-                }));
             }
             "agent_start" | "auto_compaction_start" => {
                 if text(&frame, "type") == "agent_start" {
@@ -1309,6 +1613,128 @@ fn answer_value(answers: &[Answer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("original".into()),
+            ..Default::default()
+        };
+        assert!(
+            adapter
+                .command(Command::SetInterruptMode {
+                    mode: "unknown".into()
+                })
+                .is_err()
+        );
+        let timing = adapter
+            .command(Command::SetInterruptMode {
+                mode: "wait".into(),
+            })
+            .unwrap();
+        assert_eq!(timing.writes[0]["type"], "set_interrupt_mode");
+        assert_eq!(timing.writes[0]["mode"], "wait");
+        adapter.busy = true;
+        assert!(
+            adapter
+                .command(Command::Branch {
+                    id: Some("entry-exact".into())
+                })
+                .is_err()
+        );
+        adapter.busy = false;
+        let branch = adapter
+            .command(Command::Branch {
+                id: Some("entry-exact".into()),
+            })
+            .unwrap();
+        assert_eq!(branch.writes[0]["entryId"], "entry-exact");
+        let response = adapter.receive(json!({"type":"response","id":branch.writes[0]["id"],"command":"branch","success":true,"data":{"text":"Selected prompt"}})).unwrap();
+        assert!(response.events.contains(&Event::Ready(false)));
+        assert!(
+            !response
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Composer { .. }))
+        );
+        let state = adapter.receive(json!({"type":"response","id":response.writes[0]["id"],"command":"get_state","success":true,"data":{"sessionId":"branched","isStreaming":false,"interruptMode":"wait","queuedMessages":{"followUp":[]}}})).unwrap();
+        let reset = state
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Reset { .. }))
+            .unwrap();
+        let draft = state
+            .events
+            .iter()
+            .position(
+                |event| matches!(event, Event::Composer { text } if text == "Selected prompt"),
+            )
+            .unwrap();
+        assert!(reset < draft);
+        assert_eq!(adapter.session_id.as_deref(), Some("branched"));
+        assert!(state.events.contains(&Event::InterruptMode("wait".into())));
+    }
+
+    #[test]
+    fn oversized_optional_child_history_preserves_parent_control() {
+        let mut adapter = Omp {
+            ready: true,
+            busy: true,
+            ..Default::default()
+        };
+        let metadata = adapter.receive(json!({"type":"subagent_lifecycle","payload":{"progress":{"id":"child","status":"running"},"task":"review"}})).unwrap();
+        let request_id = metadata.writes[0]["id"].as_str().unwrap();
+        let prefix = format!(
+            "{{\"type\":\"response\",\"id\":\"{request_id}\",\"command\":\"get_subagent_messages\",\"success\":true,\"data\":{{"
+        );
+        // Chunks can end midway through a UTF-8 code point in the data body.
+        let mut prefix = prefix.into_bytes();
+        prefix.extend_from_slice(&[b'"', 0xe2, 0x82]);
+        let dropped = adapter.receive(json!({"type":"rpc_chunk","chunkId":"large","index":0,"count":2,"byteLength":MAX_PAYLOAD+1,"data":STANDARD.encode(prefix)})).unwrap();
+        assert!(
+            dropped
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Subagent { id, .. } if id == "child"))
+        );
+        adapter.receive(json!({"type":"rpc_chunk","chunkId":"large","index":1,"count":2,"byteLength":MAX_PAYLOAD+1,"data":""})).unwrap();
+        let live = adapter.receive(json!({"type":"subagent_event","payload":{"id":"child","event":{"type":"message_end","message":{"role":"assistant","timestamp":123,"content":[{"type":"text","text":"still live"}]}}}})).unwrap();
+        assert!(
+            live.events
+                .iter()
+                .any(|event| matches!(event, Event::SubagentItem { id, .. } if id == "child"))
+        );
+        assert!(adapter.chunks.is_empty());
+        assert!(adapter.dropped_chunks.is_empty());
+        assert!(adapter.command(Command::Interrupt).is_ok());
+    }
+
+    #[test]
+    fn child_partial_replaces_overlapping_history_and_preserves_configured_auto() {
+        let mut adapter = Omp::default();
+        let metadata = adapter.receive(json!({"type":"subagent_progress","payload":{"progress":{"id":"child","status":"running"}}})).unwrap();
+        let live = json!({"type":"message_update","assistantMessageEvent":{"partial":{"role":"assistant","timestamp":123,"content":[{"type":"text","text":"hello world"}]},"type":"text_delta","contentIndex":0,"delta":" world"}});
+        adapter
+            .receive(json!({"type":"subagent_event","payload":{"id":"child","event":live}}))
+            .unwrap();
+        let hydrated = adapter.receive(json!({"type":"response","id":metadata.writes[0]["id"],"command":"get_subagent_messages","success":true,"data":{"messages":[{"role":"assistant","timestamp":123,"content":[{"type":"text","text":"hello world"}]}]}})).unwrap();
+        assert!(
+            !hydrated
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::SubagentTextDelta { .. }))
+        );
+        assert!(hydrated.events.iter().any(|event| matches!(event, Event::SubagentItem { item: Item { content:ItemContent::Text { text, .. }, .. }, .. } if text == "hello world")));
+        let thinking = adapter
+            .receive(
+                json!({"type":"thinking_level_changed","thinkingLevel":"low","configured":"auto"}),
+            )
+            .unwrap();
+        assert!(thinking.events.iter().any(
+            |event| matches!(event, Event::Models { reasoning:Some(level), .. } if level == "auto")
+        ));
+    }
 
     #[test]
     fn accepted_prompt_finishes_only_from_its_correlated_prompt_result() {

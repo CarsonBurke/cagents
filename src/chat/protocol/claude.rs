@@ -5,6 +5,7 @@
 use super::{Adapter, ProcessSpec, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
+use crate::chat;
 use crate::chat::{
     Answer, Attachment, AttachmentRules, Capabilities, Choice, Command, CommandAction,
     DeliveryKind, Event, Field, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role,
@@ -280,6 +281,10 @@ struct Claude {
     cwd: PathBuf,
     ready: bool,
     busy: bool,
+    /// Only advertised for a CLI whose async input contract we have verified.
+    async_input: bool,
+    submissions: HashMap<String, chat::QueuedMessage>,
+    queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
     attention_generation: u64,
     deferred_attention: HashMap<
@@ -359,6 +364,9 @@ impl Claude {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            steer: self.async_input,
+            queue: self.async_input,
+            queue_remove: self.async_input,
             attachments: true,
             compact: self.commands.iter().any(|c| c.name == "compact"),
             model_selection: !self.models.is_empty(),
@@ -397,12 +405,25 @@ impl Claude {
             }
         }
     }
-    fn send_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Step, String> {
+    fn send_prompt(
+        &mut self,
+        text: String,
+        attachments: Vec<Attachment>,
+        mode: PromptMode,
+    ) -> Result<Step, String> {
         if !self.ready {
             return Err("Claude is still initializing".into());
         }
-        if self.busy {
+        if self.busy && mode == PromptMode::Send {
             return Err("Claude is busy; interrupt or wait before sending another prompt".into());
+        }
+        if mode != PromptMode::Send && !self.async_input {
+            return Err(
+                "This Claude version does not advertise verified async message delivery".into(),
+            );
+        }
+        if self.submissions.len() >= chat::QueuedMessage::LIMIT {
+            return Err("Too many pending Claude messages".into());
         }
         if text.len() > MAX_TEXT || attachments.len() > ATTACHMENTS.max_count.unwrap() {
             return Err("Claude prompt exceeds the native transport limit".into());
@@ -439,10 +460,23 @@ impl Claude {
             return Err("Serialized Claude prompt must be smaller than 30 MiB".into());
         }
         let mut step = Step::default();
+        if self.async_input {
+            frame["priority"] = match mode {
+                PromptMode::Send | PromptMode::Steer => "next",
+                PromptMode::Queue => "later",
+            }
+            .into();
+        }
+        if self.async_input {
+            self.submissions
+                .insert(id.clone(), chat::QueuedMessage::new(id.clone(), text));
+        }
         self.message(&frame, &mut step)?;
         step.writes.push(frame);
-        step.events.push(Event::TurnStarted);
-        self.status(true, "Claude is working", &mut step);
+        if !self.busy && mode == PromptMode::Send {
+            step.events.push(Event::TurnStarted);
+            self.status(true, "Claude is working", &mut step);
+        }
         Ok(step)
     }
     fn answer(&mut self, id: String, action: String, answers: Vec<Answer>) -> Result<Step, String> {
@@ -594,6 +628,14 @@ impl Claude {
         })
     }
     fn metadata(&mut self, data: &Value, step: &mut Step) {
+        if let Some(version) = data["claude_code_version"].as_str() {
+            let mut parts = version
+                .split('.')
+                .filter_map(|part| part.parse::<u32>().ok());
+            self.async_input = parts.next() == Some(2)
+                && parts.next() == Some(1)
+                && parts.next().is_some_and(|patch| patch >= 286);
+        }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
         }
@@ -964,7 +1006,9 @@ impl Claude {
             }
         }
         if role == Role::Assistant {
-            if let Some(usage) = frame["context_usage"].as_object() {
+            if child.is_none()
+                && let Some(usage) = frame["context_usage"].as_object()
+            {
                 self.usage.context_tokens = usage
                     .get("totalTokens")
                     .and_then(Value::as_u64)
@@ -981,7 +1025,9 @@ impl Claude {
                     fatal: false,
                 });
             }
-            self.update_usage(&message["usage"], step);
+            if child.is_none() {
+                self.update_usage(&message["usage"], step);
+            }
         }
         let ids = step.events[event_start..]
             .iter()
@@ -1245,11 +1291,19 @@ impl Adapter for Claude {
             Command::Prompt {
                 text,
                 attachments,
-                mode: PromptMode::Send,
-            } => self.send_prompt(text, attachments),
-            Command::Prompt { .. } => {
-                Err("Claude stream-json does not expose native steer or queue controls".into())
+                mode,
+            } => self.send_prompt(text, attachments, mode),
+            Command::RemoveQueued { id } => {
+                if !self.queued.iter().any(|message| message.id == id) {
+                    return Err("This Claude message is no longer queued".into());
+                }
+                self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
+            Command::UpdateQueued { .. }
+            | Command::StartQueued { .. }
+            | Command::SetInterruptMode { .. }
+            | Command::ListBranches
+            | Command::Branch { .. } => Err("This operation is not supported by Claude".into()),
             Command::Answer {
                 request_id,
                 action,
@@ -1294,7 +1348,7 @@ impl Adapter for Claude {
                 if !self.capabilities().compact {
                     return Err("This Claude session does not advertise /compact".into());
                 }
-                self.send_prompt("/compact".into(), vec![])
+                self.send_prompt("/compact".into(), vec![], PromptMode::Send)
             }
             Command::Slash { command } => {
                 let name = command
@@ -1309,6 +1363,7 @@ impl Adapter for Claude {
                 self.send_prompt(
                     format!("/{}", command.trim().trim_start_matches('/')),
                     vec![],
+                    PromptMode::Send,
                 )
             }
             Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
@@ -1392,6 +1447,8 @@ impl Adapter for Claude {
                 self.tasks.clear();
                 self.agent_tasks.clear();
                 self.handed_back.clear();
+                self.submissions.clear();
+                self.queued.clear();
                 self.stream_events.clear();
                 self.carrier_items.clear();
                 self.carrier_order.clear();
@@ -1580,18 +1637,21 @@ impl Adapter for Claude {
                     }
                 }
                 self.attention_generation = self.attention_generation.wrapping_add(1);
-                let busy = !self.tasks.is_empty() || !self.pending.is_empty();
+                // Background agents have their own status. They must not
+                // prevent new input once the main turn has ended.
+                let busy = !self.pending.is_empty();
                 self.status(
                     busy,
                     if busy {
-                        "Claude turn ended; background work or decisions remain"
+                        "Claude turn ended; decisions remain"
                     } else {
                         "Claude turn complete"
                     },
                     &mut step,
                 );
-                self.streams.clear();
-                self.blocks.clear();
+                if let Some(stream) = self.streams.remove("") {
+                    self.settle(&stream.message);
+                }
                 // Result input totals span multiple API calls; they are not the
                 // context occupancy of the last individual model call.
                 if let Some(tokens) = frame["usage"]["input_tokens"].as_u64() {
@@ -1662,6 +1722,24 @@ impl Adapter for Claude {
             "command_lifecycle" => {
                 // UUID-tagged user messages receive these transport lifecycle
                 // notifications. Only result settles a turn and its decisions.
+                let state = required(&frame, "state")?;
+                if let Some(id) = frame["command_uuid"].as_str() {
+                    if state == "queued" {
+                        if let Some(message) = self.submissions.get(id)
+                            && !self.queued.iter().any(|queued| queued.id == id)
+                        {
+                            self.queued.push(message.clone());
+                        }
+                    } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
+                        if state == "started" && !self.busy && self.submissions.contains_key(id) {
+                            step.events.push(Event::TurnStarted);
+                            self.status(true, "Claude is working", &mut step);
+                        }
+                        self.queued.retain(|message| message.id != id);
+                        self.submissions.remove(id);
+                    }
+                    step.events.push(Event::QueueChanged(self.queued.clone()));
+                }
                 step.events.push(Event::Status {
                     busy: self.busy,
                     detail: format!("Claude command {}", required(&frame, "state")?),
@@ -1750,6 +1828,12 @@ fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
     let child: Vec<_> = events
         .drain(start..)
+        .filter(|event| {
+            !matches!(
+                event,
+                Event::Status { .. } | Event::Usage(_) | Event::TurnStarted | Event::TurnSettled
+            )
+        })
         .map(|event| match event {
             Event::Item(mut item) => {
                 if item.role == Role::User {
@@ -2518,12 +2602,14 @@ impl Claude {
                     };
                     // A message interrupted before its `message_stop` is
                     // abandoned once its stream moves on.
-                    if let Some(abandoned) = self.streams.insert(parent, stream) {
+                    if let Some(abandoned) = self.streams.insert(parent.clone(), stream) {
                         self.settle(&abandoned.message);
                     }
                 }
-                self.update_usage(&event["message"]["usage"], step);
-                self.status(true, "Claude is working", step);
+                if parent.is_empty() {
+                    self.update_usage(&event["message"]["usage"], step);
+                    self.status(true, "Claude is working", step);
+                }
             }
             "content_block_start" => {
                 let stream = self
@@ -2670,7 +2756,11 @@ impl Claude {
                     }
                 }
             }
-            "message_delta" => self.update_usage(&event["usage"], step),
+            "message_delta" => {
+                if parent.is_empty() {
+                    self.update_usage(&event["usage"], step);
+                }
+            }
             "message_stop" => {
                 if let Some(stream) = self.streams.remove(&parent) {
                     self.settle(&stream.message);
@@ -3693,7 +3783,9 @@ mod tests {
             ready: true,
             ..Default::default()
         };
-        adapter.send_prompt("hello".into(), Vec::new()).unwrap();
+        adapter
+            .send_prompt("hello".into(), Vec::new(), PromptMode::Send)
+            .unwrap();
         for state in ["queued", "started", "completed"] {
             let step = adapter
                 .receive(json!({"type":"command_lifecycle","command_uuid":"request","state":state}))
@@ -3703,7 +3795,11 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, Event::Status { busy: true, .. }))
             );
-            assert!(adapter.send_prompt("too soon".into(), Vec::new()).is_err());
+            assert!(
+                adapter
+                    .send_prompt("too soon".into(), Vec::new(), PromptMode::Send)
+                    .is_err()
+            );
         }
         let settled = adapter
             .receive(json!({"type":"result","subtype":"success","is_error":false}))
@@ -3714,7 +3810,78 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Status { busy: false, .. }))
         );
-        assert!(adapter.send_prompt("next turn".into(), Vec::new()).is_ok());
+        assert!(
+            adapter
+                .send_prompt("next turn".into(), Vec::new(), PromptMode::Send)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn async_delivery_reaches_provider_during_turn_and_queued_turn_has_own_lifecycle() {
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            async_input: true,
+            ..Default::default()
+        };
+        let steer = adapter
+            .send_prompt("correct the approach".into(), vec![], PromptMode::Steer)
+            .unwrap();
+        assert_eq!(steer.writes[0]["priority"], "next");
+        let queue = adapter
+            .send_prompt("later task".into(), vec![], PromptMode::Queue)
+            .unwrap();
+        assert_eq!(queue.writes[0]["priority"], "later");
+        let id = queue.writes[0]["uuid"].clone();
+        adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
+            .unwrap();
+        assert_eq!(adapter.queued.len(), 1);
+        adapter
+            .receive(json!({"type":"result","is_error":false}))
+            .unwrap();
+        let started = adapter
+            .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}))
+            .unwrap();
+        assert!(
+            started
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarted))
+        );
+        assert!(adapter.queued.is_empty());
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(adapter.submissions.is_empty());
+        assert!(adapter.queued.is_empty());
+    }
+
+    #[test]
+    fn background_child_stream_cannot_reopen_parent_turn_or_replace_usage() {
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let step = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"child","event":{"type":"message_start","message":{"id":"child-message","usage":{"input_tokens":999}}}})).unwrap();
+        assert!(!adapter.busy);
+        assert_eq!(adapter.usage.input_tokens, 0);
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { busy: true, .. } | Event::Usage(_)))
+        );
+        for _ in 0..130 {
+            adapter
+                .send_prompt("legacy".into(), vec![], PromptMode::Send)
+                .unwrap();
+            adapter
+                .receive(json!({"type":"result","is_error":false}))
+                .unwrap();
+        }
+        assert!(adapter.submissions.is_empty());
     }
 
     #[test]
@@ -4768,6 +4935,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_parent_result_preserves_background_child_streams() {
+        let mut adapter = Claude::default();
+        let child = |event: Value| json!({"type":"stream_event", "parent_tool_use_id":"child", "event":event});
+        adapter
+            .receive(child(
+                json!({"type":"message_start","message":{"id":"child-message"}}),
+            ))
+            .unwrap();
+        adapter.receive(child(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))).unwrap();
+        adapter
+            .receive(json!({"type":"result","uuid":"parent-result","is_error":false}))
+            .unwrap();
+        let delta = adapter.receive(child(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"still working"}}))).unwrap();
+        assert!(delta.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child" && delta == "still working")));
+        adapter
+            .receive(child(json!({"type":"content_block_stop","index":0})))
+            .unwrap();
+        adapter
+            .receive(child(json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(adapter.streams.is_empty());
+        assert!(adapter.blocks.is_empty());
+        assert!(!adapter.busy);
+    }
+
     /// Claude Code closes a message it abandons mid-stream, but a message
     /// that never reaches its `message_stop` is still released once its
     /// stream starts another.
@@ -4934,7 +5127,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(adapter.busy);
+        assert!(!adapter.busy);
         adapter
             .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
             .unwrap();
@@ -5010,7 +5203,9 @@ mod tests {
                     .any(|event| matches!(event, Event::TurnFinished { .. }))
             );
             // A new turn can begin while the old interrupt response is queued.
-            let next = adapter.send_prompt("next turn".into(), Vec::new()).unwrap();
+            let next = adapter
+                .send_prompt("next turn".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
             assert!(
                 next.events
                     .iter()

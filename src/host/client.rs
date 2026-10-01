@@ -522,6 +522,7 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatPrepareResume { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }
         | ClientRequest::ChatCandidates { .. }

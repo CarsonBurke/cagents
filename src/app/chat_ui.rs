@@ -178,6 +178,10 @@ pub enum Action {
     CopyLiteral(String),
     Latest(Target),
     CancelFollowup(Target),
+    EditQueue(Target, Option<String>),
+    QueueText(Target, String),
+    SaveQueue(Target),
+    BranchPicker(Target, bool),
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
@@ -1146,6 +1150,11 @@ pub(super) struct Runtime {
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     followup: Option<(String, Vec<Attachment>)>,
+    queue_edit: Option<(String, String)>,
+    queue_edit_submitted: Option<(String, String)>,
+    branch_picker: bool,
+    fork_requested: bool,
+    fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     cache: HashMap<String, CachedItem>,
     /// The palette the cache's code blocks are highlighted in.
@@ -1487,6 +1496,11 @@ impl Runtime {
             connection,
             queued: None,
             followup: None,
+            queue_edit: None,
+            queue_edit_submitted: None,
+            branch_picker: false,
+            fork_requested: false,
+            fork_seen: None,
             files: None,
             find: None,
             find_focused: false,
@@ -1654,6 +1668,20 @@ impl Runtime {
         }
         self.subagent_scroll
             .retain(|id, _| snapshot.subagents.iter().any(|agent| &agent.id == id));
+        if self.queue_edit.as_ref().is_some_and(|(id, text)| {
+            snapshot
+                .queued_messages
+                .iter()
+                .find(|message| &message.id == id)
+                .is_none_or(|message| {
+                    !message.editable
+                        || (self.queue_edit_submitted.as_ref() == self.queue_edit.as_ref()
+                            && &message.text == text)
+                })
+        }) {
+            self.queue_edit = None;
+            self.queue_edit_submitted = None;
+        }
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
@@ -3333,7 +3361,15 @@ impl Cagents {
         let skills = if session.is_unstarted() {
             self.open_chat_draft(card_id, session)
         } else {
-            self.open_chat(card_id, session, chat::Intent::Start)
+            let intent = if matches!(
+                session.native_continuity,
+                chat::NativeContinuity::Durable { .. }
+            ) {
+                chat::Intent::Restore
+            } else {
+                chat::Intent::Start
+            };
+            self.open_chat(card_id, session, intent)
         };
         self.persist();
         Task::batch([
@@ -4452,6 +4488,9 @@ impl Cagents {
             Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
             _ => None,
         };
+        if let Command::UpdateQueued { id, text } = &command {
+            runtime.queue_edit_submitted = Some((id.clone(), text.clone()));
+        }
         runtime.pending = Some(PendingCommand {
             followup: false,
             id,
@@ -5241,6 +5280,24 @@ impl Cagents {
                 match wake {
                     Wake::Changed => {
                         runtime.refresh();
+                        let fork = if runtime.fork_requested
+                            && runtime.snapshot.forked != runtime.fork_seen
+                        {
+                            runtime.fork_requested = false;
+                            runtime.fork_seen = runtime.snapshot.forked.clone();
+                            runtime.snapshot.forked.as_ref().and_then(|id| {
+                                let mut fork = runtime.session.clone();
+                                fork.reset_owned_codex_listener();
+                                fork.id = TerminalId::new();
+                                fork.proof = None;
+                                fork.terminal = None;
+                                fork.launch.session_id = Some(id.clone());
+                                fork.launch.recipe = fork.launch.terminal_recipe()?;
+                                Some(fork)
+                            })
+                        } else {
+                            None
+                        };
                         let activity = Activity {
                             provider: runtime.session.launch.provider,
                             state: handle.take_activity(),
@@ -5265,6 +5322,25 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
+                            fork.map_or_else(Task::none, |session| {
+                                let scope = if let Some(channel) = self
+                                    .durable
+                                    .channels
+                                    .iter()
+                                    .find(|channel| channel.cards.contains(&target.card))
+                                    .map(|channel| channel.id)
+                                {
+                                    self.select_channel(channel)
+                                } else {
+                                    self.select_worktree(
+                                        session.launch.recipe.working_directory.clone(),
+                                        false,
+                                    )
+                                };
+                                let insert =
+                                    self.insert_chat_card(session, Some(target.card), None);
+                                Task::batch([scope, insert])
+                            }),
                         ]);
                     }
                     Wake::Observed => {
@@ -5624,6 +5700,45 @@ impl Cagents {
                 };
                 return self.chat_send(target, command, true);
             }
+            Action::EditQueue(target, id) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.queue_edit_submitted = None;
+                    runtime.queue_edit = id.and_then(|id| {
+                        runtime
+                            .snapshot
+                            .queued_messages
+                            .iter()
+                            .find(|message| message.id == id && message.editable)
+                            .map(|message| (id, message.text.clone()))
+                    });
+                }
+            }
+            Action::QueueText(target, text) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some((_, draft)) = &mut runtime.queue_edit
+                {
+                    *draft = text;
+                    runtime.queue_edit_submitted = None;
+                }
+            }
+            Action::SaveQueue(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some((id, text)) = runtime.queue_edit.clone() else {
+                    return Task::none();
+                };
+                if text.trim().is_empty()
+                    || !runtime
+                        .snapshot
+                        .queued_messages
+                        .iter()
+                        .any(|message| message.id == id && message.editable)
+                {
+                    return Task::none();
+                }
+                return self.chat_send(target, Command::UpdateQueued { id, text }, false);
+            }
             Action::HistoryOlder(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.recall(true);
@@ -5695,7 +5810,24 @@ impl Cagents {
                         }
                     }
                 }
+                if matches!(command, Command::Branch { .. })
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.pending.is_none()
+                    && !runtime.snapshot.busy
+                {
+                    runtime.branch_picker = false;
+                    runtime.fork_requested = true;
+                    runtime.fork_seen = runtime.snapshot.forked.clone();
+                }
                 return self.chat_send(target, command, false);
+            }
+            Action::BranchPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.branch_picker = open;
+                }
+                if open {
+                    return self.chat_send(target, Command::ListBranches, false);
+                }
             }
             Action::CommandFinished(target, id, result) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -5768,10 +5900,12 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
+                        runtime.queue_edit_submitted = None;
                         if pending.followup {
                             runtime.restore_followup();
                         }
                         runtime.note(error.clone());
+                        runtime.fork_requested = false;
                         runtime.error = Some(error);
                         None
                     }
@@ -7040,6 +7174,41 @@ mod tests {
         handle.publish_snapshot_for_test(snapshot);
         runtime.refresh();
         (card, target, handle)
+    }
+
+    #[test]
+    fn queue_editor_survives_streaming_until_its_save_is_confirmed() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let queued = chat::QueuedMessage {
+            id: "queued".into(),
+            text: "original".into(),
+            editable: true,
+        };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages = vec![queued];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let _ = app.handle_chat_ui(Action::EditQueue(target, Some("queued".into())));
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert_eq!(
+            chat_runtime(&app, card).queue_edit.as_ref().unwrap().1,
+            "original"
+        );
+        let _ = app.handle_chat_ui(Action::QueueText(target, "edited".into()));
+        let _ = app.handle_chat_ui(Action::SaveQueue(target));
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot.clone());
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).queue_edit.is_some());
+        snapshot.queued_messages[0].text = "edited".into();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        assert!(chat_runtime(&app, card).queue_edit.is_none());
     }
 
     #[test]

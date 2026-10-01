@@ -1855,6 +1855,42 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatPrepareResume { source } => {
+            let proof = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone();
+            if !source.has_valid_native_continuity() || source.launch.session_id.is_none() {
+                return Err(error("Saved conversation has invalid continuity evidence"));
+            }
+            // A present owner must be restored, not replaced. Missing evidence
+            // is never proof of a completed close.
+            if has_native_owner(&source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            }
+            // A kernel boot change proves every process from the saved boot
+            // is gone. Unlike missing runtime files within the same boot, it
+            // authorizes an exact disk resume without its ephemeral receipt.
+            let previous_boot = source.proof.as_ref().is_some_and(|previous| {
+                previous.is_complete() && previous.boot_id != proof.boot_id
+            });
+            if !previous_boot
+                && !chat::native_holder::closed_source(&source, &proof)
+                    .map_err(unavailable)?
+                    .is_some_and(|(_, paired_closed)| paired_closed)
+            {
+                return Err(unavailable(
+                    "The old Codex owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
+                ));
+            }
+            let mut session = source;
+            session.reset_owned_codex_listener();
+            session.id = TerminalId::new();
+            session.proof = None;
+            session.terminal = None;
+            Ok(ServerResponse::ChatResumePrepared { session })
+        }
         ClientRequest::ChatRecoverAccount {
             source,
             replacement,
@@ -2260,7 +2296,7 @@ fn process_inner(
                 }
                 attached(&state, client, chat_id)?.handle.clone()
             };
-            handle.close().map_err(unavailable)?;
+            handle.close_for_resume().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
             let (retained, pending_cleanup) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2274,7 +2310,18 @@ fn process_inner(
                     })?;
                 (retained, state.native_closing.contains_key(&chat_id))
             };
-            if pending_cleanup || has_native_owner(&retained)? {
+            let closed_receipt = if matches!(
+                retained.native_continuity,
+                chat::NativeContinuity::Durable { .. }
+            ) {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                chat::native_holder::closed_source(&retained, state.proof())
+                    .map_err(unavailable)?
+                    .is_some()
+            } else {
+                false
+            };
+            if pending_cleanup || closed_receipt || has_native_owner(&retained)? {
                 // Closing an exited attachment proves only that local actor is
                 // gone. A server preserved by an earlier failed adoption must
                 // also acknowledge exact cleanup before this close can succeed.
@@ -3107,7 +3154,7 @@ print(json.dumps({"type": "ready"}), flush=True)
 for line in sys.stdin:
     request = json.loads(line)
     command = request["type"]
-    if command not in ("negotiate_protocol", "get_state", "get_available_models", "get_available_commands", "get_session_stats", "get_messages_page"):
+    if command not in ("negotiate_protocol", "get_state", "get_available_models", "get_available_commands", "get_session_stats", "get_messages_page", "get_subagents", "set_subagent_subscription"):
         sys.exit(7)
     data = {"sessionId": os.environ.get("REPORTED_SESSION", identity), "messages": []}
     print(json.dumps({"type": "response", "id": request["id"], "command": command, "success": True, "data": data}), flush=True)
@@ -4248,7 +4295,7 @@ for line in sys.stdin:
                     .any(|args| args == ["--resume", "12345678-1234-4234-8234-123456789abc"])
             );
             let replacement = host.lock().unwrap().terminals.remove(&terminal.id).unwrap();
-            replacement.handle.shutdown();
+            let _ = replacement.handle.shutdown();
         } else {
             client.close_chat(session).unwrap();
         }

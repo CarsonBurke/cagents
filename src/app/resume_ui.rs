@@ -3,6 +3,7 @@ use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
 use std::io::{Read, Seek};
+mod catalog;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -10,7 +11,7 @@ pub(super) struct State {
     generation: u64,
     query: String,
     entries: Vec<SavedConversation>,
-    loading: bool,
+    pub(super) loading: bool,
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
@@ -25,6 +26,7 @@ pub enum Action {
     Resume(CardId),
     More,
     Submit,
+    Prepared(u64, SavedConversation, Result<chat::Session, String>),
 }
 
 pub(super) fn focus_id() -> widget::Id {
@@ -181,6 +183,8 @@ impl Cagents {
                 let generation = self.resume_ui.generation;
                 let store = self.session.as_ref().map(SessionRuntime::operation_store);
                 let current = self.durable.cards.clone();
+                let accounts = self.resume_catalog_accounts();
+                let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
                 Task::batch([
                     iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
                     cosmic::task::future(async move {
@@ -212,24 +216,40 @@ impl Cagents {
                                     );
                                 }
                             }
+                            let mut seeds = Vec::new();
+                            for account in accounts {
+                                if let Ok(session) = chat::fresh_session(
+                                    account.provider,
+                                    TerminalId::new(),
+                                    directory.clone(),
+                                    &account,
+                                ) {
+                                    seeds.push(session);
+                                }
+                            }
                             entries.sort_by_key(|entry| {
                                 (
                                     std::cmp::Reverse(entry.open),
                                     std::cmp::Reverse(entry.updated_at_unix_ms),
                                 )
                             });
+                            // Persisted descriptors retain their launch configuration and
+                            // ownership evidence even when a log file is newer.
+                            entries.extend(catalog::discover(&seeds));
                             let mut seen = HashSet::new();
                             entries.retain(|entry| {
                                 let launch = &entry.session.launch;
                                 seen.insert((
                                     launch.provider,
                                     launch.session_id.clone(),
-                                    launch.recipe.working_directory.clone(),
                                     crate::account::home_variable(launch.provider)
                                         .and_then(|variable| {
                                             launch.recipe.environment.get(variable)
                                         })
-                                        .cloned(),
+                                        .map(|home| {
+                                            let path = PathBuf::from(home);
+                                            path.canonicalize().unwrap_or(path)
+                                        }),
                                 ))
                             });
                             entries
@@ -252,6 +272,7 @@ impl Cagents {
             }
             Action::Close => {
                 self.resume_ui.open = false;
+                self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
@@ -280,7 +301,7 @@ impl Cagents {
                 Task::none()
             }
             Action::Resume(card) => {
-                if !self.resume_ui.open {
+                if !self.resume_ui.open || self.resume_ui.loading {
                     return Task::none();
                 }
                 let Some(entry) = self
@@ -300,6 +321,25 @@ impl Cagents {
                     .get(self.resume_ui.selected)
                     .map(|entry| entry.card);
                 card.map_or_else(Task::none, |card| self.update_resume(Action::Resume(card)))
+            }
+            Action::Prepared(generation, mut entry, result) => {
+                if generation != self.resume_ui.generation {
+                    return Task::none();
+                }
+                self.resume_ui.loading = false;
+                match result {
+                    Ok(session) => {
+                        entry.session = session;
+                        if self.existing_conversation_card(&entry.session).is_some() {
+                            return self.resume_saved_conversation(entry);
+                        }
+                        self.insert_resumed_conversation(entry)
+                    }
+                    Err(error) => {
+                        self.resume_error(&error);
+                        Task::none()
+                    }
+                }
             }
         }
     }
@@ -321,6 +361,9 @@ impl Cagents {
     }
 
     pub(super) fn resume_saved_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
+        if self.resume_ui.loading {
+            return Task::none();
+        }
         self.resume_ui.error = None;
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
@@ -347,23 +390,49 @@ impl Cagents {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }
-        let mut session = entry.session;
+        let session = &entry.session;
         if matches!(
             session.native_continuity,
             chat::NativeContinuity::Durable { .. }
         ) {
-            self.resume_error("This Codex conversation needs its retained native server. Reopening a closed server is not yet supported.");
-            return Task::none();
+            let generation = self.resume_ui.generation;
+            self.resume_ui.loading = true;
+            return cosmic::task::future(async move {
+                let source = entry.session.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let socket = crate::terminal::ipc::daemon_socket_path()
+                        .map_err(|error| error.to_string())?;
+                    crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())?
+                        .prepare_chat_resume(source)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()));
+                Message::ResumeConversation(Action::Prepared(generation, entry, result))
+            });
         }
+        self.insert_resumed_conversation(entry)
+    }
+
+    fn insert_resumed_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
+        let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir() {
             self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
             return Task::none();
         }
-        session.reset_owned_codex_listener();
-        session.id = TerminalId::new();
-        session.proof = None;
-        session.terminal = None;
+        if !matches!(
+            session.native_continuity,
+            chat::NativeContinuity::Durable { .. }
+        ) {
+            session.reset_owned_codex_listener();
+            session.id = TerminalId::new();
+            session.proof = None;
+            session.terminal = None;
+        }
         self.resume_ui.open = false;
+        self.recently_closed
+            .retain(|(card, _)| card.id != entry.card);
         let scope = self.select_worktree(session.launch.recipe.working_directory.clone(), false);
         let insert = self.insert_chat_card(session, None, None);
         if let Some(card) = self.workspace.focused() {
@@ -409,7 +478,7 @@ impl Cagents {
                 entry.session.launch.recipe.working_directory.display(),
                 date
             );
-            let mut contents = widget::column::with_children(vec![
+            let contents = widget::column::with_children(vec![
                 design::body(&entry.title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
@@ -433,16 +502,6 @@ impl Cagents {
                     .into(),
             ])
             .spacing(4);
-            let unsupported = !entry.open
-                && self.existing_conversation_card(&entry.session).is_none()
-                && matches!(
-                    entry.session.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
-                );
-            if unsupported {
-                contents =
-                    contents.push(design::caption("Saved Codex server cannot be reopened yet"));
-            }
             rows.push(
                 widget::button::custom(contents)
                     .name(format!("Resume {}", entry.title))
@@ -451,7 +510,7 @@ impl Cagents {
                     .class(cosmic::theme::Button::ListItem([8.0; 4]))
                     .selected(index == state.selected)
                     .on_press_maybe(
-                        (!unsupported)
+                        (!state.loading)
                             .then_some(Message::ResumeConversation(Action::Resume(entry.card))),
                     )
                     .into(),
@@ -578,6 +637,45 @@ mod tests {
         let before = app.durable.cards.len();
         let _ = app.resume_saved_conversation(entry);
         assert_eq!(app.durable.cards.len(), before);
+    }
+
+    #[test]
+    fn cancelling_resume_ignores_late_preparation_and_allows_another_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = saved(directory.path());
+        app.resume_ui.open = true;
+        app.resume_ui.loading = true;
+        app.resume_ui.generation = 7;
+        let _ = app.update_resume(Action::Close);
+        assert!(!app.resume_ui.loading);
+        let _ = app.update_resume(Action::Prepared(
+            7,
+            entry.clone(),
+            Ok(entry.session.clone()),
+        ));
+        assert!(app.durable.cards.is_empty());
+        let _ = app.resume_saved_conversation(entry);
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn preparation_rechecks_a_conversation_opened_while_waiting() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = saved(directory.path());
+        let _ = app.resume_saved_conversation(entry.clone());
+        let card = app.workspace.focused();
+        app.resume_ui.loading = true;
+        let generation = app.resume_ui.generation;
+        let _ = app.update_resume(Action::Prepared(
+            generation,
+            entry.clone(),
+            Ok(entry.session),
+        ));
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), card);
+        assert!(!app.resume_ui.loading);
     }
 
     #[test]

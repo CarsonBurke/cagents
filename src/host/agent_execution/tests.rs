@@ -207,6 +207,8 @@ while IFS= read -r frame; do
     get_state) data='{"sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","isStreaming":false}' ;;
     get_available_models) data='{"models":[]}' ;;
     get_available_commands) data='{"commands":[]}' ;;
+    get_subagents) data='{"subagents":[]}' ;;
+    set_subagent_subscription) data='{"level":"events"}' ;;
     get_messages_page) data='{"messages":[],"nextCursor":null}' ;;
     get_session_stats) data='{"tokens":{"input":7,"output":3},"cost":0.0001}' ;;
     prompt)
@@ -1050,7 +1052,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
                     json!({"thread":{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "model/list" | "skills/list" => json!({"data":[]}),
-                "thread/queue/list" => json!({"data":[],"nextCursor":null}),
+                "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
                 "turn/start" => {
                     prompts += 1;
                     json!({"turn":{"id":"owned-turn"}})
