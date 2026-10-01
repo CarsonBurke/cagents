@@ -6,21 +6,22 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 
 const CONTENT: &str = include_str!("../../assets/skills/cagents-agents/SKILL.md");
 const NAME: &str = "cagents-agents";
-/// SHA-256 of [`CONTENT`]. A test fails when `SKILL.md` changes until this is
-/// updated, and updating it means moving the old value into [`PREVIOUS`].
-const CURRENT_SHA256: &str = "7213ff9f5c012409711c3183c82f4dbb5293cbb309251334f83efda7fb863b33";
-/// SHA-256 of every earlier bundled `SKILL.md`, oldest first. An installed copy
-/// matching one of these is ours and unedited, so it is upgraded in place.
-/// Anything else is user content and is never replaced. Append only.
-const PREVIOUS: &[&str] = &[
+/// SHA-256 of every bundled `SKILL.md`, oldest first; the last entry is the
+/// current [`CONTENT`]. An installed copy matching any entry is ours and
+/// unedited, so it is upgraded in place; anything else is user content and is
+/// never replaced. Append only: when `SKILL.md` changes, a test fails until its
+/// new hash is appended, which keeps every earlier revision upgradable.
+const BUNDLED: &[&str] = &[
     // 0e2d75a / #437: the first bundled revision.
     "9305357e17ee29e04d13494dc2a86a066684c3c7952c4f1bd4a45c577350308b",
+    // e0bf6c0 / #546: documents --reasoning-effort.
+    "7213ff9f5c012409711c3183c82f4dbb5293cbb309251334f83efda7fb863b33",
 ];
 /// Larger than any bundled revision, so an oversized file is user content
 /// without being read in full.
@@ -62,7 +63,7 @@ pub(crate) fn install(
 }
 
 fn install_at(root: &Path, create_root: bool) -> io::Result<()> {
-    install_bundle(root, create_root, CONTENT.as_bytes(), PREVIOUS)
+    install_bundle(root, create_root, CONTENT.as_bytes(), BUNDLED)
 }
 
 fn install_bundle(
@@ -89,7 +90,7 @@ fn install_bundle(
     let destination = skill.join("SKILL.md");
     match read_regular(&destination, 0) {
         Ok((existing, _)) if existing == content => return Ok(()),
-        Ok(_) => return upgrade(&skills, &skill, &destination, content, previous),
+        Ok(_) => return upgrade(&skill, &destination, content, previous),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
@@ -112,23 +113,16 @@ fn install_bundle(
 
 /// Replaces an unedited earlier bundle, and nothing else.
 ///
-/// A symbolic link anywhere from `skills` down means the skill is managed
-/// elsewhere (for example by a dotfiles repository), so its target is never
-/// written even when it holds an earlier bundle. The provider root itself may
-/// be linked: selected account configuration directories legitimately are.
-/// The checks are path-based, so a link swapped in between them and the rename
-/// is not detected; the tree belongs to the same user who runs the daemon.
-fn upgrade(
-    skills: &Path,
-    skill: &Path,
-    destination: &Path,
-    content: &[u8],
-    previous: &[&str],
-) -> io::Result<()> {
-    for directory in [skills, skill] {
-        if !fs::symlink_metadata(directory)?.file_type().is_dir() {
-            return Err(preserved("is reached through a symbolic link"));
-        }
+/// The hash allowlist is the guard: only a byte-exact earlier bundle, which
+/// cagents itself wrote, is replaced. The provider root and its `skills`
+/// directory may be links, as users commonly link them into dotfiles. A linked
+/// `cagents-agents` directory or `SKILL.md` is a deliberately managed copy of
+/// this skill, so its target is never written even when it holds an earlier
+/// bundle. The link checks are path-based, so a link swapped in between them
+/// and the rename is not detected; the tree belongs to the daemon's user.
+fn upgrade(skill: &Path, destination: &Path, content: &[u8], previous: &[&str]) -> io::Result<()> {
+    if !fs::symlink_metadata(skill)?.file_type().is_dir() {
+        return Err(preserved("directory is a symbolic link"));
     }
     let (existing, metadata) = read_regular(destination, libc::O_NOFOLLOW).map_err(|error| {
         match error.raw_os_error() {
@@ -141,6 +135,10 @@ fn upgrade(
             "differs from every bundled version and may be user-edited",
         ));
     }
+    // A second hard link is another managed copy that a rename would detach.
+    if metadata.nlink() > 1 {
+        return Err(preserved("has another hard link"));
+    }
     // Rename within the skill directory is atomic: a provider reading the
     // skill concurrently sees either the complete old or new revision.
     let mut pending = tempfile::NamedTempFile::new_in(skill)?;
@@ -151,8 +149,28 @@ fn upgrade(
             metadata.permissions().mode() & 0o7777,
         ))?;
     pending.as_file().sync_all()?;
+    // Narrow the window for an in-place edit made since the hash was checked.
+    let current = fs::symlink_metadata(destination)?;
+    if (
+        current.ino(),
+        current.len(),
+        current.mtime(),
+        current.mtime_nsec(),
+    ) != (
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    ) {
+        return Err(preserved("changed during the upgrade"));
+    }
     pending.persist(destination).map_err(|error| error.error)?;
-    fs::File::open(skill)?.sync_all()
+    // The rename has happened; directory durability is best effort and must
+    // not report a completed upgrade as a failed installation.
+    if let Err(error) = fs::File::open(skill).and_then(|directory| directory.sync_all()) {
+        tracing::debug!(%error, path = %skill.display(), "cannot sync upgraded skill directory");
+    }
+    Ok(())
 }
 
 fn preserved(reason: &str) -> io::Error {
@@ -289,20 +307,17 @@ mod tests {
     fn bundled_revision_hashes_are_recorded() {
         let actual = sha256(CONTENT.as_bytes());
         assert_eq!(
-            actual, CURRENT_SHA256,
-            "assets/skills/cagents-agents/SKILL.md changed. Append the old CURRENT_SHA256 \
-             to PREVIOUS so installed copies of it upgrade, then set CURRENT_SHA256 to {actual}"
+            BUNDLED.last(),
+            Some(&actual.as_str()),
+            "assets/skills/cagents-agents/SKILL.md changed. Append {actual} to BUNDLED \
+             and keep every earlier entry, so installed copies of them upgrade"
         );
-        assert!(
-            !PREVIOUS.contains(&CURRENT_SHA256),
-            "the current bundle is not an earlier one"
-        );
-        for (index, hash) in PREVIOUS.iter().enumerate() {
+        for (index, hash) in BUNDLED.iter().enumerate() {
             assert!(
                 hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
                 "{hash} is not a lowercase SHA-256"
             );
-            assert!(!PREVIOUS[..index].contains(hash), "{hash} is repeated");
+            assert!(!BUNDLED[..index].contains(hash), "{hash} is repeated");
         }
     }
 
@@ -376,25 +391,59 @@ mod tests {
     }
 
     #[test]
-    fn linked_skill_or_skills_directory_is_never_written() {
-        for linked in [NAME, ""] {
-            let directory = tempfile::tempdir().unwrap();
-            let root = directory.path().join("root");
-            let managed = directory.path().join("dotfiles");
-            fs::create_dir_all(managed.join(NAME)).unwrap();
-            fs::write(managed.join(NAME).join("SKILL.md"), OLD).unwrap();
-            fs::create_dir_all(root.join("skills")).unwrap();
-            if linked == NAME {
-                std::os::unix::fs::symlink(managed.join(NAME), root.join("skills").join(NAME))
-                    .unwrap();
-            } else {
-                fs::remove_dir(root.join("skills")).unwrap();
-                std::os::unix::fs::symlink(&managed, root.join("skills")).unwrap();
-            }
-            assert_preserved(&root, &[sha256(OLD).as_str()]);
-            assert_eq!(fs::read(managed.join(NAME).join("SKILL.md")).unwrap(), OLD);
-            assert_eq!(fs::read_dir(managed.join(NAME)).unwrap().count(), 1);
-        }
+    fn linked_skill_directory_is_never_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        let managed = directory.path().join("dotfiles").join(NAME);
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(managed.join("SKILL.md"), OLD).unwrap();
+        fs::create_dir_all(root.join("skills")).unwrap();
+        std::os::unix::fs::symlink(&managed, root.join("skills").join(NAME)).unwrap();
+        assert_preserved(&root, &[sha256(OLD).as_str()]);
+        assert_eq!(fs::read(managed.join("SKILL.md")).unwrap(), OLD);
+        assert_eq!(fs::read_dir(&managed).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn earlier_bundle_under_linked_root_and_skills_directory_is_upgraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let dotfiles = directory.path().join("dotfiles");
+        fs::create_dir_all(dotfiles.join("claude")).unwrap();
+        fs::create_dir_all(dotfiles.join("skills").join(NAME)).unwrap();
+        let skill = dotfiles.join("skills").join(NAME).join("SKILL.md");
+        fs::write(&skill, OLD).unwrap();
+        // ~/.claude -> dotfiles/claude and ~/.claude/skills -> ../skills.
+        let root = directory.path().join(".claude");
+        std::os::unix::fs::symlink(dotfiles.join("claude"), &root).unwrap();
+        std::os::unix::fs::symlink("../skills", dotfiles.join("claude/skills")).unwrap();
+        install_bundle(&root, false, NEW, &[sha256(OLD).as_str()]).unwrap();
+        assert_eq!(fs::read(&skill).unwrap(), NEW);
+        assert!(fs::symlink_metadata(&skill).unwrap().is_file());
+        assert!(
+            fs::symlink_metadata(root.join("skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // The allowlist still guards linked trees: an edited copy is kept.
+        fs::write(&skill, b"edited").unwrap();
+        assert_preserved(&root, &[sha256(OLD).as_str()]);
+        assert_eq!(fs::read(&skill).unwrap(), b"edited");
+    }
+
+    #[test]
+    fn hard_linked_skill_file_is_never_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        install_bundle(directory.path(), false, OLD, &[]).unwrap();
+        let path = installed(directory.path());
+        let managed = directory.path().join("managed-SKILL.md");
+        fs::hard_link(&path, &managed).unwrap();
+        assert_preserved(directory.path(), &[sha256(OLD).as_str()]);
+        assert_eq!(fs::read(&path).unwrap(), OLD);
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            fs::metadata(&managed).unwrap().ino()
+        );
     }
 
     #[test]
