@@ -1375,11 +1375,9 @@ impl Runtime {
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
         let modes: &[PromptMode] = if snapshot.busy {
-            match (snapshot.capabilities.steer, snapshot.capabilities.queue) {
-                (true, true) => &[PromptMode::Steer, PromptMode::Queue],
-                (true, false) => &[PromptMode::Steer],
-                (false, true) => &[PromptMode::Queue],
-                (false, false) => &[PromptMode::Queue],
+            match snapshot.capabilities.steer {
+                true => &[PromptMode::Steer, PromptMode::Queue],
+                false => &[PromptMode::Queue],
             }
         } else {
             &[PromptMode::Send]
@@ -1551,7 +1549,7 @@ impl Runtime {
         // cannot use and cannot interpret: the queue button in particular was
         // a bare plus that never responded and never said what it was for.
         // Buttons still appear only when there is a message to send.
-        if available && self.followup.is_none() && has_draft && key_submit.0.is_some() {
+        if available && has_draft && key_submit.0.is_some() {
             for (slot, mode) in modes.iter().enumerate() {
                 let (name, label) = submit_control(*mode, slot, enter_sends);
                 actions.push(icon(name, label, true, Action::Submit(target, *mode)));
