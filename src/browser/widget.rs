@@ -305,7 +305,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         tree::State::new(WidgetState::default())
     }
 
-    fn diff(&self, tree: &mut Tree) {
+    fn diff(&mut self, tree: &mut Tree) {
         // Overlay widgets may stop forwarding events to their covered content.
         // Reconcile at tree construction, before that overlay is first drawn.
         let state = tree.state.downcast_mut::<WidgetState>();
@@ -736,7 +736,7 @@ mod tests {
     #[test]
     fn covering_overlay_hides_native_pixels_without_waiting_for_input() {
         let handle = BrowserHandle::fixture();
-        let widget = BrowserWidget::<()>::new(&handle);
+        let mut widget = BrowserWidget::<()>::new(&handle);
         let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
         {
             let state = tree.state.downcast_mut::<WidgetState>();
@@ -747,7 +747,7 @@ mod tests {
             state.touch_capture.insert(7);
             state.preedit = Some(Preedit::new());
         }
-        let covered = BrowserWidget::<()>::new(&handle).obscured(true);
+        let mut covered = BrowserWidget::<()>::new(&handle).obscured(true);
         covered.diff(&mut tree);
         let commands = handle.mailbox.drain_coalesced();
         assert_eq!(commands.presented, Some(false));
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn dismissing_an_overlay_does_not_reveal_a_clipped_browser() {
         let handle = BrowserHandle::fixture();
-        let widget = BrowserWidget::<()>::new(&handle).obscured(true);
+        let mut widget = BrowserWidget::<()>::new(&handle).obscured(true);
         let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
         widget.diff(&mut tree);
         assert_eq!(handle.mailbox.drain_coalesced().presented, Some(false));
