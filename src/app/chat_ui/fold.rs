@@ -61,11 +61,15 @@ struct State {
     tall: bool,
     /// The height of the content that is shown.
     shown: f32,
+    /// The content is cut, not merely tall enough to be.
+    cut: bool,
+    /// A press began on the shown content and has not been released, as when
+    /// the reader is selecting its text.
+    pressed: bool,
 }
 
 impl<Message> Fold<'_, Message> {
-    /// Where the shown part of the content is, so input under the cut part
-    /// does not reach text the reader cannot see.
+    /// Where the shown part of the content is.
     fn shown(state: &State, layout: Layout<'_>) -> Rectangle {
         let bounds = layout.bounds();
         Rectangle {
@@ -74,10 +78,27 @@ impl<Message> Fold<'_, Message> {
         }
     }
 
-    fn cursor(state: &State, layout: Layout<'_>, cursor: mouse::Cursor) -> mouse::Cursor {
+    /// The cursor as the content sees it. Over the cut part the content is
+    /// out of reach, so text the reader cannot see is neither hovered nor
+    /// clicked; but a press that began on the shown part follows the cursor
+    /// past the cut as far as the last shown line, so a selection can still
+    /// reach it.
+    fn cursor(
+        state: &State,
+        layout: Layout<'_>,
+        content: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) -> mouse::Cursor {
+        let shown = Self::shown(state, layout);
         match cursor.position() {
-            Some(position) if !Self::shown(state, layout).contains(position) => {
-                mouse::Cursor::Unavailable
+            Some(position) if state.cut && position.y >= shown.y + shown.height => {
+                if state.pressed {
+                    mouse::Cursor::Available(Point::new(position.x, shown.y + shown.height - 1.0))
+                } else if content.bounds().contains(position) {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                }
             }
             _ => cursor,
         }
@@ -135,7 +156,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         } else {
             (layout::Node::new(Size::ZERO), shown)
         };
-        *tree.state.downcast_mut::<State>() = State { tall, shown };
+        let state = tree.state.downcast_mut::<State>();
+        state.tall = tall;
+        state.shown = shown;
+        state.cut = shown < full;
         layout::Node::with_children(
             limits.resolve(Length::Fill, Length::Shrink, Size::new(width, total)),
             vec![content, toggle],
@@ -178,9 +202,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
-        let state = tree.state.downcast_ref::<State>();
+        let state = tree.state.downcast_mut::<State>();
+        if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
+            state.pressed = cursor.is_over(Self::shown(state, layout));
+        }
         let tall = state.tall;
-        let inner = Self::cursor(state, layout, cursor);
+        let inner = Self::cursor(state, layout, content, cursor);
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -203,6 +230,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
                 viewport,
             );
         }
+        if matches!(event, Event::Mouse(mouse::Event::ButtonReleased(_))) {
+            tree.state.downcast_mut::<State>().pressed = false;
+        }
     }
 
     fn mouse_interaction(
@@ -221,7 +251,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let shown = self.content.as_widget().mouse_interaction(
             &tree.children[0],
             content,
-            Self::cursor(state, layout, cursor),
+            Self::cursor(state, layout, content, cursor),
             viewport,
             renderer,
         );
@@ -255,7 +285,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let state = tree.state.downcast_ref::<State>();
         let shown = Self::shown(state, layout);
         let cut = shown.height < content.bounds().height;
-        let inner = Self::cursor(state, layout, cursor);
+        let inner = Self::cursor(state, layout, content, cursor);
         if !cut {
             self.content.as_widget().draw(
                 &tree.children[0],
@@ -313,6 +343,30 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
                 viewport,
             );
         }
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        let mut children = layout.children();
+        let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
+            return iced_accessibility::A11yTree::default();
+        };
+        let content = self
+            .content
+            .as_widget()
+            .a11y_nodes(content, &tree.children[0], cursor);
+        if !tree.state.downcast_ref::<State>().tall {
+            return content;
+        }
+        let toggle = self
+            .toggle
+            .as_widget()
+            .a11y_nodes(toggle, &tree.children[1], cursor);
+        iced_accessibility::A11yTree::join([content, toggle].into_iter())
     }
 
     fn overlay<'b>(

@@ -1104,7 +1104,12 @@ impl Claude {
                 if self.handed_back.len() > MAX_TOOLS {
                     self.handed_back.pop_front();
                 }
-            } else if from.is_empty() && self.handed_back.contains(sender) {
+            } else if from.is_empty()
+                && let Some(index) = self.handed_back.iter().position(|known| known == sender)
+            {
+                // The harness may notify of an agent again, once it is sent
+                // more work; the report that work ends in is a new one.
+                self.handed_back.remove(index);
                 *kind = DeliveryKind::Notice;
                 body.clear();
             }
@@ -2056,10 +2061,12 @@ fn teammate_messages(content: &str) -> Vec<ItemContent> {
         };
         let result = string(&event, "result").trim();
         let failure = string(&event, "failureReason").trim();
-        let summary = match (failure.is_empty(), string(&event, "summary").trim()) {
-            (false, _) => format!("Stopped: {failure}"),
-            (true, "") => summary,
-            (true, written) => written.into(),
+        // The event's own `summary` previews the last message the teammate
+        // sent someone, not what it reports, so it is no heading.
+        let summary = if failure.is_empty() {
+            summary
+        } else {
+            format!("Stopped: {failure}")
         };
         deliveries.push(if result.is_empty() {
             ItemContent::Delivery {
@@ -2094,6 +2101,23 @@ const HANDED_BACK: &str = "This agent's report was delivered to you as a message
 
 /// What the harness answers for an agent that stopped before reporting.
 const NOT_REPORTED: &str = "This agent has not reported yet";
+
+/// What the harness answers for an agent that ended without handing a report
+/// back, whose last words it withholds.
+const UNSENT: &str = "The subagent ended without delivering a report";
+
+/// What to show for a harness pointer in place of an agent's result: nothing
+/// for a report already shown, and the pointer itself for one never made.
+/// `None` when `result` is the report.
+fn pointer(result: &str) -> Option<&str> {
+    if result.starts_with(HANDED_BACK) {
+        Some("")
+    } else if result.starts_with(NOT_REPORTED) || result.starts_with(UNSENT) {
+        Some(result)
+    } else {
+        None
+    }
+}
 
 /// Parses the `<task-notification>` elements in `content`: the harness
 /// telling the model a background command, monitor or agent finished or
@@ -2137,9 +2161,10 @@ fn task_notification(inner: &str) -> ItemContent {
     // A finished agent's result is its report: headless Claude Code hands a
     // background agent's final message back this way rather than as a peer's.
     let (kind, body) = match element("result") {
-        Some(result) if result.starts_with(HANDED_BACK) => (DeliveryKind::Notice, String::new()),
-        Some(result) if result.starts_with(NOT_REPORTED) => (DeliveryKind::Notice, result),
-        Some(result) => (DeliveryKind::Report, result),
+        Some(result) => match pointer(&result) {
+            Some(shown) => (DeliveryKind::Notice, shown.to_owned()),
+            None => (DeliveryKind::Report, result),
+        },
         None => (DeliveryKind::Notice, element("event").unwrap_or_default()),
     };
     ItemContent::Delivery {
@@ -2178,12 +2203,10 @@ fn live_notification(frame: &Value, description: &str, agent: bool) -> ItemConte
         (false, "stopped" | "killed") => format!("Agent \"{description}\" was stopped"),
         (false, _) => format!("Agent \"{description}\" finished"),
     };
-    let (kind, body) = if summary.starts_with(HANDED_BACK) || summary.is_empty() {
-        (DeliveryKind::Notice, "")
-    } else if summary.starts_with(NOT_REPORTED) {
-        (DeliveryKind::Notice, summary)
-    } else {
-        (DeliveryKind::Report, summary)
+    let (kind, body) = match pointer(summary) {
+        _ if summary.is_empty() => (DeliveryKind::Notice, ""),
+        Some(shown) => (DeliveryKind::Notice, shown),
+        None => (DeliveryKind::Report, summary),
     };
     ItemContent::Delivery {
         kind,
@@ -2798,7 +2821,9 @@ impl Claude {
                 // Headless Claude Code tells the model a task finished in a turn
                 // it never streams, then acts on it; without the notice the reply
                 // would answer nothing on screen. The transcript records that turn,
-                // and history shows it the same way.
+                // and history shows it the same way. A notification the harness
+                // keeps out of the transcript, or out of the model's way, is not
+                // one the model acts on, and history never shows it.
                 if string(frame, "subtype") == "task_notification" {
                     let description = match &item.content {
                         ItemContent::Tool { input, .. } => input.clone(),
@@ -2806,13 +2831,19 @@ impl Claude {
                     };
                     let agent = self.agent_tasks.iter().any(|known| known == task);
                     self.agent_tasks.retain(|known| known != task);
-                    let content = self.deduplicate(live_notification(frame, &description, agent));
-                    step.events.push(Event::Item(Item {
-                        id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
-                        role: Role::User,
-                        content,
-                        at: None,
-                    }));
+                    let recorded = ["skip_transcript", "ambient"]
+                        .iter()
+                        .all(|key| frame.get(key).and_then(Value::as_bool) != Some(true));
+                    if recorded {
+                        let content =
+                            self.deduplicate(live_notification(frame, &description, agent));
+                        step.events.push(Event::Item(Item {
+                            id: format!("claude-notification:{task}:{}", string(frame, "uuid")),
+                            role: Role::User,
+                            content,
+                            at: None,
+                        }));
+                    }
                 }
             }
             // Compaction is the one frame here a reader acts on, and its only
@@ -4164,6 +4195,38 @@ mod tests {
             [(Role::User, ItemContent::Delivery { kind: DeliveryKind::Notice, body, .. })]
                 if body.starts_with("This agent has not reported yet")
         ));
+        let unsent = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "unsent",
+                "origin": {"kind": "task-notification"},
+                "message": {"role": "user", "content": "<task-notification>\n<task-id>a98</task-id>\n<summary>Agent \"Lint\" finished</summary>\n<result>The subagent ended without delivering a report through SubagentHandback, so no report was delivered.</result>\n</task-notification>"}
+            }))
+            .unwrap();
+        assert!(matches!(
+            &deliveries(&unsent)[..],
+            [(
+                Role::User,
+                ItemContent::Delivery {
+                    kind: DeliveryKind::Notice,
+                    ..
+                }
+            )]
+        ));
+        // Sent more work, the agent ends in a new report, shown in full.
+        let again = adapter
+            .receive(json!({
+                "type": "user",
+                "uuid": "again",
+                "origin": {"kind": "task-notification"},
+                "message": {"role": "user", "content": "<task-notification>\n<task-id>a5434</task-id>\n<summary>Agent \"Review\" finished</summary>\n<result>Second findings</result>\n</task-notification>"}
+            }))
+            .unwrap();
+        assert!(matches!(
+            &deliveries(&again)[..],
+            [(Role::User, ItemContent::Delivery { kind: DeliveryKind::Report, body, .. })]
+                if body == "Second findings"
+        ));
     }
 
     #[test]
@@ -4223,7 +4286,7 @@ mod tests {
     #[test]
     fn teammate_messages_read_as_one_delivery_each() {
         let mut adapter = Claude::default();
-        let idle = json!({"type": "idle_notification", "from": "tester", "idleReason": "available", "result": "## Suite\nAll green."}).to_string();
+        let idle = json!({"type": "idle_notification", "from": "tester", "idleReason": "available", "summary": "[to lead] Suite passes", "result": "## Suite\nAll green."}).to_string();
         let quiet =
             json!({"type": "idle_notification", "from": "builder", "idleReason": "available"})
                 .to_string();
@@ -4306,6 +4369,21 @@ mod tests {
                 ..
             }) if summary == "Background command \"Sleep then echo\" completed (exit code 0)" && body.is_empty()
         )));
+        for flag in ["skip_transcript", "ambient"] {
+            let quiet = adapter
+                .receive(json!({"type":"system","subtype":"task_notification","task_id":"bash2","status":"completed","summary":"Background command finished","uuid":"n3",flag:true}))
+                .unwrap();
+            assert!(
+                !quiet.events.iter().any(|event| matches!(
+                    event,
+                    Event::Item(Item {
+                        content: ItemContent::Delivery { .. },
+                        ..
+                    })
+                )),
+                "{flag} keeps the notification out of the transcript"
+            );
+        }
     }
 
     #[test]

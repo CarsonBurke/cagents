@@ -2493,11 +2493,11 @@ impl Cagents {
                     );
                 }
             }
-            // A delivery folded to its opening would hide a match below it.
+            // A delivery folded to its opening would hide a match in its body;
+            // its heading is always shown.
             for index in &turn.prompt {
                 if let Some(item) = runtime.snapshot.items.get(*index)
-                    && matches!(item.content, ItemContent::Delivery { .. })
-                    && contains_text(&item.content, query)
+                    && matches!(&item.content, ItemContent::Delivery { body, .. } if body.contains(query))
                 {
                     runtime.expanded.insert(item.id.clone());
                 }
