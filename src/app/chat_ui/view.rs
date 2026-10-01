@@ -21,14 +21,10 @@ const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
-/// A delivery longer than this is folded until the reader opens it. A short
-/// message is read in full where it lands; past these it is a report whose
-/// opening says what it is about.
-const DELIVERY_LINES: usize = 10;
-const DELIVERY_BYTES: usize = 1200;
-/// How much of a folded delivery shows: its heading and first paragraph or
-/// so, enough to recognize it without reading it.
-const DELIVERY_FOLDED_HEIGHT: f32 = 132.0;
+/// How much of a long report or message shows until the reader opens it:
+/// its opening paragraph or so, enough to recognize it without reading it. A
+/// short one is read in full where it lands.
+const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 /// The lines of a notice's event shown before it is opened.
 const NOTICE_LINES: usize = 3;
 
@@ -2360,15 +2356,15 @@ impl Runtime {
         };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         for index in &turn.prompt {
-            match placed(*index) {
-                Some((item, cached)) if matches!(item.content, ItemContent::Delivery { .. }) => {
-                    rows.push(self.delivery_view(item, cached, settings));
-                }
-                _ => {
-                    if let Some(item) = items.get(*index) {
-                        rows.push(self.prompt_view(item));
-                    }
-                }
+            let Some(item) = items.get(*index) else {
+                continue;
+            };
+            if !matches!(item.content, ItemContent::Delivery { .. }) {
+                rows.push(self.prompt_view(item));
+            } else if let Some(cached) = self.cache.get(&item.id) {
+                // Drawn once its body is parsed, as an answer is; never in the
+                // user's own bubble.
+                rows.push(self.delivery_view(item, cached, settings));
             }
         }
         if !turn.steps.is_empty() {
@@ -2694,7 +2690,7 @@ impl Runtime {
             return self.prompt_view(item);
         };
         let expanded = self.expanded.contains(&item.id);
-        let fold = |label: &'static str| -> Element<'static, Message> {
+        let toggle = |label: &'static str| -> Element<'static, Message> {
             widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
                 .class(crate::ui_controls::control_style(false, None))
                 .on_press(action(Action::Toggle(self.target, item.id.clone())))
@@ -2738,7 +2734,7 @@ impl Runtime {
                         .into(),
                 );
                 if long {
-                    rows.push(fold("Show more"));
+                    rows.push(toggle("Show more"));
                 }
             }
             return widget::container(message_actions(
@@ -2752,20 +2748,26 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
+        // A named sender leads and its own summary follows; an unnamed one is
+        // described by the harness's summary, as `chat::delivery_heading`.
         let mut heading = vec![glyph("chat-bubble-text-symbolic")];
-        if summary.is_empty() {
+        let mut subtitle = None;
+        if from.is_empty() && !summary.is_empty() {
+            heading.push(design::heading(summary.clone()).into());
+        } else {
             heading.push(design::caption(kind.verb()).into());
             heading.push(design::heading(chat::delivery_sender(from, sender)).into());
-        } else {
-            heading.push(design::heading(summary.clone()).into());
-        }
-        // A named sender's ID only tells two of the same name apart.
-        if summary.is_empty() && !from.is_empty() && !sender.is_empty() {
-            heading.push(
-                design::caption(sender.chars().take(8).collect::<String>())
-                    .font(iced::Font::MONOSPACE)
-                    .into(),
-            );
+            // A named sender's ID only tells two of the same name apart.
+            if !from.is_empty() && !sender.is_empty() {
+                heading.push(
+                    design::caption(sender.chars().take(8).collect::<String>())
+                        .font(iced::Font::MONOSPACE)
+                        .into(),
+                );
+            }
+            if !summary.is_empty() {
+                subtitle = Some(design::caption(summary.clone()));
+            }
         }
         let mut rows = vec![
             widget::row::with_children(heading)
@@ -2773,24 +2775,20 @@ impl Runtime {
                 .align_y(Alignment::Center)
                 .into(),
         ];
+        rows.extend(subtitle.map(Element::from));
         if !body.is_empty() {
-            let long = body.lines().count() > DELIVERY_LINES || body.len() > DELIVERY_BYTES;
-            let text = prose::view(cached, settings, self.target, self.find.as_deref());
-            rows.push(if long && !expanded {
-                widget::container(text)
-                    .max_height(DELIVERY_FOLDED_HEIGHT)
-                    .clip(true)
-                    .into()
-            } else {
-                text
-            });
-            if long {
-                rows.push(fold(if *kind == chat::DeliveryKind::Report {
+            rows.push(fold::fold(
+                prose::view(cached, settings, self.target, self.find.as_deref()),
+                toggle(if *kind == chat::DeliveryKind::Report {
                     "Show full report"
                 } else {
                     "Show full message"
-                }));
-            }
+                }),
+                !expanded,
+                DELIVERY_FOLDED_HEIGHT,
+                step::GAP_S,
+                design::sunken,
+            ));
         }
         let card = widget::container(
             widget::column::with_children(rows)

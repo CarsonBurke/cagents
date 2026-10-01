@@ -14,6 +14,7 @@ use std::sync::{
 
 mod clipboard_image;
 mod completion;
+mod fold;
 mod images;
 mod prose;
 mod retained;
@@ -607,7 +608,11 @@ impl ChangeToken {
                 summary,
                 body,
             } => Self {
-                shape: 18 + *kind as u8,
+                shape: match kind {
+                    chat::DeliveryKind::Report => 18,
+                    chat::DeliveryKind::Message => 19,
+                    chat::DeliveryKind::Notice => 20,
+                },
                 body: body.len(),
                 digest: [from, sender, summary, body]
                     .into_iter()
@@ -757,10 +762,16 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
         }
         ItemContent::Delivery {
             from,
+            sender,
             summary,
             body,
             ..
-        } => from.contains(query) || summary.contains(query) || body.contains(query),
+        } => {
+            from.contains(query)
+                || sender.contains(query)
+                || summary.contains(query)
+                || body.contains(query)
+        }
     }
 }
 
@@ -2480,6 +2491,15 @@ impl Cagents {
                         item.id.clone(),
                         CachedItem::updated(&item.content, runtime.syntax_theme, previous, true),
                     );
+                }
+            }
+            // A delivery folded to its opening would hide a match below it.
+            for index in &turn.prompt {
+                if let Some(item) = runtime.snapshot.items.get(*index)
+                    && matches!(item.content, ItemContent::Delivery { .. })
+                    && contains_text(&item.content, query)
+                {
+                    runtime.expanded.insert(item.id.clone());
                 }
             }
         }

@@ -1135,10 +1135,14 @@ fn console(
                         sender,
                         summary,
                         body,
-                    } => format!(
-                        "{}\n{body}\n",
-                        chat::delivery_heading(*kind, from, sender, summary)
-                    ),
+                    } => {
+                        let heading = chat::delivery_heading(*kind, from, sender, summary);
+                        if body.is_empty() {
+                            format!("{heading}\n")
+                        } else {
+                            format!("{heading}:\n{body}\n")
+                        }
+                    }
                     _ => continue,
                 };
                 if text.len() > remaining {

@@ -991,9 +991,9 @@ pub enum ItemContent {
         /// An opaque identifier telling this sender apart from others of the
         /// same name, such as a subagent's task ID. Empty when there is none.
         sender: String,
-        /// The harness's own one-line account of what happened, such as
-        /// `Agent "Review" finished`. Empty when it wrote none, and the
-        /// heading is then formed from `kind` and the sender.
+        /// A one-line account of the delivery: the harness's own, such as
+        /// `Agent "Review" finished`, or the one a teammate wrote for its
+        /// message. Empty when there is none.
         summary: String,
         /// A report's or message's Markdown, or the output a notice quotes,
         /// with the harness's framing removed.
@@ -1036,14 +1036,16 @@ pub fn delivery_sender(from: &str, sender: &str) -> String {
     }
 }
 
-/// A delivery's heading as plain text: the harness's own summary where it
-/// wrote one, such as `Agent "Review" finished`, and otherwise who sent it,
-/// as in `Report from general-purpose`.
+/// A delivery's heading as plain text. A named sender leads, followed by
+/// the summary it wrote, as in `Message from tester: Suite passes`; an
+/// unnamed one is described by the harness's own summary where it wrote one,
+/// such as `Agent "Review" finished`, and otherwise by its identifier.
 pub fn delivery_heading(kind: DeliveryKind, from: &str, sender: &str, summary: &str) -> String {
-    if summary.is_empty() {
-        format!("{} {}", kind.verb(), delivery_sender(from, sender))
-    } else {
-        summary.into()
+    match (kind, from.is_empty(), summary.is_empty()) {
+        (DeliveryKind::Notice, _, false) | (_, true, false) => summary.into(),
+        (DeliveryKind::Notice, _, true) => "Background work changed state".into(),
+        (_, false, false) => format!("{} {from}: {summary}", kind.verb()),
+        (_, _, true) => format!("{} {}", kind.verb(), delivery_sender(from, sender)),
     }
 }
 
@@ -1415,6 +1417,27 @@ pub enum Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_headings_name_the_sender_before_any_summary() {
+        use DeliveryKind::*;
+        assert_eq!(
+            delivery_heading(Message, "tester", "", "CI is down"),
+            "Message from tester: CI is down"
+        );
+        assert_eq!(
+            delivery_heading(Report, "", "a17925ac2cee519e2", ""),
+            "Report from agent a17925ac"
+        );
+        assert_eq!(
+            delivery_heading(Report, "", "a1", "Agent \"Review\" finished"),
+            "Agent \"Review\" finished"
+        );
+        assert_eq!(
+            delivery_heading(Notice, "", "", ""),
+            "Background work changed state"
+        );
+    }
 
     #[test]
     fn terminal_handoff_uses_confirmed_claude_permissions_without_changing_identity() {

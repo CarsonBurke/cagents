@@ -508,6 +508,16 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
+            // A notice's body is a log line or a raw result, drawn verbatim.
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                body,
+                ..
+            } => {
+                if !body.is_empty() {
+                    rows.push(code_surface(body, None, Some(Self::OUTPUT_HEIGHT), None));
+                }
+            }
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
                 rows.push(prose::view(
                     cached,

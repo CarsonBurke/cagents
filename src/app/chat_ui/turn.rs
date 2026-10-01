@@ -387,11 +387,19 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
         ItemContent::WebSearch { query, .. } => query.as_str(),
         ItemContent::Tool { name, .. } => name.as_str(),
         ItemContent::Image { description, .. } => description.as_str(),
-        ItemContent::Delivery { summary, from, .. } => {
-            if summary.is_empty() {
+        // As `chat::delivery_heading` has it, less a named sender's summary.
+        ItemContent::Delivery {
+            from,
+            sender,
+            summary,
+            ..
+        } => {
+            if !from.is_empty() {
                 from.as_str()
-            } else {
+            } else if !summary.is_empty() {
                 summary.as_str()
+            } else {
+                sender.get(..8).unwrap_or(sender)
             }
         }
     }
@@ -420,6 +428,7 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
         ItemContent::WebSearch { .. } => "Searched the web for",
         ItemContent::Tool { .. } => "Called",
         ItemContent::Image { .. } => "Viewed",
+        ItemContent::Delivery { from, summary, .. } if from.is_empty() && !summary.is_empty() => "",
         ItemContent::Delivery { kind, .. } => kind.verb(),
     }
 }
