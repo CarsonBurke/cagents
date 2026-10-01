@@ -7,6 +7,36 @@ use super::{
     DevicePoint, EditingAction, ImeInput, TouchState, WheelUnit,
 };
 
+// Servo's paint thread treats wheel deltas as device pixels, including when
+// the DOM event advertises DeltaLine. Match servoshell's line-wheel distance
+// before dispatch so ordinary mouse notches do not move just one pixel.
+const WHEEL_LINE_PIXELS: f64 = 76.0;
+
+pub(crate) fn wheel_pixels(x: f64, y: f64, unit: WheelUnit) -> (f64, f64) {
+    // The active winit backend already supplies physical pixel deltas. Only
+    // pointer positions use the widget's logical-to-device scale conversion.
+    let factor = match unit {
+        WheelUnit::Lines => WHEEL_LINE_PIXELS,
+        WheelUnit::Pixels => 1.0,
+    };
+    (x * factor, y * factor)
+}
+
+pub(crate) fn normalize_wheel(input: BrowserInput) -> BrowserInput {
+    match input {
+        BrowserInput::Wheel { x, y, unit, point } => {
+            let (x, y) = wheel_pixels(x, y, unit);
+            BrowserInput::Wheel {
+                x,
+                y,
+                unit: WheelUnit::Pixels,
+                point,
+            }
+        }
+        input => input,
+    }
+}
+
 pub(crate) fn local_device_point(
     window_x: f32,
     window_y: f32,
@@ -109,16 +139,14 @@ pub(crate) fn to_servo(input: BrowserInput) -> servo::InputEvent {
             servo_point(point),
         )),
         BrowserInput::Wheel { x, y, unit, point } => {
+            let (x, y) = wheel_pixels(x, y, unit);
             servo::InputEvent::Wheel(servo::WheelEvent::new(
                 servo::WheelDelta {
                     // iced and Servo both define positive Y as revealing content above.
                     x,
                     y,
                     z: 0.0,
-                    mode: match unit {
-                        WheelUnit::Pixels => servo::WheelMode::DeltaPixel,
-                        WheelUnit::Lines => servo::WheelMode::DeltaLine,
-                    },
+                    mode: servo::WheelMode::DeltaPixel,
                 },
                 servo_point(point),
             ))
@@ -214,6 +242,24 @@ mod tests {
             local_device_point(25.0, 50.0, 5.0, 10.0, 1.5),
             DevicePoint { x: 30.0, y: 60.0 }
         );
+    }
+
+    #[test]
+    fn line_wheels_are_device_pixel_events_at_servoshell_distance() {
+        let mapped = to_servo(BrowserInput::Wheel {
+            x: 0.5,
+            y: -1.0,
+            unit: WheelUnit::Lines,
+            point: DevicePoint { x: 2.0, y: 4.0 },
+        });
+        match mapped {
+            servo::InputEvent::Wheel(event) => {
+                assert_eq!((event.delta.x, event.delta.y), (38.0, -76.0));
+                assert_eq!(event.delta.mode, servo::WheelMode::DeltaPixel);
+            }
+            _ => panic!("wrong Servo event"),
+        }
+        assert_eq!(wheel_pixels(0.5, -1.0, WheelUnit::Pixels), (0.5, -1.0));
     }
 
     #[test]

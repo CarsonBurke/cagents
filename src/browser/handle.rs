@@ -488,6 +488,9 @@ impl BrowserHandle {
     }
 
     pub fn input(&self, input: BrowserInput) -> Result<(), BrowserError> {
+        // Coalesce in one unit so switching between a mouse and touchpad
+        // cannot discard the previous device's still-pending movement.
+        let input = super::input::normalize_wheel(input);
         match input {
             BrowserInput::MouseMove { .. } => self
                 .mailbox
@@ -632,6 +635,39 @@ mod tests {
             commands.pointer_motion,
             Some(BrowserInput::MouseMove { point }) if point.x == 1000.0 && point.y == 1001.0
         ));
+    }
+
+    #[test]
+    fn switching_wheel_units_preserves_all_pending_distance_and_latest_hit_point() {
+        let handle = BrowserHandle::fixture();
+        for (y, unit, x) in [
+            (-1.0, super::super::WheelUnit::Lines, 4.0),
+            (-12.5, super::super::WheelUnit::Pixels, 8.0),
+            (0.5, super::super::WheelUnit::Lines, 10.0),
+        ] {
+            handle
+                .input(BrowserInput::Wheel {
+                    x: 0.0,
+                    y,
+                    unit,
+                    point: super::super::DevicePoint { x, y: 20.0 },
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            handle.mailbox.receiver().try_recv(),
+            Ok(Command::WakeCoalesced)
+        ));
+        assert!(handle.mailbox.receiver().try_recv().is_err());
+        assert_eq!(
+            handle.mailbox.drain_coalesced().wheel,
+            Some(BrowserInput::Wheel {
+                x: 0.0,
+                y: -50.5,
+                unit: super::super::WheelUnit::Pixels,
+                point: super::super::DevicePoint { x: 10.0, y: 20.0 },
+            })
+        );
     }
 
     #[test]
