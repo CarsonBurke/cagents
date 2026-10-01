@@ -201,6 +201,11 @@ impl Cagents {
                 )
             })
             .collect();
+        entries.push((
+            "Resume conversation".into(),
+            "Search saved native chats".into(),
+            Message::ResumeConversation(resume_ui::Action::Open),
+        ));
         for id in self.workspace.order() {
             if let Some(card) = self.card_state(id) {
                 entries.push((
@@ -389,7 +394,24 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                let (card, saved_scope) = self.recently_closed.remove(index);
+                let (card, saved_scope) = self.recently_closed[index].clone();
+                if let CardKind::Chat(session) = &card.kind
+                    && session.launch.session_id.is_some()
+                {
+                    let task =
+                        self.resume_saved_conversation(crate::persistence::SavedConversation {
+                            card: card.id,
+                            title: card.title.clone(),
+                            session: session.clone(),
+                            open: false,
+                            updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
+                        });
+                    if self.resume_ui.error.is_none() {
+                        self.recently_closed.remove(index);
+                    }
+                    return task;
+                }
+                self.recently_closed.remove(index);
                 if card.kind.is_utility() {
                     self.open_utility_card(card.kind)
                 } else {

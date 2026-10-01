@@ -506,6 +506,22 @@ and Stop cancels navigation. Search input uses the configured search URL.
 
 ## Native agent chat
 
+### Resume a saved conversation
+
+Choose **New tab → Resume conversation**, **Resume conversation** on an empty
+workspace, or the command of the same name in the command palette. Search by
+conversation title, provider, project path, or account. Use the arrow keys and
+Enter, or click a conversation to open it.
+
+The picker includes saved native chats that were closed in an earlier run. It
+keeps the exact conversation, original account, and working directory; an
+already-open conversation takes you to its existing pane. Claude's terminal
+resume picker excludes SDK sessions, so use this picker for native Claude chats.
+Closing a pane does not delete its saved conversation.
+
+Saved Codex conversations that require a closed retained native server are
+listed with an explanation instead of starting a replacement conversation.
+
 ### Account credential isolation
 
 Choosing a managed or linked Claude/Codex account uses that home's stored login.
