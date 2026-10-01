@@ -100,7 +100,8 @@ use crate::{
 /// Version 39 adds transcript items another agent delivered.
 /// Version 40 carries provider history-loading state in native chat snapshots.
 /// Snapshots require a matched set.
-pub const PROTOCOL_VERSION: u16 = 40;
+/// Version 41 lets an agent's owner read its requests, answer and interrupt it.
+pub const PROTOCOL_VERSION: u16 = 41;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

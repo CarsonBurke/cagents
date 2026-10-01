@@ -387,7 +387,10 @@ pub struct Summary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Accepted(Accepted),
-    Status { agent: Agent, run: Run },
+    Status {
+        agent: Agent,
+        run: Run,
+    },
     Listed(Vec<Summary>),
     Closed(Agent),
     Console(Option<ConsoleView>),

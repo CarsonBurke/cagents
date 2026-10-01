@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     agent::Provider,
-    agent_execution::{Operation, Reply, Target},
+    agent_execution::{Control, Operation, Reply, Target},
     host::state::HostState,
     model::{HostIncarnation, HostSessionId, HostSessionProof, ProjectKind},
     workspace_model::ModelEdit,
@@ -1528,4 +1528,93 @@ fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
     // Seeing a session confers no control over it.
     assert!(status(&host, &child_authority, parent.agent.id).is_err());
     assert!(close(&host, &Authority::default(), child.agent.id).is_err());
+}
+
+#[test]
+fn only_an_agents_owner_reads_its_requests_and_controls_it() {
+    if isolated("only_an_agents_owner_reads_its_requests_and_controls_it").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let owner = Authority::default();
+    let agent = accepted.agent.id;
+    let requests = |authority: &Authority, operation| -> Result<Vec<chat::Request>, String> {
+        match process(&host, authority.clone(), operation)? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    assert!(
+        requests(&owner, Operation::Requests(agent))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        requests(
+            &owner,
+            Operation::Control {
+                agent,
+                command: Control::Interrupt,
+            },
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let error = requests(
+        &owner,
+        Operation::Control {
+            agent,
+            command: Control::Answer {
+                request_id: "never-asked".into(),
+                action: "allow".into(),
+                answers: Vec::new(),
+            },
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("No pending request never-asked"), "{error}");
+    // Answering on its owner's behalf is not a person taking the agent over.
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+
+    let parent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap();
+    let child_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(parent.session.as_ref().unwrap().id())
+        .unwrap();
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &child_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    for operation in [
+        Operation::Requests(child.agent.id),
+        Operation::Control {
+            agent: child.agent.id,
+            command: Control::Interrupt,
+        },
+    ] {
+        let error = requests(&owner, operation).unwrap_err();
+        assert!(error.contains("does not own"), "{error}");
+    }
+    assert!(
+        close(&host, &child_authority, child.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(requests(&child_authority, Operation::Requests(child.agent.id)).is_err());
 }
