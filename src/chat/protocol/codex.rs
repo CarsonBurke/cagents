@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
 use std::{collections::BTreeMap, path::PathBuf};
 
+mod images;
+
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
 /// Codex CLI takes it, and a new thread receives it as a `thread/start`
@@ -2250,21 +2252,25 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             },
             at: None,
         }],
-        "mcpToolCall" => tool(
+        "mcpToolCall" => images::tool_result(
+            id,
+            status,
             format!("{} / {}", string(value, "server")?, string(value, "tool")?),
             value["arguments"].to_string(),
             if !value["error"].is_null() {
-                value["error"].to_string()
+                &value["error"]
             } else if !value["result"].is_null() {
-                value["result"].to_string()
+                &value["result"]
             } else {
-                String::new()
+                &Value::Null
             },
         ),
-        "dynamicToolCall" => tool(
+        "dynamicToolCall" => images::tool_result(
+            id,
+            status,
             string(value, "tool")?.into(),
             value["arguments"].to_string(),
-            value["contentItems"].to_string(),
+            &value["contentItems"],
         ),
         "collabAgentToolCall" => tool(
             string(value, "tool")?.into(),
@@ -2309,14 +2315,45 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             },
             at: None,
         }],
-        "imageGeneration" => tool(
-            "Image generation".into(),
-            value["revisedPrompt"].as_str().unwrap_or("").into(),
-            value["savedPath"]
+        "imageGeneration" => {
+            let path = value["savedPath"]
                 .as_str()
-                .unwrap_or_else(|| value["result"].as_str().unwrap_or(""))
-                .into(),
-        ),
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    value["result"]
+                        .as_str()
+                        .filter(|data| !data.is_empty())
+                        .map(|data| {
+                            if data.starts_with("data:") {
+                                data.to_owned()
+                            } else {
+                                format!("data:image/png;base64,{data}")
+                            }
+                        })
+                });
+            match path {
+                Some(path)
+                    if status == ToolStatus::Succeeded
+                        && path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES =>
+                {
+                    vec![Item {
+                        id: id.into(),
+                        role: Role::Assistant,
+                        at: None,
+                        content: ItemContent::Image {
+                            path,
+                            description: "Generated image".into(),
+                        },
+                    }]
+                }
+                _ => tool(
+                    "Image generation".into(),
+                    value["revisedPrompt"].as_str().unwrap_or("").into(),
+                    "No displayable image was returned.".into(),
+                ),
+            }
+        }
         "enteredReviewMode" | "exitedReviewMode" => vec![text(
             id.into(),
             string(value, "review")?.into(),
@@ -2343,6 +2380,12 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
     };
     for item in &mut items {
         let bytes = item.content.byte_len();
+        let limit = if matches!(&item.content, ItemContent::Image { path, .. } if path.starts_with("data:image/"))
+        {
+            chat::MAX_INLINE_IMAGE_URL_BYTES + 1024
+        } else {
+            MAX_ITEM_BYTES
+        };
         if bytes > MAX_ITEM_BYTES {
             if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                 &mut item.content
@@ -2353,7 +2396,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 append_display_output(output, &full, limit);
             }
         }
-        if item.content.byte_len() > MAX_ITEM_BYTES {
+        if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());
         }
     }

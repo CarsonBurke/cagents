@@ -857,6 +857,7 @@ impl Runtime {
                         },
                         markdown_settings,
                     ),
+                    ItemContent::Image { .. } => self.image_preview(item, cached),
                     _ => self.step_view(item, cached, markdown_settings),
                 });
             }
@@ -2361,6 +2362,7 @@ impl Runtime {
             };
             rows.push(match &item.content {
                 ItemContent::Text { .. } => self.text_view(item, cached, prose.slot, settings),
+                ItemContent::Image { .. } => self.image_preview(item, cached),
                 // Anything else in the answer slot is a step the grouping did
                 // not recognize, drawn the way a step is.
                 _ => step(item, cached),

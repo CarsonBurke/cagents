@@ -2,9 +2,12 @@
 //! keep both long conversations and a single enormous tool result pageable.
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
+use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::PathBuf,
 };
@@ -43,6 +46,42 @@ pub(crate) struct Store {
     pending_text: Option<(String, Role, bool, String)>,
 }
 impl Store {
+    /// Decode once at ingestion. Snapshots carry a small path, never megabytes
+    /// of base64, and identical payloads share the same private file.
+    fn image_file(&self, url: &str) -> Result<String, String> {
+        if url.len() > crate::chat::MAX_INLINE_IMAGE_URL_BYTES {
+            return Err("Image exceeds the 16 MiB image limit".into());
+        }
+        let (header, encoded) = url.split_once(";base64,").ok_or("Invalid inline image")?;
+        let extension = match header {
+            "data:image/png" => "png",
+            "data:image/jpeg" => "jpg",
+            "data:image/webp" => "webp",
+            "data:image/gif" => "gif",
+            _ => return Err("Unsupported inline image format".into()),
+        };
+        let digest = Sha256::digest(url.as_bytes());
+        let path = self.directory.join(format!("image-{digest:x}.{extension}"));
+        if !path.exists() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| "Invalid inline image encoding")?;
+            if bytes.len() > crate::chat::MAX_INLINE_IMAGE_BYTES {
+                return Err("Image exceeds the 16 MiB image limit".into());
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = file.write_all(&bytes) {
+                let _ = fs::remove_file(&path);
+                return Err(error.to_string());
+            }
+        }
+        Ok(path.to_string_lossy().into_owned())
+    }
     pub fn new() -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
@@ -134,6 +173,19 @@ impl Store {
                 preserve_input = input.is_empty();
             }
         }
+        let mut warning = None;
+        if let ItemContent::Image { path, description } = &mut item.content
+            && path.starts_with("data:")
+        {
+            match self.image_file(path) {
+                Ok(file) => *path = file,
+                Err(error) => {
+                    path.clear();
+                    *description = format!("Image unavailable: {error}");
+                    warning = Some(error);
+                }
+            }
+        }
         let (body0, body1, body2) = match &mut item.content {
             ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
             // A command's output is the only field of it that grows without a
@@ -151,8 +203,8 @@ impl Store {
             ItemContent::Tool { input, output, .. } => {
                 (std::mem::take(input), std::mem::take(output), String::new())
             }
-            // An inline attachment is a body, not identity: a screenshot data URL is
-            // routinely megabytes and would otherwise blow the identity budget.
+            // Descriptions and provider paths can grow; inline bytes have
+            // already become a short private path above.
             ItemContent::Image { description, path } => (
                 std::mem::take(description),
                 String::new(),
@@ -180,7 +232,6 @@ impl Store {
             body0.len() as i64
         };
         let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-        let mut warning = None;
         if metadata.len() > METADATA_LIMIT {
             // Every identity field a provider controls is trimmed rather than
             // dropping a turn of the conversation.
@@ -779,6 +830,7 @@ fn insert_body(
 mod tests {
     use super::*;
     use crate::chat::Role;
+    use std::os::unix::fs::PermissionsExt;
     #[test]
     fn oversized_unicode_item_pages_without_losing_bytes() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
@@ -840,7 +892,8 @@ mod tests {
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
             ItemContent::Image { path, description } => {
-                assert_eq!(path, &payload);
+                assert!(path.starts_with(store.directory.to_str().unwrap()));
+                assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
             }
             other => panic!("unexpected content {other:?}"),
@@ -859,6 +912,44 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(store.window().unwrap().items.len(), 2);
+    }
+    #[test]
+    fn image_payloads_share_one_file_and_invalid_payloads_do_not_end_history() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["a", "b", "invalid"] {
+            let warnings = store
+                .apply(Event::Item(Item {
+                    id: id.into(),
+                    role: Role::Assistant,
+                    at: None,
+                    content: ItemContent::Image {
+                        path: if id == "invalid" {
+                            "data:image/png;base64,%%%".into()
+                        } else {
+                            "data:image/png;base64,QUJD".into()
+                        },
+                        description: id.into(),
+                    },
+                }))
+                .unwrap();
+            assert_eq!(warnings.is_empty(), id != "invalid");
+        }
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 3);
+        let path = |index: usize| match &window.items[index].content {
+            ItemContent::Image { path, .. } => path,
+            _ => unreachable!(),
+        };
+        assert_eq!(path(0), path(1));
+        assert!(path(2).is_empty());
+        let image_path = PathBuf::from(path(0));
+        assert_eq!(
+            fs::metadata(&image_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(postcard::to_stdvec(&window.items).unwrap().len() < 1024);
+        drop(store);
+        assert!(!image_path.exists());
     }
     /// Unbounded identity metadata degrades presentation instead of ending the actor.
     #[test]
