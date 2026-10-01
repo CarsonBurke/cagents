@@ -916,7 +916,7 @@ impl Runtime {
                 transcript.push(self.followup_view(text, true));
             }
             for queued in &snapshot.queued_messages {
-                transcript.push(self.followup_view(&queued.text, false));
+                transcript.push(self.provider_queue_view(queued));
             }
             if snapshot.queued_messages.len() == chat::QueuedMessage::LIMIT {
                 transcript.push(body("Queue preview is limited to the first 128 messages."));
@@ -936,6 +936,53 @@ impl Runtime {
             .iter()
             .map(|title| -> Element<'_, Message> { design::heading(title.as_str()).into() })
             .collect();
+        if self.branch_picker {
+            let mut choices: Vec<Element<'_, Message>> = Vec::new();
+            let codex = self.session.launch.provider == Provider::Codex;
+            choices.push(
+                design::caption(if codex {
+                    "Fork into a new pane after a completed turn"
+                } else {
+                    "Branch before a prompt; its text returns as a draft"
+                })
+                .into(),
+            );
+            if codex {
+                choices.push(
+                    widget::button::text("Fork entire conversation")
+                        .on_press_maybe(
+                            (!snapshot.busy && self.pending.is_none()).then(|| {
+                                action(Action::Command(target, Command::Branch { id: None }))
+                            }),
+                        )
+                        .into(),
+                );
+            }
+            for point in &snapshot.branch_points {
+                choices.push(
+                    widget::button::text(&point.label)
+                        .on_press_maybe((!snapshot.busy && self.pending.is_none()).then(|| {
+                            action(Action::Command(
+                                target,
+                                Command::Branch {
+                                    id: Some(point.id.clone()),
+                                },
+                            ))
+                        }))
+                        .into(),
+                );
+            }
+            choices.push(
+                widget::button::text("Close")
+                    .on_press(action(Action::BranchPicker(target, false)))
+                    .into(),
+            );
+            content.push(
+                widget::scrollable(widget::column::with_children(choices).spacing(step::GAP_XS))
+                    .height(Length::Fixed(200.0))
+                    .into(),
+            );
+        }
         // A plan is consulted rather than read, so it is pinned above the
         // transcript that scrolls under it. Inside the transcript it went out
         // of reach with the first thing the agent did after publishing it,
@@ -1518,6 +1565,32 @@ impl Runtime {
                 .into()
         };
         let mut actions = Vec::new();
+        if snapshot.capabilities.branch {
+            actions.push(icon(
+                "view-branch-symbolic",
+                "Branch conversation history",
+                available && !snapshot.busy,
+                Action::BranchPicker(target, !self.branch_picker),
+            ));
+        }
+        if !snapshot.capabilities.interrupt_modes.is_empty() {
+            let mode = snapshot.interrupt_mode.as_deref().unwrap_or("immediate");
+            let next = if mode == "wait" { "immediate" } else { "wait" };
+            actions.push(
+                widget::button::text(if mode == "wait" {
+                    "Steering: after turn"
+                } else {
+                    "Steering: after tools"
+                })
+                .on_press_maybe(available.then(|| {
+                    action(Action::Command(
+                        target,
+                        Command::SetInterruptMode { mode: next.into() },
+                    ))
+                }))
+                .into(),
+            );
+        }
         if snapshot.capabilities.attachments {
             actions.push(icon(
                 "mail-attachment-symbolic",
@@ -2474,6 +2547,74 @@ impl Runtime {
         .align_x(Alignment::End)
         .width(Length::Fill)
         .into()
+    }
+
+    fn provider_queue_view<'a>(&'a self, queued: &'a chat::QueuedMessage) -> Element<'a, Message> {
+        let caps = &self.snapshot.capabilities;
+        let available = self.pending.is_none() && !self.disconnected;
+        let mut controls: Vec<Element<'a, Message>> = Vec::new();
+        if caps.queue_remove {
+            controls.push(
+                widget::button::text("Remove")
+                    .on_press_maybe(available.then(|| {
+                        action(Action::Command(
+                            self.target,
+                            Command::RemoveQueued {
+                                id: queued.id.clone(),
+                            },
+                        ))
+                    }))
+                    .into(),
+            );
+        }
+        if caps.queue_start {
+            controls.push(
+                widget::button::text("Start next")
+                    .on_press_maybe(available.then(|| {
+                        action(Action::Command(
+                            self.target,
+                            Command::StartQueued {
+                                id: queued.id.clone(),
+                            },
+                        ))
+                    }))
+                    .into(),
+            );
+        }
+        if caps.queue_edit && queued.editable {
+            controls.push(
+                widget::button::text("Edit")
+                    .on_press(action(Action::EditQueue(
+                        self.target,
+                        Some(queued.id.clone()),
+                    )))
+                    .into(),
+            );
+        }
+        let mut content =
+            widget::column::with_children(vec![self.followup_view(&queued.text, false)])
+                .spacing(step::GAP_XS);
+        if let Some((id, draft)) = &self.queue_edit
+            && id == &queued.id
+        {
+            content = content.push(
+                widget::text_input("Queued message", draft)
+                    .on_input(move |text| action(Action::QueueText(self.target, text))),
+            );
+            controls.push(
+                widget::button::text("Save")
+                    .on_press_maybe(available.then(|| action(Action::SaveQueue(self.target))))
+                    .into(),
+            );
+            controls.push(
+                widget::button::text("Cancel edit")
+                    .on_press(action(Action::EditQueue(self.target, None)))
+                    .into(),
+            );
+        }
+        content
+            .push(widget::row::with_children(controls).spacing(step::GAP_S))
+            .into()
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {

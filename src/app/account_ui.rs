@@ -1339,6 +1339,14 @@ pub(super) struct ChatAccounts {
 }
 
 impl Cagents {
+    pub(super) fn resume_catalog_accounts(&self) -> Vec<Account> {
+        let mut accounts = self
+            .account_ui
+            .registry
+            .all_accounts(self.account_ui.homes.as_ref());
+        accounts.push(Account::system(Provider::Omp));
+        accounts
+    }
     /// The models, and their efforts, a new conversation's composer offers.
     pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
         Provider::ALL

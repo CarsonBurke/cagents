@@ -513,14 +513,40 @@ workspace, or the command of the same name in the command palette. Search by
 conversation title, provider, project path, or account. Use the arrow keys and
 Enter, or click a conversation to open it.
 
-The picker includes saved native chats that were closed in an earlier run. It
+The picker includes saved native chats that were closed in an earlier run and
+conversation history from the configured Claude, Codex, and OMP accounts. It
 keeps the exact conversation, original account, and working directory; an
 already-open conversation takes you to its existing pane. Claude's terminal
 resume picker excludes SDK sessions, so use this picker for native Claude chats.
 Closing a pane does not delete its saved conversation.
 
-Saved Codex conversations that require a closed retained native server are
-listed with an explanation instead of starting a replacement conversation.
+Saved Codex conversations reconnect to their retained owner when it exists.
+After a confirmed close, or a kernel boot change, the picker resumes the exact
+conversation from disk. Missing ownership evidence within the same boot keeps
+the conversation available and explains the refusal without starting a writer.
+
+### Messages, branches, and child agents
+
+**Steer** delivers a correction during the current turn; **Queue** schedules a
+later turn. Claude 2.1.286 and newer receive these messages immediately through
+their async protocol: steering uses the next delivery boundary, and queued
+messages wait for a later turn. Older Claude versions retain the local follow-up
+behavior. Queued previews come from provider acknowledgments. Claude supports
+removing a confirmed queued message; Codex additionally supports editing plain
+text entries and starting an entry next. Attachments are preserved and cannot
+be replaced through the plain text editor.
+
+The branch control opens a separate Codex conversation, either from the whole
+thread or after a completed turn. OMP branches before the selected user message
+and restores that message as an editable draft in the branched conversation.
+Its steering control switches between immediate interruption and waiting for
+the current tool boundary, using OMP's own interrupt mode.
+
+Child agent tabs show isolated transcripts and lifecycle status for all three
+providers. Codex child approvals remain explicit and are labeled as child
+requests. OMP child activity is read-only: its installed RPC API has no child
+messaging, stop, or restart command. Large optional child histories are omitted
+without disconnecting the parent, while live activity remains available.
 
 ### Account credential isolation
 
@@ -636,7 +662,8 @@ upgrade.
 The chat view shows streamed messages, tool activity, and provider approval and
 input requests. Controls follow provider capabilities: OMP supports steering,
 queued follow-ups, attachments, compaction, and model and thinking selection;
-Claude supports attachments, advertised models and slash commands, compaction
+Claude supports async steering and queueing on verified versions, attachments,
+advertised models and slash commands, compaction
 when advertised, and permission modes; Codex controls depend on the session's
 advertised capabilities, and image attachments need an image-capable model.
 Unsupported controls are not offered, and are never imitated with terminal

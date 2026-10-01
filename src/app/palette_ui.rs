@@ -406,9 +406,6 @@ impl Cagents {
                             open: false,
                             updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
                         });
-                    if self.resume_ui.error.is_none() {
-                        self.recently_closed.remove(index);
-                    }
                     return task;
                 }
                 self.recently_closed.remove(index);

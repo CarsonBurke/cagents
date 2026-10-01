@@ -821,6 +821,34 @@ fn upgrade_restore_isolates_a_retained_conversation_whose_rollout_is_missing() {
         || !record.root.is_current(),
         "explicit Close did not reap provider",
     );
+    // A normal close retains authenticated evidence for exact disk resume,
+    // including descriptors issued before the replacement daemon attached.
+    let crate::terminal::ipc::ServerResponse::ChatResumePrepared { session: reopened } =
+        super::super::client::process_request(
+            &rollback,
+            client,
+            crate::terminal::ipc::ClientRequest::ChatPrepareResume {
+                source: saved.source.clone(),
+            },
+        )
+        .unwrap()
+        .0
+    else {
+        panic!("closed conversation was not prepared for resume");
+    };
+    assert_eq!(reopened.launch.session_id.as_deref(), Some(THREAD));
+    assert_eq!(reopened.launch.provider, saved.source.launch.provider);
+    assert_eq!(
+        reopened.launch.recipe.working_directory,
+        saved.source.launch.recipe.working_directory
+    );
+    assert!(matches!(
+        reopened.native_continuity,
+        NativeContinuity::ReconnectOnly
+    ));
+    assert_ne!(reopened.id, id);
+    assert!(reopened.proof.is_none());
+    assert!(reopened.terminal.is_none());
     for &(terminal, pid) in &terminals {
         let handle = rollback.lock().unwrap().terminals[&terminal].handle.clone();
         assert_eq!(
@@ -1022,7 +1050,9 @@ fn provider() {
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
-                "thread/turns/list" | "thread/queue/list" => json!({"data":[],"nextCursor":null}),
+                "thread/turns/list" | "thread/queue/list" | "thread/list" => {
+                    json!({"data":[],"nextCursor":null})
+                }
                 "model/list" | "skills/list" => json!({"data":[]}),
                 method => panic!("unexpected provider request {method}"),
             };

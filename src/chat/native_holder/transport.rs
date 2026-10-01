@@ -234,7 +234,7 @@ impl Holder {
         self.close_inner(false)
     }
 
-    pub(super) fn close_inner(&mut self, retain: bool) -> Result<(), String> {
+    pub(in crate::chat) fn close_inner(&mut self, retain: bool) -> Result<(), String> {
         if self.identity.receipt(retain)? {
             self.control.take();
             self.release_on_drop = false;

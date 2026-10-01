@@ -293,7 +293,11 @@ owned process tree, including tools that changed their process group, before
 acknowledging cleanup. A private cleanup receipt records only the exact process
 and daemon identities after every descendant is reaped. If the Release reply is
 lost, a later close verifies that receipt; a missing socket or process alone is
-never treated as proof. Successful close consumes the receipt.
+never treated as proof. Explicit chat close retains the minimal authenticated
+receipt for exact disk resume; other transport teardown consumes it. A paired
+terminal must also acknowledge teardown before that receipt authorizes resume.
+Across a kernel boot change, the old process tree is necessarily gone, so an
+exact saved conversation can resume without the ephemeral runtime receipt.
 
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The current

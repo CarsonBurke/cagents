@@ -1,4 +1,4 @@
-//! Codex 0.153.4 app-server JSON-RPC, not TUI output.
+//! Codex app-server JSON-RPC, verified against installed 0.159.3 schemas.
 //! Wire contracts: `codex app-server generate-json-schema --experimental`,
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
@@ -381,11 +381,15 @@ fn create_inner(
             skill_paths: Vec::new(),
             materialized: launch.session_id.is_some(),
             execution: None,
+            children: BTreeMap::new(),
+            branch_points: Vec::new(),
+            is_child: false,
+            child_buffer: BTreeMap::new(),
         }),
     ))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Pending {
     Initialize,
     Attach,
@@ -402,6 +406,13 @@ enum Pending {
     Other,
     QueueAdd,
     QueueList,
+    ChildResume(String),
+    ChildRpc {
+        child: String,
+        original_id: Value,
+    },
+    ChildList,
+    Fork,
 }
 
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
@@ -435,6 +446,7 @@ enum RequestKind {
     Questions,
     Elicitation,
 }
+#[derive(Default)]
 struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
@@ -477,6 +489,10 @@ struct Codex {
     skill_paths: Vec<(String, String)>,
     materialized: bool,
     execution: Option<Execution>,
+    children: BTreeMap<String, Box<Codex>>,
+    branch_points: Vec<chat::BranchPoint>,
+    is_child: bool,
+    child_buffer: BTreeMap<String, Vec<Value>>,
 }
 
 struct Execution {
@@ -497,6 +513,129 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn discover_child(
+        &mut self,
+        id: &str,
+        metadata: &Value,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
+            return Ok(());
+        }
+        if !self.children.contains_key(id) {
+            if self.children.len() >= 32 {
+                let completed = self
+                    .children
+                    .iter()
+                    .find(|(child_id, child)| {
+                        child.ready
+                            && !child.busy
+                            && !self.child_buffer.contains_key(*child_id)
+                            && !self.requests.values().any(|request| {
+                                request.frame["params"]["threadId"].as_str()
+                                    == Some(child_id.as_str())
+                            })
+                    })
+                    .map(|(id, _)| id.clone());
+                if let Some(completed) = completed {
+                    self.children.remove(&completed);
+                    self.call(
+                        step,
+                        "thread/unsubscribe",
+                        json!({"threadId":completed}),
+                        Pending::Other,
+                    )?;
+                }
+            }
+            if self.children.len() >= 32 || self.pending.len() >= MAX_PENDING {
+                return Ok(());
+            }
+            let mut child = Codex::default();
+            child.thread = Some(id.into());
+            child.cwd = self.cwd.clone();
+            child.expected_home = self.expected_home.clone();
+            child.is_child = true;
+            self.children.insert(id.into(), Box::new(child));
+            self.child_buffer.insert(id.into(), Vec::new());
+            self.call(
+                step,
+                "thread/resume",
+                json!({"threadId":id,"excludeTurns":true,"initialTurnsPage":{"limit":4,"sortDirection":"desc","itemsView":"full"}}),
+                Pending::ChildResume(id.into()),
+            )?;
+        }
+        let status = match metadata["status"]
+            .as_str()
+            .or_else(|| metadata["status"]["type"].as_str())
+        {
+            Some("completed" | "idle" | "shutdown") => ToolStatus::Succeeded,
+            Some("errored" | "failed" | "notFound") => ToolStatus::Failed,
+            Some("interrupted") => ToolStatus::Denied,
+            _ => ToolStatus::Running,
+        };
+        step.events.push(Event::Subagent {
+            id: id.into(),
+            kind: metadata["agentRole"]
+                .as_str()
+                .or_else(|| metadata["agentNickname"].as_str())
+                .unwrap_or("Codex agent")
+                .into(),
+            description: metadata["message"]
+                .as_str()
+                .or_else(|| metadata["preview"].as_str())
+                .unwrap_or_default()
+                .into(),
+            status: Some(status),
+        });
+        Ok(())
+    }
+    // Child parsers share a server connection, so their local RPC IDs must
+    // never escape into the parent's ID space. Keep the original correlation
+    // inside the child and allocate every wire request through the parent.
+    fn child_step(&mut self, id: &str, content: Step, step: &mut Step) -> Result<(), String> {
+        let outcome = content.events.iter().find_map(|event| {
+            if let Event::TurnFinished { outcome, .. } = event {
+                Some(*outcome)
+            } else {
+                None
+            }
+        });
+        for event in &content.events {
+            if let Event::Status { busy, .. } = event {
+                step.events.push(Event::Subagent {
+                    id: id.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(if *busy {
+                        ToolStatus::Running
+                    } else {
+                        match outcome {
+                            Some(crate::notifications::Kind::Failed) => ToolStatus::Failed,
+                            Some(crate::notifications::Kind::Cancelled) => ToolStatus::Denied,
+                            _ => ToolStatus::Succeeded,
+                        }
+                    }),
+                });
+            }
+        }
+        step.events.extend(chat::child_events(id, content.events));
+        for frame in content.writes {
+            if let (Some(method), Some(original_id)) = (frame["method"].as_str(), frame.get("id")) {
+                self.call(
+                    step,
+                    method,
+                    frame["params"].clone(),
+                    Pending::ChildRpc {
+                        child: id.into(),
+                        original_id: original_id.clone(),
+                    },
+                )?;
+            } else {
+                step.writes.push(frame);
+            }
+        }
+        Ok(())
+    }
     fn finish_execution(&mut self, turn: &Value, step: &mut Step) -> Result<(), String> {
         let Some(execution) = self.execution.as_mut() else {
             return Ok(());
@@ -612,8 +751,15 @@ impl Codex {
                     _ => "Attachment".to_owned(),
                 });
             }
-            self.queue_listing
-                .push(chat::QueuedMessage::new(id, parts.join("\n")));
+            let mut message = chat::QueuedMessage::new(id, parts.join("\n"));
+            message.editable = entry["input"].as_array().is_some_and(|input| {
+                input.len() == 1
+                    && input[0]["type"] == "text"
+                    && input[0]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.len() <= 16 * 1024)
+            });
+            self.queue_listing.push(message);
         }
         if let Some(cursor) = result["nextCursor"].as_str() {
             if cursor.len() > 4096
@@ -681,6 +827,11 @@ impl Codex {
                 Vec::new()
             },
             skill_reach: SkillReach::Anywhere,
+            branch: self.direct_input,
+            queue_remove: self.queue_available && self.direct_input,
+            queue_edit: self.queue_available && self.direct_input,
+            queue_start: self.queue_available && self.direct_input,
+            ..Capabilities::default()
         }
     }
     /// Ask the account's server which skills apply to this conversation's
@@ -774,6 +925,35 @@ impl Codex {
                 return Err("Codex did not return full turn items as requested; history cannot be hydrated safely".into());
             }
             for value in array(turn, "items")? {
+                if !active && value["type"] == "userMessage" {
+                    if let Some(label) = value["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|input| input["text"].as_str())
+                        .and_then(crate::account::clean_label)
+                    {
+                        if !self.branch_points.iter().any(|point| point.id == turn_id)
+                            && self.branch_points.len() < 128
+                        {
+                            self.branch_points.push(chat::BranchPoint {
+                                id: turn_id.into(),
+                                label,
+                            });
+                        }
+                    }
+                }
+                if value["type"] == "collabAgentToolCall" {
+                    for id in value["receiverThreadIds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .take(32)
+                    {
+                        self.discover_child(id, &value["agentsStates"][id], step)?;
+                    }
+                }
                 for item in parse_item(value, !active, turn_id)? {
                     if active && self.busy && streams_updates(&item.content) {
                         if self.active_items.len() >= MAX_ACTIVE_ITEMS
@@ -789,6 +969,8 @@ impl Codex {
                 }
             }
         }
+        step.events
+            .push(Event::BranchPoints(self.branch_points.clone()));
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
         // a failed decode must preserve the cursor the reader can retry.
@@ -887,6 +1069,18 @@ impl Codex {
         let id = rpc_id(&frame["id"])?;
         let method = string(&frame, "method")?;
         let params = &frame["params"];
+        if let Some(child_id) = params["threadId"].as_str()
+            && let Some(child) = self.children.get_mut(child_id)
+        {
+            child.request(frame.clone(), step)?;
+            self.requests.append(&mut child.requests);
+            for event in &mut step.events {
+                if let Event::Request(request) = event {
+                    request.title = format!("Child agent · {}", request.title);
+                }
+            }
+            return Ok(());
+        }
         if params["threadId"].as_str() != self.thread.as_deref() {
             // A shared connection may see non-thread-scoped auth requests. Never
             // answer another thread's approval or manufacture authentication.
@@ -1196,6 +1390,27 @@ impl Adapter for Codex {
                 let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to interrupt")?;
                 self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?;
             }
+            operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
+                if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
+                let (method, id) = match operation {
+                    Command::RemoveQueued { id } => ("thread/queue/delete", id),
+                    Command::StartQueued { id } => ("thread/queue/start", id),
+                    _ => unreachable!(),
+                };
+                self.call(&mut step, method, json!({"threadId":self.thread,"queuedSubmissionId":id}), Pending::QueueAdd)?;
+            }
+            Command::UpdateQueued { id, text } => {
+                if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
+                let input = self.input(text, vec![])?;
+                self.call(&mut step, "thread/queue/update", json!({"threadId":self.thread,"queuedSubmissionId":id,"input":input}), Pending::QueueAdd)?;
+            }
+            Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
+            Command::ListBranches => self.history(&mut step, None)?,
+            Command::Branch { id } => {
+                if self.busy || !self.direct_input { return Err("Fork requires an idle writable Codex conversation".into()); }
+                if id.as_ref().is_some_and(|id| !self.branch_points.iter().any(|point| &point.id == id)) { return Err("Choose a completed turn from this conversation".into()); }
+                self.call(&mut step, "thread/fork", json!({"threadId":self.thread,"lastTurnId":id,"excludeTurns":true}), Pending::Fork)?;
+            }
             Command::Answer { request_id, action, answers } => self.answer(request_id, action, answers, &mut step)?,
             Command::SetModel { model, reasoning } => {
                 if !self.direct_input { return Err("This Codex thread does not accept direct input".into()); }
@@ -1255,6 +1470,19 @@ impl Adapter for Codex {
                 .pending
                 .remove(&id)
                 .ok_or("Codex response has an unknown request ID")?;
+            if let Pending::ChildRpc {
+                child: id,
+                original_id,
+            } = &pending
+            {
+                let mut response = frame;
+                response["id"] = original_id.clone();
+                if let Some(child) = self.children.get_mut(id) {
+                    let content = child.receive(response)?;
+                    self.child_step(id, content, &mut step)?;
+                }
+                return Ok(step);
+            }
             if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
             }
@@ -1262,6 +1490,18 @@ impl Adapter for Codex {
                 if matches!(pending, Pending::History { .. }) {
                     self.finish_history(&mut step)?;
                 }
+                if let Pending::ChildResume(id) = &pending {
+                    self.children.remove(id);
+                    self.child_buffer.remove(id);
+                    step.events.push(Event::Subagent {
+                        id: id.clone(),
+                        kind: String::new(),
+                        description: "Child history unavailable".into(),
+                        status: Some(ToolStatus::Failed),
+                    });
+                    return Ok(step);
+                }
+                if matches!(pending, Pending::ChildList) { return Ok(step); }
                 if matches!(pending, Pending::QueueList) && error["code"].as_i64() == Some(-32601) {
                     self.queue_available = false;
                     self.queue_listing.clear();
@@ -1391,6 +1631,12 @@ impl Adapter for Codex {
                     });
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
+                    self.call(
+                        &mut step,
+                        "thread/list",
+                        json!({"ancestorThreadId":self.thread,"limit":32}),
+                        Pending::ChildList,
+                    )?;
                     if result["initialTurnsPage"].is_object() {
                         self.page(&result["initialTurnsPage"], &mut step, false)?;
                     } else {
@@ -1620,6 +1866,58 @@ impl Adapter for Codex {
                 // happened to carry a new one.
                 Pending::Compact => self.reread(&mut step)?,
                 Pending::QueueAdd => self.read_queue(&mut step)?,
+                Pending::Fork => {
+                    let id = string(&result["thread"], "id")?;
+                    if uuid::Uuid::parse_str(id).is_err() || self.thread.as_deref() == Some(id) {
+                        return Err("Codex did not create a distinct conversation".into());
+                    }
+                    self.call(
+                        &mut step,
+                        "thread/unsubscribe",
+                        json!({"threadId":id}),
+                        Pending::Other,
+                    )?;
+                    step.events.push(Event::Forked(id.into()));
+                }
+                Pending::ChildList => {
+                    for thread in result["data"].as_array().into_iter().flatten().take(32) {
+                        if let Some(id) = thread["id"].as_str() {
+                            self.discover_child(id, thread, &mut step)?;
+                        }
+                    }
+                }
+                Pending::ChildResume(id) => {
+                    // Overflow abandons only hydration, retaining live content.
+                    if !self.child_buffer.contains_key(&id) {
+                        return Ok(step);
+                    }
+                    if result["thread"]["id"].as_str() != Some(id.as_str()) {
+                        return Err("Codex returned a different child thread".into());
+                    }
+                    if let Some(child) = self.children.get_mut(&id) {
+                        let mut content = Step::default();
+                        child.thread_state(&result["thread"], &mut content)?;
+                        child.ready = true;
+                        if result["initialTurnsPage"].is_object() {
+                            child.page(&result["initialTurnsPage"], &mut content)?;
+                        } else {
+                            for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
+                                for value in turn["items"].as_array().into_iter().flatten() {
+                                    for item in parse_item(value, true, string(turn, "id")?)? {
+                                        content.events.push(Event::Item(item));
+                                    }
+                                }
+                            }
+                        }
+                        self.child_step(&id, content, &mut step)?;
+                    }
+                    for frame in self.child_buffer.remove(&id).unwrap_or_default() {
+                        if let Some(child) = self.children.get_mut(&id) {
+                            let content = child.receive(frame)?;
+                            self.child_step(&id, content, &mut step)?;
+                        }
+                    }
+                }
                 Pending::QueueList => {
                     if let Err(message) = self.queue_page(result, &mut step) {
                         self.queue_listing.clear();
@@ -1629,6 +1927,7 @@ impl Adapter for Codex {
                         });
                     }
                 }
+                Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -1643,6 +1942,68 @@ impl Adapter for Codex {
             .as_str()
             .or_else(|| params["thread"]["id"].as_str());
         if thread.is_some() && thread != self.thread.as_deref() {
+            if let Some(id) = thread
+                && self.children.contains_key(id)
+            {
+                if method == "serverRequest/resolved" {
+                    let request_id = rpc_id(&params["requestId"])?;
+                    if self.requests.get(&request_id).is_some_and(|request| {
+                        request.frame["params"]["threadId"].as_str() == Some(id)
+                    }) {
+                        self.requests.remove(&request_id);
+                        step.events.push(Event::RequestResolved { id: request_id });
+                    }
+                    return Ok(step);
+                }
+                if method == "thread/closed" {
+                    let requests = self
+                        .requests
+                        .iter()
+                        .filter(|(_, request)| {
+                            request.frame["params"]["threadId"].as_str() == Some(id)
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    for request in requests {
+                        self.requests.remove(&request);
+                        step.events.push(Event::RequestResolved { id: request });
+                    }
+                }
+                if params["item"]["type"] == "collabAgentToolCall" {
+                    for receiver in params["item"]["receiverThreadIds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .take(32)
+                    {
+                        self.discover_child(
+                            receiver,
+                            &params["item"]["agentsStates"][receiver],
+                            &mut step,
+                        )?;
+                    }
+                }
+                if let Some(buffer) = self.child_buffer.get_mut(id) {
+                    if buffer.len() < 128
+                        && buffer
+                            .iter()
+                            .map(|frame| frame.to_string().len())
+                            .sum::<usize>()
+                            + frame.to_string().len()
+                            <= 512 * 1024
+                    {
+                        buffer.push(frame.clone());
+                        return Ok(step);
+                    }
+                    for buffered in self.child_buffer.remove(id).unwrap_or_default() {
+                        let content = self.children.get_mut(id).unwrap().receive(buffered)?;
+                        self.child_step(id, content, &mut step)?;
+                    }
+                }
+                let content = self.children.get_mut(id).unwrap().receive(frame.clone())?;
+                self.child_step(id, content, &mut step)?;
+            }
             return Ok(step);
         }
         match method {
@@ -1754,6 +2115,18 @@ impl Adapter for Codex {
             }
             "item/started" | "item/completed" => {
                 let done = method == "item/completed";
+                if params["item"]["type"] == "collabAgentToolCall" {
+                    let value = &params["item"];
+                    for id in value["receiverThreadIds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .take(32)
+                    {
+                        self.discover_child(id, &value["agentsStates"][id], &mut step)?;
+                    }
+                }
                 for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
                     if done {
                         self.active_items.remove(&item.id);
@@ -2884,6 +3257,10 @@ mod tests {
             skill_paths: Vec::new(),
             materialized: true,
             execution: None,
+            children: BTreeMap::new(),
+            branch_points: Vec::new(),
+            is_child: false,
+            child_buffer: BTreeMap::new(),
         }
     }
 
@@ -3021,6 +3398,42 @@ mod tests {
             .unwrap();
         assert!(adapter.history_initialized);
         assert_eq!(adapter.cursor.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn child_hydration_buffers_live_output_and_routes_unique_rpc_ids() {
+        let mut adapter = adapter();
+        let mut discovered = Step::default();
+        adapter
+            .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+            .unwrap();
+        assert_eq!(
+            discovered.writes[0]["params"]["initialTurnsPage"]["itemsView"],
+            "full"
+        );
+        let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"child-exact","turnId":"turn","itemId":"answer","delta":" tail"}})).unwrap();
+        assert!(live.events.is_empty());
+        let hydrated = adapter.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"turn","status":"inProgress","items":[{"id":"answer","type":"agentMessage","text":"head"}]}],"nextCursor":null}}})).unwrap();
+        assert!(hydrated.events.iter().any(|event| matches!(event, Event::SubagentTextDelta { id, delta, .. } if id == "child-exact" && delta == " tail")));
+        assert!(
+            !hydrated
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { .. }))
+        );
+        let invalidated = adapter
+            .receive(json!({"method":"skills/changed","params":{"threadId":"child-exact"}}))
+            .unwrap();
+        assert_eq!(invalidated.writes.len(), 1);
+        assert_ne!(invalidated.writes[0]["id"], discovered.writes[0]["id"]);
+        let replied = adapter
+            .receive(json!({"id":invalidated.writes[0]["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(replied.events.is_empty());
+        let completed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"child-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
+        assert!(completed.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "child-exact")));
+        let foreign = adapter.receive(json!({"method":"turn/started","params":{"threadId":"unrelated","turn":{"id":"bad","items":[]}}})).unwrap();
+        assert!(foreign.events.is_empty());
     }
 
     #[test]
@@ -3735,7 +4148,7 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.active_items.len(), 1);
         assert!(
-            matches!(&page.events[0], Event::LatestHistory { items, .. } if items.len() == MAX_ACTIVE_ITEMS + 33)
+            page.events.iter().any(|event| matches!(event, Event::LatestHistory { items, .. } if items.len() == MAX_ACTIVE_ITEMS + 33))
         );
         let started = adapter
             .receive(

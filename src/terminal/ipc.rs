@@ -101,7 +101,8 @@ use crate::{
 /// Version 40 carries provider history-loading state in native chat snapshots.
 /// Snapshots require a matched set.
 /// Version 41 lets an agent's owner read its requests, answer and interrupt it.
-pub const PROTOCOL_VERSION: u16 = 41;
+/// Version 42 adds native resume preparation, queue mutation and branching.
+pub const PROTOCOL_VERSION: u16 = 42;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -404,6 +405,10 @@ pub enum ClientRequest {
         request: uuid::Uuid,
         selection: crate::terminal::SearchMatch,
     },
+    /// Authenticate old ownership before allocating a new resume transport.
+    ChatPrepareResume {
+        source: crate::chat::Session,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -691,6 +696,9 @@ pub enum ServerResponse {
     Automation(crate::automations::Response),
     NotificationTest {
         outcome: crate::notifications::TestOutcome,
+    },
+    ChatResumePrepared {
+        session: crate::chat::Session,
     },
 }
 
