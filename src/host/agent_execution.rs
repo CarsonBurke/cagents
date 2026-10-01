@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod directory;
 mod ownership;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
@@ -811,6 +812,9 @@ pub(super) fn process(
             Ok(Reply::Listed(summaries))
         }
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
+        Operation::Directory(scope) => {
+            directory::read(host, &authority, scope).map(Reply::Directory)
+        }
     }
 }
 

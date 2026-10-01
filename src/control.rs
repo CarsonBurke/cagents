@@ -21,6 +21,8 @@ mod agents;
 pub use agents::AgentCommand;
 mod automations;
 pub use automations::AutomationCommand;
+mod sessions;
+pub use sessions::SessionsArgs;
 
 use crate::{
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
@@ -79,6 +81,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Show this session, its parent and agents, and peers in the same checkout.
+    Whoami,
+    /// List live agent sessions in this project, whoever started them.
+    #[command(visible_alias = "ls")]
+    Sessions(SessionsArgs),
     /// Manage recurring daemon-owned work and its durable run history.
     #[command(alias = "automations")]
     Automation {
@@ -1649,6 +1656,8 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
         TopCommand::Automation { command } => automations::execute(command),
         TopCommand::Agent { command } => agents::execute(command),
+        TopCommand::Whoami => sessions::whoami(),
+        TopCommand::Sessions(arguments) => sessions::list(arguments),
         TopCommand::CoordinateInstall {
             prefix,
             installer,

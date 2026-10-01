@@ -1419,4 +1419,112 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     let run = registry.lock().unwrap().agent_run(accepted.run.id).unwrap();
     assert_eq!(run.state, State::Failed);
     assert_eq!(run.result.diagnostic.as_deref(), Some("fixture"));
+
+#[test]
+fn directory_lists_live_sessions_with_relations_and_without_granting_control() {
+    use crate::agent_execution::directory::{Owner, Relation, Scope};
+    if isolated("directory_lists_live_sessions_with_relations_and_without_granting_control")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let project = path.parent().unwrap().join("project");
+    let parent = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let parent_session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(parent.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let parent_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(parent_session)
+        .unwrap();
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &parent_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let child_session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let child_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(child_session)
+        .unwrap();
+
+    let read = |authority: &Authority, scope: Scope| {
+        let Reply::Directory(directory) =
+            process(&host, authority.clone(), Operation::Directory(scope)).unwrap()
+        else {
+            panic!("directory reply")
+        };
+        directory
+    };
+    let key = project.canonicalize().unwrap();
+
+    let directory = read(&child_authority, Scope::Containing(project.join(".")));
+    assert_eq!(directory.scope, Scope::Project(key.clone()));
+    let me = directory.caller.expect("the caller is a live session");
+    assert_eq!((me.id, me.relation), (child_session, Relation::Myself));
+    assert_eq!(me.project.as_deref(), Some(key.as_path()));
+    assert_eq!(me.project_name.as_deref(), Some("Service fixture"));
+    let delegation = me.delegation.unwrap();
+    assert_eq!(delegation.owner, Owner::Session(parent_session));
+    assert_eq!(delegation.run_state, Some(State::Succeeded));
+    assert_eq!(
+        directory
+            .sessions
+            .iter()
+            .map(|entry| (entry.id, entry.relation))
+            .collect::<Vec<_>>(),
+        vec![(parent_session, Relation::Parent)]
+    );
+
+    // The parent sees its child; a user CLI sees both and owns only the parent.
+    let directory = read(&parent_authority, Scope::All);
+    assert_eq!(directory.caller.unwrap().id, parent_session);
+    assert_eq!(directory.sessions[0].id, child_session);
+    assert_eq!(directory.sessions[0].relation, Relation::Child);
+    let directory = read(&Authority::default(), Scope::Project(project.clone()));
+    assert!(directory.caller.is_none());
+    let relations: std::collections::BTreeMap<_, _> = directory
+        .sessions
+        .iter()
+        .map(|entry| (entry.id, entry.relation))
+        .collect();
+    assert_eq!(relations[&parent_session], Relation::Child);
+    assert_eq!(relations[&child_session], Relation::Peer);
+
+    // Outside every open project, the read widens rather than coming back empty.
+    let elsewhere = path.parent().unwrap().join("tmp");
+    let directory = read(&Authority::default(), Scope::Containing(elsewhere.clone()));
+    assert_eq!(directory.scope, Scope::All);
+    assert_eq!(directory.sessions.len(), 2);
+    assert!(
+        process(
+            &host,
+            Authority::default(),
+            Operation::Directory(Scope::Project(elsewhere))
+        )
+        .is_err()
+    );
+
+    // Seeing a session confers no control over it.
+    assert!(status(&host, &child_authority, parent.agent.id).is_err());
+    assert!(close(&host, &Authority::default(), child.agent.id).is_err());
 }

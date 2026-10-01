@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) mod bundled;
+pub mod directory;
 
 use serde::{Deserialize, Serialize};
 
@@ -330,6 +331,8 @@ pub enum Operation {
         agent: AgentId,
         command: ConsoleCommand,
     },
+    /// Read the caller and the sessions in a scope. Grants no control.
+    Directory(directory::Scope),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -369,6 +372,7 @@ pub enum Reply {
     Listed(Vec<Summary>),
     Closed(Agent),
     Console(Option<ConsoleView>),
+    Directory(directory::Directory),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

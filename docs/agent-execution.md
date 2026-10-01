@@ -44,6 +44,25 @@ Acceptance and its dispatch claim commit to the daemon's SQLite registry with `s
 
 If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed. A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
 
+## Finding other sessions
+
+`cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project. A directory outside every open project lists everything, and the reply's `scope` says so.
+
+```sh
+cagents ls
+cagents ls --all
+cagents whoami
+```
+
+```text
+7c0fba49  claude idle     [cagents] /repo/.worktrees/fix  "Fix flaky login test" (my agent)
+3e81d0aa  codex  working  [cagents] /repo
+```
+
+Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (the session that owns the caller), `Child` (an agent the caller may control), or `Peer`. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
+
+The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: control remains restricted to an agent's owner as described below. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID.
+
 ## Console surface
 
 `--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.
