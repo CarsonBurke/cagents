@@ -2559,15 +2559,20 @@ mod tests {
 
         let shortcuts = KeyboardShortcuts::default();
         let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
-        for (character, code, action) in [
-            ("T", Code::KeyT, GlobalShortcut::NewTerminal),
-            ("G", Code::KeyG, GlobalShortcut::NewChannel),
-            ("D", Code::KeyD, GlobalShortcut::ClonePane),
-            ("W", Code::KeyW, GlobalShortcut::CloseFocusedCard),
+        for (character, code, modifiers, action) in [
+            ("T", Code::KeyT, ctrl_shift, GlobalShortcut::NewTerminal),
+            ("G", Code::KeyG, ctrl_shift, GlobalShortcut::NewChannel),
+            ("D", Code::KeyD, ctrl_shift, GlobalShortcut::ClonePane),
+            (
+                "W",
+                Code::KeyW,
+                keyboard::Modifiers::CTRL,
+                GlobalShortcut::CloseFocusedCard,
+            ),
         ] {
             assert_eq!(
                 global_shortcut(
-                    &key_press(character, code, ctrl_shift, false),
+                    &key_press(character, code, modifiers, false),
                     &shortcuts,
                     FocusedPane::Terminal,
                 ),
@@ -2575,7 +2580,7 @@ mod tests {
             );
             assert_eq!(
                 global_shortcut(
-                    &key_press(character, code, ctrl_shift, true),
+                    &key_press(character, code, modifiers, true),
                     &shortcuts,
                     FocusedPane::Terminal,
                 ),
@@ -2585,7 +2590,7 @@ mod tests {
             assert!(is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),
                 keyboard::key::Physical::Code(code),
-                ctrl_shift,
+                modifiers,
                 &shortcuts,
                 FocusedPane::Terminal,
             ));
@@ -2717,9 +2722,7 @@ mod tests {
         }
     }
 
-    /// The keys a shell, an editor, or an agent CLI in a terminal relies on
-    /// reach it: no default binds them, so a focused terminal receives every
-    /// one. `Ctrl+W` deleting a word used to close the pane instead.
+    /// Shell chords outside the workspace's defaults reach a focused terminal.
     #[test]
     fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
         use keyboard::key::{Code, Named};
@@ -2742,7 +2745,6 @@ mod tests {
         let ctrl = keyboard::Modifiers::CTRL;
         let alt = keyboard::Modifiers::ALT;
         for (key, physical, modifiers) in [
-            character("w", Code::KeyW, ctrl),
             character("f", Code::KeyF, ctrl),
             character("r", Code::KeyR, ctrl),
             character("e", Code::KeyE, ctrl),
@@ -2751,7 +2753,6 @@ mod tests {
             character("q", Code::KeyQ, alt),
             character("w", Code::KeyW, alt),
             character("e", Code::KeyE, alt),
-            character("r", Code::KeyR, alt),
             character("g", Code::KeyG, alt),
             character("f", Code::KeyF, alt),
             character("b", Code::KeyB, alt),
@@ -2821,19 +2822,83 @@ mod tests {
             );
         }
 
-        // A user who binds a shell key to a workspace action asked for it.
+        // A custom close chord releases the default to the terminal.
         let customized = KeyboardShortcuts {
-            close_focused_column: vec!["Ctrl+W".into()],
+            close_focused_column: vec!["Ctrl+Shift+W".into()],
             ..KeyboardShortcuts::default()
         };
         assert_eq!(
             global_shortcut(
-                &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
+                &key_press(
+                    "w",
+                    Code::KeyW,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false
+                ),
                 &customized,
                 FocusedPane::Terminal,
             ),
             Some(GlobalShortcut::CloseFocusedCard)
         );
+        assert_eq!(
+            global_shortcut(
+                &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
+                &customized,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
+        use keyboard::key::Code;
+        let shortcuts = KeyboardShortcuts::default();
+        for focused in [
+            FocusedPane::Terminal,
+            FocusedPane::Review,
+            FocusedPane::Other,
+        ] {
+            for (character, code, modifiers, action) in [
+                (
+                    "w",
+                    Code::KeyW,
+                    keyboard::Modifiers::CTRL,
+                    GlobalShortcut::CloseFocusedCard,
+                ),
+                (
+                    "r",
+                    Code::KeyR,
+                    keyboard::Modifiers::ALT,
+                    GlobalShortcut::CyclePaneWidth,
+                ),
+            ] {
+                assert!(is_global_shortcut_chord(
+                    &keyboard::Key::Character(character.into()),
+                    keyboard::key::Physical::Code(code),
+                    modifiers,
+                    &shortcuts,
+                    focused
+                ));
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, code, modifiers, false),
+                        &shortcuts,
+                        focused
+                    ),
+                    Some(action)
+                );
+                assert_eq!(
+                    global_shortcut(
+                        &key_press(character, code, modifiers, true),
+                        &shortcuts,
+                        focused
+                    ),
+                    (action == GlobalShortcut::CyclePaneWidth).then_some(action),
+                    "width cycling repeats while closing a pane does not"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3496,8 +3561,11 @@ mod tests {
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
         assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
         assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
-        assert!(reserved("w".into(), Code::KeyW, ctrl_shift));
+        assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
+        assert!(!reserved("w".into(), Code::KeyW, ctrl_shift));
         assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
+        assert!(reserved("r".into(), Code::KeyR, keyboard::Modifiers::ALT));
+        assert!(!reserved("r".into(), Code::KeyR, ctrl_shift));
         assert!(!reserved(
             "t".into(),
             Code::KeyT,

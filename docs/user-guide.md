@@ -84,10 +84,10 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Focus pane 1–9 | `Alt+1` through `Alt+9` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
-| Close focused pane | `Ctrl+Shift+W` |
+| Close focused pane | `Ctrl+W` |
 | Find in the focused pane / search projects | `Ctrl+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
-| Cycle pane width | `Ctrl+Shift+R` |
+| Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
@@ -98,18 +98,19 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 Workspace and review shortcuts are configurable; see
 [Configuration](configuration.md#keyboard-shortcuts).
 
-- The defaults leave the keys shells, editors, and agent CLIs use to the
-  focused terminal, the way GNOME Terminal, Ghostty, and Kitty do: `Ctrl+W`
-  deletes a word and `Alt` letters reach the program. **Ctrl+T** creates a
-  native thread tab, including from a terminal. A chord you
-  bind is withheld from the terminal. **Ctrl+F** finds in the focused terminal,
+- Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
+  its pane, **Alt+R** cycles its width, and **Ctrl+T** creates a native thread
+  tab. These chords are withheld from the terminal program. Other shell keys
+  reach the program unless you bind them to workspace actions.
+  **Ctrl+F** finds in the focused terminal,
   chat transcript or editor, and otherwise searches projects. The
-  review chords act in pull request and local diff panes. As in those
-  terminals, `Ctrl+PageUp`/`Ctrl+PageDown` and `Ctrl+Shift` letters then no
-  longer reach terminal programs such as Vim.
-- Earlier versions used `Ctrl+T`, `Ctrl+W`, `Alt+Q`/`Alt+W`,
-  `Alt+Left`/`Alt+Right`, `Alt+E`, `Alt+G`, and `Alt+R`. Shortcuts still on
-  those defaults move to the new ones; any shortcut you changed is kept. See
+  review chords act in pull request and local diff panes.
+  `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
+  also belong to the workspace.
+- Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
+  `Ctrl+Shift+R`. Those defaults now return to **Ctrl+W** and **Alt+R**;
+  customized shortcuts are kept. Older navigation and creation defaults also
+  upgrade where they remain unchanged. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
@@ -119,7 +120,7 @@ Workspace and review shortcuts are configurable; see
 - Use the command palette to search commands, panes, channels and workspaces.
   Keyboard settings let you record a chord, remove it, or reset a command;
   conflicts name the command that already uses the chord.
-- **Ctrl+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
+- **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
@@ -669,7 +670,7 @@ the source for resumed history.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
   focused; Cancel or Escape keeps the pane. The close button and
-  `Ctrl+Shift+W` follow the same rule. The decision uses the process tree, not prompt
+  `Ctrl+W` follow the same rule. The decision uses the process tree, not prompt
   instrumentation, so a shell builtin with no child process closes without
   asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.

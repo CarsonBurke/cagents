@@ -229,10 +229,10 @@ impl LinkOpenGesture {
 /// process inside a card, except where the action's scope leaves it to a
 /// focused terminal (see `workspace_widget::ShortcutScope`).
 ///
-/// The defaults are chords a shell, an editor, or an agent CLI has no use for,
-/// the ones terminal emulators bind for the same actions: `Ctrl+Shift` plus a
-/// letter, and `Ctrl+PageUp`/`Ctrl+PageDown` between columns. A default that
-/// changes bumps [`SHORTCUT_DEFAULTS_REVISION`] and records the chords it
+/// Workspace defaults include `Ctrl+W` to close a pane and `Alt+R` to cycle
+/// its width, including while a terminal has focus. These chords belong to
+/// the workspace rather than the program inside it. A default that changes
+/// bumps [`SHORTCUT_DEFAULTS_REVISION`] and records the chords it
 /// replaces in [`RETIRED_SHORTCUT_DEFAULTS`], so a file still holding them
 /// moves to the new ones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,13 +281,13 @@ impl Default for KeyboardShortcuts {
             new_terminal: vec!["Ctrl+Shift+T".to_owned()],
             new_channel: vec!["Ctrl+Shift+G".to_owned()],
             clone_pane: vec!["Ctrl+Shift+D".to_owned()],
-            close_focused_column: vec!["Ctrl+Shift+W".to_owned()],
+            close_focused_column: vec!["Ctrl+W".to_owned()],
             // A focused terminal receives this chord as forward-char; every
             // other pane takes it as its search (see `ShortcutScope`).
             search_projects: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Ctrl+PageUp".to_owned()],
             next_column: vec!["Ctrl+PageDown".to_owned()],
-            cycle_pane_width: vec!["Ctrl+Shift+R".to_owned()],
+            cycle_pane_width: vec!["Alt+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned()],
             review_toggle_viewed: vec!["Alt+V".to_owned()],
@@ -1099,7 +1099,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 3;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 4;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -1121,6 +1121,7 @@ struct RetiredShortcutDefault {
 /// agent CLI keys. `search_projects` kept `Ctrl+F`; a focused terminal now
 /// receives it instead.
 /// Revision 3 adds the conventional new-tab chord to native threads.
+/// Revision 4 restores `Ctrl+W` to close a pane and `Alt+R` to cycle its width.
 const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -1161,6 +1162,16 @@ const RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "new_native_thread",
         retired_in: 3,
         chords: &["Ctrl+Shift+N"],
+    },
+    RetiredShortcutDefault {
+        action: "close_focused_column",
+        retired_in: 4,
+        chords: &["Ctrl+Shift+W"],
+    },
+    RetiredShortcutDefault {
+        action: "cycle_pane_width",
+        retired_in: 4,
+        chords: &["Ctrl+Shift+R"],
     },
 ];
 
@@ -3291,10 +3302,7 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Ctrl+PageUp"]);
         assert_eq!(migrated.keyboard_shortcuts.next_column, ["Ctrl+PageDown"]);
         assert!(migrated.editor_auto_save);
-        assert_eq!(
-            migrated.keyboard_shortcuts.cycle_pane_width,
-            ["Ctrl+Shift+R"]
-        );
+        assert_eq!(migrated.keyboard_shortcuts.cycle_pane_width, ["Alt+R"]);
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
     }
@@ -3303,7 +3311,7 @@ next_column = ["Alt+W", "Alt+Right"]
     fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        for (version, binding) in [(2, "\"Ctrl+Shift+R\""), (3, "[\"Ctrl+Shift+R\"]")] {
+        for (version, binding) in [(2, "\"Alt+R\""), (3, "[\"Alt+R\"]")] {
             let inspector = if version == 3 {
                 "inspector_width = 380.0\n"
             } else {
@@ -3311,7 +3319,7 @@ next_column = ["Alt+W", "Alt+Right"]
             };
             fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {binding}\n")).unwrap();
             let migrated = load(&path).unwrap();
-            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+R"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+R"]);
             assert!(migrated.keyboard_shortcuts.cycle_pane_width.is_empty());
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
@@ -3325,8 +3333,10 @@ next_column = ["Alt+W", "Alt+Right"]
         let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
         document.remove("shortcut_defaults_revision");
         let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
-        for retired in RETIRED_SHORTCUT_DEFAULTS {
-            shortcuts.insert(retired.action.into(), retired.chords.to_vec().into());
+        for action in SHORTCUT_ACTIONS {
+            if let Some(chords) = retired_default(action, FIRST_SHORTCUT_DEFAULTS_REVISION) {
+                shortcuts.insert(action.into(), chords.to_vec().into());
+            }
         }
         extend(shortcuts);
         fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
@@ -3353,7 +3363,7 @@ next_column = ["Alt+W", "Alt+Right"]
         );
         assert_eq!(
             file["keyboard_shortcuts"]["close_focused_column"],
-            vec!["Ctrl+Shift+W"].into()
+            vec!["Ctrl+W"].into()
         );
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -3391,6 +3401,80 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn pane_shortcuts_restore_revision_two_and_three_defaults_without_losing_choices() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for revision in [1, 2, 3, 4] {
+            for (close, width) in [
+                (vec!["Ctrl+Shift+W"], vec!["Ctrl+Shift+R"]),
+                (vec!["Ctrl+Alt+W"], vec!["Alt+Shift+R"]),
+                (
+                    vec!["Ctrl+W", "Ctrl+Shift+W"],
+                    vec!["Alt+R", "Ctrl+Shift+R"],
+                ),
+                (vec!["Ctrl+Shift+W"], vec![]),
+            ] {
+                let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+                document.insert("shortcut_defaults_revision".into(), revision.into());
+                let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+                shortcuts.insert("close_focused_column".into(), close.clone().into());
+                shortcuts.insert("cycle_pane_width".into(), width.clone().into());
+                fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+                let loaded = load(&path).unwrap();
+                let expected_close = if matches!(revision, 2 | 3) && close == ["Ctrl+Shift+W"] {
+                    vec!["Ctrl+W"]
+                } else {
+                    close
+                };
+                let expected_width = if matches!(revision, 2 | 3) && width == ["Ctrl+Shift+R"] {
+                    vec!["Alt+R"]
+                } else {
+                    width
+                };
+                assert_eq!(
+                    loaded.keyboard_shortcuts.close_focused_column, expected_close,
+                    "revision {revision}"
+                );
+                assert_eq!(
+                    loaded.keyboard_shortcuts.cycle_pane_width, expected_width,
+                    "revision {revision}"
+                );
+                assert_eq!(
+                    loaded.shortcut_defaults_revision,
+                    SHORTCUT_DEFAULTS_REVISION
+                );
+                save(&path, &loaded).unwrap();
+                assert_eq!(load(&path).unwrap(), loaded);
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_pane_defaults_does_not_steal_another_actions_chords() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for revision in [2, 3] {
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), revision.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            shortcuts.insert("close_focused_column".into(), vec!["Ctrl+Shift+W"].into());
+            shortcuts.insert("cycle_pane_width".into(), vec!["Ctrl+Shift+R"].into());
+            shortcuts.insert("new_channel".into(), vec!["Ctrl+W"].into());
+            shortcuts.insert("clone_pane".into(), vec!["Alt+R"].into());
+            fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+            let loaded = load_detailed(&path).unwrap();
+            assert_eq!(loaded.set_aside().count(), 0, "revision {revision}");
+            let shortcuts = &loaded.settings.keyboard_shortcuts;
+            assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
+            assert_eq!(shortcuts.cycle_pane_width, ["Ctrl+Shift+R"]);
+            assert_eq!(shortcuts.new_channel, ["Ctrl+W"]);
+            assert_eq!(shortcuts.clone_pane, ["Alt+R"]);
+            save(&path, &loaded.settings).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded.settings);
+        }
+    }
+
+    #[test]
     fn a_shortcut_the_user_chose_survives_the_move_to_new_defaults() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -3408,11 +3492,11 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(shortcuts.next_column, ["Alt+W"]);
         assert!(shortcuts.cycle_pane_width.is_empty());
         assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
 
         // Once upgraded, an old default chosen again is a choice too.
         let mut desired = loaded.clone();
-        desired.keyboard_shortcuts.close_focused_column = vec!["Ctrl+W".into()];
+        desired.keyboard_shortcuts.close_focused_column = vec!["Ctrl+Shift+W".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         assert_eq!(load(&path).unwrap(), desired);
     }
@@ -3422,17 +3506,12 @@ next_column = ["Alt+W", "Alt+Right"]
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
         revision_one_document(&path, |shortcuts| {
-            shortcuts.insert("clone_pane".into(), vec!["Ctrl+Shift+W"].into());
             shortcuts.insert("review_toggle_viewed".into(), vec!["Ctrl+PageDown"].into());
         });
         let loaded = load(&path).unwrap();
         let shortcuts = &loaded.keyboard_shortcuts;
-        assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+W"]);
-        assert_eq!(
-            shortcuts.close_focused_column,
-            ["Ctrl+W"],
-            "kept, not stolen"
-        );
+        assert_eq!(shortcuts.clone_pane, ["Ctrl+Shift+D"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
         assert_eq!(shortcuts.review_toggle_viewed, ["Ctrl+PageDown"]);
         assert_eq!(shortcuts.next_column, ["Alt+W", "Alt+Right"]);
         // The rest move.
@@ -3466,7 +3545,7 @@ new_thread = "Alt+Shift+G"
         .unwrap();
         let shortcuts = load(&path).unwrap().keyboard_shortcuts;
         assert_eq!(shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
+        assert_eq!(shortcuts.close_focused_column, ["Ctrl+W"]);
         assert_eq!(shortcuts.search_projects, ["Ctrl+F"]);
         // A single string predates chord lists, when Alt+Q alone was the
         // default; a list holding it alone was a choice, since lists shipped
@@ -3549,11 +3628,13 @@ new_thread = "Alt+Shift+G"
                 retired.action
             );
             assert!(retired.retired_in <= SHORTCUT_DEFAULTS_REVISION);
+            let successor = retired_default(retired.action, retired.retired_in)
+                .map(|chords| chords.iter().map(|chord| (*chord).to_owned()).collect())
+                .unwrap_or_else(|| default_chords(retired.action));
             assert_ne!(
-                default_chords(retired.action),
-                retired.chords,
-                "{} did not change",
-                retired.action
+                successor, retired.chords,
+                "{} did not change at revision {}",
+                retired.action, retired.retired_in
             );
             for chord in retired.chords {
                 parse_shortcut(chord).unwrap();
