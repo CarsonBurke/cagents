@@ -15,6 +15,10 @@ use std::{
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
 const WINDOW_ITEMS: usize = 128;
+// Leave room between provider items for overlapping history pages to supply
+// missing records without renumbering the whole conversation on every page.
+const ORDINAL_STRIDE: i64 = 1 << 32;
+const ORDINAL_LIMIT: i64 = i64::MAX / 2;
 /// The serialized item carries identity only, so it is not pageable and must stay small.
 const METADATA_LIMIT: usize = 64 * 1024;
 /// An identity string a provider can make arbitrarily long is trimmed to this
@@ -139,7 +143,15 @@ impl Store {
     /// holds identity alone. Returns a non-fatal warning instead of an error when an
     /// item's identity still cannot be cached intact: a single unrepresentable item
     /// must never end the conversation.
-    fn put(&mut self, mut item: Item, older: bool) -> Result<Option<String>, String> {
+    fn put(&mut self, item: Item, older: bool) -> Result<Option<String>, String> {
+        self.put_at(item, older, None)
+    }
+    fn put_at(
+        &mut self,
+        mut item: Item,
+        older: bool,
+        assigned: Option<i64>,
+    ) -> Result<Option<String>, String> {
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -217,18 +229,10 @@ impl Store {
         };
         let ordinal = match &previous {
             Some((ordinal, _, _)) => *ordinal,
-            None => self
-                .db
-                .query_row(
-                    if older {
-                        "SELECT COALESCE(MIN(ordinal),0)-1 FROM items"
-                    } else {
-                        "SELECT COALESCE(MAX(ordinal),0)+1 FROM items"
-                    },
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?,
+            None => match assigned {
+                Some(ordinal) => ordinal,
+                None => self.edge_ordinals(older, 1)?[0],
+            },
         };
         let len0 = if preserve_input {
             previous.as_ref().map_or(0, |(_, _, length)| *length)
@@ -270,10 +274,192 @@ impl Store {
         self.dirty = true;
         Ok(warning)
     }
+
+    fn ordinal(&self, id: &str) -> Result<Option<i64>, String> {
+        self.db
+            .prepare_cached("SELECT ordinal FROM items WHERE id=?1")
+            .map_err(|e| e.to_string())?
+            .query_row([id], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    fn spaced(left: Option<i64>, right: Option<i64>, count: usize) -> Option<Vec<i64>> {
+        let count = i128::try_from(count).ok()?;
+        let stride = i128::from(ORDINAL_STRIDE);
+        let (start, step) = match (left, right) {
+            (Some(left), Some(right)) => {
+                let step = (i128::from(right) - i128::from(left)) / (count + 1);
+                (i128::from(left), step)
+            }
+            (Some(left), None) => (i128::from(left), stride),
+            (None, Some(right)) => (i128::from(right) - stride * (count + 1), stride),
+            (None, None) => (0, stride),
+        };
+        if step <= 0 {
+            return None;
+        }
+        (1..=count)
+            .map(|index| {
+                let ordinal = start + index * step;
+                (ordinal.abs() <= i128::from(ORDINAL_LIMIT)).then(|| ordinal as i64)
+            })
+            .collect()
+    }
+
+    fn edge_ordinals(&mut self, earlier: bool, count: usize) -> Result<Vec<i64>, String> {
+        for _ in 0..2 {
+            let edge: Option<i64> = self
+                .db
+                .query_row(
+                    if earlier {
+                        "SELECT MIN(ordinal) FROM items"
+                    } else {
+                        "SELECT MAX(ordinal) FROM items"
+                    },
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some(ordinals) = Self::spaced(
+                (!earlier).then_some(edge).flatten(),
+                earlier.then_some(edge).flatten(),
+                count,
+            ) {
+                return Ok(ordinals);
+            }
+            self.rebalance()?;
+        }
+        Err("Transcript item order exceeds cache capacity".into())
+    }
+
+    fn history_ordinals(
+        &mut self,
+        before: Option<&str>,
+        after: Option<&str>,
+        count: usize,
+    ) -> Result<Vec<i64>, String> {
+        if before.is_none() && after.is_none() {
+            return self.edge_ordinals(true, count);
+        }
+        for _ in 0..2 {
+            let bounds = if let Some(id) = before {
+                let right = self.ordinal(id)?.ok_or("History anchor disappeared")?;
+                let left = self
+                    .db
+                    .query_row(
+                        "SELECT MAX(ordinal) FROM items WHERE ordinal<?1",
+                        [right],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                (left, Some(right))
+            } else {
+                let left = self
+                    .ordinal(after.unwrap())?
+                    .ok_or("History anchor disappeared")?;
+                let right = self
+                    .db
+                    .query_row(
+                        "SELECT MIN(ordinal) FROM items WHERE ordinal>?1",
+                        [left],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                (Some(left), right)
+            };
+            if let Some(ordinals) = Self::spaced(bounds.0, bounds.1, count) {
+                return Ok(ordinals);
+            }
+            self.rebalance()?;
+        }
+        Err("Transcript history cannot be ordered between its anchors".into())
+    }
+
+    /// Rebalance only when repeated insertion has exhausted an integer gap.
+    /// The temporary range is disjoint from every normally allocated ordinal,
+    /// so UNIQUE stays enforced through both phases of the atomic update.
+    fn rebalance(&mut self) -> Result<(), String> {
+        let transaction = self.db.transaction().map_err(|e| e.to_string())?;
+        transaction.execute_batch("CREATE TEMP TABLE ordinal_remap(old INTEGER PRIMARY KEY, temporary INTEGER UNIQUE NOT NULL, new INTEGER UNIQUE NOT NULL);").map_err(|e| e.to_string())?;
+        let count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if count > ORDINAL_LIMIT / ORDINAL_STRIDE {
+            return Err("Transcript item order exceeds cache capacity".into());
+        }
+        transaction.execute("INSERT INTO ordinal_remap SELECT ordinal,?1+ROW_NUMBER() OVER(ORDER BY ordinal),?2*ROW_NUMBER() OVER(ORDER BY ordinal) FROM items", params![i64::MIN, ORDINAL_STRIDE]).map_err(|e| e.to_string())?;
+        let remap = |cursor: Option<Cursor>| -> Result<Option<Cursor>, String> {
+            cursor
+                .map(|(ordinal, part)| {
+                    let mapped = transaction
+                        .query_row(
+                            "SELECT new FROM ordinal_remap WHERE old=?1",
+                            [ordinal],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|e| e.to_string())?;
+                    Ok(mapped.map(|ordinal| (ordinal, part)))
+                })
+                .transpose()
+                .map(Option::flatten)
+        };
+        let (end, first, pending_earlier) = (
+            remap(self.end)?,
+            remap(self.first)?,
+            remap(self.pending_earlier)?,
+        );
+        transaction.execute_batch("UPDATE items SET ordinal=(SELECT temporary FROM ordinal_remap WHERE old=items.ordinal);
+            UPDATE items SET ordinal=(SELECT new FROM ordinal_remap WHERE temporary=items.ordinal);
+            DROP TABLE ordinal_remap;").map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        self.end = end;
+        self.first = first;
+        self.pending_earlier = pending_earlier;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn merge_history(&mut self, items: Vec<Item>, earlier: bool) -> Result<Vec<String>, String> {
+        let mut run = Vec::new();
+        let mut after = None;
+        let mut warnings = Vec::new();
+        for item in items {
+            if self.ordinal(&item.id)?.is_some() {
+                if !run.is_empty() {
+                    let ordinals =
+                        self.history_ordinals(Some(&item.id), after.as_deref(), run.len())?;
+                    for (item, ordinal) in run.drain(..).zip(ordinals) {
+                        if let Some(warning) = self.put_at(item, true, Some(ordinal))? {
+                            warnings.push(warning);
+                        }
+                    }
+                }
+                after = Some(item.id);
+            } else {
+                run.push(item);
+            }
+        }
+        if !run.is_empty() {
+            let ordinals = if after.is_none() {
+                self.edge_ordinals(earlier, run.len())?
+            } else {
+                self.history_ordinals(None, after.as_deref(), run.len())?
+            };
+            for (item, ordinal) in run.into_iter().zip(ordinals) {
+                if let Some(warning) = self.put_at(item, true, Some(ordinal))? {
+                    warnings.push(warning);
+                }
+            }
+        }
+        Ok(warnings)
+    }
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
         let mut out = Vec::new();
+        let earlier = matches!(&event, Event::History { .. });
         if !matches!(&event, Event::TextDelta { .. })
             && let Some(warning) = self.flush_text()?
         {
@@ -288,25 +474,25 @@ impl Store {
             Event::History {
                 mut items,
                 has_earlier,
+            }
+            | Event::LatestHistory {
+                mut items,
+                has_earlier,
             } => {
+                if !earlier {
+                    // A latest reread cannot satisfy an outstanding older
+                    // cursor, including a deferred reread after RPC failure.
+                    self.pending_earlier = None;
+                }
                 self.provider_earlier = has_earlier;
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
-                let mut affected = 0usize;
-                let mut first_warning = None;
-                for item in items.into_iter().rev() {
-                    if let Some(warning) = self.put(item, true)? {
-                        affected += 1;
-                        if first_warning.is_none() {
-                            first_warning = Some(warning);
-                        }
-                    }
-                }
-                if let Some(warning) = first_warning {
-                    out.push(nonfatal(if affected > 1 {
-                        format!("{warning} ({affected} replayed items affected)")
+                let warnings = self.merge_history(items, earlier)?;
+                if let Some(warning) = warnings.first() {
+                    out.push(nonfatal(if warnings.len() > 1 {
+                        format!("{warning} ({} replayed items affected)", warnings.len())
                     } else {
-                        warning
+                        warning.clone()
                     }));
                 }
                 if let Some(first) = self.pending_earlier.take()
@@ -371,6 +557,14 @@ impl Store {
                 self.pending_earlier = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
+                return Ok(out);
+            }
+            Event::HistoryLoading(false) => {
+                // A failed provider request must not leave its cursor waiting
+                // for an unrelated later history response. Successful pages
+                // consume the cursor before publishing loading=false.
+                self.pending_earlier = None;
+                out.push(Event::HistoryLoading(false));
                 return Ok(out);
             }
             other => {
@@ -847,6 +1041,196 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+    fn history_item(id: &str, body: &str) -> Item {
+        Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: body.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+            at: None,
+        }
+    }
+    fn ids(store: &mut Store) -> Vec<String> {
+        store
+            .window()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    #[test]
+    fn overlapping_history_inserts_prefix_middle_and_suffix_without_replacing_live_output() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["A", "C"] {
+            store.apply(Event::Item(history_item(id, "live"))).unwrap();
+        }
+        store
+            .apply(Event::History {
+                items: ["prefix", "A", "B", "C", "D"]
+                    .map(|id| history_item(id, "replay"))
+                    .to_vec(),
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(ids(&mut store), ["prefix", "A", "B", "C", "D"]);
+        store
+            .apply(Event::TextDelta {
+                id: "C".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " update".into(),
+            })
+            .unwrap();
+        store
+            .apply(Event::LatestHistory {
+                items: ["B", "C", "D", "E"]
+                    .map(|id| history_item(id, "stale"))
+                    .to_vec(),
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(ids(&mut store), ["prefix", "A", "B", "C", "D", "E"]);
+        assert!(
+            matches!(&store.window().unwrap().items[3].content, ItemContent::Text { text, .. } if text == "live update")
+        );
+    }
+
+    #[test]
+    fn disjoint_latest_appends_and_disjoint_earlier_prepends() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for id in ["A", "B"] {
+            store.apply(Event::Item(history_item(id, id))).unwrap();
+        }
+        store
+            .apply(Event::LatestHistory {
+                items: ["D", "E"].map(|id| history_item(id, id)).to_vec(),
+                has_earlier: true,
+            })
+            .unwrap();
+        store
+            .apply(Event::History {
+                items: ["Y", "Z"].map(|id| history_item(id, id)).to_vec(),
+                has_earlier: false,
+            })
+            .unwrap();
+        assert_eq!(ids(&mut store), ["Y", "Z", "A", "B", "D", "E"]);
+    }
+
+    #[test]
+    fn latest_history_does_not_satisfy_an_older_cursor_left_after_failure() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::History {
+                items: vec![history_item("A", "A")],
+                has_earlier: true,
+            })
+            .unwrap();
+        store.window().unwrap();
+        assert!(!store.earlier().unwrap());
+        assert!(store.pending_earlier.is_some());
+        store
+            .apply(Event::LatestHistory {
+                items: vec![history_item("B", "B")],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(store.pending_earlier.is_none());
+        assert!(!store.window().unwrap().has_later);
+        assert_eq!(ids(&mut store), ["A", "B"]);
+    }
+
+    #[test]
+    fn exhausted_ordinal_gap_rebalances_without_moving_chunk_cursors() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item("A", &"x".repeat(3 * PART_BYTES))))
+            .unwrap();
+        store.apply(Event::Item(history_item("C", "live"))).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE items SET ordinal=CASE id WHEN 'A' THEN 1 ELSE 2 END",
+                [],
+            )
+            .unwrap();
+        store.end = Some((1, 2));
+        store.first = Some((1, 0));
+        store.pending_earlier = Some((2, 0));
+        store
+            .merge_history(
+                vec![
+                    history_item("A", "stale"),
+                    history_item("B", "middle"),
+                    history_item("C", "stale"),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(store.end, Some((ORDINAL_STRIDE, 2)));
+        assert_eq!(store.first, Some((ORDINAL_STRIDE, 0)));
+        assert_eq!(store.pending_earlier, Some((2 * ORDINAL_STRIDE, 0)));
+        let page = store.window().unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert!(page.has_later);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.content.byte_len())
+                .sum::<usize>(),
+            2 * PART_BYTES
+        );
+        store.latest();
+        let page = store.window().unwrap();
+        assert_eq!(page.items.last().unwrap().id, "C");
+        assert_eq!(page.items[3].id, "B");
+    }
+
+    #[test]
+    fn latest_or_failed_request_prevents_a_late_history_response_from_repinning() {
+        for cancel_with_latest in [true, false] {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            let text = |id: &str| Item {
+                id: id.into(),
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: id.into(),
+                    thinking: false,
+                    phase: Phase::Final,
+                },
+                at: None,
+            };
+            store
+                .apply(Event::History {
+                    items: vec![text("current")],
+                    has_earlier: true,
+                })
+                .unwrap();
+            assert!(store.window().unwrap().has_earlier);
+            assert!(!store.earlier().unwrap());
+            assert!(store.pending_earlier.is_some());
+            if cancel_with_latest {
+                store.latest();
+            } else {
+                store.apply(Event::HistoryLoading(false)).unwrap();
+            }
+            assert!(store.pending_earlier.is_none());
+            store
+                .apply(Event::History {
+                    items: vec![text("older")],
+                    has_earlier: false,
+                })
+                .unwrap();
+            let window = store.window().unwrap();
+            assert!(!window.has_later);
+            assert_eq!(window.items.last().unwrap().id, "current");
+        }
+    }
+
     #[test]
     fn oversized_unicode_item_pages_without_losing_bytes() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();

@@ -1837,6 +1837,7 @@ pub(super) fn observed_at() -> Option<u64> {
     crate::chat::now_ms()
 }
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
+    let latest_history = matches!(&event, Event::LatestHistory { .. });
     match event {
         Event::TurnStarted
         | Event::TurnSettled
@@ -1855,6 +1856,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             );
         }
         Event::QueueChanged(messages) => state.queued_messages = messages,
+        Event::HistoryLoading(loading) => state.history_loading = loading,
         Event::Reset { reason } => {
             state.queued_messages.clear();
             state.items.clear();
@@ -1865,6 +1867,8 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.session_id = None;
             state.title = None;
             state.has_earlier = false;
+            state.has_later = false;
+            state.history_loading = false;
             state.detail = reason;
             state.busy = false;
             state.waiting = false;
@@ -1985,16 +1989,32 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 agent.items.retain(|item| !ids.contains(&item.id));
             }
         }
-        Event::History { items, has_earlier } => {
-            let mut older = Vec::new();
+        Event::History { items, has_earlier } | Event::LatestHistory { items, has_earlier } => {
+            state.history_loading = false;
+            let mut run = Vec::new();
+            let mut after = None;
             let mut seen = std::collections::BTreeSet::new();
             for item in items {
-                if !indices.contains_key(&item.id) && seen.insert(item.id.clone()) {
-                    older.push(item);
+                if !seen.insert(item.id.clone()) {
+                    continue;
+                }
+                if let Some(index) = state.items.iter().position(|cached| cached.id == item.id) {
+                    state.items.splice(index..index, run.drain(..));
+                    after = Some(item.id);
+                } else {
+                    run.push(item);
                 }
             }
-            older.append(&mut state.items);
-            state.items = older;
+            let insertion = after
+                .and_then(|id| {
+                    state
+                        .items
+                        .iter()
+                        .position(|item| item.id == id)
+                        .map(|index| index + 1)
+                })
+                .unwrap_or(if latest_history { state.items.len() } else { 0 });
+            state.items.splice(insertion..insertion, run);
             indices.clear();
             indices.extend(
                 state
@@ -2074,6 +2094,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.error = Some(message);
             if fatal {
                 state.busy = false;
+                state.history_loading = false;
             }
         }
         Event::Exited { .. } => {
@@ -2081,6 +2102,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.waiting = false;
             state.busy = false;
             state.ready = false;
+            state.history_loading = false;
         }
         Event::Ready(ready) => state.ready = ready,
     }
@@ -2419,6 +2441,31 @@ mod tests {
         assert!(state.ready);
         apply_event(&mut state, &mut indices, Event::Exited { code: Some(0) });
         assert!(!state.ready);
+    }
+    #[test]
+    fn asynchronous_history_loading_ends_on_response_reset_or_provider_exit() {
+        for completion in [
+            Event::HistoryLoading(false),
+            Event::History {
+                items: Vec::new(),
+                has_earlier: false,
+            },
+            Event::Reset {
+                reason: "new conversation".into(),
+            },
+            Event::Error {
+                message: "provider failed".into(),
+                fatal: true,
+            },
+            Event::Exited { code: None },
+        ] {
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            apply_event(&mut state, &mut indices, Event::HistoryLoading(true));
+            assert!(state.history_loading);
+            apply_event(&mut state, &mut indices, completion);
+            assert!(!state.history_loading);
+        }
     }
 
     #[test]
