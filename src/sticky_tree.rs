@@ -138,6 +138,18 @@ fn pinned_bounds(group: Rectangle, height: f32, top: f32) -> Rectangle {
     }
 }
 
+/// Descendants share this boundary for painting and input. Painting through
+/// a pinned ancestor leaves scrolling text visible in fractional-pixel seams
+/// between independently clipped folder headers.
+fn descendants_viewport(viewport: Rectangle, header: Rectangle) -> Rectangle {
+    let top = viewport.y.max(header.y + header.height);
+    Rectangle {
+        y: top,
+        height: (viewport.y + viewport.height - top).max(0.0),
+        ..viewport
+    }
+}
+
 fn child_layouts<'a>(
     kind: &Kind,
     state: &'a State,
@@ -266,12 +278,7 @@ impl<Message> Widget<Message, Theme, Renderer> for StickyTree<'_, Message> {
             .unwrap()
             .bounds();
         let descendants_viewport = if group {
-            let top = viewport.y.max(header.y + header.height);
-            Rectangle {
-                y: top,
-                height: (viewport.y + viewport.height - top).max(0.0),
-                ..*viewport
-            }
+            descendants_viewport(*viewport, header)
         } else {
             *viewport
         };
@@ -369,15 +376,24 @@ impl<Message> Widget<Message, Theme, Renderer> for StickyTree<'_, Message> {
             let mut layouts = child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout);
             let header = layouts.next().unwrap();
             let descendants = layouts.next().unwrap();
-            self.children[1].as_widget().draw(
-                &tree.children[1],
-                renderer,
-                theme,
-                style,
-                descendants,
-                cursor,
-                viewport,
-            );
+            let below = descendants_viewport(*viewport, header.bounds());
+            if below.height > 0.0 {
+                renderer.with_layer(below, |renderer| {
+                    self.children[1].as_widget().draw(
+                        &tree.children[1],
+                        renderer,
+                        theme,
+                        style,
+                        descendants,
+                        if cursor.is_over(below) {
+                            cursor
+                        } else {
+                            mouse::Cursor::Unavailable
+                        },
+                        &below,
+                    );
+                });
+            }
             if let Some(clip) = header.bounds().intersection(viewport) {
                 renderer.with_layer(clip, |renderer| {
                     if header.bounds().y > layout.bounds().y {
@@ -519,5 +535,27 @@ mod tests {
         // At the final child, the folder slides out as the next sibling enters.
         assert_eq!(pinned_bounds(group, 24.0, 250.0).y, 206.0);
         assert_eq!(pinned_bounds(group, 24.0, 90.0).x, 12.0);
+    }
+    #[test]
+    fn nested_sticky_headers_share_a_contiguous_clip_at_fractional_offsets() {
+        let viewport = Rectangle::new(Point::new(10.0, 73.25), Size::new(280.0, 400.0));
+        let parent = pinned_bounds(
+            Rectangle::new(Point::new(10.0, 20.0), Size::new(280.0, 900.0)),
+            28.0,
+            viewport.y,
+        );
+        let below_parent = descendants_viewport(viewport, parent);
+        let child = pinned_bounds(
+            Rectangle::new(Point::new(10.0, 48.0), Size::new(280.0, 800.0)),
+            28.0,
+            below_parent.y,
+        );
+        assert_eq!(parent.y + parent.height, child.y);
+        let below_child = descendants_viewport(below_parent, child);
+        assert_eq!(below_child.y, child.y + child.height);
+        assert_eq!(
+            below_child.y + below_child.height,
+            viewport.y + viewport.height
+        );
     }
 }

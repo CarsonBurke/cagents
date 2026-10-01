@@ -131,8 +131,10 @@ fn bundled_symbolic_icon(name: &str) -> Option<widget::icon::Handle> {
     static SIDEBAR: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // Both gear and hub are symmetric around (8, 8). Render this vector
+    // directly at the control's icon size, without a bitmap intermediate.
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.5 1.5h3l.3 1.55c.45.15.87.39 1.23.7l1.5-.55 1.5 2.6-1.2 1.05c.08.48.08.96 0 1.44l1.2 1.05-1.5 2.6-1.5-.55c-.36.31-.78.55-1.23.7l-.3 1.55h-3l-.3-1.55c-.45-.15-.87-.39-1.23-.7l-1.5.55-1.5-2.6 1.2-1.05a4.3 4.3 0 0 1 0-1.44l-1.2-1.05 1.5-2.6 1.5.55c.36-.31.78-.55 1.23-.7z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="2" fill="none" stroke="black" stroke-width="1.2"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"><path d="M6.52 3.43L6.65 1.64L9.35 1.64L9.48 3.43L11.21 4.43L12.83 3.65L14.18 5.99L12.70 7.00L12.70 9.00L14.18 10.01L12.83 12.35L11.21 11.57L9.48 12.57L9.35 14.36L6.65 14.36L6.52 12.57L4.79 11.57L3.17 12.35L1.82 10.01L3.30 9.00L3.30 7.00L1.82 5.99L3.17 3.65L4.79 4.43Z"/><circle cx="8" cy="8" r="2.2"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
