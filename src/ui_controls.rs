@@ -558,58 +558,82 @@ pub fn view_tabs<'a, Message: Clone + 'a>(
     tabs: Vec<ViewTab<'a, Message>>,
     compact: bool,
 ) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let inset = if compact {
-        spacing.space_xxs
-    } else {
-        spacing.space_xs
-    };
     let row = widget::row::with_children(
         tabs.into_iter()
-            .map(|tab| {
-                let ViewTab {
-                    label,
-                    description,
-                    count,
-                    selected,
-                    id,
-                    on_press,
-                } = tab;
-                let mut content = widget::row::with_capacity(2)
-                    .spacing(spacing.space_xxs)
-                    .align_y(iced::Alignment::Center)
-                    .push(crate::design::body(label).wrapping(iced::widget::text::Wrapping::None));
-                // The count is drawn, so it is spoken too: a name that left it
-                // out would describe a different tab than the one on screen.
-                let name: Cow<'a, str> = match &count {
-                    Some((count, _)) => format!("{description}: {count}").into(),
-                    None => description,
-                };
-                if let Some((count, style)) = count {
-                    content = content.push(
-                        crate::design::caption(count)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .class(cosmic::theme::Text::Custom(style)),
-                    );
-                }
-                let mut button =
-                    widget::button::custom(widget::container(content).center_y(Length::Fill))
-                        .class(view_tab_style(selected))
-                        .name(name.clone())
-                        .selected(selected)
-                        .padding([0, inset])
-                        .height(crate::design::DENSE_ROW_HEIGHT)
-                        .on_press_maybe(if selected { None } else { on_press });
-                if let Some(id) = id {
-                    button = button.id(id);
-                }
-                tooltip(crate::interaction::hover(button), name)
-            })
+            .map(|tab| view_tab(tab, compact, None))
             .collect::<Vec<_>>(),
     )
-    .spacing(spacing.space_xxxs)
+    .spacing(cosmic::theme::spacing().space_xxxs)
     .align_y(iced::Alignment::Center);
     widget::container(row).width(Length::Fill).clip(true).into()
+}
+
+/// A shared view tab, with an optional leading status mark. Compact tabs use
+/// caption text and the smaller inline-control height.
+pub fn view_tab<'a, Message: Clone + 'a>(
+    tab: ViewTab<'a, Message>,
+    compact: bool,
+    leading: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let ViewTab {
+        label,
+        description,
+        count,
+        selected,
+        id,
+        on_press,
+    } = tab;
+    let mut content = widget::row::with_capacity(3)
+        .spacing(spacing.space_xxs)
+        .align_y(iced::Alignment::Center);
+    if let Some(leading) = leading {
+        content = content.push(leading);
+    }
+    let label = if compact {
+        crate::design::caption(label)
+    } else {
+        crate::design::body(label)
+    };
+    content = content.push(label.wrapping(iced::widget::text::Wrapping::None));
+    // The count is drawn, so it is spoken too.
+    let name: Cow<'a, str> = match &count {
+        Some((count, _)) => format!("{description}: {count}").into(),
+        None => description,
+    };
+    if let Some((count, style)) = count {
+        content = content.push(
+            crate::design::caption(count)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .class(cosmic::theme::Text::Custom(style)),
+        );
+    }
+    let mut button = widget::button::custom(widget::container(content).center_y(Length::Fill))
+        .class(view_tab_style(selected))
+        .name(name.clone())
+        .selected(selected)
+        .padding([
+            0,
+            if compact {
+                spacing.space_xxs
+            } else {
+                spacing.space_xs
+            },
+        ])
+        .height(view_tab_height(compact))
+        .on_press_maybe(if selected { None } else { on_press });
+    if let Some(id) = id {
+        button = button.id(id);
+    }
+    tooltip(crate::interaction::hover(button), name)
+}
+
+pub fn view_tab_height(compact: bool) -> f32 {
+    if compact {
+        crate::design::COMPACT_CONTROL_SIZE
+    } else {
+        crate::design::DENSE_ROW_HEIGHT
+    }
 }
 
 /// [`control_style`]'s surface with a label tone: the selected tab keeps its
@@ -1130,6 +1154,54 @@ mod tests {
     use std::f32::consts::TAU;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn compact_status_tabs_select_only_an_inactive_view() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 80.0));
+        for selected in [false, true] {
+            let mut tab = view_tab(
+                ViewTab {
+                    label: "Worker".into(),
+                    description: "Worker · Running".into(),
+                    count: None,
+                    selected,
+                    id: None,
+                    on_press: Some(()),
+                },
+                true,
+                Some(activity_spinner_tone(12.0, crate::design::accent_color)),
+            );
+            let mut tree = Tree::new(tab.as_widget());
+            let node = tab.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            assert_eq!(node.size().height, crate::design::COMPACT_CONTROL_SIZE);
+            let cursor = mouse::Cursor::Available(node.bounds().center());
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                tab.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(messages.len(), usize::from(!selected));
+        }
+    }
 
     /// Symbolic names the application leaves to the desktop theme. Each
     /// ships under its exact name in the stock COSMIC chain: the Cosmic

@@ -1139,12 +1139,18 @@ impl Runtime {
             );
         }
         if !snapshot.subagents.is_empty() {
-            let mut chips: Vec<Element<'_, Message>> = vec![
-                widget::button::custom(design::caption("Conversation"))
-                    .class(crate::ui_controls::control_style(selected.is_none(), None))
-                    .on_press(action(Action::SelectSubagent(target, None)))
-                    .into(),
-            ];
+            let mut tabs = vec![crate::ui_controls::view_tab(
+                crate::ui_controls::ViewTab {
+                    label: "Conversation".into(),
+                    description: "Main conversation".into(),
+                    count: None,
+                    selected: selected.is_none(),
+                    id: None,
+                    on_press: Some(action(Action::SelectSubagent(target, None))),
+                },
+                true,
+                None,
+            )];
             for agent in snapshot.subagents.iter().rev() {
                 let label = if agent.description.is_empty() {
                     if agent.kind.is_empty() {
@@ -1170,35 +1176,35 @@ impl Runtime {
                         design::COMPACT_ICON_SIZE,
                     )
                 };
-                chips.push(
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            marker,
-                            design::caption(Self::short_description(&label, 56)).into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .class(crate::ui_controls::control_style(
-                        selected.is_some_and(|active| active.id == agent.id),
-                        None,
-                    ))
-                    .on_press(action(Action::SelectSubagent(
-                        target,
-                        Some(agent.id.clone()),
-                    )))
-                    .into(),
-                );
+                let status = match agent.status {
+                    chat::ToolStatus::Running => "Running",
+                    chat::ToolStatus::Succeeded => "Completed",
+                    chat::ToolStatus::Failed => "Failed",
+                    chat::ToolStatus::Denied => "Denied",
+                };
+                tabs.push(crate::ui_controls::view_tab(
+                    crate::ui_controls::ViewTab {
+                        label: Self::short_description(&label, 56).into(),
+                        description: format!("{label} · {status}").into(),
+                        count: None,
+                        selected: selected.is_some_and(|active| active.id == agent.id),
+                        id: None,
+                        on_press: Some(action(Action::SelectSubagent(
+                            target,
+                            Some(agent.id.clone()),
+                        ))),
+                    },
+                    true,
+                    Some(marker),
+                ));
             }
-            content.push(
-                widget::scrollable(widget::row::with_children(chips).spacing(step::GAP_XS))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        design::scrollbar(),
-                    ))
-                    .width(Length::Fill)
-                    .height(Length::Shrink)
-                    .into(),
-            );
+            let height = crate::ui_controls::view_tab_height(true);
+            content.push(crate::tab_strip::horizontal(
+                widget::Id::new(format!("chat.subagents.{}", target.card)),
+                tabs,
+                height,
+                height + design::BORDER_WIDTH,
+            ));
             if selected.is_some() {
                 content.push(
                     design::caption(
