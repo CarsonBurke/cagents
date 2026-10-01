@@ -873,7 +873,9 @@ impl CachedItem {
             ItemContent::Image { path, .. } => {
                 cached.image = match path {
                     path if Path::new(path).is_absolute() => images::file_handle(path),
-                    path if path.len() <= 24 * 1024 * 1024 && path.starts_with("data:image/") => {
+                    path if path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES
+                        && path.starts_with("data:image/") =>
+                    {
                         path.split_once(";base64,")
                             .and_then(|(_, encoded)| {
                                 base64::engine::general_purpose::STANDARD

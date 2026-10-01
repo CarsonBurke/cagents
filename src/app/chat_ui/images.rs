@@ -1,6 +1,7 @@
 //! Image handles are shared with the transcript's cache. Opening the gallery
 //! does not decode base64, read a file, or copy a pixel buffer.
 use super::*;
+mod canvas;
 
 /// Check the small image header once when an item changes, before the renderer
 /// worker decodes it. A compressed-byte limit alone does not bound pixel memory.
@@ -23,6 +24,9 @@ pub(super) fn file_handle(path: &str) -> Option<iced::widget::image::Handle> {
         .then(|| iced::widget::image::Handle::from_path(path))
 }
 pub(super) fn bytes_handle(bytes: Vec<u8>) -> Option<iced::widget::image::Handle> {
+    if bytes.len() > chat::MAX_INLINE_IMAGE_BYTES {
+        return None;
+    }
     displayable(image::ImageReader::new(std::io::Cursor::new(&bytes)))
         .then(|| iced::widget::image::Handle::from_bytes(bytes))
 }
@@ -134,9 +138,7 @@ impl Gallery {
             .min_scale(0.1)
             .max_scale(20.0)
             .into();
-        let canvas = iced::widget::keyed_column([(self.reset, viewer)])
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let canvas = canvas::resettable(self.reset, viewer);
         dialog_ui::overlay(
             dialog_ui::surface(
                 widget::column::with_children(vec![
