@@ -89,6 +89,11 @@ fn kind_glyph(content: &ItemContent) -> &'static str {
         ItemContent::WebSearch { .. } => "web-browser-symbolic",
         ItemContent::Tool { .. } => "applications-utilities-symbolic",
         ItemContent::Image { .. } => "image-x-generic-symbolic",
+        ItemContent::Delivery {
+            kind: chat::DeliveryKind::Notice,
+            ..
+        } => "notifications-symbolic",
+        ItemContent::Delivery { .. } => "chat-bubble-text-symbolic",
     }
 }
 
@@ -503,7 +508,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
-            ItemContent::Text { .. } => {
+            ItemContent::Text { .. } | ItemContent::Delivery { .. } => {
                 rows.push(prose::view(
                     cached,
                     settings,

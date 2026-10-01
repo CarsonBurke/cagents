@@ -600,6 +600,19 @@ impl ChangeToken {
                 body: path.len(),
                 digest: tail_digest(tail_digest(0, path), description),
             },
+            ItemContent::Delivery {
+                kind,
+                from,
+                sender,
+                summary,
+                body,
+            } => Self {
+                shape: 18 + *kind as u8,
+                body: body.len(),
+                digest: [from, sender, summary, body]
+                    .into_iter()
+                    .fold(0, |digest, field| tail_digest(digest, field)),
+            },
         }
     }
     /// The item's body when the only change since this token was taken is bytes
@@ -695,6 +708,16 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         }
         (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[input, output]),
         (CopyPart::Text, ItemContent::Image { path, description }) => joined(&[description, path]),
+        (
+            CopyPart::Text,
+            ItemContent::Delivery {
+                kind,
+                from,
+                sender,
+                summary,
+                body,
+            },
+        ) => joined(&[&chat::delivery_heading(*kind, from, sender, summary), body]),
         // A command has no separate input block, so its header offers the
         // command line under the same name the tool detail uses for one.
         (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
@@ -732,6 +755,12 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
         ItemContent::Image { path, description } => {
             path.contains(query) || description.contains(query)
         }
+        ItemContent::Delivery {
+            from,
+            summary,
+            body,
+            ..
+        } => from.contains(query) || summary.contains(query) || body.contains(query),
     }
 }
 
@@ -829,6 +858,11 @@ impl CachedItem {
         };
         match content {
             ItemContent::Text { text, .. } => cached.extend(text, 0, theme),
+            // A notice's body is a log line or a raw result, drawn verbatim.
+            ItemContent::Delivery { kind, body, .. } if *kind != chat::DeliveryKind::Notice => {
+                cached.extend(body, 0, theme)
+            }
+            ItemContent::Delivery { .. } => {}
             ItemContent::Command {
                 status,
                 exit_code,

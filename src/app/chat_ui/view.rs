@@ -21,6 +21,17 @@ const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
+/// A delivery longer than this is folded until the reader opens it. A short
+/// message is read in full where it lands; past these it is a report whose
+/// opening says what it is about.
+const DELIVERY_LINES: usize = 10;
+const DELIVERY_BYTES: usize = 1200;
+/// How much of a folded delivery shows: its heading and first paragraph or
+/// so, enough to recognize it without reading it.
+const DELIVERY_FOLDED_HEIGHT: f32 = 132.0;
+/// The lines of a notice's event shown before it is opened.
+const NOTICE_LINES: usize = 3;
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// Iced's hover widget also keeps controls visible while keyboard-focused.
 fn message_actions<'a>(
@@ -2349,8 +2360,15 @@ impl Runtime {
         };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         for index in &turn.prompt {
-            if let Some(item) = items.get(*index) {
-                rows.push(self.prompt_view(item));
+            match placed(*index) {
+                Some((item, cached)) if matches!(item.content, ItemContent::Delivery { .. }) => {
+                    rows.push(self.delivery_view(item, cached, settings));
+                }
+                _ => {
+                    if let Some(item) = items.get(*index) {
+                        rows.push(self.prompt_view(item));
+                    }
+                }
             }
         }
         if !turn.steps.is_empty() {
@@ -2643,6 +2661,161 @@ impl Runtime {
             Alignment::End,
         ))
         .align_x(Alignment::End)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// Something another agent, or the harness for it, delivered.
+    ///
+    /// It opens the work it prompts, as the reader's own message does, but it
+    /// is not theirs: drawn as their bubble, a subagent's report read as
+    /// though the reader had pasted it. So it sits on the agent's side of the
+    /// column, on the surface used for quoted content, under a heading that
+    /// names who sent it. A long report is folded to its opening, because the
+    /// agent receiving it usually answers with the part that matters and a
+    /// report several screens long would bury that answer.
+    ///
+    /// A notice is the harness saying background work changed state, so it
+    /// takes one quiet line instead of a card.
+    fn delivery_view(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+    ) -> Element<'static, Message> {
+        let ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            body,
+        } = &item.content
+        else {
+            return self.prompt_view(item);
+        };
+        let expanded = self.expanded.contains(&item.id);
+        let fold = |label: &'static str| -> Element<'static, Message> {
+            widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
+                .class(crate::ui_controls::control_style(false, None))
+                .on_press(action(Action::Toggle(self.target, item.id.clone())))
+                .into()
+        };
+        let glyph = |name: &str| -> Element<'static, Message> {
+            widget::icon(crate::ui_controls::symbolic_icon(name))
+                .size(14)
+                .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
+                    cosmic::iced::widget::svg::Style {
+                        color: Some(design::muted_icon_color(theme)),
+                    }
+                })))
+                .into()
+        };
+        if *kind == chat::DeliveryKind::Notice {
+            let mut rows = vec![
+                widget::row::with_children(vec![
+                    glyph("notifications-symbolic"),
+                    design::caption(summary.clone()).into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
+            ];
+            if !body.is_empty() {
+                let long = body.lines().count() > NOTICE_LINES;
+                let text = if long && !expanded {
+                    body.lines()
+                        .take(NOTICE_LINES)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    body.clone()
+                };
+                rows.push(
+                    widget::selectable_text(text)
+                        .size(design::TEXT_CAPTION)
+                        .font(iced::Font::MONOSPACE)
+                        .width(Length::Fill)
+                        .into(),
+                );
+                if long {
+                    rows.push(fold("Show more"));
+                }
+            }
+            return widget::container(message_actions(
+                widget::column::with_children(rows)
+                    .spacing(step::GAP_XS)
+                    .into(),
+                self.message_copy(item),
+                Alignment::Start,
+            ))
+            .max_width(design::READABLE_MEASURE)
+            .width(Length::Fill)
+            .into();
+        }
+        let mut heading = vec![glyph("chat-bubble-text-symbolic")];
+        if summary.is_empty() {
+            heading.push(design::caption(kind.verb()).into());
+            heading.push(design::heading(chat::delivery_sender(from, sender)).into());
+        } else {
+            heading.push(design::heading(summary.clone()).into());
+        }
+        // A named sender's ID only tells two of the same name apart.
+        if summary.is_empty() && !from.is_empty() && !sender.is_empty() {
+            heading.push(
+                design::caption(sender.chars().take(8).collect::<String>())
+                    .font(iced::Font::MONOSPACE)
+                    .into(),
+            );
+        }
+        let mut rows = vec![
+            widget::row::with_children(heading)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+        ];
+        if !body.is_empty() {
+            let long = body.lines().count() > DELIVERY_LINES || body.len() > DELIVERY_BYTES;
+            let text = prose::view(cached, settings, self.target, self.find.as_deref());
+            rows.push(if long && !expanded {
+                widget::container(text)
+                    .max_height(DELIVERY_FOLDED_HEIGHT)
+                    .clip(true)
+                    .into()
+            } else {
+                text
+            });
+            if long {
+                rows.push(fold(if *kind == chat::DeliveryKind::Report {
+                    "Show full report"
+                } else {
+                    "Show full message"
+                }));
+            }
+        }
+        let card = widget::container(
+            widget::column::with_children(rows)
+                .spacing(step::GAP_S)
+                .width(Length::Fill),
+        )
+        .class(design::surface(
+            Some(design::sunken),
+            [
+                design::RADIUS_L,
+                design::RADIUS_L,
+                design::RADIUS_L,
+                design::RADIUS_XS,
+            ],
+            true,
+        ))
+        .padding([step::GAP_S as u16, step::GAP_M as u16])
+        .width(Length::Fill)
+        .into();
+        widget::container(message_actions(
+            card,
+            self.message_copy(item),
+            Alignment::Start,
+        ))
+        .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
         .into()
     }

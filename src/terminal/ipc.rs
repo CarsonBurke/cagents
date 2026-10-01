@@ -98,7 +98,8 @@ use crate::{
 /// and terminal-owner scrollback search, clearing, and selection copying.
 /// Snapshots require a matched set.
 /// Version 38 adds a read-only directory of hosted sessions to agent operations.
-pub const PROTOCOL_VERSION: u16 = 38;
+/// Version 39 adds transcript items another agent delivered.
+pub const PROTOCOL_VERSION: u16 = 39;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

@@ -975,6 +975,76 @@ pub enum ItemContent {
         path: String,
         description: String,
     },
+    /// Something another agent, or the harness on its behalf, delivered to
+    /// this conversation: a subagent's report, a teammate's or another
+    /// session's message, or word that background work changed state.
+    ///
+    /// It arrives in the user's slot and the agent acts on it as on a
+    /// prompt, but the user did not write it. Typesetting it as their own
+    /// message, wrapped in the framing the harness adds for the model,
+    /// made the transcript read as though they had.
+    Delivery {
+        kind: DeliveryKind,
+        /// The name the sender goes by: a subagent's type, a teammate's or a
+        /// session's name. Empty when it has none.
+        from: String,
+        /// An opaque identifier telling this sender apart from others of the
+        /// same name, such as a subagent's task ID. Empty when there is none.
+        sender: String,
+        /// The harness's own one-line account of what happened, such as
+        /// `Agent "Review" finished`. Empty when it wrote none, and the
+        /// heading is then formed from `kind` and the sender.
+        summary: String,
+        /// A report's or message's Markdown, or the output a notice quotes,
+        /// with the harness's framing removed.
+        body: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeliveryKind {
+    /// A delegated agent's final report to the conversation that started it.
+    Report,
+    /// A message from a teammate or another session.
+    Message,
+    /// The harness reporting that background work - a command, a monitor or
+    /// an agent - finished or produced an event.
+    Notice,
+}
+
+impl DeliveryKind {
+    /// The words a delivery's heading opens with; a notice's own summary
+    /// stands in their place.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Report => "Report from",
+            Self::Message => "Message from",
+            Self::Notice => "",
+        }
+    }
+}
+
+/// Who sent a delivery, as one phrase: its name, or failing that its
+/// identifier, which is shortened because a task ID is only ever needed to
+/// tell two senders apart at a glance.
+pub fn delivery_sender(from: &str, sender: &str) -> String {
+    let short: String = sender.chars().take(8).collect();
+    match (from.is_empty(), short.is_empty()) {
+        (false, _) => from.into(),
+        (true, false) => format!("agent {short}"),
+        (true, true) => "another agent".into(),
+    }
+}
+
+/// A delivery's heading as plain text: the harness's own summary where it
+/// wrote one, such as `Agent "Review" finished`, and otherwise who sent it,
+/// as in `Report from general-purpose`.
+pub fn delivery_heading(kind: DeliveryKind, from: &str, sender: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        format!("{} {}", kind.verb(), delivery_sender(from, sender))
+    } else {
+        summary.into()
+    }
 }
 
 impl ItemContent {
@@ -1020,6 +1090,17 @@ impl ItemContent {
                 .saturating_add(input.len())
                 .saturating_add(output.len()),
             Self::Image { path, description } => path.len().saturating_add(description.len()),
+            Self::Delivery {
+                from,
+                sender,
+                summary,
+                body,
+                ..
+            } => from
+                .len()
+                .saturating_add(sender.len())
+                .saturating_add(summary.len())
+                .saturating_add(body.len()),
         }
     }
 
@@ -1037,7 +1118,7 @@ impl ItemContent {
             | Self::Changes { .. }
             | Self::WebSearch { .. }
             | Self::Tool { .. } => true,
-            Self::Text { .. } | Self::Image { .. } => false,
+            Self::Text { .. } | Self::Image { .. } | Self::Delivery { .. } => false,
         }
     }
 
@@ -1046,7 +1127,10 @@ impl ItemContent {
             Self::Command { status, .. }
             | Self::Changes { status, .. }
             | Self::Tool { status, .. } => Some(*status),
-            Self::Text { .. } | Self::WebSearch { .. } | Self::Image { .. } => None,
+            Self::Text { .. }
+            | Self::WebSearch { .. }
+            | Self::Image { .. }
+            | Self::Delivery { .. } => None,
         }
     }
 }
