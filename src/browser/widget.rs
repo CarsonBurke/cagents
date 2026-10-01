@@ -236,24 +236,22 @@ impl<'a, Message> BrowserWidget<'a, Message> {
         }
     }
 
-    fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
-        if self.model_focused {
+    fn synchronize_focus(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
+        let focused = self.model_focused && !self.obscured;
+        if focused {
             state.focus_requested = false;
         }
-        if state.focused == self.model_focused {
-            return;
+        if state.focused == focused {
+            return Ok(());
         }
-        match self.handle.set_focused(self.model_focused) {
-            Ok(()) => {
-                state.focused = self.model_focused;
-                if !state.focused {
-                    state.pointer_capture = 0;
-                    state.touch_capture.clear();
-                    state.preedit = None;
-                }
-            }
-            Err(error) => self.publish_error(error, shell),
+        self.handle.set_focused(focused)?;
+        state.focused = focused;
+        if !focused {
+            state.pointer_capture = 0;
+            state.touch_capture.clear();
+            state.preedit = None;
         }
+        Ok(())
     }
 
     fn device_point(&self, bounds: Rectangle, point: Point) -> super::DevicePoint {
@@ -310,7 +308,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
     fn diff(&self, tree: &mut Tree) {
         // Overlay widgets may stop forwarding events to their covered content.
         // Reconcile at tree construction, before that overlay is first drawn.
-        let _ = self.synchronize_presentation(tree.state.downcast_mut::<WidgetState>());
+        let state = tree.state.downcast_mut::<WidgetState>();
+        let _ = self.synchronize_presentation(state);
+        let _ = self.synchronize_focus(state);
     }
 
     fn update(
@@ -358,7 +358,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         if let Err(error) = self.synchronize_presentation(state) {
             self.publish_error(error, shell);
         }
-        self.synchronize_focus(state, shell);
+        if let Err(error) = self.synchronize_focus(state) {
+            self.publish_error(error, shell);
+        }
 
         if self.obscured {
             return;
@@ -653,10 +655,21 @@ mod tests {
             let state = tree.state.downcast_mut::<WidgetState>();
             state.geometry_presented = true;
             state.last_presented = Some(true);
+            state.focused = true;
+            state.pointer_capture = 1;
+            state.touch_capture.insert(7);
+            state.preedit = Some(Preedit::new());
         }
         let covered = BrowserWidget::<()>::new(&handle).obscured(true);
         covered.diff(&mut tree);
-        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(false));
+        let commands = handle.mailbox.drain_coalesced();
+        assert_eq!(commands.presented, Some(false));
+        assert_eq!(commands.focused, Some(false));
+        let state = tree.state.downcast_ref::<WidgetState>();
+        assert!(!state.focused);
+        assert_eq!(state.pointer_capture, 0);
+        assert!(state.touch_capture.is_empty());
+        assert!(state.preedit.is_none());
         covered.diff(&mut tree);
         assert_eq!(handle.mailbox.drain_coalesced().presented, None);
 
