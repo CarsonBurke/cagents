@@ -371,6 +371,15 @@ impl std::fmt::Debug for BrowserHandle {
 }
 
 impl BrowserHandle {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self {
+            mailbox: CommandMailbox::new(),
+            events: EventBus::new(),
+            teardown: None,
+        }
+    }
+
     pub fn import_cookies(&self, request: super::ImportRequest) -> Result<(), BrowserError> {
         self.mailbox.send(Command::Import(request))
     }
@@ -466,7 +475,8 @@ impl BrowserHandle {
     /// Owned exclusively by [`BrowserWidget`](super::BrowserWidget), which
     /// derives it from real geometry. Partial clipping is expressed through
     /// [`place`](Self::place)'s source rectangle instead, so this only goes
-    /// false when the card is entirely off screen.
+    /// false when the card is entirely off screen or an application overlay
+    /// must cover its native child surface.
     pub fn set_presented(&self, presented: bool) -> Result<(), BrowserError> {
         self.mailbox
             .update_coalesced(|state| state.presented = Some(presented))

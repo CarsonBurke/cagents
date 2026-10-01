@@ -30,6 +30,22 @@ mod tests {
         assert!(matches!(app.durable.cards[0].kind, CardKind::Browser(_)));
         assert_eq!(app.workspace.focused(), Some(app.durable.cards[0].id));
     }
+
+    #[test]
+    fn dismissed_import_can_reopen_without_duplicating_a_loading_browser() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        let card = app.durable.cards[0].id;
+        drop(app.update(Message::BrowserImport(Action::Cancel)));
+        assert!(!app.browser_import.open());
+        assert!(!app.modal_is_open());
+        drop(app.update(Message::BrowserImport(Action::Open)));
+        assert!(app.browser_import.open());
+        assert!(app.modal_is_open());
+        assert!(app.browser_import_dialog().is_some());
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.durable.cards[0].id, card);
+    }
 }
 
 pub struct Transfer {
@@ -162,11 +178,9 @@ impl Cagents {
                 self.browser_import.phase = Phase::Intro;
                 self.browser_import.confirm_cancel = false;
                 self.browser_import.errors.clear();
-                if !self
-                    .cards
-                    .values()
-                    .any(|card| matches!(card, CardRuntime::Browser(_)))
-                {
+                if !self.durable.cards.iter().any(|card| {
+                    card.existence.is_open() && matches!(card.kind, CardKind::Browser(_))
+                }) {
                     // Create the card in this authorized update. Queuing a
                     // public OpenBrowser message after mounting the intro
                     // would be rejected by the modal input fence.

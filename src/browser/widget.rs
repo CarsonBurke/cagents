@@ -32,6 +32,7 @@ struct WidgetState {
     last_geometry: Option<(PhysicalViewport, SurfacePlacement)>,
     last_scale_factor: Option<f32>,
     last_presented: Option<bool>,
+    geometry_presented: bool,
     preedit: Option<Preedit>,
 }
 
@@ -119,6 +120,7 @@ pub struct BrowserWidget<'a, Message> {
     scale_factor: f32,
     ui_scale: f32,
     model_focused: bool,
+    obscured: bool,
     virtual_offset: f32,
     on_focus: Option<Message>,
     on_shortcut: Option<Box<dyn Fn(keyboard::Event) -> Option<Message> + 'a>>,
@@ -145,6 +147,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
             ui_scale: 1.0,
             virtual_offset: 0.0,
             model_focused: false,
+            obscured: false,
             on_focus: None,
             on_shortcut: None,
             on_error: None,
@@ -189,6 +192,23 @@ impl<'a, Message> BrowserWidget<'a, Message> {
     pub fn model_focused(mut self, focused: bool) -> Self {
         self.model_focused = focused;
         self
+    }
+
+    /// Native child surfaces stack above the application's rendered overlays.
+    /// Hide their pixels while an overlay owns the workspace, retaining the
+    /// browser's layout and residency so dismissal restores the same page.
+    pub fn obscured(mut self, obscured: bool) -> Self {
+        self.obscured = obscured;
+        self
+    }
+
+    fn synchronize_presentation(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
+        let presented = state.geometry_presented && !self.obscured;
+        if state.last_presented != Some(presented) {
+            self.handle.set_presented(presented)?;
+            state.last_presented = Some(presented);
+        }
+        Ok(())
     }
 
     pub fn on_focus(mut self, message: Message) -> Self {
@@ -287,6 +307,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         tree::State::new(WidgetState::default())
     }
 
+    fn diff(&self, tree: &mut Tree) {
+        // Overlay widgets may stop forwarding events to their covered content.
+        // Reconcile at tree construction, before that overlay is first drawn.
+        let _ = self.synchronize_presentation(tree.state.downcast_mut::<WidgetState>());
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -328,15 +354,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
         // visibility; the application owns the other half through
         // `set_visible`. Partial clipping never lands here - it is carried by
         // the placement's source rectangle instead.
-        if state.last_presented != Some(native.presented) {
-            state.last_presented = Some(native.presented);
-            if let Err(error) = self.handle.set_presented(native.presented)
-                && let Some(mapper) = &self.on_error
-            {
-                shell.publish(mapper(error));
-            }
+        state.geometry_presented = native.presented;
+        if let Err(error) = self.synchronize_presentation(state) {
+            self.publish_error(error, shell);
         }
         self.synchronize_focus(state, shell);
+
+        if self.obscured {
+            return;
+        }
 
         match event {
             Event::Mouse(cosmic::iced::mouse::Event::CursorMoved { position }) => {
@@ -617,6 +643,37 @@ impl<'a, Message: Clone + 'a> From<BrowserWidget<'a, Message>> for Element<'a, M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covering_overlay_hides_native_pixels_without_waiting_for_input() {
+        let handle = BrowserHandle::fixture();
+        let widget = BrowserWidget::<()>::new(&handle);
+        let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
+        {
+            let state = tree.state.downcast_mut::<WidgetState>();
+            state.geometry_presented = true;
+            state.last_presented = Some(true);
+        }
+        let covered = BrowserWidget::<()>::new(&handle).obscured(true);
+        covered.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(false));
+        covered.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, None);
+
+        widget.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(true));
+    }
+
+    #[test]
+    fn dismissing_an_overlay_does_not_reveal_a_clipped_browser() {
+        let handle = BrowserHandle::fixture();
+        let widget = BrowserWidget::<()>::new(&handle).obscured(true);
+        let mut tree = Tree::new(&widget as &dyn Widget<(), Theme, Renderer>);
+        widget.diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, Some(false));
+        BrowserWidget::<()>::new(&handle).diff(&mut tree);
+        assert_eq!(handle.mailbox.drain_coalesced().presented, None);
+    }
 
     #[test]
     fn native_placement_tracks_the_horizontal_camera_offset() {
