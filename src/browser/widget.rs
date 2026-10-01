@@ -731,6 +731,22 @@ mod tests {
             );
             assert!(handle.mailbox.drain_coalesced().wheel.is_none());
         }
+        let mut covered = BrowserWidget::<()>::new(&handle)
+            .model_focused(true)
+            .obscured(true);
+        covered.update(
+            &mut tree,
+            &wheel,
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(60.0, 80.0)),
+            &renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &clip,
+        );
+        let commands = handle.mailbox.drain_coalesced();
+        assert_eq!(commands.presented, Some(false));
+        assert!(commands.wheel.is_none());
     }
 
     #[test]
