@@ -1195,6 +1195,11 @@ impl Registry {
 
     /// Advance only the exact observed revision. Duplicate provider outcomes
     /// and an older turn's delayed completion cannot overwrite a newer result.
+    ///
+    /// Every accepted update is a run-state transition (streamed output never
+    /// reaches the registry), so each one advances the model sequence in the
+    /// same transaction: the `AgentsChanged` edge announcing it is then a real
+    /// edge that watchers order against, not a repeat of an older sequence.
     pub(crate) fn update_agent_run(
         &mut self,
         id: RunId,
@@ -1254,6 +1259,11 @@ impl Registry {
                 run.revision,
                 encode(&run)?
             ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+            [],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1416,6 +1426,41 @@ mod tests {
         let blockers = registry.agent_update_blockers().unwrap();
         assert_eq!(blockers.len(), 1);
         assert!(blockers[0].contains(&unbound.agent.id.to_string()));
+    }
+
+    #[test]
+    fn every_recorded_run_transition_advances_the_model_sequence() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let mut sequence = registry.execution_sequence().unwrap();
+        let mut revision = accepted.run.revision;
+        for update in [
+            Update::Started {
+                provider_key: "provider".into(),
+            },
+            Update::Waiting,
+            Update::Resumed,
+            Update::Finished {
+                state: State::Succeeded,
+                result: Default::default(),
+            },
+        ] {
+            revision = registry
+                .update_agent_run(accepted.run.id, revision, update, 2)
+                .unwrap()
+                .revision;
+            let next = registry.execution_sequence().unwrap();
+            assert_eq!(next, sequence + 1, "each transition is one model edge");
+            sequence = next;
+        }
+        // A rejected (stale or settled) update records nothing and so must not
+        // produce an edge that watchers would mistake for a transition.
+        assert!(
+            registry
+                .update_agent_run(accepted.run.id, revision, Update::Waiting, 3)
+                .is_err()
+        );
+        assert_eq!(registry.execution_sequence().unwrap(), sequence);
     }
 
     #[test]

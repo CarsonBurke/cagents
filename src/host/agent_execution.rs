@@ -163,19 +163,21 @@ fn dispatch_accepted_with_directory(
     {
         return Ok(());
     }
-    let host = Arc::clone(host);
+    let worker = Arc::clone(host);
     let run = accepted.run.id;
     std::thread::Builder::new()
         .name("agent-dispatch".into())
         .spawn(move || {
-            if let Err((state, diagnostic)) = dispatch(&host, &accepted, directory) {
-                finish_failure(&host, run, state, diagnostic);
+            if let Err((state, diagnostic)) = dispatch(&worker, &accepted, directory) {
+                finish_failure(&worker, run, state, diagnostic);
             }
         })
         .map_err(|error| {
             // No worker exists, so no provider could have received this run.
             let message = format!("Cannot create the agent dispatch worker: {error}");
-            finish_failure_registry(&registry, run, State::Failed, message.clone());
+            if finish_failure_registry(&registry, run, State::Failed, message.clone()) {
+                announce(host, &registry);
+            }
             message
         })?;
     Ok(())
@@ -511,61 +513,76 @@ pub(super) fn observed(
         record.session.clone()
     };
     let Ok(registry) = registry(host) else { return };
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    let result = (|| {
-        let current = registry.agent_run(run)?;
-        let agent = registry.agent(current.agent)?;
-        if agent.closed
-            || !matches!(&agent.session, Some(HostedSession::Chat(expected))
-                if expected.id == source.id && expected.proof == source.proof
-                    && expected.launch.recipe == source.launch.recipe)
-            || current.state.is_terminal()
-        {
-            return Ok(());
+    // The store guard ends with this block: `announce` takes the registry lock
+    // and then the host lock, so it must never run while either is held.
+    let recorded = {
+        let mut store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (|| {
+            let current = store.agent_run(run)?;
+            let agent = store.agent(current.agent)?;
+            if agent.closed
+                || !matches!(&agent.session, Some(HostedSession::Chat(expected))
+                    if expected.id == source.id && expected.proof == source.proof
+                        && expected.launch.recipe == source.launch.recipe)
+                || current.state.is_terminal()
+            {
+                return Ok(false);
+            }
+            store.update_agent_run(run, current.revision, update, now())?;
+            Ok::<_, String>(true)
+        })()
+    };
+    match recorded {
+        Ok(true) => announce(host, &registry),
+        Ok(false) => super::automations::wake(host),
+        Err(error) => {
+            tracing::error!(%error, %run, "cannot record provider execution outcome");
+            super::automations::wake(host);
         }
-        registry.update_agent_run(run, current.revision, update, now())?;
-        Ok::<_, String>(())
-    })();
-    if let Err(error) = result {
-        tracing::error!(%error, %run, "cannot record provider execution outcome");
     }
-    drop(registry);
-    super::automations::wake(host);
 }
 
 fn finish_failure(host: &SharedHost, run: RunId, state: State, diagnostic: String) {
-    if let Ok(registry) = registry(host) {
-        finish_failure_registry(&registry, run, state, diagnostic);
+    match registry(host) {
+        Ok(registry) if finish_failure_registry(&registry, run, state, diagnostic) => {
+            announce(host, &registry);
+        }
+        _ => super::automations::wake(host),
     }
-    super::automations::wake(host);
 }
+
+/// Returns whether this call recorded the failure, so the caller announces
+/// only a real transition rather than a run that had already settled.
 fn finish_failure_registry(
     registry: &SharedRegistry,
     run: RunId,
     state: State,
     diagnostic: String,
-) {
+) -> bool {
     let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let result = registry.agent_run(run).and_then(|current| {
         if current.state.is_terminal() {
-            return Ok(current);
+            return Ok(false);
         }
-        registry.update_agent_run(
-            run,
-            current.revision,
-            Update::Finished {
-                state,
-                result: crate::agent_execution::ResultSummary {
-                    diagnostic: Some(diagnostic),
-                    ..Default::default()
+        registry
+            .update_agent_run(
+                run,
+                current.revision,
+                Update::Finished {
+                    state,
+                    result: crate::agent_execution::ResultSummary {
+                        diagnostic: Some(diagnostic),
+                        ..Default::default()
+                    },
                 },
-            },
-            now(),
-        )
+                now(),
+            )
+            .map(|_| true)
     });
-    if let Err(error) = result {
+    result.unwrap_or_else(|error| {
         tracing::error!(%error, %run, "cannot persist failed agent dispatch");
-    }
+        false
+    })
 }
 
 pub(super) fn status(
