@@ -1139,8 +1139,8 @@ mod tests {
         let update = position(&open, "application-update").expect("update is shown");
         let toggle = position(&open, "command.toggle-context-inspector").expect("sidebar toggle");
         assert!(
-            alerts < update && update < toggle,
-            "update belongs on the right of the alerts and left of the sidebar toggle: {open:?}"
+            toggle < alerts && alerts < update,
+            "the inspector toggle leads its header, with update right of alerts: {open:?}"
         );
 
         app.context_inspector_open = false;

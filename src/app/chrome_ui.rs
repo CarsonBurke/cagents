@@ -1743,19 +1743,19 @@ impl Cagents {
         .spacing(2)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.
-        // Alerts, then the update icon on their right, then the sidebar toggle.
+        // Alerts and updates remain beside the window controls; the toggle
+        // belongs at the leading edge of the inspector it controls.
         // This header is the one mounted while the panel owns those controls,
         // including a docked inspector: the workspace header must not also
         // show the update or the icon stays on the far side of the window.
         let end = widget::row::with_children(vec![
             widget::row::with_children(self.notice_control()).into(),
             widget::row::with_children(self.update_control()).into(),
-            self.sidebar_toggle(),
         ])
         .spacing(2)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(iced::widget::Space::new().into(), Some(end), true);
+        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
         let tabs = widget::container(tabs)
             .padding([0, 8])
             .center_y(design::HEADER_CONTENT_HEIGHT)

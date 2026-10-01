@@ -3677,17 +3677,13 @@ fn view_inner<'a>(
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(header(
-                model,
-                state,
-                compact,
-                header_loading,
-                modal_open,
-                shortcuts,
-            ))
-            .padding([0, spacing.space_xxxs]),
+            widget::container(utilities(compact, modal_open, shortcuts))
+                .padding([0, spacing.space_xxxs]),
         )
-        .push(crate::design::horizontal_rule());
+        .push(
+            widget::container(header(model, state, compact, header_loading, modal_open))
+                .padding([0, spacing.space_xxxs]),
+        );
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
@@ -3715,12 +3711,7 @@ fn view_inner<'a>(
         .width(Length::Fill)
         .height(Length::Fill),
     );
-    content = content
-        .push(crate::design::horizontal_rule())
-        .push(footer(compact, modal_open))
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill);
+    content = content.spacing(0).width(Length::Fill).height(Length::Fill);
 
     widget::container(crate::interaction::layer(
         widget::container(content)
@@ -3756,21 +3747,8 @@ fn header<'a>(
     compact: bool,
     loading: bool,
     modal_open: bool,
-    shortcuts: &crate::settings::KeyboardShortcuts,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let toggle = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
-        crate::workspace_widget::shortcut_tooltip(
-            crate::workspace_widget::GlobalShortcut::ToggleProjects,
-            shortcuts,
-        ),
-        false,
-        !modal_open,
-        gated(SidebarAction::ToggleProjects, modal_open),
-    )
-    .id(Id::new("command.toggle-projects"))
-    .into();
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
     if !model.projects.is_empty() {
         let attention = state.filter == SidebarFilter::Attention;
@@ -3835,7 +3813,6 @@ fn header<'a>(
         stable_id("open-repository"),
     ));
     if compact {
-        actions.insert(0, toggle);
         return window_gestures(
             widget::column::with_children(actions)
                 .align_x(Alignment::Center)
@@ -3847,7 +3824,6 @@ fn header<'a>(
 
     let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(7);
     children.push(design::heading("Projects").into());
-    children.push(toggle);
     children.push(
         cosmic::iced::widget::Space::new()
             .width(Length::Fill)
@@ -3940,8 +3916,52 @@ fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, Sideba
     .into()
 }
 
-fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
+fn utilities<'a>(
+    compact: bool,
+    modal_open: bool,
+    shortcuts: &crate::settings::KeyboardShortcuts,
+) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
+    let toggle = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("view-sidebar-start-symbolic"),
+        crate::workspace_widget::shortcut_tooltip(
+            crate::workspace_widget::GlobalShortcut::ToggleProjects,
+            shortcuts,
+        ),
+        false,
+        !modal_open,
+        gated(SidebarAction::ToggleProjects, modal_open),
+    )
+    .id(Id::new("command.toggle-projects"))
+    .into();
+    let [settings, automations] = utility_controls(modal_open);
+    if compact {
+        let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations];
+        return widget::column::with_children(children)
+            .align_x(Alignment::Center)
+            .spacing(spacing.space_xxxs)
+            .padding(spacing.space_xxxs)
+            .width(Length::Fill)
+            .into();
+    }
+    window_gestures(
+        widget::row::with_children(vec![
+            settings,
+            automations,
+            cosmic::iced::widget::Space::new()
+                .width(Length::Fill)
+                .into(),
+            toggle,
+        ])
+        .align_y(Alignment::Center)
+        .spacing(design::GRID_UNIT / 2.0)
+        .padding([0.0, design::GRID_UNIT])
+        .height(Length::Fixed(HEADER_HEIGHT))
+        .width(Length::Fill),
+    )
+}
+
+fn utility_controls<'a>(modal_open: bool) -> [Element<'a, SidebarAction>; 2] {
     let settings: Element<'a, SidebarAction> = crate::ui_controls::icon_control(
         crate::ui_controls::symbolic_icon("emblem-system-symbolic"),
         "Settings",
@@ -3960,20 +3980,27 @@ fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
     )
     .id(stable_id("automations"))
     .into();
+    [settings, automations]
+}
+
+// The standalone editor still mounts its utility controls below its file pane.
+fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
+    let [settings, automations] = utility_controls(modal_open);
+    let spacing = cosmic::theme::spacing();
     if compact {
-        let children: Vec<Element<'a, SidebarAction>> = vec![automations, settings];
-        return widget::column::with_children(children)
+        widget::column::with_children(vec![automations, settings])
             .align_x(Alignment::Center)
             .spacing(spacing.space_xxxs)
             .padding(spacing.space_xxxs)
             .width(Length::Fill)
-            .into();
+            .into()
+    } else {
+        widget::row::with_children(vec![automations, settings])
+            .align_y(Alignment::Center)
+            .padding(spacing.space_xxxs)
+            .width(Length::Fill)
+            .into()
     }
-    widget::row::with_children(vec![automations, settings])
-        .align_y(Alignment::Center)
-        .padding(spacing.space_xxxs)
-        .width(Length::Fill)
-        .into()
 }
 
 /// The project filter input.
@@ -10370,22 +10397,12 @@ mod row_interaction {
                 }
                 return;
             }
-            // Multi-selection is marked by a short accent bar at the leading
-            // edge over a light neutral fill: distinct from the active row,
-            // whose button paints the neutral fill alone, without outlining
-            // the whole row in accent (#448). The fill uses the button's own
-            // flat bounds, so a row that is both shares one shape.
+            // Multi-selection shares the neutral row fill without a leading accent.
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
                 let bounds = state.selection_bounds.unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
-                    let edge = Rectangle {
-                        x: bounds.x + 1.0,
-                        y: bounds.y + bounds.height * 0.25,
-                        width: 2.0,
-                        height: bounds.height * 0.5,
-                    };
                     renderer.with_layer(clip, |renderer| {
                         renderer.fill_quad(
                             renderer::Quad {
@@ -10398,17 +10415,6 @@ mod row_interaction {
                             },
                             cosmic::iced::Color::from(theme.current_container().on)
                                 .scale_alpha(0.08),
-                        );
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: edge,
-                                border: cosmic::iced::Border {
-                                    radius: 1.0.into(),
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            },
-                            super::design::accent_color(theme),
                         );
                     });
                 }
@@ -12705,7 +12711,7 @@ pub(crate) mod tests {
         // A header control above the scrolled list, inside the band a menu
         // anchored in window space leaves behind if it stops covering the
         // whole window.
-        let beside = Point::new(210.0, 20.0);
+        let beside = Point::new(24.0, 20.0);
         for scroll in [0.0, MENU_SCROLL] {
             let mut sidebar = Sidebar::scrolling();
             sidebar.scroll(scroll, MENU_ROW);
@@ -13446,54 +13452,25 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SearchChanged("main".into()));
         for compact in [false, true] {
-            let actions = frame_enter_presses(
-                &renderer,
-                header(
-                    &model,
-                    &state,
-                    compact,
-                    false,
-                    false,
-                    &crate::settings::KeyboardShortcuts::default(),
-                ),
-            );
+            let actions =
+                frame_enter_presses(&renderer, header(&model, &state, compact, false, false));
             assert_eq!(
                 actions,
                 vec![
-                    SidebarAction::ToggleProjects,
                     SidebarAction::SetFilter(SidebarFilter::Attention),
                     SidebarAction::ToggleControls,
                     SidebarAction::OpenRepositoryPicker,
                 ]
             );
-            state.apply(&actions[1]);
-            let actions = frame_enter_presses(
-                &renderer,
-                header(
-                    &model,
-                    &state,
-                    compact,
-                    false,
-                    false,
-                    &crate::settings::KeyboardShortcuts::default(),
-                ),
-            );
-            assert_eq!(actions[1], SidebarAction::SetFilter(SidebarFilter::All));
-            state.apply(&actions[1]);
+            state.apply(&actions[0]);
+            let actions =
+                frame_enter_presses(&renderer, header(&model, &state, compact, false, false));
+            assert_eq!(actions[0], SidebarAction::SetFilter(SidebarFilter::All));
+            state.apply(&actions[0]);
             assert_eq!(state.query(), "main", "attention does not overwrite search");
             assert!(
-                frame_enter_presses(
-                    &renderer,
-                    header(
-                        &model,
-                        &state,
-                        compact,
-                        false,
-                        true,
-                        &crate::settings::KeyboardShortcuts::default()
-                    )
-                )
-                .is_empty()
+                frame_enter_presses(&renderer, header(&model, &state, compact, false, true))
+                    .is_empty()
             );
         }
     }
@@ -13506,7 +13483,7 @@ pub(crate) mod tests {
         let mut shortcuts = crate::settings::KeyboardShortcuts::default();
         shortcuts.toggle_projects = vec!["Alt+B".into()];
         for loading in [false, true] {
-            let mut element = header(&model, &state, false, loading, false, &shortcuts);
+            let mut element = header(&model, &state, false, loading, false);
             let mut tree = Tree::new(&element);
             // The sidebar adds another four pixels of padding on each side.
             let width = EXPANDED_WIDTH_MIN - 8.0;
@@ -13520,7 +13497,7 @@ pub(crate) mod tests {
                 assert!(child.bounds().x + child.bounds().width <= width);
             }
             assert!(
-                accessible_names(&renderer, element)
+                accessible_names(&renderer, utilities(false, false, &shortcuts))
                     .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
             );
         }
@@ -13862,14 +13839,7 @@ pub(crate) mod tests {
         // moving the window.
         for compact in [false, true] {
             for modal_open in [false, true] {
-                let mut element = header(
-                    &model,
-                    &state,
-                    compact,
-                    false,
-                    modal_open,
-                    &crate::settings::KeyboardShortcuts::default(),
-                );
+                let mut element = header(&model, &state, compact, false, modal_open);
                 let mut tree = Tree::new(&element);
                 let viewport = Rectangle::with_size(Size::new(260.0, 44.0));
                 let node = element.as_widget_mut().layout(
@@ -15257,7 +15227,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn project_worktree_and_tab_headers_share_the_same_separator_baseline() {
+    fn worktree_and_tab_headers_share_the_same_separator_baseline() {
         use cosmic::iced::Point;
         let renderer = headless_renderer();
         let model = panel_model();
@@ -15274,7 +15244,6 @@ pub(crate) mod tests {
         ])
         .into();
         let surfaces = [
-            view(&model, &state, SidebarMode::Expanded, width, false),
             file_panel(&model, &state, width, false),
             git_panel(&model, &state, width, false),
             tabs,
