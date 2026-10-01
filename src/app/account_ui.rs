@@ -4146,7 +4146,7 @@ fn usage_window_row<'a>(window: &'a UsageWindow, now: Millis, stale: bool) -> El
         ])
         .align_y(Alignment::Center)
         .into(),
-        crate::ui_controls::budget_bar(window.used, tone),
+        crate::ui_controls::budget_bar(window.left(), tone),
     ];
     if let Some(line) = reset_line(window, now) {
         rows.push(design::caption(line).into());

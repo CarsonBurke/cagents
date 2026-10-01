@@ -941,7 +941,7 @@ fn usage_cell<'a>(window: Option<&UsageWindow>, now: Millis, stale: bool) -> Ele
         widget::row::with_children(figures)
             .spacing(design::GRID_UNIT)
             .into(),
-        crate::ui_controls::budget_bar(window.used, tone),
+        crate::ui_controls::budget_bar(window.left(), tone),
     ])
     .spacing(design::GRID_UNIT)
     .width(Length::Fill)
