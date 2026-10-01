@@ -154,6 +154,7 @@ struct Anchor {
     active: Option<usize>,
     clock: u64,
     reported: Option<Report>,
+    pending_input: bool,
 }
 
 impl Anchor {
@@ -225,6 +226,9 @@ impl Anchor {
         context.used = self.clock;
         context.remember(next, rows, top);
         self.active = Some(index);
+        if switched {
+            self.pending_input = false;
+        }
         (switched || freeze_reading || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
             .then_some(bottom)
     }
@@ -343,9 +347,30 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        let mut before = ReadTop::default();
+        if self.target.is_some() {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut before,
+            );
+        }
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
+        if self.target.is_some() {
+            let mut after = ReadTop::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut after,
+            );
+            if before.0 != after.0 {
+                tree.state.downcast_mut::<Anchor>().pending_input = true;
+            }
+        }
     }
 
     fn update(
@@ -359,6 +384,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let mut before = ReadTop::default();
+        if self.target.is_some() {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut before,
+            );
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -369,6 +403,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             shell,
             viewport,
         );
+        if self.target.is_none() {
+            return;
+        }
         let mut top = ReadTop::default();
         self.content
             .as_widget_mut()
@@ -391,10 +428,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             });
             // A fresh gesture at a pinned edge is also a retry signal. A
             // failed request must not require moving away and back again.
-            let wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+            let wheel = matches!(event, Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. }
+            }) if *y != 0.0)
                 && cursor.is_over(layout.bounds())
                 && cursor.is_over(*viewport);
-            if changed || wheel {
+            let user_input = wheel || before.0 != Some(top) || anchor.pending_input;
+            if changed || user_input {
+                anchor.pending_input = false;
                 anchor.reported = Some(Report {
                     subagent: self.subagent.map(str::to_owned),
                     top,
@@ -405,6 +446,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         target,
                         self.subagent.map(str::to_owned),
                         Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                        user_input,
                     )));
                 }
             }
@@ -546,6 +588,7 @@ mod tests {
             transcript(
                 widget::scrollable(widget::column::with_children(children).width(Length::Fill))
                     .anchor_bottom()
+                    .id(Id::new("anchor-native-test"))
                     .height(Length::Fill)
                     .width(Length::Fill),
                 target,
@@ -573,7 +616,7 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(actual, None, scroll))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(actual, None, scroll, false))]
             if *actual == target && *scroll == Scroll::new(0.0, 100.0, 400.0))
         );
 
@@ -607,7 +650,7 @@ mod tests {
         assert!(
             matches!(
                 messages.as_slice(),
-                [Message::ChatUi(Action::Scrolled(_, None, _))]
+                [Message::ChatUi(Action::Scrolled(_, None, _, true))]
             ),
             "a wheel gesture at a pinned edge must permit retry"
         );
@@ -623,6 +666,17 @@ mod tests {
             &renderer,
             &mut SetBottom(1000.0),
         );
+        initial.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        messages.clear();
         let mut updated = element(vec![
             ("older", 300.0),
             ("a", 500.0),
@@ -650,9 +704,70 @@ mod tests {
             &bounds,
         );
         assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll))]
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, false))]
             if *scroll == Scroll::new(900.0, 2500.0, 400.0))
         );
+
+        // Equal-height replacement changes the offset through layout, not
+        // through a gesture. Treating it as input bounces older pages to live.
+        let mut replaced = element(vec![("d", 500.0), ("e", 500.0), ("f", 1500.0)]);
+        tree.diff(replaced.as_widget_mut());
+        let node = replaced
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        messages.clear();
+        replaced.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, false))]
+            if *scroll == Scroll::new(2100.0, 2500.0, 400.0))
+        );
+        let mut home = operation::scrollable::snap_to::<()>(
+            Id::new("anchor-native-test"),
+            iced::widget::scrollable::RelativeOffset {
+                x: None,
+                y: Some(1.0),
+            },
+        );
+        replaced
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut home);
+        messages.clear();
+        replaced.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Scrolled(_, None, scroll, true))]
+            if *scroll == Scroll::new(0.0, 2500.0, 400.0)),
+            "Home's external operation is input"
+        );
+        messages.clear();
+        replaced.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(messages.is_empty(), "input signal must be consumed once");
     }
 
     #[test]
