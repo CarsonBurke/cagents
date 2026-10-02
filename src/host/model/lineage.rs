@@ -574,7 +574,7 @@ mod tests {
                 .db
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            4
+            super::super::SCHEMA_VERSION
         );
     }
 }

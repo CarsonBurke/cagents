@@ -18,6 +18,7 @@ use std::{
 };
 
 mod directory;
+pub(super) mod mailbox;
 mod ownership;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
@@ -832,6 +833,10 @@ pub(super) fn process(
         Operation::Control { agent, command } => {
             control(host, &authority, agent, command).map(Reply::Requests)
         }
+        Operation::SendMessage(outgoing) => {
+            mailbox::send(host, &authority, outgoing).map(Reply::Sent)
+        }
+        Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
     }
 }
 

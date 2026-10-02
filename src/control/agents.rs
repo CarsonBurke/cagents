@@ -158,27 +158,43 @@ fn parse_provider(value: &str) -> Result<Provider, String> {
 
 impl PromptArgs {
     fn read(self) -> Result<String, AppError> {
-        let read_input = || {
-            let mut prompt = String::new();
-            io::stdin()
-                .take(crate::agent_execution::MAX_PROMPT_BYTES as u64 + 1)
-                .read_to_string(&mut prompt)
-                .map(|_| prompt)
-                .map_err(|e| AppError::new("prompt", e))
-        };
-        match (self.text, self.prompt_file, self.flag) {
-            (Some(text), ..) if text == "-" => read_input(),
-            (Some(text), ..) | (_, _, Some(text)) => Ok(text),
-            (_, Some(file), _) => std::fs::read_to_string(&file)
-                .map_err(|e| AppError::new("prompt", format!("{}: {e}", file.display()))),
-            // Standard input is read only when asked for: a caller whose input
-            // is a pipe that never closes would otherwise wait forever on a
-            // forgotten prompt.
-            (None, None, None) => Err(AppError::new(
-                "prompt",
-                "Give a prompt, --prompt-file FILE, or - to read standard input",
-            )),
+        if let Some(text) = self.flag {
+            return Ok(text);
         }
+        read_text(
+            self.text,
+            self.prompt_file,
+            "prompt",
+            "Give a prompt, --prompt-file FILE, or - to read standard input",
+            crate::agent_execution::MAX_PROMPT_BYTES,
+        )
+    }
+}
+
+/// Text given as an argument, in a file, or, for a lone `-`, on standard input.
+pub(super) fn read_text(
+    text: Option<String>,
+    file: Option<PathBuf>,
+    code: &'static str,
+    missing: &'static str,
+    limit: usize,
+) -> Result<String, AppError> {
+    match (text, file) {
+        (Some(text), _) if text == "-" => {
+            let mut input = String::new();
+            io::stdin()
+                .take(limit as u64 + 1)
+                .read_to_string(&mut input)
+                .map(|_| input)
+                .map_err(|e| AppError::new(code, e))
+        }
+        (Some(text), _) => Ok(text),
+        (None, Some(file)) => std::fs::read_to_string(&file)
+            .map_err(|e| AppError::new(code, format!("{}: {e}", file.display()))),
+        // Standard input is read only when asked for: a caller whose input
+        // is a pipe that never closes would otherwise wait forever on
+        // forgotten text.
+        (None, None) => Err(AppError::new(code, missing)),
     }
 }
 
@@ -261,17 +277,44 @@ impl ControlClient {
     }
 }
 
+/// What a wait for runs saw before it returned.
+#[derive(Debug, PartialEq)]
+struct Waited {
+    /// Each run's last known status.
+    replies: Vec<Reply>,
+    /// The deadline came first.
+    timed_out: bool,
+    /// Messages for the caller that ended the wait early.
+    messages: Vec<crate::agent_execution::mailbox::Message>,
+}
+
+impl Waited {
+    /// Why the wait returned, for a caller reading JSON: `runs`, `messages`
+    /// or `timeout`. Only `runs` means the runs are ready.
+    fn ended_by(&self) -> &'static str {
+        if !self.messages.is_empty() {
+            "messages"
+        } else if self.timed_out {
+            "timeout"
+        } else {
+            "runs"
+        }
+    }
+}
+
 impl ControlClient {
     /// Polls `runs` until all of them, or with `any` the first, settle or ask
-    /// for input, or `timeout` passes. Returns each run's last known status
-    /// and whether the deadline came first.
+    /// for input, or `timeout` passes. With `messages`, a message left for the
+    /// caller also ends the wait, and is read: a session waiting here is busy,
+    /// so no message would otherwise reach it until its runs finish.
     fn wait_agents(
         &mut self,
         authority: Authority,
         runs: &[RunId],
         any: bool,
+        mut messages: bool,
         timeout: Duration,
-    ) -> Result<(Vec<Reply>, bool), ControlError> {
+    ) -> Result<Waited, ControlError> {
         let deadline = Instant::now() + timeout;
         let mut replies = Vec::with_capacity(runs.len());
         for run in runs {
@@ -283,6 +326,13 @@ impl ControlClient {
         }
         let ready =
             |reply: &Reply| matches!(reply, Reply::Status { run, .. } if run.state.wait_ready());
+        let waited = |replies, timed_out, messages| {
+            Ok(Waited {
+                replies,
+                timed_out,
+                messages,
+            })
+        };
         loop {
             let done = if any {
                 replies.iter().any(ready)
@@ -290,15 +340,35 @@ impl ControlClient {
                 replies.iter().all(ready)
             };
             if done {
-                return Ok((replies, false));
+                return waited(replies, false, Vec::new());
+            }
+            if messages {
+                let inbox = Operation::Inbox(crate::agent_execution::mailbox::Inbox {
+                    all: false,
+                    replies_to: None,
+                });
+                match self.agent_before(authority.clone(), inbox, Some(deadline)) {
+                    Ok(Reply::Inbox(new)) if !new.is_empty() => {
+                        return waited(replies, false, new);
+                    }
+                    Ok(_) => {}
+                    Err(error) if is_timeout_error(&error) => {
+                        return waited(replies, true, Vec::new());
+                    }
+                    // Messages are a courtesy here; the runs are the wait.
+                    Err(error) => {
+                        tracing::debug!(%error, "cannot read messages while waiting");
+                        messages = false;
+                    }
+                }
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Ok((replies, true));
+                return waited(replies, true, Vec::new());
             }
             thread::sleep(Duration::from_millis(200).min(remaining));
             if Instant::now() >= deadline {
-                return Ok((replies, true));
+                return waited(replies, true, Vec::new());
             }
             // A waiting run may be answered and resume, so only a finished
             // one is known for good.
@@ -308,7 +378,9 @@ impl ControlClient {
                 }
                 match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
                     Ok(current) => *reply = current,
-                    Err(error) if is_timeout_error(&error) => return Ok((replies, true)),
+                    Err(error) if is_timeout_error(&error) => {
+                        return waited(replies, true, Vec::new());
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -411,15 +483,19 @@ impl Session {
             .map_err(protocol_error)
     }
 
-    fn wait(
-        &mut self,
-        runs: &[RunId],
-        any: bool,
-        timeout: f64,
-    ) -> Result<(Vec<Reply>, bool), AppError> {
+    /// Waits for `runs`; an agent's wait also ends when a message arrives
+    /// for it. The user's shell has `cagents inbox` and is never busy.
+    fn wait(&mut self, runs: &[RunId], any: bool, timeout: f64) -> Result<Waited, AppError> {
         let authority = self.authority.clone();
+        let messages = authority.token().is_some();
         self.client()?
-            .wait_agents(authority, runs, any, Duration::from_secs_f64(timeout))
+            .wait_agents(
+                authority,
+                runs,
+                any,
+                messages,
+                Duration::from_secs_f64(timeout),
+            )
             .map_err(protocol_error)
     }
 
@@ -696,28 +772,44 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 .iter()
                 .map(|handle| session.run(handle))
                 .collect::<Result<Vec<_>, _>>()?;
-            let (replies, timed_out) = session.wait(&runs, any, timeout)?;
+            let waited = session.wait(&runs, any, timeout)?;
+            let ended_by = waited.ended_by();
+            let Waited {
+                replies,
+                timed_out,
+                messages,
+            } = waited;
             let statuses = replies
                 .into_iter()
                 .map(status_reply)
                 .collect::<Result<Vec<_>, _>>()?;
-            let human = statuses
+            let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
                     status_lines(agent, run, timed_out && !run.state.wait_ready(), show)
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let data = match statuses.as_slice() {
-                [(agent, run)] => json!({"agent": agent, "run": run, "timed_out": timed_out}),
+            human.push_str(&arrived_lines(&messages));
+            let mut data = match statuses.as_slice() {
+                [(agent, run)] => json!({
+                    "agent": agent,
+                    "run": run,
+                    "timed_out": timed_out,
+                    "ended_by": ended_by,
+                }),
                 _ => json!({
                     "results": statuses
                         .iter()
                         .map(|(agent, run)| json!({"agent": agent, "run": run}))
                         .collect::<Vec<_>>(),
                     "timed_out": timed_out,
+                    "ended_by": ended_by,
                 }),
             };
+            if !messages.is_empty() {
+                data["messages"] = json!(messages);
+            }
             Ok(CommandOutput {
                 command: "agent.wait",
                 data,
@@ -834,12 +926,22 @@ fn submitted(
         "idempotency_key": key,
     });
     if wait.wait {
-        let (mut replies, timed_out) = session.wait(&[accepted.run.id], false, wait.timeout)?;
+        let waited = session.wait(&[accepted.run.id], false, wait.timeout)?;
+        data["ended_by"] = json!(waited.ended_by());
+        let Waited {
+            mut replies,
+            timed_out,
+            messages,
+        } = waited;
         let (agent, run) = status_reply(replies.remove(0))?;
         human = status_lines(&agent, &run, timed_out, show);
+        human.push_str(&arrived_lines(&messages));
         data["agent"] = json!(agent);
         data["run"] = json!(run);
         data["timed_out"] = json!(timed_out);
+        if !messages.is_empty() {
+            data["messages"] = json!(messages);
+        }
     }
     Ok(CommandOutput {
         command,
@@ -863,6 +965,19 @@ fn requests_reply(reply: Reply) -> Result<Vec<crate::chat::Request>, AppError> {
             "Unexpected requests response",
         )),
     }
+}
+
+/// The messages that ended a wait early, and how to go on.
+fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["\n\nMessages arrived while waiting:".to_owned()];
+    lines.extend(messages.iter().map(super::messages::message_lines));
+    lines.push(
+        "Answer one with: cagents reply <id> \"…\"; then wait again with cagents agent wait".into(),
+    );
+    lines.join("\n\n")
 }
 
 /// An agent's latest run in a few lines: who and where, how the run stands,
@@ -947,15 +1062,16 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bounded_wait_returns_last_known_run_without_polling_after_deadline() {
-        use crate::agent_execution::{Agent, Origin, Run, State};
-        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
-        let proof = HostSessionProof {
+    fn proof() -> HostSessionProof {
+        HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("agent-wait"),
             boot_id: crate::model::BootId::new("boot"),
             host_incarnation: crate::model::HostIncarnation::new("incarnation"),
-        };
+        }
+    }
+
+    fn running() -> (RunId, Reply) {
+        use crate::agent_execution::{Agent, Origin, Run, State};
         let agent = Agent {
             id: AgentId::new(),
             origin: Origin::User,
@@ -989,42 +1105,48 @@ mod tests {
             provider_key: Some("exact-turn".into()),
             result: Default::default(),
         };
-        let run_id = run.id;
-        let expected = Reply::Status { agent, run };
+        (run.id, Reply::Status { agent, run })
+    }
+
+    /// Answers the next request, which `expected` must accept.
+    fn answer(
+        stream: &mut UnixStream,
+        expected: impl FnOnce(&ClientRequest) -> bool,
+        response: ServerResponse,
+    ) {
+        let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+        assert!(expected(&request.request), "{:?}", request.request);
+        write_frame(
+            stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request.request_id),
+                proof: proof(),
+                message: ServerMessage::Response { response },
+            },
+        )
+        .unwrap();
+    }
+
+    fn connected() -> ServerResponse {
+        ServerResponse::Connected {
+            proof: proof(),
+            resumed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_wait_returns_last_known_run_without_polling_after_deadline() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, expected) = running();
         let response = expected.clone();
         let server = thread::spawn(move || {
-            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            write_frame(
+            answer(&mut server_stream, |_| true, connected());
+            answer(
                 &mut server_stream,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(connect.request_id),
-                    proof: proof.clone(),
-                    message: ServerMessage::Response {
-                        response: ServerResponse::Connected {
-                            proof: proof.clone(),
-                            resumed: Vec::new(),
-                        },
-                    },
-                },
-            )
-            .unwrap();
-            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(
-                matches!(request.request, ClientRequest::Agent { operation: Operation::Run(id), .. } if id == run_id)
+                |request| matches!(request, ClientRequest::Agent { operation: Operation::Run(id), .. } if *id == run_id),
+                ServerResponse::Agent(response),
             );
-            write_frame(
-                &mut server_stream,
-                &ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: Some(request.request_id),
-                    proof,
-                    message: ServerMessage::Response {
-                        response: ServerResponse::Agent(response),
-                    },
-                },
-            )
-            .unwrap();
             assert!(
                 read_frame::<ClientEnvelope>(&mut server_stream)
                     .unwrap()
@@ -1033,19 +1155,110 @@ mod tests {
             );
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let (replies, timed_out) = client
+        let waited = client
             .wait_agents(
                 Authority::default(),
                 &[run_id],
                 false,
+                false,
                 Duration::from_millis(100),
             )
             .unwrap();
-        assert!(timed_out);
-        assert_eq!(replies, vec![expected]);
+        assert!(waited.timed_out);
+        assert_eq!(waited.ended_by(), "timeout");
+        assert_eq!(waited.replies, vec![expected]);
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         drop(client);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_message_for_a_waiting_agent_ends_its_wait() {
+        use crate::agent_execution::mailbox::{Inbox, Message, Party, State};
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, status) = running();
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: Party::user(),
+            to: Party::user(),
+            reply_to: None,
+            body: "Use the staging database".into(),
+            wait_until_ms: None,
+            state: State::Read,
+            created_ms: 0,
+        };
+        let delivered = vec![message.clone()];
+        let inbox = |request: &ClientRequest| {
+            matches!(
+                request,
+                ClientRequest::Agent {
+                    operation: Operation::Inbox(Inbox {
+                        all: false,
+                        replies_to: None
+                    }),
+                    ..
+                }
+            )
+        };
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(
+                        request,
+                        ClientRequest::Agent {
+                            operation: Operation::Run(_),
+                            ..
+                        }
+                    )
+                },
+                ServerResponse::Agent(status),
+            );
+            answer(
+                &mut server_stream,
+                inbox,
+                ServerResponse::Agent(Reply::Inbox(Vec::new())),
+            );
+            answer(
+                &mut server_stream,
+                |request| {
+                    matches!(
+                        request,
+                        ClientRequest::Agent {
+                            operation: Operation::Run(_),
+                            ..
+                        }
+                    )
+                },
+                ServerResponse::Agent(running().1),
+            );
+            answer(
+                &mut server_stream,
+                inbox,
+                ServerResponse::Agent(Reply::Inbox(delivered)),
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let waited = client
+            .wait_agents(
+                Authority::default(),
+                &[run_id],
+                false,
+                true,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(!waited.timed_out);
+        assert_eq!(waited.ended_by(), "messages");
+        assert_eq!(waited.messages, vec![message]);
+        server.join().unwrap();
+        let printed = arrived_lines(&waited.messages);
+        assert!(
+            printed.contains("Messages arrived while waiting"),
+            "{printed}"
+        );
+        assert!(printed.contains("  Use the staging database"), "{printed}");
     }
 
     #[test]

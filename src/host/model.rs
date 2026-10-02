@@ -28,8 +28,9 @@ mod automations;
 pub(super) use automations::Claimed;
 mod execution;
 mod lineage;
+mod mailbox;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -570,6 +571,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 4 {
         lineage::migrate(db)?;
+    }
+    if version < 5 {
+        mailbox::migrate(db)?;
     }
     Ok(())
 }

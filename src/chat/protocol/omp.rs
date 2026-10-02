@@ -700,6 +700,9 @@ impl Adapter for Omp {
         let mut step = Step::default();
         match command {
             Command::Prompt{text:message,attachments,mode} => {
+                if self.busy && mode == PromptMode::Send {
+                    return Err("OMP is busy; steer or queue instead of sending another prompt".into());
+                }
                 let kind=match mode {PromptMode::Send=>"prompt",PromptMode::Steer=>"steer",PromptMode::Queue=>"follow_up"};
                 let mut request=self.request(kind);
                 let mut message=message;
@@ -1636,6 +1639,16 @@ mod tests {
         assert_eq!(timing.writes[0]["type"], "set_interrupt_mode");
         assert_eq!(timing.writes[0]["mode"], "wait");
         adapter.busy = true;
+        let prompt = |mode| Command::Prompt {
+            text: "next".into(),
+            attachments: Vec::new(),
+            mode,
+        };
+        assert!(adapter.command(prompt(PromptMode::Send)).is_err());
+        assert_eq!(
+            adapter.command(prompt(PromptMode::Queue)).unwrap().writes[0]["type"],
+            "follow_up"
+        );
         assert!(
             adapter
                 .command(Command::Branch {

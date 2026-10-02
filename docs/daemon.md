@@ -66,6 +66,7 @@ cagents daemon stop --confirm
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 
 - `daemon status` reads `daemon_version` from the running daemon; it is null
   when no daemon can report its build.

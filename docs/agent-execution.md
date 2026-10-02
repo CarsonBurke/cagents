@@ -69,6 +69,37 @@ Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` sta
 
 The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. The lower-level `cagents terminal` commands are not: any process that can reach the daemon socket can already write to or close a terminal by ID, so treat a listed peer's terminal as someone else's work and coordinate through its owner. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, printed beneath a session whose lineage differs from its ID, names the root session it succeeds and stays the same across those relaunches and recoveries.
 
+## Messages between sessions
+
+Any session, or the user from their own shell, can leave a message for another live session. The message is addressed to the recipient's lineage, so it still arrives if that session is relaunched or recovered before reading it.
+
+```sh
+cagents send 7c0f 'I am refactoring src/auth.rs; hold edits there until I report back'
+cagents send parent 'Blocked: the staging credentials are missing'
+cagents ask 7c0f 'Which branch are you on?' --timeout 300
+cagents reply 9a41 'main'
+cagents inbox
+```
+
+- `send SESSION` names the recipient by at least four characters of its session ID, lineage, or delegated agent ID, as `cagents ls` prints them. `parent` is the session that started the caller as its agent, or the user when the user's own CLI started it. A session cannot message itself.
+- `ask` sends a question and waits for the reply, 90 seconds by default and at most an hour. Until then the reply is held for the waiting command rather than delivered to the asker's conversation; once the wait ends, a later reply is delivered like any other message. A question to a lineage with no live session does not wait, since no one can answer it yet. `reply MESSAGE_ID` answers a message the caller received, by any prefix of its ID; only the recipient's lineage may answer it, and `--wait` waits for the answer in turn.
+- `inbox` prints the caller's undelivered messages and marks them read; `--all` lists the 50 most recent, delivered or not, and `--wait` blocks until one arrives. Messages to the user are read this way from a shell outside cagents.
+- An agent blocked in `cagents agent wait`, or in `spawn`/`send --wait`, is mid-turn, so the courier cannot reach it. Its wait therefore also returns when a message arrives for it, prints the message, and marks it read; the agent answers and waits again. A child can thus `ask parent` while its parent waits on it. The user's own shell has no such turn, so its waits are unchanged. With `--json`, a wait reports `ended_by` as `runs`, `messages` or `timeout`; only `runs` means the runs are ready.
+
+The daemon's courier gives a live native conversation its oldest waiting message as a prompt once the conversation is idle: ready, not working, and not waiting on a question or approval. It never interrupts a turn, and the next message waits for the turn the previous one started to finish. It prompts as an execution client, so delivering a message never takes a delegated agent over. If the conversation refuses the prompt, usually because a person's own prompt reached it first, the message returns to the queue. Delivery is at most once: a prompt the conversation took but did not acknowledge in time, a provider that rejects a turn after accepting the prompt, or a daemon that stops between claiming a message and prompting leaves the message marked delivered rather than risk a second prompt. A session running in a terminal, such as a provider CLI, is never prompted; it reads its messages with `cagents inbox`. A message to a lineage with no live session waits for the next one to start.
+
+A delivered message is a prompt framed for the agent:
+
+```text
+[cagents message from session 3e81d0aa "Fix flaky login test"]
+I am refactoring src/auth.rs; hold edits there until I report back
+[Reply: cagents reply 9a41c2e7 "…" · seal 5f0c…]
+```
+
+The daemon seals each frame with a keyed hash under a secret it keeps in its registry. Windows show a sealed prompt as a message from its sender, both when it is delivered and when the transcript is read back from provider history; a prompt that only looks like one stays the user's own words. The seal proves who wrote a frame, not what its sender may ask for: a message is as trustworthy as a prompt from the session that sent it, and the recipient decides what to do with it. Nor does it bind a frame to the conversation it was delivered to; a sealed frame pasted into another conversation shows there as the same message. A caller without a daemon-issued capability is the user, so a process that drops its capability speaks as the user, as any program the user runs can.
+
+A message body is at most 64 KiB, and a lineage holds at most 64 undelivered messages. The user reads messages only when they choose to, so the cap there applies to each sender separately. The courier deletes messages 30 days after they were sent, checking hourly. The daemon registry keeps messages from schema version 5.
+
 ## Console surface
 
 `--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.

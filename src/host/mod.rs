@@ -246,6 +246,13 @@ pub fn run() -> Result<(), HostError> {
             None
         }
     };
+    let courier = match agent_execution::mailbox::Courier::start(&host) {
+        Ok(courier) => Some(courier),
+        Err(error) => {
+            tracing::warn!(%error, "messages between sessions are unavailable");
+            None
+        }
+    };
 
     let next_client_id = AtomicU64::new(1);
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
@@ -330,6 +337,7 @@ pub fn run() -> Result<(), HostError> {
     // Stop deadline acceptance before snapshotting/tearing down provider
     // ownership. Dedicated prechecks keep their own bounded cleanup deadline.
     drop(automation_broker);
+    drop(courier);
     let proof = host
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
