@@ -921,7 +921,9 @@ impl Claude {
                                 .is_some_and(|status| status != ToolStatus::Running)
                         }) {
                             if string(block, "name") == "Agent" {
-                                if block["input"]["run_in_background"].as_bool() == Some(true) {
+                                if child.is_none()
+                                    && block["input"]["run_in_background"].as_bool() == Some(true)
+                                {
                                     self.background_agents.insert(tool_id.clone());
                                 }
                                 step.events.push(Event::Subagent {
@@ -1244,7 +1246,9 @@ impl Adapter for Claude {
         )?;
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
-            for (tool, agent) in &history.agent_ids {
+            let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
+            calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
+            for (tool, agent) in calls {
                 self.agent_call(agent, tool);
             }
             self.background_agents.extend(
@@ -1401,9 +1405,13 @@ impl Adapter for Claude {
                 let has_earlier = history.offset > 0;
                 self.history = Some(history);
                 let mut step = Step::default();
+                // An earlier page replays launches whose agents settled long
+                // ago; which agents are still running is already known.
+                let running = self.background_agents.clone();
                 for frame in frames? {
                     self.message(&frame, &mut step)?;
                 }
+                self.background_agents = running;
                 let items = step
                     .events
                     .into_iter()
@@ -2521,8 +2529,6 @@ fn command_content(
         output: String::new(),
     }
 }
-/// Attach a tool result to whichever variant the call was mapped to, so that a
-/// richer mapping never costs the result the provider reported.
 /// A history page's items, each once: where it first appeared, as it last
 /// stood. Replaying a tool reports its call and then its result as the same
 /// item, and a page keeps an item's first copy.
@@ -2539,6 +2545,8 @@ fn settled(items: Vec<Item>) -> Vec<Item> {
     }
     page
 }
+/// Attach a tool result to whichever variant the call was mapped to, so that a
+/// richer mapping never costs the result the provider reported.
 fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
     let result = if failed {
         ToolStatus::Failed
@@ -5119,9 +5127,15 @@ mod tests {
     fn a_nested_background_launch_is_not_awaited() {
         let mut adapter = Claude::default();
         adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{}}]}})).unwrap();
-        adapter.receive(json!({"type":"assistant","uuid":"nested-launch","parent_tool_use_id":"tool-agent","message":{"id":"nested-message","content":[{"type":"tool_use","id":"tool-nested","name":"Agent","input":{}}]}})).unwrap();
-        let launched = adapter.receive(json!({"type":"user","uuid":"nested-result","parent_tool_use_id":"tool-agent","tool_use_result":{"status":"async_launched","agentId":"a2"},"message":{"content":[{"type":"tool_result","tool_use_id":"tool-nested","content":"Launched"}]}})).unwrap();
-        assert!(launched.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == "tool-nested")));
+        // Backgrounded unasked, then asked to.
+        for (nested, input) in [
+            ("tool-unasked", json!({})),
+            ("tool-asked", json!({"run_in_background": true})),
+        ] {
+            adapter.receive(json!({"type":"assistant","uuid":format!("{nested}-launch"),"parent_tool_use_id":"tool-agent","message":{"id":format!("{nested}-message"),"content":[{"type":"tool_use","id":nested,"name":"Agent","input":input}]}})).unwrap();
+            let launched = adapter.receive(json!({"type":"user","uuid":format!("{nested}-result"),"parent_tool_use_id":"tool-agent","tool_use_result":{"status":"async_launched","agentId":"a2"},"message":{"content":[{"type":"tool_result","tool_use_id":nested,"content":"Launched"}]}})).unwrap();
+            assert!(launched.events.iter().any(|event| matches!(event, Event::Subagent { id, status: Some(ToolStatus::Succeeded), .. } if id == nested)));
+        }
         assert!(adapter.background_agents.is_empty());
         assert!(adapter.agent_calls.is_empty());
     }
