@@ -819,8 +819,28 @@ where
 
     /// Creates a [`Content`] with the given text.
     pub fn with_text(text: &str) -> Self {
+        use cosmic::iced::advanced::graphics::text::cosmic_text;
+        // The native constructor shapes all text before it has a viewport.
+        // Insert native line fragments instead: Paste does not shape, and
+        // appending one fragment avoids its quadratic interior Vec insertions
+        // for a large multiline paste. Use the same parser as Buffer::set_text
+        // so mixed and paired line endings retain their exact native identity.
+        let mut editor = R::Editor::with_text("");
+        for (range, ending) in cosmic_text::LineIter::new(text) {
+            let fragment = &text[range.start..range.end + ending.as_str().len()];
+            editor.perform(Action::Edit(Edit::Paste(Arc::new(fragment.to_owned()))));
+        }
+        editor.perform(Action::ClearSelection);
+        editor.move_to(Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        });
+        // Native edits remember the latest changed line for highlighting.
+        // Renew that marker at the start after the append-only load, without
+        // changing text, so the first viewport highlights from line zero.
+        editor.perform(Action::Edit(Edit::Paste(Arc::new(String::new()))));
         Self(RefCell::new(Internal {
-            editor: R::Editor::with_text(text),
+            editor,
             pending_scroll: None,
             horizontal: 0.0,
             reveal_horizontal: true,
@@ -2956,6 +2976,134 @@ impl ScrollGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn construction_preserves_exact_native_lines_endings_and_initial_cursor() {
+        for source in [
+            "",
+            "plain",
+            "one\ntwo\n",
+            "one\r\ntwo\r\n",
+            "one\rtwo\r",
+            "one\n\rtwo\n\r",
+            "\n\n\r\r\n\r\n",
+            "Straße\rcafé\r\n東京\n\rtail",
+            "α\r\nβ\nγ\rδ\n\r",
+        ] {
+            let original = NativeEditor::with_text(source);
+            let content: Content = Content::with_text(source);
+            let internal = content.0.borrow();
+            let lines = |editor: &NativeEditor| {
+                editor
+                    .buffer()
+                    .lines
+                    .iter()
+                    .map(|line| (line.text().to_owned(), line.ending()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(lines(&internal.editor), lines(&original), "{source:?}");
+            assert_eq!(internal.editor.cursor(), original.cursor());
+            drop(internal);
+            assert_eq!(content.text(), source);
+        }
+    }
+
+    #[test]
+    fn construction_notifies_the_first_highlighter_from_line_zero() {
+        struct ChangedLine(Option<usize>);
+        impl Highlighter for ChangedLine {
+            type Settings = ();
+            type Highlight = ();
+            type Iterator<'a> = std::iter::Empty<(ops::Range<usize>, ())>;
+            fn new(_: &()) -> Self {
+                Self(None)
+            }
+            fn update(&mut self, _: &()) {}
+            fn change_line(&mut self, line: usize) {
+                self.0 = Some(line);
+            }
+            fn highlight_line(&mut self, _: &str) -> Self::Iterator<'_> {
+                std::iter::empty()
+            }
+            fn current_line(&self) -> usize {
+                self.0.unwrap_or(usize::MAX)
+            }
+        }
+        let mut content: Content = Content::with_text(&"token\n".repeat(100));
+        let mut highlighter = ChangedLine::new(&());
+        // Match the constructor's font and metrics, so those transitions do
+        // not themselves renew the changed-line marker and mask a bad load.
+        content.0.get_mut().editor.update(
+            Size::new(800.0, 24.0),
+            cosmic::iced::Font::DEFAULT,
+            Pixels(1.0),
+            LineHeight::Absolute(Pixels(1.0)),
+            Wrapping::None,
+            &mut highlighter,
+        );
+        assert_eq!(highlighter.0, Some(0));
+    }
+
+    #[test]
+    fn large_document_construction_leaves_unvisited_lines_unshaped() {
+        let source = "let token = 123; // native fixture\n".repeat(100_000);
+        let started = Instant::now();
+        let mut content: Content = Content::with_text(&source);
+        eprintln!("100k-line construction: {:?}", started.elapsed());
+        {
+            let internal = content.0.borrow();
+            let lines = &internal.editor.buffer().lines;
+            assert_eq!(lines.len(), 100_001);
+            assert!(lines.iter().all(|line| line.shape_opt().is_none()));
+            assert!(lines.iter().all(|line| line.layout_opt().is_none()));
+        }
+        layout_content(&mut content, 800.0, 240.0);
+        let internal = content.0.borrow();
+        let lines = &internal.editor.buffer().lines;
+        let shaped = lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        assert!(
+            (1..100).contains(&shaped),
+            "only the viewport needs shapes: {shaped}"
+        );
+        assert!(lines.last().unwrap().shape_opt().is_none());
+        assert!(lines.last().unwrap().layout_opt().is_none());
+    }
+
+    #[test]
+    #[ignore = "explicit constructor benchmark retains the old full-file glyph caches"]
+    fn native_constructor_large_file_microbenchmark() {
+        let source = "let token = 123; // native fixture\n".repeat(100_000);
+        let started = Instant::now();
+        let content: Content = Content::with_text(&source);
+        let current_elapsed = started.elapsed();
+        let current_shaped = content
+            .0
+            .borrow()
+            .editor
+            .buffer()
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        let started = Instant::now();
+        let original = NativeEditor::with_text(&source);
+        let original_elapsed = started.elapsed();
+        let original_shaped = original
+            .buffer()
+            .lines
+            .iter()
+            .filter(|line| line.shape_opt().is_some())
+            .count();
+        eprintln!(
+            "100k lines / {} bytes: original {original_elapsed:?}, {original_shaped} shaped; current {current_elapsed:?}, {current_shaped} shaped (unoptimized test profile)",
+            source.len()
+        );
+        assert_eq!(original_shaped, 100_001);
+        assert_eq!(current_shaped, 0);
+    }
 
     #[test]
     fn search_snapshot_preserves_native_positions_unicode_and_mixed_endings() {
