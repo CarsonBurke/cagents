@@ -13,6 +13,7 @@ use crate::{
     model::{TerminalId, TerminalSession},
     terminal_ipc::{ClientRequest, ProtocolError, ProtocolErrorCode},
 };
+
 enum Access<'a> {
     /// Reads, or presentation private to this connection.
     Open,
