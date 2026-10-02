@@ -17230,6 +17230,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "explicit complete 100k-match Replace All and history benchmark"]
+    fn large_replace_all_and_history_microbenchmark() {
+        let card = CardId::new();
+        let original = "token\r\n".repeat(100_000);
+        let replaced = "replacement\r\n".repeat(100_000);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "large.txt", &original);
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        let scan = runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "token".into(),
+        });
+        drop(runtime.update(find_output(scan)));
+        assert_eq!(runtime.find_total, 100_000);
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "replacement".into(),
+        }));
+        let started = std::time::Instant::now();
+        drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
+        let replace_elapsed = started.elapsed();
+        assert_eq!(buffer_text(&runtime), replaced);
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        let started = std::time::Instant::now();
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        let undo_elapsed = started.elapsed();
+        assert_eq!(buffer_text(&runtime), original);
+        let started = std::time::Instant::now();
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        let redo_elapsed = started.elapsed();
+        assert_eq!(buffer_text(&runtime), replaced);
+        eprintln!(
+            "100k matches complete Replace All: {replace_elapsed:?}; undo: {undo_elapsed:?}; redo: {redo_elapsed:?} (unoptimized test profile, excludes layout)"
+        );
+    }
+
+    #[test]
     fn unicode_find_replace_all_is_one_edit_and_renews_matches() {
         let card = CardId::new();
         let (mut runtime, _) =
